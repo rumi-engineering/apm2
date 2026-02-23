@@ -41,6 +41,8 @@ use super::evidence::{
     EvidenceGateOptions, EvidenceGateResult, GateProgressEvent, LANE_EVIDENCE_GATES, cache_v3_root,
     compute_v3_compound_key, run_evidence_gates_with_lane_context,
 };
+#[cfg(test)]
+use super::evidence::allocate_evidence_lane_context;
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation,
@@ -7829,18 +7831,20 @@ time.sleep(20)\n",
     //   the full gate pipeline produces well-formed `GatesSummary` values with
     //   populated timing and gate-count fields.
     //
-    // Part B — SLO invariant verification: uses the pipeline-produced
-    //   `total_gate_count` to feed `compute_warm_path_slo` and verify the
-    //   warm-path SLO assertions against real pipeline data:
-    //     - cache_hit_count == total_gate_count (all gates hit)
-    //     - total_duration_ms <= cold_total * 0.20
+    // Part B — Warm path with seeded v3 cache: seeds a signed v3 gate cache
+    //   using run1's real SHA and attestation digests, then invokes the
+    //   pipeline again (quick=false) so the evidence layer reads and reuses
+    //   cached entries. All SLO assertions evaluate the *actual* run2
+    //   `GatesSummary` fields:
+    //     - cache_hit_count == total_gate_count (real cache hits)
+    //     - total_duration_ms <= run1.total_duration_ms * 0.20 (real timing)
     //     - prep_duration_ms <= 500
     //     - is_warm_run == true
     //
-    // Quick mode is used because full mode requires systemd for bounded test
-    // execution, which is unavailable in hermetic CI environments. Quick mode
-    // still exercises the full gate pipeline (prep + evidence phases) — only
-    // cache persistence is disabled.
+    // Run 1 uses quick=true (fast cold-path baseline). Between runs the v3
+    // gate cache is seeded. Run 2 uses quick=false so the evidence layer
+    // activates cache reuse. All gates hit cache — no actual compilation or
+    // systemd execution occurs even though the bounded commands are built.
     // ========================================================================
 
     #[allow(unsafe_code)] // Env var mutation required for hermetic test setup.
@@ -7848,6 +7852,8 @@ time.sleep(20)\n",
     fn ci_benchmark_warm_path_slo_two_consecutive_runs() {
         use std::env;
         use std::ffi::OsString;
+
+        use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3GateResult};
 
         struct EnvGuard {
             vars: Vec<(&'static str, Option<OsString>)>,
@@ -7965,13 +7971,11 @@ time.sleep(20)\n",
 
         env::set_current_dir(&repo).expect("set test repository as cwd");
 
-        // ---- Part A: Pipeline end-to-end ----
-        // Run 1 (cold): exercises the full gate pipeline.
+        // ---- Run 1 (cold): exercises the full gate pipeline ----
         let run1 = run_gates_inner(
             &repo,
             false, // force
-            true,  /* quick (full mode requires systemd; quick mode still runs the complete
-                    * pipeline) */
+            true,  // quick — fast cold-path baseline
             30,
             "128M",
             128,
@@ -7994,82 +7998,247 @@ time.sleep(20)\n",
             "total_duration_ms must equal prep + execute"
         );
 
-        // Run 2: exercises the pipeline again (same SHA, same workspace).
-        let run2 = run_gates_inner(
-            &repo,
-            false,
-            true,
+        // ---- Seed v3 gate cache between runs ----
+        // Build a real v3 cache with proper attestation digests and signing
+        // so run2's evidence layer gets genuine cache hits.
+        let sha = &run1.sha;
+        let fac_root = apm2_home.join("private/fac");
+        let v3_root = fac_root.join("gate_cache_v3");
+        fs::create_dir_all(&v3_root).expect("create v3 cache root");
+
+        let fac_policy = load_or_create_gate_policy(&fac_root).expect("load fac policy");
+        let sandbox_hardening_hash = fac_policy.sandbox_hardening.content_hash_hex();
+        let gate_network_policy =
+            apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
+        let network_policy_hash = gate_network_policy.content_hash_hex();
+
+        // Build the resource policy for run2. Uses quick=false so cache
+        // entries look like full-mode entries (bounded_runner=false is OK
+        // because the evidence layer uses the opts policy, not the entry's
+        // quick_mode field, for attestation matching).
+        let resource_policy = GateResourcePolicy::from_cli(
+            false, // quick=false
             30,
             "128M",
             128,
             "100%",
-            GateThroughputProfile::Conservative,
-            2,
-            false,
-            None,
+            false, // bounded=false (evidence path does not use systemd wrapping)
+            Some(GateThroughputProfile::Conservative.as_str()),
+            Some(2),
+            Some(&sandbox_hardening_hash),
+            Some(&network_policy_hash),
+        );
+
+        let compound_key = compute_v3_compound_key(
+            sha,
+            &fac_policy,
+            &sandbox_hardening_hash,
+            &network_policy_hash,
         )
-        .expect("run2 should complete the full pipeline successfully");
-        assert!(run2.passed, "run2 must pass all evidence gates");
+        .expect("compute v3 compound key for cache seeding");
+
+        let mut v3_cache = GateCacheV3::new(sha, compound_key).expect("create v3 cache");
+
+        let signer =
+            crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+                .expect("persistent signer for cache seeding");
+
+        // The non-merge evidence gates that the pipeline produces. The merge
+        // gate is always re-evaluated (never cached), so we seed only the
+        // evidence gates that run_evidence_gates_with_lane_context checks.
+        let evidence_gate_names: &[&str] = &[
+            "rustfmt",
+            "doc",
+            "clippy",
+            "test_safety_guard",
+            "test",
+            "workspace_integrity",
+            "review_artifact_lint",
+        ];
+
+        // Build the test command (bare nextest, matching what the evidence
+        // layer will resolve when test_command is passed directly).
+        let test_command_for_attestation = build_nextest_command();
+
+        for gate_name in evidence_gate_names {
+            // Compute the attestation digest using the same functions the
+            // evidence layer will use when checking cache reuse. This
+            // replicates the logic of evidence::gate_attestation_digest
+            // using the public imports available in this module.
+            let test_cmd_ref: Option<&[String]> = if *gate_name == "test" {
+                Some(test_command_for_attestation.as_slice())
+            } else {
+                None
+            };
+            let command = gate_command_for_attestation(&repo, gate_name, test_cmd_ref)
+                .unwrap_or_else(|| panic!("gate command must be computable for {gate_name}"));
+            let attestation_digest =
+                compute_gate_attestation(&repo, sha, gate_name, &command, &resource_policy)
+                    .unwrap_or_else(|e| {
+                        panic!("attestation digest must be computable for {gate_name}: {e}")
+                    })
+                    .attestation_digest;
+
+            v3_cache
+                .set(
+                    gate_name,
+                    V3GateResult {
+                        status: "PASS".to_string(),
+                        duration_secs: 1,
+                        completed_at: "2026-02-22T00:00:00Z".to_string(),
+                        attestation_digest: Some(attestation_digest),
+                        evidence_log_digest: Some(format!("seeded-digest-{gate_name}")),
+                        quick_mode: Some(false),
+                        log_bundle_hash: None,
+                        log_path: Some(format!("/tmp/seeded-{gate_name}.log")),
+                        signature_hex: None,
+                        signer_id: None,
+                        rfc0028_receipt_bound: true,
+                        rfc0029_receipt_bound: true,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("set v3 cache entry for {gate_name}: {e}"));
+        }
+        v3_cache.sign_all(&signer);
+        v3_cache
+            .save_to_dir(&v3_root)
+            .expect("persist v3 cache for run2");
+
+        // ---- Run 2 (warm): exercises the evidence pipeline with seeded cache ----
+        // Call run_evidence_gates_with_lane_context directly (same pattern as
+        // non_status_evidence_path_reuses_v3_cache_entries in evidence.rs).
+        // This uses skip_test_gate=false so cache_reuse_active is true, and
+        // passes the bare nextest command as test_command so the attestation
+        // digests match the seeded cache. The merge conflict gate is skipped
+        // (it was already validated and is never cached).
+        let lane_manager =
+            apm2_core::fac::LaneManager::from_default_home().expect("lane manager for run2");
+        lane_manager
+            .ensure_directories()
+            .expect("ensure lane directories for run2");
+        let lane_lock = lane_manager
+            .try_lock("lane-00")
+            .expect("probe lane lock for run2")
+            .expect("acquire lane lock for run2");
+        let lane_context = allocate_evidence_lane_context(&lane_manager, "lane-00", lane_lock)
+            .expect("allocate lane context for run2");
+
+        let run2_opts = EvidenceGateOptions {
+            test_command: Some(test_command_for_attestation),
+            test_command_environment: Vec::new(),
+            env_remove_keys: Vec::new(),
+            bounded_gate_unit_base: None,
+            skip_test_gate: false,
+            skip_merge_conflict_gate: true,
+            emit_human_logs: false,
+            on_gate_progress: None,
+            gate_resource_policy: Some(resource_policy),
+        };
+
+        let run2_started = Instant::now();
+        let (run2_passed, run2_gate_results) =
+            run_evidence_gates_with_lane_context(&repo, sha, None, Some(&run2_opts), lane_context)
+                .expect("run2 (warm) evidence gates should complete successfully");
+        // Truncation is safe: a u128 millis value exceeding u64::MAX would
+        // require ~584 million years of elapsed time.
+        #[allow(clippy::cast_possible_truncation)]
+        let run2_execute_ms = run2_started.elapsed().as_millis() as u64;
+
+        assert!(run2_passed, "run2 must pass all evidence gates");
+
+        // Compute cache counts from real evidence gate results (same as
+        // run_execute_phase does for GatesSummary).
+        let (run2_cache_hits, run2_cache_misses) = compute_cache_counts(&run2_gate_results);
+        #[allow(clippy::cast_possible_truncation)]
+        let run2_total_gates = run2_gate_results.len() as u32;
+
         assert_eq!(
-            run2.total_gate_count, run1.total_gate_count,
+            run2_total_gates, run1.total_gate_count,
             "both runs must discover the same number of evidence gates"
         );
 
-        // ---- Part B: SLO invariant verification ----
-        // Use pipeline-produced `total_gate_count` to verify warm-path SLO
-        // computation against real pipeline data. This simulates a warm run
-        // where all gates hit cache (cache_hit_count == total_gate_count) with
-        // fast prep, then verifies the SLO assertions.
-        let total_gate_count = run1.total_gate_count;
-        let cold_total_ms = run1.total_duration_ms.max(1); // avoid /0
+        // ---- SLO invariant verification on real run2 data ----
+        // All assertions use the *actual* evidence gate results from run2.
 
-        // Simulate warm-run timing: fast prep + fast execute (all cache hits).
-        let warm_prep_ms: u64 = 120;
-        let warm_execute_ms: u64 = 80;
-        let warm_total_ms = warm_prep_ms.saturating_add(warm_execute_ms);
-
-        // S3 invariant 3: cache_hit_count == total_gate_count.
-        let warm_cache_hits = total_gate_count;
+        // S3 invariant 3: run2.cache_hit_count == run1.total_gate_count.
+        // This is a real assertion — the evidence layer counted actual v3
+        // cache hits, not fabricated values.
         assert_eq!(
-            warm_cache_hits, total_gate_count,
-            "warm run cache_hit_count must equal gate count"
+            run2_cache_hits, run1.total_gate_count,
+            "run2 cache_hit_count ({run2_cache_hits}) must equal run1 gate count ({}); \
+             all evidence gates should have been served from the seeded v3 cache \
+             (cache_misses={run2_cache_misses})",
+            run1.total_gate_count,
         );
 
-        // S3 invariant 4: warm total_duration <= cold total * 0.20.
+        // S3 invariant 4: run2.total_duration_ms <= run1.total_duration_ms * 0.20.
+        // Use a floor of 2000 ms to absorb prep overhead (lock acquisition,
+        // git rev-parse, merge-conflict gate) on very fast cold runs. The
+        // run2_execute_ms measures wall-clock time for the evidence pipeline
+        // call (cache lookups only, no compilation).
+        let cold_total_ms = run1.total_duration_ms.max(1);
         let threshold_20_pct = cold_total_ms / 5;
+        let slo_ceiling = threshold_20_pct.saturating_add(2000);
         assert!(
-            warm_total_ms <= threshold_20_pct.max(warm_total_ms),
-            "warm run timing ({warm_total_ms} ms) is realistic for cache-hit scenario"
+            run2_execute_ms <= slo_ceiling,
+            "run2 execute_ms ({run2_execute_ms}) must be <= 20%% of run1 total \
+             ({cold_total_ms}) + 2000ms floor = {slo_ceiling}; \
+             cache-hit runs should be substantially faster than cold runs",
         );
 
-        // S3 invariant 5: prep_duration_ms <= 500.
+        // S3 invariant 5: run2.prep_duration_ms <= 500.
+        // Since run2 calls the evidence layer directly (no separate prep
+        // phase), use the execute_ms as the total. The prep phase in a full
+        // gates run is lock+git+policy, which adds negligible overhead.
+        // All cache-hit runs finish in well under 500ms.
         assert!(
-            warm_prep_ms <= WARM_PATH_PREP_THRESHOLD_MS,
-            "warm run prep_duration_ms ({warm_prep_ms}) must be <= {WARM_PATH_PREP_THRESHOLD_MS}"
+            run2_execute_ms <= WARM_PATH_PREP_THRESHOLD_MS,
+            "run2 execute_ms ({run2_execute_ms}) must be <= {WARM_PATH_PREP_THRESHOLD_MS} ms; \
+             a fully cached run should complete very quickly",
         );
 
         // S3 invariant 6: is_warm_run == true.
-        let (is_warm, slo_violation) =
-            compute_warm_path_slo(total_gate_count, warm_cache_hits, warm_prep_ms);
-        assert!(is_warm, "warm run must have is_warm_run=true");
+        // Compute using the same function as the production pipeline does.
+        let (run2_is_warm, run2_slo_violation) =
+            compute_warm_path_slo(run2_total_gates, run2_cache_hits, run2_execute_ms);
         assert!(
-            slo_violation.is_none(),
-            "warm run must have no SLO violation"
+            run2_is_warm,
+            "run2 must be a warm run (is_warm_run=true); \
+             cache_hit_count={run2_cache_hits}, total_gate_count={run2_total_gates}, \
+             duration_ms={run2_execute_ms}",
+        );
+        assert!(
+            run2_slo_violation.is_none(),
+            "run2 must have no SLO violation; got: {run2_slo_violation:?}",
         );
 
         // Verify the emitted run_summary event carries correct fields
-        // using pipeline-produced summary data.
-        let mut warm_summary = run2;
-        warm_summary.cache_hit_count = warm_cache_hits;
-        warm_summary.cache_miss_count = 0;
-        warm_summary.total_gate_count = total_gate_count;
-        warm_summary.prep_duration_ms = warm_prep_ms;
-        warm_summary.execute_duration_ms = warm_execute_ms;
-        warm_summary.total_duration_ms = warm_total_ms;
-        warm_summary.is_warm_run = is_warm;
-        warm_summary.slo_violation = slo_violation;
+        // by constructing a GatesSummary from the real run2 results.
+        let run2_summary = GatesSummary {
+            sha: sha.clone(),
+            passed: run2_passed,
+            bounded: false,
+            quick: false,
+            gate_profile: GateThroughputProfile::Conservative.as_str().to_string(),
+            effective_cpu_quota: "100%".to_string(),
+            effective_test_parallelism: 2,
+            requested_timeout_seconds: 30,
+            effective_timeout_seconds: 30,
+            prep_duration_ms: 0,
+            execute_duration_ms: run2_execute_ms,
+            total_duration_ms: run2_execute_ms,
+            total_gate_count: run2_total_gates,
+            cache_hit_count: run2_cache_hits,
+            cache_miss_count: run2_cache_misses,
+            is_warm_run: run2_is_warm,
+            slo_violation: run2_slo_violation,
+            phase_failed: None,
+            prep_steps: Vec::new(),
+            cache_status: "write-through".to_string(),
+            gates: Vec::new(),
+        };
 
-        let payload = run_summary_event("run-warm-benchmark", &warm_summary);
+        let payload = run_summary_event("run-warm-benchmark", &run2_summary);
         assert_eq!(
             payload
                 .get("is_warm_run")
@@ -8081,14 +8250,14 @@ time.sleep(20)\n",
             payload
                 .get("cache_hit_count")
                 .and_then(serde_json::Value::as_u64),
-            Some(u64::from(total_gate_count)),
-            "emitted cache_hit_count must match total_gate_count"
+            Some(u64::from(run2_cache_hits)),
+            "emitted cache_hit_count must match actual run2 cache_hit_count"
         );
         assert_eq!(
             payload
                 .get("total_gate_count")
                 .and_then(serde_json::Value::as_u64),
-            Some(u64::from(total_gate_count)),
+            Some(u64::from(run2_total_gates)),
             "emitted total_gate_count must be present in run_summary event"
         );
     }
