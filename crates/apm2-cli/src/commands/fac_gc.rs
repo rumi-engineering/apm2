@@ -420,3 +420,53 @@ fn read_bounded(path: &Path, max_size: usize) -> Result<Vec<u8>, String> {
 
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(unsafe_code)] // Env mutation is required for scoped test setup.
+    fn set_apm2_home(path: &Path) {
+        unsafe {
+            std::env::set_var("APM2_HOME", path);
+        }
+    }
+
+    #[allow(unsafe_code)] // Env mutation is required for scoped test teardown.
+    fn restore_apm2_home(previous: Option<&std::ffi::OsString>) {
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("APM2_HOME", value),
+                None => std::env::remove_var("APM2_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_gc_for_doctor_fix_fails_when_fac_root_is_not_directory() {
+        let _env_lock = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize env-mutating test");
+        let previous = std::env::var_os("APM2_HOME");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let private_dir = tmp.path().join("private");
+        std::fs::create_dir_all(&private_dir).expect("create private dir");
+        std::fs::write(private_dir.join("fac"), b"not-a-directory")
+            .expect("create fac blocker file");
+        set_apm2_home(tmp.path());
+
+        let result = run_gc_for_doctor_fix();
+
+        restore_apm2_home(previous.as_ref());
+        assert!(
+            result.is_err(),
+            "doctor GC should fail closed when fac root is not a directory"
+        );
+        let error = result.expect_err("result should be error");
+        assert!(
+            error.contains("cannot load fac policy"),
+            "error should indicate policy load failure, got: {error}"
+        );
+    }
+}

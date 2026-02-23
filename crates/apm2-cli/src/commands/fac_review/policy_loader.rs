@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
 use apm2_core::fac::policy::MAX_POLICY_SIZE;
-use apm2_core::fac::{FacPolicyV1, deserialize_policy, persist_policy};
+use apm2_core::fac::{
+    FacPolicyV1, apply_lane_env_overrides, deserialize_policy, ensure_lane_env_dirs, persist_policy,
+};
 
 /// Load or create the FAC policy from `$FAC_ROOT/policy/fac_policy.v1.json`.
 ///
@@ -139,19 +141,25 @@ pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
 }
 
 /// Apply a stable `RUSTUP_HOME` when the policy environment does not provide
-/// one explicitly.
+/// one explicitly, or provides an invalid path.
 ///
 /// FAC review gates run with lane-scoped `HOME`. If `RUSTUP_HOME` is unset,
 /// rustup falls back to `$HOME/.rustup`, which is lane-local and may be wiped
 /// during lane recovery. This helper pins `RUSTUP_HOME` to an existing shared
 /// rustup home (ambient `RUSTUP_HOME` first, then ambient `HOME/.rustup`) when
 /// that directory already contains `toolchains/`.
+///
+/// Existing `RUSTUP_HOME` values are preserved when valid and absolute. If an
+/// existing value is invalid (missing path or missing `toolchains/`), it is
+/// replaced by a discovered stable candidate when available.
 pub fn apply_stable_rustup_home_if_available(
     policy_env: &mut BTreeMap<String, String>,
     ambient: &[(String, String)],
 ) {
-    if policy_env.contains_key("RUSTUP_HOME") {
-        return;
+    if let Some(existing) = policy_env.get("RUSTUP_HOME") {
+        if validate_stable_rustup_home(PathBuf::from(existing)).is_some() {
+            return;
+        }
     }
     if let Some(path) = discover_stable_rustup_home(ambient) {
         policy_env.insert(
@@ -159,6 +167,24 @@ pub fn apply_stable_rustup_home_if_available(
             path.to_string_lossy().to_string(),
         );
     }
+}
+
+/// Apply lane-local environment isolation for FAC review execution.
+///
+/// This bundles the three required steps for deterministic, resilient lane
+/// execution:
+/// - ensure lane env directories exist with restricted permissions,
+/// - override HOME/TMP/XDG variables to the lane directory,
+/// - pin `RUSTUP_HOME` to a stable shared location when available.
+pub fn apply_review_lane_environment(
+    policy_env: &mut BTreeMap<String, String>,
+    lane_dir: &Path,
+    ambient: &[(String, String)],
+) -> Result<(), String> {
+    ensure_lane_env_dirs(lane_dir)?;
+    apply_lane_env_overrides(policy_env, lane_dir);
+    apply_stable_rustup_home_if_available(policy_env, ambient);
+    Ok(())
 }
 
 fn discover_stable_rustup_home(ambient: &[(String, String)]) -> Option<PathBuf> {
@@ -402,25 +428,46 @@ mod tests {
     }
 
     #[test]
-    fn apply_stable_rustup_home_does_not_override_existing_value() {
+    fn apply_stable_rustup_home_does_not_override_existing_valid_value() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let rustup_home = dir.path().join("rustup");
-        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+        let existing = dir.path().join("existing-rustup");
+        let ambient_rustup = dir.path().join("ambient-rustup");
+        fs::create_dir_all(existing.join("toolchains/stable")).expect("create existing toolchains");
+        fs::create_dir_all(ambient_rustup.join("toolchains/stable"))
+            .expect("create ambient toolchains");
 
         let ambient = vec![(
             "RUSTUP_HOME".to_string(),
-            rustup_home.to_string_lossy().to_string(),
+            ambient_rustup.to_string_lossy().to_string(),
         )];
         let mut env = BTreeMap::from([(
             "RUSTUP_HOME".to_string(),
-            "/already/pinned/rustup".to_string(),
+            existing.to_string_lossy().to_string(),
         )]);
 
         apply_stable_rustup_home_if_available(&mut env, &ambient);
 
         assert_eq!(
             env.get("RUSTUP_HOME").map(String::as_str),
-            Some("/already/pinned/rustup")
+            Some(existing.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn apply_stable_rustup_home_replaces_invalid_existing_value_when_candidate_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let rustup_home = home.join(".rustup");
+        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+
+        let ambient = vec![("HOME".to_string(), home.to_string_lossy().to_string())];
+        let mut env = BTreeMap::from([("RUSTUP_HOME".to_string(), "/does/not/exist".to_string())]);
+
+        apply_stable_rustup_home_if_available(&mut env, &ambient);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some(rustup_home.to_string_lossy().as_ref())
         );
     }
 
@@ -441,6 +488,33 @@ mod tests {
         assert!(
             !env.contains_key("RUSTUP_HOME"),
             "RUSTUP_HOME should remain unset without a toolchains/ directory"
+        );
+    }
+
+    #[test]
+    fn apply_review_lane_environment_sets_lane_overrides_and_stable_rustup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lane_dir = dir.path().join("lane-00");
+        fs::create_dir_all(&lane_dir).expect("create lane dir");
+
+        let home = dir.path().join("home");
+        let rustup_home = home.join(".rustup");
+        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+
+        let ambient = vec![("HOME".to_string(), home.to_string_lossy().to_string())];
+        let mut env = BTreeMap::new();
+        apply_review_lane_environment(&mut env, &lane_dir, &ambient)
+            .expect("apply review lane env");
+
+        let lane_prefix = lane_dir.to_string_lossy();
+        let expected_home = format!("{lane_prefix}/home");
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some(expected_home.as_str())
+        );
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some(rustup_home.to_string_lossy().as_ref())
         );
     }
 }
