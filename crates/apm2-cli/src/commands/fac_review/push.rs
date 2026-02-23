@@ -1629,73 +1629,203 @@ fn with_operator_client<T>(
     rt.block_on(f).map_err(|err| err.to_string())
 }
 
+fn resolve_ticket_alias_to_work_id(
+    ticket_alias: &str,
+    operator_socket: &Path,
+) -> Result<Option<String>, String> {
+    let ticket_alias_for_rpc = ticket_alias.to_string();
+    let resolved = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&ticket_alias_for_rpc).await
+    })?;
+    if !resolved.found {
+        return Ok(None);
+    }
+    validate_push_work_id(&resolved.work_id)?;
+    Ok(Some(resolved.work_id))
+}
+
+fn normalize_non_empty_arg(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn is_active_push_fallback_status(status: &str) -> bool {
+    let normalized = status.trim().to_ascii_uppercase();
+    normalized == "CLAIMED" || normalized == "SPAWNED"
+}
+
+fn matches_push_fallback_candidate(
+    work_item: &apm2_daemon::protocol::WorkStatusResponse,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    if !is_active_push_fallback_status(&work_item.status) {
+        return false;
+    }
+
+    if let Some(role_raw) = work_item.role {
+        let role = apm2_daemon::protocol::WorkRole::try_from(role_raw);
+        if role != Ok(apm2_daemon::protocol::WorkRole::Implementer) {
+            return false;
+        }
+    }
+
+    if let Some(expected_lease_id) = lease_filter {
+        let observed_lease_id = work_item
+            .lease_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_lease_id != Some(expected_lease_id) {
+            return false;
+        }
+    }
+
+    if let Some(expected_session_id) = session_filter {
+        let observed_session_id = work_item
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(observed_session_id) = observed_session_id
+            && observed_session_id != expected_session_id
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn select_push_fallback_work_id_from_list(
+    work_items: &[apm2_daemon::protocol::WorkStatusResponse],
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let mut candidates = BTreeSet::new();
+    for work_item in work_items {
+        if !matches_push_fallback_candidate(work_item, lease_filter, session_filter) {
+            continue;
+        }
+        let work_id = work_item.work_id.trim();
+        if work_id.is_empty() {
+            continue;
+        }
+        if validate_push_work_id(work_id).is_err() {
+            continue;
+        }
+        candidates.insert(work_id.to_string());
+    }
+
+    match candidates.len() {
+        0 => Err(
+            "daemon fallback could not identify an active Implementer work item; pass `--work-id` \
+             explicitly or ensure ticket alias reconciliation is populated"
+                .to_string(),
+        ),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| "internal error: fallback candidate set unexpectedly empty".to_string()),
+        _ => {
+            let candidate_list = candidates.into_iter().collect::<Vec<_>>().join(", ");
+            Err(format!(
+                "daemon fallback found multiple active Implementer work items ({candidate_list}); \
+                 pass `--work-id` explicitly"
+            ))
+        },
+    }
+}
+
+fn resolve_push_work_id_from_projection_fallback(
+    operator_socket: &Path,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let list_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(false).await
+    })?;
+
+    select_push_fallback_work_id_from_list(&list_response.work_items, lease_filter, session_filter)
+}
+
 fn resolve_work_id_for_push(
     work_id_arg: Option<&str>,
     ticket_alias_arg: Option<&str>,
+    lease_id_arg: Option<&str>,
+    session_id_arg: Option<&str>,
     branch: &str,
     worktree_dir: &Path,
     operator_socket: &Path,
 ) -> Result<(String, Option<String>), String> {
-    let trimmed_work_id = work_id_arg.map(str::trim).filter(|value| !value.is_empty());
-    let alias = ticket_alias_arg
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    let trimmed_work_id = normalize_non_empty_arg(work_id_arg);
+    let alias = normalize_non_empty_arg(ticket_alias_arg);
+    let requested_lease_id = normalize_non_empty_arg(lease_id_arg);
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(session_id_arg);
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
 
-    match (trimmed_work_id, alias) {
+    match (trimmed_work_id, alias.as_deref()) {
         (Some(work_id), Some(ticket_alias)) => {
-            validate_push_work_id(work_id)?;
-            let ticket_alias_for_rpc = ticket_alias.clone();
-            let resolved = with_operator_client(async move {
-                let mut client = OperatorClient::connect(operator_socket).await?;
-                client.resolve_ticket_alias(&ticket_alias_for_rpc).await
-            })?;
-            if !resolved.found {
+            validate_push_work_id(&work_id)?;
+            if let Some(resolved_work_id) =
+                resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?
+                && resolved_work_id != work_id
+            {
                 return Err(format!(
-                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id"
+                    "`--work-id` mismatch: provided `{work_id}` but ticket alias \
+                     `{ticket_alias}` resolved to `{resolved_work_id}`",
                 ));
             }
-            if resolved.work_id != work_id {
-                return Err(format!(
-                    "`--work-id` mismatch: provided `{work_id}` but ticket alias `{ticket_alias}` \
-                     resolved to `{}`",
-                    resolved.work_id
-                ));
-            }
-            Ok((work_id.to_string(), Some(ticket_alias)))
+            Ok((work_id, Some(ticket_alias.to_string())))
         },
         (Some(work_id), None) => {
-            validate_push_work_id(work_id)?;
-            Ok((work_id.to_string(), None))
+            validate_push_work_id(&work_id)?;
+            Ok((work_id, None))
         },
         (None, Some(ticket_alias)) => {
-            let ticket_alias_for_rpc = ticket_alias.clone();
-            let resolved = with_operator_client(async move {
-                let mut client = OperatorClient::connect(operator_socket).await?;
-                client.resolve_ticket_alias(&ticket_alias_for_rpc).await
-            })?;
-            if !resolved.found {
-                return Err(format!(
-                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id"
-                ));
+            if let Some(work_id) = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)? {
+                return Ok((work_id, Some(ticket_alias.to_string())));
             }
-            validate_push_work_id(&resolved.work_id)?;
-            Ok((resolved.work_id, Some(ticket_alias)))
+            let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                operator_socket,
+                requested_lease_id.as_deref(),
+                requested_session_id.as_deref(),
+            )
+            .map_err(|fallback_err| {
+                format!(
+                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id and \
+                     projection fallback failed: {fallback_err}"
+                )
+            })?;
+            Ok((fallback_work_id, Some(ticket_alias.to_string())))
         },
         (None, None) => {
             let derived_alias = resolve_tck_id(branch, worktree_dir)?;
-            let derived_alias_for_rpc = derived_alias.clone();
-            let resolved = with_operator_client(async move {
-                let mut client = OperatorClient::connect(operator_socket).await?;
-                client.resolve_ticket_alias(&derived_alias_for_rpc).await
-            })?;
-            if !resolved.found {
-                return Err(format!(
-                    "derived ticket alias `{derived_alias}` did not resolve to a canonical work_id"
-                ));
+            if let Some(work_id) = resolve_ticket_alias_to_work_id(&derived_alias, operator_socket)?
+            {
+                return Ok((work_id, Some(derived_alias)));
             }
-            validate_push_work_id(&resolved.work_id)?;
-            Ok((resolved.work_id, Some(derived_alias)))
+            let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                operator_socket,
+                requested_lease_id.as_deref(),
+                requested_session_id.as_deref(),
+            )
+            .map_err(|fallback_err| {
+                format!(
+                    "derived ticket alias `{derived_alias}` did not resolve to a canonical \
+                     work_id and projection fallback failed: {fallback_err}"
+                )
+            })?;
+            Ok((fallback_work_id, Some(derived_alias)))
         },
     }
 }
@@ -1838,6 +1968,51 @@ fn parse_git_diff_manifest(base_ref: &str, head_sha: &str) -> Result<Vec<FileCha
     }
 
     parse_git_name_status_manifest_z(&output.stdout, &range)
+}
+
+fn parse_dirty_worktree_entries(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn ensure_clean_worktree_for_push() -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|err| format!("failed to inspect git working tree status: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to inspect git working tree status: {}",
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries = parse_dirty_worktree_entries(&stdout);
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let preview = entries
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if entries.len() > 10 {
+        format!(" (+{} more)", entries.len() - 10)
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "working tree is dirty; commit or stash changes before `fac push` \
+         (detected {} entries: {preview}{suffix})",
+        entries.len()
+    ))
 }
 
 fn parse_git_name_status_manifest_z(raw: &[u8], range: &str) -> Result<Vec<FileChange>, String> {
@@ -2251,6 +2426,8 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let (work_id, resolved_ticket_alias) = match resolve_work_id_for_push(
         work_id_arg,
         ticket_alias_arg,
+        lease_id_arg,
+        session_id_arg,
         &branch,
         &worktree_dir,
         operator_socket,
@@ -2291,6 +2468,10 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             .as_deref()
             .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
     );
+
+    if let Err(err) = ensure_clean_worktree_for_push() {
+        fail_with_attempt!("fac_push_dirty_worktree", err);
+    }
 
     // Step 1: fail closed on HEAD drift before running queued gates.
     let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
@@ -3221,6 +3402,130 @@ mod tests {
         assert!(err.contains("must start with `W-`"));
     }
 
+    fn sample_daemon_work_item(
+        work_id: &str,
+        status: &str,
+        role: Option<apm2_daemon::protocol::WorkRole>,
+        lease_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> apm2_daemon::protocol::WorkStatusResponse {
+        apm2_daemon::protocol::WorkStatusResponse {
+            work_id: work_id.to_string(),
+            status: status.to_string(),
+            actor_id: Some("actor:test".to_string()),
+            role: role.map(|value| value as i32),
+            session_id: session_id.map(str::to_string),
+            lease_id: lease_id.map(str::to_string),
+            created_at_ns: 0,
+            claimed_at_ns: None,
+            implementer_claim_blocked: false,
+            dependency_diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_prefers_unique_implementer() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-gate-executor",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::GateExecutor),
+                Some("L-gate"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-implementer"),
+                None,
+            ),
+        ];
+
+        let selected = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect("unique implementer candidate should resolve");
+        assert_eq!(selected, "W-implementer");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_fails_closed_on_ambiguity() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-implementer-1",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-1"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer-2",
+                "SPAWNED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-2"),
+                Some("S-2"),
+            ),
+        ];
+
+        let err = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect_err("ambiguous implementer candidates must fail closed");
+        assert!(err.contains("multiple active Implementer work items"));
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_honors_lease_filter() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-implementer-1",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-target"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer-2",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-other"),
+                None,
+            ),
+        ];
+
+        let selected = select_push_fallback_work_id_from_list(&rows, Some("L-target"), None)
+            .expect("lease filter should disambiguate candidate selection");
+        assert_eq!(selected, "W-implementer-1");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_tolerates_missing_session_metadata() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "CLAIMED",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-target"),
+            None,
+        )];
+
+        let selected =
+            select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-backfill"))
+                .expect("missing daemon session metadata should not block fallback selection");
+        assert_eq!(selected, "W-implementer-1");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_rejects_non_active_status() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer",
+            "COMPLETED",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-implementer"),
+            None,
+        )];
+
+        let err = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect_err("non-active statuses must not be selected for fallback");
+        assert!(err.contains("could not identify an active Implementer work item"));
+    }
+
     #[test]
     fn make_push_session_dedupe_key_uses_session_id() {
         let dedupe = make_push_session_dedupe_key("S-1234-5678")
@@ -3277,6 +3582,15 @@ mod tests {
         let err = parse_git_name_status_manifest_z(raw, "base..head")
             .expect_err("unsupported status should fail");
         assert!(err.contains("unsupported status"));
+    }
+
+    #[test]
+    fn parse_dirty_worktree_entries_filters_blank_lines() {
+        let entries = parse_dirty_worktree_entries(" M src/main.rs\n\n?? new-file.txt\n");
+        assert_eq!(
+            entries,
+            vec!["M src/main.rs".to_string(), "?? new-file.txt".to_string()]
+        );
     }
 
     #[test]
