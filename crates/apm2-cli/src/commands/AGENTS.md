@@ -667,10 +667,20 @@ daemon runtime executables:
 
 ### Queue lifecycle dual-write ordering (TCK-00669 / QL-003 migration)
 
-- **Event-first for queue mutations**: Lifecycle dual-write emission is
-  attempted before filesystem mutation on enqueue (`fac.job.enqueued`),
-  claim (`fac.job.claimed`), release (`fac.job.released`), and pre-claim
-  deny transitions (`fac.job.failed`).
+- **Event-first for most queue mutations**: Lifecycle dual-write emission
+  is attempted before filesystem mutation on enqueue (`fac.job.enqueued`),
+  release (`fac.job.released`), and pre-claim deny transitions
+  (`fac.job.failed`).
+- **Move-first exception for claim (`fac.job.claimed`)**: The claim path
+  (`claim_pending_job_with_exclusive_lock`) intentionally uses move-first
+  ordering — the atomic `pending/` -> `claimed/` filesystem transition
+  executes before lifecycle event emission.  This is correct for
+  resilience: the filesystem move must not be blocked by payload
+  deserialization (a malformed pending file would otherwise be permanently
+  stuck in `pending/`, exhausting `QueueBoundsPolicy` capacity over time).
+  After the move, if emission fails, the file remains in `claimed/` where
+  the orchestrator handles it via the existing denial path.  This is the
+  correct behavior per the filesystem-authoritative migration contract.
 - **Best-effort emission during migration**: When dual-write is enabled and
   lifecycle event emission fails, the worker/submitter logs a warning and
   still performs the filesystem mutation. During QL-003 staging, the

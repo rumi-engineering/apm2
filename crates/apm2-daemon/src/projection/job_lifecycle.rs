@@ -624,16 +624,27 @@ impl JobLifecycleRehydrationReconciler {
             }
         }
 
-        // f-798-security-1771812591501920-0: Only delete unknown files when
-        // the reconciler cursor is caught up to the ledger head. During
-        // backlog processing, newly enqueued jobs (whose ledger events are
-        // ahead of the cursor) are NOT yet in the projection. Deleting them
-        // would cause critical data loss — valid job payloads replaced by
-        // unexecutable witness stubs when the cursor catches up.
-        let cursor_caught_up = self
-            .ledger
-            .get_latest_event()
-            .is_none_or(|latest| checkpoint.cursor_timestamp_ns >= latest.timestamp_ns);
+        // f-798-security-1771812591501920-0 / f-798-security-1771814320321724-0:
+        // Only delete unknown files when the reconciler cursor is caught up to
+        // the ledger head.  During backlog processing, newly enqueued jobs
+        // (whose ledger events are ahead of the cursor) are NOT yet in the
+        // projection.  Deleting them would cause critical data loss — valid
+        // job payloads replaced by unexecutable witness stubs when the cursor
+        // catches up.
+        //
+        // The check compares BOTH timestamp AND event_id against the latest
+        // ledger event.  Timestamp alone is insufficient because
+        // `get_events_since` is paginated — multiple events can share the
+        // same timestamp_ns.  When the reconciler processes some-but-not-all
+        // events at timestamp T (due to per-tick page limits), the cursor
+        // timestamp advances to T while `cursor_event_id` still points to an
+        // earlier event at T.  Without the event_id comparison, cleanup would
+        // fire prematurely and delete files for unprocessed events.
+        let cursor_caught_up = self.ledger.get_latest_event().is_none_or(|latest| {
+            checkpoint.cursor_timestamp_ns > latest.timestamp_ns
+                || (checkpoint.cursor_timestamp_ns == latest.timestamp_ns
+                    && checkpoint.cursor_event_id >= latest.event_id)
+        });
 
         if applied_fs_ops < self.config.max_fs_ops_per_tick && cursor_caught_up {
             self.cleanup_unknown_files(&checkpoint.projection, &mut applied_fs_ops)?;
@@ -1843,6 +1854,87 @@ mod tests {
         assert!(
             queue_root.join(PENDING_DIR).join("second.json").exists(),
             "second job should still exist in pending after being projected"
+        );
+    }
+
+    #[test]
+    fn cleanup_skipped_when_same_timestamp_events_remain_unprocessed() {
+        // f-798-security-1771814320321724-0: Verify that the cursor caught-up
+        // check requires BOTH timestamp AND event_id to match the latest
+        // ledger event.  When multiple events share the same timestamp_ns and
+        // the per-tick page limit causes only the first to be processed, the
+        // cursor_event_id will be lexicographically earlier than the latest
+        // event's ID at that timestamp.  Cleanup must NOT fire in this state.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let same_ts = now_timestamp_ns();
+
+        // Emit two events at the SAME timestamp.  The StubLedgerEventEmitter
+        // assigns event_ids in insertion order, so the second event's ID will
+        // sort lexicographically after the first.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:alpha",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("alpha"),
+                    enqueue_epoch_ns: same_ts,
+                }),
+            ),
+            same_ts,
+        );
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:beta",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("beta"),
+                    enqueue_epoch_ns: same_ts,
+                }),
+            ),
+            same_ts,
+        );
+
+        // Pre-create a pending file for "beta" (e.g. the submitter wrote the
+        // file before the reconciler processed the event).
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::write(
+            queue_root.join(PENDING_DIR).join("beta.json"),
+            br#"{"pre-existing":"beta-payload"}"#,
+        )
+        .expect("seed pre-existing beta");
+
+        // Process only ONE event per tick (page boundary simulation).
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 1,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        // First tick: processes "alpha" only. Cursor timestamp == same_ts
+        // but cursor_event_id < latest event_id at same_ts.  Cleanup must
+        // NOT fire.
+        let first_tick = reconciler.tick().expect("first tick");
+        assert_eq!(first_tick.processed_events, 1);
+        assert!(
+            queue_root.join(PENDING_DIR).join("beta.json").exists(),
+            "pre-existing file for not-yet-projected same-timestamp job must \
+             NOT be deleted (cursor event_id behind latest at same timestamp)"
+        );
+
+        // Second tick: processes "beta". Now cursor is fully caught up.
+        let second_tick = reconciler.tick().expect("second tick");
+        assert_eq!(second_tick.processed_events, 1);
+        assert!(
+            queue_root.join(PENDING_DIR).join("beta.json").exists(),
+            "beta job should still exist in pending after being projected"
         );
     }
 }

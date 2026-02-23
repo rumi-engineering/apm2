@@ -164,9 +164,22 @@ pub fn derive_content_addressable_job_id(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacJobIdentityV1 {
-    /// Content-addressable lifecycle job ID.
+    /// Content-addressable lifecycle job ID (format: `fj1-<blake3-256 hex>`).
+    ///
+    /// Derived deterministically from [`FacJobIdentityPreimageV1`] via
+    /// [`derive_content_addressable_job_id`].  Used as the canonical key in
+    /// the ledger-backed projection (`JobLifecycleProjectionV1::jobs`).
+    /// Semantically distinct from `queue_job_id` — this ID is
+    /// content-addressed and stable across replay (CTR-2602).
     pub job_id: String,
     /// Filesystem queue job ID (migration compatibility key).
+    ///
+    /// This is the original filename-safe identifier used by the
+    /// filesystem-based queue (`pending/<queue_job_id>.json`).  During the
+    /// QL-003 dual-write migration the reconciler maps `job_id` to
+    /// `queue_job_id` for witness-cache file placement.  Semantically
+    /// distinct from `job_id` — this ID is format-bound to the filesystem
+    /// queue and is NOT content-addressed (CTR-2602).
     pub queue_job_id: String,
     /// Stable work identifier.
     pub work_id: String,
