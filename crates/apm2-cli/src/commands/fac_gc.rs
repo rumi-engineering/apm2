@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use apm2_core::fac::{
     DEFAULT_MIN_FREE_BYTES, FacPolicyV1, GcActionKind, GcPlan, GcReceiptV1, LaneManager,
@@ -21,6 +21,109 @@ pub struct GcArgs {
     /// Minimum free bytes to enforce.
     #[arg(long, default_value_t = 1_073_741_824)]
     pub min_free_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DoctorGcMaintenanceSummary {
+    pub plan_targets: usize,
+    pub actions_applied: usize,
+    pub errors: usize,
+    pub bytes_freed: u64,
+    pub receipt_path: PathBuf,
+    pub migration_files_moved: usize,
+    pub migration_files_failed: usize,
+    pub migration_skipped: bool,
+    pub migration_warning: Option<String>,
+}
+
+/// Run full FAC GC maintenance as an internal doctor remediation action.
+///
+/// This includes:
+/// - legacy evidence migration (non-fatal on error)
+/// - policy-derived GC planning
+/// - GC execution and durable receipt persistence
+pub fn run_gc_for_doctor_fix() -> Result<DoctorGcMaintenanceSummary, String> {
+    let lane_manager = LaneManager::from_default_home()
+        .map_err(|error| format!("cannot initialize lane manager: {error}"))?;
+    let fac_root = lane_manager.fac_root().to_path_buf();
+
+    let policy = load_or_create_policy(&fac_root)
+        .map_err(|error| format!("cannot load fac policy: {error}"))?;
+
+    let (migration_files_moved, migration_files_failed, migration_skipped, migration_warning) =
+        match run_migration_to_completion(&fac_root) {
+            Ok(receipt) => (
+                receipt.files_moved,
+                receipt.files_failed,
+                receipt.skipped,
+                None,
+            ),
+            Err(error) => (0_usize, 0_usize, true, Some(error.to_string())),
+        };
+
+    let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
+    let denied_ttl_secs = u64::from(policy.denied_ttl_days).saturating_mul(24 * 3600);
+    let log_retention = LogRetentionConfig {
+        per_lane_log_max_bytes: policy.per_lane_log_max_bytes,
+        per_job_log_ttl_secs: u64::from(policy.per_job_log_ttl_days).saturating_mul(24 * 3600),
+        keep_last_n_jobs_per_lane: policy.keep_last_n_jobs_per_lane,
+    };
+
+    let plan = plan_gc_with_log_retention(
+        &fac_root,
+        &lane_manager,
+        quarantine_ttl_secs,
+        denied_ttl_secs,
+        &log_retention,
+    )
+    .map_err(|error| format!("planning failed: {error:?}"))?;
+    let plan_targets = plan.targets.len();
+
+    let before_free = check_disk_space(&fac_root)
+        .map_err(|error| format!("cannot sample pre-gc free space: {error}"))?;
+    let mut receipt = execute_gc(&plan);
+    let after_free = check_disk_space(&fac_root)
+        .map_err(|error| format!("cannot sample post-gc free space: {error}"))?;
+
+    if receipt.min_free_threshold == 0 {
+        receipt.min_free_threshold = DEFAULT_MIN_FREE_BYTES;
+    }
+
+    let actions_applied = receipt.actions.len();
+    let errors = receipt.errors.len();
+    let bytes_freed = receipt
+        .actions
+        .iter()
+        .fold(0_u64, |acc, action| acc.saturating_add(action.bytes_freed));
+
+    let receipts_dir = fac_root.join("receipts");
+    let receipt_path = persist_gc_receipt(
+        &receipts_dir,
+        GcReceiptV1 {
+            schema: receipt.schema,
+            receipt_id: receipt.receipt_id,
+            timestamp_secs: receipt.timestamp_secs,
+            before_free_bytes: before_free,
+            after_free_bytes: after_free,
+            min_free_threshold: receipt.min_free_threshold,
+            actions: receipt.actions,
+            errors: receipt.errors,
+            content_hash: receipt.content_hash,
+        },
+    )
+    .map_err(|error| format!("cannot persist GC receipt: {error}"))?;
+
+    Ok(DoctorGcMaintenanceSummary {
+        plan_targets,
+        actions_applied,
+        errors,
+        bytes_freed,
+        receipt_path,
+        migration_files_moved,
+        migration_files_failed,
+        migration_skipped,
+        migration_warning,
+    })
 }
 
 /// Run garbage collection for FAC workspace artifacts.

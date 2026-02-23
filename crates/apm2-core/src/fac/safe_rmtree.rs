@@ -231,6 +231,20 @@ impl fmt::Display for SafeRmtreeOutcome {
     }
 }
 
+/// Summary for user-owned directory mode normalization performed before
+/// `safe_rmtree_v1*` deletion.
+///
+/// This helper is used by lane cleanup paths to recover from directories
+/// created with restrictive mode bits (for example, `0333` sandbox IPC
+/// directories) while preserving fail-closed ownership boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirModeNormalizationSummary {
+    /// Number of directories inspected.
+    pub directories_scanned: u64,
+    /// Number of directories whose mode bits were updated.
+    pub directories_repaired: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Refused-delete receipt
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,6 +403,140 @@ pub fn safe_rmtree_v1_with_entry_limit(
     #[cfg(not(unix))]
     {
         safe_rmtree_v1_non_unix_with_limit(root, allowed_parent, effective_limit)
+    }
+}
+
+/// Ensure user-owned directories under `root` are traversable for subsequent
+/// safe deletion by adding owner `rwx` bits where missing.
+///
+/// This is a bounded, fail-closed preflight used by lane cleanup and doctor
+/// recovery paths before invoking `safe_rmtree_v1*`. It never follows symlinks.
+///
+/// On Unix:
+/// - Only directories owned by the current effective UID are modified.
+/// - Mode repair is `mode |= 0o700`, preserving all existing non-owner bits.
+/// - Directory entry traversal is bounded by `max_entries_per_dir`.
+///
+/// On non-Unix platforms this function is a no-op and returns a zero summary.
+///
+/// # Errors
+///
+/// Returns [`SafeRmtreeError`] when:
+/// - `root` is not absolute or contains dot segments.
+/// - metadata/stat/chmod/read-dir operations fail.
+/// - per-directory scan exceeds `max_entries_per_dir` (clamped to
+///   [`MAX_LOG_DIR_ENTRIES`]).
+pub fn normalize_user_owned_dir_modes_for_safe_delete(
+    root: &Path,
+    max_entries_per_dir: usize,
+) -> Result<DirModeNormalizationSummary, SafeRmtreeError> {
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
+
+    if !root.is_absolute() {
+        return Err(SafeRmtreeError::NotAbsolute {
+            path: root.to_path_buf(),
+        });
+    }
+    reject_dot_segments(root)?;
+
+    let root_meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(DirModeNormalizationSummary::default());
+        },
+        Err(err) => {
+            return Err(SafeRmtreeError::io(
+                format!("stat root {}", root.display()),
+                err,
+            ));
+        },
+    };
+    if root_meta.file_type().is_symlink() {
+        return Ok(DirModeNormalizationSummary::default());
+    }
+    if !root_meta.is_dir() {
+        return Ok(DirModeNormalizationSummary::default());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = effective_limit;
+        return Ok(DirModeNormalizationSummary::default());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let mut summary = DirModeNormalizationSummary::default();
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+        while let Some(dir_path) = stack.pop() {
+            let metadata = match fs::symlink_metadata(&dir_path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(SafeRmtreeError::io(
+                        format!("stat directory {}", dir_path.display()),
+                        err,
+                    ));
+                },
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+
+            summary.directories_scanned = summary.directories_scanned.saturating_add(1);
+
+            if metadata.uid() == current_uid {
+                let current_mode = metadata.mode() & 0o7777;
+                let repaired_mode = current_mode | 0o700;
+                if repaired_mode != current_mode {
+                    fs::set_permissions(&dir_path, fs::Permissions::from_mode(repaired_mode))
+                        .map_err(|err| {
+                            SafeRmtreeError::io(
+                                format!("chmod user-rwx {}", dir_path.display()),
+                                err,
+                            )
+                        })?;
+                    summary.directories_repaired = summary.directories_repaired.saturating_add(1);
+                }
+            }
+
+            let entries = fs::read_dir(&dir_path).map_err(|err| {
+                SafeRmtreeError::io(format!("read_dir {}", dir_path.display()), err)
+            })?;
+            let mut entry_count: usize = 0;
+            for entry in entries {
+                entry_count = entry_count.saturating_add(1);
+                if entry_count > effective_limit {
+                    return Err(SafeRmtreeError::TooManyEntries {
+                        path: dir_path,
+                        max: effective_limit,
+                    });
+                }
+                let entry = entry.map_err(|err| {
+                    SafeRmtreeError::io(format!("read_dir entry {}", dir_path.display()), err)
+                })?;
+                let child_path = entry.path();
+                let child_meta = match fs::symlink_metadata(&child_path) {
+                    Ok(meta) => meta,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(SafeRmtreeError::io(
+                            format!("stat entry {}", child_path.display()),
+                            err,
+                        ));
+                    },
+                };
+                if child_meta.is_dir() && !child_meta.file_type().is_symlink() {
+                    stack.push(child_path);
+                }
+            }
+        }
+
+        Ok(summary)
     }
 }
 
@@ -1731,6 +1879,57 @@ mod tests {
             SafeRmtreeError::PermissionDenied { .. } => {},
             other => panic!("expected PermissionDenied, got {other}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_repairs_write_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        let nested = root.join("queue").join("broker_requests");
+        fs::create_dir_all(&nested).expect("create nested tree");
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o333)).expect("chmod root to 0333");
+        fs::set_permissions(root.join("queue"), fs::Permissions::from_mode(0o333))
+            .expect("chmod queue to 0333");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let summary =
+            normalize_user_owned_dir_modes_for_safe_delete(&root, 64).expect("normalize modes");
+        assert!(
+            summary.directories_repaired >= 3,
+            "expected recursive permission repair to touch all 0333 dirs, got {summary:?}"
+        );
+
+        for path in [&root, &root.join("queue"), &nested] {
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o700;
+            assert_eq!(
+                mode,
+                0o700,
+                "owner rwx bits must be present after normalization for {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_enforces_entry_limit() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        fs::create_dir_all(&root).expect("create tmp root");
+        for idx in 0..4 {
+            fs::write(root.join(format!("entry-{idx}.txt")), b"x").expect("write entry");
+        }
+
+        let result = normalize_user_owned_dir_modes_for_safe_delete(&root, 2);
+        assert!(
+            matches!(result, Err(SafeRmtreeError::TooManyEntries { .. })),
+            "expected TooManyEntries when scan limit is exceeded, got {result:?}"
+        );
     }
 
     // ── Depth Limit ──────────────────────────────────────────────────

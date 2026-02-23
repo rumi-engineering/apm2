@@ -1258,6 +1258,7 @@ fn build_pipeline_test_command(
     // to lane-00).
     ensure_lane_env_dirs(lane_dir)?;
     apply_lane_env_overrides(&mut policy_env, lane_dir);
+    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -1421,6 +1422,7 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
     ensure_lane_env_dirs(lane_dir)?;
     apply_lane_env_overrides(&mut policy_env, lane_dir);
+    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
 
     Ok(policy_env.into_iter().collect())
 }

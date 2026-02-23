@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
@@ -16,10 +17,10 @@ use apm2_core::fac::{
     LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
     LogRetentionConfig, MAX_LOG_DIR_ENTRIES, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
-    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeError, SafeRmtreeOutcome,
-    TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    check_fac_lane_liveness, check_fac_unit_liveness, execute_gc, plan_gc_with_log_retention,
-    safe_rmtree_v1, safe_rmtree_v1_with_entry_limit, verify_pid_identity,
+    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, check_fac_lane_liveness, check_fac_unit_liveness,
+    execute_gc, normalize_user_owned_dir_modes_for_safe_delete, plan_gc_with_log_retention,
+    safe_rmtree_v1_with_entry_limit, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
@@ -245,6 +246,10 @@ pub enum FacSubcommand {
     /// Inspect FAC broker state and health.
     Broker(BrokerArgs),
     /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
+    ///
+    /// `apm2 fac doctor --fix` now runs this maintenance pass automatically.
+    /// This command remains available as an explicit/manual operator override.
+    #[command(hide = true)]
     Gc(fac_gc::GcArgs),
     /// Manage quarantined and denied jobs.
     Quarantine(fac_quarantine::QuarantineArgs),
@@ -1677,6 +1682,7 @@ enum SystemDoctorFixActionStatus {
 enum SystemDoctorFixActionKind {
     LaneReconcile,
     QueueReconcileApply,
+    GcMaintenance,
     LaneLogGc,
     LaneStatusScan,
     LaneTmpCorruptionDetection,
@@ -1731,11 +1737,26 @@ enum DoctorLaneResetError {
 struct DoctorLaneResetSummary {
     files_deleted: u64,
     dirs_deleted: u64,
+    deferred_cleanup_roots: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TmpScrubSummary {
     entries_deleted: u64,
+    deferred_cleanup_roots: u64,
+}
+
+#[derive(Debug)]
+enum DoctorSubdirDeleteOutcome {
+    Deleted {
+        files_deleted: u64,
+        dirs_deleted: u64,
+    },
+    AlreadyAbsent,
+    DeferredCleanup {
+        deferred_path: PathBuf,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2070,8 +2091,21 @@ fn detect_lane_tmp_corruption_with_entry_limit(
     let mut scanned_entries: usize = 0;
 
     while let Some(scan_dir) = dirs_to_scan.pop() {
-        let entries = std::fs::read_dir(&scan_dir)
-            .map_err(|err| format!("failed to read tmp dir {}: {err}", scan_dir.display()))?;
+        let entries = match std::fs::read_dir(&scan_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(Some(format!(
+                    "tmp scan permission denied at {} (will require scrub/reset)",
+                    scan_dir.display()
+                )));
+            },
+            Err(err) => {
+                return Err(format!(
+                    "failed to read tmp dir {}: {err}",
+                    scan_dir.display()
+                ));
+            },
+        };
         for entry in entries {
             scanned_entries = scanned_entries.saturating_add(1);
             if scanned_entries > max_entries {
@@ -2085,6 +2119,12 @@ fn detect_lane_tmp_corruption_with_entry_limit(
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(Some(format!(
+                        "tmp metadata permission denied at {} (will require scrub/reset)",
+                        path.display()
+                    )));
+                },
                 Err(err) => {
                     return Err(format!(
                         "failed to stat tmp entry {}: {err}",
@@ -2155,29 +2195,48 @@ fn doctor_reset_lane_once(
 
     let mut total_files: u64 = 0;
     let mut total_dirs: u64 = 0;
+    let mut deferred_cleanup_roots: u64 = 0;
     let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
     for subdir in &subdirs {
         let subdir_path = lane_dir.join(subdir);
-        match safe_rmtree_v1(&subdir_path, lanes_root) {
-            Ok(SafeRmtreeOutcome::Deleted {
+        match delete_path_for_recovery(
+            &subdir_path,
+            lanes_root,
+            &lane_dir,
+            subdir,
+            MAX_LOG_DIR_ENTRIES,
+        ) {
+            Ok(DoctorSubdirDeleteOutcome::Deleted {
                 files_deleted,
                 dirs_deleted,
             }) => {
                 total_files = total_files.saturating_add(files_deleted);
                 total_dirs = total_dirs.saturating_add(dirs_deleted);
             },
-            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
+            Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent) => {},
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path,
+                reason,
+            }) => {
+                deferred_cleanup_roots = deferred_cleanup_roots.saturating_add(1);
+                refused_receipts.push(RefusedDeleteReceipt {
+                    root: deferred_path,
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: format!("deferred cleanup: {reason}"),
+                    mark_corrupt: false,
+                });
+            },
             Err(err) => {
                 refused_receipts.push(RefusedDeleteReceipt {
                     root: subdir_path,
                     allowed_parent: lanes_root.to_path_buf(),
-                    reason: err.to_string(),
+                    reason: err,
                     mark_corrupt: true,
                 });
             },
         }
     }
-    if !refused_receipts.is_empty() {
+    if refused_receipts.iter().any(|receipt| receipt.mark_corrupt) {
         return Err(DoctorLaneResetError::RefusedDelete {
             receipts: refused_receipts,
         });
@@ -2197,13 +2256,137 @@ fn doctor_reset_lane_once(
     Ok(DoctorLaneResetSummary {
         files_deleted: total_files,
         dirs_deleted: total_dirs,
+        deferred_cleanup_roots,
     })
 }
 
+#[cfg(test)]
 fn refused_delete_mentions_tmp(receipts: &[RefusedDeleteReceipt]) -> bool {
-    receipts
-        .iter()
-        .any(|receipt| receipt.root.file_name().and_then(|name| name.to_str()) == Some("tmp"))
+    receipts.iter().any(|receipt| {
+        receipt
+            .root
+            .components()
+            .any(|component| component.as_os_str() == "tmp")
+    })
+}
+
+fn next_doctor_orphan_path(lane_dir: &Path, label: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    lane_dir.join(format!(".doctor-orphan-{label}-{pid}-{stamp}"))
+}
+
+fn rotate_path_to_doctor_orphan(
+    path: &Path,
+    lane_dir: &Path,
+    label: &str,
+) -> Result<Option<PathBuf>, String> {
+    for attempt in 0..16 {
+        let mut target = next_doctor_orphan_path(lane_dir, label);
+        if attempt > 0 {
+            target = lane_dir.join(format!(
+                "{}-{attempt}",
+                target
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("doctor-orphan")
+            ));
+        }
+        match std::fs::rename(path, &target) {
+            Ok(()) => return Ok(Some(target)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                if attempt == 15 {
+                    return Err(format!(
+                        "failed to rotate {} for deferred cleanup: {err}",
+                        path.display()
+                    ));
+                }
+            },
+        }
+    }
+    Err(format!(
+        "failed to rotate {} for deferred cleanup (retry budget exhausted)",
+        path.display()
+    ))
+}
+
+fn delete_path_for_recovery(
+    target_path: &Path,
+    allowed_parent: &Path,
+    lane_dir: &Path,
+    orphan_label: &str,
+    entry_limit: usize,
+) -> Result<DoctorSubdirDeleteOutcome, String> {
+    let metadata = match std::fs::symlink_metadata(target_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent);
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to stat {} before cleanup: {err}",
+                target_path.display()
+            ));
+        },
+    };
+
+    if metadata.is_dir() {
+        let deletion_attempt =
+            normalize_user_owned_dir_modes_for_safe_delete(target_path, entry_limit)
+                .map_err(|err| format!("permission repair failed: {err}"))
+                .and_then(|_| {
+                    safe_rmtree_v1_with_entry_limit(target_path, allowed_parent, entry_limit)
+                        .map_err(|err| err.to_string())
+                });
+
+        return match deletion_attempt {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }),
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent),
+            Err(reason) => {
+                let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                    .ok_or_else(|| {
+                    format!(
+                        "cleanup failed and path vanished before defer: {} ({reason})",
+                        target_path.display()
+                    )
+                })?;
+                Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                    deferred_path: deferred,
+                    reason,
+                })
+            },
+        };
+    }
+
+    match std::fs::remove_file(target_path) {
+        Ok(()) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+            files_deleted: 1,
+            dirs_deleted: 0,
+        }),
+        Err(remove_err) => {
+            let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                .ok_or_else(|| {
+                    format!(
+                        "failed to remove non-directory path {}: {remove_err}",
+                        target_path.display()
+                    )
+                })?;
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path: deferred,
+                reason: format!("failed to remove non-directory path: {remove_err}"),
+            })
+        },
+    }
 }
 
 fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSummary, String> {
@@ -2244,52 +2427,29 @@ fn scrub_lane_tmp_dir_with_entry_limit(
     let lane_dir = manager.lane_dir(lane_id);
     let tmp_dir = lane_dir.join("tmp");
     let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
-
-    let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TmpScrubSummary { entries_deleted: 0 });
-        },
-        Err(err) => {
-            return Err(format!(
-                "failed to stat tmp dir {}: {err}",
-                tmp_dir.display()
-            ));
-        },
-    };
-
-    if !tmp_meta.is_dir() {
-        std::fs::remove_file(&tmp_dir)
-            .map_err(|err| format!("failed to remove non-directory tmp path: {err}"))?;
-        ensure_tmp_dir_exists(&tmp_dir)?;
-        return Ok(TmpScrubSummary { entries_deleted: 1 });
-    }
-
-    // Delete the tmp tree in one bounded traversal, then recreate it.
-    // This prevents per-entry nested traversals from multiplying bounds.
-    let scrubbed =
-        safe_rmtree_v1_with_entry_limit(&tmp_dir, &lane_dir, effective_limit).map_err(|err| {
-            match err {
-                SafeRmtreeError::TooManyEntries { .. } => format!(
-                    "tmp scrub refused directory {} due to entry bound (> {})",
-                    tmp_dir.display(),
-                    effective_limit
-                ),
-                _ => format!("tmp scrub failed to delete {}: {err}", tmp_dir.display()),
-            }
-        })?;
-
+    let cleanup_outcome =
+        delete_path_for_recovery(&tmp_dir, &lane_dir, &lane_dir, "tmp-scrub", effective_limit)?;
     ensure_tmp_dir_exists(&tmp_dir)?;
 
-    let entries_deleted = match scrubbed {
-        SafeRmtreeOutcome::Deleted {
+    let (entries_deleted, deferred_cleanup_roots) = match cleanup_outcome {
+        DoctorSubdirDeleteOutcome::Deleted {
             files_deleted,
             dirs_deleted,
-        } => files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
-        SafeRmtreeOutcome::AlreadyAbsent => 0,
+        } => (
+            files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
+            0_u64,
+        ),
+        DoctorSubdirDeleteOutcome::AlreadyAbsent => (0_u64, 0_u64),
+        DoctorSubdirDeleteOutcome::DeferredCleanup {
+            deferred_path: _,
+            reason: _,
+        } => (0_u64, 1_u64),
     };
 
-    Ok(TmpScrubSummary { entries_deleted })
+    Ok(TmpScrubSummary {
+        entries_deleted,
+        deferred_cleanup_roots,
+    })
 }
 
 fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogGcSummary, String> {
@@ -2534,6 +2694,52 @@ fn run_system_doctor_fix_with_hooks(
         },
     }
 
+    match fac_gc::run_gc_for_doctor_fix() {
+        Ok(summary) => {
+            let detail = format!(
+                "plan_targets={} actions={} errors={} bytes_freed={} migration_moved={} migration_failed={} migration_skipped={} receipt={}",
+                summary.plan_targets,
+                summary.actions_applied,
+                summary.errors,
+                summary.bytes_freed,
+                summary.migration_files_moved,
+                summary.migration_files_failed,
+                summary.migration_skipped,
+                summary.receipt_path.display()
+            );
+            let detail = match summary.migration_warning.as_ref() {
+                Some(warning) => format!("{detail}; migration_warning={warning}"),
+                None => detail,
+            };
+            if summary.errors == 0 {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    detail,
+                );
+            } else {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("partial_gc_with_errors: {detail}"),
+                );
+            }
+        },
+        Err(err) => {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::GcMaintenance,
+                SystemDoctorFixActionStatus::Skipped,
+                None,
+                format!("autonomous GC maintenance unavailable: {err}"),
+            );
+        },
+    }
+
     match gc_stale_lane_logs(&fac_root, &manager) {
         Ok(summary) if summary.targets == 0 => {
             push_system_doctor_fix_action(
@@ -2666,8 +2872,8 @@ fn run_system_doctor_fix_with_hooks(
                         SystemDoctorFixActionStatus::Applied,
                         Some(&lane_id),
                         format!(
-                            "tmp scrubbed (entries_deleted={})",
-                            scrub_summary.entries_deleted
+                            "tmp scrubbed (entries_deleted={}, deferred_cleanup_roots={})",
+                            scrub_summary.entries_deleted, scrub_summary.deferred_cleanup_roots
                         ),
                     );
                 },
@@ -2695,8 +2901,10 @@ fn run_system_doctor_fix_with_hooks(
                     SystemDoctorFixActionStatus::Applied,
                     Some(&lane_id),
                     format!(
-                        "reset complete (files_deleted={}, dirs_deleted={})",
-                        reset_summary.files_deleted, reset_summary.dirs_deleted
+                        "reset complete (files_deleted={}, dirs_deleted={}, deferred_cleanup_roots={})",
+                        reset_summary.files_deleted,
+                        reset_summary.dirs_deleted,
+                        reset_summary.deferred_cleanup_roots
                     ),
                 );
             },
@@ -2711,76 +2919,6 @@ fn run_system_doctor_fix_with_hooks(
                         pid.unwrap_or(0)
                     ),
                 );
-            },
-            Err(DoctorLaneResetError::RefusedDelete { receipts })
-                if refused_delete_mentions_tmp(&receipts) =>
-            {
-                if let Err(detail) = enforce_lane_reset_liveness_for_context(
-                    &lane_id,
-                    job_id.as_deref(),
-                    reason_is_orphaned,
-                    check_fac_unit_liveness,
-                    check_fac_lane_liveness,
-                ) {
-                    push_system_doctor_fix_action(
-                        &mut actions,
-                        reset_action,
-                        SystemDoctorFixActionStatus::Blocked,
-                        Some(&lane_id),
-                        format!("reset blocked before retry scrub: {detail}"),
-                    );
-                    continue;
-                }
-                match scrub_lane_tmp_dir(&manager, &lane_id) {
-                    Ok(scrub_summary) => {
-                        push_system_doctor_fix_action(
-                            &mut actions,
-                            SystemDoctorFixActionKind::LaneTmpScrub,
-                            SystemDoctorFixActionStatus::Applied,
-                            Some(&lane_id),
-                            format!(
-                                "tmp scrubbed (entries_deleted={})",
-                                scrub_summary.entries_deleted
-                            ),
-                        );
-                        match doctor_reset_lane_once(&manager, &lane_id) {
-                            Ok(reset_summary) => {
-                                lane_resets_applied = true;
-                                should_restart_worker = true;
-                                push_system_doctor_fix_action(
-                                    &mut actions,
-                                    reset_action,
-                                    SystemDoctorFixActionStatus::Applied,
-                                    Some(&lane_id),
-                                    format!(
-                                        "reset complete after tmp scrub (files_deleted={}, dirs_deleted={})",
-                                        reset_summary.files_deleted, reset_summary.dirs_deleted
-                                    ),
-                                );
-                            },
-                            Err(err) => {
-                                action_failed = true;
-                                push_system_doctor_fix_action(
-                                    &mut actions,
-                                    reset_action,
-                                    SystemDoctorFixActionStatus::Failed,
-                                    Some(&lane_id),
-                                    format!("reset still failing after tmp scrub: {err:?}"),
-                                );
-                            },
-                        }
-                    },
-                    Err(err) => {
-                        action_failed = true;
-                        push_system_doctor_fix_action(
-                            &mut actions,
-                            SystemDoctorFixActionKind::LaneTmpScrub,
-                            SystemDoctorFixActionStatus::Failed,
-                            Some(&lane_id),
-                            err,
-                        );
-                    },
-                }
             },
             Err(DoctorLaneResetError::RefusedDelete { receipts }) => {
                 action_failed = true;
@@ -7563,6 +7701,47 @@ mod tests {
         assert!(detail.contains("transient.tmp"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_permission_denied_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager
+            .lane_dir(lane_id)
+            .join("tmp")
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("permission-denied tmp tree should be detected");
+        assert!(
+            detail.contains("permission denied"),
+            "unexpected detail: {detail}"
+        );
+    }
+
     #[test]
     fn test_detect_lane_tmp_corruption_with_entry_limit_fails_closed() {
         let home = tempfile::tempdir().expect("temp dir");
@@ -7645,7 +7824,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_lane_tmp_dir_with_entry_limit_fails_closed() {
+    fn test_scrub_lane_tmp_dir_with_entry_limit_defers_cleanup_when_entry_limit_exceeded() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -7662,12 +7841,62 @@ mod tests {
                 .expect("write nested tmp file");
         }
 
-        let err = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
-            .expect_err("tmp scrub should fail when entry limit is exceeded");
-        assert!(
-            err.contains("entry bound"),
-            "expected entry bound failure, got: {err}"
+        let scrub = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
+            .expect("tmp scrub should succeed via deferred cleanup fallback");
+        assert_eq!(
+            scrub.deferred_cleanup_roots, 1,
+            "entry-limit overflow should defer old tmp tree instead of failing"
         );
+        assert!(
+            manager.lane_dir(lane_id).join("tmp").is_dir(),
+            "tmp directory must be recreated after deferred cleanup fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scrub_lane_tmp_dir_repairs_write_only_broker_requests_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request-1.json"), b"{\"op\":\"a\"}")
+            .expect("write broker request 1");
+        std::fs::write(nested_dir.join("request-2.json"), b"{\"op\":\"b\"}")
+            .expect("write broker request 2");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id)
+            .expect("tmp scrub should recover from write-only broker_requests tree");
+        assert!(
+            scrub.entries_deleted >= 2,
+            "expected scrub to delete broker request files, got {scrub:?}"
+        );
+
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
     }
 
     #[test]
@@ -7918,6 +8147,94 @@ mod tests {
                 .join("doctor-fix-idempotent-job.json")
                 .exists(),
             "claimed job should not remain in claimed after idempotent repair"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_recovers_from_write_only_tmp_residue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let lane_id = "lane-00";
+        manager
+            .mark_corrupt(
+                lane_id,
+                "tmp cleanup permission denied during worker crash",
+                None,
+            )
+            .expect("mark lane corrupt");
+
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should auto-recover write-only tmp residue"
+        );
+
+        let status = manager
+            .lane_status(lane_id)
+            .expect("load lane status after doctor --fix");
+        assert_ne!(
+            status.state,
+            LaneState::Corrupt,
+            "lane should not remain CORRUPT after doctor fix"
+        );
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none(),
+            "doctor fix should clear the corrupt marker"
+        );
+        assert!(tmp_dir.is_dir(), "doctor fix should restore tmp directory");
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after doctor fix")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after doctor fix");
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "lane reset recovery should restart worker exactly once"
         );
     }
 

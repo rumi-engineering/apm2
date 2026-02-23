@@ -13,13 +13,14 @@
 //! the read buffer. This prevents unbounded reads from oversized or malicious
 //! policy files.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
@@ -135,6 +136,65 @@ pub fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Apply a stable `RUSTUP_HOME` when the policy environment does not provide
+/// one explicitly.
+///
+/// FAC review gates run with lane-scoped `HOME`. If `RUSTUP_HOME` is unset,
+/// rustup falls back to `$HOME/.rustup`, which is lane-local and may be wiped
+/// during lane recovery. This helper pins `RUSTUP_HOME` to an existing shared
+/// rustup home (ambient `RUSTUP_HOME` first, then ambient `HOME/.rustup`) when
+/// that directory already contains `toolchains/`.
+pub fn apply_stable_rustup_home_if_available(
+    policy_env: &mut BTreeMap<String, String>,
+    ambient: &[(String, String)],
+) {
+    if policy_env.contains_key("RUSTUP_HOME") {
+        return;
+    }
+    if let Some(path) = discover_stable_rustup_home(ambient) {
+        policy_env.insert(
+            "RUSTUP_HOME".to_string(),
+            path.to_string_lossy().to_string(),
+        );
+    }
+}
+
+fn discover_stable_rustup_home(ambient: &[(String, String)]) -> Option<PathBuf> {
+    let explicit_rustup_home = ambient_env_value(ambient, "RUSTUP_HOME")
+        .map(PathBuf::from)
+        .and_then(validate_stable_rustup_home);
+    if explicit_rustup_home.is_some() {
+        return explicit_rustup_home;
+    }
+
+    ambient_env_value(ambient, "HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".rustup"))
+        .and_then(validate_stable_rustup_home)
+}
+
+fn ambient_env_value<'a>(ambient: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    ambient
+        .iter()
+        .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value.as_str()))
+}
+
+fn validate_stable_rustup_home(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let canonical = path.canonicalize().unwrap_or(path);
+    if !canonical.is_dir() {
+        return None;
+    }
+    if !canonical.join("toolchains").is_dir() {
+        return None;
+    }
+
+    Some(canonical)
 }
 
 /// Verify that an existing managed `CARGO_HOME` directory has restrictive
@@ -300,6 +360,87 @@ mod tests {
         assert!(
             err.contains("symlink"),
             "should report symlink rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_stable_rustup_home_uses_ambient_rustup_home_when_toolchains_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup_home = dir.path().join("rustup");
+        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+
+        let ambient = vec![(
+            "RUSTUP_HOME".to_string(),
+            rustup_home.to_string_lossy().to_string(),
+        )];
+        let mut env = BTreeMap::new();
+
+        apply_stable_rustup_home_if_available(&mut env, &ambient);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some(rustup_home.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn apply_stable_rustup_home_falls_back_to_home_dot_rustup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let rustup_home = home.join(".rustup");
+        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+
+        let ambient = vec![("HOME".to_string(), home.to_string_lossy().to_string())];
+        let mut env = BTreeMap::new();
+
+        apply_stable_rustup_home_if_available(&mut env, &ambient);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some(rustup_home.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn apply_stable_rustup_home_does_not_override_existing_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup_home = dir.path().join("rustup");
+        fs::create_dir_all(rustup_home.join("toolchains/stable")).expect("create toolchains");
+
+        let ambient = vec![(
+            "RUSTUP_HOME".to_string(),
+            rustup_home.to_string_lossy().to_string(),
+        )];
+        let mut env = BTreeMap::from([(
+            "RUSTUP_HOME".to_string(),
+            "/already/pinned/rustup".to_string(),
+        )]);
+
+        apply_stable_rustup_home_if_available(&mut env, &ambient);
+
+        assert_eq!(
+            env.get("RUSTUP_HOME").map(String::as_str),
+            Some("/already/pinned/rustup")
+        );
+    }
+
+    #[test]
+    fn apply_stable_rustup_home_ignores_home_without_toolchains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rustup_home = dir.path().join("rustup");
+        fs::create_dir_all(&rustup_home).expect("create rustup root");
+
+        let ambient = vec![(
+            "RUSTUP_HOME".to_string(),
+            rustup_home.to_string_lossy().to_string(),
+        )];
+        let mut env = BTreeMap::new();
+
+        apply_stable_rustup_home_if_available(&mut env, &ambient);
+
+        assert!(
+            !env.contains_key("RUSTUP_HOME"),
+            "RUSTUP_HOME should remain unset without a toolchains/ directory"
         );
     }
 }

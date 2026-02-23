@@ -4267,6 +4267,7 @@ fn compute_nextest_test_environment(
     let lane_dir = fac_root.join("lanes/lane-00");
     ensure_lane_env_dirs(&lane_dir)?;
     apply_lane_env_overrides(&mut policy_env, &lane_dir);
+    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
 
     // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy
