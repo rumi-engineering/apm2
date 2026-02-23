@@ -762,6 +762,23 @@ pub(super) fn scan_pending_from_projection(
                     canonicalizer_tuple_digest,
                     toolchain_fingerprint,
                 );
+                // f-798-code_quality-1771816907239154-0: Emit fac.job.failed so the
+                // projection moves this job to a terminal state, breaking the
+                // quarantine-recreate-quarantine infinite loop.
+                if let Err(emit_err) = fac_queue_lifecycle_dual_write::emit_job_failed_by_queue_id(
+                    fac_root,
+                    &record.job_id,
+                    &record.queue_job_id,
+                    &record.work_id,
+                    "malformed_payload_quarantined",
+                    false,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: lifecycle failed event emission after \
+                         quarantine skipped (non-fatal): {emit_err}"
+                    );
+                }
                 continue;
             },
         };
@@ -792,6 +809,23 @@ pub(super) fn scan_pending_from_projection(
                     canonicalizer_tuple_digest,
                     toolchain_fingerprint,
                 );
+                // f-798-code_quality-1771816907239154-0: Emit fac.job.failed so the
+                // projection moves this job to a terminal state, breaking the
+                // quarantine-recreate-quarantine infinite loop.
+                if let Err(emit_err) = fac_queue_lifecycle_dual_write::emit_job_failed_by_queue_id(
+                    fac_root,
+                    &record.job_id,
+                    &record.queue_job_id,
+                    &record.work_id,
+                    "malformed_payload_quarantined",
+                    false,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: lifecycle failed event emission after \
+                         quarantine skipped (non-fatal): {emit_err}"
+                    );
+                }
                 continue;
             },
         };

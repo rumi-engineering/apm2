@@ -821,28 +821,27 @@ impl JobLifecycleRehydrationReconciler {
             .filter(|record| record.status == ProjectedJobStatus::Pending)
             .filter_map(|record| safe_job_file_name(&record.queue_job_id).ok())
             .collect::<BTreeSet<_>>();
-        let expected_claimed_files = projection
-            .jobs
-            .values()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    ProjectedJobStatus::Claimed | ProjectedJobStatus::Running
-                )
-            })
-            .filter_map(|record| safe_job_file_name(&record.queue_job_id).ok())
-            .collect::<BTreeSet<_>>();
 
         if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
             return Ok(());
         }
 
-        // Unknown-file cleanup is intentionally restricted to `pending/` and
-        // `claimed/`.
-        // Terminal witness files (`completed/`, `denied/`) must be preserved
-        // even when in-memory projection entries are evicted.
+        // f-798-security-1771817270663374-0: Unknown-file cleanup is
+        // intentionally restricted to `pending/` ONLY.
+        //
+        // During QL-003 migration staging, we do NOT clean up unknown
+        // `claimed/` files to avoid deleting in-flight jobs whose claim
+        // emission failed. The move-first claim implementation moves a
+        // file from `pending/` to `claimed/` before emitting
+        // `fac.job.claimed`. If emission fails, the claimed file exists
+        // on disk but NOT in the projection. Cleaning it up here would
+        // delete an actively executing job (Unix `unlink` succeeds even
+        // under `flock`), causing later commit-by-path operations to
+        // fail. Only `pending/` unknown files are safe to clean up.
+        //
+        // Terminal witness files (`completed/`, `denied/`) must also be
+        // preserved even when in-memory projection entries are evicted.
         self.cleanup_unknown_files_in_dir(PENDING_DIR, &expected_pending_files, applied_fs_ops)?;
-        self.cleanup_unknown_files_in_dir(CLAIMED_DIR, &expected_claimed_files, applied_fs_ops)?;
         Ok(())
     }
 
@@ -1152,12 +1151,17 @@ mod tests {
             !queue_root.join(PENDING_DIR).join("orphan.json").exists(),
             "unknown filesystem state must be removed when ledger has no matching lifecycle event"
         );
+        // f-798-security-1771817270663374-0: Unknown claimed/ files are no
+        // longer cleaned up — during QL-003 migration staging, in-flight jobs
+        // whose claim emission failed must not be deleted. The reconciler can
+        // only safely clean up pending/ unknowns.
         assert!(
-            !queue_root
+            queue_root
                 .join(CLAIMED_DIR)
                 .join("orphan-claimed.json")
                 .exists(),
-            "unknown claimed state must be removed when ledger has no matching lifecycle event"
+            "unknown claimed state must NOT be removed — claimed/ cleanup is \
+             skipped to avoid deleting in-flight jobs whose claim emission failed"
         );
         assert!(
             queue_root
