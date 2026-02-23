@@ -10350,7 +10350,7 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id, None) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -10364,7 +10364,7 @@ impl PrivilegedDispatcher {
             };
 
         let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, digest);
+            self.resolve_risk_tier_for_lease(&request.lease_id, None, digest);
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder =
@@ -10444,6 +10444,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            None,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -10582,7 +10583,7 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id, None) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -10597,7 +10598,7 @@ impl PrivilegedDispatcher {
 
         let freeze_id_hash = *blake3::hash(request.freeze_id.as_bytes()).as_bytes();
         let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, freeze_id_hash);
+            self.resolve_risk_tier_for_lease(&request.lease_id, None, freeze_id_hash);
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::RequestUnfreeze)
@@ -10674,6 +10675,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            None,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -10819,17 +10821,23 @@ impl PrivilegedDispatcher {
     /// Falls back to role-agnostic `get_claim` only for legacy leases
     /// that pre-date multi-role registration.
     ///
+    /// If the lease validator cannot resolve lease->work mapping, callers may
+    /// provide a `work_id_hint` and this function will attempt a claim-scoped
+    /// recovery (bound to `lease_id`) before failing closed.
+    ///
     /// Fail-closed behavior:
-    /// - Missing lease->work mapping => Tier4, fallback policy hash.
+    /// - Missing lease->work mapping (and no valid hint) => Tier4, fallback
+    ///   hash.
     /// - Missing work claim => Tier4, fallback policy hash.
     /// - Invalid risk tier value => Tier4, keep resolved policy hash.
     #[allow(clippy::option_if_let_else)]
     fn resolve_risk_tier_for_lease(
         &self,
         lease_id: &str,
+        work_id_hint: Option<&str>,
         fallback_policy_hash: [u8; 32],
     ) -> (RiskTier, [u8; 32]) {
-        if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
+        if let Ok(work_id) = self.resolve_work_id_for_pcac_revalidation(lease_id, work_id_hint) {
             // Role-scoped lookup: find the claim whose lease_id matches
             // exactly. This prevents cross-role policy confusion when
             // multiple roles (implementer, reviewer, coordinator) have
@@ -10907,6 +10915,7 @@ impl PrivilegedDispatcher {
     fn derive_privileged_pcac_revalidation_inputs(
         &self,
         lease_id: &str,
+        work_id_hint: Option<&str>,
     ) -> Result<PrivilegedPcacRevalidationInputs, String> {
         let hlc = self
             .holonic_clock
@@ -10920,10 +10929,7 @@ impl PrivilegedDispatcher {
         let current_time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
         let current_ledger_anchor = self.derive_pcac_ledger_anchor()?;
 
-        let work_id = self
-            .lease_validator
-            .get_lease_work_id(lease_id)
-            .ok_or_else(|| format!("work_id missing for lease '{lease_id}'"))?;
+        let work_id = self.resolve_work_id_for_pcac_revalidation(lease_id, work_id_hint)?;
         // Role-scoped lookup: resolve the exact claim bound to this lease_id
         // to prevent cross-role policy confusion when multiple roles have
         // claims on the same work_id. Falls back to role-agnostic get_claim
@@ -10951,6 +10957,56 @@ impl PrivilegedDispatcher {
         ))
     }
 
+    /// Resolve `work_id` for privileged PCAC revalidation.
+    ///
+    /// Primary source is the lease validator (authoritative lease mapping).
+    /// If unavailable, a work-scoped claim fallback is permitted only when the
+    /// caller provides a `work_id_hint` that has a claim bound to `lease_id`.
+    fn resolve_work_id_for_pcac_revalidation(
+        &self,
+        lease_id: &str,
+        work_id_hint: Option<&str>,
+    ) -> Result<String, String> {
+        if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
+            return Ok(work_id);
+        }
+
+        let Some(hinted_work_id) = work_id_hint else {
+            return Err(format!("work_id missing for lease '{lease_id}'"));
+        };
+        let Some(claim) = self
+            .work_registry
+            .get_claim_by_lease_id(hinted_work_id, lease_id)
+            .or_else(|| {
+                self.work_registry
+                    .get_claim(hinted_work_id)
+                    .filter(|claim| {
+                        claim.lease_id.len() == lease_id.len()
+                            && bool::from(claim.lease_id.as_bytes().ct_eq(lease_id.as_bytes()))
+                    })
+            })
+        else {
+            return Err(format!("work_id missing for lease '{lease_id}'"));
+        };
+
+        if claim.work_id == hinted_work_id {
+            warn!(
+                lease_id = %lease_id,
+                work_id = %hinted_work_id,
+                "PCAC revalidation fallback used claim registry due missing lease mapping"
+            );
+        } else {
+            warn!(
+                lease_id = %lease_id,
+                hinted_work_id = %hinted_work_id,
+                claim_work_id = %claim.work_id,
+                "PCAC revalidation fallback recovered claim with mismatched work_id hint"
+            );
+        }
+
+        Ok(claim.work_id)
+    }
+
     fn map_pcac_deny_to_privileged_response(
         operation: &str,
         deny: &apm2_core::pcac::AuthorityDenyV1,
@@ -10974,6 +11030,7 @@ impl PrivilegedDispatcher {
         gate: &crate::pcac::LifecycleGate,
         join_input: &AuthorityJoinInputV1,
         lease_id: &str,
+        work_id_hint: Option<&str>,
         join_freshness_tick: u64,
         join_time_envelope_ref: [u8; 32],
         join_ledger_anchor: [u8; 32],
@@ -10981,13 +11038,13 @@ impl PrivilegedDispatcher {
         effect_intent_digest: [u8; 32],
     ) -> Result<Option<PrivilegedPcacLifecycleArtifacts>, PrivilegedResponse> {
         let work_id = self
-            .lease_validator
-            .get_lease_work_id(lease_id)
-            .ok_or_else(|| {
+            .resolve_work_id_for_pcac_revalidation(lease_id, work_id_hint)
+            .map_err(|error| {
                 PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
-                        "PCAC authority denied for {operation}: policy state missing for lease '{lease_id}'"
+                        "PCAC authority denied for {operation}: policy state missing for lease \
+                         '{lease_id}': {error}"
                     ),
                 )
             })?;
@@ -11061,7 +11118,7 @@ impl PrivilegedDispatcher {
             })?;
 
         let (fresh_tick, current_time_envelope_ref, current_ledger_anchor, current_revocation_head) =
-            self.derive_privileged_pcac_revalidation_inputs(lease_id)
+            self.derive_privileged_pcac_revalidation_inputs(lease_id, Some(&work_id))
                 .map_err(|error| {
                     PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
@@ -15517,7 +15574,9 @@ impl PrivilegedDispatcher {
         }
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self
+                .derive_privileged_pcac_revalidation_inputs(&request.lease_id, Some(&spec.work_id))
+            {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -15530,8 +15589,11 @@ impl PrivilegedDispatcher {
                 },
             };
 
-        let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, spec_hash_bytes);
+        let (risk_tier, _resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(&spec.work_id),
+            spec_hash_bytes,
+        );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::OpenWork)
@@ -15608,6 +15670,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(&spec.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -16049,7 +16112,10 @@ impl PrivilegedDispatcher {
         }
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.lease_id,
+                Some(&request.work_id),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -16071,8 +16137,11 @@ impl PrivilegedDispatcher {
             *hasher.finalize().as_bytes()
         };
 
-        let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, claim_content_hash);
+        let (risk_tier, _resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(&request.work_id),
+            claim_content_hash,
+        );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder = PrivilegedPcacInputBuilder::new(PrivilegedHandlerClass::ClaimWorkV2)
@@ -16145,6 +16214,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(&request.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -18262,8 +18332,6 @@ impl PrivilegedDispatcher {
             .as_slice()
             .try_into()
             .expect("validated to be 32 bytes above");
-        let (risk_tier, resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, changeset_digest);
 
         // Authoritative terminal receipts MUST bind an authoritative lease
         // envelope. Fail closed if the lease cannot be resolved with full HTF
@@ -18278,6 +18346,12 @@ impl PrivilegedDispatcher {
             ));
         };
 
+        let authoritative_work_id = lease_for_receipt.work_id.clone();
+        let (risk_tier, resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(authoritative_work_id.as_str()),
+            changeset_digest,
+        );
         if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
             warn!(
                 lease_id = %request.lease_id,
@@ -18291,7 +18365,6 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
-        let authoritative_work_id = lease_for_receipt.work_id.clone();
         let Some(claim_for_receipt) = self.work_registry.get_claim(&lease_for_receipt.work_id)
         else {
             return Ok(deny_response_for_authority_context(
@@ -18566,7 +18639,10 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.lease_id,
+                Some(authoritative_work_id.as_str()),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -18684,6 +18760,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(authoritative_work_id.as_str()),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -19875,7 +19952,10 @@ impl PrivilegedDispatcher {
             ));
         };
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.lease_id,
+                Some(&request.work_id),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -19894,8 +19974,11 @@ impl PrivilegedDispatcher {
             *hasher.finalize().as_bytes()
         };
 
-        let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, identity_proof_hash);
+        let (risk_tier, _resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(&request.work_id),
+            identity_proof_hash,
+        );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let effect_intent_digest = domain_tagged_hash(
@@ -19964,6 +20047,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(&request.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -20485,7 +20569,10 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.lease_id,
+                Some(&request.work_id),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -20504,8 +20591,11 @@ impl PrivilegedDispatcher {
             *hasher.finalize().as_bytes()
         };
 
-        let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, identity_proof_hash);
+        let (risk_tier, _resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(&request.work_id),
+            identity_proof_hash,
+        );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder =
@@ -20595,6 +20685,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(&request.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -21169,7 +21260,10 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.lease_id,
+                Some(&request.work_id),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -21194,8 +21288,11 @@ impl PrivilegedDispatcher {
             ],
         );
 
-        let (risk_tier, _resolved_policy_hash) =
-            self.resolve_risk_tier_for_lease(&request.lease_id, effect_intent_digest);
+        let (risk_tier, _resolved_policy_hash) = self.resolve_risk_tier_for_lease(
+            &request.lease_id,
+            Some(&request.work_id),
+            effect_intent_digest,
+        );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
         let pcac_builder =
@@ -21261,6 +21358,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.lease_id,
+            Some(&request.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -21743,8 +21841,11 @@ impl PrivilegedDispatcher {
         }
 
         // Resolve parent risk tier for delegated PCAC join input construction.
-        let (parent_risk_tier, _) =
-            self.resolve_risk_tier_for_lease(&request.parent_lease_id, parent_lease.policy_hash);
+        let (parent_risk_tier, _) = self.resolve_risk_tier_for_lease(
+            &request.parent_lease_id,
+            Some(&parent_lease.work_id),
+            parent_lease.policy_hash,
+        );
 
         // ---- Phase 2b: Parent lease HTF authority validation ----
         //
@@ -22139,7 +22240,10 @@ impl PrivilegedDispatcher {
         };
 
         let (join_freshness_tick, join_time_envelope_ref, join_ledger_anchor, join_revocation_head) =
-            match self.derive_privileged_pcac_revalidation_inputs(&request.parent_lease_id) {
+            match self.derive_privileged_pcac_revalidation_inputs(
+                &request.parent_lease_id,
+                Some(&parent_lease.work_id),
+            ) {
                 Ok(values) => values,
                 Err(error) => {
                     return Ok(PrivilegedResponse::error(
@@ -22249,6 +22353,7 @@ impl PrivilegedDispatcher {
             pcac_gate,
             &pcac_input,
             &request.parent_lease_id,
+            Some(&parent_lease.work_id),
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -34409,6 +34514,28 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_record_work_pr_association_recovers_when_lease_mapping_missing() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+            assert!(
+                dispatcher.lease_validator.remove_lease(&lease_id),
+                "test setup must remove lease mapping to exercise claim fallback"
+            );
+
+            let request = make_request(&work_id, 73, VALID_COMMIT_SHA, &lease_id);
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert_eq!(resp.work_id, work_id);
+                    assert_eq!(resp.pr_number, 73);
+                    assert_eq!(resp.commit_sha, VALID_COMMIT_SHA);
+                },
+                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
             }
         }
 
