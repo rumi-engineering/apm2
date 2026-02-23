@@ -240,6 +240,7 @@ pub fn run_fac_warm(
         &spec,
         &fac_policy.queue_bounds_policy,
         write_mode,
+        fac_policy.queue_lifecycle_dual_write_enabled,
     ) {
         return output_error(
             json_output,

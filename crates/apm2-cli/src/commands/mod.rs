@@ -64,6 +64,7 @@ pub mod fac_pr;
 pub mod fac_preflight;
 pub mod fac_quarantine;
 pub mod fac_queue;
+mod fac_queue_lifecycle_dual_write;
 mod fac_queue_submit;
 pub mod fac_review;
 pub mod fac_secure_io;

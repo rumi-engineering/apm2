@@ -145,6 +145,9 @@ pub mod harness_sandbox;
 /// Prune old time buckets, rebuild deterministically, and emit
 /// `IndexCompactionReceiptV1`.
 pub mod index_compaction;
+/// Queue lifecycle ledger event vocabulary and content-addressable job identity
+/// helpers (TCK-00669).
+pub mod job_lifecycle;
 pub mod job_spec;
 mod key_policy;
 pub mod lane;

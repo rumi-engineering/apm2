@@ -126,6 +126,7 @@ pub mod deferred_replay_worker;
 pub mod divergence_watchdog;
 pub mod github_sync;
 pub mod intent_buffer;
+pub mod job_lifecycle;
 pub mod projection_receipt;
 pub mod worker;
 
@@ -153,6 +154,13 @@ pub use github_sync::{
 pub use intent_buffer::{
     DeferredReplayEntry, IntentBuffer, IntentBufferError, IntentVerdict, MAX_BACKLOG_ITEMS,
     ProjectionIntent,
+};
+pub use job_lifecycle::{
+    DEFAULT_MAX_EVENTS_PER_TICK as DEFAULT_QUEUE_LIFECYCLE_MAX_EVENTS_PER_TICK,
+    DEFAULT_MAX_FS_OPS_PER_TICK as DEFAULT_QUEUE_LIFECYCLE_MAX_FS_OPS_PER_TICK,
+    JobLifecycleCheckpointV1, JobLifecycleProjectionError, JobLifecycleProjectionV1,
+    JobLifecycleReconcileTickV1, JobLifecycleReconcilerConfig, JobLifecycleRehydrationReconciler,
+    ProjectedJobLifecycleV1, ProjectedJobStatus,
 };
 pub use projection_receipt::{
     DeferredReplayReceiptInput, IdempotencyKey, MAX_BOUNDARY_ID_LENGTH, MAX_STRING_LENGTH,

@@ -26,6 +26,43 @@ mod exit_codes {
 // This integration crate does not define the production `commands` module.
 #[allow(missing_docs)]
 pub mod commands {
+    pub mod fac_queue_submit {
+        use std::path::{Path, PathBuf};
+
+        use apm2_core::fac::job_spec::FacJobSpecV1;
+        use apm2_core::fac::queue_bounds::QueueBoundsPolicy;
+        use apm2_core::fac::service_user_gate::QueueWriteMode;
+
+        pub(crate) fn enqueue_job(
+            queue_root: &Path,
+            fac_root: &Path,
+            spec: &FacJobSpecV1,
+            _queue_bounds_policy: &QueueBoundsPolicy,
+            _write_mode: QueueWriteMode,
+            dual_write_enabled: bool,
+        ) -> Result<PathBuf, String> {
+            let pending_dir = queue_root.join("pending");
+            std::fs::create_dir_all(&pending_dir)
+                .map_err(|err| format!("create pending dir: {err}"))?;
+
+            let path = pending_dir.join(format!("{}.json", spec.job_id));
+            let bytes =
+                serde_json::to_vec(spec).map_err(|err| format!("serialize job spec: {err}"))?;
+            std::fs::write(&path, bytes).map_err(|err| format!("write pending job: {err}"))?;
+
+            if dual_write_enabled {
+                crate::fac_queue_lifecycle_dual_write::emit_job_enqueued(
+                    fac_root,
+                    spec,
+                    "fac.queue_submit",
+                )
+                .map_err(|err| format!("dual-write lifecycle enqueue event failed: {err}"))?;
+            }
+
+            Ok(path)
+        }
+    }
+
     pub struct EnvVarTestLock(std::sync::Mutex<()>);
 
     impl EnvVarTestLock {
@@ -53,6 +90,9 @@ pub mod fac_secure_io;
 
 #[path = "../src/commands/fac_key_material.rs"]
 pub mod fac_key_material;
+
+#[path = "../src/commands/fac_queue_lifecycle_dual_write.rs"]
+pub mod fac_queue_lifecycle_dual_write;
 
 #[path = "../src/commands/fac_worker/mod.rs"]
 mod fac_worker;
