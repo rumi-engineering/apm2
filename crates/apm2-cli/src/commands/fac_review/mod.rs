@@ -2564,15 +2564,33 @@ fn doctor_interrupt_flag() -> Result<Arc<AtomicBool>, String> {
 const MAX_TRACKED_PR_SUMMARIES: usize = 100;
 
 pub fn collect_tracked_pr_summaries(
-    _fallback_owner_repo: Option<&str>,
+    fallback_owner_repo: Option<&str>,
     repo_filter: Option<&str>,
 ) -> Result<Vec<DoctorTrackedPrSummary>, String> {
-    let mut candidates = lifecycle::list_all_tracked_prs()?;
+    let normalized_repo_filter = normalize_owner_repo_filter(repo_filter);
+    let normalized_fallback_repo = normalize_owner_repo_filter(fallback_owner_repo);
+
+    let mut candidates = if let Some(owner_repo) = normalized_repo_filter.as_deref() {
+        lifecycle::list_tracked_prs_for_repo(owner_repo)?
+    } else {
+        lifecycle::list_all_tracked_prs()?
+    };
+
+    if candidates.is_empty()
+        && normalized_repo_filter.is_none()
+        && let Some(owner_repo) = normalized_fallback_repo.as_deref()
+    {
+        candidates = lifecycle::list_tracked_prs_for_repo(owner_repo)?;
+    }
 
     // Sort descending so we keep the most recent PRs when truncating.
     candidates.sort_unstable_by(|(a_pr, _), (b_pr, _)| b_pr.cmp(a_pr));
 
-    let selected = filter_tracked_pr_candidates(candidates, repo_filter, MAX_TRACKED_PR_SUMMARIES);
+    let selected = filter_tracked_pr_candidates(
+        candidates,
+        normalized_repo_filter.as_deref(),
+        MAX_TRACKED_PR_SUMMARIES,
+    );
 
     let mut summaries = Vec::with_capacity(selected.len());
     for (pr_number, owner_repo) in selected {
@@ -2607,16 +2625,27 @@ pub fn collect_tracked_pr_summaries(
     Ok(summaries)
 }
 
+fn normalize_owner_repo_filter(owner_repo: Option<&str>) -> Option<String> {
+    owner_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 fn filter_tracked_pr_candidates(
     candidates: Vec<(u32, String)>,
     repo_filter: Option<&str>,
     limit: usize,
 ) -> Vec<(u32, String)> {
+    let explicit_repo_filter = normalize_owner_repo_filter(repo_filter).is_some();
     candidates
         .into_iter()
         .filter(|(_, owner_repo)| tracked_pr_matches_repo_filter(owner_repo, repo_filter))
         .filter(|(_, owner_repo)| {
-            !owner_repo.starts_with("example/") && !owner_repo.starts_with("test/")
+            explicit_repo_filter || {
+                let normalized = owner_repo.trim().to_ascii_lowercase();
+                !normalized.starts_with("example/") && !normalized.starts_with("test/")
+            }
         })
         .take(limit)
         .collect()
@@ -2627,10 +2656,7 @@ fn tracked_pr_matches_repo_filter(owner_repo: &str, repo_filter: Option<&str>) -
     if normalized_owner_repo.is_empty() {
         return false;
     }
-    let normalized_filter = repo_filter
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
+    let normalized_filter = normalize_owner_repo_filter(repo_filter);
     normalized_filter.is_none_or(|filter| normalized_owner_repo == filter)
 }
 
@@ -2845,9 +2871,11 @@ fn run_doctor_inner(
         Ok(None) => {
             repair_signals.lifecycle_missing = true;
             health.push(DoctorHealthItem {
-                severity: "high",
-                message: "no lifecycle record found for this PR".to_string(),
-                remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix`".to_string(),
+                severity: "medium",
+                message: "no local lifecycle record found for this PR".to_string(),
+                remediation:
+                    "run `apm2 fac push` or `apm2 fac doctor --pr <PR_NUMBER> --fix` to rehydrate local lifecycle state"
+                        .to_string(),
             });
             None
         },
@@ -3201,9 +3229,6 @@ fn run_doctor_inner(
                     let mut latest = activity_by_run_id.get(&run_id_key).copied();
                     if latest.is_none() {
                         latest = activity_map.get(review_type).copied();
-                    }
-                    if let Some(ts) = log_activity.last_modified_at.get(&run_id_key).copied() {
-                        latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
                     }
                     if let Some(ts) = pulse_activity {
                         latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
@@ -3906,7 +3931,6 @@ fn load_run_state_nudge_counts_for_pr(pr_number: u32) -> std::collections::BTree
 #[derive(Default)]
 struct DoctorLogActivitySignals {
     line_counts: std::collections::BTreeMap<String, u64>,
-    last_modified_at: std::collections::BTreeMap<String, DateTime<Utc>>,
 }
 
 fn collect_log_activity_for_pr(
@@ -3924,16 +3948,6 @@ fn collect_log_activity_for_pr(
                 continue;
             }
             let run_id = run_id.to_string();
-            if let Ok(metadata) = fs::metadata(&entry.log_file)
-                && let Ok(modified) = metadata.modified()
-            {
-                let modified_at = DateTime::<Utc>::from(modified);
-                signals
-                    .last_modified_at
-                    .entry(run_id.clone())
-                    .and_modify(|existing| *existing = (*existing).max(modified_at))
-                    .or_insert(modified_at);
-            }
             if include_line_counts
                 && let Some(line_count) = count_log_lines_bounded(&entry.log_file)
             {
@@ -5248,7 +5262,6 @@ impl DoctorDecisionFacts {
                 != DoctorMergeConflictStatus::HasConflicts
             && !has_gate_failure_signal;
         let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
-            || input.repair_signals.lifecycle_missing
             || input.repair_signals.agent_registry_load_failed
             || input.repair_signals.run_state_repair_required;
         let lifecycle_escalation = input.lifecycle.is_some_and(|entry| {
@@ -8660,6 +8673,45 @@ mod tests {
     }
 
     #[test]
+    fn test_build_recommended_action_lifecycle_missing_does_not_override_merge_ready() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            lifecycle_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: None,
+            gates: &[
+                doctor_gate_snapshot("fmt", "PASS"),
+                doctor_gate_snapshot("test", "PASS"),
+            ],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "merge");
+    }
+
+    #[test]
     fn test_build_recommended_action_projection_gap_triggers_fix_and_follow_up_repair() {
         let findings = vec![
             findings_summary_entry("security", "approve", 0, 0, 0, 0),
@@ -10508,5 +10560,25 @@ mod tests {
             selected,
             vec![(42, "guardian-intelligence/apm2".to_string())]
         );
+    }
+
+    #[test]
+    fn tracked_pr_candidate_filter_preserves_explicit_test_repo_filter() {
+        let selected = super::filter_tracked_pr_candidates(
+            vec![(42, "test/capacity-load".to_string())],
+            Some("test/capacity-load"),
+            super::MAX_TRACKED_PR_SUMMARIES,
+        );
+        assert_eq!(selected, vec![(42, "test/capacity-load".to_string())]);
+    }
+
+    #[test]
+    fn tracked_pr_candidate_filter_excludes_synthetic_repo_without_filter() {
+        let selected = super::filter_tracked_pr_candidates(
+            vec![(42, "test/capacity-load".to_string())],
+            None,
+            super::MAX_TRACKED_PR_SUMMARIES,
+        );
+        assert!(selected.is_empty());
     }
 }
