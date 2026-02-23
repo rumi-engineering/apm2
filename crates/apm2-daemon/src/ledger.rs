@@ -3126,6 +3126,11 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             params
         };
 
+        // Legacy branch intentionally orders by `event_id` (not `rowid`) for
+        // cursor pagination compatibility with mixed legacy+canonical reads.
+        // `get_events_since` persists only `(timestamp_ns, event_id)` cursors;
+        // when canonical freeze mode is active, the same cursor must be
+        // comparable across both tables using a single stable string key.
         let legacy_sql = format!(
             "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
              FROM ledger_events \

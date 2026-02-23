@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,6 +53,7 @@ const PENDING_DIR: &str = "pending";
 const CLAIMED_DIR: &str = "claimed";
 const COMPLETED_DIR: &str = "completed";
 const DENIED_DIR: &str = "denied";
+const BROKER_REQUESTS_DIR: &str = "broker_requests";
 const QUEUE_DIRS: [&str; 4] = [PENDING_DIR, CLAIMED_DIR, COMPLETED_DIR, DENIED_DIR];
 const LIFECYCLE_EVENT_TYPES: [&str; 6] = [
     FAC_JOB_ENQUEUED_EVENT_TYPE,
@@ -587,12 +590,40 @@ impl JobLifecycleRehydrationReconciler {
 
     fn ensure_queue_dirs(&self) -> Result<(), JobLifecycleProjectionError> {
         for dir in QUEUE_DIRS {
-            fs::create_dir_all(self.queue_root.join(dir)).map_err(|err| {
+            let path = self.queue_root.join(dir);
+            fs::create_dir_all(&path).map_err(|err| {
                 JobLifecycleProjectionError::Io(format!(
                     "create queue dir {}: {err}",
-                    self.queue_root.join(dir).display()
+                    path.display()
                 ))
             })?;
+            #[cfg(unix)]
+            {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o711)).map_err(|err| {
+                    JobLifecycleProjectionError::Io(format!(
+                        "set queue dir mode 0711 {}: {err}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
+
+        let broker_requests_path = self.queue_root.join(BROKER_REQUESTS_DIR);
+        fs::create_dir_all(&broker_requests_path).map_err(|err| {
+            JobLifecycleProjectionError::Io(format!(
+                "create queue dir {}: {err}",
+                broker_requests_path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&broker_requests_path, fs::Permissions::from_mode(0o1733))
+                .map_err(|err| {
+                    JobLifecycleProjectionError::Io(format!(
+                        "set queue dir mode 01733 {}: {err}",
+                        broker_requests_path.display()
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -620,6 +651,7 @@ impl JobLifecycleRehydrationReconciler {
         }
 
         let has_desired = existing_paths.iter().any(|path| path == &desired_path);
+        let mut moved_source_path: Option<PathBuf> = None;
         if !has_desired {
             if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
                 return Ok(false);
@@ -633,6 +665,7 @@ impl JobLifecycleRehydrationReconciler {
                         desired_path.display()
                     ))
                 })?;
+                moved_source_path = Some(source.clone());
             } else {
                 write_witness_file(&desired_path, projected)?;
             }
@@ -641,6 +674,12 @@ impl JobLifecycleRehydrationReconciler {
 
         for path in existing_paths {
             if path == desired_path {
+                continue;
+            }
+            if moved_source_path
+                .as_ref()
+                .is_some_and(|moved| moved == &path)
+            {
                 continue;
             }
             if *applied_fs_ops >= self.config.max_fs_ops_per_tick {
@@ -1227,5 +1266,114 @@ mod tests {
                 .exists(),
             "ledger terminal failure must win and place witness in denied/"
         );
+    }
+
+    #[test]
+    fn reconcile_projected_job_skips_removing_file_already_renamed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::write(queue_root.join(PENDING_DIR).join("job-rename.json"), br"{}")
+            .expect("seed stale pending");
+
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:rename",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("job-rename"),
+                    enqueue_epoch_ns: now_timestamp_ns(),
+                }),
+            ),
+            now_timestamp_ns(),
+        );
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:started:rename",
+                None,
+                FacJobLifecycleEventData::Started(FacJobStartedV1 {
+                    identity: identity("job-rename"),
+                    worker_instance_id: "worker-1".to_string(),
+                    start_receipt_id: None,
+                }),
+            ),
+            now_timestamp_ns() + 1,
+        );
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 8,
+                max_fs_ops_per_tick: 8,
+            },
+        );
+
+        let tick = reconciler.tick().expect("tick should succeed");
+        assert_eq!(tick.processed_events, 2);
+        assert!(
+            !queue_root
+                .join(PENDING_DIR)
+                .join("job-rename.json")
+                .exists(),
+            "source file should have been moved out of pending/"
+        );
+        assert!(
+            queue_root
+                .join(CLAIMED_DIR)
+                .join("job-rename.json")
+                .exists(),
+            "renamed witness should exist in claimed/"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tick_hardens_queue_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+
+        for dir in QUEUE_DIRS {
+            let path = queue_root.join(dir);
+            fs::create_dir_all(&path).expect("create queue subdir");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o777))
+                .expect("set unsafe subdir mode");
+        }
+        let broker_requests = queue_root.join(BROKER_REQUESTS_DIR);
+        fs::create_dir_all(&broker_requests).expect("create broker_requests");
+        fs::set_permissions(&broker_requests, fs::Permissions::from_mode(0o333))
+            .expect("set unsafe broker mode");
+
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig::default(),
+        );
+        reconciler.tick().expect("tick");
+
+        for dir in QUEUE_DIRS {
+            let mode = fs::metadata(queue_root.join(dir))
+                .expect("queue dir metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o711, "queue dir {dir} must be mode 0711");
+        }
+
+        let broker_mode = fs::metadata(&broker_requests)
+            .expect("broker dir metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(broker_mode, 0o1733, "broker_requests/ must be mode 01733");
     }
 }

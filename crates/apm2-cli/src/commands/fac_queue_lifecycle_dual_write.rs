@@ -179,6 +179,9 @@ fn emit_event(
     let payload = event
         .encode_bounded()
         .map_err(|err| format!("encode lifecycle event: {err}"))?;
+    // Temporary migration helper: this path is invoked from short-lived queue
+    // mutation commands, so each emit opens and initializes the ledger emitter
+    // independently instead of holding a long-lived process-global connection.
     let emitter = open_queue_lifecycle_emitter(fac_root)?;
     emitter
         .emit_session_event(
@@ -197,7 +200,7 @@ fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmit
     let secret_key_bytes = signer.secret_key_bytes();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
 
-    let db_path = resolve_authoritative_ledger_db_path()?;
+    let db_path = resolve_authoritative_ledger_db_path(fac_root)?;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -221,33 +224,32 @@ fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmit
     ))
 }
 
-fn resolve_authoritative_ledger_db_path() -> Result<PathBuf, String> {
-    #[cfg(test)]
+#[cfg(test)]
+fn resolve_authoritative_ledger_db_path(fac_root: &Path) -> Result<PathBuf, String> {
+    if !fac_root.exists() {
+        return Err(format!(
+            "fac_root does not exist for lifecycle test ledger: {}",
+            fac_root.display()
+        ));
+    }
+    Ok(fac_root.join(TEST_QUEUE_LIFECYCLE_LEDGER_DB))
+}
+
+#[cfg(not(test))]
+fn resolve_authoritative_ledger_db_path(_fac_root: &Path) -> Result<PathBuf, String> {
+    let config_path = resolve_daemon_config_path(Path::new(DEFAULT_CONFIG_FILE));
+    if config_path.exists()
+        && let Ok(config) = EcosystemConfig::from_file(&config_path)
+        && let Some(ledger_db) = config.daemon.ledger_db
     {
-        let home = apm2_core::github::resolve_apm2_home()
-            .ok_or_else(|| "could not resolve APM2 home for lifecycle test ledger".to_string())?;
-        Ok(home
-            .join("private")
-            .join("fac")
-            .join(TEST_QUEUE_LIFECYCLE_LEDGER_DB))
+        return Ok(ledger_db);
     }
 
-    #[cfg(not(test))]
-    {
-        let config_path = resolve_daemon_config_path(Path::new(DEFAULT_CONFIG_FILE));
-        if config_path.exists()
-            && let Ok(config) = EcosystemConfig::from_file(&config_path)
-            && let Some(ledger_db) = config.daemon.ledger_db
-        {
-            return Ok(ledger_db);
-        }
-
-        let config = EcosystemConfig::from_env();
-        config
-            .daemon
-            .ledger_db
-            .ok_or_else(|| "daemon ledger_db is not configured".to_string())
-    }
+    let config = EcosystemConfig::from_env();
+    config
+        .daemon
+        .ledger_db
+        .ok_or_else(|| "daemon ledger_db is not configured".to_string())
 }
 
 #[cfg(not(test))]
