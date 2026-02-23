@@ -374,7 +374,7 @@ fn identity_from_spec(spec: &FacJobSpecV1) -> Result<FacJobIdentityV1, String> {
         blake3::hash(spec.source.head_sha.as_bytes()).to_hex()
     );
     let preimage = FacJobIdentityPreimageV1 {
-        work_id: spec.source.repo_id.clone(),
+        work_id: spec.source.work_id.clone(),
         changeset_digest: changeset_digest.clone(),
         gate_profile: gate_profile.clone(),
         revision: spec.job_spec_digest.clone(),

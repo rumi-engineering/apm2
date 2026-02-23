@@ -13,7 +13,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
-use apm2_core::fac::{parse_b3_256_digest, parse_policy_hash};
+use apm2_core::fac::work_cas_schemas::{
+    WORK_CONTEXT_ENTRY_V1_SCHEMA, WorkContextEntryV1, WorkContextKind,
+};
+use apm2_core::fac::{
+    ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo, parse_b3_256_digest,
+    parse_policy_hash,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +39,7 @@ use super::types::{
     sanitize_for_path,
 };
 use super::{github_projection, lifecycle, projection_store, state, verdict_projection};
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_pr::sync_required_status_ruleset;
 use crate::exit_codes::codes as exit_codes;
 
@@ -363,6 +370,7 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
 
 fn run_blocking_evidence_gates(
     sha: &str,
+    work_id: Option<&str>,
     write_mode: QueueWriteMode,
 ) -> Result<QueuedGatesOutcome, String> {
     let request = QueuedGatesRequest {
@@ -381,6 +389,7 @@ fn run_blocking_evidence_gates(
         // ServiceUserOnly; only bypass when --unsafe-local-write is
         // explicitly passed at the top-level FacCommand.
         write_mode,
+        work_id_override: work_id.map(ToString::to_string),
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)
@@ -1559,14 +1568,462 @@ fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     latest_gate_error_hint(&result.gate_name)
 }
 
-pub fn run_push(
-    repo: &str,
-    remote: &str,
-    branch: Option<&str>,
-    ticket: Option<&Path>,
-    json_output: bool,
-    write_mode: QueueWriteMode,
-) -> u8 {
+fn require_handoff_note(handoff_note_arg: Option<&str>) -> Result<String, String> {
+    let Some(raw) = handoff_note_arg else {
+        return Err("`--handoff-note` is required".to_string());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("`--handoff-note` cannot be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+const MAX_PUSH_IDENTIFIER_LENGTH: usize = 256;
+
+fn validate_push_identifier(value: &str, field: &str, required_prefix: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    if value.len() > MAX_PUSH_IDENTIFIER_LENGTH {
+        return Err(format!(
+            "{field} exceeds max length ({} > {MAX_PUSH_IDENTIFIER_LENGTH})",
+            value.len(),
+        ));
+    }
+    if !value.starts_with(required_prefix) {
+        return Err(format!(
+            "{field} must start with `{required_prefix}`, got `{value}`"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!(
+            "{field} contains invalid characters; only [A-Za-z0-9_-] are allowed"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_push_work_id(work_id: &str) -> Result<(), String> {
+    validate_push_identifier(work_id, "work_id", "W-")
+}
+
+fn validate_push_lease_id(lease_id: &str) -> Result<(), String> {
+    validate_push_identifier(lease_id, "lease_id", "L-")
+}
+
+fn validate_push_session_id(session_id: &str) -> Result<(), String> {
+    validate_push_identifier(session_id, "session_id", "S-")
+}
+
+fn with_operator_client<T>(
+    f: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
+) -> Result<T, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
+    rt.block_on(f).map_err(|err| err.to_string())
+}
+
+fn resolve_work_id_for_push(
+    work_id_arg: Option<&str>,
+    ticket_alias_arg: Option<&str>,
+    branch: &str,
+    worktree_dir: &Path,
+    operator_socket: &Path,
+) -> Result<(String, Option<String>), String> {
+    let trimmed_work_id = work_id_arg.map(str::trim).filter(|value| !value.is_empty());
+    let alias = ticket_alias_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    match (trimmed_work_id, alias) {
+        (Some(work_id), Some(ticket_alias)) => {
+            validate_push_work_id(work_id)?;
+            let ticket_alias_for_rpc = ticket_alias.clone();
+            let resolved = with_operator_client(async move {
+                let mut client = OperatorClient::connect(operator_socket).await?;
+                client.resolve_ticket_alias(&ticket_alias_for_rpc).await
+            })?;
+            if !resolved.found {
+                return Err(format!(
+                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id"
+                ));
+            }
+            if resolved.work_id != work_id {
+                return Err(format!(
+                    "`--work-id` mismatch: provided `{work_id}` but ticket alias `{ticket_alias}` \
+                     resolved to `{}`",
+                    resolved.work_id
+                ));
+            }
+            Ok((work_id.to_string(), Some(ticket_alias)))
+        },
+        (Some(work_id), None) => {
+            validate_push_work_id(work_id)?;
+            Ok((work_id.to_string(), None))
+        },
+        (None, Some(ticket_alias)) => {
+            let ticket_alias_for_rpc = ticket_alias.clone();
+            let resolved = with_operator_client(async move {
+                let mut client = OperatorClient::connect(operator_socket).await?;
+                client.resolve_ticket_alias(&ticket_alias_for_rpc).await
+            })?;
+            if !resolved.found {
+                return Err(format!(
+                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id"
+                ));
+            }
+            validate_push_work_id(&resolved.work_id)?;
+            Ok((resolved.work_id, Some(ticket_alias)))
+        },
+        (None, None) => {
+            let derived_alias = resolve_tck_id(branch, worktree_dir)?;
+            let derived_alias_for_rpc = derived_alias.clone();
+            let resolved = with_operator_client(async move {
+                let mut client = OperatorClient::connect(operator_socket).await?;
+                client.resolve_ticket_alias(&derived_alias_for_rpc).await
+            })?;
+            if !resolved.found {
+                return Err(format!(
+                    "derived ticket alias `{derived_alias}` did not resolve to a canonical work_id"
+                ));
+            }
+            validate_push_work_id(&resolved.work_id)?;
+            Ok((resolved.work_id, Some(derived_alias)))
+        },
+    }
+}
+
+struct PushRuntimeBinding {
+    lease_id: String,
+    session_id: String,
+}
+
+fn resolve_runtime_binding_for_push(
+    work_id: &str,
+    lease_id_arg: Option<&str>,
+    session_id_arg: Option<&str>,
+    operator_socket: &Path,
+) -> Result<PushRuntimeBinding, String> {
+    let requested_lease_id = lease_id_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    let requested_session_id = session_id_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
+
+    let work_id_owned = work_id.to_string();
+    let status_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_owned).await
+    })?;
+
+    let status_lease_id = status_response
+        .lease_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let status_session_id = status_response
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if let (Some(requested), Some(observed)) = (&requested_lease_id, &status_lease_id)
+        && requested != observed
+    {
+        return Err(format!(
+            "`--lease-id` mismatch for work_id `{work_id}`: provided `{requested}` but daemon reports `{observed}`"
+        ));
+    }
+    if let (Some(requested), Some(observed)) = (&requested_session_id, &status_session_id)
+        && requested != observed
+    {
+        return Err(format!(
+            "`--session-id` mismatch for work_id `{work_id}`: provided `{requested}` but daemon reports active `{observed}`"
+        ));
+    }
+
+    let lease_id = requested_lease_id.or(status_lease_id).ok_or_else(|| {
+        format!(
+            "no active lease_id found for work_id `{work_id}`; pass `--lease-id` \
+                 or claim work before running `fac push`"
+        )
+    })?;
+    validate_push_lease_id(&lease_id)?;
+
+    let session_id = requested_session_id.or(status_session_id).ok_or_else(|| {
+        format!(
+            "no active session_id found for work_id `{work_id}`; pass `--session-id` \
+                 when backfilling a terminated session attempt"
+        )
+    })?;
+    validate_push_session_id(&session_id)?;
+
+    Ok(PushRuntimeBinding {
+        lease_id,
+        session_id,
+    })
+}
+
+fn make_push_session_dedupe_key(session_id: &str) -> Result<String, String> {
+    validate_push_session_id(session_id)?;
+    Ok(session_id.to_string())
+}
+
+fn parse_git_base_ref_commit(base_ref: &str) -> Result<(HashAlgo, String), String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base_ref}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|err| format!("failed to resolve base ref `{base_ref}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve base ref `{base_ref}`: {}",
+            stderr.trim()
+        ));
+    }
+    let object_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let is_hex = object_id.as_bytes().iter().all(u8::is_ascii_hexdigit);
+    if !is_hex {
+        return Err(format!(
+            "base commit id for `{base_ref}` is not hexadecimal: `{object_id}`"
+        ));
+    }
+    let algo = match object_id.len() {
+        40 => HashAlgo::Sha1,
+        64 => HashAlgo::Sha256,
+        other => {
+            return Err(format!(
+                "unsupported base commit id length for `{base_ref}`: {other}"
+            ));
+        },
+    };
+    Ok((algo, object_id))
+}
+
+fn parse_git_diff_manifest(base_ref: &str, head_sha: &str) -> Result<Vec<FileChange>, String> {
+    let range = format!("{base_ref}..{head_sha}");
+    let output = Command::new("git")
+        .args(["diff", "--name-status", "--find-renames", "-z", &range])
+        .output()
+        .map_err(|err| format!("failed to collect diff manifest for `{range}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to collect diff manifest for `{range}`: {}",
+            stderr.trim()
+        ));
+    }
+
+    parse_git_name_status_manifest_z(&output.stdout, &range)
+}
+
+fn parse_git_name_status_manifest_z(raw: &[u8], range: &str) -> Result<Vec<FileChange>, String> {
+    let mut manifest = Vec::new();
+    let mut tokens = raw
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty());
+    while let Some(status_bytes) = tokens.next() {
+        let status = std::str::from_utf8(status_bytes)
+            .map_err(|_| format!("diff manifest contains non-UTF8 status token for `{range}`"))?;
+
+        let status_prefix = status.chars().next().unwrap_or('M');
+        let parse_path = |bytes: &[u8], label: &str| -> Result<String, String> {
+            std::str::from_utf8(bytes)
+                .map(ToString::to_string)
+                .map_err(|_| {
+                    format!("diff manifest contains non-UTF8 {label} path token for `{range}`")
+                })
+        };
+
+        match status_prefix {
+            'R' => {
+                let old_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after rename status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "rename old"))?;
+                let new_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after rename status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "rename new"))?;
+                manifest.push(FileChange {
+                    path: new_path,
+                    change_kind: ChangeKind::Rename,
+                    old_path: Some(old_path),
+                });
+            },
+            'C' => {
+                let old_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after copy status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "copy old"))?;
+                let new_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after copy status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "copy new"))?;
+                manifest.push(FileChange {
+                    path: new_path,
+                    change_kind: ChangeKind::Modify,
+                    old_path: Some(old_path),
+                });
+            },
+            'A' | 'D' | 'M' | 'T' | 'U' | 'X' | 'B' => {
+                let path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!("diff manifest for `{range}` truncated after status `{status}`")
+                    })
+                    .and_then(|value| parse_path(value, "file"))?;
+                let change_kind = match status_prefix {
+                    'A' => ChangeKind::Add,
+                    'D' => ChangeKind::Delete,
+                    _ => ChangeKind::Modify,
+                };
+                manifest.push(FileChange {
+                    path,
+                    change_kind,
+                    old_path: None,
+                });
+            },
+            _ => {
+                return Err(format!(
+                    "diff manifest for `{range}` contains unsupported status `{status}`"
+                ));
+            },
+        }
+    }
+    Ok(manifest)
+}
+
+fn build_changeset_bundle_json(remote: &str, sha: &str) -> Result<Vec<u8>, String> {
+    let base_ref = resolve_commit_history_base_ref(remote)?;
+    let (base_algo, base_object_id) = parse_git_base_ref_commit(&base_ref)?;
+    let manifest = parse_git_diff_manifest(&base_ref, sha)?;
+    let diff_range = format!("{base_ref}..{sha}");
+    let diff_bytes = Command::new("git")
+        .args(["diff", "--binary", &diff_range])
+        .output()
+        .map_err(|err| format!("failed to collect diff bytes for `{diff_range}`: {err}"))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(output.stdout)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!(
+                    "failed to collect diff bytes for `{diff_range}`: {}",
+                    stderr.trim()
+                ))
+            }
+        })?;
+
+    let changeset_id_suffix = &sha[..sha.len().min(12)];
+    let bundle = ChangeSetBundleV1::builder()
+        .changeset_id(format!("cs-{changeset_id_suffix}"))
+        .base(GitObjectRef {
+            algo: base_algo,
+            object_kind: "commit".to_string(),
+            object_id: base_object_id,
+        })
+        .diff_hash(*blake3::hash(&diff_bytes).as_bytes())
+        .file_manifest(manifest)
+        .binary_detected(false)
+        .build()
+        .map_err(|err| format!("failed to build changeset bundle: {err}"))?;
+
+    serde_json::to_vec(&bundle)
+        .map_err(|err| format!("failed to serialize changeset bundle: {err}"))
+}
+
+fn build_context_entry_json(
+    work_id: &str,
+    kind: WorkContextKind,
+    dedupe_key: &str,
+    body: String,
+    metadata: Option<serde_json::Value>,
+) -> Result<Vec<u8>, String> {
+    let entry = WorkContextEntryV1 {
+        schema: WORK_CONTEXT_ENTRY_V1_SCHEMA.to_string(),
+        work_id: work_id.to_string(),
+        entry_id: "placeholder".to_string(),
+        kind,
+        dedupe_key: dedupe_key.to_string(),
+        source_session_id: None,
+        actor_id: None,
+        body: Some(body),
+        metadata,
+        tags: vec!["fac_push".to_string()],
+        created_at_ns: None,
+    };
+    serde_json::to_vec(&entry)
+        .map_err(|err| format!("failed to serialize work context entry: {err}"))
+}
+
+pub(super) struct PushInvocation<'a> {
+    pub repo: &'a str,
+    pub remote: &'a str,
+    pub branch: Option<&'a str>,
+    pub ticket: Option<&'a Path>,
+    pub work_id_arg: Option<&'a str>,
+    pub ticket_alias_arg: Option<&'a str>,
+    pub lease_id_arg: Option<&'a str>,
+    pub session_id_arg: Option<&'a str>,
+    pub handoff_note_arg: Option<&'a str>,
+    pub json_output: bool,
+    pub write_mode: QueueWriteMode,
+    pub operator_socket: &'a Path,
+}
+
+pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
+    let repo = invocation.repo;
+    let remote = invocation.remote;
+    let branch = invocation.branch;
+    let ticket = invocation.ticket;
+    let work_id_arg = invocation.work_id_arg;
+    let ticket_alias_arg = invocation.ticket_alias_arg;
+    let lease_id_arg = invocation.lease_id_arg;
+    let session_id_arg = invocation.session_id_arg;
+    let handoff_note_arg = invocation.handoff_note_arg;
+    let json_output = invocation.json_output;
+    let write_mode = invocation.write_mode;
+    let operator_socket = invocation.operator_socket;
     macro_rules! emit_machine_error {
         ($error:expr, $message:expr) => {{
             if json_output {
@@ -1784,6 +2241,57 @@ pub fn run_push(
         metadata.ticket_path.display()
     );
 
+    let handoff_note = match require_handoff_note(handoff_note_arg) {
+        Ok(note) => note,
+        Err(err) => {
+            fail_with_attempt!("fac_push_handoff_note_missing", err);
+        },
+    };
+
+    let (work_id, resolved_ticket_alias) = match resolve_work_id_for_push(
+        work_id_arg,
+        ticket_alias_arg,
+        &branch,
+        &worktree_dir,
+        operator_socket,
+    ) {
+        Ok(binding) => binding,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_id_resolution_failed", err);
+        },
+    };
+    let runtime_binding = match resolve_runtime_binding_for_push(
+        &work_id,
+        lease_id_arg,
+        session_id_arg,
+        operator_socket,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_runtime_binding_resolution_failed", err);
+        },
+    };
+    let lease_id = runtime_binding.lease_id;
+    let session_id = runtime_binding.session_id;
+    emit_stage(
+        "work_binding_resolved",
+        serde_json::json!({
+            "work_id": work_id,
+            "ticket_alias": resolved_ticket_alias,
+            "lease_id": lease_id,
+            "session_id": session_id,
+        }),
+    );
+    human_log!(
+        "fac push: bound work_id={} lease_id={} session_id={}{}",
+        work_id,
+        lease_id,
+        session_id,
+        resolved_ticket_alias
+            .as_deref()
+            .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
+    );
+
     // Step 1: fail closed on HEAD drift before running queued gates.
     let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -1820,7 +2328,7 @@ pub fn run_push(
             );
             emit_stage("gates_started", serde_json::json!({}));
             let gates_started = Instant::now();
-            let gate_outcome = match run_blocking_evidence_gates(&sha, write_mode) {
+            let gate_outcome = match run_blocking_evidence_gates(&sha, Some(&work_id), write_mode) {
                 Ok(outcome) => {
                     for gate in &outcome.gate_results {
                         let stage = stage_from_gate_name(&gate.gate_name);
@@ -2245,8 +2753,153 @@ pub fn run_push(
             "url": format!("https://github.com/{repo}/pull/{pr_number}"),
         }),
     );
+
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    let dedupe_key = match make_push_session_dedupe_key(&session_id) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_session_dedupe_key_failed", err);
+        },
+    };
+    emit_stage(
+        "work_publication_started",
+        serde_json::json!({
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "pr_number": pr_number,
+            "dedupe_key": dedupe_key,
+        }),
+    );
+
+    let bundle_bytes = match build_changeset_bundle_json(remote, &sha) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail_with_attempt!("fac_push_changeset_bundle_failed", err);
+        },
+    };
+    let handoff_entry_json = match build_context_entry_json(
+        &work_id,
+        WorkContextKind::HandoffNote,
+        &dedupe_key,
+        handoff_note,
+        Some(serde_json::json!({
+            "repo": repo,
+            "branch": branch,
+            "pr_number": pr_number,
+            "head_sha": sha,
+            "ticket_alias": resolved_ticket_alias,
+            "source": "fac.push",
+            "session_id": session_id,
+            "lease_id": lease_id,
+        })),
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail_with_attempt!("fac_push_handoff_entry_build_failed", err);
+        },
+    };
+    let terminal_entry_json = match build_context_entry_json(
+        &work_id,
+        WorkContextKind::ImplementerTerminal,
+        &dedupe_key,
+        format!(
+            "fac push session complete\nrepo: {repo}\npr: #{pr_number}\nbranch: {branch}\nhead_sha: {sha}\n"
+        ),
+        Some(serde_json::json!({
+            "repo": repo,
+            "branch": branch,
+            "pr_number": pr_number,
+            "head_sha": sha,
+            "ticket_alias": resolved_ticket_alias,
+            "source": "fac.push",
+            "mode": "implementer_terminal",
+            "session_id": session_id,
+            "lease_id": lease_id,
+        })),
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail_with_attempt!("fac_push_terminal_entry_build_failed", err);
+        },
+    };
+
+    let rpc_work_id = work_id.clone();
+    let rpc_lease_id = lease_id.clone();
+    let rpc_sha = sha.clone();
+    let rpc_pr_url = pr_url;
+    let rpc_dedupe_key = dedupe_key.clone();
+    let rpc_bundle_bytes = bundle_bytes;
+    let rpc_handoff_entry_json = handoff_entry_json;
+    let rpc_terminal_entry_json = terminal_entry_json;
+    let rpc_result = match with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        let changeset = client
+            .publish_changeset(&rpc_work_id, rpc_bundle_bytes)
+            .await?;
+        let association = client
+            .record_work_pr_association(
+                &rpc_work_id,
+                u64::from(pr_number),
+                &rpc_sha,
+                &rpc_lease_id,
+                Some(&rpc_pr_url),
+            )
+            .await?;
+        let handoff_entry = client
+            .publish_work_context_entry(
+                &rpc_work_id,
+                "HANDOFF_NOTE",
+                &rpc_dedupe_key,
+                rpc_handoff_entry_json,
+                &rpc_lease_id,
+            )
+            .await?;
+        let terminal_entry = client
+            .publish_work_context_entry(
+                &rpc_work_id,
+                "IMPLEMENTER_TERMINAL",
+                &rpc_dedupe_key,
+                rpc_terminal_entry_json,
+                &rpc_lease_id,
+            )
+            .await?;
+        Ok::<_, ProtocolClientError>((changeset, association, handoff_entry, terminal_entry))
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_publication_failed", err);
+        },
+    };
+    let (changeset_response, pr_association_response, handoff_response, terminal_response) =
+        rpc_result;
+    emit_stage(
+        "work_publication_completed",
+        serde_json::json!({
+            "work_id": work_id,
+            "changeset_digest": changeset_response.changeset_digest,
+            "changeset_event_id": changeset_response.event_id,
+            "changeset_cas_hash": changeset_response.cas_hash,
+            "pr_number": pr_association_response.pr_number,
+            "pr_association_already_existed": pr_association_response.already_existed,
+            "handoff_entry_id": handoff_response.entry_id,
+            "implementer_terminal_entry_id": terminal_response.entry_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "dedupe_key": dedupe_key,
+        }),
+    );
+    human_log!(
+        "fac push: published work projection chain (work_id={}, changeset={}, handoff_entry={}, implementer_terminal_entry={})",
+        work_id,
+        changeset_response.changeset_digest,
+        handoff_response.entry_id,
+        terminal_response.entry_id
+    );
+
     let mut successful_projection_targets = Vec::new();
     successful_projection_targets.push("pr_metadata");
+    successful_projection_targets.push("work_projection");
     match fetch_pr_base_sha(repo, pr_number) {
         Ok(base_sha) => {
             if let Err(err) = projection_store::save_prepare_base_snapshot(
@@ -2555,6 +3208,75 @@ mod tests {
     fn ensure_projection_success_for_push_rejects_empty_set() {
         let err = ensure_projection_success_for_push(&[]).expect_err("empty set must fail");
         assert!(err.contains("at least one successful projection"));
+    }
+
+    #[test]
+    fn validate_push_work_id_accepts_canonical_value() {
+        validate_push_work_id("W-12345-abcdef").expect("canonical work_id must pass");
+    }
+
+    #[test]
+    fn validate_push_work_id_rejects_non_canonical_value() {
+        let err = validate_push_work_id("owner/repo").expect_err("non-canonical work_id must fail");
+        assert!(err.contains("must start with `W-`"));
+    }
+
+    #[test]
+    fn make_push_session_dedupe_key_uses_session_id() {
+        let dedupe = make_push_session_dedupe_key("S-1234-5678")
+            .expect("session id dedupe key should be accepted");
+        assert_eq!(dedupe, "S-1234-5678");
+    }
+
+    #[test]
+    fn make_push_session_dedupe_key_rejects_invalid_session_id() {
+        let err = make_push_session_dedupe_key("session/1")
+            .expect_err("invalid session id should be rejected");
+        assert!(err.contains("must start with `S-`") || err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_parses_add_modify_delete() {
+        let raw = b"A\0added.rs\0M\0mod.rs\0D\0deleted.rs\0";
+        let manifest =
+            parse_git_name_status_manifest_z(raw, "base..head").expect("manifest should parse");
+        assert_eq!(manifest.len(), 3);
+        assert_eq!(manifest[0].path, "added.rs");
+        assert_eq!(manifest[0].change_kind, ChangeKind::Add);
+        assert_eq!(manifest[1].path, "mod.rs");
+        assert_eq!(manifest[1].change_kind, ChangeKind::Modify);
+        assert_eq!(manifest[2].path, "deleted.rs");
+        assert_eq!(manifest[2].change_kind, ChangeKind::Delete);
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_parses_rename_and_copy() {
+        let raw = b"R100\0old.rs\0new.rs\0C100\0src.rs\0dst.rs\0";
+        let manifest =
+            parse_git_name_status_manifest_z(raw, "base..head").expect("manifest should parse");
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0].change_kind, ChangeKind::Rename);
+        assert_eq!(manifest[0].old_path.as_deref(), Some("old.rs"));
+        assert_eq!(manifest[0].path, "new.rs");
+        assert_eq!(manifest[1].change_kind, ChangeKind::Modify);
+        assert_eq!(manifest[1].old_path.as_deref(), Some("src.rs"));
+        assert_eq!(manifest[1].path, "dst.rs");
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_rejects_truncated_rename_tokens() {
+        let raw = b"R100\0only-old.rs\0";
+        let err = parse_git_name_status_manifest_z(raw, "base..head")
+            .expect_err("truncated rename should fail");
+        assert!(err.contains("truncated"));
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_rejects_unsupported_status() {
+        let raw = b"Z\0mystery.rs\0";
+        let err = parse_git_name_status_manifest_z(raw, "base..head")
+            .expect_err("unsupported status should fail");
+        assert!(err.contains("unsupported status"));
     }
 
     #[test]

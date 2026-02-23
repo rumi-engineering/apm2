@@ -280,6 +280,7 @@ fn make_orchestrator_step_candidate(job_id: &str, path: PathBuf) -> PendingCandi
     let source = apm2_core::fac::job_spec::JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "test/repo".to_string(),
+        work_id: "W-TEST".to_string(),
         head_sha: "a".repeat(40),
         patch: None,
     };
@@ -1018,7 +1019,11 @@ fn make_receipt_test_spec() -> FacJobSpecV1 {
         },
         source: apm2_core::fac::job_spec::JobSource {
             kind: "mirror_commit".to_string(),
-            repo_id,
+            repo_id: repo_id.clone(),
+            work_id: format!(
+                "W-LEGACY-{}",
+                &blake3::hash(repo_id.as_bytes()).to_hex()[..24]
+            ),
             head_sha: "abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
             patch: None,
         },
@@ -3431,6 +3436,7 @@ fn make_valid_broker_request_json(job_id: &str) -> String {
     let source = JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "test/repo".to_string(),
+        work_id: "W-TEST".to_string(),
         head_sha: "a".repeat(40),
         patch: None,
     };

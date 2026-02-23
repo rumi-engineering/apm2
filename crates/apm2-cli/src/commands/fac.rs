@@ -1099,6 +1099,29 @@ pub struct PushArgs {
     /// id.
     #[arg(long)]
     pub ticket: Option<PathBuf>,
+
+    /// Canonical work identifier to bind projection and daemon publication.
+    #[arg(long = "work-id")]
+    pub work_id: Option<String>,
+
+    /// Optional ticket alias (for example `TCK-00640`) used to resolve
+    /// canonical `work_id` via daemon projection authority.
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
+
+    /// Optional governing lease identifier for privileged work RPC calls.
+    /// When omitted, `fac push` resolves `lease_id` from daemon work status.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
+
+    /// Optional implementer session identifier for terminal-contract dedupe.
+    /// When omitted, `fac push` resolves `session_id` from daemon work status.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+
+    /// Required handoff note body to publish as `HANDOFF_NOTE`.
+    #[arg(long = "handoff-note")]
+    pub handoff_note: Option<String>,
 }
 
 /// Arguments for `apm2 fac logs`.
@@ -3438,14 +3461,20 @@ pub fn run_fac(
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_push(
-                &repo,
-                &args.remote,
-                args.branch.as_deref(),
-                args.ticket.as_deref(),
-                output_json,
-                cmd.queue_write_mode(),
-            )
+            fac_review::run_push(&fac_review::PushRunConfig {
+                repo: &repo,
+                remote: &args.remote,
+                branch: args.branch.as_deref(),
+                ticket: args.ticket.as_deref(),
+                work_id: args.work_id.as_deref(),
+                ticket_alias: args.ticket_alias.as_deref(),
+                lease_id: args.lease_id.as_deref(),
+                session_id: args.session_id.as_deref(),
+                handoff_note: args.handoff_note.as_deref(),
+                json_output: output_json,
+                write_mode: cmd.queue_write_mode(),
+                operator_socket,
+            })
         },
         FacSubcommand::Logs(args) => {
             let output_json = json_output;

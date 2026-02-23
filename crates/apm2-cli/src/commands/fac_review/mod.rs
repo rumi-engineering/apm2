@@ -6280,15 +6280,36 @@ fn run_terminate_inner_for_home(
     Ok(())
 }
 
-pub fn run_push(
-    repo: &str,
-    remote: &str,
-    branch: Option<&str>,
-    ticket: Option<&Path>,
-    json_output: bool,
-    write_mode: QueueWriteMode,
-) -> u8 {
-    push::run_push(repo, remote, branch, ticket, json_output, write_mode)
+pub struct PushRunConfig<'a> {
+    pub repo: &'a str,
+    pub remote: &'a str,
+    pub branch: Option<&'a str>,
+    pub ticket: Option<&'a Path>,
+    pub work_id: Option<&'a str>,
+    pub ticket_alias: Option<&'a str>,
+    pub lease_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub handoff_note: Option<&'a str>,
+    pub json_output: bool,
+    pub write_mode: QueueWriteMode,
+    pub operator_socket: &'a Path,
+}
+
+pub fn run_push(config: &PushRunConfig<'_>) -> u8 {
+    push::run_push(&push::PushInvocation {
+        repo: config.repo,
+        remote: config.remote,
+        branch: config.branch,
+        ticket: config.ticket,
+        work_id_arg: config.work_id,
+        ticket_alias_arg: config.ticket_alias,
+        lease_id_arg: config.lease_id,
+        session_id_arg: config.session_id,
+        handoff_note_arg: config.handoff_note,
+        json_output: config.json_output,
+        write_mode: config.write_mode,
+        operator_socket: config.operator_socket,
+    })
 }
 
 pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {

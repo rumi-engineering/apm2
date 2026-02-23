@@ -91,7 +91,11 @@ use apm2_daemon::protocol::{
     // Evidence publishing
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
     PulseEvent,
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
     ReloadProcessRequest,
@@ -157,6 +161,8 @@ use apm2_daemon::protocol::{
     encode_process_status_request,
     encode_publish_changeset_request,
     encode_publish_evidence_request,
+    encode_publish_work_context_entry_request,
+    encode_record_work_pr_association_request,
     encode_refresh_credential_request,
     encode_reload_process_request,
     encode_remove_credential_request,
@@ -2197,6 +2203,139 @@ impl OperatorClient {
         }
 
         PublishChangeSetResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Records a canonical PR association for an existing `work_id`.
+    pub async fn record_work_pr_association(
+        &mut self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+        lease_id: &str,
+        pr_url: Option<&str>,
+    ) -> Result<RecordWorkPrAssociationResponse, ProtocolClientError> {
+        let request = RecordWorkPrAssociationRequest {
+            work_id: work_id.to_string(),
+            pr_number,
+            commit_sha: commit_sha.to_string(),
+            lease_id: lease_id.to_string(),
+            pr_url: pr_url.unwrap_or_default().to_string(),
+        };
+        let request_bytes = encode_record_work_pr_association_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_record_work_pr_association_response(&response_frame)
+    }
+
+    fn decode_record_work_pr_association_response(
+        frame: &Bytes,
+    ) -> Result<RecordWorkPrAssociationResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::RecordWorkPrAssociation.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected RecordWorkPrAssociation response (tag {}), got tag {tag}",
+                PrivilegedMessageType::RecordWorkPrAssociation.tag()
+            )));
+        }
+
+        RecordWorkPrAssociationResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Publishes a work context entry anchored by `(work_id, kind,
+    /// dedupe_key)`.
+    pub async fn publish_work_context_entry(
+        &mut self,
+        work_id: &str,
+        kind: &str,
+        dedupe_key: &str,
+        entry_json: Vec<u8>,
+        lease_id: &str,
+    ) -> Result<PublishWorkContextEntryResponse, ProtocolClientError> {
+        let request = PublishWorkContextEntryRequest {
+            work_id: work_id.to_string(),
+            kind: kind.to_string(),
+            dedupe_key: dedupe_key.to_string(),
+            entry_json,
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_publish_work_context_entry_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_publish_work_context_entry_response(&response_frame)
+    }
+
+    fn decode_publish_work_context_entry_response(
+        frame: &Bytes,
+    ) -> Result<PublishWorkContextEntryResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::PublishWorkContextEntry.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected PublishWorkContextEntry response (tag {}), got tag {tag}",
+                PrivilegedMessageType::PublishWorkContextEntry.tag()
+            )));
+        }
+
+        PublishWorkContextEntryResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 

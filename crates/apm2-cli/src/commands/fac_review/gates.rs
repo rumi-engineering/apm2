@@ -258,6 +258,8 @@ pub(super) struct QueuedGatesRequest {
     /// TCK-00577: Controls whether the service user ownership gate is
     /// enforced or bypassed for direct queue writes.
     pub(super) write_mode: QueueWriteMode,
+    /// Optional canonical work identifier to bind queue lifecycle identity.
+    pub(super) work_id_override: Option<String>,
 }
 
 /// Queue-backed FAC gates outcome with materialized per-gate rows.
@@ -764,10 +766,15 @@ fn prepare_queued_gates_job(
 
     let job_id = format!("gates-{}", generate_job_suffix());
     let lease_id = format!("gates-lease-{}", generate_job_suffix());
+    let effective_work_id = request
+        .work_id_override
+        .clone()
+        .unwrap_or_else(|| fallback_work_id_for_repo(&repo_source.repo_id));
     let spec = build_gates_job_spec(
         &job_id,
         &lease_id,
         &repo_source.repo_id,
+        &effective_work_id,
         &repo_source.head_sha,
         &policy_digest,
         memory_max_bytes,
@@ -1886,6 +1893,7 @@ fn run_gates_via_worker(
         wait_timeout_secs,
         require_external_worker: false,
         write_mode,
+        work_id_override: None,
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
@@ -2092,6 +2100,7 @@ fn build_gates_job_spec(
     job_id: &str,
     lease_id: &str,
     repo_id: &str,
+    work_id: &str,
     head_sha: &str,
     policy_digest: &[u8; 32],
     memory_max_bytes: u64,
@@ -2124,6 +2133,7 @@ fn build_gates_job_spec(
         source: JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: repo_id.to_string(),
+            work_id: work_id.to_string(),
             head_sha: head_sha.to_string(),
             patch: Some(patch),
         },
@@ -2173,6 +2183,11 @@ fn build_gates_job_spec(
     validate_job_spec_with_policy(&spec, job_spec_policy)
         .map_err(|err| format!("validate job spec: {err}"))?;
     Ok(spec)
+}
+
+fn fallback_work_id_for_repo(repo_id: &str) -> String {
+    let digest = blake3::hash(repo_id.as_bytes()).to_hex();
+    format!("W-LEGACY-{}", &digest[..24])
 }
 
 fn wait_for_gates_job_receipt(
@@ -4506,6 +4521,7 @@ mod tests {
             wait_timeout_secs: 60,
             require_external_worker,
             write_mode: QueueWriteMode::UnsafeLocalWrite,
+            work_id_override: None,
         }
     }
 
@@ -4547,6 +4563,7 @@ mod tests {
             source: JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: repo_id.to_string(),
+                work_id: fallback_work_id_for_repo(repo_id),
                 head_sha: head_sha.to_string(),
                 patch: Some(serde_json::to_value(options).expect("serialize options")),
             },
@@ -5625,6 +5642,7 @@ mod tests {
                 "gates-intent-test",
                 "gates-lease-intent-test",
                 "guardian-intelligence/apm2",
+                "W-GATES-INTENT-TEST",
                 &"d".repeat(40),
                 &policy_digest,
                 256 * 1024 * 1024,
