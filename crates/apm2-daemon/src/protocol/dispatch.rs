@@ -39734,6 +39734,23 @@ mod tests {
         /// The canonical test gate ID.
         const TEST_GOV_GATE_ID: &str = "G-open-work-test-001";
 
+        fn make_work_opened_session_envelope_payload(work_id: &str, actor_id: &str) -> Vec<u8> {
+            let opened_payload = apm2_core::work::helpers::work_opened_payload(
+                work_id,
+                "TICKET",
+                vec![0xAA; 32],
+                vec![],
+                vec![],
+            );
+            serde_json::to_vec(&serde_json::json!({
+                "event_type": "work.opened",
+                "session_id": work_id,
+                "actor_id": actor_id,
+                "payload": hex::encode(opened_payload),
+            }))
+            .expect("work.opened session envelope should encode")
+        }
+
         /// Helper: creates a dispatcher with CAS and PCAC gate wired for
         /// `ClaimWorkV2` tests.
         fn claim_v2_dispatcher() -> PrivilegedDispatcher {
@@ -39818,21 +39835,14 @@ mod tests {
                 .register_claim(claim)
                 .expect("claim registration should succeed");
 
-            // Inject a raw work.opened event for the governing work_id
-            // so the projection recognizes it.
-            let opened_payload = apm2_core::work::helpers::work_opened_payload(
-                TEST_GOV_WORK_ID,
-                "TICKET",
-                vec![0xAA; 32],
-                vec![],
-                vec![],
-            );
+            // Inject a canonical session-envelope work.opened event for the
+            // governing work_id so projection replay matches production decode.
             stub_emitter.inject_raw_event(SignedLedgerEvent {
                 event_id: format!("EVT-gov-{TEST_GOV_WORK_ID}"),
                 event_type: "work.opened".to_string(),
                 work_id: TEST_GOV_WORK_ID.to_string(),
                 actor_id: "test-actor".to_string(),
-                payload: opened_payload,
+                payload: make_work_opened_session_envelope_payload(TEST_GOV_WORK_ID, "test-actor"),
                 signature: vec![0u8; 64],
                 timestamp_ns: 1_000_000_000,
             });
@@ -39943,19 +39953,12 @@ mod tests {
                 })
                 .expect("governing claim registration should succeed");
 
-            let opened_payload = apm2_core::work::helpers::work_opened_payload(
-                TEST_GOV_WORK_ID,
-                "TICKET",
-                vec![0xAA; 32],
-                vec![],
-                vec![],
-            );
             stub_emitter.inject_raw_event(SignedLedgerEvent {
                 event_id: format!("EVT-gov-{TEST_GOV_WORK_ID}"),
                 event_type: "work.opened".to_string(),
                 work_id: TEST_GOV_WORK_ID.to_string(),
                 actor_id: "test-actor".to_string(),
-                payload: opened_payload,
+                payload: make_work_opened_session_envelope_payload(TEST_GOV_WORK_ID, "test-actor"),
                 signature: vec![0u8; 64],
                 timestamp_ns: 1_000_000_000,
             });
@@ -39972,25 +39975,16 @@ mod tests {
             }))
         }
 
-        /// Helper: injects a raw `work.opened` event into the emitter
-        /// so the `ProjectionWorkAuthority` can decode it. This bypasses
-        /// the `handle_open_work` handler to avoid the JSON-envelope
-        /// wrapping issue where `emit_session_event` wraps protobuf
-        /// payloads in JSON that the projection cannot decode.
+        /// Helper: injects a canonical session-envelope `work.opened` event
+        /// into the emitter so `ProjectionWorkAuthority` replay uses the
+        /// same payload contract as production.
         fn inject_work_opened(dispatcher: &PrivilegedDispatcher, work_id: &str) {
-            let payload = apm2_core::work::helpers::work_opened_payload(
-                work_id,
-                "TICKET",
-                vec![0xAA; 32],
-                vec![],
-                vec![],
-            );
             let event = SignedLedgerEvent {
                 event_id: format!("EVT-test-{work_id}"),
                 event_type: "work.opened".to_string(),
                 work_id: work_id.to_string(),
                 actor_id: "test-actor".to_string(),
-                payload,
+                payload: make_work_opened_session_envelope_payload(work_id, "test-actor"),
                 signature: vec![0u8; 64],
                 timestamp_ns: 1_000_000_000,
             };
