@@ -654,7 +654,75 @@ pub(super) fn commit_claimed_job_via_pipeline(
         );
     }
 
+    let dual_write_enabled = fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(
+        fac_root,
+    )
+    .map_err(|err| {
+        ReceiptPipelineError::ReceiptPersistFailed(format!(
+            "resolve lifecycle dual-write flag failed: {err}"
+        ))
+    })?;
+    if dual_write_enabled {
+        let claimed_parent = claimed_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str());
+        if claimed_parent == Some(CLAIMED_DIR) {
+            fac_queue_lifecycle_dual_write::emit_job_started(
+                fac_root,
+                spec,
+                "fac.worker",
+                "fac.worker",
+            )
+            .map_err(|err| {
+                ReceiptPipelineError::ReceiptPersistFailed(format!(
+                    "dual-write lifecycle started event failed: {err}"
+                ))
+            })?;
+        }
+
+        if outcome == FacJobOutcome::Completed {
+            fac_queue_lifecycle_dual_write::emit_job_completed(
+                fac_root,
+                spec,
+                "completed",
+                None,
+                "fac.worker",
+            )
+            .map_err(|err| {
+                ReceiptPipelineError::ReceiptPersistFailed(format!(
+                    "dual-write lifecycle completed event failed: {err}"
+                ))
+            })?;
+        } else {
+            let reason_class = lifecycle_failed_reason_class(outcome, denial_reason);
+            fac_queue_lifecycle_dual_write::emit_job_failed(
+                fac_root,
+                spec,
+                &reason_class,
+                false,
+                None,
+                "fac.worker",
+            )
+            .map_err(|err| {
+                ReceiptPipelineError::ReceiptPersistFailed(format!(
+                    "dual-write lifecycle failed event failed: {err}"
+                ))
+            })?;
+        }
+    }
+
     Ok(result.job_terminal_path)
+}
+
+fn lifecycle_failed_reason_class(
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+) -> String {
+    if let Some(code) = denial_reason {
+        return strip_json_string_quotes(&serialize_to_json_string(&code));
+    }
+    strip_json_string_quotes(&serialize_to_json_string(&outcome))
 }
 
 /// Handle a pipeline commit failure for a denial/failure path.

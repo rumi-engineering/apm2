@@ -5106,20 +5106,297 @@ fn runtime_repair_state_machine_retains_failed_request_until_success() {
 }
 
 #[test]
+fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
+    use apm2_core::fac::job_lifecycle::{
+        FAC_JOB_CLAIMED_EVENT_TYPE, FAC_JOB_COMPLETED_EVENT_TYPE, FAC_JOB_ENQUEUED_EVENT_TYPE,
+        FAC_JOB_FAILED_EVENT_TYPE, FAC_JOB_RELEASED_EVENT_TYPE, FAC_JOB_STARTED_EVENT_TYPE,
+    };
+    use apm2_core::fac::service_user_gate::QueueWriteMode;
+
+    let _guard = env_var_test_lock().lock().expect("serialize env test");
+    let original_apm2_home = std::env::var_os("APM2_HOME");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let apm2_home = dir.path().join(".apm2");
+    let fac_root = apm2_home.join("private").join("fac");
+    let queue_root = apm2_home.join("queue");
+    std::fs::create_dir_all(&fac_root).expect("create fac root");
+    ensure_queue_dirs(&queue_root).expect("create queue dirs");
+    set_env_var_for_test("APM2_HOME", &apm2_home);
+
+    let mut policy = FacPolicyV1::default_policy();
+    policy.queue_lifecycle_dual_write_enabled = true;
+    persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+
+    let mut spec_completed = make_receipt_test_spec();
+    spec_completed.job_id = "job-lifecycle-completed".to_string();
+    spec_completed.job_spec_digest = format!("b3-256:{}", "1".repeat(64));
+    spec_completed.actuation.lease_id = "lease-lifecycle-completed".to_string();
+
+    let mut spec_released = make_receipt_test_spec();
+    spec_released.job_id = "job-lifecycle-released".to_string();
+    spec_released.job_spec_digest = format!("b3-256:{}", "2".repeat(64));
+    spec_released.actuation.lease_id = "lease-lifecycle-released".to_string();
+
+    let mut spec_failed = make_receipt_test_spec();
+    spec_failed.job_id = "job-lifecycle-failed".to_string();
+    spec_failed.job_spec_digest = format!("b3-256:{}", "3".repeat(64));
+    spec_failed.actuation.lease_id = "lease-lifecycle-failed".to_string();
+
+    let channel_boundary = ChannelBoundaryTrace {
+        passed: true,
+        defect_count: 0,
+        defect_classes: Vec::new(),
+        token_fac_policy_hash: None,
+        token_canonicalizer_tuple_digest: None,
+        token_boundary_id: None,
+        token_issued_at_tick: None,
+        token_expiry_tick: None,
+    };
+    let queue_admission = JobQueueAdmissionTrace {
+        verdict: "allow".to_string(),
+        queue_lane: "control".to_string(),
+        defect_reason: None,
+        cost_estimate_ticks: None,
+    };
+
+    for spec in [&spec_completed, &spec_released, &spec_failed] {
+        crate::commands::fac_queue_submit::enqueue_job(
+            &queue_root,
+            &fac_root,
+            spec,
+            &QueueBoundsPolicy::default(),
+            QueueWriteMode::UnsafeLocalWrite,
+            true,
+        )
+        .expect("enqueue with lifecycle dual-write");
+    }
+
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    let completed_file_name = format!("{}.json", spec_completed.job_id);
+    let pending_completed = queue_root.join(PENDING_DIR).join(&completed_file_name);
+    let (claimed_completed, completed_lock_file) = claim_pending_job_with_exclusive_lock(
+        &pending_completed,
+        &claimed_dir,
+        &completed_file_name,
+        &fac_root,
+        true,
+    )
+    .expect("claim completed job");
+    drop(completed_lock_file);
+    let completed_terminal = commit_claimed_job_via_pipeline(
+        &fac_root,
+        &queue_root,
+        &spec_completed,
+        &claimed_completed,
+        &completed_file_name,
+        FacJobOutcome::Completed,
+        None,
+        "completed",
+        Some(&channel_boundary),
+        Some(&queue_admission),
+        None,
+        None,
+        None,
+        &spec_completed.job_spec_digest,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("commit completed job");
+    assert!(
+        completed_terminal.starts_with(queue_root.join(COMPLETED_DIR)),
+        "completed job must move to completed/"
+    );
+
+    let released_file_name = format!("{}.json", spec_released.job_id);
+    let pending_released = queue_root.join(PENDING_DIR).join(&released_file_name);
+    let (claimed_released, released_lock_file) = claim_pending_job_with_exclusive_lock(
+        &pending_released,
+        &claimed_dir,
+        &released_file_name,
+        &fac_root,
+        true,
+    )
+    .expect("claim released job");
+    drop(released_lock_file);
+    let released_path = release_claimed_job_to_pending(
+        &claimed_released,
+        &queue_root,
+        &released_file_name,
+        &fac_root,
+        &spec_released,
+        "test_release_to_pending",
+    )
+    .expect("release claimed job back to pending");
+    assert!(
+        released_path.starts_with(queue_root.join(PENDING_DIR)),
+        "released job must move back to pending/"
+    );
+
+    let failed_file_name = format!("{}.json", spec_failed.job_id);
+    let pending_failed = queue_root.join(PENDING_DIR).join(&failed_file_name);
+    let (claimed_failed, failed_lock_file) = claim_pending_job_with_exclusive_lock(
+        &pending_failed,
+        &claimed_dir,
+        &failed_file_name,
+        &fac_root,
+        true,
+    )
+    .expect("claim failed job");
+    drop(failed_lock_file);
+    let failed_terminal = commit_claimed_job_via_pipeline(
+        &fac_root,
+        &queue_root,
+        &spec_failed,
+        &claimed_failed,
+        &failed_file_name,
+        FacJobOutcome::Denied,
+        Some(DenialReasonCode::ValidationFailed),
+        "denied",
+        Some(&channel_boundary),
+        Some(&queue_admission),
+        None,
+        None,
+        None,
+        &spec_failed.job_spec_digest,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("commit failed job");
+    assert!(
+        failed_terminal.starts_with(queue_root.join(DENIED_DIR)),
+        "failed job must move to denied/"
+    );
+
+    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
+        .expect("open lifecycle ledger");
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .expect("set sqlite busy timeout");
+
+    let has_legacy_events = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    let has_canonical_events = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+
+    let mut counts = HashMap::new();
+    for event_type in [
+        FAC_JOB_ENQUEUED_EVENT_TYPE,
+        FAC_JOB_CLAIMED_EVENT_TYPE,
+        FAC_JOB_STARTED_EVENT_TYPE,
+        FAC_JOB_COMPLETED_EVENT_TYPE,
+        FAC_JOB_RELEASED_EVENT_TYPE,
+        FAC_JOB_FAILED_EVENT_TYPE,
+    ] {
+        let mut total = 0usize;
+        if has_legacy_events {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
+                    [event_type],
+                    |row| row.get(0),
+                )
+                .expect("count legacy lifecycle events");
+            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+        }
+        if has_canonical_events {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                    [event_type],
+                    |row| row.get(0),
+                )
+                .expect("count canonical lifecycle events");
+            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+        }
+        counts.insert(event_type.to_string(), total);
+    }
+
+    assert!(
+        counts
+            .get(FAC_JOB_ENQUEUED_EVENT_TYPE)
+            .copied()
+            .unwrap_or(0)
+            >= 3,
+        "enqueue transitions must dual-write fac.job.enqueued"
+    );
+    assert!(
+        counts.get(FAC_JOB_CLAIMED_EVENT_TYPE).copied().unwrap_or(0) >= 3,
+        "claim transitions must dual-write fac.job.claimed"
+    );
+    assert!(
+        counts.get(FAC_JOB_STARTED_EVENT_TYPE).copied().unwrap_or(0) >= 2,
+        "terminal claimed flows must dual-write fac.job.started"
+    );
+    assert!(
+        counts
+            .get(FAC_JOB_COMPLETED_EVENT_TYPE)
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "completed transitions must dual-write fac.job.completed"
+    );
+    assert!(
+        counts
+            .get(FAC_JOB_RELEASED_EVENT_TYPE)
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "release transitions must dual-write fac.job.released"
+    );
+    assert!(
+        counts.get(FAC_JOB_FAILED_EVENT_TYPE).copied().unwrap_or(0) >= 1,
+        "failed transitions must dual-write fac.job.failed"
+    );
+
+    if let Some(value) = original_apm2_home {
+        set_env_var_for_test("APM2_HOME", value);
+    } else {
+        remove_env_var_for_test("APM2_HOME");
+    }
+}
+
+#[test]
 fn claim_pending_job_with_exclusive_lock_holds_lock_for_job_lifecycle() {
     let temp = tempfile::tempdir().expect("tempdir");
     let queue_root = temp.path().join("queue");
+    let fac_root = temp.path().join("private").join("fac");
     let pending_dir = queue_root.join(PENDING_DIR);
     let claimed_dir = queue_root.join(CLAIMED_DIR);
+    std::fs::create_dir_all(&fac_root).expect("create fac root");
     std::fs::create_dir_all(&pending_dir).expect("create pending");
     std::fs::create_dir_all(&claimed_dir).expect("create claimed");
 
     let pending_path = pending_dir.join("lock-test.json");
     std::fs::write(&pending_path, b"{\"job_id\":\"lock-test\"}").expect("write pending spec");
 
-    let (claimed_path, claimed_lock_file) =
-        claim_pending_job_with_exclusive_lock(&pending_path, &claimed_dir, "lock-test.json")
-            .expect("claim+lock pending job");
+    let (claimed_path, claimed_lock_file) = claim_pending_job_with_exclusive_lock(
+        &pending_path,
+        &claimed_dir,
+        "lock-test.json",
+        &fac_root,
+        false,
+    )
+    .expect("claim+lock pending job");
     assert!(
         !pending_path.exists(),
         "pending file should move to claimed during claim"

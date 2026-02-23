@@ -660,10 +660,21 @@ impl JobLifecycleRehydrationReconciler {
         projection: &JobLifecycleProjectionV1,
         applied_fs_ops: &mut usize,
     ) -> Result<(), JobLifecycleProjectionError> {
-        let expected_files = projection
+        let expected_pending_files = projection
             .jobs
             .values()
             .filter(|record| record.status == ProjectedJobStatus::Pending)
+            .filter_map(|record| safe_job_file_name(&record.queue_job_id).ok())
+            .collect::<BTreeSet<_>>();
+        let expected_claimed_files = projection
+            .jobs
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    ProjectedJobStatus::Claimed | ProjectedJobStatus::Running
+                )
+            })
             .filter_map(|record| safe_job_file_name(&record.queue_job_id).ok())
             .collect::<BTreeSet<_>>();
 
@@ -671,11 +682,23 @@ impl JobLifecycleRehydrationReconciler {
             return Ok(());
         }
 
-        // Unknown-file cleanup is intentionally restricted to `pending/`.
+        // Unknown-file cleanup is intentionally restricted to `pending/` and
+        // `claimed/`.
         // Terminal witness files (`completed/`, `denied/`) must be preserved
         // even when in-memory projection entries are evicted.
-        let pending_dir_path = self.queue_root.join(PENDING_DIR);
-        let Ok(entries) = fs::read_dir(&pending_dir_path) else {
+        self.cleanup_unknown_files_in_dir(PENDING_DIR, &expected_pending_files, applied_fs_ops)?;
+        self.cleanup_unknown_files_in_dir(CLAIMED_DIR, &expected_claimed_files, applied_fs_ops)?;
+        Ok(())
+    }
+
+    fn cleanup_unknown_files_in_dir(
+        &self,
+        dir_name: &str,
+        expected_files: &BTreeSet<String>,
+        applied_fs_ops: &mut usize,
+    ) -> Result<(), JobLifecycleProjectionError> {
+        let dir_path = self.queue_root.join(dir_name);
+        let Ok(entries) = fs::read_dir(&dir_path) else {
             return Ok(());
         };
         for entry in entries {
@@ -696,8 +719,9 @@ impl JobLifecycleRehydrationReconciler {
             }
             fs::remove_file(&path).map_err(|err| {
                 JobLifecycleProjectionError::Io(format!(
-                    "remove unknown queue file {}: {err}",
-                    path.display()
+                    "remove unknown queue file {} in {}: {err}",
+                    path.display(),
+                    dir_name,
                 ))
             })?;
             *applied_fs_ops = applied_fs_ops.saturating_add(1);
@@ -926,8 +950,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue_root = make_queue_root(&tmp);
         fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::create_dir_all(queue_root.join(CLAIMED_DIR)).expect("create claimed");
         fs::create_dir_all(queue_root.join(COMPLETED_DIR)).expect("create completed");
         fs::write(queue_root.join(PENDING_DIR).join("orphan.json"), b"{}").expect("seed orphan");
+        fs::write(
+            queue_root.join(CLAIMED_DIR).join("orphan-claimed.json"),
+            b"{}",
+        )
+        .expect("seed orphan claimed");
         fs::write(queue_root.join(COMPLETED_DIR).join("terminal.json"), b"{}")
             .expect("seed completed");
 
@@ -944,6 +974,13 @@ mod tests {
         assert!(
             !queue_root.join(PENDING_DIR).join("orphan.json").exists(),
             "unknown filesystem state must be removed when ledger has no matching lifecycle event"
+        );
+        assert!(
+            !queue_root
+                .join(CLAIMED_DIR)
+                .join("orphan-claimed.json")
+                .exists(),
+            "unknown claimed state must be removed when ledger has no matching lifecycle event"
         );
         assert!(
             queue_root

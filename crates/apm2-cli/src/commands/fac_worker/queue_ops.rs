@@ -107,6 +107,8 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
     pending_path: &Path,
     claimed_dir: &Path,
     file_name: &str,
+    fac_root: &Path,
+    dual_write_enabled: bool,
 ) -> Result<(PathBuf, fs::File), String> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
@@ -142,10 +144,59 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         )
     })?;
 
+    let dual_write_spec = if dual_write_enabled {
+        let bytes = read_bounded(pending_path, MAX_JOB_SPEC_SIZE)
+            .map_err(|err| format!("cannot read pending job for dual-write claim event: {err}"))?;
+        Some(deserialize_job_spec(&bytes).map_err(|err| {
+            format!("cannot deserialize pending job for dual-write claim event: {err}")
+        })?)
+    } else {
+        None
+    };
+
     let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
         .map_err(|err| format!("atomic claim failed: {err}"))?;
 
+    if let Some(spec) = dual_write_spec.as_ref() {
+        fac_queue_lifecycle_dual_write::emit_job_claimed(
+            fac_root,
+            spec,
+            &spec.actuation.lease_id,
+            "fac.worker",
+        )
+        .map_err(|err| format!("dual-write lifecycle claim event failed: {err}"))?;
+    }
+
     Ok((claimed_path, claimed_lock_file))
+}
+
+pub(super) fn release_claimed_job_to_pending(
+    claimed_path: &Path,
+    queue_root: &Path,
+    claimed_file_name: &str,
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    let moved_path = move_to_dir_safe(
+        claimed_path,
+        &queue_root.join(PENDING_DIR),
+        claimed_file_name,
+    )
+    .map_err(|err| format!("move claimed job back to pending failed: {err}"))?;
+
+    if fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root)? {
+        fac_queue_lifecycle_dual_write::emit_job_released(
+            fac_root,
+            spec,
+            reason,
+            Some(spec.actuation.lease_id.clone()),
+            "fac.worker",
+        )
+        .map_err(|err| format!("dual-write lifecycle release event failed: {err}"))?;
+    }
+
+    Ok(moved_path)
 }
 
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`

@@ -763,8 +763,14 @@ impl WorkerOrchestrator {
 
             // Atomic claim via rename.
             let claimed_dir = queue_root.join(CLAIMED_DIR);
-            let claimed_path = match move_to_dir_safe(path, &claimed_dir, &file_name) {
-                Ok(p) => p,
+            let (claimed_path, _claimed_lock_file) = match claim_pending_job_with_exclusive_lock(
+                path,
+                &claimed_dir,
+                &file_name,
+                fac_root,
+                policy.queue_lifecycle_dual_write_enabled,
+            ) {
+                Ok(result) => result,
                 Err(e) => {
                     return IdlePhaseOutcome::Done(JobOutcome::skipped(format!(
                         "atomic claim failed: {e}"
@@ -1727,15 +1733,20 @@ impl WorkerOrchestrator {
         // lifecycle so runtime reconcile's flock probe cannot reclaim actively
         // executing jobs.
         let claimed_dir = queue_root.join(CLAIMED_DIR);
-        let (claimed_path, claimed_lock_file) =
-            match claim_pending_job_with_exclusive_lock(path, &claimed_dir, &file_name) {
-                Ok(result) => result,
-                Err(e) => {
-                    // Another worker may have claimed first, or the entry failed lock
-                    // invariants; skip this candidate and continue.
-                    return IdlePhaseOutcome::Done(JobOutcome::skipped(e));
-                },
-            };
+        let (claimed_path, claimed_lock_file) = match claim_pending_job_with_exclusive_lock(
+            path,
+            &claimed_dir,
+            &file_name,
+            fac_root,
+            policy.queue_lifecycle_dual_write_enabled,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                // Another worker may have claimed first, or the entry failed lock
+                // invariants; skip this candidate and continue.
+                return IdlePhaseOutcome::Done(JobOutcome::skipped(e));
+            },
+        };
 
         let claimed_file_name = claimed_path
             .file_name()
@@ -1855,10 +1866,13 @@ impl WorkerOrchestrator {
         let lane_mgr = match LaneManager::new(fac_root.to_path_buf()) {
             Ok(mgr) => mgr,
             Err(e) => {
-                if let Err(move_err) = move_to_dir_safe(
+                if let Err(move_err) = release_claimed_job_to_pending(
                     &claimed_path,
-                    &queue_root.join(PENDING_DIR),
+                    queue_root,
                     &claimed_file_name,
+                    fac_root,
+                    spec,
+                    "lane_manager_init_failed",
                 ) {
                     eprintln!(
                         "worker: WARNING: failed to return claimed job to pending: {move_err}"
@@ -1876,10 +1890,13 @@ impl WorkerOrchestrator {
         let lane_ids = LaneManager::default_lane_ids();
         let Some((lane_guard, acquired_lane_id)) = acquire_worker_lane(&lane_mgr, &lane_ids) else {
             // No lane available -> move back to pending for retry.
-            if let Err(move_err) = move_to_dir_safe(
+            if let Err(move_err) = release_claimed_job_to_pending(
                 &claimed_path,
-                &queue_root.join(PENDING_DIR),
+                queue_root,
                 &claimed_file_name,
+                fac_root,
+                spec,
+                "no_lane_available",
             ) {
                 eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
             }
@@ -2954,10 +2971,13 @@ impl WorkerOrchestrator {
         ) {
             eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
             let _ = LaneLeaseV1::remove(&lane_dir);
-            if let Err(move_err) = move_to_dir_safe(
+            if let Err(move_err) = release_claimed_job_to_pending(
                 &claimed_path,
-                &queue_root.join(PENDING_DIR),
+                queue_root,
                 &claimed_file_name,
+                fac_root,
+                spec,
+                "pipeline_commit_failed",
             ) {
                 eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
             }

@@ -1,16 +1,20 @@
 //! Temporary dual-write helper for FAC queue lifecycle migration.
 //!
 //! When enabled by `FacPolicyV1.queue_lifecycle_dual_write_enabled`, queue
-//! mutation paths emit `fac.job.*` lifecycle events into a local SQLite-backed
-//! ledger stream (`queue_lifecycle_ledger.db`) in addition to filesystem
-//! mutations.
+//! mutation paths emit `fac.job.*` lifecycle events into the daemon
+//! authoritative `SQLite` ledger stream in addition to filesystem mutations.
 #![allow(dead_code)] // Staged migration helper: additional emit_* paths wire in follow-up tickets.
 
-use std::path::Path;
+#[cfg(not(test))]
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use apm2_core::fac::FacJobSpecV1;
+#[cfg(not(test))]
+use apm2_core::config::EcosystemConfig;
 use apm2_core::fac::job_lifecycle::{
     FAC_JOB_CLAIMED_EVENT_TYPE, FAC_JOB_COMPLETED_EVENT_TYPE, FAC_JOB_ENQUEUED_EVENT_TYPE,
     FAC_JOB_FAILED_EVENT_TYPE, FAC_JOB_RELEASED_EVENT_TYPE, FAC_JOB_STARTED_EVENT_TYPE,
@@ -18,13 +22,29 @@ use apm2_core::fac::job_lifecycle::{
     FacJobIdentityV1, FacJobLifecycleEventData, FacJobLifecycleEventV1, FacJobReleasedV1,
     FacJobStartedV1, MAX_JOB_LIFECYCLE_STRING_LENGTH, derive_content_addressable_job_id,
 };
+use apm2_core::fac::{FacJobSpecV1, MAX_POLICY_SIZE, deserialize_policy};
 use apm2_daemon::ledger::SqliteLedgerEventEmitter;
 use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
 use rusqlite::Connection;
 
-use super::fac_key_material;
+use super::{fac_key_material, fac_secure_io};
 
-const QUEUE_LIFECYCLE_LEDGER_DB: &str = "queue_lifecycle_ledger.db";
+#[cfg(not(test))]
+const DEFAULT_CONFIG_FILE: &str = "ecosystem.toml";
+#[cfg(test)]
+const TEST_QUEUE_LIFECYCLE_LEDGER_DB: &str = "queue_lifecycle_ledger.db";
+
+pub(super) fn queue_lifecycle_dual_write_enabled(fac_root: &Path) -> Result<bool, String> {
+    let policy_path = fac_root.join("policy").join("fac_policy.v1.json");
+    if !policy_path.exists() {
+        return Ok(false);
+    }
+
+    let bytes = fac_secure_io::read_bounded(&policy_path, MAX_POLICY_SIZE)?;
+    let policy = deserialize_policy(&bytes)
+        .map_err(|err| format!("cannot load fac policy for lifecycle dual-write flag: {err}"))?;
+    Ok(policy.queue_lifecycle_dual_write_enabled)
+}
 
 /// Emits `fac.job.enqueued` for the given spec.
 pub(super) fn emit_job_enqueued(
@@ -177,7 +197,15 @@ fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmit
     let secret_key_bytes = signer.secret_key_bytes();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
 
-    let db_path = fac_root.join(QUEUE_LIFECYCLE_LEDGER_DB);
+    let db_path = resolve_authoritative_ledger_db_path()?;
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create lifecycle ledger parent directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
     let conn = Connection::open(&db_path)
         .map_err(|err| format!("open queue lifecycle ledger {}: {err}", db_path.display()))?;
     SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key).map_err(|err| {
@@ -191,6 +219,84 @@ fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmit
         Arc::new(Mutex::new(conn)),
         signing_key,
     ))
+}
+
+fn resolve_authoritative_ledger_db_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        let home = apm2_core::github::resolve_apm2_home()
+            .ok_or_else(|| "could not resolve APM2 home for lifecycle test ledger".to_string())?;
+        Ok(home
+            .join("private")
+            .join("fac")
+            .join(TEST_QUEUE_LIFECYCLE_LEDGER_DB))
+    }
+
+    #[cfg(not(test))]
+    {
+        let config_path = resolve_daemon_config_path(Path::new(DEFAULT_CONFIG_FILE));
+        if config_path.exists()
+            && let Ok(config) = EcosystemConfig::from_file(&config_path)
+            && let Some(ledger_db) = config.daemon.ledger_db
+        {
+            return Ok(ledger_db);
+        }
+
+        let config = EcosystemConfig::from_env();
+        config
+            .daemon
+            .ledger_db
+            .ok_or_else(|| "daemon ledger_db is not configured".to_string())
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_daemon_config_path(config_path: &Path) -> PathBuf {
+    if config_path != Path::new(DEFAULT_CONFIG_FILE) {
+        return config_path.to_path_buf();
+    }
+
+    let Some(common_dir) = resolve_git_common_dir() else {
+        return config_path.to_path_buf();
+    };
+
+    if common_dir.file_name() != Some(OsStr::new(".git")) {
+        return config_path.to_path_buf();
+    }
+    let Some(repo_root) = common_dir.parent() else {
+        return config_path.to_path_buf();
+    };
+
+    let shared_config = repo_root.join(DEFAULT_CONFIG_FILE);
+    if shared_config.exists() {
+        shared_config
+    } else {
+        config_path.to_path_buf()
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_git_common_dir() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let raw = stdout.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
 }
 
 fn identity_from_spec(spec: &FacJobSpecV1) -> Result<FacJobIdentityV1, String> {

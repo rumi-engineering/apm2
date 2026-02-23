@@ -661,10 +661,13 @@ pub(super) fn execute_queued_gates_job(
             toolchain_fingerprint,
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
-            if let Err(move_err) = move_to_dir_safe(
+            if let Err(move_err) = release_claimed_job_to_pending(
                 claimed_path,
-                &queue_root.join(PENDING_DIR),
+                queue_root,
                 claimed_file_name,
+                fac_root,
+                spec,
+                "gates_pipeline_commit_failed",
             ) {
                 eprintln!(
                     "worker: WARNING: failed to return claimed gates job to pending: {move_err}"
@@ -1828,10 +1831,13 @@ pub(super) fn execute_warm_job(
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        if let Err(move_err) = move_to_dir_safe(
+        if let Err(move_err) = release_claimed_job_to_pending(
             claimed_path,
-            &queue_root.join(PENDING_DIR),
+            queue_root,
             claimed_file_name,
+            fac_root,
+            spec,
+            "warm_pipeline_commit_failed",
         ) {
             eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
         }
