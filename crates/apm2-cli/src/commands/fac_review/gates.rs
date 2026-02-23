@@ -8104,13 +8104,26 @@ time.sleep(20)\n",
             .save_to_dir(&v3_root)
             .expect("persist v3 cache for run2");
 
-        // ---- Run 2 (warm): exercises the evidence pipeline with seeded cache ----
-        // Call run_evidence_gates_with_lane_context directly (same pattern as
-        // non_status_evidence_path_reuses_v3_cache_entries in evidence.rs).
-        // This uses skip_test_gate=false so cache_reuse_active is true, and
-        // passes the bare nextest command as test_command so the attestation
-        // digests match the seeded cache. The merge conflict gate is skipped
-        // (it was already validated and is never cached).
+        // ---- Run 2 (warm): full pipeline including prep phase with seeded cache ----
+        // TCK-00627 BLOCKER fix: invoke the full pipeline including the prep
+        // phase so that prep_duration_ms comes from actual execution, not a
+        // hardcoded zero. The prep phase (readiness controller, singleflight
+        // lock reap, dependency closure hydration) runs first, then the
+        // evidence gate execution with cache reuse enabled.
+        //
+        // Phase 1: Prep phase (timed, same as run_gates_phases does).
+        let run2_prep_started = Instant::now();
+        let mut run2_prep_steps = Vec::new();
+        run_prep_phase(&repo, &mut run2_prep_steps, None)
+            .map_err(|e| e.message)
+            .expect("run2 prep phase should complete successfully");
+        let run2_prep_duration_ms = duration_ms(run2_prep_started.elapsed());
+
+        // Phase 2: Execute phase — evidence gates with cache reuse enabled.
+        // Uses skip_test_gate=false so cache_reuse_active is true, and passes
+        // the bare nextest command as test_command so the attestation digests
+        // match the seeded cache. The merge conflict gate is skipped (it was
+        // already validated in run1 and is never cached).
         let lane_manager =
             apm2_core::fac::LaneManager::from_default_home().expect("lane manager for run2");
         lane_manager
@@ -8135,16 +8148,17 @@ time.sleep(20)\n",
             gate_resource_policy: Some(resource_policy),
         };
 
-        let run2_started = Instant::now();
+        let run2_execute_started = Instant::now();
         let (run2_passed, run2_gate_results) =
             run_evidence_gates_with_lane_context(&repo, sha, None, Some(&run2_opts), lane_context)
                 .expect("run2 (warm) evidence gates should complete successfully");
-        // Truncation is safe: a u128 millis value exceeding u64::MAX would
-        // require ~584 million years of elapsed time.
-        #[allow(clippy::cast_possible_truncation)]
-        let run2_execute_ms = run2_started.elapsed().as_millis() as u64;
+        let run2_execute_duration_ms = duration_ms(run2_execute_started.elapsed());
 
         assert!(run2_passed, "run2 must pass all evidence gates");
+
+        // Combine prep + execute into total_duration_ms (same as
+        // run_gates_inner_detailed does for production GatesSummary).
+        let run2_total_duration_ms = run2_prep_duration_ms.saturating_add(run2_execute_duration_ms);
 
         // Compute cache counts from real evidence gate results (same as
         // run_execute_phase does for GatesSummary).
@@ -8158,7 +8172,8 @@ time.sleep(20)\n",
         );
 
         // ---- SLO invariant verification on real run2 data ----
-        // All assertions use the *actual* evidence gate results from run2.
+        // All assertions use the *actual* evidence gate results and real
+        // timing from both the prep and execute phases.
 
         // S3 invariant 3: run2.cache_hit_count == run1.total_gate_count.
         // This is a real assertion — the evidence layer counted actual v3
@@ -8172,40 +8187,40 @@ time.sleep(20)\n",
         );
 
         // S3 invariant 4: run2.total_duration_ms <= run1.total_duration_ms * 0.20.
-        // Use a floor of 2000 ms to absorb prep overhead (lock acquisition,
-        // git rev-parse, merge-conflict gate) on very fast cold runs. The
-        // run2_execute_ms measures wall-clock time for the evidence pipeline
-        // call (cache lookups only, no compilation).
+        // Strictly enforced per ticket requirement: "it must not be loosened
+        // ad-hoc in the implementation." No floor, no saturating_add.
         let cold_total_ms = run1.total_duration_ms.max(1);
         let threshold_20_pct = cold_total_ms / 5;
-        let slo_ceiling = threshold_20_pct.saturating_add(2000);
         assert!(
-            run2_execute_ms <= slo_ceiling,
-            "run2 execute_ms ({run2_execute_ms}) must be <= 20%% of run1 total \
-             ({cold_total_ms}) + 2000ms floor = {slo_ceiling}; \
-             cache-hit runs should be substantially faster than cold runs",
+            run2_total_duration_ms <= threshold_20_pct,
+            "run2 total_duration_ms ({run2_total_duration_ms}) must be <= 20%% of run1 total \
+             ({cold_total_ms}) = {threshold_20_pct}; \
+             cache-hit runs must be substantially faster than cold runs \
+             (prep_ms={run2_prep_duration_ms}, execute_ms={run2_execute_duration_ms})",
         );
 
         // S3 invariant 5: run2.prep_duration_ms <= 500.
-        // Since run2 calls the evidence layer directly (no separate prep
-        // phase), use the execute_ms as the total. The prep phase in a full
-        // gates run is lock+git+policy, which adds negligible overhead.
-        // All cache-hit runs finish in well under 500ms.
+        // Uses the actual prep phase duration from the pipeline, not a
+        // hardcoded value. The prep phase (readiness controller, singleflight
+        // reap, dependency closure hydration) is expected to complete quickly
+        // on a warm substrate.
         assert!(
-            run2_execute_ms <= WARM_PATH_PREP_THRESHOLD_MS,
-            "run2 execute_ms ({run2_execute_ms}) must be <= {WARM_PATH_PREP_THRESHOLD_MS} ms; \
-             a fully cached run should complete very quickly",
+            run2_prep_duration_ms <= WARM_PATH_PREP_THRESHOLD_MS,
+            "run2 prep_duration_ms ({run2_prep_duration_ms}) must be <= \
+             {WARM_PATH_PREP_THRESHOLD_MS} ms; the prep phase should complete quickly \
+             on a warm substrate",
         );
 
         // S3 invariant 6: is_warm_run == true.
-        // Compute using the same function as the production pipeline does.
+        // Compute using the same function as the production pipeline does,
+        // passing the actual prep_duration_ms (not execute_ms).
         let (run2_is_warm, run2_slo_violation) =
-            compute_warm_path_slo(run2_total_gates, run2_cache_hits, run2_execute_ms);
+            compute_warm_path_slo(run2_total_gates, run2_cache_hits, run2_prep_duration_ms);
         assert!(
             run2_is_warm,
             "run2 must be a warm run (is_warm_run=true); \
              cache_hit_count={run2_cache_hits}, total_gate_count={run2_total_gates}, \
-             duration_ms={run2_execute_ms}",
+             prep_duration_ms={run2_prep_duration_ms}",
         );
         assert!(
             run2_slo_violation.is_none(),
@@ -8213,7 +8228,7 @@ time.sleep(20)\n",
         );
 
         // Verify the emitted run_summary event carries correct fields
-        // by constructing a GatesSummary from the real run2 results.
+        // by constructing a GatesSummary from the real run2 pipeline results.
         let run2_summary = GatesSummary {
             sha: sha.clone(),
             passed: run2_passed,
@@ -8224,16 +8239,16 @@ time.sleep(20)\n",
             effective_test_parallelism: 2,
             requested_timeout_seconds: 30,
             effective_timeout_seconds: 30,
-            prep_duration_ms: 0,
-            execute_duration_ms: run2_execute_ms,
-            total_duration_ms: run2_execute_ms,
+            prep_duration_ms: run2_prep_duration_ms,
+            execute_duration_ms: run2_execute_duration_ms,
+            total_duration_ms: run2_total_duration_ms,
             total_gate_count: run2_total_gates,
             cache_hit_count: run2_cache_hits,
             cache_miss_count: run2_cache_misses,
             is_warm_run: run2_is_warm,
             slo_violation: run2_slo_violation,
             phase_failed: None,
-            prep_steps: Vec::new(),
+            prep_steps: run2_prep_steps,
             cache_status: "write-through".to_string(),
             gates: Vec::new(),
         };
@@ -8259,6 +8274,13 @@ time.sleep(20)\n",
                 .and_then(serde_json::Value::as_u64),
             Some(u64::from(run2_total_gates)),
             "emitted total_gate_count must be present in run_summary event"
+        );
+        assert_eq!(
+            payload
+                .get("prep_duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(run2_prep_duration_ms),
+            "emitted prep_duration_ms must match actual run2 prep phase timing"
         );
     }
 }
