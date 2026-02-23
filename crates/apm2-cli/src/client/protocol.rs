@@ -44,6 +44,8 @@ use apm2_daemon::protocol::{
     // Privileged endpoint messages
     ClaimWorkRequest,
     ClaimWorkResponse,
+    ClaimWorkV2Request,
+    ClaimWorkV2Response,
     // Handshake
     ClientHandshake,
     // TCK-00345: Consensus query messages
@@ -143,6 +145,7 @@ use apm2_daemon::protocol::{
     // Encoding helpers
     encode_add_credential_request,
     encode_claim_work_request,
+    encode_claim_work_v2_request,
     // TCK-00345: Consensus query encoding
     encode_consensus_byzantine_evidence_request,
     encode_consensus_metrics_request,
@@ -1328,6 +1331,39 @@ impl OperatorClient {
         Self::decode_open_work_response(&response_frame)
     }
 
+    /// Claims an existing work item via RFC-0032 `ClaimWorkV2` (TCK-00637).
+    ///
+    /// `ClaimWorkV2` claims an already opened work item and returns a
+    /// role-scoped issued claim lease.
+    pub async fn claim_work_v2(
+        &mut self,
+        work_id: &str,
+        role: WorkRole,
+        lease_id: &str,
+    ) -> Result<ClaimWorkV2Response, ProtocolClientError> {
+        let request = ClaimWorkV2Request {
+            work_id: work_id.to_string(),
+            role: role.into(),
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_claim_work_v2_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_claim_work_v2_response(&response_frame)
+    }
+
     // =========================================================================
     // TCK-00654: HEF Pulse Wait Integration (RFC-0032 section 12.5)
     // =========================================================================
@@ -1554,6 +1590,39 @@ impl OperatorClient {
         }
 
         OpenWorkResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ClaimWorkV2` response (TCK-00637).
+    fn decode_claim_work_v2_response(
+        frame: &Bytes,
+    ) -> Result<ClaimWorkV2Response, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ClaimWorkV2.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ClaimWorkV2 response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ClaimWorkV2.tag()
+            )));
+        }
+
+        ClaimWorkV2Response::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
@@ -3329,6 +3398,65 @@ mod tests {
             tag,
             PrivilegedMessageType::ClaimWork.tag(),
             "ClaimWork request should use correct tag"
+        );
+    }
+
+    /// Tests that `ClaimWorkV2` requests use tag-based encoding.
+    #[test]
+    fn test_operator_claim_work_v2_routing() {
+        let request = ClaimWorkV2Request {
+            work_id: "W-TCK-00640".to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: "L-governing-001".to_string(),
+        };
+        let encoded = encode_claim_work_v2_request(&request);
+
+        assert!(!encoded.is_empty());
+        let tag = encoded[0];
+        assert_eq!(
+            tag,
+            PrivilegedMessageType::ClaimWorkV2.tag(),
+            "ClaimWorkV2 request should use correct tag"
+        );
+    }
+
+    #[test]
+    fn test_decode_claim_work_v2_response_success() {
+        let response = ClaimWorkV2Response {
+            work_id: "W-TCK-00640".to_string(),
+            issued_lease_id: "L-issued-001".to_string(),
+            authority_bindings_hash: "b3-256:abcd".to_string(),
+            evidence_id: "WAB-001".to_string(),
+            already_claimed: false,
+        };
+        let mut frame = vec![PrivilegedMessageType::ClaimWorkV2.tag()];
+        response
+            .encode(&mut frame)
+            .expect("encode ClaimWorkV2Response");
+        let decoded = OperatorClient::decode_claim_work_v2_response(&Bytes::from(frame))
+            .expect("decode ClaimWorkV2 response");
+        assert_eq!(decoded.work_id, "W-TCK-00640");
+        assert_eq!(decoded.issued_lease_id, "L-issued-001");
+    }
+
+    #[test]
+    fn test_decode_claim_work_v2_response_wrong_tag() {
+        let response = ClaimWorkV2Response {
+            work_id: "W-TCK-00640".to_string(),
+            issued_lease_id: "L-issued-001".to_string(),
+            authority_bindings_hash: "b3-256:abcd".to_string(),
+            evidence_id: "WAB-001".to_string(),
+            already_claimed: false,
+        };
+        let mut frame = vec![PrivilegedMessageType::OpenWork.tag()];
+        response
+            .encode(&mut frame)
+            .expect("encode ClaimWorkV2Response");
+        let err = OperatorClient::decode_claim_work_v2_response(&Bytes::from(frame))
+            .expect_err("wrong tag must fail");
+        assert!(
+            matches!(err, ProtocolClientError::UnexpectedResponse(_)),
+            "expected UnexpectedResponse, got {err:?}"
         );
     }
 

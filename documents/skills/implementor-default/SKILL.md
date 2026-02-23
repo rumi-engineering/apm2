@@ -69,11 +69,12 @@ decision_tree:
           action: "References do not interpolate variables. Replace placeholders like <TICKET_ID>, <PR_NUMBER>, and <WORKTREE_PATH> before running commands."
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
-            Discover the 4 CLI commands you will use. Run these help commands:
-            (1) `apm2 work claim --help`
-            (2) `apm2 fac work current --help`
-            (3) `apm2 fac review findings --help`
-            (4) `apm2 fac push --help`
+            Discover the FAC CLI surfaces you will use. Run these help commands:
+            (1) `apm2 fac work open --help`
+            (2) `apm2 fac work claim --help`
+            (3) `apm2 fac work current --help`
+            (4) `apm2 fac review findings --help`
+            (5) `apm2 fac push --help`
             Note: `--handoff-note` on `fac push` is optional.
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE

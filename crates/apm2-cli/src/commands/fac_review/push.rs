@@ -9,6 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,9 @@ use apm2_core::fac::work_cas_schemas::{
 use apm2_core::fac::{
     ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo, parse_b3_256_digest,
     parse_policy_hash,
+};
+use apm2_daemon::protocol::{
+    PublishChangeSetResponse, PublishWorkContextEntryResponse, RecordWorkPrAssociationResponse,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,11 @@ use super::types::{
 use super::{github_projection, lifecycle, projection_store, state, verdict_projection};
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_pr::sync_required_status_ruleset;
+use crate::commands::work_identity::{
+    derive_adhoc_session_id, extract_tck_from_text, normalize_non_empty_arg,
+    validate_lease_id as validate_push_lease_id, validate_session_id as validate_push_session_id,
+    validate_work_id as validate_push_work_id,
+};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
@@ -58,34 +67,7 @@ const PUSH_QUEUE_GATES_PIDS_MAX: u64 = 1536;
 const PUSH_QUEUE_GATES_CPU_QUOTA: &str = "auto";
 const PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const PUSH_ATTEMPT_MALFORMED_WARN_LIMIT: usize = 3;
-
-/// Extract `TCK-xxxxx` from arbitrary text.
-fn extract_tck_from_text(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    if bytes.len() < 9 {
-        return None;
-    }
-
-    for idx in 0..=bytes.len() - 9 {
-        if &bytes[idx..idx + 4] != b"TCK-" {
-            continue;
-        }
-
-        let digits = &bytes[idx + 4..idx + 9];
-        if !digits.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-
-        if idx + 9 < bytes.len() && bytes[idx + 9].is_ascii_digit() {
-            continue;
-        }
-
-        let matched = std::str::from_utf8(&bytes[idx..idx + 9]).ok()?;
-        return Some(matched.to_string());
-    }
-
-    None
-}
+const PUSH_PROGRESS_TICK_SECS: u64 = 10;
 
 /// Resolve TCK id from branch first, then worktree directory name.
 fn resolve_tck_id(branch: &str, worktree_dir: &Path) -> Result<String, String> {
@@ -1568,6 +1550,66 @@ fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     latest_gate_error_hint(&result.gate_name)
 }
 
+struct PushPhaseProgressTicker {
+    stop_tx: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PushPhaseProgressTicker {
+    fn start(phase: &'static str, json_output: bool) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let phase_name = phase.to_string();
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            let mut tick = 0_u64;
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(PUSH_PROGRESS_TICK_SECS)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        tick = tick.saturating_add(1);
+                        let elapsed_seconds = started.elapsed().as_secs();
+                        if json_output {
+                            let _ = emit_jsonl(&StageEvent {
+                                event: "push_progress".to_string(),
+                                ts: ts_now(),
+                                extra: serde_json::json!({
+                                    "phase": phase_name.as_str(),
+                                    "tick": tick,
+                                    "elapsed_seconds": elapsed_seconds,
+                                    "interval_seconds": PUSH_PROGRESS_TICK_SECS,
+                                }),
+                            });
+                        } else {
+                            eprintln!(
+                                "fac push: still running phase={phase_name} elapsed={elapsed_seconds}s"
+                            );
+                        }
+                    },
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PushPhaseProgressTicker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn parse_handoff_note(handoff_note_arg: Option<&str>) -> Result<Option<String>, String> {
     let Some(raw) = handoff_note_arg else {
         return Ok(None);
@@ -1577,46 +1619,6 @@ fn parse_handoff_note(handoff_note_arg: Option<&str>) -> Result<Option<String>, 
         return Err("`--handoff-note` cannot be empty when provided".to_string());
     }
     Ok(Some(trimmed.to_string()))
-}
-
-const MAX_PUSH_IDENTIFIER_LENGTH: usize = 256;
-
-fn validate_push_identifier(value: &str, field: &str, required_prefix: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{field} cannot be empty"));
-    }
-    if value.len() > MAX_PUSH_IDENTIFIER_LENGTH {
-        return Err(format!(
-            "{field} exceeds max length ({} > {MAX_PUSH_IDENTIFIER_LENGTH})",
-            value.len(),
-        ));
-    }
-    if !value.starts_with(required_prefix) {
-        return Err(format!(
-            "{field} must start with `{required_prefix}`, got `{value}`"
-        ));
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err(format!(
-            "{field} contains invalid characters; only [A-Za-z0-9_-] are allowed"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_push_work_id(work_id: &str) -> Result<(), String> {
-    validate_push_identifier(work_id, "work_id", "W-")
-}
-
-fn validate_push_lease_id(lease_id: &str) -> Result<(), String> {
-    validate_push_identifier(lease_id, "lease_id", "L-")
-}
-
-fn validate_push_session_id(session_id: &str) -> Result<(), String> {
-    validate_push_identifier(session_id, "session_id", "S-")
 }
 
 fn with_operator_client<T>(
@@ -1643,13 +1645,6 @@ fn resolve_ticket_alias_to_work_id(
     }
     validate_push_work_id(&resolved.work_id)?;
     Ok(Some(resolved.work_id))
-}
-
-fn normalize_non_empty_arg(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn is_active_push_fallback_status(status: &str) -> bool {
@@ -1850,50 +1845,51 @@ fn resolve_work_id_for_push(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PushRuntimeBinding {
     lease_id: String,
     session_id: String,
+    session_id_source: PushSessionIdSource,
 }
 
-fn resolve_runtime_binding_for_push(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushSessionIdSource {
+    Requested,
+    DaemonStatus,
+    DerivedAdhoc,
+}
+
+impl PushSessionIdSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::DaemonStatus => "daemon_status",
+            Self::DerivedAdhoc => "derived_adhoc",
+        }
+    }
+}
+
+fn resolve_runtime_binding_from_inputs(
     work_id: &str,
-    lease_id_arg: Option<&str>,
-    session_id_arg: Option<&str>,
-    operator_socket: &Path,
+    requested_lease_id: Option<String>,
+    requested_session_id: Option<String>,
+    status_lease_id: Option<String>,
+    status_session_id: Option<String>,
 ) -> Result<PushRuntimeBinding, String> {
-    let requested_lease_id = lease_id_arg
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    validate_push_work_id(work_id)?;
+
     if let Some(ref lease_id) = requested_lease_id {
         validate_push_lease_id(lease_id)?;
     }
-    let requested_session_id = session_id_arg
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
     if let Some(ref session_id) = requested_session_id {
         validate_push_session_id(session_id)?;
     }
-
-    let work_id_owned = work_id.to_string();
-    let status_response = with_operator_client(async move {
-        let mut client = OperatorClient::connect(operator_socket).await?;
-        client.work_status(&work_id_owned).await
-    })?;
-
-    let status_lease_id = status_response
-        .lease_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let status_session_id = status_response
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    if let Some(ref lease_id) = status_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    if let Some(ref session_id) = status_session_id {
+        validate_push_session_id(session_id)?;
+    }
 
     if let (Some(requested), Some(observed)) = (&requested_lease_id, &status_lease_id)
         && requested != observed
@@ -1913,23 +1909,65 @@ fn resolve_runtime_binding_for_push(
     let lease_id = requested_lease_id.or(status_lease_id).ok_or_else(|| {
         format!(
             "no active lease_id found for work_id `{work_id}`; pass `--lease-id` \
-                 or claim work before running `fac push`"
+             or claim work before running `fac push`"
         )
     })?;
     validate_push_lease_id(&lease_id)?;
 
-    let session_id = requested_session_id.or(status_session_id).ok_or_else(|| {
-        format!(
-            "no active session_id found for work_id `{work_id}`; pass `--session-id` \
-                 when backfilling a terminated session attempt"
-        )
-    })?;
+    let (session_id, session_id_source) = requested_session_id.map_or_else(
+        || {
+            status_session_id.map_or_else(
+                || {
+                    (
+                        derive_adhoc_session_id(work_id, &lease_id),
+                        PushSessionIdSource::DerivedAdhoc,
+                    )
+                },
+                |from_status| (from_status, PushSessionIdSource::DaemonStatus),
+            )
+        },
+        |requested| (requested, PushSessionIdSource::Requested),
+    );
     validate_push_session_id(&session_id)?;
 
     Ok(PushRuntimeBinding {
         lease_id,
         session_id,
+        session_id_source,
     })
+}
+
+fn resolve_runtime_binding_for_push(
+    work_id: &str,
+    lease_id_arg: Option<&str>,
+    session_id_arg: Option<&str>,
+    operator_socket: &Path,
+) -> Result<PushRuntimeBinding, String> {
+    let requested_lease_id = normalize_non_empty_arg(lease_id_arg);
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(session_id_arg);
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
+
+    let work_id_owned = work_id.to_string();
+    let status_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_owned).await
+    })?;
+
+    let status_lease_id = normalize_non_empty_arg(status_response.lease_id.as_deref());
+    let status_session_id = normalize_non_empty_arg(status_response.session_id.as_deref());
+
+    resolve_runtime_binding_from_inputs(
+        work_id,
+        requested_lease_id,
+        requested_session_id,
+        status_lease_id,
+        status_session_id,
+    )
 }
 
 fn make_push_session_dedupe_key(session_id: &str) -> Result<String, String> {
@@ -2222,6 +2260,98 @@ fn build_context_entry_json(
         .map_err(|err| format!("failed to serialize work context entry: {err}"))
 }
 
+fn validate_context_entry_publication_response(
+    label: &str,
+    expected_work_id: &str,
+    response: &PublishWorkContextEntryResponse,
+) -> Result<(), String> {
+    validate_push_work_id(&response.work_id)?;
+    if response.work_id != expected_work_id {
+        return Err(format!(
+            "{label} work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            response.work_id
+        ));
+    }
+    if response.entry_id.trim().is_empty() {
+        return Err(format!("{label} entry_id is empty"));
+    }
+    if !response.entry_id.starts_with("CTX-") {
+        return Err(format!(
+            "{label} entry_id must start with `CTX-`, got `{}`",
+            response.entry_id
+        ));
+    }
+    if response.evidence_id != response.entry_id {
+        return Err(format!(
+            "{label} evidence_id mismatch: entry_id=`{}` evidence_id=`{}`",
+            response.entry_id, response.evidence_id
+        ));
+    }
+    if response.cas_hash.trim().is_empty() {
+        return Err(format!("{label} cas_hash is empty"));
+    }
+    Ok(())
+}
+
+fn validate_work_publication_chain_responses(
+    expected_work_id: &str,
+    expected_pr_number: u32,
+    expected_commit_sha: &str,
+    changeset: &PublishChangeSetResponse,
+    association: &RecordWorkPrAssociationResponse,
+    handoff_entry: Option<&PublishWorkContextEntryResponse>,
+    terminal_entry: &PublishWorkContextEntryResponse,
+) -> Result<(), String> {
+    validate_push_work_id(expected_work_id)?;
+    validate_push_work_id(&changeset.work_id)?;
+    if changeset.work_id != expected_work_id {
+        return Err(format!(
+            "changeset publication work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            changeset.work_id
+        ));
+    }
+    if changeset.changeset_digest.trim().is_empty() {
+        return Err("changeset publication returned empty changeset_digest".to_string());
+    }
+    if changeset.cas_hash.trim().is_empty() {
+        return Err("changeset publication returned empty cas_hash".to_string());
+    }
+    if changeset.event_id.trim().is_empty() {
+        return Err("changeset publication returned empty event_id".to_string());
+    }
+
+    validate_push_work_id(&association.work_id)?;
+    if association.work_id != expected_work_id {
+        return Err(format!(
+            "PR association work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            association.work_id
+        ));
+    }
+    if association.pr_number != u64::from(expected_pr_number) {
+        return Err(format!(
+            "PR association number mismatch: expected `{expected_pr_number}` but daemon returned `{}`",
+            association.pr_number
+        ));
+    }
+    if association.commit_sha != expected_commit_sha {
+        return Err(format!(
+            "PR association commit mismatch: expected `{expected_commit_sha}` but daemon returned `{}`",
+            association.commit_sha
+        ));
+    }
+
+    if let Some(handoff) = handoff_entry {
+        validate_context_entry_publication_response("handoff", expected_work_id, handoff)?;
+    }
+    validate_context_entry_publication_response(
+        "implementer_terminal",
+        expected_work_id,
+        terminal_entry,
+    )?;
+
+    Ok(())
+}
+
 pub(super) struct PushInvocation<'a> {
     pub repo: &'a str,
     pub remote: &'a str,
@@ -2501,6 +2631,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     };
     let lease_id = runtime_binding.lease_id;
     let session_id = runtime_binding.session_id;
+    let session_id_source = runtime_binding.session_id_source;
     emit_stage(
         "work_binding_resolved",
         serde_json::json!({
@@ -2508,13 +2639,15 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             "ticket_alias": resolved_ticket_alias,
             "lease_id": lease_id,
             "session_id": session_id,
+            "session_id_source": session_id_source.as_str(),
         }),
     );
     human_log!(
-        "fac push: bound work_id={} lease_id={} session_id={}{}",
+        "fac push: bound work_id={} lease_id={} session_id={} (source={}){}",
         work_id,
         lease_id,
         session_id,
+        session_id_source.as_str(),
         resolved_ticket_alias
             .as_deref()
             .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
@@ -2555,6 +2688,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let mut ruleset_sync_passed = false;
     let gate_outcome = match run_pre_push_sequence_with(
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("gates", json_output);
             human_log!(
                 "fac push: enqueuing evidence gates job (blocking; external worker if present, inline fallback otherwise)"
             );
@@ -2776,6 +2910,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             Ok(gate_outcome)
         },
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("ruleset_sync", json_output);
             emit_stage("ruleset_sync_started", serde_json::json!({}));
             let sync_started = Instant::now();
             match sync_required_status_ruleset(repo, None, None, false) {
@@ -2829,6 +2964,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             }
         },
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("git_push", json_output);
             let git_push_started = Instant::now();
             let push_output = Command::new("git")
                 .args(["push", "--force", remote, &branch])
@@ -2937,6 +3073,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
 
     // Step 2: create or update PR.
     let pr_update_started = Instant::now();
+    let pr_update_progress = PushPhaseProgressTicker::start("pr_update", json_output);
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
         match create_pr(repo, &metadata.title, &metadata.body) {
@@ -2978,6 +3115,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         pr_number
     };
     attempt_pr_number = pr_number;
+    drop(pr_update_progress);
     emit_stage(
         "pr_updated",
         serde_json::json!({
@@ -3071,6 +3209,8 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let rpc_bundle_bytes = bundle_bytes;
     let rpc_handoff_entry_json = handoff_entry_json;
     let rpc_terminal_entry_json = terminal_entry_json;
+    let work_publication_progress =
+        PushPhaseProgressTicker::start("work_publication_rpc", json_output);
     let rpc_result = match with_operator_client(async move {
         let mut client = OperatorClient::connect(operator_socket).await?;
         let changeset = client
@@ -3116,8 +3256,23 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             fail_with_attempt!("fac_push_work_publication_failed", err);
         },
     };
+    drop(work_publication_progress);
     let (changeset_response, pr_association_response, handoff_response, terminal_response) =
         rpc_result;
+    if let Err(err) = validate_work_publication_chain_responses(
+        &work_id,
+        pr_number,
+        &sha,
+        &changeset_response,
+        &pr_association_response,
+        handoff_response.as_ref(),
+        &terminal_response,
+    ) {
+        fail_with_attempt!(
+            "fac_push_work_publication_response_invalid",
+            format!("daemon returned invalid publication chain response: {err}")
+        );
+    }
     emit_stage(
         "work_publication_completed",
         serde_json::json!({
@@ -3236,6 +3391,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     // by doctor-first remediation surfaces.
     let dispatch_started = Instant::now();
     emit_stage("dispatch_started", serde_json::json!({}));
+    let dispatch_progress = PushPhaseProgressTicker::start("dispatch_reviews", json_output);
     let mut emitted_reviews_dispatched = false;
     let dispatch_warning = match dispatch_reviews_with(
         repo,
@@ -3322,6 +3478,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             }
         },
     };
+    drop(dispatch_progress);
     let has_dispatch_warning = dispatch_warning.is_some();
     emit_stage(
         "dispatch_completed",
@@ -3660,6 +3817,197 @@ mod tests {
         let err = make_push_session_dedupe_key("session/1")
             .expect_err("invalid session id should be rejected");
         assert!(err.contains("must start with `S-`") || err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_prefers_requested_session_when_daemon_session_missing() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            Some("S-requested-123".to_string()),
+            Some("L-lease-123".to_string()),
+            None,
+        )
+        .expect("requested session should be used when daemon status has no active session");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert_eq!(binding.session_id, "S-requested-123");
+        assert_eq!(binding.session_id_source, PushSessionIdSource::Requested);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_uses_daemon_session_when_not_requested() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            None,
+            None,
+            Some("L-lease-123".to_string()),
+            Some("S-daemon-999".to_string()),
+        )
+        .expect("daemon session should be used when no request override is provided");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert_eq!(binding.session_id, "S-daemon-999");
+        assert_eq!(binding.session_id_source, PushSessionIdSource::DaemonStatus);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_derives_adhoc_session_when_missing() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            None,
+            Some("L-lease-123".to_string()),
+            None,
+        )
+        .expect("missing daemon session should derive deterministic ad-hoc session");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert!(binding.session_id.starts_with("S-adhoc-"));
+        assert_eq!(binding.session_id_source, PushSessionIdSource::DerivedAdhoc);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_rejects_lease_mismatch() {
+        let err = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-requested".to_string()),
+            None,
+            Some("L-daemon".to_string()),
+            None,
+        )
+        .expect_err("lease mismatch must fail closed");
+        assert!(err.contains("`--lease-id` mismatch"));
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_rejects_session_mismatch() {
+        let err = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            Some("S-requested".to_string()),
+            Some("L-lease-123".to_string()),
+            Some("S-daemon".to_string()),
+        )
+        .expect_err("session mismatch must fail closed");
+        assert!(err.contains("`--session-id` mismatch"));
+    }
+
+    fn sample_changeset_response(work_id: &str) -> PublishChangeSetResponse {
+        PublishChangeSetResponse {
+            changeset_digest: "b3-256:abc123".to_string(),
+            cas_hash: "b3-256:def456".to_string(),
+            work_id: work_id.to_string(),
+            event_id: "evt-123".to_string(),
+        }
+    }
+
+    fn sample_pr_association_response(
+        work_id: &str,
+        pr_number: u32,
+        commit_sha: &str,
+    ) -> RecordWorkPrAssociationResponse {
+        RecordWorkPrAssociationResponse {
+            work_id: work_id.to_string(),
+            pr_number: u64::from(pr_number),
+            commit_sha: commit_sha.to_string(),
+            already_existed: false,
+        }
+    }
+
+    fn sample_context_response(work_id: &str, entry_id: &str) -> PublishWorkContextEntryResponse {
+        PublishWorkContextEntryResponse {
+            entry_id: entry_id.to_string(),
+            evidence_id: entry_id.to_string(),
+            cas_hash: "b3-256:ctx".to_string(),
+            work_id: work_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_accepts_valid_payload() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let handoff = sample_context_response("W-TCK-00640", "CTX-123");
+        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+
+        validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            Some(&handoff),
+            &terminal,
+        )
+        .expect("valid publication chain should be accepted");
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_rejects_pr_number_mismatch() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            999,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+
+        let err = validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            None,
+            &terminal,
+        )
+        .expect_err("pr number mismatch must fail closed");
+        assert!(err.contains("PR association number mismatch"));
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_rejects_non_context_entry_id() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let terminal = sample_context_response("W-TCK-00640", "bad-entry");
+
+        let err = validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            None,
+            &terminal,
+        )
+        .expect_err("non-CTX entry id must fail closed");
+        assert!(err.contains("entry_id must start with `CTX-`"));
+    }
+
+    #[test]
+    fn derive_adhoc_session_id_is_deterministic_and_prefixed() {
+        let first = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
+        let second = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
+        let different = derive_adhoc_session_id("W-TCK-00640", "L-lease-456");
+
+        assert_eq!(
+            first, second,
+            "adhoc session derivation must be deterministic"
+        );
+        assert_ne!(
+            first, different,
+            "different lease_id must produce different ad-hoc session ids"
+        );
+        assert!(
+            first.starts_with("S-adhoc-"),
+            "derived ad-hoc session id must be canonical: {first}"
+        );
     }
 
     #[test]

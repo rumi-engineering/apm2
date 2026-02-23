@@ -24,16 +24,20 @@ use apm2_core::fac::{
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
+use crate::commands::work_identity::{
+    derive_adhoc_session_id, extract_tck_from_text, normalize_non_empty_arg, validate_lease_id,
+    validate_session_id, validate_work_id,
+};
 use crate::commands::{
     fac_broker, fac_economics, fac_gc, fac_policy, fac_pr, fac_preflight, fac_quarantine,
-    fac_review,
+    fac_review, work,
 };
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
@@ -69,7 +73,6 @@ const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
 const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
 const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
 const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
-const MAX_WORK_IDENTIFIER_LENGTH: usize = 256;
 const WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
 
 // =============================================================================
@@ -663,6 +666,12 @@ pub struct ServicesStatusArgs {}
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
+    /// Open a work item from a ticket YAML using RFC-0032 `OpenWork`.
+    Open(WorkOpenArgs),
+
+    /// Claim an existing work item using RFC-0032 `ClaimWorkV2`.
+    Claim(WorkClaimArgs),
+
     /// Resolve current work identity from branch/worktree alias or projection.
     Current(WorkCurrentArgs),
 
@@ -713,6 +722,62 @@ pub struct WorkCurrentArgs {
     /// Optional session filter for projection fallback disambiguation.
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
+}
+
+/// Arguments for `apm2 fac work open`.
+#[derive(Debug, Args)]
+pub struct WorkOpenArgs {
+    /// Ticket YAML path to open as `WorkSpec`.
+    #[arg(long = "from-ticket")]
+    pub from_ticket: PathBuf,
+
+    /// Governing lease ID for PCAC admission.
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkClaimRoleArg {
+    /// Claim as implementer (Open -> Claimed).
+    Implementer,
+    /// Claim as reviewer (`ReadyForReview` -> Review).
+    Reviewer,
+    /// Claim as coordinator (Open -> Claimed).
+    Coordinator,
+}
+
+impl WorkClaimRoleArg {
+    const fn to_work_role(self) -> WorkRole {
+        match self {
+            Self::Implementer => WorkRole::Implementer,
+            Self::Reviewer => WorkRole::Reviewer,
+            Self::Coordinator => WorkRole::Coordinator,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementer => "implementer",
+            Self::Reviewer => "reviewer",
+            Self::Coordinator => "coordinator",
+        }
+    }
+}
+
+/// Arguments for `apm2 fac work claim`.
+#[derive(Debug, Args)]
+pub struct WorkClaimArgs {
+    /// Canonical work ID to claim (`W-...`).
+    #[arg(long = "work-id")]
+    pub work_id: String,
+
+    /// Governing lease ID for PCAC admission (`L-...`).
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+
+    /// Claim role.
+    #[arg(long, value_enum, default_value = "implementer")]
+    pub role: WorkClaimRoleArg,
 }
 
 /// Arguments for `apm2 fac work resolve-alias`.
@@ -1134,6 +1199,8 @@ pub struct PushArgs {
     /// Canonical work identifier to bind projection and daemon publication.
     /// If omitted, `fac push` derives work binding via ticket alias and
     /// projection fallback. Use `apm2 fac work current` to inspect.
+    /// If no work exists yet, create/claim one via `apm2 fac work open` and
+    /// `apm2 fac work claim`.
     #[arg(long = "work-id")]
     pub work_id: Option<String>,
 
@@ -1147,12 +1214,15 @@ pub struct PushArgs {
     /// Optional governing lease identifier for privileged work RPC calls.
     /// When omitted, `fac push` resolves `lease_id` from daemon work status.
     /// Use `apm2 fac work current` to inspect the daemon-resolved value.
+    /// For ad-hoc workflows, pass a governing lease from `apm2 fac work claim`.
     #[arg(long = "lease-id")]
     pub lease_id: Option<String>,
 
     /// Optional implementer session identifier for terminal-contract dedupe.
     /// When omitted, `fac push` resolves `session_id` from daemon work status.
-    /// Use `apm2 fac work current` to inspect the daemon-resolved value.
+    /// If daemon status does not expose one but a lease is available, `fac
+    /// push` derives deterministic `S-adhoc-*` session identity from
+    /// (`work_id`,`lease_id`).
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
 
@@ -3484,6 +3554,12 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Work(args) => match &args.subcommand {
+            WorkSubcommand::Open(open_args) => {
+                run_work_open(open_args, operator_socket, json_output)
+            },
+            WorkSubcommand::Claim(claim_args) => {
+                run_work_claim(claim_args, operator_socket, json_output)
+            },
             WorkSubcommand::Current(current_args) => {
                 run_work_current(current_args, operator_socket, json_output)
             },
@@ -3989,51 +4065,6 @@ struct WorkCurrentResolution {
     source: WorkCurrentResolutionSource,
 }
 
-fn normalize_non_empty_arg(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn validate_work_identifier(value: &str, field: &str, required_prefix: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{field} cannot be empty"));
-    }
-    if value.len() > MAX_WORK_IDENTIFIER_LENGTH {
-        return Err(format!(
-            "{field} exceeds max length ({} > {MAX_WORK_IDENTIFIER_LENGTH})",
-            value.len(),
-        ));
-    }
-    if !value.starts_with(required_prefix) {
-        return Err(format!(
-            "{field} must start with `{required_prefix}`, got `{value}`"
-        ));
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err(format!(
-            "{field} contains invalid characters; only [A-Za-z0-9_-] are allowed"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_work_id(value: &str) -> Result<(), String> {
-    validate_work_identifier(value, "work_id", "W-")
-}
-
-fn validate_lease_id(value: &str) -> Result<(), String> {
-    validate_work_identifier(value, "lease_id", "L-")
-}
-
-fn validate_session_id(value: &str) -> Result<(), String> {
-    validate_work_identifier(value, "session_id", "S-")
-}
-
 fn with_operator_client<T>(
     future: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
 ) -> Result<T, String> {
@@ -4042,30 +4073,6 @@ fn with_operator_client<T>(
         .build()
         .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
     rt.block_on(future).map_err(|err| err.to_string())
-}
-
-fn extract_tck_from_text(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    if bytes.len() < 9 {
-        return None;
-    }
-
-    for idx in 0..=bytes.len() - 9 {
-        if &bytes[idx..idx + 4] != b"TCK-" {
-            continue;
-        }
-        let digits = &bytes[idx + 4..idx + 9];
-        if !digits.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-        if idx + 9 < bytes.len() && bytes[idx + 9].is_ascii_digit() {
-            continue;
-        }
-        let matched = std::str::from_utf8(&bytes[idx..idx + 9]).ok()?;
-        return Some(matched.to_string());
-    }
-
-    None
 }
 
 fn resolve_current_branch_name() -> Result<String, String> {
@@ -4507,6 +4514,173 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
                 serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
             );
 
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
+/// Execute the work open command by reusing the hardened `apm2 work open`
+/// implementation.
+fn run_work_open(args: &WorkOpenArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    if args.lease_id.trim().is_empty() {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            "Lease ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    if let Err(err) = validate_lease_id(args.lease_id.trim()) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let cmd = work::WorkCommand {
+        json: json_output,
+        subcommand: work::WorkSubcommand::Open(work::OpenArgs {
+            from_ticket: args.from_ticket.to_string_lossy().to_string(),
+            lease_id: args.lease_id.trim().to_string(),
+        }),
+    };
+    work::run_work(&cmd, operator_socket)
+}
+
+#[derive(Debug, Serialize)]
+struct WorkClaimJson {
+    work_id: String,
+    role: String,
+    issued_lease_id: String,
+    authority_bindings_hash: String,
+    evidence_id: String,
+    already_claimed: bool,
+    session_id: String,
+}
+
+/// Execute the work claim command via RFC-0032 `ClaimWorkV2`.
+fn run_work_claim(args: &WorkClaimArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    let work_id = args.work_id.trim();
+    if let Err(err) = validate_work_id(work_id) {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    let lease_id = args.lease_id.trim();
+    if let Err(err) = validate_lease_id(lease_id) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let requested_role = args.role.to_work_role();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client
+            .claim_work_v2(work_id, requested_role, lease_id)
+            .await
+    });
+
+    match result {
+        Ok(response) => {
+            if let Err(err) = validate_work_id(&response.work_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("daemon returned invalid work_id in ClaimWorkV2 response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if let Err(err) = validate_lease_id(&response.issued_lease_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!(
+                        "daemon returned invalid issued_lease_id in ClaimWorkV2 response: {err}"
+                    ),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.authority_bindings_hash.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty authority_bindings_hash in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.evidence_id.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty evidence_id in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+
+            let session_id = derive_adhoc_session_id(&response.work_id, &response.issued_lease_id);
+            if let Err(err) = validate_session_id(&session_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("failed to derive canonical session_id from claim response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            let payload = WorkClaimJson {
+                work_id: response.work_id,
+                role: args.role.as_str().to_string(),
+                issued_lease_id: response.issued_lease_id,
+                authority_bindings_hash: response.authority_bindings_hash,
+                evidence_id: response.evidence_id,
+                already_claimed: response.already_claimed,
+                session_id,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Work claim recorded");
+                println!("  Work ID:                 {}", payload.work_id);
+                println!("  Role:                    {}", payload.role);
+                println!("  Issued Lease ID:         {}", payload.issued_lease_id);
+                println!("  Session ID:              {}", payload.session_id);
+                println!(
+                    "  Authority Bindings Hash: {}",
+                    payload.authority_bindings_hash
+                );
+                println!("  Evidence ID:             {}", payload.evidence_id);
+                if payload.already_claimed {
+                    println!("  Idempotency:             already claimed");
+                }
+            }
             exit_codes::SUCCESS
         },
         Err(error) => handle_protocol_error(json_output, &error),
@@ -7485,6 +7659,64 @@ mod tests {
     fn assert_fac_command_parses(args: &[&str]) {
         FacLogsCliHarness::try_parse_from(args.iter().copied())
             .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
+    }
+
+    #[test]
+    fn work_claim_role_arg_maps_to_protocol_role() {
+        assert_eq!(
+            WorkClaimRoleArg::Implementer.to_work_role(),
+            WorkRole::Implementer
+        );
+        assert_eq!(WorkClaimRoleArg::Implementer.as_str(), "implementer");
+        assert_eq!(
+            WorkClaimRoleArg::Reviewer.to_work_role(),
+            WorkRole::Reviewer
+        );
+        assert_eq!(WorkClaimRoleArg::Reviewer.as_str(), "reviewer");
+        assert_eq!(
+            WorkClaimRoleArg::Coordinator.to_work_role(),
+            WorkRole::Coordinator
+        );
+        assert_eq!(WorkClaimRoleArg::Coordinator.as_str(), "coordinator");
+    }
+
+    #[test]
+    fn derive_adhoc_session_id_is_deterministic() {
+        let first = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let second = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let third = derive_adhoc_session_id("W-TCK-00640", "L-issued-002");
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+        assert!(first.starts_with("S-adhoc-"));
+    }
+
+    #[test]
+    fn fac_work_open_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "open",
+            "--from-ticket",
+            "documents/work/tickets/TCK-00640.yaml",
+            "--lease-id",
+            "L-governing-001",
+        ]);
+    }
+
+    #[test]
+    fn fac_work_claim_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "claim",
+            "--work-id",
+            "W-TCK-00640",
+            "--lease-id",
+            "L-governing-001",
+            "--role",
+            "implementer",
+        ]);
     }
 
     // KNOWN ISSUE (f-685-security-1771186259820160-0): Apm2HomeGuard mutates
