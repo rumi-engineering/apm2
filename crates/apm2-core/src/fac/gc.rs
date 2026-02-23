@@ -1364,6 +1364,9 @@ fn safe_rmtree_error_to_string(error: SafeRmtreeError) -> String {
         SafeRmtreeError::TooManyEntries { path, max } => {
             format!("too_many_entries:{}:{max}", path.display())
         },
+        SafeRmtreeError::TooManyDirectoriesScanned { path, max } => {
+            format!("too_many_directories_scanned:{}:{max}", path.display())
+        },
         SafeRmtreeError::DotSegment { path } => format!("dot_segment:{}", path.display()),
     }
 }

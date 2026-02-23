@@ -131,10 +131,10 @@ scope:
     - "Adding --force-unsafe-cleanup flag (Option B — unnecessary if Option A works)"
 
   affected_paths:
-    - "crates/apm2-cli/src/commands/fac.rs"        # safe_rmtree_v1 implementation
-    - "crates/apm2-cli/src/commands/fac.rs"        # lane state transitions
-    - "crates/apm2-cli/src/commands/fac.rs"        # doctor --fix lane_tmp_scrub action
-    - "crates/apm2-cli/src/commands/fac.rs"        # broker_requests dir creation (sandbox setup)
+    - "crates/apm2-core/src/fac/safe_rmtree.rs"    # safe_rmtree_v1 implementation
+    - "crates/apm2-core/src/fac/lane.rs"           # lane cleanup/state transitions
+    - "crates/apm2-core/src/fac/reconcile.rs"      # lane recovery scrub path
+    - "crates/apm2-cli/src/commands/fac.rs"        # doctor --fix lane_tmp_scrub orchestration
 
 impact: |
   - Reduces effective lane pool by 1 per occurrence (33% capacity loss with 3 lanes)
