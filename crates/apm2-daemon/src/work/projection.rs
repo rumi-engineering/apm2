@@ -648,18 +648,13 @@ fn translate_signed_event(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CanonicalWorkEventEnvelopeJson {
-    payload: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionWorkEventEnvelopeJson {
+struct WorkEventEnvelopeJson {
     event_type: String,
     session_id: String,
     actor_id: String,
     payload: String,
+    #[serde(flatten)]
+    _extra_fields: BTreeMap<String, serde_json::Value>,
 }
 
 fn decode_canonical_work_event_payload(
@@ -677,41 +672,35 @@ fn decode_canonical_work_event_payload(
     }
 
     if payload.first() != Some(&b'{') {
-        WorkEvent::decode(payload).map_err(|error| WorkProjectionError::InvalidPayload {
+        return Err(WorkProjectionError::InvalidPayload {
             event_type: event_type.to_string(),
-            reason: format!("work.* payload is not protobuf WorkEvent: {error}"),
-        })?;
-        return Ok(payload.to_vec());
+            reason: "work.* payload must use JSON session envelope; legacy raw protobuf payloads are no longer supported".to_string(),
+        });
     }
 
-    let wrapped_payload = match serde_json::from_slice::<CanonicalWorkEventEnvelopeJson>(payload) {
-        Ok(envelope) => envelope.payload,
-        Err(canonical_error) => {
-            let session_envelope = serde_json::from_slice::<SessionWorkEventEnvelopeJson>(payload)
-                .map_err(|session_error| WorkProjectionError::InvalidPayload {
-                    event_type: event_type.to_string(),
-                    reason: format!(
-                        "work.* payload is not protobuf or strict JSON envelope: canonical={canonical_error}; session={session_error}"
-                    ),
-                })?;
-            if session_envelope.event_type != event_type {
-                return Err(WorkProjectionError::InvalidPayload {
-                    event_type: event_type.to_string(),
-                    reason: format!(
-                        "session envelope event_type '{}' does not match ledger event_type '{}'",
-                        session_envelope.event_type, event_type
-                    ),
-                });
+    let session_envelope =
+        serde_json::from_slice::<WorkEventEnvelopeJson>(payload).map_err(|e| {
+            WorkProjectionError::InvalidPayload {
+                event_type: event_type.to_string(),
+                reason: format!("work.* payload is not a valid JSON session envelope: {e}"),
             }
-            if session_envelope.session_id.is_empty() || session_envelope.actor_id.is_empty() {
-                return Err(WorkProjectionError::InvalidPayload {
-                    event_type: event_type.to_string(),
-                    reason: "session envelope missing required identity fields".to_string(),
-                });
-            }
-            session_envelope.payload
-        },
-    };
+        })?;
+    if session_envelope.event_type != event_type {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: format!(
+                "session envelope event_type '{}' does not match ledger event_type '{}'",
+                session_envelope.event_type, event_type
+            ),
+        });
+    }
+    if session_envelope.session_id.is_empty() || session_envelope.actor_id.is_empty() {
+        return Err(WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: "session envelope missing required identity fields".to_string(),
+        });
+    }
+    let wrapped_payload = session_envelope.payload;
 
     if wrapped_payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
         return Err(WorkProjectionError::InvalidPayload {
@@ -1508,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_canonical_work_event_payload_accepts_raw_protobuf_when_not_json_prefixed() {
+    fn decode_canonical_work_event_payload_rejects_raw_protobuf_when_not_json_prefixed() {
         let payload = helpers::work_opened_payload(
             "W-projection-raw-protobuf",
             "TICKET",
@@ -1517,11 +1506,15 @@ mod tests {
             vec![],
         );
 
-        let decoded =
-            decode_canonical_work_event_payload(&payload, "work.opened").expect("decode succeeds");
-        assert_eq!(
-            decoded, payload,
-            "non-JSON-prefixed payloads must be treated as raw protobuf"
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("must use JSON session envelope")
+            ),
+            "legacy raw protobuf work payloads must be rejected after envelope cutover"
         );
     }
 
@@ -1535,7 +1528,11 @@ mod tests {
             vec![],
         );
         let envelope = serde_json::to_vec(&serde_json::json!({
+            "event_type": "work.opened",
+            "session_id": "W-projection-json-envelope",
+            "actor_id": "actor:test-projection",
             "payload": hex::encode(&opened_payload),
+            "ajc_id": "f".repeat(64),
         }))
         .expect("JSON envelope should encode");
         assert_eq!(
@@ -1553,6 +1550,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_canonical_work_event_payload_rejects_payload_only_envelope() {
+        let opened_payload = helpers::work_opened_payload(
+            "W-projection-payload-only-envelope",
+            "TICKET",
+            vec![0x44; 32],
+            vec![],
+            vec![],
+        );
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "payload": hex::encode(&opened_payload),
+        }))
+        .expect("payload-only envelope should encode");
+
+        let result = decode_canonical_work_event_payload(&envelope, "work.opened");
+        assert!(
+            matches!(
+                result,
+                Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                    if event_type == "work.opened"
+                        && reason.contains("valid JSON session envelope")
+            ),
+            "payload-only envelope must be rejected after envelope cutover"
+        );
+    }
+
+    #[test]
     fn decode_canonical_work_event_payload_rejects_non_json_non_protobuf_payload() {
         let payload = b"not-a-valid-work-event".to_vec();
         let result = decode_canonical_work_event_payload(&payload, "work.opened");
@@ -1562,9 +1585,9 @@ mod tests {
                 result,
                 Err(WorkProjectionError::InvalidPayload { event_type, reason })
                     if event_type == "work.opened"
-                        && reason.contains("not protobuf WorkEvent")
+                        && reason.contains("must use JSON session envelope")
             ),
-            "non-JSON-prefixed payloads must fail on protobuf decode and never attempt envelope parsing"
+            "non-JSON-prefixed payloads must fail closed under envelope-only decoding"
         );
     }
 

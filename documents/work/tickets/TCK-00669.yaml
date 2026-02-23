@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00669"
     title: "FAC execution queue: migrate toward ledger-backed job lifecycle; treat filesystem queue as witnessed cache and add rehydration reconciler"
-    status: "OPEN"
+    status: "IN_PROGRESS"
   binds:
     prd_id: "PRD-PLACEHOLDER"
     rfc_id: "RFC-0032"
@@ -17,6 +17,14 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00656"
         reason: "Immediate lane-lease identity fixes reduce risk during migration; this ticket builds the longer-term substrate alignment."
+
+delivery_notes:
+  completed_in_related_changes:
+    - "Baseline ledger-backed FAC job lifecycle events and reconciler plumbing have landed."
+    - "Filesystem queue is now treated as a witnessed cache in the main execution path."
+  remaining_focus:
+    - "Operational wiring hardening (doctor/fix orchestration, stale-runtime detection, bounded reconciler guarantees under restart churn)."
+    - "Final removal/deprecation path for manual/legacy queue repair entrypoints that conflict with ledger-authoritative behavior."
 
 root_cause_analysis:
   summary: |
@@ -34,53 +42,32 @@ root_cause_analysis:
 
 scope:
   in_scope:
-    - id: "QL-001"
-      title: "Define ledger event vocabulary for FAC job lifecycle (enqueue/claim/start/finish/release)"
+    - id: "QL-R1"
+      title: "Finalize doctor-driven autonomous recovery and remove conflicting manual repair assumptions"
       detail: |
-        Introduce canonical event types (names illustrative; align with existing event naming conventions):
-          - fac.job.enqueued { job_id, work_id, changeset_digest, lane_id?, spec_digest }
-          - fac.job.claimed { job_id, lease_id, actor_id, claim_epoch }
-          - fac.job.started { job_id, worker_instance_id, start_receipt }
-          - fac.job.completed { job_id, outcome, receipts[], artifact_digests[] }
-          - fac.job.released { job_id, reason, previous_lease_id }
-          - fac.job.failed { job_id, reason_class, retryable }
+        Ensure doctor/fix owns queue hygiene end-to-end for ledger-authoritative operation.
+        Any legacy/manual queue repair path that can diverge from projection truth must be
+        removed or redirected through doctor/fix.
 
-        Requirements:
-          - job_id must be stable and content-addressable (digest of work_id + changeset_digest + gate/profile + revision).
-          - events must be idempotent and safe under replay; use intent->receipt patterns for irreversible actions.
-
-    - id: "QL-002"
-      title: "Implement a JobLifecycleProjectionV1 and a filesystem rehydration reconciler"
+    - id: "QL-R2"
+      title: "Enforce bounded reconciler behavior under sustained churn"
       detail: |
-        Implement a projection that derives the current queue state from ledger events.
-        Add a reconciler that:
-          - reads projection deltas since cursor
-          - ensures filesystem queue directories reflect the projection (create pending files, release stale claims, etc.)
-          - treats filesystem as a witnessed cache: deletable and rebuildable
+        Add explicit runtime guards and tests for:
+          - max events processed per tick
+          - max filesystem ops per tick
+          - cursor/checkpoint monotonicity under repeated crash/restart cycles
 
-        The reconciler MUST be bounded:
-          - fixed max events processed per tick
-          - fixed max filesystem ops per tick
-          - maintains cursor/checkpoint
+        The reconciler must remain CPU and I/O bounded under adversarial queue shapes.
 
-    - id: "QL-003"
-      title: "Dual-write migration path (temporary): emit ledger events alongside existing filesystem mutations"
+    - id: "QL-R3"
+      title: "Verification: divergence healing remains projection-authoritative"
       detail: |
-        During cutover:
-          - whenever queue code mutates filesystem state, also emit the corresponding ledger event.
-          - worker pickup path should prefer the ledger projection when available, but may fall back to filesystem for compatibility.
-
-        Provide a config flag to enable/disable dual-write, defaulting to off until tested.
-
-    - id: "QL-004"
-      title: "Verification: crash recovery and divergence healing"
-      detail: |
-        Add tests / harnesses that simulate:
-          - crash after filesystem mutate but before ledger append (divergence)
+        Add/maintain crash matrix tests for:
+          - crash after filesystem mutate but before ledger append
           - crash after ledger append but before filesystem mutate
-          - restart reconciler heals divergence into the projection-defined truth (fail-closed for ambiguous authority)
+          - restart convergence to projection-defined truth (fail-closed on ambiguity)
 
-        The correctness rule: ledger projection wins; filesystem is repaired to match.
+        The correctness rule remains: ledger projection wins; filesystem is repaired to match.
 
   out_of_scope:
     - Full deletion of filesystem queue implementation (future phase).
@@ -88,18 +75,17 @@ scope:
 
 plan:
   steps:
-    - Define event types + schemas; add bounded decode/encode.
-    - Implement projection reducer and storage.
-    - Implement reconciler loop + cursor/checkpoint.
-    - Add dual-write hooks in existing queue mutation sites.
-    - Add crash/divergence tests.
+    - Remove/redirect legacy manual queue repair paths into doctor-driven flows.
+    - Add explicit boundedness assertions and regression tests for reconciler loop caps.
+    - Expand crash/divergence matrix tests and prove deterministic convergence to projection truth.
+    - Audit daemon wiring so queue authority reads never bypass projection state.
 
 definition_of_done:
   criteria:
-    - "A daemon-side projection can describe the job lifecycle from ledger events."
-    - "A reconciler can (re)create filesystem queue state from projection (witnessed cache)."
-    - "Crash/divergence tests demonstrate that restart converges to ledger-defined truth."
-    - "Dual-write flag exists and is off by default."
+    - "Doctor/fix is the sole supported autonomous recovery path for queue divergence repair."
+    - "Reconciler boundedness is enforced and regression-tested under crash/restart churn."
+    - "Crash/divergence tests demonstrate restart convergence to ledger-defined truth."
+    - "No authority-critical queue path depends on filesystem state without projection corroboration."
 
 risks:
   - id: "R-QL-01"

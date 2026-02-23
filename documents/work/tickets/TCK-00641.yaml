@@ -20,7 +20,7 @@ ticket_meta:
   dependencies:
     tickets:
     - ticket_id: TCK-00640
-      reason: Requires changeset_published bound to work_id and fac push terminal markers
+      reason: Requires authoritative push work_id binding, terminal marker publication, and projection-safe work envelope decoding
     - ticket_id: TCK-00631
       reason: Canonical ledger append
   scope:
@@ -29,6 +29,8 @@ ticket_meta:
     - Maintain `work_latest_changeset` projection (work_id -> latest changeset digest) and ensure transitions only apply to latest digest
     - Emit `work.transitioned(InProgress -> CiPending)` when a new latest changeset is observed
     - Emit `work.transitioned(CiPending -> ReadyForReview)` or `Blocked` based on gate/receipt outcomes (existing gate orchestrator integration)
+    - Ensure processor wiring reads only canonical ledger/projection state (no filesystem/state-file authority shortcuts)
+    - Preserve fail-closed behavior if latest changeset binding is missing/ambiguous for a candidate receipt
     out_of_scope:
     - Making CI actor id configurable (explicitly deferred; reducer hard-codes `system:ci-processor` today)
   plan:
@@ -43,3 +45,4 @@ ticket_meta:
     - CI processor emits transitions with actor_id exactly `system:ci-processor` to satisfy current WorkReducer checks.
     - Transitions are only emitted for the latest changeset digest per work (no stale transitions).
     - Projections and reducers remain replayable from ledger+CAS (no hidden SQLite authority).
+    - Processor behavior is deterministic under replay and does not depend on ephemeral daemon state files.

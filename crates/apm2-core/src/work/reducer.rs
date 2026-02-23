@@ -447,9 +447,10 @@ impl WorkReducer {
     /// # Security Constraints
     ///
     /// - **State Restriction**: PR association is only allowed when the work
-    ///   item is in `InProgress` state. This prevents agents from bypassing CI
-    ///   gating by associating a work item with a PR that has already passed CI
-    ///   while in `CiPending` or `Blocked` state.
+    ///   item is in `Claimed` or `InProgress` state. This permits manual
+    ///   operator-supervised push flows before explicit `InProgress`
+    ///   transition, while still preventing CI-gating bypass from
+    ///   `CiPending`/`Blocked` and terminal states.
     ///
     /// - **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be
     ///   associated with a work item if it is already associated with another
@@ -484,10 +485,9 @@ impl WorkReducer {
                     work_id: work_id.clone(),
                 })?;
 
-        // Security check: PR association only allowed from InProgress state.
-        // This prevents bypassing CI gating by associating with a PR that has
-        // already passed CI while in CiPending or Blocked state.
-        if work.state != WorkState::InProgress {
+        // Security check: PR association only allowed from Claimed or
+        // InProgress state.
+        if !matches!(work.state, WorkState::Claimed | WorkState::InProgress) {
             return Err(WorkError::PrAssociationNotAllowed {
                 work_id: work_id.clone(),
                 current_state: work.state,

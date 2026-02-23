@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00679"
     title: "FAC: safe_rmtree_v1 cannot recover lanes with sandboxed 0333-mode broker_requests directories"
-    status: "OPEN"
+    status: "IN_PROGRESS"
     severity: "major"
     component: "fac/lane"
     tags: ["recovery-gap", "safe-rmtree", "lane-corruption", "broker-requests", "sandbox"]
@@ -107,19 +107,15 @@ root_cause_analysis:
 scope:
   in_scope:
     - id: "RMTREE-001"
-      title: "chmod u+rwx user-owned directories lacking read bit before recursive deletion"
+      title: "Residual hardening: keep mode-normalization fail-closed under adversarial trees"
       detail: |
-        In the lane cleanup / safe_rmtree_v1 path, before attempting recursive
-        deletion, chmod u+rwx any directories owned by the current user that
-        lack the read bit. This is safe because:
-          - Lane dirs are always owned by the service user
-          - We're already deleting them — adding read permission is less destructive
-          - No privilege escalation: we own the files
-    - id: "RMTREE-002"
-      title: "doctor --fix lane_tmp_scrub must not fail on permission errors for user-owned directories"
-      detail: |
-        The doctor --fix lane_tmp_scrub action should attempt chmod before
-        giving up on user-owned directories with restrictive permissions.
+        The core pre-delete normalization path now repairs user-owned directories
+        via handle-relative operations and bounded traversal. Remaining work is
+        hardening/verification:
+          - preserve symlink refusal and ownership checks under race pressure
+          - keep global directory-scan and depth bounds enforced
+          - maintain deterministic error surfaces for doctor/lane recovery flows
+
     - id: "RMTREE-003"
       title: "Integration test: kill worker mid-gate, verify lane auto-recovers"
       detail: |
