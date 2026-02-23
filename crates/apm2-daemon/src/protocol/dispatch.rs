@@ -17544,6 +17544,17 @@ impl PrivilegedDispatcher {
         }
     }
 
+    fn derive_claim_scoped_adhoc_session_id(work_id: &str, lease_id: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"apm2.work_status.adhoc_session.v1");
+        hasher.update(b"\0");
+        hasher.update(work_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(lease_id.as_bytes());
+        let digest = hasher.finalize();
+        format!("S-adhoc-{}", hex::encode(digest.as_bytes()))
+    }
+
     fn authority_status_to_work_status_response(
         &self,
         authority_status: &WorkAuthorityStatus,
@@ -17566,17 +17577,32 @@ impl PrivilegedDispatcher {
                 .collect(),
         };
 
+        let mut derived_adhoc_session_id: Option<String> = None;
+
         // Supplement with claim metadata when available.
         if let Some(claim) = self.work_registry.get_claim(&authority_status.work_id) {
             response.actor_id = Some(claim.actor_id);
             response.role = Some(claim.role.into());
             response.lease_id = Some(claim.lease_id);
+            if let Some(lease_id) = response
+                .lease_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                derived_adhoc_session_id = Some(Self::derive_claim_scoped_adhoc_session_id(
+                    &authority_status.work_id,
+                    lease_id,
+                ));
+            }
         }
 
         // Supplement with active session metadata when available.
         if let Some(session) = self.find_session_by_work_id(&authority_status.work_id) {
             response.session_id = Some(session.session_id);
             response.role = Some(session.role);
+        } else if let Some(adhoc_session_id) = derived_adhoc_session_id {
+            response.session_id = Some(adhoc_session_id);
         }
 
         response
@@ -27859,6 +27885,91 @@ mod tests {
                     assert_eq!(resp.actor_id, Some("actor:alice".to_string()));
                     assert_eq!(resp.role, Some(WorkRole::Reviewer.into()));
                     assert_eq!(resp.lease_id, Some("L-CLAIM-001".to_string()));
+                    assert_eq!(
+                        resp.session_id,
+                        Some(PrivilegedDispatcher::derive_claim_scoped_adhoc_session_id(
+                            "W-CLAIM-001",
+                            "L-CLAIM-001",
+                        )),
+                        "claimed work without an active episode should expose a deterministic ad-hoc session_id",
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_work_status_prefers_active_session_over_adhoc_fallback() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-CLAIM-SESSION-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:alice",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
+
+            let claim = WorkClaim {
+                work_id: "W-CLAIM-SESSION-001".to_string(),
+                lease_id: "L-CLAIM-SESSION-001".to_string(),
+                actor_id: "actor:alice".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-ref".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let session = SessionState {
+                session_id: "S-REAL-SESSION-001".to_string(),
+                work_id: "W-CLAIM-SESSION-001".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: "L-CLAIM-SESSION-001".to_string(),
+                ephemeral_handle: "handle-real-session-001".to_string(),
+                policy_resolved_ref: String::new(),
+                pcac_policy: None,
+                pointer_only_waiver: None,
+                capability_manifest_hash: vec![],
+                episode_id: Some("E-REAL-SESSION-001".to_string()),
+            };
+            dispatcher
+                .session_registry
+                .register_session(session)
+                .expect("session registration should succeed");
+
+            let request = WorkStatusRequest {
+                work_id: "W-CLAIM-SESSION-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(
+                        resp.session_id,
+                        Some("S-REAL-SESSION-001".to_string()),
+                        "active runtime session must override derived ad-hoc session identity",
+                    );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
             }
