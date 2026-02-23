@@ -279,7 +279,9 @@ fn resolve_daemon_config_path(config_path: &Path) -> PathBuf {
 
 #[cfg(not(test))]
 fn resolve_git_common_dir() -> Option<PathBuf> {
-    let output = Command::new("git")
+    // Security: use absolute path to avoid PATH injection
+    // (f-798-security-1771810456437363-0).
+    let output = Command::new("/usr/bin/git")
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .ok()?;
