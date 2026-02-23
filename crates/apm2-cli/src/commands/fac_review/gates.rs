@@ -37,12 +37,12 @@ use sha2::{Digest, Sha256};
 use super::bounded_test_runner::{
     BoundedTestLimits, build_bounded_test_command as build_systemd_bounded_test_command,
 };
+#[cfg(test)]
+use super::evidence::allocate_evidence_lane_context;
 use super::evidence::{
     EvidenceGateOptions, EvidenceGateResult, GateProgressEvent, LANE_EVIDENCE_GATES, cache_v3_root,
     compute_v3_compound_key, run_evidence_gates_with_lane_context,
 };
-#[cfg(test)]
-use super::evidence::allocate_evidence_lane_context;
 use super::gate_attestation::{
     GateResourcePolicy, build_nextest_command, compute_gate_attestation,
     gate_command_for_attestation,
