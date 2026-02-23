@@ -2556,6 +2556,23 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         }};
     }
 
+    // Explicitly stage fast, fail-closed checks before any time-consuming gate
+    // execution. This ordering is a push contract: no gate job may be enqueued
+    // until identity/worktree/head checks complete successfully.
+    let fast_checks_started = Instant::now();
+    let mut fast_checks_completed = false;
+    emit_stage(
+        "fast_checks_started",
+        serde_json::json!({
+            "checks": [
+                "ticket_metadata_resolution",
+                "work_binding_resolution",
+                "clean_worktree",
+                "head_drift_check",
+            ],
+        }),
+    );
+
     // Resolve metadata deterministically from TCK identity.
     let worktree_dir = match std::env::current_dir() {
         Ok(path) => path,
@@ -2675,6 +2692,23 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             )
         );
     }
+    if fast_checks_completed {
+        fail_with_attempt!(
+            "fac_push_fast_checks_state_invalid",
+            "internal invariant violation: fast checks already marked complete"
+        );
+    }
+    fast_checks_completed = true;
+    emit_stage(
+        "fast_checks_completed",
+        serde_json::json!({
+            "duration_secs": fast_checks_started.elapsed().as_secs(),
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "head_sha": sha,
+        }),
+    );
 
     let existing_pr_number = find_existing_pr(repo, &branch);
     attempt_pr_number = existing_pr_number;
@@ -2686,6 +2720,12 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let mut ruleset_sync_error_hint: Option<String> = None;
     let mut ruleset_sync_executed = false;
     let mut ruleset_sync_passed = false;
+    if !fast_checks_completed {
+        fail_with_attempt!(
+            "fac_push_fast_checks_not_completed",
+            "internal invariant violation: fast checks must complete before gate execution"
+        );
+    }
     let gate_outcome = match run_pre_push_sequence_with(
         || {
             let _phase_progress = PushPhaseProgressTicker::start("gates", json_output);
