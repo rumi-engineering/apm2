@@ -31,6 +31,28 @@ const GATE_START_PERSISTOR_ACTOR_ID: &str = "orchestrator:gate-start-kernel";
 /// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
 const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
 
+/// Detect whether a persisted cursor `event_id` is in the legacy (pre-unified)
+/// format. Legacy cursors store raw event IDs without the `legacy:` or
+/// `canonical:` namespace prefix that the unified reader now emits.
+///
+/// On upgrade, resuming from a legacy cursor value can cause the lexicographic
+/// comparison `cursor_event_id > last_cursor` to skip namespaced rows that sort
+/// before the raw value, permanently missing those events.
+///
+/// When a legacy cursor is detected, `load_with_conn` resets the cursor to the
+/// beginning. Re-processing is safe because the intent store's `state='done'`
+/// markers provide idempotent deduplication (CSID-003).
+fn is_legacy_cursor(event_id: &str) -> bool {
+    // An empty event_id is the default (no cursor persisted yet) — not legacy.
+    if event_id.is_empty() {
+        return false;
+    }
+    // The unified reader emits `legacy:<event_id>` or `canonical:<seq>`.
+    // Any persisted cursor that lacks one of these prefixes is from a
+    // previous version and must be treated as legacy.
+    !event_id.starts_with("legacy:") && !event_id.starts_with("canonical:")
+}
+
 /// Kernel configuration for gate-start orchestration ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateStartKernelConfig {
@@ -599,6 +621,12 @@ impl SqliteGateStartCursorStore {
     }
 
     /// Static `load` — callable from `spawn_blocking`.
+    ///
+    /// Migration safety: if the persisted cursor has a legacy (pre-unified)
+    /// `event_id` format (no `legacy:`/`canonical:` prefix), the cursor is
+    /// reset to the default (start from beginning). Re-processing from the
+    /// beginning is safe because the intent store's `state='done'` markers
+    /// deduplicate already-completed events (CSID-003 idempotency).
     fn load_with_conn(conn: &Arc<Mutex<Connection>>) -> Result<CompositeCursor, String> {
         let guard = conn
             .lock()
@@ -616,6 +644,13 @@ impl SqliteGateStartCursorStore {
         let Some((timestamp_ns, event_id)) = row else {
             return Ok(CompositeCursor::default());
         };
+        // Migration: detect pre-unified cursor format and reset to beginning.
+        // Legacy cursors used raw event IDs without the `legacy:` or
+        // `canonical:` namespace prefix. Resuming from such a cursor under
+        // the new unified ordering could permanently skip events.
+        if is_legacy_cursor(&event_id) {
+            return Ok(CompositeCursor::default());
+        }
         let timestamp_ns = u64::try_from(timestamp_ns)
             .map_err(|_| "gate-start cursor timestamp is negative".to_string())?;
         Ok(CompositeCursor {
@@ -1540,7 +1575,7 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
 
-    use super::{SqliteGateStartLedgerReader, gate_start_intent_key};
+    use super::{SqliteGateStartLedgerReader, gate_start_intent_key, is_legacy_cursor};
 
     #[test]
     fn gate_start_intent_key_matches_contract() {
@@ -1914,6 +1949,161 @@ mod tests {
         assert_eq!(
             count_after_gc, 0,
             "effect journal table must be empty after GC"
+        );
+    }
+
+    /// Tests for `is_legacy_cursor` — cursor format detection for migration
+    /// safety. Legacy cursors are raw event IDs without `legacy:` or
+    /// `canonical:` namespace prefix.
+    #[test]
+    fn is_legacy_cursor_detects_raw_event_ids() {
+        // Raw event IDs (no namespace prefix) are legacy.
+        assert!(
+            is_legacy_cursor("evt-12345"),
+            "raw event ID without prefix is legacy"
+        );
+        assert!(
+            is_legacy_cursor("a-legacy"),
+            "raw event ID 'a-legacy' is legacy (despite containing 'legacy' substring)"
+        );
+        assert!(
+            is_legacy_cursor("uuid-style-event-id-abc"),
+            "UUID-style raw event ID is legacy"
+        );
+    }
+
+    #[test]
+    fn is_legacy_cursor_accepts_namespaced_cursors() {
+        // Properly namespaced cursors are NOT legacy.
+        assert!(
+            !is_legacy_cursor("legacy:evt-12345"),
+            "'legacy:' prefixed cursor is not legacy"
+        );
+        assert!(
+            !is_legacy_cursor("canonical:00000000000000000001"),
+            "'canonical:' prefixed cursor is not legacy"
+        );
+    }
+
+    #[test]
+    fn is_legacy_cursor_empty_is_not_legacy() {
+        // Empty string is the default (no cursor persisted yet), not legacy.
+        assert!(
+            !is_legacy_cursor(""),
+            "empty event_id is not legacy (it is the default)"
+        );
+    }
+
+    /// Migration test: loading a cursor with a raw (pre-unified) event ID
+    /// resets to the default `CompositeCursor` (start from beginning).
+    /// Re-processing is idempotent via the intent store's `state='done'`
+    /// markers (CSID-003).
+    #[test]
+    fn sqlite_cursor_store_resets_legacy_cursor_to_beginning() {
+        use super::SqliteGateStartCursorStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let store = SqliteGateStartCursorStore::new(Arc::clone(&conn)).expect("init cursor store");
+
+        // Simulate a pre-unified cursor persisted by a previous version:
+        // raw event ID without `legacy:` or `canonical:` prefix.
+        let legacy_cursor = CompositeCursor {
+            timestamp_ns: 1_706_000_000_000_000_000,
+            event_id: "raw-event-id-from-v1".to_string(),
+        };
+        SqliteGateStartCursorStore::save_with_conn(&store.conn, &legacy_cursor)
+            .expect("save legacy cursor");
+
+        // Load must detect the legacy format and reset to default (beginning).
+        let loaded =
+            SqliteGateStartCursorStore::load_with_conn(&store.conn).expect("load should succeed");
+        assert_eq!(
+            loaded,
+            CompositeCursor::default(),
+            "legacy cursor must be reset to default (start from beginning)"
+        );
+    }
+
+    /// Verify that a cursor with the `legacy:` prefix is loaded correctly
+    /// (no reset).
+    #[test]
+    fn sqlite_cursor_store_preserves_legacy_prefixed_cursor() {
+        use super::SqliteGateStartCursorStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let store = SqliteGateStartCursorStore::new(Arc::clone(&conn)).expect("init cursor store");
+
+        let valid_cursor = CompositeCursor {
+            timestamp_ns: 1_706_000_000_000_000_000,
+            event_id: "legacy:evt-12345".to_string(),
+        };
+        SqliteGateStartCursorStore::save_with_conn(&store.conn, &valid_cursor)
+            .expect("save valid cursor");
+
+        let loaded =
+            SqliteGateStartCursorStore::load_with_conn(&store.conn).expect("load should succeed");
+        assert_eq!(
+            loaded.timestamp_ns, valid_cursor.timestamp_ns,
+            "timestamp_ns must be preserved for valid cursor"
+        );
+        assert_eq!(
+            loaded.event_id, "legacy:evt-12345",
+            "event_id must be preserved for 'legacy:' prefixed cursor"
+        );
+    }
+
+    /// Verify that a cursor with the `canonical:` prefix is loaded correctly
+    /// (no reset).
+    #[test]
+    fn sqlite_cursor_store_preserves_canonical_prefixed_cursor() {
+        use super::SqliteGateStartCursorStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let store = SqliteGateStartCursorStore::new(Arc::clone(&conn)).expect("init cursor store");
+
+        let valid_cursor = CompositeCursor {
+            timestamp_ns: 1_706_000_000_000_000_000,
+            event_id: "canonical:00000000000000000042".to_string(),
+        };
+        SqliteGateStartCursorStore::save_with_conn(&store.conn, &valid_cursor)
+            .expect("save valid cursor");
+
+        let loaded =
+            SqliteGateStartCursorStore::load_with_conn(&store.conn).expect("load should succeed");
+        assert_eq!(
+            loaded.timestamp_ns, valid_cursor.timestamp_ns,
+            "timestamp_ns must be preserved for valid cursor"
+        );
+        assert_eq!(
+            loaded.event_id, "canonical:00000000000000000042",
+            "event_id must be preserved for 'canonical:' prefixed cursor"
+        );
+    }
+
+    /// Verify that a fresh database (no cursor row) returns the default cursor
+    /// (not treated as legacy).
+    #[test]
+    fn sqlite_cursor_store_returns_default_for_fresh_db() {
+        use super::SqliteGateStartCursorStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let _store = SqliteGateStartCursorStore::new(Arc::clone(&conn)).expect("init cursor store");
+
+        // No cursor saved — must return default.
+        let loaded =
+            SqliteGateStartCursorStore::load_with_conn(&conn).expect("load should succeed");
+        assert_eq!(
+            loaded,
+            CompositeCursor::default(),
+            "fresh database must return default cursor"
         );
     }
 }

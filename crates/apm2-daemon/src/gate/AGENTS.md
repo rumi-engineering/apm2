@@ -33,6 +33,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT15] Event payloads enforce `MAX_PAYLOAD_BYTES` (1 MiB) size limit BEFORE JSON deserialization to prevent memory exhaustion.
 - [INV-GT16] `publisher_actor_id` is derived from the verified `actor_id` column of the ledger row (signed envelope), not from untrusted payload content. Cross-validation rejects identity mismatches.
 - [INV-GT17] `publisher_actor_id` length is validated against `MAX_STRING_LENGTH` consistent with other string fields.
+- [INV-GT18] `GateStartKernel` cursor migration safety: on upgrade from pre-unified to unified event reader, persisted cursors with raw event IDs (no `legacy:` or `canonical:` prefix) are detected and reset to the beginning. Re-processing is safe because the intent store's `state='done'` markers provide idempotent deduplication (CSID-003).
 
 **Contracts:**
 
