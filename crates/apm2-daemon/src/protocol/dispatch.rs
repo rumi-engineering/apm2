@@ -27828,6 +27828,26 @@ mod tests {
             }))
         }
 
+        fn make_work_opened_session_envelope_payload(
+            work_id: &str,
+            spec_snapshot_hash: Vec<u8>,
+        ) -> Vec<u8> {
+            let opened_payload = apm2_core::work::helpers::work_opened_payload(
+                work_id,
+                "TICKET",
+                spec_snapshot_hash,
+                vec![],
+                vec![],
+            );
+            serde_json::to_vec(&serde_json::json!({
+                "event_type": "work.opened",
+                "session_id": work_id,
+                "actor_id": "actor:test",
+                "payload": hex::encode(opened_payload),
+            }))
+            .expect("work.opened session envelope should encode")
+        }
+
         fn inject_work_opened(dispatcher: &PrivilegedDispatcher, work_id: &str, timestamp_ns: u64) {
             dispatcher
                 .event_emitter
@@ -27836,13 +27856,7 @@ mod tests {
                     event_type: "work.opened".to_string(),
                     work_id: work_id.to_string(),
                     actor_id: "actor:test".to_string(),
-                    payload: apm2_core::work::helpers::work_opened_payload(
-                        work_id,
-                        "TICKET",
-                        vec![0xAA; 32],
-                        vec![],
-                        vec![],
-                    ),
+                    payload: make_work_opened_session_envelope_payload(work_id, vec![0xAA; 32]),
                     signature: vec![0u8; 64],
                     timestamp_ns,
                 });
@@ -28461,12 +28475,9 @@ mod tests {
                     event_type: "work.opened".to_string(),
                     work_id: work_id.clone(),
                     actor_id: "actor:test".to_string(),
-                    payload: apm2_core::work::helpers::work_opened_payload(
+                    payload: make_work_opened_session_envelope_payload(
                         &work_id,
-                        "TICKET",
                         stored.hash.to_vec(),
-                        vec![],
-                        vec![],
                     ),
                     signature: vec![0u8; 64],
                     timestamp_ns: 1_000_000_100,
