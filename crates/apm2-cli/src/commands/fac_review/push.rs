@@ -1653,8 +1653,12 @@ fn normalize_non_empty_arg(value: Option<&str>) -> Option<String> {
 }
 
 fn is_active_push_fallback_status(status: &str) -> bool {
-    let normalized = status.trim().to_ascii_uppercase();
-    normalized == "CLAIMED" || normalized == "SPAWNED"
+    match status.trim().to_ascii_uppercase().as_str() {
+        // Current canonical work states surfaced by daemon work projection,
+        // plus legacy/in-flight aliases preserved during migration windows.
+        "CLAIMED" | "IN_PROGRESS" | "INPROGRESS" | "SPAWNED" | "RUNNING" => true,
+        _ => false,
+    }
 }
 
 fn matches_push_fallback_candidate(
@@ -1666,11 +1670,12 @@ fn matches_push_fallback_candidate(
         return false;
     }
 
-    if let Some(role_raw) = work_item.role {
-        let role = apm2_daemon::protocol::WorkRole::try_from(role_raw);
-        if role != Ok(apm2_daemon::protocol::WorkRole::Implementer) {
-            return false;
-        }
+    let Some(role_raw) = work_item.role else {
+        return false;
+    };
+    let role = apm2_daemon::protocol::WorkRole::try_from(role_raw);
+    if role != Ok(apm2_daemon::protocol::WorkRole::Implementer) {
+        return false;
     }
 
     if let Some(expected_lease_id) = lease_filter {
@@ -1690,9 +1695,7 @@ fn matches_push_fallback_candidate(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if let Some(observed_session_id) = observed_session_id
-            && observed_session_id != expected_session_id
-        {
+        if observed_session_id != Some(expected_session_id) {
             return false;
         }
     }
@@ -1776,16 +1779,20 @@ fn resolve_work_id_for_push(
     match (trimmed_work_id, alias.as_deref()) {
         (Some(work_id), Some(ticket_alias)) => {
             validate_push_work_id(&work_id)?;
-            if let Some(resolved_work_id) =
-                resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?
-                && resolved_work_id != work_id
+            let resolved_work_id = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?;
+            if let Some(ref resolved_work_id) = resolved_work_id
+                && resolved_work_id != &work_id
             {
                 return Err(format!(
                     "`--work-id` mismatch: provided `{work_id}` but ticket alias \
                      `{ticket_alias}` resolved to `{resolved_work_id}`",
                 ));
             }
-            Ok((work_id, Some(ticket_alias.to_string())))
+            // Only persist ticket_alias when daemon projection authority
+            // verified it. Unverified aliases are never projected as
+            // authoritative identity bindings.
+            let verified_alias = resolved_work_id.map(|_| ticket_alias.to_string());
+            Ok((work_id, verified_alias))
         },
         (Some(work_id), None) => {
             validate_push_work_id(&work_id)?;
@@ -1806,7 +1813,7 @@ fn resolve_work_id_for_push(
                      projection fallback failed: {fallback_err}"
                 )
             })?;
-            Ok((fallback_work_id, Some(ticket_alias.to_string())))
+            Ok((fallback_work_id, None))
         },
         (None, None) => {
             let derived_alias = resolve_tck_id(branch, worktree_dir)?;
@@ -1825,7 +1832,7 @@ fn resolve_work_id_for_push(
                      work_id and projection fallback failed: {fallback_err}"
                 )
             })?;
-            Ok((fallback_work_id, Some(derived_alias)))
+            Ok((fallback_work_id, None))
         },
     }
 }
@@ -1970,6 +1977,36 @@ fn parse_git_diff_manifest(base_ref: &str, head_sha: &str) -> Result<Vec<FileCha
     parse_git_name_status_manifest_z(&output.stdout, &range)
 }
 
+fn parse_git_numstat_binary_detected(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let mut parts = trimmed.splitn(3, '\t');
+        let inserted = parts.next().unwrap_or_default().trim();
+        let deleted = parts.next().unwrap_or_default().trim();
+        inserted == "-" || deleted == "-"
+    })
+}
+
+fn detect_binary_changes(base_ref: &str, head_sha: &str) -> Result<bool, String> {
+    let range = format!("{base_ref}..{head_sha}");
+    let output = Command::new("git")
+        .args(["diff", "--numstat", "--find-renames", &range])
+        .output()
+        .map_err(|err| format!("failed to collect numstat for `{range}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to collect numstat for `{range}`: {}",
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_git_numstat_binary_detected(&stdout))
+}
+
 fn parse_dirty_worktree_entries(raw: &str) -> Vec<String> {
     raw.lines()
         .map(str::trim)
@@ -2112,6 +2149,7 @@ fn build_changeset_bundle_json(remote: &str, sha: &str) -> Result<Vec<u8>, Strin
     let base_ref = resolve_commit_history_base_ref(remote)?;
     let (base_algo, base_object_id) = parse_git_base_ref_commit(&base_ref)?;
     let manifest = parse_git_diff_manifest(&base_ref, sha)?;
+    let binary_detected = detect_binary_changes(&base_ref, sha)?;
     let diff_range = format!("{base_ref}..{sha}");
     let diff_bytes = Command::new("git")
         .args(["diff", "--binary", &diff_range])
@@ -2139,7 +2177,7 @@ fn build_changeset_bundle_json(remote: &str, sha: &str) -> Result<Vec<u8>, Strin
         })
         .diff_hash(*blake3::hash(&diff_bytes).as_bytes())
         .file_manifest(manifest)
-        .binary_detected(false)
+        .binary_detected(binary_detected)
         .build()
         .map_err(|err| format!("failed to build changeset bundle: {err}"))?;
 
@@ -3496,7 +3534,7 @@ mod tests {
     }
 
     #[test]
-    fn select_push_fallback_work_id_from_list_tolerates_missing_session_metadata() {
+    fn select_push_fallback_work_id_from_list_requires_session_match_when_filter_provided() {
         let rows = vec![sample_daemon_work_item(
             "W-implementer-1",
             "CLAIMED",
@@ -3505,10 +3543,46 @@ mod tests {
             None,
         )];
 
+        let err = select_push_fallback_work_id_from_list(
+            &rows,
+            Some("L-target"),
+            Some("S-backfill"),
+        )
+        .expect_err(
+            "missing daemon session metadata must fail closed when session filter is explicit",
+        );
+        assert!(err.contains("could not identify an active Implementer work item"));
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_accepts_in_progress_status() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "IN_PROGRESS",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-target"),
+            Some("S-target"),
+        )];
+
         let selected =
-            select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-backfill"))
-                .expect("missing daemon session metadata should not block fallback selection");
+            select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-target"))
+                .expect("IN_PROGRESS should be treated as an active status");
         assert_eq!(selected, "W-implementer-1");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_rejects_missing_role() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "CLAIMED",
+            None,
+            Some("L-target"),
+            Some("S-target"),
+        )];
+
+        let err = select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-target"))
+            .expect_err("missing role must fail closed");
+        assert!(err.contains("could not identify an active Implementer work item"));
     }
 
     #[test]
@@ -3582,6 +3656,24 @@ mod tests {
         let err = parse_git_name_status_manifest_z(raw, "base..head")
             .expect_err("unsupported status should fail");
         assert!(err.contains("unsupported status"));
+    }
+
+    #[test]
+    fn parse_git_numstat_binary_detected_flags_binary_rows() {
+        let raw = "12\t4\tsrc/lib.rs\n-\t-\tassets/logo.png\n";
+        assert!(
+            parse_git_numstat_binary_detected(raw),
+            "numstat parser must detect binary rows marked with '-'"
+        );
+    }
+
+    #[test]
+    fn parse_git_numstat_binary_detected_ignores_text_only_rows() {
+        let raw = "12\t4\tsrc/lib.rs\n1\t0\tREADME.md\n";
+        assert!(
+            !parse_git_numstat_binary_detected(raw),
+            "numstat parser must not report binary when all rows are text"
+        );
     }
 
     #[test]

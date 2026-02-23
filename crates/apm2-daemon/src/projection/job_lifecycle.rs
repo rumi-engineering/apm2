@@ -591,6 +591,12 @@ impl JobLifecycleRehydrationReconciler {
     /// Individually undecodable lifecycle events are warned-and-skipped while
     /// still advancing the cursor to prevent poison-pill replay loops.
     pub fn tick(&self) -> Result<JobLifecycleReconcileTickV1, JobLifecycleProjectionError> {
+        if self.config.max_events_per_tick == 0 {
+            return Err(JobLifecycleProjectionError::Validation(
+                "max_events_per_tick must be greater than zero".to_string(),
+            ));
+        }
+
         self.ensure_queue_dirs()?;
         let mut checkpoint = self.load_checkpoint()?;
 
@@ -2388,5 +2394,26 @@ mod tests {
             "orphan file must be cleaned up when cursor is caught up to \
              lifecycle stream, regardless of non-lifecycle events ahead"
         );
+    }
+
+    #[test]
+    fn tick_rejects_zero_event_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let reconciler = make_reconciler(
+            &queue_root,
+            emitter,
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 0,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        let err = reconciler
+            .tick()
+            .expect_err("zero event budget must fail closed");
+        assert!(matches!(err, JobLifecycleProjectionError::Validation(_)));
+        assert!(err.to_string().contains("max_events_per_tick"));
     }
 }
