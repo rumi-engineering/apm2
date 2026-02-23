@@ -29,6 +29,10 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT05] Changeset digest in each lease matches the authoritative `ChangeSetPublished` digest.
 - [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). `on_session_terminated` is lifecycle-only (timeout polling) and deprecated.
 - [INV-GT13] Idempotency key is `(work_id, changeset_digest)`, a pure function of authoritative publication inputs (CSID-003).
+- [INV-GT14] Orchestrations map keyed by `(work_id, changeset_digest)` composite key (CSID-003). Starting `(work, digest2)` while `(work, digest1)` is active is ALLOWED; starting the same `(work, digest1)` twice is detected as replay no-op.
+- [INV-GT15] Event payloads enforce `MAX_PAYLOAD_BYTES` (1 MiB) size limit BEFORE JSON deserialization to prevent memory exhaustion.
+- [INV-GT16] `publisher_actor_id` is derived from the verified `actor_id` column of the ledger row (signed envelope), not from untrusted payload content. Cross-validation rejects identity mismatches.
+- [INV-GT17] `publisher_actor_id` length is validated against `MAX_STRING_LENGTH` consistent with other string fields.
 
 **Contracts:**
 

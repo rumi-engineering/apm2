@@ -303,20 +303,14 @@ async fn tck_00388_admission_check_before_events() {
     );
     assert!(events.is_empty(), "no-op should not emit events");
 
-    // Same work_id with a different digest while active is rejected.
-    let duplicate_result = orch2
+    // CSID-003: Same work_id with a different digest while active is ALLOWED
+    // (different changeset orchestrations can run concurrently for the same work).
+    let different_digest_result = orch2
         .start_for_changeset(test_publication("work-integ-04c", [0x47; 32]))
         .await;
     assert!(
-        duplicate_result.is_err(),
-        "expected DuplicateOrchestration error"
-    );
-    let err = duplicate_result
-        .err()
-        .expect("duplicate_result must be an error");
-    assert!(
-        matches!(err, GateOrchestratorError::DuplicateOrchestration { .. }),
-        "Expected DuplicateOrchestration error, got: {err:?}"
+        different_digest_result.is_ok(),
+        "same work_id with different digest should be allowed (CSID-003)"
     );
 }
 

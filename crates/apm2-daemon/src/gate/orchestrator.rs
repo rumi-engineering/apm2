@@ -677,8 +677,13 @@ impl Default for GateOrchestratorConfig {
 pub struct GateOrchestrator {
     /// Configuration.
     config: GateOrchestratorConfig,
-    /// Active orchestrations indexed by `work_id`.
-    orchestrations: RwLock<HashMap<String, OrchestrationEntry>>,
+    /// Active orchestrations indexed by `(work_id, changeset_digest)`.
+    ///
+    /// CSID-003: Keyed by composite `(work_id, changeset_digest)` to allow
+    /// concurrent orchestrations for the same work item with different
+    /// changesets. Starting `(work, digest2)` while `(work, digest1)` is
+    /// active is ALLOWED; starting the same `(work, digest1)` twice is denied.
+    orchestrations: RwLock<HashMap<(String, [u8; 32]), OrchestrationEntry>>,
     /// Signer for gate leases and policy resolutions.
     signer: Arc<Signer>,
     /// Injected clock for timestamps and timeout checking (MAJOR 1).
@@ -858,8 +863,7 @@ impl GateOrchestrator {
         gate_type: GateType,
     ) -> Option<VerifyingKey> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
+        find_by_work_id(&orchestrations, work_id)
             .and_then(|e| e.executor_keys.get(&gate_type).copied())
     }
 
@@ -913,6 +917,15 @@ impl GateOrchestrator {
             return Err(GateOrchestratorError::StringTooLong {
                 field: "changeset_published_event_id",
                 actual: publication.changeset_published_event_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        // NIT (Security): Validate publisher_actor_id length consistent with
+        // work_id and event_id validation above.
+        if publication.publisher_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(GateOrchestratorError::StringTooLong {
+                field: "publisher_actor_id",
+                actual: publication.publisher_actor_id.len(),
                 max: MAX_STRING_LENGTH,
             });
         }
@@ -999,8 +1012,12 @@ impl GateOrchestrator {
                 });
             }
 
-            // Duplicate work_id check + insert.
-            match orchestrations.entry(publication.work_id.clone()) {
+            // BLOCKER 2 (Code-Quality): CSID-003 composite key.
+            // Duplicate (work_id, changeset_digest) check + insert.
+            // Starting (work, digest2) while (work, digest1) is active is ALLOWED.
+            // Starting the same (work, digest1) twice is denied.
+            let composite_key = (publication.work_id.clone(), publication.changeset_digest);
+            match orchestrations.entry(composite_key) {
                 Entry::Occupied(_) => {
                     return Err(GateOrchestratorError::DuplicateOrchestration {
                         work_id: publication.work_id.clone(),
@@ -1103,7 +1120,7 @@ impl GateOrchestrator {
 
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1254,7 +1271,7 @@ impl GateOrchestrator {
 
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1422,7 +1439,7 @@ impl GateOrchestrator {
 
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1510,7 +1527,7 @@ impl GateOrchestrator {
         let orchestrations = self.orchestrations.read().await;
         let mut timed_out = Vec::new();
 
-        for (work_id, entry) in orchestrations.iter() {
+        for ((work_id, _digest), entry) in orchestrations.iter() {
             // Security BLOCKER 1: Use monotonic elapsed time, not wall-clock.
             let elapsed = entry.started_at_monotonic.elapsed();
             if elapsed >= self.gate_timeout_duration {
@@ -1603,25 +1620,19 @@ impl GateOrchestrator {
     /// Returns the gate status for a specific gate in an orchestration.
     pub async fn gate_status(&self, work_id: &str, gate_type: GateType) -> Option<GateStatus> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .and_then(|e| e.gates.get(&gate_type).cloned())
+        find_by_work_id(&orchestrations, work_id).and_then(|e| e.gates.get(&gate_type).cloned())
     }
 
     /// Returns the gate lease for a specific gate in an orchestration.
     pub async fn gate_lease(&self, work_id: &str, gate_type: GateType) -> Option<GateLease> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .and_then(|e| e.leases.get(&gate_type).cloned())
+        find_by_work_id(&orchestrations, work_id).and_then(|e| e.leases.get(&gate_type).cloned())
     }
 
     /// Returns the policy resolution for a work item.
     pub async fn policy_resolution(&self, work_id: &str) -> Option<PolicyResolvedForChangeSet> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .map(|e| e.policy_resolution.clone())
+        find_by_work_id(&orchestrations, work_id).map(|e| e.policy_resolution.clone())
     }
 
     /// Removes a completed orchestration from the active set.
@@ -1629,7 +1640,7 @@ impl GateOrchestrator {
     /// Returns `true` if the orchestration was found and removed.
     pub async fn remove_orchestration(&self, work_id: &str) -> bool {
         let mut orchestrations = self.orchestrations.write().await;
-        orchestrations.remove(work_id).is_some()
+        remove_by_work_id(&mut orchestrations, work_id)
     }
 
     // =========================================================================
@@ -2085,7 +2096,7 @@ impl GateOrchestrator {
         events: &mut Vec<GateOrchestratorEvent>,
     ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
         let orchestrations = self.orchestrations.read().await;
-        let entry = orchestrations.get(work_id).ok_or_else(|| {
+        let entry = find_by_work_id(&orchestrations, work_id).ok_or_else(|| {
             GateOrchestratorError::OrchestrationNotFound {
                 work_id: work_id.to_string(),
             }
@@ -2171,6 +2182,46 @@ impl GateOrchestrator {
 
         Ok(Some(outcomes))
     }
+}
+
+// =============================================================================
+// Composite Key Helpers (CSID-003)
+// =============================================================================
+
+/// Finds the first orchestration entry matching `work_id` (any digest).
+///
+/// Used by methods that only receive `work_id` as a parameter (receipt
+/// recording, status queries, timeouts). At most a handful of entries exist
+/// per `work_id`, so linear scan is correct and performant.
+fn find_by_work_id<'a>(
+    map: &'a HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<&'a OrchestrationEntry> {
+    map.iter()
+        .find(|((wid, _), _)| wid == work_id)
+        .map(|(_, entry)| entry)
+}
+
+/// Finds the first orchestration entry matching `work_id` (any digest),
+/// mutable.
+fn find_by_work_id_mut<'a>(
+    map: &'a mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<&'a mut OrchestrationEntry> {
+    map.iter_mut()
+        .find(|((wid, _), _)| wid == work_id)
+        .map(|(_, entry)| entry)
+}
+
+/// Removes the first orchestration entry matching `work_id` (any digest).
+///
+/// Returns `true` if an entry was found and removed.
+fn remove_by_work_id(
+    map: &mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> bool {
+    let key = map.keys().find(|(wid, _)| wid == work_id).cloned();
+    key.is_some_and(|k| map.remove(&k).is_some())
 }
 
 // =============================================================================
@@ -2658,8 +2709,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duplicate_work_id_different_session_rejected() {
-        // Same work_id but different session_id → DuplicateOrchestration
+    async fn test_same_work_id_different_digest_allowed() {
+        // CSID-003: Same work_id but different changeset_digest → ALLOWED
+        // (different changesets for the same work can be orchestrated
+        // concurrently).
         let orch = test_orchestrator();
         let info1 = SessionTerminatedInfo {
             session_id: "session-alpha".to_string(),
@@ -2670,21 +2723,50 @@ mod tests {
         let info2 = SessionTerminatedInfo {
             session_id: "session-beta".to_string(),
             work_id: "work-dup-wid".to_string(),
-            changeset_digest: [0x99; 32], // Different digest avoids replay check
+            changeset_digest: [0x99; 32], // Different digest → separate orchestration
             terminated_at_ms: 0,
         };
 
         orch.handle_session_terminated(info1).await.unwrap();
 
-        let err = orch
-            .handle_session_terminated(info2)
-            .await
-            .err()
-            .expect("expected error");
-        assert!(matches!(
-            err,
-            GateOrchestratorError::DuplicateOrchestration { .. }
-        ));
+        // With composite key (work_id, changeset_digest), this should succeed.
+        let result = orch.handle_session_terminated(info2).await;
+        assert!(
+            result.is_ok(),
+            "same work_id with different digest should be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_work_id_same_digest_duplicate_rejected() {
+        // CSID-003: Same (work_id, changeset_digest) → DuplicateOrchestration
+        let orch = test_orchestrator();
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-alpha".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x42; 32],
+            terminated_at_ms: 0,
+        };
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-beta".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x42; 32], // Same digest → duplicate
+            terminated_at_ms: 0,
+        };
+
+        orch.handle_session_terminated(info1).await.unwrap();
+
+        // Same (work_id, changeset_digest) should be detected as replay/no-op.
+        // Note: the idempotency key set provides this guard, returning
+        // empty outputs instead of an error.
+        let result = orch.handle_session_terminated(info2).await;
+        assert!(result.is_ok(), "duplicate should be no-op, not error");
+        let (gate_types, _, events) = result.unwrap();
+        assert!(
+            gate_types.is_empty(),
+            "duplicate should return empty outputs"
+        );
+        assert!(events.is_empty(), "duplicate should return no events");
     }
 
     #[tokio::test]
