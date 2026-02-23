@@ -18,6 +18,7 @@ use apm2_core::fac::job_lifecycle::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::fs_safe;
 use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
@@ -46,7 +47,9 @@ pub const MAX_PENDING_RECONCILES: usize = 16_384;
 const CHECKPOINT_FILE_NAME: &str = ".job_lifecycle_checkpoint.v1.json";
 const MAX_CURSOR_EVENT_ID_LENGTH: usize = 256;
 const MAX_QUEUE_JOB_ID_LENGTH: usize = 256;
-const MAX_CHECKPOINT_FILE_SIZE_BYTES: u64 = 1_048_576;
+// At MAX_PROJECTED_JOBS capacity (16,384), checkpoint state can exceed 10 MiB.
+// Keep read bound aligned with configured projection/pending limits.
+const MAX_CHECKPOINT_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TERMINAL_EVICTION_QUEUE_ENTRIES: usize = MAX_PROJECTED_JOBS * 2;
 
 const PENDING_DIR: &str = "pending";
@@ -505,26 +508,44 @@ impl JobLifecycleRehydrationReconciler {
     ///
     /// # Errors
     ///
-    /// Returns [`JobLifecycleProjectionError`] when event decode, projection,
+    /// Returns [`JobLifecycleProjectionError`] when projection,
     /// checkpoint persistence, or filesystem operations fail.
+    /// Individually undecodable lifecycle events are warned-and-skipped while
+    /// still advancing the cursor to prevent poison-pill replay loops.
     pub fn tick(&self) -> Result<JobLifecycleReconcileTickV1, JobLifecycleProjectionError> {
         self.ensure_queue_dirs()?;
         let mut checkpoint = self.load_checkpoint()?;
-
-        let new_events = self.collect_events_since(
-            checkpoint.cursor_timestamp_ns,
-            &checkpoint.cursor_event_id,
-            self.config.max_events_per_tick,
-        );
 
         let mut dirty_job_ids: BTreeSet<String> = checkpoint
             .pending_reconcile_job_ids
             .drain(..)
             .collect::<BTreeSet<_>>();
+        let remaining_pending_capacity = MAX_PENDING_RECONCILES.saturating_sub(dirty_job_ids.len());
+        let event_fetch_limit = self
+            .config
+            .max_events_per_tick
+            .min(remaining_pending_capacity);
+        let new_events = self.collect_events_since(
+            checkpoint.cursor_timestamp_ns,
+            &checkpoint.cursor_event_id,
+            event_fetch_limit,
+        );
         let mut processed_events = 0usize;
 
         for event in new_events {
-            let lifecycle_event = decode_lifecycle_event(&event)?;
+            let lifecycle_event = match decode_lifecycle_event(&event) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %error,
+                        "skipping undecodable fac.job lifecycle event"
+                    );
+                    checkpoint.cursor_timestamp_ns = event.timestamp_ns;
+                    checkpoint.cursor_event_id = event.event_id;
+                    continue;
+                },
+            };
             let dirty_job_id = checkpoint.projection.apply_event(
                 &lifecycle_event,
                 &event.event_id,
@@ -1375,5 +1396,120 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(broker_mode, 0o1733, "broker_requests/ must be mode 01733");
+    }
+
+    #[test]
+    fn tick_skips_undecodable_event_and_continues_same_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+
+        emitter
+            .emit_session_event(
+                "session-job",
+                FAC_JOB_ENQUEUED_EVENT_TYPE,
+                b"malformed lifecycle payload",
+                "fac-worker",
+                now_timestamp_ns(),
+            )
+            .expect("emit malformed lifecycle payload");
+
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:good",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("job-good"),
+                    enqueue_epoch_ns: now_timestamp_ns() + 1,
+                }),
+            ),
+            now_timestamp_ns() + 1,
+        );
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 8,
+                max_fs_ops_per_tick: 8,
+            },
+        );
+
+        let first = reconciler.tick().expect("tick should skip malformed event");
+        assert_eq!(
+            first.processed_events, 1,
+            "valid events after poison pill must still be processed in same tick"
+        );
+        assert!(
+            queue_root.join(PENDING_DIR).join("job-good.json").exists(),
+            "valid event should still be reconciled"
+        );
+
+        let second = reconciler.tick().expect("second tick");
+        assert_eq!(
+            second.processed_events, 0,
+            "malformed event must be cursor-advanced and not replayed"
+        );
+    }
+
+    #[test]
+    fn tick_backpressures_when_pending_reconcile_queue_is_full() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let checkpoint_path = queue_root.join(CHECKPOINT_FILE_NAME);
+
+        let checkpoint = JobLifecycleCheckpointV1 {
+            pending_reconcile_job_ids: (0..MAX_PENDING_RECONCILES)
+                .map(|index| format!("pending-{index}"))
+                .collect(),
+            ..JobLifecycleCheckpointV1::default()
+        };
+        fs_safe::atomic_write_json(&checkpoint_path, &checkpoint)
+            .expect("seed full pending checkpoint");
+
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:overflow",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("job-overflow"),
+                    enqueue_epoch_ns: now_timestamp_ns(),
+                }),
+            ),
+            now_timestamp_ns(),
+        );
+
+        let reconciler = JobLifecycleRehydrationReconciler::with_checkpoint_path(
+            Arc::clone(&emitter),
+            queue_root.clone(),
+            checkpoint_path,
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 64,
+                max_fs_ops_per_tick: 0,
+            },
+        );
+
+        let tick = reconciler
+            .tick()
+            .expect("full pending queue should backpressure, not fail");
+        assert_eq!(
+            tick.processed_events, 0,
+            "no lifecycle events should be fetched when pending queue is saturated"
+        );
+        assert_eq!(tick.remaining_reconciles, MAX_PENDING_RECONCILES);
+        assert_eq!(tick.cursor_timestamp_ns, 0);
+        assert_eq!(tick.cursor_event_id, "");
+        assert!(
+            !queue_root
+                .join(PENDING_DIR)
+                .join("job-overflow.json")
+                .exists(),
+            "new events must remain unread while pending backlog is full"
+        );
     }
 }
