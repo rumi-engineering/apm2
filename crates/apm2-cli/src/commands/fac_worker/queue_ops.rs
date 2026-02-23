@@ -216,7 +216,24 @@ pub(super) fn release_claimed_job_to_pending(
     spec: &FacJobSpecV1,
     reason: &str,
 ) -> Result<PathBuf, String> {
-    if fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root)? {
+    // f-798-code_quality: Treat policy-read failures as "dual-write disabled"
+    // (graceful fallback). During QL-003 staged migration the dual-write
+    // feature is best-effort and the filesystem queue is authoritative.
+    // A policy/config read failure must not block recovery of claimed jobs —
+    // it would leave jobs stranded in `claimed/` indefinitely.
+    let dual_write_enabled =
+        match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                eprintln!(
+                    "worker: WARNING: cannot read queue lifecycle dual-write flag \
+                 for release_claimed_job_to_pending; proceeding with filesystem \
+                 authoritative queue: {err}"
+                );
+                false
+            },
+        };
+    if dual_write_enabled {
         if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_released(
             fac_root,
             spec,
