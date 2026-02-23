@@ -535,24 +535,20 @@ impl ReceiptWritePipeline {
                 });
             },
         };
-        match try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
+        if !try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
             ReceiptPipelineError::JobMoveFailed {
                 from: claimed_path.to_string_lossy().to_string(),
                 to: dest_dir.to_string_lossy().to_string(),
                 reason: format!("failed to acquire advisory lock on claimed file: {e}"),
             }
         })? {
-            true => {},
-            false => {
-                return Err(ReceiptPipelineError::JobMoveFailed {
-                    from: claimed_path.to_string_lossy().to_string(),
-                    to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!(
-                        "claimed file is already locked after {}ms timeout",
-                        CLAIMED_LOCK_WAIT_TIMEOUT_MS
-                    ),
-                });
-            },
+            return Err(ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: format!(
+                    "claimed file is already locked after {CLAIMED_LOCK_WAIT_TIMEOUT_MS}ms timeout"
+                ),
+            });
         }
         let _claimed_lock_guard = claimed_file;
 
@@ -654,24 +650,20 @@ impl ReceiptWritePipeline {
                 });
             },
         };
-        match try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
+        if !try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
             ReceiptPipelineError::JobMoveFailed {
                 from: claimed_path.to_string_lossy().to_string(),
                 to: dest_dir.to_string_lossy().to_string(),
                 reason: format!("failed to acquire advisory lock on claimed file: {e}"),
             }
         })? {
-            true => {},
-            false => {
-                return Err(ReceiptPipelineError::JobMoveFailed {
-                    from: claimed_path.to_string_lossy().to_string(),
-                    to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!(
-                        "claimed file is already locked after {}ms timeout",
-                        CLAIMED_LOCK_WAIT_TIMEOUT_MS
-                    ),
-                });
-            },
+            return Err(ReceiptPipelineError::JobMoveFailed {
+                from: claimed_path.to_string_lossy().to_string(),
+                to: dest_dir.to_string_lossy().to_string(),
+                reason: format!(
+                    "claimed file is already locked after {CLAIMED_LOCK_WAIT_TIMEOUT_MS}ms timeout"
+                ),
+            });
         }
         let _claimed_lock_guard = claimed_file;
 
