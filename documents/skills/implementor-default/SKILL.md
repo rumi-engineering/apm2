@@ -70,8 +70,11 @@ decision_tree:
         - id: DISCOVER_RELEVANT_FAC_HELP
           action: |
             Discover the 4 CLI commands you will use. Run these help commands:
-            (1) `apm2 fac review findings --help`
-            (2) `apm2 fac push --help`
+            (1) `apm2 work claim --help`
+            (2) `apm2 fac work current --help`
+            (3) `apm2 fac review findings --help`
+            (4) `apm2 fac push --help`
+            Note: `--handoff-note` on `fac push` is optional.
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
@@ -246,7 +249,9 @@ decision_tree:
       steps[4]:
         - id: RUN_FAC_PUSH
           action: |
-            COMMIT ALL CHANGES FIRST, then run `apm2 fac push`. Push requires a clean working tree — no uncommitted, staged, or untracked files. Gates execute internally as part of push.
+            COMMIT ALL CHANGES FIRST. Run `apm2 fac work current` to confirm daemon-resolved work binding (`work_id`, `lease_id`, `session_id`), then run `apm2 fac push`.
+            Push requires a clean working tree — no uncommitted, staged, or untracked files. Gates execute internally as part of push.
+            Add `--handoff-note` only when you have an explicit handoff body; it is optional.
         - id: FIX_AND_RERUN
           action: |
             Fix failures, COMMIT, and re-run `apm2 fac push` until PASS or BLOCKED.
@@ -286,7 +291,7 @@ decision_tree:
       purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures. Requires a clean committed tree."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. Run `apm2 fac push --ticket <TICKET_YAML>` (or `--branch <BRANCH>` when ticket metadata is unavailable). Expect it to take about 5-10 minutes on a fresh worktree"
+          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. First run `apm2 fac work current` to verify work binding. Then run `apm2 fac push` (add `--ticket <TICKET_YAML>` for metadata consistency checks, and add `--handoff-note <NOTE>` only when needed). Expect it to take about 5-10 minutes on a fresh worktree"
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE

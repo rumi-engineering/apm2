@@ -1568,15 +1568,15 @@ fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     latest_gate_error_hint(&result.gate_name)
 }
 
-fn require_handoff_note(handoff_note_arg: Option<&str>) -> Result<String, String> {
+fn parse_handoff_note(handoff_note_arg: Option<&str>) -> Result<Option<String>, String> {
     let Some(raw) = handoff_note_arg else {
-        return Err("`--handoff-note` is required".to_string());
+        return Ok(None);
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("`--handoff-note` cannot be empty".to_string());
+        return Err("`--handoff-note` cannot be empty when provided".to_string());
     }
-    Ok(trimmed.to_string())
+    Ok(Some(trimmed.to_string()))
 }
 
 const MAX_PUSH_IDENTIFIER_LENGTH: usize = 256;
@@ -1815,24 +1815,37 @@ fn resolve_work_id_for_push(
             })?;
             Ok((fallback_work_id, None))
         },
-        (None, None) => {
-            let derived_alias = resolve_tck_id(branch, worktree_dir)?;
-            if let Some(work_id) = resolve_ticket_alias_to_work_id(&derived_alias, operator_socket)?
-            {
-                return Ok((work_id, Some(derived_alias)));
-            }
-            let fallback_work_id = resolve_push_work_id_from_projection_fallback(
-                operator_socket,
-                requested_lease_id.as_deref(),
-                requested_session_id.as_deref(),
-            )
-            .map_err(|fallback_err| {
-                format!(
-                    "derived ticket alias `{derived_alias}` did not resolve to a canonical \
-                     work_id and projection fallback failed: {fallback_err}"
+        (None, None) => match resolve_tck_id(branch, worktree_dir) {
+            Ok(derived_alias) => {
+                if let Some(work_id) =
+                    resolve_ticket_alias_to_work_id(&derived_alias, operator_socket)?
+                {
+                    return Ok((work_id, Some(derived_alias)));
+                }
+                let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                    operator_socket,
+                    requested_lease_id.as_deref(),
+                    requested_session_id.as_deref(),
                 )
-            })?;
-            Ok((fallback_work_id, None))
+                .map_err(|fallback_err| {
+                    format!(
+                        "derived ticket alias `{derived_alias}` did not resolve to a canonical \
+                             work_id and projection fallback failed: {fallback_err}"
+                    )
+                })?;
+                Ok((fallback_work_id, None))
+            },
+            Err(derive_err) => {
+                let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                    operator_socket,
+                    requested_lease_id.as_deref(),
+                    requested_session_id.as_deref(),
+                )
+                .map_err(|fallback_err| {
+                    format!("{derive_err} Projection fallback also failed: {fallback_err}")
+                })?;
+                Ok((fallback_work_id, None))
+            },
         },
     }
 }
@@ -2454,10 +2467,10 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         metadata.ticket_path.display()
     );
 
-    let handoff_note = match require_handoff_note(handoff_note_arg) {
+    let handoff_note = match parse_handoff_note(handoff_note_arg) {
         Ok(note) => note,
         Err(err) => {
-            fail_with_attempt!("fac_push_handoff_note_missing", err);
+            fail_with_attempt!("fac_push_handoff_note_invalid", err);
         },
     };
 
@@ -2988,6 +3001,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             "session_id": session_id,
             "pr_number": pr_number,
             "dedupe_key": dedupe_key,
+            "handoff_note_present": handoff_note.is_some(),
         }),
     );
 
@@ -2997,26 +3011,32 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             fail_with_attempt!("fac_push_changeset_bundle_failed", err);
         },
     };
-    let handoff_entry_json = match build_context_entry_json(
-        &work_id,
-        WorkContextKind::HandoffNote,
-        &dedupe_key,
-        handoff_note,
-        Some(serde_json::json!({
-            "repo": repo,
-            "branch": branch,
-            "pr_number": pr_number,
-            "head_sha": sha,
-            "ticket_alias": resolved_ticket_alias,
-            "source": "fac.push",
-            "session_id": session_id,
-            "lease_id": lease_id,
-        })),
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            fail_with_attempt!("fac_push_handoff_entry_build_failed", err);
-        },
+    let handoff_entry_json = if let Some(handoff_note) = handoff_note.clone() {
+        Some(
+            match build_context_entry_json(
+                &work_id,
+                WorkContextKind::HandoffNote,
+                &dedupe_key,
+                handoff_note,
+                Some(serde_json::json!({
+                    "repo": repo,
+                    "branch": branch,
+                    "pr_number": pr_number,
+                    "head_sha": sha,
+                    "ticket_alias": resolved_ticket_alias,
+                    "source": "fac.push",
+                    "session_id": session_id,
+                    "lease_id": lease_id,
+                })),
+            ) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    fail_with_attempt!("fac_push_handoff_entry_build_failed", err);
+                },
+            },
+        )
+    } else {
+        None
     };
     let terminal_entry_json = match build_context_entry_json(
         &work_id,
@@ -3065,15 +3085,21 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                 Some(&rpc_pr_url),
             )
             .await?;
-        let handoff_entry = client
-            .publish_work_context_entry(
-                &rpc_work_id,
-                "HANDOFF_NOTE",
-                &rpc_dedupe_key,
-                rpc_handoff_entry_json,
-                &rpc_lease_id,
+        let handoff_entry = if let Some(handoff_entry_json) = rpc_handoff_entry_json {
+            Some(
+                client
+                    .publish_work_context_entry(
+                        &rpc_work_id,
+                        "HANDOFF_NOTE",
+                        &rpc_dedupe_key,
+                        handoff_entry_json,
+                        &rpc_lease_id,
+                    )
+                    .await?,
             )
-            .await?;
+        } else {
+            None
+        };
         let terminal_entry = client
             .publish_work_context_entry(
                 &rpc_work_id,
@@ -3101,18 +3127,22 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             "changeset_cas_hash": changeset_response.cas_hash,
             "pr_number": pr_association_response.pr_number,
             "pr_association_already_existed": pr_association_response.already_existed,
-            "handoff_entry_id": handoff_response.entry_id,
+            "handoff_entry_id": handoff_response.as_ref().map(|response| response.entry_id.clone()),
             "implementer_terminal_entry_id": terminal_response.entry_id,
             "lease_id": lease_id,
             "session_id": session_id,
             "dedupe_key": dedupe_key,
         }),
     );
+    let handoff_entry_display = handoff_response
+        .as_ref()
+        .map(|response| response.entry_id.as_str())
+        .unwrap_or("none");
     human_log!(
         "fac push: published work projection chain (work_id={}, changeset={}, handoff_entry={}, implementer_terminal_entry={})",
         work_id,
         changeset_response.changeset_digest,
-        handoff_response.entry_id,
+        handoff_entry_display,
         terminal_response.entry_id
     );
 
@@ -3438,6 +3468,25 @@ mod tests {
     fn validate_push_work_id_rejects_non_canonical_value() {
         let err = validate_push_work_id("owner/repo").expect_err("non-canonical work_id must fail");
         assert!(err.contains("must start with `W-`"));
+    }
+
+    #[test]
+    fn parse_handoff_note_allows_omission() {
+        let parsed = parse_handoff_note(None).expect("omitted handoff note should be accepted");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_handoff_note_rejects_empty_when_provided() {
+        let err = parse_handoff_note(Some("   ")).expect_err("blank handoff note must be rejected");
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn parse_handoff_note_trims_when_provided() {
+        let parsed = parse_handoff_note(Some("  ready for review  "))
+            .expect("non-empty handoff note should be accepted");
+        assert_eq!(parsed.as_deref(), Some("ready for review"));
     }
 
     fn sample_daemon_work_item(

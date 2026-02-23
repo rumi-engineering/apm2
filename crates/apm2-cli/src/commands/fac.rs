@@ -68,6 +68,8 @@ const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
 const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
 const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
 const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
+const MAX_WORK_IDENTIFIER_LENGTH: usize = 256;
+const WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
 
 // =============================================================================
 // Command Types
@@ -140,7 +142,8 @@ pub enum FacSubcommand {
 
     /// Query projection-backed work authority via daemon operator IPC.
     ///
-    /// Displays work status or lists work items from runtime projection state.
+    /// Resolves current work identity, displays work status, lists work items,
+    /// and resolves ticket aliases from runtime projection state.
     /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
 
@@ -194,9 +197,9 @@ pub enum FacSubcommand {
 
     /// Push code and create/update PR (lean push).
     ///
-    /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// blocks on evidence gates, synchronizes ruleset projection, and
-    /// dispatches reviews.
+    /// Resolves current work binding (work_id/lease_id/session_id), pushes to
+    /// remote, creates or updates a PR, blocks on evidence gates,
+    /// synchronizes ruleset projection, and dispatches reviews.
     Push(PushArgs),
 
     /// Show local pipeline, evidence, and review log paths.
@@ -655,6 +658,9 @@ pub struct ServicesStatusArgs {}
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
+    /// Resolve current work identity from branch/worktree alias or projection.
+    Current(WorkCurrentArgs),
+
     /// Show projection-backed work status from daemon authority.
     Status(WorkStatusArgs),
 
@@ -682,6 +688,26 @@ pub struct WorkListArgs {
     /// Return only claimable work items.
     #[arg(long, default_value_t = false)]
     pub claimable_only: bool,
+}
+
+/// Arguments for `apm2 fac work current`.
+#[derive(Debug, Args)]
+pub struct WorkCurrentArgs {
+    /// Optional branch name override. Defaults to the current branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Optional ticket alias override (for example `TCK-00640`).
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
+
+    /// Optional lease filter for projection fallback disambiguation.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
+
+    /// Optional session filter for projection fallback disambiguation.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
 }
 
 /// Arguments for `apm2 fac work resolve-alias`.
@@ -1101,25 +1127,31 @@ pub struct PushArgs {
     pub ticket: Option<PathBuf>,
 
     /// Canonical work identifier to bind projection and daemon publication.
+    /// If omitted, `fac push` derives work binding via ticket alias and
+    /// projection fallback. Use `apm2 fac work current` to inspect.
     #[arg(long = "work-id")]
     pub work_id: Option<String>,
 
     /// Optional ticket alias (for example `TCK-00640`) used to resolve
     /// canonical `work_id` via daemon projection authority.
+    /// If omitted, branch/worktree TCK derivation and projection fallback
+    /// apply.
     #[arg(long = "ticket-alias")]
     pub ticket_alias: Option<String>,
 
     /// Optional governing lease identifier for privileged work RPC calls.
     /// When omitted, `fac push` resolves `lease_id` from daemon work status.
+    /// Use `apm2 fac work current` to inspect the daemon-resolved value.
     #[arg(long = "lease-id")]
     pub lease_id: Option<String>,
 
     /// Optional implementer session identifier for terminal-contract dedupe.
     /// When omitted, `fac push` resolves `session_id` from daemon work status.
+    /// Use `apm2 fac work current` to inspect the daemon-resolved value.
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
 
-    /// Required handoff note body to publish as `HANDOFF_NOTE`.
+    /// Optional handoff note body to publish as `HANDOFF_NOTE`.
     #[arg(long = "handoff-note")]
     pub handoff_note: Option<String>,
 }
@@ -3297,6 +3329,9 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Work(args) => match &args.subcommand {
+            WorkSubcommand::Current(current_args) => {
+                run_work_current(current_args, operator_socket, json_output)
+            },
             WorkSubcommand::Status(status_args) => {
                 run_work_status(status_args, operator_socket, json_output)
             },
@@ -3773,6 +3808,444 @@ fn open_ledger(path: &Path) -> Result<Ledger, LedgerError> {
 fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerError> {
     let max_seq = ledger.head_sync()?;
     Ok(max_seq.saturating_sub(limit).max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkCurrentResolutionSource {
+    TicketAlias,
+    BranchAlias,
+    ProjectionFallback,
+}
+
+impl WorkCurrentResolutionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TicketAlias => "ticket_alias",
+            Self::BranchAlias => "branch_alias",
+            Self::ProjectionFallback => "projection_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkCurrentResolution {
+    work_id: String,
+    ticket_alias: Option<String>,
+    source: WorkCurrentResolutionSource,
+}
+
+fn normalize_non_empty_arg(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn validate_work_identifier(value: &str, field: &str, required_prefix: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    if value.len() > MAX_WORK_IDENTIFIER_LENGTH {
+        return Err(format!(
+            "{field} exceeds max length ({} > {MAX_WORK_IDENTIFIER_LENGTH})",
+            value.len(),
+        ));
+    }
+    if !value.starts_with(required_prefix) {
+        return Err(format!(
+            "{field} must start with `{required_prefix}`, got `{value}`"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!(
+            "{field} contains invalid characters; only [A-Za-z0-9_-] are allowed"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_work_id(value: &str) -> Result<(), String> {
+    validate_work_identifier(value, "work_id", "W-")
+}
+
+fn validate_lease_id(value: &str) -> Result<(), String> {
+    validate_work_identifier(value, "lease_id", "L-")
+}
+
+fn validate_session_id(value: &str) -> Result<(), String> {
+    validate_work_identifier(value, "session_id", "S-")
+}
+
+fn with_operator_client<T>(
+    future: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
+) -> Result<T, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
+    rt.block_on(future).map_err(|err| err.to_string())
+}
+
+fn extract_tck_from_text(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 9 {
+        return None;
+    }
+
+    for idx in 0..=bytes.len() - 9 {
+        if &bytes[idx..idx + 4] != b"TCK-" {
+            continue;
+        }
+        let digits = &bytes[idx + 4..idx + 9];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        if idx + 9 < bytes.len() && bytes[idx + 9].is_ascii_digit() {
+            continue;
+        }
+        let matched = std::str::from_utf8(&bytes[idx..idx + 9]).ok()?;
+        return Some(matched.to_string());
+    }
+
+    None
+}
+
+fn resolve_current_branch_name() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to resolve current branch: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve current branch: {}",
+            stderr.trim()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err("git returned empty branch name".to_string());
+    }
+    Ok(branch)
+}
+
+fn resolve_ticket_alias_to_work_id_via_daemon(
+    ticket_alias: &str,
+    operator_socket: &Path,
+) -> Result<Option<String>, String> {
+    let ticket_alias_owned = ticket_alias.to_string();
+    let response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&ticket_alias_owned).await
+    })?;
+    if !response.found {
+        return Ok(None);
+    }
+    validate_work_id(&response.work_id)?;
+    Ok(Some(response.work_id))
+}
+
+fn is_active_work_fallback_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "CLAIMED" | "IN_PROGRESS" | "INPROGRESS" | "SPAWNED" | "RUNNING"
+    )
+}
+
+fn matches_work_current_fallback_candidate(
+    work_item: &apm2_daemon::protocol::WorkStatusResponse,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    if !is_active_work_fallback_status(&work_item.status) {
+        return false;
+    }
+    let Some(role_raw) = work_item.role else {
+        return false;
+    };
+    if WorkRole::try_from(role_raw).ok() != Some(WorkRole::Implementer) {
+        return false;
+    }
+
+    if let Some(expected_lease_id) = lease_filter {
+        let observed_lease_id = work_item
+            .lease_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_lease_id != Some(expected_lease_id) {
+            return false;
+        }
+    }
+
+    if let Some(expected_session_id) = session_filter {
+        let observed_session_id = work_item
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_session_id != Some(expected_session_id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn select_work_current_fallback_work_id(
+    work_items: &[apm2_daemon::protocol::WorkStatusResponse],
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for work_item in work_items {
+        if !matches_work_current_fallback_candidate(work_item, lease_filter, session_filter) {
+            continue;
+        }
+        let work_id = work_item.work_id.trim();
+        if work_id.is_empty() {
+            continue;
+        }
+        if validate_work_id(work_id).is_err() {
+            continue;
+        }
+        candidates.insert(work_id.to_string());
+    }
+
+    match candidates.len() {
+        0 => Err(
+            "projection fallback could not identify an active Implementer work item; pass `--ticket-alias` or provide `--lease-id`/`--session-id` filters"
+                .to_string(),
+        ),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| "internal error: fallback candidate set unexpectedly empty".to_string()),
+        _ => {
+            let candidate_list = candidates.into_iter().collect::<Vec<_>>().join(", ");
+            Err(format!(
+                "projection fallback found multiple active Implementer work items ({candidate_list}); pass `--ticket-alias` or `--lease-id`/`--session-id` to disambiguate"
+            ))
+        },
+    }
+}
+
+fn resolve_work_current_from_projection_fallback(
+    operator_socket: &Path,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let list_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(false).await
+    })?;
+    select_work_current_fallback_work_id(&list_response.work_items, lease_filter, session_filter)
+}
+
+fn resolve_work_current_identity(
+    args: &WorkCurrentArgs,
+    operator_socket: &Path,
+    worktree_dir: &Path,
+) -> Result<(WorkCurrentResolution, Option<String>), String> {
+    let requested_lease_id = normalize_non_empty_arg(args.lease_id.as_deref());
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(args.session_id.as_deref());
+    if let Some(ref session_id) = requested_session_id {
+        validate_session_id(session_id)?;
+    }
+
+    let branch = match normalize_non_empty_arg(args.branch.as_deref()) {
+        Some(value) => Some(value),
+        None => resolve_current_branch_name().ok(),
+    };
+
+    let explicit_alias = normalize_non_empty_arg(args.ticket_alias.as_deref());
+    if let Some(alias) = explicit_alias.clone() {
+        if let Some(work_id) = resolve_ticket_alias_to_work_id_via_daemon(&alias, operator_socket)?
+        {
+            return Ok((
+                WorkCurrentResolution {
+                    work_id,
+                    ticket_alias: Some(alias),
+                    source: WorkCurrentResolutionSource::TicketAlias,
+                },
+                branch,
+            ));
+        }
+        let fallback_work_id = resolve_work_current_from_projection_fallback(
+            operator_socket,
+            requested_lease_id.as_deref(),
+            requested_session_id.as_deref(),
+        )
+        .map_err(|fallback_err| {
+            format!(
+                "ticket alias `{alias}` did not resolve to a canonical work_id and projection fallback failed: {fallback_err}"
+            )
+        })?;
+        return Ok((
+            WorkCurrentResolution {
+                work_id: fallback_work_id,
+                ticket_alias: None,
+                source: WorkCurrentResolutionSource::ProjectionFallback,
+            },
+            branch,
+        ));
+    }
+
+    if let Some(branch_value) = branch.as_deref() {
+        if let Some(derived_alias) = extract_tck_from_text(branch_value).or_else(|| {
+            worktree_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(extract_tck_from_text)
+        }) {
+            if let Some(work_id) =
+                resolve_ticket_alias_to_work_id_via_daemon(&derived_alias, operator_socket)?
+            {
+                return Ok((
+                    WorkCurrentResolution {
+                        work_id,
+                        ticket_alias: Some(derived_alias),
+                        source: WorkCurrentResolutionSource::BranchAlias,
+                    },
+                    branch,
+                ));
+            }
+            let fallback_work_id = resolve_work_current_from_projection_fallback(
+                operator_socket,
+                requested_lease_id.as_deref(),
+                requested_session_id.as_deref(),
+            )
+            .map_err(|fallback_err| {
+                format!(
+                    "derived ticket alias `{derived_alias}` did not resolve to a canonical work_id and projection fallback failed: {fallback_err}"
+                )
+            })?;
+            return Ok((
+                WorkCurrentResolution {
+                    work_id: fallback_work_id,
+                    ticket_alias: None,
+                    source: WorkCurrentResolutionSource::ProjectionFallback,
+                },
+                branch,
+            ));
+        }
+    }
+
+    let fallback_work_id = resolve_work_current_from_projection_fallback(
+        operator_socket,
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    )
+    .map_err(|fallback_err| {
+        if let Some(branch_value) = branch.as_deref() {
+            format!(
+                "could not derive TCK from branch `{branch_value}` or worktree `{}`. {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} Projection fallback also failed: {fallback_err}",
+                worktree_dir.display()
+            )
+        } else {
+            format!("projection fallback failed and no branch context was available: {fallback_err}")
+        }
+    })?;
+    Ok((
+        WorkCurrentResolution {
+            work_id: fallback_work_id,
+            ticket_alias: None,
+            source: WorkCurrentResolutionSource::ProjectionFallback,
+        },
+        branch,
+    ))
+}
+
+/// Execute the work current command.
+fn run_work_current(args: &WorkCurrentArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    #[derive(Debug, Serialize)]
+    struct WorkCurrentJson {
+        work_id: String,
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ticket_alias: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lease_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    }
+
+    let worktree_dir = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "current_dir_failed",
+                &format!("Failed to resolve current working directory: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let (resolution, branch) =
+        match resolve_work_current_identity(args, operator_socket, &worktree_dir) {
+            Ok(value) => value,
+            Err(error) => {
+                return output_error(
+                    json_output,
+                    "work_current_resolution_failed",
+                    &error,
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        };
+
+    let work_id_for_status = resolution.work_id.clone();
+    let status_response = match with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_for_status).await
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            return output_error(
+                json_output,
+                "work_current_status_failed",
+                &error,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let role = status_response
+        .role
+        .and_then(|value| WorkRole::try_from(value).ok())
+        .map(|value| format!("{value:?}"));
+
+    let output = WorkCurrentJson {
+        work_id: resolution.work_id,
+        source: resolution.source.as_str().to_string(),
+        ticket_alias: resolution.ticket_alias,
+        branch,
+        status: status_response.status,
+        actor_id: status_response.actor_id,
+        role,
+        lease_id: status_response.lease_id,
+        session_id: status_response.session_id,
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+    );
+    exit_codes::SUCCESS
 }
 
 // =============================================================================
@@ -7464,6 +7937,107 @@ mod tests {
         let restored: WorkStatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.work_id, "work-123");
         assert_eq!(restored.status, "CLAIMED");
+    }
+
+    fn daemon_work_item_for_current_tests(
+        work_id: &str,
+        status: &str,
+        role: Option<WorkRole>,
+        lease_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> apm2_daemon::protocol::WorkStatusResponse {
+        apm2_daemon::protocol::WorkStatusResponse {
+            work_id: work_id.to_string(),
+            status: status.to_string(),
+            role: role.map(|value| value as i32),
+            lease_id: lease_id.map(ToString::to_string),
+            session_id: session_id.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_tck_from_text_accepts_valid_pattern() {
+        assert_eq!(
+            extract_tck_from_text("ticket/RFC-0018/TCK-00640"),
+            Some("TCK-00640".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tck_from_text_rejects_invalid_pattern() {
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-006400"), None);
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_returns_single_candidate() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "BLOCKED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, None, None)
+            .expect("single active implementer candidate should be selected");
+        assert_eq!(selected, "W-AAA111");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_honors_filters() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, Some("L-222"), Some("S-222"))
+            .expect("lease/session filter should isolate a single candidate");
+        assert_eq!(selected, "W-BBB222");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_errors_on_ambiguity() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "RUNNING",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let error = select_work_current_fallback_work_id(&items, None, None)
+            .expect_err("multiple active candidates must fail closed");
+        assert!(error.contains("multiple active Implementer work items"));
     }
 
     #[test]
