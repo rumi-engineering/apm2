@@ -297,7 +297,15 @@ impl LedgerReader<GateStartObservedEvent> for GateStartLedgerReader {
         limit: usize,
     ) -> Result<Vec<GateStartObservedEvent>, Self::Error> {
         match self {
-            Self::Sqlite(reader) => reader.poll(cursor, limit),
+            Self::Sqlite(reader) => {
+                let conn = Arc::clone(&reader.conn);
+                let cursor = cursor.clone();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartLedgerReader::poll_with_conn(&conn, &cursor, limit)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for ledger poll: {e}"))?
+            },
             Self::Memory(_reader) => Ok(Vec::new()),
         }
     }
@@ -313,8 +321,9 @@ impl SqliteGateStartLedgerReader {
         Self { conn }
     }
 
-    fn poll(
-        &self,
+    /// Static `poll` — callable from `spawn_blocking`.
+    fn poll_with_conn(
+        conn: &Arc<Mutex<Connection>>,
         cursor: &CompositeCursor,
         limit: usize,
     ) -> Result<Vec<GateStartObservedEvent>, String> {
@@ -326,11 +335,20 @@ impl SqliteGateStartLedgerReader {
             i64::try_from(limit).map_err(|_| "observe limit exceeds i64 range".to_string())?;
         let cursor_ts_i64 = i64::try_from(cursor.timestamp_ns)
             .map_err(|_| "cursor timestamp exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
         Self::query_changeset_published_unified(&guard, cursor_ts_i64, &cursor.event_id, limit_i64)
+    }
+
+    /// Instance poll for tests that use the reader directly.
+    #[cfg(test)]
+    fn poll(
+        &self,
+        cursor: &CompositeCursor,
+        limit: usize,
+    ) -> Result<Vec<GateStartObservedEvent>, String> {
+        Self::poll_with_conn(&self.conn, cursor, limit)
     }
 
     fn query_changeset_published_unified(
@@ -494,14 +512,29 @@ impl CursorStore for GateStartCursorStore {
 
     async fn load(&self) -> Result<CompositeCursor, Self::Error> {
         match self {
-            Self::Sqlite(store) => store.load(),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartCursorStore::load_with_conn(&conn)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for cursor load: {e}"))?
+            },
             Self::Memory(store) => store.load(),
         }
     }
 
     async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => store.save(cursor),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                let cursor = cursor.clone();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartCursorStore::save_with_conn(&conn, &cursor)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for cursor save: {e}"))?
+            },
             Self::Memory(store) => store.save(cursor),
         }
     }
@@ -531,9 +564,9 @@ impl SqliteGateStartCursorStore {
         Ok(Self { conn })
     }
 
-    fn load(&self) -> Result<CompositeCursor, String> {
-        let guard = self
-            .conn
+    /// Static `load` — callable from `spawn_blocking`.
+    fn load_with_conn(conn: &Arc<Mutex<Connection>>) -> Result<CompositeCursor, String> {
+        let guard = conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
         let row: Option<(i64, String)> = guard
@@ -557,11 +590,14 @@ impl SqliteGateStartCursorStore {
         })
     }
 
-    fn save(&self, cursor: &CompositeCursor) -> Result<(), String> {
+    /// Static `save` — callable from `spawn_blocking`.
+    fn save_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        cursor: &CompositeCursor,
+    ) -> Result<(), String> {
         let timestamp_ns = i64::try_from(cursor.timestamp_ns)
             .map_err(|_| "gate-start cursor timestamp exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
         guard
@@ -612,35 +648,76 @@ impl IntentStore<GateStartIntent, String> for GateStartIntentStore {
 
     async fn enqueue_many(&self, intents: &[GateStartIntent]) -> Result<usize, Self::Error> {
         match self {
-            Self::Sqlite(store) => store.enqueue_many(intents),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                let intents = intents.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::enqueue_many_with_conn(&conn, &intents)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for enqueue_many: {e}"))?
+            },
             Self::Memory(store) => store.enqueue_many(intents),
         }
     }
 
     async fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateStartIntent>, Self::Error> {
         match self {
-            Self::Sqlite(store) => store.dequeue_batch(limit),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::dequeue_batch_with_conn(&conn, limit)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for dequeue_batch: {e}"))?
+            },
             Self::Memory(store) => store.dequeue_batch(limit),
         }
     }
 
     async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => store.mark_done(key),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                let key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::mark_done_with_conn(&conn, &key)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for mark_done: {e}"))?
+            },
             Self::Memory(store) => store.mark_done(key),
         }
     }
 
     async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => store.mark_blocked(key, reason),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                let key = key.clone();
+                let reason = reason.to_string();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::mark_blocked_with_conn(&conn, &key, &reason)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for mark_blocked: {e}"))?
+            },
             Self::Memory(store) => store.mark_blocked(key, reason),
         }
     }
 
     async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => store.mark_retryable(key, reason),
+            Self::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                let key = key.clone();
+                let reason = reason.to_string();
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::mark_retryable_with_conn(&conn, &key, &reason)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking failed for mark_retryable: {e}"))?
+            },
             Self::Memory(store) => store.mark_retryable(key, reason),
         }
     }
@@ -680,10 +757,13 @@ impl SqliteGateStartIntentStore {
         Ok(Self { conn })
     }
 
-    fn enqueue_many(&self, intents: &[GateStartIntent]) -> Result<usize, String> {
+    /// Static `enqueue` — callable from `spawn_blocking`.
+    fn enqueue_many_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        intents: &[GateStartIntent],
+    ) -> Result<usize, String> {
         let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let tx = guard
@@ -709,14 +789,17 @@ impl SqliteGateStartIntentStore {
         Ok(inserted)
     }
 
-    fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateStartIntent>, String> {
+    /// Static `dequeue` — callable from `spawn_blocking`.
+    fn dequeue_batch_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        limit: usize,
+    ) -> Result<Vec<GateStartIntent>, String> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit_i64 =
             i64::try_from(limit).map_err(|_| "execute limit exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let mut stmt = guard
@@ -751,27 +834,28 @@ impl SqliteGateStartIntentStore {
         Ok(intents)
     }
 
-    fn mark_done(&self, key: &str) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
+    /// Static `mark_done` — callable from `spawn_blocking`.
+    fn mark_done_with_conn(conn: &Arc<Mutex<Connection>>, key: &str) -> Result<(), String> {
+        let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         guard
             .execute(
-                "UPDATE gate_start_intents
-                 SET state = 'done', blocked_reason = NULL, updated_at_ns = ?2
-                 WHERE intent_key = ?1",
-                params![key, now_ns],
+                "DELETE FROM gate_start_intents WHERE intent_key = ?1",
+                params![key],
             )
-            .map_err(|e| format!("failed to mark gate-start intent done: {e}"))?;
+            .map_err(|e| format!("failed to delete completed gate-start intent: {e}"))?;
         Ok(())
     }
 
-    fn mark_blocked(&self, key: &str, reason: &str) -> Result<(), String> {
+    /// Static `mark_blocked` — callable from `spawn_blocking`.
+    fn mark_blocked_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        key: &str,
+        reason: &str,
+    ) -> Result<(), String> {
         let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         guard
@@ -785,10 +869,14 @@ impl SqliteGateStartIntentStore {
         Ok(())
     }
 
-    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
+    /// Static `mark_retryable` — callable from `spawn_blocking`.
+    fn mark_retryable_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        key: &str,
+        _reason: &str,
+    ) -> Result<(), String> {
         let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
+        let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         guard
@@ -801,6 +889,24 @@ impl SqliteGateStartIntentStore {
             )
             .map_err(|e| format!("failed to mark gate-start intent retryable: {e}"))?;
         Ok(())
+    }
+
+    /// Instance method for use in tests (delegates to static).
+    #[cfg(test)]
+    fn enqueue_many(&self, intents: &[GateStartIntent]) -> Result<usize, String> {
+        Self::enqueue_many_with_conn(&self.conn, intents)
+    }
+
+    /// Instance method for use in tests (delegates to static).
+    #[cfg(test)]
+    fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateStartIntent>, String> {
+        Self::dequeue_batch_with_conn(&self.conn, limit)
+    }
+
+    /// Instance method for use in tests (delegates to static).
+    #[cfg(test)]
+    fn mark_done(&self, key: &str) -> Result<(), String> {
+        Self::mark_done_with_conn(&self.conn, key)
     }
 }
 
@@ -858,10 +964,16 @@ impl MemoryGateStartIntentStore {
 
     fn mark_done(&self, key: &str) -> Result<(), String> {
         self.remove_pending(key)?;
+        // Delete the intent entirely to prevent unbounded growth of
+        // completed entries (Security BLOCKER: DoS via intent store).
         self.states
             .lock()
             .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "done".to_string());
+            .remove(key);
+        self.intents
+            .lock()
+            .map_err(|e| format!("memory intent index lock poisoned: {e}"))?
+            .remove(key);
         Ok(())
     }
 
@@ -921,9 +1033,12 @@ impl GateStartEffectJournal {
         })
     }
 
-    fn load_state(&self, key: &str) -> Result<Option<String>, String> {
-        let guard = self
-            .conn
+    /// Static `load` — callable from `spawn_blocking`.
+    fn load_state_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        let guard = conn
             .lock()
             .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
         guard
@@ -938,9 +1053,14 @@ impl GateStartEffectJournal {
             .map_err(|e| format!("failed to load gate-start effect state for key '{key}': {e}"))
     }
 
-    fn upsert_state(&self, key: &str, state: &str, updated_at_ns: i64) -> Result<(), String> {
-        let guard = self
-            .conn
+    /// Static `upsert` — callable from `spawn_blocking`.
+    fn upsert_state_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        key: &str,
+        state: &str,
+        updated_at_ns: i64,
+    ) -> Result<(), String> {
+        let guard = conn
             .lock()
             .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
         guard
@@ -958,9 +1078,9 @@ impl GateStartEffectJournal {
         Ok(())
     }
 
-    fn delete_state(&self, key: &str) -> Result<(), String> {
-        let guard = self
-            .conn
+    /// Static `delete` — callable from `spawn_blocking`.
+    fn delete_state_with_conn(conn: &Arc<Mutex<Connection>>, key: &str) -> Result<(), String> {
+        let guard = conn
             .lock()
             .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
         guard
@@ -973,75 +1093,119 @@ impl GateStartEffectJournal {
             })?;
         Ok(())
     }
+
+    /// Instance load for tests (delegates to static).
+    #[cfg(test)]
+    fn load_state(&self, key: &str) -> Result<Option<String>, String> {
+        Self::load_state_with_conn(&self.conn, key)
+    }
+
+    /// Instance upsert for tests (delegates to static).
+    #[cfg(test)]
+    fn upsert_state(&self, key: &str, state: &str, updated_at_ns: i64) -> Result<(), String> {
+        Self::upsert_state_with_conn(&self.conn, key, state, updated_at_ns)
+    }
 }
 
 impl EffectJournal<String> for GateStartEffectJournal {
     type Error = String;
 
     async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
-        let state = self.load_state(key.as_str())?;
-        Ok(match state.as_deref() {
-            None => EffectExecutionState::NotStarted,
-            Some("completed") => EffectExecutionState::Completed,
-            Some(_) => EffectExecutionState::Unknown,
+        let conn = Arc::clone(&self.conn);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = Self::load_state_with_conn(&conn, &key)?;
+            Ok(match state.as_deref() {
+                None => EffectExecutionState::NotStarted,
+                Some("completed") => EffectExecutionState::Completed,
+                Some(_) => EffectExecutionState::Unknown,
+            })
         })
+        .await
+        .map_err(|e| format!("spawn_blocking failed for query_state: {e}"))?
     }
 
     async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
-        if matches!(self.load_state(key.as_str())?.as_deref(), Some("completed")) {
-            return Ok(());
-        }
-        self.upsert_state(key.as_str(), "started", epoch_now_ns_i64()?)
+        let conn = Arc::clone(&self.conn);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            if matches!(
+                Self::load_state_with_conn(&conn, &key)?.as_deref(),
+                Some("completed")
+            ) {
+                return Ok(());
+            }
+            Self::upsert_state_with_conn(&conn, &key, "started", epoch_now_ns_i64()?)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed for record_started: {e}"))?
     }
 
     async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
-        self.upsert_state(key.as_str(), "completed", epoch_now_ns_i64()?)
+        // Delete the effect journal entry on completion to prevent unbounded
+        // growth of terminal entries (Security BLOCKER: DoS).
+        let conn = Arc::clone(&self.conn);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || Self::delete_state_with_conn(&conn, &key))
+            .await
+            .map_err(|e| format!("spawn_blocking failed for record_completed: {e}"))?
     }
 
     async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
-        let state = self.load_state(key.as_str())?;
-        match state.as_deref() {
-            Some("started") => self.delete_state(key.as_str()),
-            Some("completed") => Err(format!(
-                "cannot mark gate-start effect retryable for completed key '{key}'"
-            )),
-            Some(other) => Err(format!(
-                "cannot mark gate-start effect retryable from state '{other}' for key '{key}'"
-            )),
-            None => Err(format!(
-                "cannot mark gate-start effect retryable for unknown key '{key}'"
-            )),
-        }
+        let conn = Arc::clone(&self.conn);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = Self::load_state_with_conn(&conn, &key)?;
+            match state.as_deref() {
+                Some("started") => Self::delete_state_with_conn(&conn, &key),
+                Some("completed") => Err(format!(
+                    "cannot mark gate-start effect retryable for completed key '{key}'"
+                )),
+                Some(other) => Err(format!(
+                    "cannot mark gate-start effect retryable from state '{other}' for key '{key}'"
+                )),
+                None => Err(format!(
+                    "cannot mark gate-start effect retryable for unknown key '{key}'"
+                )),
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed for record_retryable: {e}"))?
     }
 
     async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
-        self.upsert_state(key.as_str(), "unknown", epoch_now_ns_i64()?)?;
-        Ok(InDoubtResolution::Deny {
-            reason: "gate-start effect state is in-doubt; manual reconciliation required"
-                .to_string(),
+        let conn = Arc::clone(&self.conn);
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::upsert_state_with_conn(&conn, &key, "unknown", epoch_now_ns_i64()?)?;
+            Ok(InDoubtResolution::Deny {
+                reason: "gate-start effect state is in-doubt; manual reconciliation required"
+                    .to_string(),
+            })
         })
+        .await
+        .map_err(|e| format!("spawn_blocking failed for resolve_in_doubt: {e}"))?
     }
 }
 
 #[derive(Debug)]
 struct GateStartReceiptWriter {
-    ledger_emitter: Option<SqliteLedgerEventEmitter>,
+    /// Wrapped in `Arc` to allow cloning for `spawn_blocking` closures.
+    ledger_emitter: Option<Arc<SqliteLedgerEventEmitter>>,
 }
 
 impl GateStartReceiptWriter {
-    const fn new(ledger_emitter: Option<SqliteLedgerEventEmitter>) -> Self {
-        Self { ledger_emitter }
+    fn new(ledger_emitter: Option<SqliteLedgerEventEmitter>) -> Self {
+        Self {
+            ledger_emitter: ledger_emitter.map(Arc::new),
+        }
     }
-}
 
-impl ReceiptWriter<GateStartReceipt> for GateStartReceiptWriter {
-    type Error = String;
-
-    async fn persist_many(&self, receipts: &[GateStartReceipt]) -> Result<(), Self::Error> {
-        let Some(emitter) = self.ledger_emitter.as_ref() else {
-            return Ok(());
-        };
-
+    /// Synchronous persist — callable from `spawn_blocking`.
+    fn persist_many_sync(
+        emitter: &SqliteLedgerEventEmitter,
+        receipts: &[GateStartReceipt],
+    ) -> Result<(), String> {
         for receipt in receipts {
             match receipt {
                 GateStartReceipt::OrchestratorEvent(event) => {
@@ -1098,6 +1262,22 @@ impl ReceiptWriter<GateStartReceipt> for GateStartReceiptWriter {
             }
         }
         Ok(())
+    }
+}
+
+impl ReceiptWriter<GateStartReceipt> for GateStartReceiptWriter {
+    type Error = String;
+
+    async fn persist_many(&self, receipts: &[GateStartReceipt]) -> Result<(), Self::Error> {
+        let Some(emitter) = self.ledger_emitter.as_ref() else {
+            return Ok(());
+        };
+
+        let emitter = Arc::clone(emitter);
+        let receipts = receipts.to_vec();
+        tokio::task::spawn_blocking(move || Self::persist_many_sync(&emitter, &receipts))
+            .await
+            .map_err(|e| format!("spawn_blocking failed for persist_many: {e}"))?
     }
 }
 
@@ -1444,5 +1624,145 @@ mod tests {
         );
         let pub_result = result.unwrap();
         assert_eq!(pub_result.publisher_actor_id, "actor:real");
+    }
+
+    /// Security BLOCKER regression test: after marking N intents done, the
+    /// `SQLite` intent table must have 0 entries (DELETE, not UPDATE to
+    /// 'done').
+    #[test]
+    fn sqlite_intent_store_mark_done_deletes_entry() {
+        use super::SqliteGateStartIntentStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let store = SqliteGateStartIntentStore::new(Arc::clone(&conn)).expect("init store");
+
+        let publication = apm2_core::fac::ChangesetPublication {
+            work_id: "W-delete-test".to_string(),
+            changeset_digest: [0xAA; 32],
+            bundle_cas_hash: [0xBB; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:test".to_string(),
+            changeset_published_event_id: "evt-1".to_string(),
+        };
+        let intent = super::GateStartIntent {
+            publication: publication.clone(),
+        };
+
+        // Enqueue and verify it exists.
+        let inserted = store.enqueue_many(&[intent]).expect("enqueue");
+        assert_eq!(inserted, 1, "one intent should be inserted");
+        let pending = store.dequeue_batch(10).expect("dequeue");
+        assert_eq!(pending.len(), 1, "one intent should be pending");
+
+        // Mark done — must DELETE, not UPDATE.
+        let key = super::gate_start_intent_key(&publication.work_id, &publication.changeset_digest);
+        store.mark_done(&key).expect("mark done");
+
+        // Verify: the table must have 0 rows.
+        let guard = conn.lock().expect("lock");
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM gate_start_intents", [], |r| r.get(0))
+            .expect("count query");
+        assert_eq!(
+            count, 0,
+            "intent table must be empty after mark_done (DELETE, not UPDATE)"
+        );
+    }
+
+    /// Security BLOCKER regression test: after marking N intents done, the
+    /// in-memory intent store must have 0 entries.
+    #[test]
+    fn memory_intent_store_mark_done_deletes_entry() {
+        use super::MemoryGateStartIntentStore;
+
+        let store = MemoryGateStartIntentStore::default();
+        let publication = apm2_core::fac::ChangesetPublication {
+            work_id: "W-mem-delete".to_string(),
+            changeset_digest: [0xCC; 32],
+            bundle_cas_hash: [0xDD; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:mem".to_string(),
+            changeset_published_event_id: "evt-2".to_string(),
+        };
+        let intent = super::GateStartIntent {
+            publication: publication.clone(),
+        };
+
+        let inserted = store.enqueue_many(&[intent]).expect("enqueue");
+        assert_eq!(inserted, 1);
+
+        let key = super::gate_start_intent_key(&publication.work_id, &publication.changeset_digest);
+        store.mark_done(&key).expect("mark done");
+
+        // All internal collections must be empty.
+        let pending_count = store.pending.lock().expect("lock").len();
+        let states_count = store.states.lock().expect("lock").len();
+        let intents_count = store.intents.lock().expect("lock").len();
+        assert_eq!(
+            pending_count, 0,
+            "pending queue must be empty after mark_done"
+        );
+        assert_eq!(states_count, 0, "states map must be empty after mark_done");
+        assert_eq!(
+            intents_count, 0,
+            "intents map must be empty after mark_done"
+        );
+    }
+
+    /// Security BLOCKER regression test: effect journal deletes completed
+    /// entries to prevent unbounded terminal growth.
+    #[test]
+    fn effect_journal_record_completed_deletes_entry() {
+        use super::GateStartEffectJournal;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let journal_path = dir.path().join("test_journal.sqlite");
+        let journal = GateStartEffectJournal::open(&journal_path).expect("open journal");
+
+        let key = "gate_start:W-journal-test:aa".to_string() + &"bb".repeat(16);
+
+        // Record started, then completed.
+        journal
+            .upsert_state(&key, "started", 1000)
+            .expect("record started");
+        let state = journal.load_state(&key).expect("load state");
+        assert_eq!(state.as_deref(), Some("started"));
+
+        // record_completed deletes the entry.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            use apm2_core::orchestrator_kernel::EffectJournal;
+            let key_string = key.clone();
+            journal
+                .record_completed(&key_string)
+                .await
+                .expect("record completed");
+        });
+
+        // Verify: no row in the journal.
+        let state_after = journal.load_state(&key).expect("load state after");
+        assert!(
+            state_after.is_none(),
+            "effect journal entry must be deleted after record_completed"
+        );
+
+        // Verify row count is 0.
+        let guard = journal.conn.lock().expect("lock");
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM gate_start_effect_journal_state",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        assert_eq!(
+            count, 0,
+            "effect journal table must be empty after record_completed"
+        );
     }
 }

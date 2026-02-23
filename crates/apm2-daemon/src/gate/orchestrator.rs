@@ -25,7 +25,6 @@
 //! invocations could steal or drop events from a global buffer.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -679,10 +678,13 @@ pub struct GateOrchestrator {
     config: GateOrchestratorConfig,
     /// Active orchestrations indexed by `(work_id, changeset_digest)`.
     ///
-    /// CSID-003: Keyed by composite `(work_id, changeset_digest)` to allow
-    /// concurrent orchestrations for the same work item with different
-    /// changesets. Starting `(work, digest2)` while `(work, digest1)` is
-    /// active is ALLOWED; starting the same `(work, digest1)` twice is denied.
+    /// CSID-003 + Code-Quality MAJOR fix: Keyed by composite
+    /// `(work_id, changeset_digest)` for dedup, but enforces a
+    /// **one-active-per-work_id** invariant (latest changeset wins per
+    /// RFC-0032). Starting `(work, digest2)` while `(work, digest1)` is
+    /// active supersedes the old entry; starting the same `(work, digest1)`
+    /// twice is denied. This ensures `find_by_work_id` helpers always
+    /// resolve to the correct (unique) entry.
     orchestrations: RwLock<HashMap<(String, [u8; 32]), OrchestrationEntry>>,
     /// Signer for gate leases and policy resolutions.
     signer: Arc<Signer>,
@@ -1012,31 +1014,50 @@ impl GateOrchestrator {
                 });
             }
 
-            // BLOCKER 2 (Code-Quality): CSID-003 composite key.
-            // Duplicate (work_id, changeset_digest) check + insert.
-            // Starting (work, digest2) while (work, digest1) is active is ALLOWED.
-            // Starting the same (work, digest1) twice is denied.
+            // Code-Quality MAJOR: Enforce one active orchestration per
+            // work_id (latest-wins policy per RFC-0032). When a new
+            // (work_id, digest2) arrives while (work_id, digest1) is
+            // active, the old orchestration is superseded/removed so
+            // that find_by_work_id helpers always resolve to the
+            // correct entry. Starting the same (work_id, digest)
+            // twice is denied as a duplicate.
             let composite_key = (publication.work_id.clone(), publication.changeset_digest);
-            match orchestrations.entry(composite_key) {
-                Entry::Occupied(_) => {
-                    return Err(GateOrchestratorError::DuplicateOrchestration {
-                        work_id: publication.work_id.clone(),
-                    });
-                },
-                Entry::Vacant(vacant) => {
-                    vacant.insert(OrchestrationEntry {
-                        _publication: publication.clone(),
-                        policy_resolution,
-                        gates,
-                        leases: leases.clone(),
-                        executor_keys,
-                        receipts: HashMap::new(),
-                        _started_at_ms: now_ms,
-                        started_at_monotonic: monotonic_now,
-                        idempotency_key: idempotency_key.clone(),
-                    });
-                },
+            if orchestrations.contains_key(&composite_key) {
+                return Err(GateOrchestratorError::DuplicateOrchestration {
+                    work_id: publication.work_id.clone(),
+                });
             }
+
+            // Supersede any existing orchestration for this work_id
+            // with a different digest (latest changeset wins).
+            let old_key = orchestrations
+                .keys()
+                .find(|(wid, _)| wid == &publication.work_id)
+                .cloned();
+            if let Some(key) = old_key {
+                info!(
+                    work_id = %publication.work_id,
+                    old_digest = %hex::encode(key.1),
+                    new_digest = %hex::encode(publication.changeset_digest),
+                    "Superseding old orchestration with latest changeset (latest-wins)"
+                );
+                orchestrations.remove(&key);
+            }
+
+            orchestrations.insert(
+                composite_key,
+                OrchestrationEntry {
+                    _publication: publication.clone(),
+                    policy_resolution,
+                    gates,
+                    leases: leases.clone(),
+                    executor_keys,
+                    receipts: HashMap::new(),
+                    _started_at_ms: now_ms,
+                    started_at_monotonic: monotonic_now,
+                    idempotency_key: idempotency_key.clone(),
+                },
+            );
 
             // Security MAJOR 1: Register idempotency key atomically with
             // the orchestration insert. Bounded eviction: if we exceed the
@@ -2188,11 +2209,11 @@ impl GateOrchestrator {
 // Composite Key Helpers (CSID-003)
 // =============================================================================
 
-/// Finds the first orchestration entry matching `work_id` (any digest).
+/// Finds the orchestration entry matching `work_id`.
 ///
-/// Used by methods that only receive `work_id` as a parameter (receipt
-/// recording, status queries, timeouts). At most a handful of entries exist
-/// per `work_id`, so linear scan is correct and performant.
+/// The one-active-per-work_id invariant (enforced in `start_for_publication`)
+/// guarantees at most one entry exists per `work_id`, making this lookup
+/// unambiguous. Used by receipt recording, status queries, and timeouts.
 fn find_by_work_id<'a>(
     map: &'a HashMap<(String, [u8; 32]), OrchestrationEntry>,
     work_id: &str,
@@ -2202,8 +2223,9 @@ fn find_by_work_id<'a>(
         .map(|(_, entry)| entry)
 }
 
-/// Finds the first orchestration entry matching `work_id` (any digest),
-/// mutable.
+/// Finds the orchestration entry matching `work_id`, mutable.
+///
+/// The one-active-per-work_id invariant guarantees unambiguous lookup.
 fn find_by_work_id_mut<'a>(
     map: &'a mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
     work_id: &str,
@@ -2213,8 +2235,9 @@ fn find_by_work_id_mut<'a>(
         .map(|(_, entry)| entry)
 }
 
-/// Removes the first orchestration entry matching `work_id` (any digest).
+/// Removes the orchestration entry matching `work_id`.
 ///
+/// The one-active-per-work_id invariant guarantees at most one entry.
 /// Returns `true` if an entry was found and removed.
 fn remove_by_work_id(
     map: &mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
@@ -4819,5 +4842,128 @@ mod tests {
                 tier, profile.attestation
             );
         }
+    }
+
+    // =========================================================================
+    // One-Active-Per-Work-Id (Latest-Wins) Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_new_digest_supersedes_old_orchestration_for_same_work_id() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "supersede-work".to_string(),
+            changeset_digest: [0x11; 32],
+            bundle_cas_hash: [0xAA; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:1".to_string(),
+            changeset_published_event_id: "evt-1".to_string(),
+        };
+        let pub2 = ChangesetPublication {
+            work_id: "supersede-work".to_string(),
+            changeset_digest: [0x22; 32],
+            bundle_cas_hash: [0xBB; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:2".to_string(),
+            changeset_published_event_id: "evt-2".to_string(),
+        };
+
+        // Start first orchestration.
+        let (types1, _, events1) = orch.start_for_changeset(pub1).await.unwrap();
+        assert_eq!(types1.len(), 3, "first start should issue 3 gate types");
+        assert!(!events1.is_empty(), "first start should emit events");
+        assert_eq!(orch.active_count().await, 1);
+
+        // Start second orchestration for same work_id, different digest.
+        // The old one should be superseded.
+        let (types2, _, events2) = orch.start_for_changeset(pub2).await.unwrap();
+        assert_eq!(types2.len(), 3, "second start should issue 3 gate types");
+        assert!(!events2.is_empty(), "second start should emit events");
+        // Still only 1 active orchestration (old was superseded).
+        assert_eq!(
+            orch.active_count().await,
+            1,
+            "only one active orchestration per work_id (latest-wins)"
+        );
+
+        // Verify the active one is for the new digest.
+        let lease = orch
+            .gate_lease("supersede-work", GateType::Aat)
+            .await
+            .expect("lease should exist for the new digest");
+        assert_eq!(
+            lease.changeset_digest, [0x22; 32],
+            "active lease should be for the new (superseding) digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_same_digest_is_idempotent_noop() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "dup-work".to_string(),
+            changeset_digest: [0x33; 32],
+            bundle_cas_hash: [0xCC; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:dup".to_string(),
+            changeset_published_event_id: "evt-dup".to_string(),
+        };
+
+        let (types1, _, events1) = orch.start_for_changeset(pub1.clone()).await.unwrap();
+        assert_eq!(types1.len(), 3, "first start should issue 3 gate types");
+        assert!(!events1.is_empty(), "first start should emit events");
+
+        // Same (work_id, digest) again should be a silent no-op
+        // (idempotent replay rejection, not an error).
+        let (types2, signers2, events2) = orch.start_for_changeset(pub1).await.unwrap();
+        assert!(
+            types2.is_empty(),
+            "duplicate should return empty gate types (no-op)"
+        );
+        assert!(
+            signers2.is_empty(),
+            "duplicate should return empty signers (no-op)"
+        );
+        assert!(
+            events2.is_empty(),
+            "duplicate should return empty events (no-op)"
+        );
+        // Still only one orchestration.
+        assert_eq!(orch.active_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_work_id_unambiguous_after_supersede() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "find-work".to_string(),
+            changeset_digest: [0x44; 32],
+            bundle_cas_hash: [0xDD; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:find".to_string(),
+            changeset_published_event_id: "evt-find-1".to_string(),
+        };
+        let pub2 = ChangesetPublication {
+            work_id: "find-work".to_string(),
+            changeset_digest: [0x55; 32],
+            bundle_cas_hash: [0xEE; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:find".to_string(),
+            changeset_published_event_id: "evt-find-2".to_string(),
+        };
+
+        let _ = orch.start_for_changeset(pub1).await.unwrap();
+        let (_, signers2, _) = orch.start_for_changeset(pub2).await.unwrap();
+
+        // Executor key should match the new orchestration.
+        let vk = orch
+            .executor_verifying_key("find-work", GateType::Security)
+            .await
+            .expect("executor key should exist");
+        let expected_vk = signers2[&GateType::Security].verifying_key();
+        assert_eq!(
+            vk, expected_vk,
+            "executor key must match the latest (superseding) orchestration"
+        );
     }
 }
