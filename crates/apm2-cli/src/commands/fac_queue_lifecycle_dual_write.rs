@@ -170,6 +170,47 @@ pub(super) fn emit_job_failed(
     emit_event(fac_root, FAC_JOB_FAILED_EVENT_TYPE, &event, actor_id)
 }
 
+/// Emits `fac.job.failed` using projection-derived identity fields.
+///
+/// f-798-code_quality-1771816907239154-0: When `scan_pending_from_projection`
+/// quarantines a malformed pending file, the projection still shows the job as
+/// `Pending`. Without a terminal lifecycle event, the reconciler recreates the
+/// witness stub, the worker re-quarantines it, and the loop repeats forever.
+///
+/// This function constructs a synthetic `FacJobIdentityV1` from the projection
+/// record fields (`job_id`, `queue_job_id`, `work_id`) with sentinel values for
+/// fields that are unavailable because the payload could not be deserialized.
+pub(super) fn emit_job_failed_by_queue_id(
+    fac_root: &Path,
+    job_id: &str,
+    queue_job_id: &str,
+    work_id: &str,
+    reason_class: &str,
+    retryable: bool,
+    actor_id: &str,
+) -> Result<(), String> {
+    let sentinel = "unavailable:malformed_payload";
+    let identity = FacJobIdentityV1 {
+        job_id: job_id.to_string(),
+        queue_job_id: queue_job_id.to_string(),
+        work_id: work_id.to_string(),
+        changeset_digest: sentinel.to_string(),
+        spec_digest: sentinel.to_string(),
+        gate_profile: sentinel.to_string(),
+        revision: sentinel.to_string(),
+    };
+    let event = FacJobLifecycleEventV1::new(
+        stable_intent_id("failed", queue_job_id, reason_class),
+        None,
+        FacJobLifecycleEventData::Failed(FacJobFailedV1 {
+            identity,
+            reason_class: reason_class.to_string(),
+            retryable,
+        }),
+    );
+    emit_event(fac_root, FAC_JOB_FAILED_EVENT_TYPE, &event, actor_id)
+}
+
 fn emit_event(
     fac_root: &Path,
     event_type: &str,
@@ -211,6 +252,18 @@ fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmit
     }
     let conn = Connection::open(&db_path)
         .map_err(|err| format!("open queue lifecycle ledger {}: {err}", db_path.display()))?;
+    // f-798-code_quality-1771816912391438-0: Set busy_timeout to prevent
+    // SQLITE_BUSY under concurrent queue mutation load (multiple workers
+    // claiming jobs). Without this, SQLite immediately returns SQLITE_BUSY
+    // instead of waiting for locks, causing dropped dual-write events and
+    // projection state divergence.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|err| {
+            format!(
+                "set busy_timeout on queue lifecycle ledger {}: {err}",
+                db_path.display()
+            )
+        })?;
     SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key).map_err(|err| {
         format!(
             "init queue lifecycle ledger schema {}: {err}",
