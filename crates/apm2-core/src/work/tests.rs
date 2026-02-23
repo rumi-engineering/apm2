@@ -37,11 +37,9 @@ fn apply_changeset_published(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize changeset_published payload");
+    // session_id must match payload work_id (envelope binding — CSID-004)
     reducer
-        .apply(
-            &create_event("changeset_published", "session-1", payload),
-            ctx,
-        )
+        .apply(&create_event("changeset_published", work_id, payload), ctx)
         .expect("apply changeset_published");
 }
 
@@ -56,9 +54,10 @@ fn apply_gate_receipt_collected(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize gate receipt payload");
+    // session_id must match payload work_id (envelope binding — CSID-004)
     reducer
         .apply(
-            &create_event("gate.receipt_collected", "session-1", payload),
+            &create_event("gate.receipt_collected", work_id, payload),
             ctx,
         )
         .expect("apply gate.receipt_collected");
@@ -76,9 +75,10 @@ fn apply_review_receipt_recorded(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize review receipt payload");
+    // session_id must match payload work_id (envelope binding — CSID-004)
     reducer
         .apply(
-            &create_event("review_receipt_recorded", "session-1", payload),
+            &create_event("review_receipt_recorded", work_id, payload),
             ctx,
         )
         .expect("apply review_receipt_recorded");
@@ -96,9 +96,10 @@ fn apply_merge_receipt_recorded(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize merge receipt payload");
+    // session_id must match payload work_id (envelope binding — CSID-004)
     reducer
         .apply(
-            &create_event("merge_receipt_recorded", "session-1", payload),
+            &create_event("merge_receipt_recorded", work_id, payload),
             ctx,
         )
         .expect("apply merge_receipt_recorded");
@@ -801,6 +802,8 @@ fn test_work_completed_accepts_case_variant_merge_receipt_prefix() {
     let ctx = ReducerContext::new(1);
 
     setup_review_work(&mut reducer, &ctx, "work-1");
+    // Seed merge-stage digest (required for non-empty merge_receipt_id).
+    apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
 
     // Case-variant prefix (MERGE-RECEIPT-) is accepted — the domain
     // separation check normalizes to ASCII lowercase before the
@@ -868,6 +871,8 @@ fn test_work_completed_rejects_case_variant_gate_receipt_cross_injection() {
     for variant in &case_variants_merge {
         let mut reducer = WorkReducer::new();
         setup_review_work(&mut reducer, &ctx, "work-1");
+        // Seed merge-stage digest (required for non-empty merge_receipt_id).
+        apply_merge_receipt_recorded(&mut reducer, &ctx, "work-1", default_changeset_digest());
         let payload = helpers::work_completed_payload(
             "work-1",
             vec![10, 20, 30],
@@ -2833,11 +2838,10 @@ fn test_non_ci_gated_transition_allows_any_rationale() {
 }
 
 #[test]
-fn test_ci_transition_allowed_when_no_changeset_published() {
+fn test_ci_transition_denied_when_no_changeset_published() {
     // When no changeset has been published for a work item (no entry in
-    // latest_changeset_by_work), the CI transition guard is a no-op and the
-    // transition is allowed through. This preserves backward compatibility
-    // with pre-changeset-identity code paths.
+    // latest_changeset_by_work), the CI transition guard must DENY the
+    // transition (fail-closed CSID-004). Work stays at CiPending.
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
@@ -2891,6 +2895,9 @@ fn test_ci_transition_allowed_when_no_changeset_published() {
         "ci_passed",
         3,
     );
+    // The transition should succeed at the reducer level (no error), but the
+    // work should remain at CiPending because the guard denies the transition
+    // (returns Ok(false) — silently ignores the transition).
     reducer
         .apply(
             &create_event_with_actor(
@@ -2906,8 +2913,8 @@ fn test_ci_transition_allowed_when_no_changeset_published() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(
         work.state,
-        WorkState::ReadyForReview,
-        "transition must be allowed when no changeset has been published (legacy path)"
+        WorkState::CiPending,
+        "transition must be DENIED when no changeset has been published (fail-closed CSID-004)"
     );
 }
 

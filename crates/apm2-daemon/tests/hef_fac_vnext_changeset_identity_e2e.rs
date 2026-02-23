@@ -50,11 +50,16 @@ fn apply_digest_event(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize digest event payload");
+    // Use work_id as session_id so envelope binding matches payload (CSID-004).
+    let record = EventRecord::with_timestamp(
+        event_type,
+        work_id,
+        "actor:fac-kernel",
+        payload,
+        timestamp_ns,
+    );
     reducer
-        .apply(
-            &create_event(event_type, "actor:fac-kernel", payload, timestamp_ns),
-            ctx,
-        )
+        .apply(&record, ctx)
         .expect("apply digest-bound event");
 }
 

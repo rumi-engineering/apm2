@@ -190,22 +190,75 @@ impl WorkReducer {
         Self::default()
     }
 
+    /// Canonical merge receipt event types (explicit allowlist).
+    ///
+    /// Replaces substring matching to prevent cross-work state injection via
+    /// unreserved event types that contain `merge_receipt`.
+    const MERGE_RECEIPT_EVENT_TYPES: &'static [&'static str] = &[
+        "fac.merge_receipt.recorded",
+        "gate.merge_receipt_created",
+        "merge_receipt_recorded",
+        "merge_receipt_created",
+    ];
+
     /// Records latest-digest projections from non-work events.
     ///
     /// This keeps stage-bound digest context available when processing
     /// `work.transitioned` / `work.completed` boundaries.
+    ///
+    /// # Security
+    ///
+    /// Digest state updates are bound to `EventRecord.work_id` (the signed
+    /// envelope field), NOT the payload-extracted `work_id`. If the payload
+    /// `work_id` does not match the envelope `work_id`, a security warning
+    /// is logged and the event is skipped, preventing cross-work state
+    /// injection attacks.
     fn observe_changeset_bound_event(&mut self, event: &EventRecord) {
-        let Some((work_id, changeset_digest)) =
+        let Some((payload_work_id, changeset_digest)) =
             extract_work_id_and_digest_from_payload(&event.payload)
         else {
             return;
+        };
+
+        // Bind to signed envelope identity: use EventRecord.session_id as the
+        // authoritative work_id for state updates. Validate that payload
+        // work_id matches the envelope to prevent cross-work injection.
+        let envelope_work_id = &event.session_id;
+
+        // If the envelope work_id is empty (some legacy events), fall back to
+        // payload work_id but only for changeset_published (which populates
+        // the index). For all receipt types, require envelope binding.
+        let authoritative_work_id = if envelope_work_id.is_empty() {
+            if event.event_type == "changeset_published" {
+                payload_work_id
+            } else {
+                warn!(
+                    event_type = %event.event_type,
+                    payload_work_id = %payload_work_id,
+                    "digest-bound event skipped: empty envelope work_id on non-publication event"
+                );
+                return;
+            }
+        } else {
+            if payload_work_id != *envelope_work_id {
+                warn!(
+                    event_type = %event.event_type,
+                    envelope_work_id = %envelope_work_id,
+                    payload_work_id = %payload_work_id,
+                    defect_code = "CROSS_WORK_INJECTION_ATTEMPT",
+                    "SECURITY: digest-bound event skipped: payload work_id does not match \
+                     signed envelope work_id — possible cross-work state injection"
+                );
+                return;
+            }
+            envelope_work_id.clone()
         };
 
         match event.event_type.as_str() {
             "changeset_published" => {
                 self.state
                     .latest_changeset_by_work
-                    .insert(work_id, changeset_digest);
+                    .insert(authoritative_work_id, changeset_digest);
             },
             // CI transitions are driven by gate receipts (not lease issuance).
             // Enforce latest-digest validation: only receipts whose digest
@@ -215,46 +268,44 @@ impl WorkReducer {
             | "gate_receipt_collected"
             | "gate.receipt"
             | "gate_receipt" => {
-                if self.is_digest_latest(&work_id, changeset_digest) {
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
                     self.state
                         .ci_receipt_digest_by_work
-                        .insert(work_id, changeset_digest);
+                        .insert(authoritative_work_id, changeset_digest);
                 } else {
                     self.log_stale_digest_observation(
                         "gate_receipt",
                         &event.event_type,
-                        &work_id,
+                        &authoritative_work_id,
                         changeset_digest,
                     );
                 }
             },
             "review_receipt_recorded" | "review_blocked_recorded" => {
-                if self.is_digest_latest(&work_id, changeset_digest) {
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
                     self.state
                         .review_receipt_digest_by_work
-                        .insert(work_id, changeset_digest);
+                        .insert(authoritative_work_id, changeset_digest);
                 } else {
                     self.log_stale_digest_observation(
                         "review_receipt",
                         &event.event_type,
-                        &work_id,
+                        &authoritative_work_id,
                         changeset_digest,
                     );
                 }
             },
-            // Merge receipt event names are currently implementation-defined.
-            // Accept any merge-receipt-shaped event_type and enforce latest
-            // digest at ingestion.
-            event_type if event_type.contains("merge_receipt") => {
-                if self.is_digest_latest(&work_id, changeset_digest) {
+            // Merge receipt events: explicit allowlist (no substring matching).
+            event_type if Self::MERGE_RECEIPT_EVENT_TYPES.contains(&event_type) => {
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
                     self.state
                         .merge_receipt_digest_by_work
-                        .insert(work_id, changeset_digest);
+                        .insert(authoritative_work_id, changeset_digest);
                 } else {
                     self.log_stale_digest_observation(
                         "merge_receipt",
                         event_type,
-                        &work_id,
+                        &authoritative_work_id,
                         changeset_digest,
                     );
                 }
@@ -340,33 +391,40 @@ impl WorkReducer {
                 });
             }
             if matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
-                // Only enforce changeset-digest binding when a changeset has
-                // actually been published for this work. Pre-changeset-identity
-                // code paths (and tests that predate ChangeSetPublished) have no
-                // entry in latest_changeset_by_work — allow them through.
-                if let Some(latest_digest) = self.latest_changeset_digest(work_id) {
-                    let Some(incoming_digest) =
-                        self.state.ci_receipt_digest_by_work.get(work_id).copied()
-                    else {
-                        warn!(
-                            work_id,
-                            event_type = "work.transitioned",
-                            from_state = %from_state.as_str(),
-                            to_state = %to_state.as_str(),
-                            latest_digest = %hex::encode(latest_digest),
-                            "ci transition denied: no changeset-bound gate receipt observed"
-                        );
-                        return Ok(false);
-                    };
-                    if incoming_digest != latest_digest {
-                        self.log_stale_digest_observation(
-                            "ci_transition",
-                            "work.transitioned",
-                            work_id,
-                            incoming_digest,
-                        );
-                        return Ok(false);
-                    }
+                // Fail-closed: a published changeset MUST exist before any
+                // CI stage boundary transition is admitted (CSID-004).
+                let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        defect_code = "MISSING_CHANGESET_PUBLISHED",
+                        "ci transition denied: no changeset published for work (fail-closed)"
+                    );
+                    return Ok(false);
+                };
+                let Some(incoming_digest) =
+                    self.state.ci_receipt_digest_by_work.get(work_id).copied()
+                else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        latest_digest = %hex::encode(latest_digest),
+                        "ci transition denied: no changeset-bound gate receipt observed"
+                    );
+                    return Ok(false);
+                };
+                if incoming_digest != latest_digest {
+                    self.log_stale_digest_observation(
+                        "ci_transition",
+                        "work.transitioned",
+                        work_id,
+                        incoming_digest,
+                    );
+                    return Ok(false);
                 }
             }
         }
@@ -374,30 +432,38 @@ impl WorkReducer {
         // ---- Review start stage boundary (CSID-004) ----
         //
         // When transitioning ReadyForReview -> Review, verify that a latest
-        // changeset exists. If a review receipt has already been observed but
-        // its digest is stale, deny the transition (the review was for an
-        // older changeset and must be re-done).
+        // changeset exists (fail-closed). If a review receipt has already been
+        // observed but its digest is stale, deny the transition (the review
+        // was for an older changeset and must be re-done).
         if from_state == WorkState::ReadyForReview && to_state == WorkState::Review {
-            // Only enforce review-start digest binding when a changeset has
-            // been published for this work. Pre-changeset-identity code paths
-            // are allowed through (no latest digest → nothing to validate).
-            if let Some(_latest_digest) = self.latest_changeset_digest(work_id) {
-                // If a review receipt already exists but is stale, deny.
-                if let Some(review_digest) = self
-                    .state
-                    .review_receipt_digest_by_work
-                    .get(work_id)
-                    .copied()
-                {
-                    if !self.is_digest_latest(work_id, review_digest) {
-                        self.log_stale_digest_observation(
-                            "review_start",
-                            "work.transitioned",
-                            work_id,
-                            review_digest,
-                        );
-                        return Ok(false);
-                    }
+            // Fail-closed: a published changeset MUST exist before review
+            // start is admitted (CSID-004).
+            let Some(_latest_digest) = self.latest_changeset_digest(work_id) else {
+                warn!(
+                    work_id,
+                    event_type = "work.transitioned",
+                    from_state = %from_state.as_str(),
+                    to_state = %to_state.as_str(),
+                    defect_code = "MISSING_CHANGESET_PUBLISHED",
+                    "review start denied: no changeset published for work (fail-closed)"
+                );
+                return Ok(false);
+            };
+            // If a review receipt already exists but is stale, deny.
+            if let Some(review_digest) = self
+                .state
+                .review_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+            {
+                if !self.is_digest_latest(work_id, review_digest) {
+                    self.log_stale_digest_observation(
+                        "review_start",
+                        "work.transitioned",
+                        work_id,
+                        review_digest,
+                    );
+                    return Ok(false);
                 }
             }
         }
@@ -456,14 +522,19 @@ impl WorkReducer {
 
     /// Enforces latest-digest merge admission. Returns `true` if admissible.
     ///
-    /// When no changeset has been published for this work (no entry in
-    /// `latest_changeset_by_work`), the guard is a no-op — completion is
-    /// allowed through to preserve backward compatibility with pre-changeset-
-    /// identity code paths.
+    /// Fail-closed: when no changeset has been published for this work (no
+    /// entry in `latest_changeset_by_work`), completion is denied. A published
+    /// changeset is required for merge admission (CSID-004).
     fn completion_latest_digest_admitted(&self, work_id: &str, merge_receipt_id: &str) -> bool {
         let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
-            // No changeset published yet — allow completion (legacy path).
-            return true;
+            // Fail-closed: no changeset published — deny completion.
+            warn!(
+                work_id,
+                event_type = "work.completed",
+                defect_code = "MISSING_CHANGESET_PUBLISHED",
+                "work completion denied: no changeset published for work (fail-closed)"
+            );
+            return false;
         };
         let Some(incoming_digest) = self.completion_incoming_digest(work_id, merge_receipt_id)
         else {

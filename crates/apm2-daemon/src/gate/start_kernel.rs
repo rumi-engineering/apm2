@@ -1125,7 +1125,10 @@ fn parse_changeset_publication_payload(
     let publisher_actor_id = payload_json
         .get("actor_id")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "changeset_published payload missing or empty actor_id (fail-closed)".to_string()
+        })?;
     let published_at_ns = payload_json
         .get("timestamp_ns")
         .and_then(serde_json::Value::as_u64)

@@ -80,9 +80,10 @@ fn emit_gate_receipt_collected(
         "gate_type": "quality",
     });
 
+    // Use work_id as session_id so envelope binding matches payload (CSID-004).
     emitter
         .emit_session_event_with_envelope(
-            "session-gate-receipt",
+            work_id,
             "gate.receipt_collected",
             &payload_envelope,
             "system:gate",

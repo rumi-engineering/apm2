@@ -680,24 +680,21 @@ fn translate_signed_event(
 
         // Forward digest-bound non-work events so WorkReducer can maintain
         // latest changeset + stage receipt context (CSID-004).
+        // Merge receipt events use an explicit allowlist (no substring matching)
+        // to prevent cross-work state injection via unreserved event types.
         "changeset_published"
         | "gate.receipt_collected"
         | "gate_receipt_collected"
         | "gate.receipt"
         | "gate_receipt"
         | "review_receipt_recorded"
-        | "review_blocked_recorded" => {
+        | "review_blocked_recorded"
+        | "fac.merge_receipt.recorded"
+        | "gate.merge_receipt_created"
+        | "merge_receipt_recorded"
+        | "merge_receipt_created" => {
             push_event(
                 &event.event_type,
-                &event.work_id,
-                &event.actor_id,
-                event.payload.clone(),
-                event.timestamp_ns,
-            );
-        },
-        event_type if event_type.contains("merge_receipt") => {
-            push_event(
-                event_type,
                 &event.work_id,
                 &event.actor_id,
                 event.payload.clone(),
