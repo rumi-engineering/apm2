@@ -326,6 +326,47 @@ impl WorkObjectProjection {
         self.ordered_work.len()
     }
 
+    /// Returns the latest changeset digest for a work ID from the reducer
+    /// state, if a `ChangeSetPublished` event has been observed.
+    #[must_use]
+    pub fn latest_changeset_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .latest_changeset_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the CI receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .ci_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .review_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the merge receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn merge_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .merge_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
     /// Returns claimable work items in deterministic ID order.
     #[must_use]
     pub fn claimable_work(&self) -> Vec<&Work> {

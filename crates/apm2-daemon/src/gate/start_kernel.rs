@@ -23,7 +23,6 @@ use crate::ledger::SqliteLedgerEventEmitter;
 use crate::protocol::dispatch::LedgerEventEmitter;
 
 const GATE_START_CURSOR_KEY: i64 = 1;
-const GATE_START_PERSISTOR_SESSION_ID: &str = "gate-start-kernel";
 const GATE_START_PERSISTOR_ACTOR_ID: &str = "orchestrator:gate-start-kernel";
 
 /// Maximum payload size (in bytes) for `changeset_published` events before JSON
@@ -223,6 +222,9 @@ impl CursorEvent for GateStartObservedEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GateStartIntent {
     publication: ChangesetPublication,
+    /// Monotonic sequence number assigned when the intent is first observed,
+    /// preserving ledger observation order across `plan()` calls.
+    observed_seq: u64,
 }
 
 impl GateStartIntent {
@@ -250,6 +252,8 @@ enum GateStartReceipt {
 struct GateStartDomain {
     orchestrator: Arc<GateOrchestrator>,
     pending_intents: HashMap<String, GateStartIntent>,
+    /// Monotonic counter for preserving ledger observation order.
+    next_observed_seq: u64,
 }
 
 impl GateStartDomain {
@@ -257,6 +261,7 @@ impl GateStartDomain {
         Self {
             orchestrator,
             pending_intents: HashMap::new(),
+            next_observed_seq: 0,
         }
     }
 }
@@ -272,8 +277,11 @@ impl OrchestratorDomain<GateStartObservedEvent, GateStartIntent, String, GateSta
 
     async fn apply_events(&mut self, events: &[GateStartObservedEvent]) -> Result<(), Self::Error> {
         for event in events {
+            let seq = self.next_observed_seq;
+            self.next_observed_seq = seq.saturating_add(1);
             let intent = GateStartIntent {
                 publication: event.publication.clone(),
+                observed_seq: seq,
             };
             self.pending_intents.insert(intent.key(), intent);
         }
@@ -283,7 +291,10 @@ impl OrchestratorDomain<GateStartObservedEvent, GateStartIntent, String, GateSta
     async fn plan(&mut self) -> Result<Vec<GateStartIntent>, Self::Error> {
         let mut intents: Vec<GateStartIntent> =
             self.pending_intents.drain().map(|(_, v)| v).collect();
-        intents.sort_by_key(GateStartIntent::key);
+        // Sort by ledger observation order, not by key.  This preserves the
+        // deterministic ordering established by the cursor-driven poll, which
+        // orders by (timestamp_ns, cursor_event_id).
+        intents.sort_by_key(|i| i.observed_seq);
         Ok(intents)
     }
 
@@ -421,10 +432,10 @@ impl SqliteGateStartLedgerReader {
             )
             .optional()
             .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        // MAJOR (Security): SELECT actor_id from both tables (verified
-        // envelope identity) for identity spoofing prevention. Both
-        // `ledger_events` and canonical `events` tables have an actor_id
-        // column that stores the cryptographically verified envelope identity.
+        // Security: SELECT actor_id and work_id/session_id from both tables.
+        // Both `ledger_events` (work_id) and canonical `events` (session_id)
+        // tables have mandatory actor_id and work identity columns. These are
+        // the cryptographically verified envelope identities.
         let query = if table_exists.is_some() {
             // Ordering invariant:
             // - Every observed event has a deterministic `cursor_event_id` namespaced by
@@ -436,13 +447,15 @@ impl SqliteGateStartLedgerReader {
             // canonical rows sharing a timestamp could be skipped when each
             // table applied incompatible local ordering.
             if cursor_event_id.is_empty() {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns, verified_actor_id
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns,
+                        verified_actor_id, verified_work_id
                  FROM (
                    SELECT ('legacy:' || event_id) AS cursor_event_id,
                           event_id AS source_event_id,
                           payload,
                           timestamp_ns,
-                          actor_id AS verified_actor_id
+                          actor_id AS verified_actor_id,
+                          work_id AS verified_work_id
                    FROM ledger_events
                    WHERE event_type = 'changeset_published'
                    UNION ALL
@@ -450,7 +463,8 @@ impl SqliteGateStartLedgerReader {
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
                           timestamp_ns,
-                          actor_id AS verified_actor_id
+                          actor_id AS verified_actor_id,
+                          session_id AS verified_work_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -458,13 +472,15 @@ impl SqliteGateStartLedgerReader {
                  ORDER BY timestamp_ns ASC, cursor_event_id ASC
                  LIMIT ?2"
             } else {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns, verified_actor_id
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns,
+                        verified_actor_id, verified_work_id
                  FROM (
                    SELECT ('legacy:' || event_id) AS cursor_event_id,
                           event_id AS source_event_id,
                           payload,
                           timestamp_ns,
-                          actor_id AS verified_actor_id
+                          actor_id AS verified_actor_id,
+                          work_id AS verified_work_id
                    FROM ledger_events
                    WHERE event_type = 'changeset_published'
                    UNION ALL
@@ -472,7 +488,8 @@ impl SqliteGateStartLedgerReader {
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
                           timestamp_ns,
-                          actor_id AS verified_actor_id
+                          actor_id AS verified_actor_id,
+                          session_id AS verified_work_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -486,7 +503,8 @@ impl SqliteGateStartLedgerReader {
                     event_id AS source_event_id,
                     payload,
                     timestamp_ns,
-                    actor_id AS verified_actor_id
+                    actor_id AS verified_actor_id,
+                    work_id AS verified_work_id
              FROM ledger_events
              WHERE event_type = 'changeset_published'
                AND timestamp_ns > ?1
@@ -497,7 +515,8 @@ impl SqliteGateStartLedgerReader {
                     event_id AS source_event_id,
                     payload,
                     timestamp_ns,
-                    actor_id AS verified_actor_id
+                    actor_id AS verified_actor_id,
+                    work_id AS verified_work_id
              FROM ledger_events
              WHERE event_type = 'changeset_published'
                AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND ('legacy:' || event_id) > ?2))
@@ -533,16 +552,22 @@ impl SqliteGateStartLedgerReader {
                 .map_err(|e| format!("failed to decode unified timestamp: {e}"))?;
             let timestamp_ns =
                 u64::try_from(ts_i64).map_err(|_| "unified timestamp is negative".to_string())?;
-            // MAJOR (Security): Extract verified actor_id from ledger row.
-            // NULL for canonical events table rows (no actor_id column).
-            let verified_actor_id: Option<String> = row
+            // Security: Extract verified actor_id from ledger row envelope.
+            // Both legacy (actor_id) and canonical (actor_id) are NOT NULL.
+            let verified_actor_id: String = row
                 .get(4)
                 .map_err(|e| format!("failed to decode verified_actor_id: {e}"))?;
+            // Security MAJOR: Extract verified work_id from ledger row
+            // envelope (legacy: work_id, canonical: session_id).
+            let verified_work_id: String = row
+                .get(5)
+                .map_err(|e| format!("failed to decode verified_work_id: {e}"))?;
             let publication = parse_changeset_publication_payload(
                 &payload,
                 timestamp_ns,
                 &source_event_id,
-                verified_actor_id.as_deref(),
+                &verified_actor_id,
+                &verified_work_id,
             )?;
             out.push(GateStartObservedEvent {
                 timestamp_ns,
@@ -905,7 +930,13 @@ impl SqliteGateStartIntentStore {
             }
             let publication: ChangesetPublication = serde_json::from_str(&publication_json)
                 .map_err(|e| format!("failed to decode publication json: {e}"))?;
-            intents.push(GateStartIntent { publication });
+            intents.push(GateStartIntent {
+                publication,
+                // Dequeued intents are already ordered by created_at_ns ASC
+                // in the SQL query, so observed_seq is not used for ordering
+                // in this path.
+                observed_seq: 0,
+            });
         }
         Ok(intents)
     }
@@ -1326,6 +1357,14 @@ impl GateStartReceiptWriter {
     }
 
     /// Synchronous persist — callable from `spawn_blocking`.
+    ///
+    /// # Session ID binding
+    ///
+    /// Events are emitted under the actual `work_id` from the orchestrator
+    /// event or lease as the ledger `session_id`. The canonical `events` table
+    /// uses `session_id` as the work-item binding (the `WorkReducer` treats
+    /// `session_id` as `work_id`), so a hardcoded session ID would cause all
+    /// gate events to be attributed to the wrong work item and rejected.
     fn persist_many_sync(
         emitter: &SqliteLedgerEventEmitter,
         receipts: &[GateStartReceipt],
@@ -1334,12 +1373,16 @@ impl GateStartReceiptWriter {
             match receipt {
                 GateStartReceipt::OrchestratorEvent(event) => {
                     let (event_type, timestamp_ns) = gate_start_event_persistence_fields(event);
+                    // Use the actual work_id from the event as the session_id
+                    // (Security BLOCKER fix: replaces hardcoded
+                    // GATE_START_PERSISTOR_SESSION_ID).
+                    let session_id = event.work_id();
                     let payload = serde_json::to_vec(event).map_err(|e| {
                         format!("failed to serialize gate-start orchestrator event: {e}")
                     })?;
                     emitter
                         .emit_session_event(
-                            GATE_START_PERSISTOR_SESSION_ID,
+                            session_id,
                             event_type,
                             &payload,
                             GATE_START_PERSISTOR_ACTOR_ID,
@@ -1365,9 +1408,12 @@ impl GateStartReceiptWriter {
                     let payload_bytes = serde_json::to_vec(&payload).map_err(|e| {
                         format!("failed to serialize gate_lease_issued payload: {e}")
                     })?;
+                    // Use the actual work_id from the lease as the session_id
+                    // (Security BLOCKER fix: replaces hardcoded
+                    // GATE_START_PERSISTOR_SESSION_ID).
                     emitter
                         .emit_session_event(
-                            GATE_START_PERSISTOR_SESSION_ID,
+                            &lease.work_id,
                             "gate_lease_issued",
                             &payload_bytes,
                             GATE_START_PERSISTOR_ACTOR_ID,
@@ -1439,11 +1485,23 @@ pub const fn gate_start_event_persistence_fields(
     }
 }
 
+/// Parse and validate a `changeset_published` payload from the ledger.
+///
+/// # Security
+///
+/// - `verified_actor_id` is the envelope `actor_id` from the ledger row
+///   (mandatory NOT NULL column in both tables). Cross-validated against the
+///   payload's `actor_id` when present.
+/// - `verified_work_id` is the envelope `work_id`/`session_id` from the ledger
+///   row. Cross-validated against the payload's `work_id` to prevent cross-work
+///   identity spoofing.
+/// - Both are fail-closed: mismatches are rejected.
 fn parse_changeset_publication_payload(
     payload: &[u8],
     fallback_timestamp_ns: u64,
     event_id: &str,
-    verified_actor_id: Option<&str>,
+    verified_actor_id: &str,
+    verified_work_id: &str,
 ) -> Result<ChangesetPublication, String> {
     // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
     // prevent DoS via oversized payloads exhausting daemon memory.
@@ -1456,10 +1514,22 @@ fn parse_changeset_publication_payload(
     }
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode changeset_published payload json: {e}"))?;
-    let work_id = payload_json
+    let payload_work_id = payload_json
         .get("work_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "changeset_published payload missing work_id".to_string())?;
+
+    // Security MAJOR: Cross-validate payload work_id against the verified
+    // envelope work_id/session_id from the ledger row. Mismatch means
+    // the payload is spoofing a different work item.
+    if !verified_work_id.is_empty() && payload_work_id != verified_work_id {
+        return Err(format!(
+            "changeset_published work_id spoofing: payload work_id '{payload_work_id}' \
+             does not match verified ledger work_id '{verified_work_id}' \
+             (event_id={event_id})"
+        ));
+    }
+
     let changeset_digest_hex = payload_json
         .get("changeset_digest")
         .and_then(serde_json::Value::as_str)
@@ -1468,48 +1538,45 @@ fn parse_changeset_publication_payload(
         .get("cas_hash")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "changeset_published payload missing cas_hash".to_string())?;
-    // MAJOR (Security): Use the verified actor_id from the ledger row (the
-    // signed envelope identity) as the authoritative publisher_actor_id.
-    // Cross-validate against the payload's actor_id when both are available
-    // to detect spoofing attempts.
+
+    // Security MINOR fix: Require verified_actor_id to be present (fail-closed).
+    // No fallback to payload actor_id — if the verified actor_id is empty,
+    // reject the event.
+    if verified_actor_id.is_empty() {
+        return Err(format!(
+            "changeset_published missing verified_actor_id (fail-closed, event_id={event_id})"
+        ));
+    }
+
+    // Cross-validate: if the payload also declares an actor_id that
+    // differs from the verified one, reject as spoofing attempt.
     let payload_actor_id = payload_json
         .get("actor_id")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty());
-
-    let publisher_actor_id = if let Some(verified) = verified_actor_id {
-        // Ledger row provides verified identity — use it as authoritative.
-        // Cross-validate: if the payload also declares an actor_id that
-        // differs from the verified one, reject as spoofing attempt.
-        if let Some(payload_aid) = payload_actor_id {
-            if payload_aid != verified {
-                return Err(format!(
-                    "changeset_published identity spoofing: payload actor_id '{payload_aid}' \
-                     does not match verified ledger actor_id '{verified}' (event_id={event_id})"
-                ));
-            }
+    if let Some(payload_aid) = payload_actor_id {
+        if payload_aid != verified_actor_id {
+            return Err(format!(
+                "changeset_published identity spoofing: payload actor_id '{payload_aid}' \
+                 does not match verified ledger actor_id '{verified_actor_id}' \
+                 (event_id={event_id})"
+            ));
         }
-        verified
-    } else {
-        // No verified actor_id available (e.g. canonical events table lacks
-        // the column). Fall back to payload but require it to be present.
-        payload_actor_id.ok_or_else(|| {
-            "changeset_published payload missing or empty actor_id (fail-closed)".to_string()
-        })?
-    };
+    }
+
     let published_at_ns = payload_json
         .get("timestamp_ns")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(fallback_timestamp_ns);
-    let payload = ChangeSetPublishedKernelEventPayload {
-        work_id: work_id.to_string(),
+    let cs_payload = ChangeSetPublishedKernelEventPayload {
+        work_id: payload_work_id.to_string(),
         changeset_digest: decode_hex_32(changeset_digest_hex)?,
         cas_hash: decode_hex_32(cas_hash_hex)?,
         published_at_ns,
-        publisher_actor_id: publisher_actor_id.to_string(),
+        publisher_actor_id: verified_actor_id.to_string(),
         event_id: event_id.to_string(),
     };
-    ChangesetPublication::try_from(payload).map_err(|e| {
+    ChangesetPublication::try_from(cs_payload).map_err(|e| {
         format!("invalid authoritative changeset publication payload (event_id={event_id}): {e}")
     })
 }
@@ -1596,6 +1663,7 @@ mod tests {
                         event_id TEXT PRIMARY KEY,
                         event_type TEXT NOT NULL,
                         actor_id TEXT NOT NULL DEFAULT '',
+                        work_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
                         timestamp_ns INTEGER NOT NULL
                     )",
@@ -1608,6 +1676,7 @@ mod tests {
                         seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_type TEXT NOT NULL,
                         actor_id TEXT NOT NULL DEFAULT '',
+                        session_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
                         timestamp_ns INTEGER NOT NULL
                     )",
@@ -1633,16 +1702,16 @@ mod tests {
             .expect("serialize canonical payload");
             guard
                 .execute(
-                    "INSERT INTO ledger_events (event_id, event_type, actor_id, payload, timestamp_ns)
-                     VALUES (?1, 'changeset_published', ?2, ?3, ?4)",
-                    rusqlite::params!["a-legacy", "actor:legacy", legacy_payload, ts],
+                    "INSERT INTO ledger_events (event_id, event_type, actor_id, work_id, payload, timestamp_ns)
+                     VALUES (?1, 'changeset_published', ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["a-legacy", "actor:legacy", "work-legacy", legacy_payload, ts],
                 )
                 .expect("insert legacy changeset");
             guard
                 .execute(
-                    "INSERT INTO events (event_type, actor_id, payload, timestamp_ns)
-                     VALUES ('changeset_published', ?1, ?2, ?3)",
-                    rusqlite::params!["actor:canonical", canonical_payload, ts],
+                    "INSERT INTO events (event_type, actor_id, session_id, payload, timestamp_ns)
+                     VALUES ('changeset_published', ?1, ?2, ?3, ?4)",
+                    rusqlite::params!["actor:canonical", "work-canonical", canonical_payload, ts],
                 )
                 .expect("insert canonical changeset");
         }
@@ -1671,7 +1740,8 @@ mod tests {
 
         // Create a payload just over the limit
         let oversized = vec![0u8; MAX_PAYLOAD_BYTES + 1];
-        let result = parse_changeset_publication_payload(&oversized, 0, "test-event", None);
+        let result =
+            parse_changeset_publication_payload(&oversized, 0, "test-event", "actor:test", "W-1");
         assert!(result.is_err(), "oversized payload should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -1695,7 +1765,8 @@ mod tests {
         }))
         .expect("serialize payload");
         assert!(small_valid.len() <= MAX_PAYLOAD_BYTES);
-        let result = parse_changeset_publication_payload(&small_valid, 0, "test-event", None);
+        let result =
+            parse_changeset_publication_payload(&small_valid, 0, "test-event", "actor:test", "W-1");
         assert!(result.is_ok(), "valid payload should parse: {result:?}");
     }
 
@@ -1717,7 +1788,8 @@ mod tests {
             &payload,
             0,
             "test-event",
-            Some("actor:legitimate"),
+            "actor:legitimate",
+            "W-1",
         );
         assert!(result.is_err(), "mismatched actor_id should be rejected");
         let err = result.unwrap_err();
@@ -1742,7 +1814,7 @@ mod tests {
 
         // Verified matches payload — should succeed
         let result =
-            parse_changeset_publication_payload(&payload, 0, "test-event", Some("actor:real"));
+            parse_changeset_publication_payload(&payload, 0, "test-event", "actor:real", "W-1");
         assert!(
             result.is_ok(),
             "matching verified actor_id should succeed: {result:?}"
@@ -1773,6 +1845,7 @@ mod tests {
         };
         let intent = super::GateStartIntent {
             publication: publication.clone(),
+            observed_seq: 0,
         };
 
         // Enqueue and verify it exists.
@@ -1801,7 +1874,10 @@ mod tests {
         // guard dropped — subsequent store methods can acquire the lock.
 
         // A second enqueue for the same key must be treated as duplicate.
-        let intent2 = super::GateStartIntent { publication };
+        let intent2 = super::GateStartIntent {
+            publication,
+            observed_seq: 0,
+        };
         let inserted2 = store.enqueue_many(&[intent2]).expect("re-enqueue");
         assert_eq!(
             inserted2, 0,
@@ -1844,6 +1920,7 @@ mod tests {
         };
         let intent = super::GateStartIntent {
             publication: publication.clone(),
+            observed_seq: 0,
         };
 
         let inserted = store.enqueue_many(&[intent]).expect("enqueue");
@@ -1868,7 +1945,10 @@ mod tests {
         );
 
         // A second enqueue must be treated as duplicate.
-        let intent2 = super::GateStartIntent { publication };
+        let intent2 = super::GateStartIntent {
+            publication,
+            observed_seq: 0,
+        };
         let inserted2 = store.enqueue_many(&[intent2]).expect("re-enqueue");
         assert_eq!(
             inserted2, 0,

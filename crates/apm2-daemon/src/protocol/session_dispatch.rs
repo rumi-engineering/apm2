@@ -14799,6 +14799,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-DOWNGRADE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -14983,6 +14984,7 @@ mod tests {
             let governance_payload = serde_json::to_vec(
                 &crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 },
@@ -16865,6 +16867,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17049,6 +17052,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-TIMING".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17231,6 +17235,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17785,6 +17790,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -18519,6 +18525,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-001".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 1,
             })
@@ -18548,6 +18555,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-002".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 2,
             })
@@ -24735,6 +24743,7 @@ mod tests {
         ) {
             let payload = serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-emit".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash,
                 timestamp_ms: 1,
             })
@@ -27132,6 +27141,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash,
                     timestamp_ms: 1,
                 })

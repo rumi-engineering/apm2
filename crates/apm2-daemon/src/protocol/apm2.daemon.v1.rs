@@ -526,6 +526,34 @@ pub struct WorkStatusResponse {
     /// Structured dependency diagnostics for doctor/work status consumers.
     #[prost(message, repeated, tag = "10")]
     pub dependency_diagnostics: ::prost::alloc::vec::Vec<WorkDependencyDiagnostic>,
+    /// STEP_10: FAC identity chain surface.
+    /// Latest changeset digest (hex-encoded, 64 chars) from ChangeSetPublished.
+    #[prost(string, optional, tag = "11")]
+    pub latest_changeset_digest: ::core::option::Option<::prost::alloc::string::String>,
+    /// Event ID of the ChangeSetPublished event that established the latest
+    /// changeset identity binding.
+    #[prost(string, optional, tag = "12")]
+    pub changeset_published_event_id: ::core::option::Option<
+        ::prost::alloc::string::String,
+    >,
+    /// CAS hash (hex-encoded) of the ChangeSetBundleV1 for the latest changeset.
+    #[prost(string, optional, tag = "13")]
+    pub bundle_cas_hash: ::core::option::Option<::prost::alloc::string::String>,
+    /// Gate status for the latest changeset digest: "pending", "passed", "failed",
+    /// or "unknown" when no gate activity has been observed.
+    #[prost(string, optional, tag = "14")]
+    pub gate_status: ::core::option::Option<::prost::alloc::string::String>,
+    /// Review status for the latest changeset digest: "pending", "passed",
+    /// "blocked", or "unknown".
+    #[prost(string, optional, tag = "15")]
+    pub review_status: ::core::option::Option<::prost::alloc::string::String>,
+    /// Merge status for the latest changeset digest: "pending", "merged", or
+    /// "unknown".
+    #[prost(string, optional, tag = "16")]
+    pub merge_status: ::core::option::Option<::prost::alloc::string::String>,
+    /// Number of identity-chain defects recorded for this work item.
+    #[prost(uint32, tag = "17")]
+    pub identity_chain_defect_count: u32,
 }
 /// IPC-PRIV-019: WorkList (TCK-00415)
 /// List all work items known to projection authority.
