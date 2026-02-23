@@ -964,7 +964,22 @@ impl Reducer for WorkReducer {
     }
 }
 
+/// Maximum payload size (in bytes) for event payloads before JSON
+/// deserialization. Prevents denial-of-service via oversized `SQLite` payloads
+/// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
+const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
+
 fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
+    // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
+    // prevent DoS via oversized payloads exhausting daemon memory.
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        warn!(
+            payload_size = payload.len(),
+            max = MAX_PAYLOAD_BYTES,
+            "payload too large for digest extraction, skipping deserialization"
+        );
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
     find_work_id_and_digest(&value)
 }
@@ -1173,5 +1188,32 @@ pub mod helpers {
             event: Some(work_event::Event::PrAssociated(pr_associated)),
         };
         event.encode_to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_PAYLOAD_BYTES, extract_work_id_and_digest_from_payload};
+
+    #[test]
+    fn oversized_payload_returns_none_not_oom() {
+        let oversized = vec![0u8; MAX_PAYLOAD_BYTES + 1];
+        let result = extract_work_id_and_digest_from_payload(&oversized);
+        assert!(result.is_none(), "oversized payload must be rejected");
+    }
+
+    #[test]
+    fn payload_within_limit_is_parsed() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x42; 32]),
+        }))
+        .expect("serialize");
+        assert!(payload.len() <= MAX_PAYLOAD_BYTES);
+        let result = extract_work_id_and_digest_from_payload(&payload);
+        assert!(result.is_some(), "valid payload should parse");
+        let (work_id, digest) = result.unwrap();
+        assert_eq!(work_id, "W-1");
+        assert_eq!(digest, [0x42; 32]);
     }
 }

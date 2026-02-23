@@ -26,6 +26,11 @@ const GATE_START_CURSOR_KEY: i64 = 1;
 const GATE_START_PERSISTOR_SESSION_ID: &str = "gate-start-kernel";
 const GATE_START_PERSISTOR_ACTOR_ID: &str = "orchestrator:gate-start-kernel";
 
+/// Maximum payload size (in bytes) for `changeset_published` events before JSON
+/// deserialization. Prevents denial-of-service via oversized `SQLite` payloads
+/// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
+const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
+
 /// Kernel configuration for gate-start orchestration ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateStartKernelConfig {
@@ -342,6 +347,10 @@ impl SqliteGateStartLedgerReader {
             )
             .optional()
             .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
+        // MAJOR (Security): SELECT actor_id from ledger_events (verified
+        // envelope identity) for identity spoofing prevention. The canonical
+        // `events` table lacks an actor_id column, so we use NULL as a
+        // sentinel — the parser falls back to payload-only validation.
         let query = if table_exists.is_some() {
             // Ordering invariant:
             // - Every observed event has a deterministic `cursor_event_id` namespaced by
@@ -353,19 +362,21 @@ impl SqliteGateStartLedgerReader {
             // canonical rows sharing a timestamp could be skipped when each
             // table applied incompatible local ordering.
             if cursor_event_id.is_empty() {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns, verified_actor_id
                  FROM (
                    SELECT ('legacy:' || event_id) AS cursor_event_id,
                           event_id AS source_event_id,
                           payload,
-                          timestamp_ns
+                          timestamp_ns,
+                          actor_id AS verified_actor_id
                    FROM ledger_events
                    WHERE event_type = 'changeset_published'
                    UNION ALL
                    SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
-                          timestamp_ns
+                          timestamp_ns,
+                          NULL AS verified_actor_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -373,19 +384,21 @@ impl SqliteGateStartLedgerReader {
                  ORDER BY timestamp_ns ASC, cursor_event_id ASC
                  LIMIT ?2"
             } else {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns
+                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns, verified_actor_id
                  FROM (
                    SELECT ('legacy:' || event_id) AS cursor_event_id,
                           event_id AS source_event_id,
                           payload,
-                          timestamp_ns
+                          timestamp_ns,
+                          actor_id AS verified_actor_id
                    FROM ledger_events
                    WHERE event_type = 'changeset_published'
                    UNION ALL
                    SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
-                          timestamp_ns
+                          timestamp_ns,
+                          NULL AS verified_actor_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -398,7 +411,8 @@ impl SqliteGateStartLedgerReader {
             "SELECT ('legacy:' || event_id) AS cursor_event_id,
                     event_id AS source_event_id,
                     payload,
-                    timestamp_ns
+                    timestamp_ns,
+                    actor_id AS verified_actor_id
              FROM ledger_events
              WHERE event_type = 'changeset_published'
                AND timestamp_ns > ?1
@@ -408,7 +422,8 @@ impl SqliteGateStartLedgerReader {
             "SELECT ('legacy:' || event_id) AS cursor_event_id,
                     event_id AS source_event_id,
                     payload,
-                    timestamp_ns
+                    timestamp_ns,
+                    actor_id AS verified_actor_id
              FROM ledger_events
              WHERE event_type = 'changeset_published'
                AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND ('legacy:' || event_id) > ?2))
@@ -444,8 +459,17 @@ impl SqliteGateStartLedgerReader {
                 .map_err(|e| format!("failed to decode unified timestamp: {e}"))?;
             let timestamp_ns =
                 u64::try_from(ts_i64).map_err(|_| "unified timestamp is negative".to_string())?;
-            let publication =
-                parse_changeset_publication_payload(&payload, timestamp_ns, &source_event_id)?;
+            // MAJOR (Security): Extract verified actor_id from ledger row.
+            // NULL for canonical events table rows (no actor_id column).
+            let verified_actor_id: Option<String> = row
+                .get(4)
+                .map_err(|e| format!("failed to decode verified_actor_id: {e}"))?;
+            let publication = parse_changeset_publication_payload(
+                &payload,
+                timestamp_ns,
+                &source_event_id,
+                verified_actor_id.as_deref(),
+            )?;
             out.push(GateStartObservedEvent {
                 timestamp_ns,
                 cursor_event_id,
@@ -712,6 +736,14 @@ impl SqliteGateStartIntentStore {
         for row in rows {
             let publication_json =
                 row.map_err(|e| format!("failed to decode gate-start intent row: {e}"))?;
+            // Defense-in-depth: enforce size limit on stored intent payloads.
+            if publication_json.len() > MAX_PAYLOAD_BYTES {
+                return Err(format!(
+                    "gate-start intent payload too large: {} bytes > {} max",
+                    publication_json.len(),
+                    MAX_PAYLOAD_BYTES
+                ));
+            }
             let publication: ChangesetPublication = serde_json::from_str(&publication_json)
                 .map_err(|e| format!("failed to decode publication json: {e}"))?;
             intents.push(GateStartIntent { publication });
@@ -1107,7 +1139,17 @@ fn parse_changeset_publication_payload(
     payload: &[u8],
     fallback_timestamp_ns: u64,
     event_id: &str,
+    verified_actor_id: Option<&str>,
 ) -> Result<ChangesetPublication, String> {
+    // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
+    // prevent DoS via oversized payloads exhausting daemon memory.
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "changeset_published payload too large: {} bytes > {} max",
+            payload.len(),
+            MAX_PAYLOAD_BYTES
+        ));
+    }
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode changeset_published payload json: {e}"))?;
     let work_id = payload_json
@@ -1122,13 +1164,35 @@ fn parse_changeset_publication_payload(
         .get("cas_hash")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "changeset_published payload missing cas_hash".to_string())?;
-    let publisher_actor_id = payload_json
+    // MAJOR (Security): Use the verified actor_id from the ledger row (the
+    // signed envelope identity) as the authoritative publisher_actor_id.
+    // Cross-validate against the payload's actor_id when both are available
+    // to detect spoofing attempts.
+    let payload_actor_id = payload_json
         .get("actor_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
+        .filter(|s| !s.is_empty());
+
+    let publisher_actor_id = if let Some(verified) = verified_actor_id {
+        // Ledger row provides verified identity — use it as authoritative.
+        // Cross-validate: if the payload also declares an actor_id that
+        // differs from the verified one, reject as spoofing attempt.
+        if let Some(payload_aid) = payload_actor_id {
+            if payload_aid != verified {
+                return Err(format!(
+                    "changeset_published identity spoofing: payload actor_id '{payload_aid}' \
+                     does not match verified ledger actor_id '{verified}' (event_id={event_id})"
+                ));
+            }
+        }
+        verified
+    } else {
+        // No verified actor_id available (e.g. canonical events table lacks
+        // the column). Fall back to payload but require it to be present.
+        payload_actor_id.ok_or_else(|| {
             "changeset_published payload missing or empty actor_id (fail-closed)".to_string()
-        })?;
+        })?
+    };
     let published_at_ns = payload_json
         .get("timestamp_ns")
         .and_then(serde_json::Value::as_u64)
@@ -1227,6 +1291,7 @@ mod tests {
                     "CREATE TABLE ledger_events (
                         event_id TEXT PRIMARY KEY,
                         event_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
                         timestamp_ns INTEGER NOT NULL
                     )",
@@ -1263,9 +1328,9 @@ mod tests {
             .expect("serialize canonical payload");
             guard
                 .execute(
-                    "INSERT INTO ledger_events (event_id, event_type, payload, timestamp_ns)
-                     VALUES (?1, 'changeset_published', ?2, ?3)",
-                    rusqlite::params!["a-legacy", legacy_payload, ts],
+                    "INSERT INTO ledger_events (event_id, event_type, actor_id, payload, timestamp_ns)
+                     VALUES (?1, 'changeset_published', ?2, ?3, ?4)",
+                    rusqlite::params!["a-legacy", "actor:legacy", legacy_payload, ts],
                 )
                 .expect("insert legacy changeset");
             guard
@@ -1293,5 +1358,91 @@ mod tests {
             .expect("second poll should succeed");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].publication.work_id, "work-legacy");
+    }
+
+    #[test]
+    fn oversized_payload_rejected_before_deserialization() {
+        use super::{MAX_PAYLOAD_BYTES, parse_changeset_publication_payload};
+
+        // Create a payload just over the limit
+        let oversized = vec![0u8; MAX_PAYLOAD_BYTES + 1];
+        let result = parse_changeset_publication_payload(&oversized, 0, "test-event", None);
+        assert!(result.is_err(), "oversized payload should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("payload too large"),
+            "error should mention 'payload too large', got: {err}"
+        );
+    }
+
+    #[test]
+    fn payload_at_limit_is_accepted_if_valid_json() {
+        use super::{MAX_PAYLOAD_BYTES, parse_changeset_publication_payload};
+
+        // A valid payload within the size limit should parse (or fail on JSON
+        // validity, but not on size).
+        let small_valid = serde_json::to_vec(&json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x01; 32]),
+            "cas_hash": hex::encode([0x02; 32]),
+            "actor_id": "actor:test",
+            "timestamp_ns": 123_456_789_u64,
+        }))
+        .expect("serialize payload");
+        assert!(small_valid.len() <= MAX_PAYLOAD_BYTES);
+        let result = parse_changeset_publication_payload(&small_valid, 0, "test-event", None);
+        assert!(result.is_ok(), "valid payload should parse: {result:?}");
+    }
+
+    #[test]
+    fn identity_spoofing_rejected_when_payload_actor_mismatches_verified() {
+        use super::parse_changeset_publication_payload;
+
+        let payload = serde_json::to_vec(&json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x01; 32]),
+            "cas_hash": hex::encode([0x02; 32]),
+            "actor_id": "actor:attacker",
+            "timestamp_ns": 123_456_789_u64,
+        }))
+        .expect("serialize payload");
+
+        // Verified actor from ledger is different from payload actor
+        let result = parse_changeset_publication_payload(
+            &payload,
+            0,
+            "test-event",
+            Some("actor:legitimate"),
+        );
+        assert!(result.is_err(), "mismatched actor_id should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("identity spoofing"),
+            "error should mention 'identity spoofing', got: {err}"
+        );
+    }
+
+    #[test]
+    fn verified_actor_id_used_when_available() {
+        use super::parse_changeset_publication_payload;
+
+        let payload = serde_json::to_vec(&json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x01; 32]),
+            "cas_hash": hex::encode([0x02; 32]),
+            "actor_id": "actor:real",
+            "timestamp_ns": 123_456_789_u64,
+        }))
+        .expect("serialize payload");
+
+        // Verified matches payload — should succeed
+        let result =
+            parse_changeset_publication_payload(&payload, 0, "test-event", Some("actor:real"));
+        assert!(
+            result.is_ok(),
+            "matching verified actor_id should succeed: {result:?}"
+        );
+        let pub_result = result.unwrap();
+        assert_eq!(pub_result.publisher_actor_id, "actor:real");
     }
 }
