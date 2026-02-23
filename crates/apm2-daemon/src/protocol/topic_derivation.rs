@@ -28,12 +28,12 @@
 //! - [INV-TOPIC-005] Work graph event types MUST NOT start with `work.` prefix
 //!   to avoid WorkReducer decoding (TCK-00642)
 //!
-//! # Changeset->Work Mapping (TCK-00305)
+//! # Changeset->Work Mapping (TCK-00305, TCK-00672)
 //!
 //! Gate receipts reference a `changeset_digest` but need to route to topics
 //! containing `work_id`. The `ChangesetWorkIndex` maintains this mapping by
-//! observing `PolicyResolvedForChangeSet` events, which establish the
-//! relationship between changesets and work items.
+//! observing `ChangeSetPublished` events (primary, authoritative per CSID-002)
+//! and `PolicyResolvedForChangeSet` events (secondary, backward-compat).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -130,8 +130,10 @@ pub struct BridgeTopicHints {
 
 /// Index mapping changeset digests to work IDs.
 ///
-/// This index is populated by observing `PolicyResolvedForChangeSet` events
-/// and queried when deriving topics for `GateReceipt` events.
+/// This index is populated from `ChangeSetPublished` events (authoritative,
+/// primary source per CSID-002) and `PolicyResolvedForChangeSet` events
+/// (backward-compat secondary). Queried when deriving topics for `GateReceipt`
+/// events.
 ///
 /// # Thread Safety
 ///
@@ -201,10 +203,40 @@ impl ChangesetWorkIndex {
 
     /// Updates the index from a kernel event.
     ///
-    /// Only `PolicyResolvedForChangeSet` events update the index.
+    /// Both `ChangeSetPublished` and `PolicyResolvedForChangeSet` events
+    /// update the index. `ChangeSetPublished` is the primary, authoritative
+    /// source (CSID-002); `PolicyResolvedForChangeSet` is retained for
+    /// backward compatibility. If both signals exist and disagree on the
+    /// `(changeset_digest -> work_id)` mapping, the `ChangeSetPublished`
+    /// mapping takes precedence and a warning is logged.
     pub fn update_from_event(&self, event: &KernelEvent) {
-        if let Some(Payload::PolicyResolvedForChangeset(p)) = &event.payload {
-            self.insert(p.changeset_digest.clone(), p.work_id.clone());
+        match &event.payload {
+            Some(Payload::ChangesetPublished(p)) => {
+                // Authoritative mapping from ChangeSetPublished (CSID-002).
+                self.insert(p.changeset_digest.clone(), p.work_id.clone());
+            },
+            Some(Payload::PolicyResolvedForChangeset(p)) => {
+                // Backward-compat: only insert if no existing mapping or if
+                // the existing mapping agrees. Log warning on mismatch.
+                let existing = self.get(&p.changeset_digest);
+                match existing {
+                    Some(ref existing_wid) if existing_wid != &p.work_id => {
+                        warn!(
+                            changeset_digest = %hex::encode(&p.changeset_digest),
+                            changeset_published_work_id = %existing_wid,
+                            policy_resolved_work_id = %p.work_id,
+                            "ChangesetWorkIndex consistency violation: PolicyResolvedForChangeSet \
+                             claims different work_id than ChangeSetPublished (keeping authoritative)"
+                        );
+                        // Do NOT overwrite — ChangeSetPublished is
+                        // authoritative.
+                    },
+                    _ => {
+                        self.insert(p.changeset_digest.clone(), p.work_id.clone());
+                    },
+                }
+            },
+            _ => {},
         }
     }
 }
@@ -1109,6 +1141,107 @@ mod tests {
 
             assert_eq!(index.len(), 1);
             assert_eq!(index.get(&digest), Some("W-second".to_string()));
+        }
+
+        /// BLOCKER 3 fix: `ChangeSetPublished` populates the index directly.
+        #[test]
+        fn update_from_changeset_published_event() {
+            use apm2_core::events::ChangeSetPublished;
+
+            let index = ChangesetWorkIndex::new();
+            let digest = vec![0xAB; 32];
+
+            let event = KernelEvent {
+                payload: Some(Payload::ChangesetPublished(ChangeSetPublished {
+                    work_id: "W-published-test".to_string(),
+                    changeset_digest: digest.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
+            index.update_from_event(&event);
+            assert_eq!(
+                index.get(&digest),
+                Some("W-published-test".to_string()),
+                "ChangeSetPublished must populate the changeset->work index"
+            );
+        }
+
+        /// Consistency check: `PolicyResolved` cannot overwrite
+        /// `ChangeSetPublished` mapping with a different `work_id`.
+        #[test]
+        fn policy_resolved_does_not_overwrite_changeset_published() {
+            use apm2_core::events::ChangeSetPublished;
+
+            let index = ChangesetWorkIndex::new();
+            let digest = vec![0xCD; 32];
+
+            // ChangeSetPublished sets the authoritative mapping.
+            let cs_event = KernelEvent {
+                payload: Some(Payload::ChangesetPublished(ChangeSetPublished {
+                    work_id: "W-authoritative".to_string(),
+                    changeset_digest: digest.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            index.update_from_event(&cs_event);
+
+            // PolicyResolved tries to claim a different work_id.
+            let pr_event = KernelEvent {
+                payload: Some(Payload::PolicyResolvedForChangeset(
+                    PolicyResolvedForChangeSet {
+                        changeset_digest: digest.clone(),
+                        work_id: "W-imposter".to_string(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            index.update_from_event(&pr_event);
+
+            // ChangeSetPublished mapping must be retained (authoritative).
+            assert_eq!(
+                index.get(&digest),
+                Some("W-authoritative".to_string()),
+                "PolicyResolved must not overwrite ChangeSetPublished mapping"
+            );
+        }
+
+        /// When `PolicyResolved` and `ChangeSetPublished` agree, the mapping
+        /// should still be correct.
+        #[test]
+        fn policy_resolved_agrees_with_changeset_published() {
+            use apm2_core::events::ChangeSetPublished;
+
+            let index = ChangesetWorkIndex::new();
+            let digest = vec![0xEF; 32];
+
+            let cs_event = KernelEvent {
+                payload: Some(Payload::ChangesetPublished(ChangeSetPublished {
+                    work_id: "W-same".to_string(),
+                    changeset_digest: digest.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            index.update_from_event(&cs_event);
+
+            let pr_event = KernelEvent {
+                payload: Some(Payload::PolicyResolvedForChangeset(
+                    PolicyResolvedForChangeSet {
+                        changeset_digest: digest.clone(),
+                        work_id: "W-same".to_string(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            index.update_from_event(&pr_event);
+
+            assert_eq!(index.get(&digest), Some("W-same".to_string()));
+            assert_eq!(index.len(), 1);
         }
     }
 

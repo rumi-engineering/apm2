@@ -74,10 +74,11 @@ pub const MAX_WORK_ID_LENGTH: usize = 4096;
 
 /// Maximum number of entries in the idempotency key store (Security MAJOR 1).
 ///
-/// Bounds the `seen_idempotency_keys` set to prevent unbounded memory growth
-/// over the process lifetime. When this limit is reached, the set is cleared
-/// (the active orchestrations map serves as the primary duplicate guard;
-/// the seen-keys set provides secondary coverage for the post-removal window).
+/// Bounds the `seen_idempotency_keys` deque to prevent unbounded memory growth
+/// over the process lifetime. When this limit is reached, the oldest half
+/// is evicted (the active orchestrations map serves as the primary duplicate
+/// guard; the seen-keys set provides secondary coverage for the post-removal
+/// window).
 ///
 /// 10 * `MAX_CONCURRENT_ORCHESTRATIONS` provides ample headroom for completed
 /// orchestrations that have been removed but whose keys should still be
@@ -694,7 +695,9 @@ pub struct GateOrchestrator {
     ///
     /// Tracks idempotency keys for both active and completed orchestrations
     /// to prevent replayed termination events from generating new lifecycles.
-    seen_idempotency_keys: RwLock<std::collections::HashSet<IdempotencyKey>>,
+    /// Ordered idempotency keys — `VecDeque` preserves insertion order so
+    /// that eviction removes the oldest half (not all entries).
+    seen_idempotency_keys: RwLock<std::collections::VecDeque<IdempotencyKey>>,
     /// Gate timeout as a `Duration` for monotonic comparison (Security BLOCKER
     /// 1).
     gate_timeout_duration: std::time::Duration,
@@ -720,7 +723,7 @@ impl GateOrchestrator {
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock: Arc::new(SystemClock),
-            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            seen_idempotency_keys: RwLock::new(std::collections::VecDeque::new()),
             gate_timeout_duration,
             cas: None,
         }
@@ -742,7 +745,7 @@ impl GateOrchestrator {
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock,
-            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            seen_idempotency_keys: RwLock::new(std::collections::VecDeque::new()),
             gate_timeout_duration,
             cas: None,
         }
@@ -997,7 +1000,7 @@ impl GateOrchestrator {
             let mut orchestrations = self.orchestrations.write().await;
 
             // Replay check: identical (work_id, changeset_digest) is a no-op.
-            if seen_keys.contains(&idempotency_key) {
+            if seen_keys.iter().any(|k| k == &idempotency_key) {
                 debug!(
                     work_id = %publication.work_id,
                     changeset_digest = %hex::encode(publication.changeset_digest),
@@ -1006,21 +1009,18 @@ impl GateOrchestrator {
                 return Ok((Vec::new(), HashMap::new(), Vec::new()));
             }
 
-            // Capacity check.
-            if orchestrations.len() >= self.config.max_concurrent_orchestrations {
-                return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
-                    current: orchestrations.len(),
-                    max: self.config.max_concurrent_orchestrations,
-                });
-            }
-
-            // Code-Quality MAJOR: Enforce one active orchestration per
-            // work_id (latest-wins policy per RFC-0032). When a new
+            // Step 1: Enforce one active orchestration per work_id
+            // (latest-wins policy per RFC-0032). When a new
             // (work_id, digest2) arrives while (work_id, digest1) is
             // active, the old orchestration is superseded/removed so
             // that find_by_work_id helpers always resolve to the
             // correct entry. Starting the same (work_id, digest)
             // twice is denied as a duplicate.
+            //
+            // CRITICAL: The supersede check MUST happen BEFORE the capacity
+            // check. Otherwise, at capacity=1, starting (work, digest2)
+            // while (work, digest1) is active returns MaxOrchestrationsExceeded
+            // instead of superseding (INV-GT14 latest-wins violation).
             let composite_key = (publication.work_id.clone(), publication.changeset_digest);
             if orchestrations.contains_key(&composite_key) {
                 return Err(GateOrchestratorError::DuplicateOrchestration {
@@ -1044,6 +1044,14 @@ impl GateOrchestrator {
                 orchestrations.remove(&key);
             }
 
+            // Step 2: Capacity check (after supersede, so freed slot is counted).
+            if orchestrations.len() >= self.config.max_concurrent_orchestrations {
+                return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
+                    current: orchestrations.len(),
+                    max: self.config.max_concurrent_orchestrations,
+                });
+            }
+
             orchestrations.insert(
                 composite_key,
                 OrchestrationEntry {
@@ -1065,14 +1073,20 @@ impl GateOrchestrator {
             // map is the authoritative duplicate guard; the seen-keys set is
             // a secondary defence that covers the window after removal).
             if seen_keys.len() >= MAX_IDEMPOTENCY_KEYS {
+                // Evict the oldest half to preserve recent replay protection
+                // while bounding memory growth. This is an improvement over
+                // clearing all entries which would remove replay protection
+                // for recently-completed orchestrations.
+                let evict_count = seen_keys.len() / 2;
                 warn!(
                     current = seen_keys.len(),
                     max = MAX_IDEMPOTENCY_KEYS,
-                    "Idempotency key store at capacity, evicting oldest entries"
+                    evicting = evict_count,
+                    "Idempotency key store at capacity, evicting oldest half"
                 );
-                seen_keys.clear();
+                seen_keys.drain(..evict_count);
             }
-            seen_keys.insert(idempotency_key);
+            seen_keys.push_back(idempotency_key);
         }
 
         // Step 4 (BLOCKER 3 FIX): Stage events locally per-invocation and

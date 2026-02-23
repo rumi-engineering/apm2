@@ -21,22 +21,20 @@ fn make_emitter(conn: Arc<Mutex<Connection>>, key_seed: u8) -> SqliteLedgerEvent
     SqliteLedgerEventEmitter::new(conn, signing_key)
 }
 
-fn create_event(
-    event_type: &str,
-    actor_id: &str,
-    payload: Vec<u8>,
-    timestamp_ns: u64,
-) -> EventRecord {
-    EventRecord::with_timestamp(
-        event_type,
-        "session-hef-fac-vnext",
-        actor_id,
-        payload,
-        timestamp_ns,
-    )
-}
-
-fn apply_digest_event(
+/// Emits a digest-bound event through the ledger emitter (canonical persistence
+/// path), then reads the persisted row back and applies it to the reducer.
+///
+/// This replaces the previous `apply_digest_event` helper that bypassed
+/// canonical ledger storage by constructing synthetic `EventRecord` inputs
+/// and calling `reducer.apply(...)` directly. The new implementation
+/// exercises the full daemon event path:
+///   emit -> ledger persist -> read -> reduce
+///
+/// This is required by CSID-005 (end-to-end integration coverage).
+#[allow(clippy::too_many_arguments)]
+fn emit_and_apply_digest_event(
+    emitter: &SqliteLedgerEventEmitter,
+    conn: &Arc<Mutex<Connection>>,
     reducer: &mut WorkReducer,
     ctx: &ReducerContext,
     event_type: &str,
@@ -50,17 +48,40 @@ fn apply_digest_event(
         "changeset_digest": hex::encode(digest),
     }))
     .expect("serialize digest event payload");
-    // Use work_id as session_id so envelope binding matches payload (CSID-004).
+    // Emit through canonical ledger path (persist to SQLite).
+    emitter
+        .emit_session_event(
+            work_id,
+            event_type,
+            &payload,
+            "actor:fac-kernel",
+            timestamp_ns,
+        )
+        .expect("emit digest-bound event through ledger");
+
+    // Read the persisted event back from the ledger and apply to reducer.
+    // This proves the full persistence -> replay path.
+    let guard = conn.lock().expect("lock sqlite for read-back");
+    let (read_payload, read_ts, read_actor): (Vec<u8>, i64, String) = guard
+        .query_row(
+            "SELECT payload, timestamp_ns, actor_id FROM ledger_events
+             WHERE event_type = ?1
+             ORDER BY rowid DESC LIMIT 1",
+            rusqlite::params![event_type],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read persisted event from ledger");
+    drop(guard);
     let record = EventRecord::with_timestamp(
         event_type,
         work_id,
-        "actor:fac-kernel",
-        payload,
-        timestamp_ns,
+        &read_actor,
+        read_payload,
+        u64::try_from(read_ts).expect("timestamp positive"),
     );
     reducer
         .apply(&record, ctx)
-        .expect("apply digest-bound event");
+        .expect("apply ledger-persisted digest-bound event");
 }
 
 struct TransitionSpec<'a> {
@@ -71,7 +92,11 @@ struct TransitionSpec<'a> {
     actor_id: &'a str,
 }
 
-fn apply_work_transition(
+/// Emits a work.transitioned event through the ledger, then reads back and
+/// applies to the reducer (CSID-005 canonical path).
+fn emit_and_apply_work_transition(
+    emitter: &SqliteLedgerEventEmitter,
+    conn: &Arc<Mutex<Connection>>,
     reducer: &mut WorkReducer,
     ctx: &ReducerContext,
     work_id: &str,
@@ -85,24 +110,87 @@ fn apply_work_transition(
         spec.rationale_code,
         spec.previous_transition_count,
     );
-    reducer
-        .apply(
-            &create_event("work.transitioned", spec.actor_id, payload, timestamp_ns),
-            ctx,
+    // Persist through canonical ledger path.
+    emitter
+        .emit_session_event(
+            work_id,
+            "work.transitioned",
+            &payload,
+            spec.actor_id,
+            timestamp_ns,
         )
-        .expect("apply work.transitioned");
+        .expect("emit work.transitioned through ledger");
+
+    // Read back and apply.
+    let guard = conn.lock().expect("lock sqlite for transition read-back");
+    let (read_payload, read_ts, read_actor): (Vec<u8>, i64, String) = guard
+        .query_row(
+            "SELECT payload, timestamp_ns, actor_id FROM ledger_events
+             WHERE event_type = 'work.transitioned'
+             ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read persisted work.transitioned from ledger");
+    drop(guard);
+    let record = EventRecord::with_timestamp(
+        "work.transitioned",
+        work_id,
+        &read_actor,
+        read_payload,
+        u64::try_from(read_ts).expect("timestamp positive"),
+    );
+    reducer
+        .apply(&record, ctx)
+        .expect("apply ledger-persisted work.transitioned");
 }
 
-fn setup_ci_pending(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str, base_ts: u64) {
+fn setup_ci_pending(
+    emitter: &SqliteLedgerEventEmitter,
+    conn: &Arc<Mutex<Connection>>,
+    reducer: &mut WorkReducer,
+    ctx: &ReducerContext,
+    work_id: &str,
+    base_ts: u64,
+) {
     let opened = work_helpers::work_opened_payload(work_id, "TICKET", vec![1], vec![], vec![]);
-    reducer
-        .apply(
-            &create_event("work.opened", "actor:implementer", opened, base_ts),
-            ctx,
+    // Emit work.opened through the canonical ledger path.
+    emitter
+        .emit_session_event(
+            work_id,
+            "work.opened",
+            &opened,
+            "actor:implementer",
+            base_ts,
         )
-        .expect("apply work.opened");
+        .expect("emit work.opened through ledger");
+    {
+        let guard = conn.lock().expect("lock sqlite for work.opened read-back");
+        let (read_payload, read_ts, read_actor): (Vec<u8>, i64, String) = guard
+            .query_row(
+                "SELECT payload, timestamp_ns, actor_id FROM ledger_events
+                 WHERE event_type = 'work.opened'
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read persisted work.opened from ledger");
+        drop(guard);
+        let record = EventRecord::with_timestamp(
+            "work.opened",
+            work_id,
+            &read_actor,
+            read_payload,
+            u64::try_from(read_ts).expect("timestamp positive"),
+        );
+        reducer
+            .apply(&record, ctx)
+            .expect("apply ledger-persisted work.opened");
+    }
 
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        emitter,
+        conn,
         reducer,
         ctx,
         work_id,
@@ -115,7 +203,9 @@ fn setup_ci_pending(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &s
         },
         base_ts + 1,
     );
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        emitter,
+        conn,
         reducer,
         ctx,
         work_id,
@@ -128,7 +218,9 @@ fn setup_ci_pending(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &s
         },
         base_ts + 2,
     );
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        emitter,
+        conn,
         reducer,
         ctx,
         work_id,
@@ -216,10 +308,19 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
 
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
-    setup_ci_pending(&mut reducer, &ctx, work_id, 2_000_000_000);
+    setup_ci_pending(
+        &publish_emitter,
+        &sqlite,
+        &mut reducer,
+        &ctx,
+        work_id,
+        2_000_000_000,
+    );
 
     // STEP_06 assertion 2: work_latest_changeset(W) == D
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "changeset_published",
@@ -238,7 +339,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // STEP_06 assertion 4: gate receipts have changeset_digest == D
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "gate.receipt_collected",
@@ -258,7 +361,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
 
     // STEP_06 assertion 5: work transitions to ReadyForReview only from
     // receipts bound to D
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         work_id,
@@ -282,7 +387,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Review start transition (ReadyForReview -> Review)
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         work_id,
@@ -306,7 +413,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // STEP_06 assertion 6: review receipt has changeset_digest == D
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "review_receipt_recorded",
@@ -325,7 +434,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // STEP_06 assertion 7: merge receipt has changeset_digest == D
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "merge_receipt_recorded",
@@ -344,19 +455,47 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Work completion with latest-digest merge admission
-    let completed = work_helpers::work_completed_payload(
-        work_id,
-        vec![1],
-        vec!["evidence-1".to_string()],
-        "gate-receipt-quality-1",
-        "merge-receipt-sha111",
-    );
-    reducer
-        .apply(
-            &create_event("work.completed", "actor:merge", completed, 2_000_000_700),
-            &ctx,
-        )
-        .expect("apply work.completed");
+    {
+        let completed = work_helpers::work_completed_payload(
+            work_id,
+            vec![1],
+            vec!["evidence-1".to_string()],
+            "gate-receipt-quality-1",
+            "merge-receipt-sha111",
+        );
+        publish_emitter
+            .emit_session_event(
+                work_id,
+                "work.completed",
+                &completed,
+                "actor:merge",
+                2_000_000_700,
+            )
+            .expect("emit work.completed through ledger");
+        let guard = sqlite
+            .lock()
+            .expect("lock sqlite for work.completed read-back");
+        let (read_payload, read_ts, read_actor): (Vec<u8>, i64, String) = guard
+            .query_row(
+                "SELECT payload, timestamp_ns, actor_id FROM ledger_events
+                 WHERE event_type = 'work.completed'
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read persisted work.completed from ledger");
+        drop(guard);
+        let record = EventRecord::with_timestamp(
+            "work.completed",
+            work_id,
+            &read_actor,
+            read_payload,
+            u64::try_from(read_ts).expect("timestamp positive"),
+        );
+        reducer
+            .apply(&record, &ctx)
+            .expect("apply ledger-persisted work.completed");
+    }
     assert_eq!(
         reducer
             .state()
@@ -375,10 +514,19 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
 
     let stale_work_id = "W-hef-fac-vnext-csid-e2e-stale";
     let newer_digest = [0x66; 32];
-    setup_ci_pending(&mut reducer, &ctx, stale_work_id, 3_000_000_000);
+    setup_ci_pending(
+        &publish_emitter,
+        &sqlite,
+        &mut reducer,
+        &ctx,
+        stale_work_id,
+        3_000_000_000,
+    );
 
     // Publish D for stale_work_id, then supersede with D2
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "changeset_published",
@@ -386,7 +534,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         published_digest,
         3_000_000_100,
     );
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "changeset_published",
@@ -405,7 +555,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Stale gate receipt for D must NOT be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "gate.receipt_collected",
@@ -420,7 +572,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Stale CI transition from D must NOT advance state
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         stale_work_id,
@@ -444,7 +598,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // D2 gate receipt SHOULD be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "gate.receipt_collected",
@@ -463,7 +619,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // D2 CI transition succeeds
-    apply_work_transition(
+    emit_and_apply_work_transition(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         stale_work_id,
@@ -487,7 +645,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Stale review receipt for D must NOT be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "review_receipt_recorded",
@@ -505,7 +665,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // D2 review receipt must be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "review_receipt_recorded",
@@ -524,7 +686,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // Stale merge receipt for D must NOT be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "merge_receipt_recorded",
@@ -542,7 +706,9 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
     );
 
     // D2 merge receipt must be admitted
-    apply_digest_event(
+    emit_and_apply_digest_event(
+        &publish_emitter,
+        &sqlite,
         &mut reducer,
         &ctx,
         "merge_receipt_recorded",
