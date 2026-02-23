@@ -109,7 +109,7 @@ pub struct Work {
 - [INV-0107] `abort_reason` is populated only on abort
 - [INV-0113] `gate_receipt_id` MUST NOT contain merge receipt identifiers (values starting with `merge-receipt-`); use `merge_receipt_id` instead (fail-closed gate)
 - [INV-0114] `merge_receipt_id`, when non-empty, MUST start with `merge-receipt-` (positive allowlist); distinct from `gate_receipt_id`. Together with INV-0113 this enforces bidirectional domain separation at the reducer boundary
-- [INV-0111] `pr_number` is set only via `WorkPrAssociated` event from `InProgress` state
+- [INV-0111] `pr_number` is set only via `WorkPrAssociated` event from pre-CI states (`Claimed` or `InProgress`)
 - [INV-0112] `commit_sha` is set together with `pr_number` for CI verification
 
 **Contracts:**
@@ -394,12 +394,12 @@ let good = helpers::work_completed_payload(
 
 PR association is restricted to prevent CI gating bypass:
 
-1. **State Restriction**: PR association is only allowed from `InProgress` state. This prevents agents from bypassing CI gating by associating a work item with a PR that has already passed CI while in `CiPending` or `Blocked` state.
+1. **State Restriction**: PR association is only allowed from `Claimed` or `InProgress` state. This permits manual/operator-supervised push flows before explicit `InProgress` transition while still preventing CI gating bypass from `CiPending`, `Blocked`, and terminal states.
 
 ```rust
-// WorkError::PrAssociationNotAllowed - work must be in InProgress
+// WorkError::PrAssociationNotAllowed - work must be in Claimed/InProgress
 let bad_pr = helpers::work_pr_associated_payload("WORK-001", 42, "sha123");
-// Fails if work is in CiPending, Blocked, or any other non-InProgress state
+// Fails if work is in CiPending, Blocked, or terminal states
 ```
 
 2. **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be associated with multiple active work items. This prevents CI result confusion where CI events could incorrectly transition unrelated work.

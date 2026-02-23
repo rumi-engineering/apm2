@@ -2230,7 +2230,7 @@ fn setup_ci_pending_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_i
 // =============================================================================
 
 #[test]
-fn test_pr_association_only_allowed_from_in_progress() {
+fn test_pr_association_allowed_from_claimed_or_in_progress() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
@@ -2254,10 +2254,29 @@ fn test_pr_association_only_allowed_from_in_progress() {
         Err(WorkError::PrAssociationNotAllowed { .. })
     ));
 
-    // Verify work is still in Open state with no PR
+    // Transition to Claimed and verify PR association succeeds pre-CI.
+    let claimed_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", claimed_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let claimed_pr_payload = helpers::work_pr_associated_payload("work-1", 42, "sha123");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", claimed_pr_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify work is in Claimed with PR metadata bound.
     let work = reducer.state().get("work-1").unwrap();
-    assert_eq!(work.state, WorkState::Open);
-    assert_eq!(work.pr_number, None);
+    assert_eq!(work.state, WorkState::Claimed);
+    assert_eq!(work.pr_number, Some(42));
+    assert_eq!(work.commit_sha, Some("sha123".to_string()));
 }
 
 #[test]

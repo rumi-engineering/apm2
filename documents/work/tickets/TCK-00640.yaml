@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00640
     title: 'RFC-0032 Phase 2: extend `apm2 fac push` to bind work_id + emit terminal contract markers'
-    status: OPEN
+    status: IN_PROGRESS
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032
@@ -26,24 +26,29 @@ ticket_meta:
       reason: Needs ticket-alias -> work_id resolution
   scope:
     in_scope:
-    - Add `--work-id <W-...>` to `apm2 fac push` (and/or `--ticket-alias` resolution) and ensure work_id is bound through PublishChangeSet
-    - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE), PublishWorkContextEntry(IMPLEMENTER_TERMINAL)'
-    - 'Enforce hard terminal contract: HANDOFF_NOTE and IMPLEMENTER_TERMINAL must exist per session attempt'
-    - Do not emit any `work.transitioned` events from CLI; CLI only publishes changeset + context markers
+    - Resolve `work_id` deterministically for `apm2 fac push` via priority order: explicit `--work-id`, branch ticket alias (`TCK-*`), then daemon-side claim/projection recovery
+    - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE optional), PublishWorkContextEntry(IMPLEMENTER_TERMINAL required)'
+    - Enforce terminal contract from ledger+CAS truth: IMPLEMENTER_TERMINAL is mandatory per push attempt; HANDOFF_NOTE is optional
+    - Keep CLI non-authoritative for lifecycle transitions (no direct `work.transitioned` emission)
+    - Remove legacy work-event envelope decode branches from projection rebuild; enforce session-envelope contract (`event_type`, `session_id`, `actor_id`, `payload`) while allowing extension fields
+    - Scope lease->work fallback to push publication paths only (RecordWorkPrAssociation + terminal/handoff context entry kinds) to preserve revocation semantics elsewhere
+    - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
     out_of_scope:
     - Daemon-side CI processor transitions (separate ticket)
   plan:
     steps:
-    - Update CLI args in `crates/apm2-cli/src/commands/fac_review/push.rs` to accept work-id / ticket-alias
-    - Thread resolved work_id into existing PublishChangeSet request path
-    - Call RecordWorkPrAssociation and PublishWorkContextEntry RPCs; ensure retries are safe (idempotent dedupe keys)
-    - 'Add CLI-level validation: require handoff note text and ensure dedupe_key=session_id is used'
-    - 'Add integration test: run fac push twice and verify no duplicate context entries/evidence events'
+    - Keep CLI argument surface for explicit work binding while defaulting to branch alias/work-claim resolution for manual operator flow
+    - Thread resolved `work_id` through PublishChangeSet, PR association, and context publication calls
+    - Ensure idempotent retries with stable dedupe keys and scoped lease->work recovery behavior
+    - Make `--handoff-note` optional; always emit IMPLEMENTER_TERMINAL marker
+    - Harden projection rebuild decoder to current session envelope contract and remove historical raw/payload-only branches
+    - Add/maintain regression tests for idempotent push replay and lease-mapping recovery in publication closures
   definition_of_done:
     evidence_ids: []
     criteria:
-    - '`apm2 fac push` binds changeset publication to a specific work_id and records required terminal markers.'
-    - The terminal contract is enforceable from ledger+CAS alone (no local files required for truth).
+    - '`apm2 fac push` binds changeset publication to an authoritative `work_id` and records required terminal markers.'
+    - Terminal closure semantics are enforceable from ledger+CAS alone (IMPLEMENTER_TERMINAL required, HANDOFF_NOTE optional).
+    - Projection-backed work identity recovery no longer fails on extension fields in current session envelopes.
     - CLI does not emit work transitions; CI/system actors remain the only sources of CI transitions.
   notes:
     verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.
