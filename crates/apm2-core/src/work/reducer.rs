@@ -1,6 +1,6 @@
 //! Work lifecycle reducer implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -162,6 +162,15 @@ impl WorkReducerState {
     }
 }
 
+/// Maximum number of identity-chain defect records retained in memory.
+///
+/// When the buffer is at capacity, the oldest entry is evicted before
+/// appending a new one.  This prevents unbounded memory growth when
+/// `drain_identity_chain_defects()` is not called (or called
+/// infrequently) while a flood of stale-digest / cross-work injection
+/// events is processed.
+pub const MAX_IDENTITY_CHAIN_DEFECTS: usize = 1_000;
+
 /// Reducer for work lifecycle events.
 ///
 /// Processes work events and maintains the state of all work items.
@@ -183,7 +192,10 @@ pub struct WorkReducer {
     ///
     /// Accumulated during event processing. Consumers should drain this
     /// after each reduce cycle to persist defects via the ledger.
-    identity_chain_defects: Vec<DefectRecorded>,
+    ///
+    /// Bounded by [`MAX_IDENTITY_CHAIN_DEFECTS`]; oldest entries are
+    /// evicted when at capacity (ring-buffer semantics via `VecDeque`).
+    identity_chain_defects: VecDeque<DefectRecorded>,
 }
 
 impl WorkReducer {
@@ -200,13 +212,25 @@ impl WorkReducer {
     /// Consumers should call this after each reduce cycle to retrieve and
     /// persist defect records via the ledger.
     pub fn drain_identity_chain_defects(&mut self) -> Vec<DefectRecorded> {
-        std::mem::take(&mut self.identity_chain_defects)
+        std::mem::take(&mut self.identity_chain_defects).into()
     }
 
     /// Returns the number of pending identity-chain defects.
     #[must_use]
     pub fn identity_chain_defect_count(&self) -> usize {
         self.identity_chain_defects.len()
+    }
+
+    /// Appends a defect record, evicting the oldest entry when the
+    /// buffer is at [`MAX_IDENTITY_CHAIN_DEFECTS`] capacity.
+    ///
+    /// O(1) amortised: `VecDeque::pop_front` and `push_back` are both
+    /// O(1).
+    fn push_defect(&mut self, defect: DefectRecorded) {
+        if self.identity_chain_defects.len() >= MAX_IDENTITY_CHAIN_DEFECTS {
+            self.identity_chain_defects.pop_front();
+        }
+        self.identity_chain_defects.push_back(defect);
     }
 
     /// Canonical merge receipt event types (explicit allowlist).
@@ -378,13 +402,10 @@ impl WorkReducer {
             "STALE_DIGEST:{stage}:{event_type}:{work_id}:incoming={},latest={latest}",
             hex::encode(incoming_digest),
         );
-        let mut cas_preimage = Vec::new();
-        cas_preimage.extend_from_slice(work_id.as_bytes());
-        cas_preimage.extend_from_slice(&incoming_digest);
-        cas_preimage.extend_from_slice(reason.as_bytes());
-        let cas_hash = *blake3::hash(&cas_preimage).as_bytes();
+        let cas_hash =
+            hash_defect_preimage(work_id.as_bytes(), &incoming_digest, reason.as_bytes());
 
-        self.identity_chain_defects.push(DefectRecorded {
+        self.push_defect(DefectRecorded {
             defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
             defect_type: "IDENTITY_CHAIN_STALE_DIGEST".to_string(),
             cas_hash: cas_hash.to_vec(),
@@ -407,13 +428,13 @@ impl WorkReducer {
         let reason = format!(
             "CROSS_WORK_INJECTION:{event_type}:envelope={envelope_work_id},payload={payload_work_id}",
         );
-        let mut cas_preimage = Vec::new();
-        cas_preimage.extend_from_slice(envelope_work_id.as_bytes());
-        cas_preimage.extend_from_slice(payload_work_id.as_bytes());
-        cas_preimage.extend_from_slice(reason.as_bytes());
-        let cas_hash = *blake3::hash(&cas_preimage).as_bytes();
+        let cas_hash = hash_defect_preimage(
+            envelope_work_id.as_bytes(),
+            payload_work_id.as_bytes(),
+            reason.as_bytes(),
+        );
 
-        self.identity_chain_defects.push(DefectRecorded {
+        self.push_defect(DefectRecorded {
             defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
             defect_type: "IDENTITY_CHAIN_CROSS_WORK_INJECTION".to_string(),
             cas_hash: cas_hash.to_vec(),
@@ -1044,6 +1065,34 @@ impl Reducer for WorkReducer {
     }
 }
 
+/// Computes a canonical BLAKE3 hash over length-prefixed variable fields.
+///
+/// Each field is preceded by its `u32` little-endian length, preventing
+/// byte-shifting collisions that arise from raw concatenation of
+/// variable-length inputs (e.g., `"ab" || "cd"` vs `"a" || "bcd"`).
+///
+/// This function is used for defect CAS hashes in both
+/// `WorkReducer::record_stale_digest_defect` and
+/// `WorkReducer::record_cross_work_injection_defect`, and is also
+/// available for use by gate-start defect builders.
+#[must_use]
+pub fn hash_defect_preimage(field_a: &[u8], field_b: &[u8], field_c: &[u8]) -> [u8; 32] {
+    /// Writes a `u32` little-endian length prefix for `data`, saturating at
+    /// `u32::MAX` for fields that exceed 4 GiB (which should never occur for
+    /// defect preimages, but we never truncate silently).
+    fn write_length_prefixed(hasher: &mut blake3::Hasher, data: &[u8]) {
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(data);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    write_length_prefixed(&mut hasher, field_a);
+    write_length_prefixed(&mut hasher, field_b);
+    write_length_prefixed(&mut hasher, field_c);
+    *hasher.finalize().as_bytes()
+}
+
 /// Maximum payload size (in bytes) for event payloads before JSON
 /// deserialization. Prevents denial-of-service via oversized `SQLite` payloads
 /// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
@@ -1273,7 +1322,11 @@ pub mod helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PAYLOAD_BYTES, extract_work_id_and_digest_from_payload};
+    use super::{
+        MAX_IDENTITY_CHAIN_DEFECTS, MAX_PAYLOAD_BYTES, WorkReducer,
+        extract_work_id_and_digest_from_payload, hash_defect_preimage,
+    };
+    use crate::events::{DefectRecorded, DefectSource};
 
     #[test]
     fn oversized_payload_returns_none_not_oom() {
@@ -1295,5 +1348,87 @@ mod tests {
         let (work_id, digest) = result.unwrap();
         assert_eq!(work_id, "W-1");
         assert_eq!(digest, [0x42; 32]);
+    }
+
+    // ---- BLOCKER fix: bounded identity_chain_defects ----
+
+    #[test]
+    fn identity_chain_defects_bounded_at_max() {
+        let mut reducer = WorkReducer::new();
+        let total = MAX_IDENTITY_CHAIN_DEFECTS + 5;
+
+        #[allow(clippy::cast_possible_truncation)]
+        for i in 0..total {
+            let defect = DefectRecorded {
+                defect_id: format!("DEF-{i}"),
+                defect_type: "TEST".to_string(),
+                cas_hash: vec![(i & 0xFF) as u8],
+                source: DefectSource::ProjectionTamper as i32,
+                work_id: "W-1".to_string(),
+                severity: "S2".to_string(),
+                detected_at: i as u64,
+                time_envelope_ref: None,
+            };
+            reducer.push_defect(defect);
+        }
+
+        assert_eq!(
+            reducer.identity_chain_defect_count(),
+            MAX_IDENTITY_CHAIN_DEFECTS,
+            "defect buffer must not exceed MAX_IDENTITY_CHAIN_DEFECTS"
+        );
+
+        // Oldest entries (0..5) were evicted; first remaining is DEF-5
+        let drained = reducer.drain_identity_chain_defects();
+        assert_eq!(drained.len(), MAX_IDENTITY_CHAIN_DEFECTS);
+        assert_eq!(drained[0].defect_id, "DEF-5");
+        assert_eq!(
+            drained[MAX_IDENTITY_CHAIN_DEFECTS - 1].defect_id,
+            format!("DEF-{}", total - 1)
+        );
+    }
+
+    #[test]
+    fn drain_returns_vec_and_clears_buffer() {
+        let mut reducer = WorkReducer::new();
+        reducer.push_defect(DefectRecorded {
+            defect_id: "DEF-0".to_string(),
+            defect_type: "TEST".to_string(),
+            cas_hash: vec![0],
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: "W-1".to_string(),
+            severity: "S2".to_string(),
+            detected_at: 0,
+            time_envelope_ref: None,
+        });
+        let drained = reducer.drain_identity_chain_defects();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(reducer.identity_chain_defect_count(), 0);
+    }
+
+    // ---- MAJOR fix: canonical length-prefixed hashing ----
+
+    #[test]
+    fn hash_defect_preimage_is_collision_resistant() {
+        // Without length prefixes, "ab" || "cd" || "" == "a" || "bcd" || ""
+        // With length prefixes these MUST differ.
+        let h1 = hash_defect_preimage(b"ab", b"cd", b"");
+        let h2 = hash_defect_preimage(b"a", b"bcd", b"");
+        assert_ne!(
+            h1, h2,
+            "length-prefixed hashing must prevent byte-shifting collisions"
+        );
+
+        // Also verify a second boundary shift.
+        let h3 = hash_defect_preimage(b"abc", b"d", b"");
+        assert_ne!(h1, h3);
+        assert_ne!(h2, h3);
+    }
+
+    #[test]
+    fn hash_defect_preimage_is_deterministic() {
+        let h1 = hash_defect_preimage(b"work-1", &[0xAA; 32], b"reason");
+        let h2 = hash_defect_preimage(b"work-1", &[0xAA; 32], b"reason");
+        assert_eq!(h1, h2, "same inputs must produce the same hash");
     }
 }

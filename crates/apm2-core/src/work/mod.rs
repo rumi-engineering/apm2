@@ -70,5 +70,7 @@ pub use parity::{
     ParityDefect, ParityField, ParityValidator, PromotionGateResult, ReplayEquivalenceChecker,
     ReplayResult, TransitionClass,
 };
-pub use reducer::{WorkReducer, WorkReducerState, helpers};
+pub use reducer::{
+    MAX_IDENTITY_CHAIN_DEFECTS, WorkReducer, WorkReducerState, hash_defect_preimage, helpers,
+};
 pub use state::{Work, WorkState, WorkType};

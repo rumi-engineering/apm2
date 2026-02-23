@@ -1604,11 +1604,11 @@ fn build_gate_start_defect(
     reason: &str,
     timestamp_ns: u64,
 ) -> DefectRecorded {
-    let mut cas_preimage = Vec::new();
-    cas_preimage.extend_from_slice(publication.work_id.as_bytes());
-    cas_preimage.extend_from_slice(&publication.changeset_digest);
-    cas_preimage.extend_from_slice(reason.as_bytes());
-    let cas_hash = *blake3::hash(&cas_preimage).as_bytes();
+    let cas_hash = apm2_core::work::hash_defect_preimage(
+        publication.work_id.as_bytes(),
+        &publication.changeset_digest,
+        reason.as_bytes(),
+    );
 
     DefectRecorded {
         defect_id: format!("DEF-GATE-START-{}", uuid::Uuid::new_v4()),

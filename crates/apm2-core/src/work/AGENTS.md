@@ -121,6 +121,8 @@ pub struct Work {
 #[derive(Debug, Default)]
 pub struct WorkReducer {
     state: WorkReducerState,
+    /// Bounded ring buffer (VecDeque) capped at MAX_IDENTITY_CHAIN_DEFECTS (1000).
+    identity_chain_defects: VecDeque<DefectRecorded>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +138,8 @@ pub struct WorkReducerState {
 - [INV-0116] Receipt events bound to stale digests are never admitted into gate/review/merge digest projections
 - [INV-0117] Gate receipt collection enforces latest-digest validation: gate receipts bound to superseded changesets are silently dropped (logged, not stored in `ci_receipt_digest_by_work`)
 - [INV-0118] Review-start stage boundary (`ReadyForReview -> Review`) requires a known latest changeset and, if a review receipt digest exists, it must match the latest digest
+- [INV-0119] `identity_chain_defects` is bounded by `MAX_IDENTITY_CHAIN_DEFECTS` (1000); oldest entries are evicted (ring-buffer via `VecDeque`) to prevent unbounded memory growth
+- [INV-0120] Defect CAS hashes use length-prefixed BLAKE3 (`hash_defect_preimage`) to prevent byte-shifting collisions across variable-length field boundaries
 
 **Contracts:**
 - [CTR-0106] `apply()` returns `Ok(())` for non-work events (no-op)
