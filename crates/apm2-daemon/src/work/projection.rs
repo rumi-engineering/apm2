@@ -367,6 +367,34 @@ impl WorkObjectProjection {
             .copied()
     }
 
+    /// Returns the event ID of the `ChangeSetPublished` event that established
+    /// the latest changeset identity binding (`STEP_10`).
+    #[must_use]
+    pub fn changeset_published_event_id(&self, work_id: &str) -> Option<&str> {
+        self.reducer
+            .state()
+            .changeset_published_event_id_by_work
+            .get(work_id)
+            .map(String::as_str)
+    }
+
+    /// Returns the CAS hash of the `ChangeSetBundleV1` for the latest
+    /// changeset (`STEP_10`).
+    #[must_use]
+    pub fn bundle_cas_hash(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .bundle_cas_hash_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the number of pending identity-chain defects in the reducer.
+    #[must_use]
+    pub fn identity_chain_defect_count(&self) -> usize {
+        self.reducer.identity_chain_defect_count()
+    }
+
     /// Returns claimable work items in deterministic ID order.
     #[must_use]
     pub fn claimable_work(&self) -> Vec<&Work> {

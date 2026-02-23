@@ -355,6 +355,15 @@ impl ProjectionWorkAuthority {
             })
             .or_else(|| latest_digest.map(|_| "pending".to_string()));
 
+        // STEP_10: Populate identity chain surface fields from projection
+        // reducer state rather than hardcoding None/0.
+        let changeset_published_event_id = projection
+            .changeset_published_event_id(&work.work_id)
+            .map(ToString::to_string);
+        let bundle_cas_hash = projection.bundle_cas_hash(&work.work_id);
+        #[allow(clippy::cast_possible_truncation)]
+        let identity_chain_defect_count = projection.identity_chain_defect_count() as u32;
+
         WorkAuthorityStatus {
             work_id: work.work_id.clone(),
             state: work.state,
@@ -366,12 +375,12 @@ impl ProjectionWorkAuthority {
             implementer_claim_blocked: dependency_evaluation.implementer_claim_blocked,
             dependency_diagnostics: dependency_evaluation.diagnostics,
             latest_changeset_digest: latest_digest,
-            changeset_published_event_id: None,
-            bundle_cas_hash: None,
+            changeset_published_event_id,
+            bundle_cas_hash,
             gate_status,
             review_status,
             merge_status,
-            identity_chain_defect_count: 0,
+            identity_chain_defect_count,
         }
     }
 

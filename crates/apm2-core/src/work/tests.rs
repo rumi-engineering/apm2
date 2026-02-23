@@ -279,6 +279,11 @@ fn test_work_transition_in_progress_to_review() {
         )
         .unwrap();
 
+    // Publish a changeset — required by the review-start boundary guard
+    // (CSID-004) which now covers ALL transitions to Review (not just
+    // ReadyForReview -> Review).
+    apply_changeset_published(&mut reducer, &ctx, "work-1", default_changeset_digest());
+
     // Submit for review (previous_transition_count = 2)
     let review_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
@@ -3067,4 +3072,67 @@ fn test_work_completion_merge_receipt_uses_latest_digest_binding() {
         reducer.state().get("work-1").unwrap().state,
         WorkState::Completed
     );
+}
+
+/// Regression: `InProgress -> Review` must also be guarded by the
+/// latest-changeset check (CSID-004). Without a `changeset_published`
+/// event, the transition is silently denied (fail-closed).
+#[test]
+fn test_in_progress_to_review_denied_without_changeset_published() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(
+            &create_event("work.opened", "session-1", open_payload),
+            &ctx,
+        )
+        .unwrap();
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", claim_payload),
+            &ctx,
+        )
+        .unwrap();
+    let start_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", start_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Attempt InProgress -> Review WITHOUT changeset published.
+    // Should be silently denied (work stays at InProgress).
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "ready_for_review",
+        2,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", review_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(
+        work.state,
+        WorkState::InProgress,
+        "InProgress -> Review must be denied without a changeset published"
+    );
+    // transition_count remains 2 (Open->Claimed, Claimed->InProgress)
+    assert_eq!(work.transition_count, 2);
 }

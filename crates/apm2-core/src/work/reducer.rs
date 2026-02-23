@@ -41,6 +41,12 @@ pub struct WorkReducerState {
     pub review_receipt_digest_by_work: HashMap<String, [u8; 32]>,
     /// Last observed merge receipt digest per work ID.
     pub merge_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Event ID of the `ChangeSetPublished` event that established the latest
+    /// changeset identity binding, keyed by work ID (`STEP_10`).
+    pub changeset_published_event_id_by_work: HashMap<String, String>,
+    /// CAS hash (32 bytes) of the `ChangeSetBundleV1` for the latest
+    /// changeset, keyed by work ID (`STEP_10`).
+    pub bundle_cas_hash_by_work: HashMap<String, [u8; 32]>,
 }
 
 impl WorkReducerState {
@@ -305,9 +311,7 @@ impl WorkReducer {
 
         match event.event_type.as_str() {
             "changeset_published" => {
-                self.state
-                    .latest_changeset_by_work
-                    .insert(authoritative_work_id, changeset_digest);
+                self.record_changeset_published(event, authoritative_work_id, changeset_digest);
             },
             // CI transitions are driven by gate receipts (not lease issuance).
             // Enforce latest-digest validation: only receipts whose digest
@@ -363,6 +367,30 @@ impl WorkReducer {
         }
     }
 
+    /// Records a `changeset_published` event's digest, event ID, and CAS hash
+    /// into projection state (`STEP_10`).
+    fn record_changeset_published(
+        &mut self,
+        event: &EventRecord,
+        authoritative_work_id: String,
+        changeset_digest: [u8; 32],
+    ) {
+        self.state
+            .latest_changeset_by_work
+            .insert(authoritative_work_id.clone(), changeset_digest);
+        let event_id = event
+            .seq_id
+            .map_or_else(|| "unknown".to_string(), |s| format!("seq-{s}"));
+        self.state
+            .changeset_published_event_id_by_work
+            .insert(authoritative_work_id.clone(), event_id);
+        if let Some(cas_hash) = extract_cas_hash_from_payload(&event.payload) {
+            self.state
+                .bundle_cas_hash_by_work
+                .insert(authoritative_work_id, cas_hash);
+        }
+    }
+
     /// Returns `true` when `incoming` matches the latest authoritative
     /// changeset digest for `work_id`.
     fn is_digest_latest(&self, work_id: &str, incoming: [u8; 32]) -> bool {
@@ -405,8 +433,14 @@ impl WorkReducer {
         let cas_hash =
             hash_defect_preimage(work_id.as_bytes(), &incoming_digest, reason.as_bytes());
 
+        // Deterministic defect ID derived from the CAS hash (first 16 bytes
+        // hex-encoded). This ensures replay consistency: the same inputs
+        // always produce the same defect_id, which is required because the
+        // WorkReducer must be a pure function of its input events.
+        let defect_id = format!("DEF-IDENTITY-CHAIN-{}", hex::encode(&cas_hash[..16]));
+
         self.push_defect(DefectRecorded {
-            defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
+            defect_id,
             defect_type: "IDENTITY_CHAIN_STALE_DIGEST".to_string(),
             cas_hash: cas_hash.to_vec(),
             source: DefectSource::ProjectionTamper as i32,
@@ -434,8 +468,12 @@ impl WorkReducer {
             reason.as_bytes(),
         );
 
+        // Deterministic defect ID derived from the CAS hash (first 16 bytes
+        // hex-encoded). Same rationale as `record_stale_digest_defect`.
+        let defect_id = format!("DEF-IDENTITY-CHAIN-{}", hex::encode(&cas_hash[..16]));
+
         self.push_defect(DefectRecorded {
-            defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
+            defect_id,
             defect_type: "IDENTITY_CHAIN_CROSS_WORK_INJECTION".to_string(),
             cas_hash: cas_hash.to_vec(),
             source: DefectSource::ProjectionTamper as i32,
@@ -531,11 +569,15 @@ impl WorkReducer {
 
         // ---- Review start stage boundary (CSID-004) ----
         //
-        // When transitioning ReadyForReview -> Review, verify that a latest
-        // changeset exists (fail-closed). If a review receipt has already been
-        // observed but its digest is stale, deny the transition (the review
-        // was for an older changeset and must be re-done).
-        if from_state == WorkState::ReadyForReview && to_state == WorkState::Review {
+        // When transitioning to Review from ANY state (ReadyForReview,
+        // InProgress, etc.), verify that a latest changeset exists
+        // (fail-closed). If a review receipt has already been observed but
+        // its digest is stale, deny the transition (the review was for an
+        // older changeset and must be re-done).
+        //
+        // This guard covers both CI-gated workflows (ReadyForReview ->
+        // Review) and non-CI-gated workflows (InProgress -> Review).
+        if to_state == WorkState::Review {
             // Fail-closed: a published changeset MUST exist before review
             // start is admitted (CSID-004).
             let Some(_latest_digest) = self.latest_changeset_digest(work_id) else {
@@ -1097,6 +1139,19 @@ pub fn hash_defect_preimage(field_a: &[u8], field_b: &[u8], field_c: &[u8]) -> [
 /// deserialization. Prevents denial-of-service via oversized `SQLite` payloads
 /// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
 const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
+
+/// Extracts the `cas_hash` field from a `changeset_published` payload.
+///
+/// Only called after size validation in `observe_changeset_bound_event`,
+/// so the double-parse is limited to `changeset_published` events only.
+fn extract_cas_hash_from_payload(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let cas_hash_value = value.get("cas_hash")?;
+    decode_digest_value(cas_hash_value)
+}
 
 fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
     // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
