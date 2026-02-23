@@ -10921,6 +10921,24 @@ impl PrivilegedDispatcher {
         }
     }
 
+    /// Selects lease->work resolution strictness for context-entry publication.
+    ///
+    /// `IMPLEMENTER_TERMINAL`/`HANDOFF_NOTE` are FAC push closure artifacts
+    /// that may need claim-scoped recovery when lease-validator mapping is
+    /// absent. Other kinds retain strict lease mapping to preserve
+    /// revocation semantics.
+    const fn work_id_resolution_mode_for_context_entry_kind(
+        kind: apm2_core::fac::work_cas_schemas::WorkContextKind,
+    ) -> WorkIdResolutionMode {
+        match kind {
+            apm2_core::fac::work_cas_schemas::WorkContextKind::ImplementerTerminal
+            | apm2_core::fac::work_cas_schemas::WorkContextKind::HandoffNote => {
+                WorkIdResolutionMode::AllowClaimHintFallback
+            },
+            _ => WorkIdResolutionMode::StrictLeaseMapping,
+        }
+    }
+
     /// Derive a fail-closed PCAC ledger anchor from the validated chain hash.
     fn derive_pcac_ledger_anchor(&self) -> Result<[u8; 32], String> {
         let mut hasher = blake3::Hasher::new();
@@ -20508,6 +20526,8 @@ impl PrivilegedDispatcher {
                     ));
                 },
             };
+        let work_id_resolution_mode =
+            Self::work_id_resolution_mode_for_context_entry_kind(parsed_kind);
 
         if entry.kind != parsed_kind {
             return Ok(PrivilegedResponse::error(
@@ -20629,7 +20649,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(&request.work_id),
-                WorkIdResolutionMode::StrictLeaseMapping,
+                work_id_resolution_mode,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -20653,7 +20673,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(&request.work_id),
             identity_proof_hash,
-            WorkIdResolutionMode::StrictLeaseMapping,
+            work_id_resolution_mode,
         );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
@@ -20745,7 +20765,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(&request.work_id),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            work_id_resolution_mode,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -33976,6 +33996,48 @@ mod tests {
                 },
                 other => {
                     panic!("Expected Error response after lease revocation, got: {other:?}");
+                },
+            }
+        }
+
+        /// FAC push closure path: `IMPLEMENTER_TERMINAL` entries must remain
+        /// publishable when lease->work mapping is missing but the active claim
+        /// still binds (`work_id`, `lease_id`).
+        #[test]
+        fn test_publish_work_context_entry_implementer_terminal_recovers_missing_lease_mapping() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
+            assert!(
+                dispatcher.lease_validator.remove_lease(&lease_id),
+                "lease must exist to be removed"
+            );
+
+            let entry_json = make_entry_json(
+                &work_id,
+                "IMPLEMENTER_TERMINAL",
+                "key-terminal-fallback-001",
+            );
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.clone(),
+                kind: "IMPLEMENTER_TERMINAL".to_string(),
+                dedupe_key: "key-terminal-fallback-001".to_string(),
+                entry_json,
+                lease_id: lease_id.clone(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::PublishWorkContextEntry(resp) => {
+                    assert!(
+                        !resp.entry_id.is_empty(),
+                        "terminal entry publish must return non-empty entry_id"
+                    );
+                    assert_eq!(resp.work_id, work_id);
+                },
+                other => {
+                    panic!(
+                        "Expected PublishWorkContextEntry success for terminal fallback, got: {other:?}"
+                    );
                 },
             }
         }
