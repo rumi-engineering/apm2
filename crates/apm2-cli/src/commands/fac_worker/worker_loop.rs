@@ -1040,30 +1040,46 @@ pub(super) fn run_fac_worker_impl(
             repair_coordinator.settle_idle();
         }
 
-        // Scan pending directory (quarantines malformed files inline).
-        let candidates = match scan_pending(
-            &queue_root,
-            &fac_root,
-            &current_tuple_digest,
-            Some(toolchain_fingerprint.as_str()),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                output_worker_error(json_output, &format!("scan error: {e}"));
-                if once {
-                    if let Err(persist_err) = persist_queue_scheduler_state(
-                        &fac_root,
-                        &queue_state,
-                        broker.current_tick(),
-                        Some(&cost_model),
-                    ) {
-                        output_worker_error(json_output, &persist_err);
+        // f-798-code_quality-1771812825696989-0 (QL-003): Prefer the ledger
+        // lifecycle projection for pickup selection when dual-write is enabled
+        // and a valid projection checkpoint exists. Fall back to filesystem
+        // scan if projection is unavailable.
+        let candidates = if policy.queue_lifecycle_dual_write_enabled {
+            scan_pending_from_projection(
+                &queue_root,
+                &fac_root,
+                &current_tuple_digest,
+                Some(toolchain_fingerprint.as_str()),
+            )
+        } else {
+            None
+        };
+        let candidates = match candidates {
+            Some(c) => c,
+            None => match scan_pending(
+                &queue_root,
+                &fac_root,
+                &current_tuple_digest,
+                Some(toolchain_fingerprint.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    output_worker_error(json_output, &format!("scan error: {e}"));
+                    if once {
+                        if let Err(persist_err) = persist_queue_scheduler_state(
+                            &fac_root,
+                            &queue_state,
+                            broker.current_tick(),
+                            Some(&cost_model),
+                        ) {
+                            output_worker_error(json_output, &persist_err);
+                        }
+                        return exit_codes::GENERIC_ERROR;
                     }
-                    return exit_codes::GENERIC_ERROR;
-                }
-                std::thread::sleep(Duration::from_secs(safety_nudge_secs.max(1)));
-                pending_wake_reason = Some(WorkerWakeReason::SafetyNudge);
-                continue;
+                    std::thread::sleep(Duration::from_secs(safety_nudge_secs.max(1)));
+                    pending_wake_reason = Some(WorkerWakeReason::SafetyNudge);
+                    continue;
+                },
             },
         };
 

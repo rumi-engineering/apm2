@@ -146,31 +146,47 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         )
     })?;
 
-    let dual_write_spec = if dual_write_enabled {
-        let bytes = read_bounded(pending_path, MAX_JOB_SPEC_SIZE)
-            .map_err(|err| format!("cannot read pending job for dual-write claim event: {err}"))?;
-        Some(deserialize_job_spec(&bytes).map_err(|err| {
-            format!("cannot deserialize pending job for dual-write claim event: {err}")
-        })?)
-    } else {
-        None
-    };
-
-    if let Some(spec) = dual_write_spec.as_ref() {
-        if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_claimed(
-            fac_root,
-            spec,
-            &spec.actuation.lease_id,
-            "fac.worker",
-        ) {
-            eprintln!(
-                "worker: WARNING: dual-write lifecycle claim event failed (continuing with filesystem authoritative queue): {err}"
-            );
-        }
-    }
-
+    // f-798-security-1771812602410346-0: Move from pending/ to claimed/ FIRST.
+    // If deserialization fails (e.g. malformed JSON), the file was previously
+    // stuck in pending/ permanently (treated as lock failure, never retried).
+    // Over time malformed files exhaust QueueBoundsPolicy capacity. By moving
+    // first, the orchestrator's existing path moves unreadable claimed files
+    // to denied/.
     let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
         .map_err(|err| format!("atomic claim failed: {err}"))?;
+
+    // After the successful move, attempt dual-write lifecycle emission.
+    // Deserialization and emit failures are warn-and-continue: the filesystem
+    // claim is authoritative.
+    if dual_write_enabled {
+        match read_bounded(&claimed_path, MAX_JOB_SPEC_SIZE)
+            .and_then(|bytes| deserialize_job_spec(&bytes).map_err(|err| err.to_string()))
+        {
+            Ok(spec) => {
+                if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_claimed(
+                    fac_root,
+                    &spec,
+                    &spec.actuation.lease_id,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: dual-write lifecycle claim event failed \
+                         (continuing with filesystem authoritative queue): {err}"
+                    );
+                }
+            },
+            Err(err) => {
+                // Deserialization failed AFTER the file was moved to claimed/.
+                // The worker's run_idle_phase will subsequently handle this
+                // unreadable claimed file by moving it to denied/.
+                eprintln!(
+                    "worker: WARNING: dual-write lifecycle claim event skipped \
+                     (cannot deserialize claimed job, orchestrator will route \
+                     to denied/): {err}"
+                );
+            },
+        }
+    }
 
     Ok((claimed_path, claimed_lock_file))
 }
@@ -655,6 +671,152 @@ pub(super) fn promote_via_rewrite(
             dest.display()
         )),
     }
+}
+
+/// QL-003: Scan pending jobs from the ledger lifecycle projection when
+/// available (f-798-code_quality-1771812825696989-0).
+///
+/// Reads the reconciler checkpoint, extracts projected `Pending` jobs, and
+/// loads the corresponding `FacJobSpecV1` payloads from the `pending/`
+/// filesystem directory. The projection-derived list is ledger-authoritative:
+/// only jobs whose lifecycle events have been applied to the projection are
+/// included.
+///
+/// Returns `None` if the projection is unavailable (no checkpoint, corrupt
+/// checkpoint, or no pending jobs in projection). The caller should fall
+/// back to `scan_pending` (filesystem scan) in that case.
+pub(super) fn scan_pending_from_projection(
+    queue_root: &Path,
+    fac_root: &Path,
+    canonicalizer_tuple_digest: &str,
+    toolchain_fingerprint: Option<&str>,
+) -> Option<Vec<PendingCandidate>> {
+    use apm2_daemon::projection::job_lifecycle::{JobLifecycleCheckpointV1, ProjectedJobStatus};
+
+    let checkpoint_path = queue_root.join(".job_lifecycle_checkpoint.v1.json");
+    if !checkpoint_path.exists() {
+        return None;
+    }
+
+    let checkpoint: JobLifecycleCheckpointV1 = match apm2_daemon::fs_safe::bounded_read_json(
+        &checkpoint_path,
+        16 * 1024 * 1024, // MAX_CHECKPOINT_FILE_SIZE_BYTES
+    ) {
+        Ok(cp) => cp,
+        Err(_) => return None,
+    };
+
+    // Only use projection if the cursor has advanced (non-zero).
+    if checkpoint.cursor_timestamp_ns == 0 && checkpoint.cursor_event_id.is_empty() {
+        return None;
+    }
+
+    let pending_dir = queue_root.join(PENDING_DIR);
+    if !pending_dir.is_dir() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let mut scanned = 0usize;
+
+    for record in checkpoint.projection.jobs.values() {
+        if record.status != ProjectedJobStatus::Pending {
+            continue;
+        }
+        if scanned >= MAX_PENDING_SCAN_ENTRIES {
+            break;
+        }
+        scanned += 1;
+
+        // Construct the expected filename from the projection's queue_job_id.
+        let file_name = format!("{}.json", record.queue_job_id);
+        let path = pending_dir.join(&file_name);
+        if !path.exists() {
+            // File not yet materialized by reconciler; skip.
+            continue;
+        }
+
+        let bytes = match read_bounded(&path, MAX_JOB_SPEC_SIZE) {
+            Ok(b) => b,
+            Err(e) => {
+                let reason = format!("projection scan read failure: {e}");
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&[]),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
+                    &reason,
+                    canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
+                );
+                continue;
+            },
+        };
+
+        let spec = match deserialize_job_spec(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let reason = format!("projection scan deserialization failed: {e}");
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&bytes),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
+                    &reason,
+                    canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
+                );
+                continue;
+            },
+        };
+
+        candidates.push(PendingCandidate {
+            path,
+            spec,
+            raw_bytes: bytes,
+        });
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Same deterministic ordering as scan_pending (INV-WRK-005).
+    candidates.sort_by(|a, b| {
+        a.spec
+            .priority
+            .cmp(&b.spec.priority)
+            .then_with(|| a.spec.enqueue_time.cmp(&b.spec.enqueue_time))
+            .then_with(|| a.spec.job_id.cmp(&b.spec.job_id))
+    });
+
+    Some(candidates)
 }
 
 /// Scans `queue/pending/` and returns sorted candidates.

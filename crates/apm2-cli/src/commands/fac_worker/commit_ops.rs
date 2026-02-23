@@ -658,6 +658,12 @@ pub(super) fn commit_claimed_job_via_pipeline(
     // lifecycle emission is best-effort / advisory.  The filesystem pipeline
     // commit above is authoritative — a lifecycle emit failure must never
     // abort the terminal commit.  Warn-and-continue on any error.
+    //
+    // f-798-code_quality-1771812840679708-0 (QL-001): Pass the receipt
+    // content_hash from the pipeline commit result as the receipt_id for
+    // terminal lifecycle events, fulfilling the intent-to-receipt pattern
+    // for irreversible actions.
+    let receipt_id_for_lifecycle = Some(result.content_hash.clone());
     match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
         Ok(true) => {
             let claimed_parent = claimed_path
@@ -683,7 +689,7 @@ pub(super) fn commit_claimed_job_via_pipeline(
                     fac_root,
                     spec,
                     "completed",
-                    None,
+                    receipt_id_for_lifecycle,
                     "fac.worker",
                 ) {
                     tracing::warn!(
@@ -698,7 +704,7 @@ pub(super) fn commit_claimed_job_via_pipeline(
                     spec,
                     &reason_class,
                     false,
-                    None,
+                    receipt_id_for_lifecycle,
                     "fac.worker",
                 ) {
                     tracing::warn!(

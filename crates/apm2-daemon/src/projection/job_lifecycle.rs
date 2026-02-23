@@ -319,6 +319,17 @@ impl JobLifecycleProjectionV1 {
             ),
         };
 
+        // f-798-code_quality-1771812851882322-0: Validate queue_job_id at
+        // the apply boundary before storing it. Invalid IDs (empty, overlong,
+        // or containing unsafe characters) would brick the reconciler when
+        // reconcile_projected_job later calls safe_job_file_name. Treat as
+        // poison pill: skip and let the caller advance the cursor.
+        if let Err(err) = validate_queue_job_id(&queue_job_id) {
+            return Err(JobLifecycleProjectionError::Validation(format!(
+                "event {ledger_event_id}: invalid queue_job_id: {err}"
+            )));
+        }
+
         let existing_status = self.jobs.get(&job_id).map(|record| record.status);
         let mut lease_id: Option<String> = None;
         let mut reason_code: Option<String> = None;
@@ -546,11 +557,31 @@ impl JobLifecycleRehydrationReconciler {
                     continue;
                 },
             };
-            let dirty_job_id = checkpoint.projection.apply_event(
+            // f-798-security-1771812596683957-0 and f-798-code_quality-1771812851882322-0:
+            // Handle apply_event failures (capacity Validation, invalid queue_job_id)
+            // as skip-and-advance defects. This prevents infinite replay loops when the
+            // projection is at capacity with no evictable terminal jobs, or when a
+            // semantically invalid queue_job_id passes decode but fails filesystem
+            // safety validation. Same poison-pill-resilience pattern as decode errors.
+            let dirty_job_id = match checkpoint.projection.apply_event(
                 &lifecycle_event,
                 &event.event_id,
                 event.timestamp_ns,
-            )?;
+            ) {
+                Ok(job_id) => job_id,
+                Err(JobLifecycleProjectionError::Validation(ref msg)) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %msg,
+                        "skipping lifecycle event that failed projection validation \
+                         (capacity or identity poison pill)"
+                    );
+                    checkpoint.cursor_timestamp_ns = event.timestamp_ns;
+                    checkpoint.cursor_event_id = event.event_id;
+                    continue;
+                },
+                Err(other) => return Err(other),
+            };
             checkpoint.cursor_timestamp_ns = event.timestamp_ns;
             checkpoint.cursor_event_id = event.event_id;
             processed_events = processed_events.saturating_add(1);
@@ -571,14 +602,40 @@ impl JobLifecycleRehydrationReconciler {
                 remaining_reconcile.push(job_id);
                 continue;
             }
-            let fully_reconciled =
-                self.reconcile_projected_job(&checkpoint.projection, &job_id, &mut applied_fs_ops)?;
-            if !fully_reconciled {
-                remaining_reconcile.push(job_id);
+            // f-798-code_quality-1771812851882322-0: Treat reconcile-time
+            // Validation errors (e.g. safe_job_file_name failure for invalid
+            // queue_job_id that was stored before the apply-boundary check
+            // existed) as skip-with-cursor-advance defects, not hard failures.
+            match self.reconcile_projected_job(&checkpoint.projection, &job_id, &mut applied_fs_ops)
+            {
+                Ok(true) => {},
+                Ok(false) => {
+                    remaining_reconcile.push(job_id);
+                },
+                Err(JobLifecycleProjectionError::Validation(ref msg)) => {
+                    warn!(
+                        job_id = %job_id,
+                        error = %msg,
+                        "skipping reconciliation for job with invalid identity \
+                         (poison pill in projection state)"
+                    );
+                },
+                Err(other) => return Err(other),
             }
         }
 
-        if applied_fs_ops < self.config.max_fs_ops_per_tick {
+        // f-798-security-1771812591501920-0: Only delete unknown files when
+        // the reconciler cursor is caught up to the ledger head. During
+        // backlog processing, newly enqueued jobs (whose ledger events are
+        // ahead of the cursor) are NOT yet in the projection. Deleting them
+        // would cause critical data loss — valid job payloads replaced by
+        // unexecutable witness stubs when the cursor catches up.
+        let cursor_caught_up = self
+            .ledger
+            .get_latest_event()
+            .is_none_or(|latest| checkpoint.cursor_timestamp_ns >= latest.timestamp_ns);
+
+        if applied_fs_ops < self.config.max_fs_ops_per_tick && cursor_caught_up {
             self.cleanup_unknown_files(&checkpoint.projection, &mut applied_fs_ops)?;
         }
 
@@ -878,6 +935,28 @@ fn write_witness_file(
             JobLifecycleProjectionError::Io(format!("write witness file {}: {err}", path.display()))
         },
     })
+}
+
+/// Validates a `queue_job_id` for filesystem safety BEFORE storing it in the
+/// projection. This prevents semantically invalid-but-decodable IDs from
+/// bricking the reconciler (f-798-code_quality-1771812851882322-0).
+fn validate_queue_job_id(queue_job_id: &str) -> Result<(), String> {
+    if queue_job_id.is_empty() {
+        return Err("queue_job_id is empty".to_string());
+    }
+    if queue_job_id.len() > MAX_QUEUE_JOB_ID_LENGTH {
+        return Err(format!(
+            "queue_job_id exceeds bound: {} > {MAX_QUEUE_JOB_ID_LENGTH}",
+            queue_job_id.len()
+        ));
+    }
+    if !queue_job_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!("unsafe queue_job_id: {queue_job_id:?}"));
+    }
+    Ok(())
 }
 
 fn safe_job_file_name(queue_job_id: &str) -> Result<String, JobLifecycleProjectionError> {
@@ -1510,6 +1589,260 @@ mod tests {
                 .join("job-overflow.json")
                 .exists(),
             "new events must remain unread while pending backlog is full"
+        );
+    }
+
+    #[test]
+    fn tick_skips_capacity_exhausted_event_and_advances_cursor() {
+        // f-798-security-1771812596683957-0: Verify that when projection is at
+        // MAX_PROJECTED_JOBS with no terminal jobs, apply_event capacity
+        // failure is treated as skip-and-advance (not infinite replay loop).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let base_ts = now_timestamp_ns();
+
+        // Build a checkpoint with MAX_PROJECTED_JOBS active (non-terminal)
+        // jobs so there is nothing to evict.
+        let mut projection = JobLifecycleProjectionV1::default();
+        for index in 0..MAX_PROJECTED_JOBS {
+            let queue_job_id = format!("active-{index}");
+            let job_id = format!("fj1-{queue_job_id}");
+            projection.jobs.insert(
+                job_id.clone(),
+                ProjectedJobLifecycleV1 {
+                    job_id,
+                    queue_job_id,
+                    work_id: "W-42".to_string(),
+                    status: ProjectedJobStatus::Pending,
+                    last_event_id: format!("event-{index}"),
+                    last_event_timestamp_ns: base_ts + index as u64,
+                    lease_id: None,
+                    reason_code: None,
+                },
+            );
+        }
+        let checkpoint = JobLifecycleCheckpointV1 {
+            projection,
+            ..JobLifecycleCheckpointV1::default()
+        };
+        let checkpoint_path = queue_root.join(CHECKPOINT_FILE_NAME);
+        fs_safe::atomic_write_json(&checkpoint_path, &checkpoint)
+            .expect("seed capacity-full checkpoint");
+
+        // Emit a new job event that will hit capacity with no evictable
+        // terminal jobs.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:overflow-skip",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("overflow-skip"),
+                    enqueue_epoch_ns: base_ts + MAX_PROJECTED_JOBS as u64 + 1,
+                }),
+            ),
+            base_ts + MAX_PROJECTED_JOBS as u64 + 1,
+        );
+        // Emit a second valid event after the capacity-exhausted event.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:started:active-0",
+                None,
+                FacJobLifecycleEventData::Started(FacJobStartedV1 {
+                    identity: identity("active-0"),
+                    worker_instance_id: "worker-1".to_string(),
+                    start_receipt_id: None,
+                }),
+            ),
+            base_ts + MAX_PROJECTED_JOBS as u64 + 2,
+        );
+
+        let reconciler = JobLifecycleRehydrationReconciler::with_checkpoint_path(
+            Arc::clone(&emitter),
+            queue_root,
+            checkpoint_path,
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 16,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        let tick = reconciler
+            .tick()
+            .expect("tick must succeed (skip capacity-exhausted event)");
+        // The overflow event is skipped, the started event for active-0 is
+        // processed.
+        assert_eq!(
+            tick.processed_events, 1,
+            "valid events after capacity-exhausted poison pill must be processed"
+        );
+        assert!(
+            tick.cursor_timestamp_ns >= base_ts + MAX_PROJECTED_JOBS as u64 + 2,
+            "cursor must advance past both the skipped and processed events"
+        );
+
+        // Second tick must not replay the capacity-exhausted event.
+        let second = reconciler.tick().expect("second tick");
+        assert_eq!(
+            second.processed_events, 0,
+            "capacity-exhausted event must not be replayed"
+        );
+    }
+
+    #[test]
+    fn tick_skips_invalid_queue_job_id_and_advances_cursor() {
+        // f-798-code_quality-1771812851882322-0: Verify that a lifecycle event
+        // with an unsafe queue_job_id (e.g. containing "../") is treated as a
+        // poison pill: skipped with cursor advance, tick returns Ok.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let ts = now_timestamp_ns();
+
+        // Construct a lifecycle event with an unsafe queue_job_id.
+        let unsafe_identity = FacJobIdentityV1 {
+            job_id: "fj1-unsafe-traversal".to_string(),
+            queue_job_id: "../etc/passwd".to_string(),
+            work_id: "W-42".to_string(),
+            changeset_digest: "b3-256:".to_string() + &"a".repeat(64),
+            spec_digest: "b3-256:".to_string() + &"b".repeat(64),
+            gate_profile: "gates:balanced".to_string(),
+            revision: "1".to_string(),
+        };
+        let unsafe_event = FacJobLifecycleEventV1::new(
+            "intent:enqueue:unsafe-traversal",
+            None,
+            FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                identity: unsafe_identity,
+                enqueue_epoch_ns: ts,
+            }),
+        );
+        emit_lifecycle(&emitter, &unsafe_event, ts);
+
+        // Emit a valid event after the unsafe one.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:valid-after-unsafe",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("valid-after-unsafe"),
+                    enqueue_epoch_ns: ts + 1,
+                }),
+            ),
+            ts + 1,
+        );
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 8,
+                max_fs_ops_per_tick: 8,
+            },
+        );
+
+        let tick = reconciler
+            .tick()
+            .expect("tick must succeed (unsafe queue_job_id treated as poison pill)");
+        assert_eq!(
+            tick.processed_events, 1,
+            "valid event after unsafe queue_job_id poison pill must be processed"
+        );
+        assert!(
+            queue_root
+                .join(PENDING_DIR)
+                .join("valid-after-unsafe.json")
+                .exists(),
+            "valid event must be reconciled to pending/"
+        );
+
+        // Unsafe event must not be replayed.
+        let second = reconciler.tick().expect("second tick");
+        assert_eq!(
+            second.processed_events, 0,
+            "unsafe queue_job_id event must not be replayed"
+        );
+    }
+
+    #[test]
+    fn cleanup_unknown_files_skipped_during_backlog() {
+        // f-798-security-1771812591501920-0: Verify that cleanup_unknown_files
+        // does NOT delete files in pending/ when the cursor lags behind the
+        // ledger head (backlog processing). A file for a job whose event has
+        // not yet been projected must survive.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let base_ts = now_timestamp_ns();
+
+        // Emit two events. We will process only the first event per tick
+        // (max_events_per_tick = 1). After the first tick, the cursor will
+        // be behind the ledger head.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:first",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("first"),
+                    enqueue_epoch_ns: base_ts,
+                }),
+            ),
+            base_ts,
+        );
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:second",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("second"),
+                    enqueue_epoch_ns: base_ts + 1,
+                }),
+            ),
+            base_ts + 1,
+        );
+
+        // Pre-create a pending file for "second" (e.g. it was enqueued to
+        // disk by the submitter before the reconciler caught up).
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::write(
+            queue_root.join(PENDING_DIR).join("second.json"),
+            br#"{"pre-existing":"payload"}"#,
+        )
+        .expect("seed pre-existing second");
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 1,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        // First tick: processes only the "first" event. "second" is not yet
+        // in projection. Cursor lags behind ledger head.
+        let first_tick = reconciler.tick().expect("first tick");
+        assert_eq!(first_tick.processed_events, 1);
+        assert!(
+            queue_root.join(PENDING_DIR).join("second.json").exists(),
+            "pre-existing file for not-yet-projected job must NOT be deleted \
+             during backlog (cursor behind ledger head)"
+        );
+
+        // Second tick: processes the "second" event. Now cursor is caught up.
+        let second_tick = reconciler.tick().expect("second tick");
+        assert_eq!(second_tick.processed_events, 1);
+        assert!(
+            queue_root.join(PENDING_DIR).join("second.json").exists(),
+            "second job should still exist in pending after being projected"
         );
     }
 }
