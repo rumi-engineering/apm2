@@ -3011,7 +3011,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             fail_with_attempt!("fac_push_changeset_bundle_failed", err);
         },
     };
-    let handoff_entry_json = if let Some(handoff_note) = handoff_note.clone() {
+    let handoff_entry_json = if let Some(handoff_note) = handoff_note {
         Some(
             match build_context_entry_json(
                 &work_id,
@@ -3136,8 +3136,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     );
     let handoff_entry_display = handoff_response
         .as_ref()
-        .map(|response| response.entry_id.as_str())
-        .unwrap_or("none");
+        .map_or("none", |response| response.entry_id.as_str());
     human_log!(
         "fac push: published work projection chain (work_id={}, changeset={}, handoff_entry={}, implementer_terminal_entry={})",
         work_id,

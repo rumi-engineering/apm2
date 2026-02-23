@@ -197,7 +197,7 @@ pub enum FacSubcommand {
 
     /// Push code and create/update PR (lean push).
     ///
-    /// Resolves current work binding (work_id/lease_id/session_id), pushes to
+    /// Resolves current work binding (`work_id/lease_id/session_id`), pushes to
     /// remote, creates or updates a PR, blocks on evidence gates,
     /// synchronizes ruleset projection, and dispatches reviews.
     Push(PushArgs),
@@ -4059,13 +4059,11 @@ fn resolve_work_current_identity(
         validate_session_id(session_id)?;
     }
 
-    let branch = match normalize_non_empty_arg(args.branch.as_deref()) {
-        Some(value) => Some(value),
-        None => resolve_current_branch_name().ok(),
-    };
+    let branch = normalize_non_empty_arg(args.branch.as_deref())
+        .map_or_else(|| resolve_current_branch_name().ok(), Some);
 
     let explicit_alias = normalize_non_empty_arg(args.ticket_alias.as_deref());
-    if let Some(alias) = explicit_alias.clone() {
+    if let Some(alias) = explicit_alias {
         if let Some(work_id) = resolve_ticket_alias_to_work_id_via_daemon(&alias, operator_socket)?
         {
             return Ok((
@@ -4143,14 +4141,19 @@ fn resolve_work_current_identity(
         requested_session_id.as_deref(),
     )
     .map_err(|fallback_err| {
-        if let Some(branch_value) = branch.as_deref() {
-            format!(
-                "could not derive TCK from branch `{branch_value}` or worktree `{}`. {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} Projection fallback also failed: {fallback_err}",
-                worktree_dir.display()
-            )
-        } else {
-            format!("projection fallback failed and no branch context was available: {fallback_err}")
-        }
+        branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "projection fallback failed and no branch context was available: {fallback_err}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} Projection fallback also failed: {fallback_err}",
+                    worktree_dir.display()
+                )
+            },
+        )
     })?;
     Ok((
         WorkCurrentResolution {
