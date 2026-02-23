@@ -145,6 +145,40 @@ impl GateStartKernel {
         .await
         .map_err(|e| GateStartKernelError::Tick(e.to_string()))
     }
+
+    /// Garbage-collects completed intent and effect-journal rows older than
+    /// `cutoff_ns`. Returns `(intent_gc_count, effect_gc_count)`.
+    ///
+    /// This is a maintenance method intended to be called periodically by the
+    /// daemon supervisor (e.g., once per hour). It is NOT called automatically
+    /// during `tick()` to keep the hot path free of GC latency.
+    pub async fn gc_completed(
+        &self,
+        cutoff_ns: i64,
+    ) -> Result<(usize, usize), GateStartKernelError> {
+        let intent_gc = match &self.intent_store {
+            GateStartIntentStore::Sqlite(store) => {
+                let conn = Arc::clone(&store.conn);
+                tokio::task::spawn_blocking(move || {
+                    SqliteGateStartIntentStore::gc_completed_before_with_conn(&conn, cutoff_ns)
+                })
+                .await
+                .map_err(|e| {
+                    GateStartKernelError::Tick(format!("spawn_blocking failed for intent GC: {e}"))
+                })?
+                .map_err(GateStartKernelError::Tick)?
+            },
+            GateStartIntentStore::Memory(_) => 0,
+        };
+
+        let effect_gc = GateStartEffectJournal::gc_completed_before_with_conn(
+            &self.effect_journal.conn,
+            cutoff_ns,
+        )
+        .map_err(GateStartKernelError::Tick)?;
+
+        Ok((intent_gc, effect_gc))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,10 +399,10 @@ impl SqliteGateStartLedgerReader {
             )
             .optional()
             .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        // MAJOR (Security): SELECT actor_id from ledger_events (verified
-        // envelope identity) for identity spoofing prevention. The canonical
-        // `events` table lacks an actor_id column, so we use NULL as a
-        // sentinel — the parser falls back to payload-only validation.
+        // MAJOR (Security): SELECT actor_id from both tables (verified
+        // envelope identity) for identity spoofing prevention. Both
+        // `ledger_events` and canonical `events` tables have an actor_id
+        // column that stores the cryptographically verified envelope identity.
         let query = if table_exists.is_some() {
             // Ordering invariant:
             // - Every observed event has a deterministic `cursor_event_id` namespaced by
@@ -394,7 +428,7 @@ impl SqliteGateStartLedgerReader {
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
                           timestamp_ns,
-                          NULL AS verified_actor_id
+                          actor_id AS verified_actor_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -416,7 +450,7 @@ impl SqliteGateStartLedgerReader {
                           ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
                           payload,
                           timestamp_ns,
-                          NULL AS verified_actor_id
+                          actor_id AS verified_actor_id
                    FROM events
                    WHERE event_type = 'changeset_published'
                  )
@@ -741,11 +775,18 @@ impl SqliteGateStartIntentStore {
                     state TEXT NOT NULL CHECK(state IN ('pending', 'done', 'blocked')),
                     blocked_reason TEXT,
                     created_at_ns INTEGER NOT NULL,
-                    updated_at_ns INTEGER NOT NULL
+                    updated_at_ns INTEGER NOT NULL,
+                    completed_at_ns INTEGER
                 )",
                 [],
             )
             .map_err(|e| format!("failed to create gate_start_intents: {e}"))?;
+        // Migration: add completed_at_ns column if the table predates the
+        // TTL-bounded GC change (the column may already exist).
+        let _ = guard.execute(
+            "ALTER TABLE gate_start_intents ADD COLUMN completed_at_ns INTEGER",
+            [],
+        );
         guard
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_gate_start_intents_pending
@@ -835,17 +876,46 @@ impl SqliteGateStartIntentStore {
     }
 
     /// Static `mark_done` — callable from `spawn_blocking`.
+    ///
+    /// Retains the intent row with `state = 'done'` and a `completed_at_ns`
+    /// timestamp so that a crash between `mark_done` and cursor save still
+    /// finds the durable completion marker on restart. Use
+    /// [`gc_completed_before_with_conn`] to reclaim space (TTL-bounded GC).
     fn mark_done_with_conn(conn: &Arc<Mutex<Connection>>, key: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
         let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         guard
             .execute(
-                "DELETE FROM gate_start_intents WHERE intent_key = ?1",
-                params![key],
+                "UPDATE gate_start_intents
+                 SET state = 'done', completed_at_ns = ?2, updated_at_ns = ?2
+                 WHERE intent_key = ?1",
+                params![key, now_ns],
             )
-            .map_err(|e| format!("failed to delete completed gate-start intent: {e}"))?;
+            .map_err(|e| format!("failed to mark gate-start intent done: {e}"))?;
         Ok(())
+    }
+
+    /// Deletes completed intent rows older than `cutoff_ns` (TTL-bounded GC).
+    ///
+    /// This is NOT part of the hot path — it runs infrequently to reclaim
+    /// space without breaking restart idempotency.
+    pub(crate) fn gc_completed_before_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        cutoff_ns: i64,
+    ) -> Result<usize, String> {
+        let guard = conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        let deleted = guard
+            .execute(
+                "DELETE FROM gate_start_intents
+                 WHERE state = 'done' AND completed_at_ns < ?1",
+                params![cutoff_ns],
+            )
+            .map_err(|e| format!("failed to gc completed gate-start intents: {e}"))?;
+        Ok(deleted)
     }
 
     /// Static `mark_blocked` — callable from `spawn_blocking`.
@@ -964,16 +1034,13 @@ impl MemoryGateStartIntentStore {
 
     fn mark_done(&self, key: &str) -> Result<(), String> {
         self.remove_pending(key)?;
-        // Delete the intent entirely to prevent unbounded growth of
-        // completed entries (Security BLOCKER: DoS via intent store).
+        // Retain the 'done' marker so restart idempotency is preserved
+        // (CSID-003). A second enqueue for the same key will be treated
+        // as a duplicate because `states` still maps the key.
         self.states
             .lock()
             .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .remove(key);
-        self.intents
-            .lock()
-            .map_err(|e| format!("memory intent index lock poisoned: {e}"))?
-            .remove(key);
+            .insert(key.to_string(), "done".to_string());
         Ok(())
     }
 
@@ -1094,6 +1161,25 @@ impl GateStartEffectJournal {
         Ok(())
     }
 
+    /// Deletes completed effect journal rows older than `cutoff_ns`
+    /// (TTL-bounded GC). Not part of the hot path.
+    pub(crate) fn gc_completed_before_with_conn(
+        conn: &Arc<Mutex<Connection>>,
+        cutoff_ns: i64,
+    ) -> Result<usize, String> {
+        let guard = conn
+            .lock()
+            .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
+        let deleted = guard
+            .execute(
+                "DELETE FROM gate_start_effect_journal_state
+                 WHERE state = 'completed' AND updated_at_ns < ?1",
+                params![cutoff_ns],
+            )
+            .map_err(|e| format!("failed to gc completed effect journal entries: {e}"))?;
+        Ok(deleted)
+    }
+
     /// Instance load for tests (delegates to static).
     #[cfg(test)]
     fn load_state(&self, key: &str) -> Result<Option<String>, String> {
@@ -1142,13 +1228,16 @@ impl EffectJournal<String> for GateStartEffectJournal {
     }
 
     async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
-        // Delete the effect journal entry on completion to prevent unbounded
-        // growth of terminal entries (Security BLOCKER: DoS).
+        // Retain the 'completed' marker durably so that a crash between
+        // record_completed and cursor save still finds the completion state
+        // on restart (CSID-003 restart-safe idempotency). Use gc to reclaim.
         let conn = Arc::clone(&self.conn);
         let key = key.clone();
-        tokio::task::spawn_blocking(move || Self::delete_state_with_conn(&conn, &key))
-            .await
-            .map_err(|e| format!("spawn_blocking failed for record_completed: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            Self::upsert_state_with_conn(&conn, &key, "completed", epoch_now_ns_i64()?)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed for record_completed: {e}"))?
     }
 
     async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
@@ -1483,6 +1572,7 @@ mod tests {
                     "CREATE TABLE events (
                         seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
                         timestamp_ns INTEGER NOT NULL
                     )",
@@ -1515,9 +1605,9 @@ mod tests {
                 .expect("insert legacy changeset");
             guard
                 .execute(
-                    "INSERT INTO events (event_type, payload, timestamp_ns)
-                     VALUES ('changeset_published', ?1, ?2)",
-                    rusqlite::params![canonical_payload, ts],
+                    "INSERT INTO events (event_type, actor_id, payload, timestamp_ns)
+                     VALUES ('changeset_published', ?1, ?2, ?3)",
+                    rusqlite::params!["actor:canonical", canonical_payload, ts],
                 )
                 .expect("insert canonical changeset");
         }
@@ -1626,11 +1716,11 @@ mod tests {
         assert_eq!(pub_result.publisher_actor_id, "actor:real");
     }
 
-    /// Security BLOCKER regression test: after marking N intents done, the
-    /// `SQLite` intent table must have 0 entries (DELETE, not UPDATE to
-    /// 'done').
+    /// CSID-003 restart-safe idempotency: after marking N intents done, the
+    /// `SQLite` intent table must retain the row with `state = 'done'` so
+    /// that a crash before cursor save still finds the completion marker.
     #[test]
-    fn sqlite_intent_store_mark_done_deletes_entry() {
+    fn sqlite_intent_store_mark_done_retains_durable_marker() {
         use super::SqliteGateStartIntentStore;
 
         let conn = Arc::new(Mutex::new(
@@ -1639,7 +1729,7 @@ mod tests {
         let store = SqliteGateStartIntentStore::new(Arc::clone(&conn)).expect("init store");
 
         let publication = apm2_core::fac::ChangesetPublication {
-            work_id: "W-delete-test".to_string(),
+            work_id: "W-done-test".to_string(),
             changeset_digest: [0xAA; 32],
             bundle_cas_hash: [0xBB; 32],
             published_at_ms: 1_000,
@@ -1656,30 +1746,61 @@ mod tests {
         let pending = store.dequeue_batch(10).expect("dequeue");
         assert_eq!(pending.len(), 1, "one intent should be pending");
 
-        // Mark done — must DELETE, not UPDATE.
+        // Mark done — must UPDATE to 'done', not DELETE.
         let key = super::gate_start_intent_key(&publication.work_id, &publication.changeset_digest);
         store.mark_done(&key).expect("mark done");
 
-        // Verify: the table must have 0 rows.
-        let guard = conn.lock().expect("lock");
-        let count: i64 = guard
+        // Verify: the row exists with state = 'done'.
+        {
+            let guard = conn.lock().expect("lock");
+            let (count, state): (i64, String) = guard
+                .query_row(
+                    "SELECT COUNT(*), state FROM gate_start_intents WHERE intent_key = ?1",
+                    rusqlite::params![key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("query done intent");
+            assert_eq!(count, 1, "intent row must be retained after mark_done");
+            assert_eq!(state, "done", "intent state must be 'done' after mark_done");
+        }
+        // guard dropped — subsequent store methods can acquire the lock.
+
+        // A second enqueue for the same key must be treated as duplicate.
+        let intent2 = super::GateStartIntent { publication };
+        let inserted2 = store.enqueue_many(&[intent2]).expect("re-enqueue");
+        assert_eq!(
+            inserted2, 0,
+            "re-enqueue of done intent must be treated as duplicate"
+        );
+
+        // Dequeue must return 0 pending (done rows are not pending).
+        let pending2 = store.dequeue_batch(10).expect("dequeue after done");
+        assert_eq!(pending2.len(), 0, "no pending intents after mark_done");
+
+        // GC clears rows older than cutoff.
+        let future_ns = i64::MAX - 1;
+        let gc_count = SqliteGateStartIntentStore::gc_completed_before_with_conn(&conn, future_ns)
+            .expect("gc");
+        assert_eq!(gc_count, 1, "GC should delete the completed row");
+
+        let count_after_gc: i64 = conn
+            .lock()
+            .expect("lock for gc count")
             .query_row("SELECT COUNT(*) FROM gate_start_intents", [], |r| r.get(0))
             .expect("count query");
-        assert_eq!(
-            count, 0,
-            "intent table must be empty after mark_done (DELETE, not UPDATE)"
-        );
+        assert_eq!(count_after_gc, 0, "intent table must be empty after GC");
     }
 
-    /// Security BLOCKER regression test: after marking N intents done, the
-    /// in-memory intent store must have 0 entries.
+    /// CSID-003 restart-safe idempotency: after marking N intents done, the
+    /// in-memory intent store must retain the 'done' marker so a re-enqueue
+    /// for the same key is treated as a duplicate.
     #[test]
-    fn memory_intent_store_mark_done_deletes_entry() {
+    fn memory_intent_store_mark_done_retains_marker() {
         use super::MemoryGateStartIntentStore;
 
         let store = MemoryGateStartIntentStore::default();
         let publication = apm2_core::fac::ChangesetPublication {
-            work_id: "W-mem-delete".to_string(),
+            work_id: "W-mem-done".to_string(),
             changeset_digest: [0xCC; 32],
             bundle_cas_hash: [0xDD; 32],
             published_at_ms: 2_000,
@@ -1696,25 +1817,34 @@ mod tests {
         let key = super::gate_start_intent_key(&publication.work_id, &publication.changeset_digest);
         store.mark_done(&key).expect("mark done");
 
-        // All internal collections must be empty.
+        // Pending queue must be empty (done intents are not pending).
         let pending_count = store.pending.lock().expect("lock").len();
-        let states_count = store.states.lock().expect("lock").len();
-        let intents_count = store.intents.lock().expect("lock").len();
         assert_eq!(
             pending_count, 0,
             "pending queue must be empty after mark_done"
         );
-        assert_eq!(states_count, 0, "states map must be empty after mark_done");
+
+        // States map must retain the 'done' marker.
+        let state = store.states.lock().expect("lock").get(&key).cloned();
         assert_eq!(
-            intents_count, 0,
-            "intents map must be empty after mark_done"
+            state.as_deref(),
+            Some("done"),
+            "states map must retain 'done' marker after mark_done"
+        );
+
+        // A second enqueue must be treated as duplicate.
+        let intent2 = super::GateStartIntent { publication };
+        let inserted2 = store.enqueue_many(&[intent2]).expect("re-enqueue");
+        assert_eq!(
+            inserted2, 0,
+            "re-enqueue of done intent must be treated as duplicate"
         );
     }
 
-    /// Security BLOCKER regression test: effect journal deletes completed
-    /// entries to prevent unbounded terminal growth.
+    /// CSID-003 restart-safe idempotency: effect journal retains 'completed'
+    /// marker after `record_completed`. TTL-bounded GC reclaims space.
     #[test]
-    fn effect_journal_record_completed_deletes_entry() {
+    fn effect_journal_record_completed_retains_marker() {
         use super::GateStartEffectJournal;
 
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1730,7 +1860,7 @@ mod tests {
         let state = journal.load_state(&key).expect("load state");
         assert_eq!(state.as_deref(), Some("started"));
 
-        // record_completed deletes the entry.
+        // record_completed retains 'completed' marker.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1744,16 +1874,37 @@ mod tests {
                 .expect("record completed");
         });
 
-        // Verify: no row in the journal.
+        // Verify: row exists with state = 'completed'.
         let state_after = journal.load_state(&key).expect("load state after");
-        assert!(
-            state_after.is_none(),
-            "effect journal entry must be deleted after record_completed"
+        assert_eq!(
+            state_after.as_deref(),
+            Some("completed"),
+            "effect journal entry must be 'completed' after record_completed"
         );
 
-        // Verify row count is 0.
-        let guard = journal.conn.lock().expect("lock");
-        let count: i64 = guard
+        // query_state returns Completed.
+        rt.block_on(async {
+            use apm2_core::orchestrator_kernel::EffectJournal as _;
+            let key_string = key.clone();
+            let ees = journal.query_state(&key_string).await.expect("query_state");
+            assert_eq!(
+                ees,
+                apm2_core::orchestrator_kernel::EffectExecutionState::Completed,
+                "query_state must return Completed"
+            );
+        });
+
+        // GC clears completed entries older than cutoff.
+        let future_ns = i64::MAX - 1;
+        let gc_count =
+            GateStartEffectJournal::gc_completed_before_with_conn(&journal.conn, future_ns)
+                .expect("gc");
+        assert_eq!(gc_count, 1, "GC should delete the completed row");
+
+        let count_after_gc: i64 = journal
+            .conn
+            .lock()
+            .expect("lock")
             .query_row(
                 "SELECT COUNT(*) FROM gate_start_effect_journal_state",
                 [],
@@ -1761,8 +1912,8 @@ mod tests {
             )
             .expect("count query");
         assert_eq!(
-            count, 0,
-            "effect journal table must be empty after record_completed"
+            count_after_gc, 0,
+            "effect journal table must be empty after GC"
         );
     }
 }
