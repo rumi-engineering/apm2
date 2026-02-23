@@ -600,6 +600,18 @@ fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
     let work_id = "W-TCK-00421-RECOVERY";
     let actor_id = "actor:tck-00421";
 
+    // A changeset_published event is required before the IN_PROGRESS -> REVIEW
+    // transition because TCK-00672 enforces fail-closed latest-changeset
+    // admission: the work reducer denies review-start when no
+    // ChangeSetPublished has been observed for the work (CSID-004).
+    let changeset_digest = blake3_hash(format!("changeset:{work_id}"));
+    let changeset_published_payload = serde_json::json!({
+        "work_id": work_id,
+        "changeset_digest": hex::encode(changeset_digest),
+    })
+    .to_string()
+    .into_bytes();
+
     let full_records = vec![
         dotted_opened_event(work_id, actor_id, 10_000, 1),
         dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 10_100, 2),
@@ -614,6 +626,16 @@ fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
             3,
         ),
         dotted_pr_associated_event(work_id, actor_id, 901, "abc123def456", 10_300, 4),
+        // ChangeSetPublished establishes the authoritative changeset identity
+        // for this work, which is required for the review-start gate (CSID-004).
+        event_record(
+            "changeset_published",
+            work_id,
+            actor_id,
+            changeset_published_payload,
+            10_350,
+            5,
+        ),
         dotted_transition_event(
             work_id,
             actor_id,
@@ -622,9 +644,13 @@ fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
             "ready_for_review",
             2,
             10_400,
-            5,
+            6,
         ),
     ];
+    // Number of work.* events that mutate reducer state (changeset_published
+    // is not a work.* event, so it is processed by observe_changeset_bound_event
+    // but not counted by ReplayEquivalenceChecker as an applied work event).
+    let expected_work_event_count = 5usize;
 
     let expected_state = reduce_expected_state(&full_records);
     let full_sync = records_to_sync_events(&full_records, [0u8; 32]);
@@ -689,9 +715,9 @@ fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
         "projection replay after loss + catchup should converge"
     );
     assert_eq!(
-        replay.applied_event_count,
-        full_records.len(),
-        "applied transition side effects should match exactly one full lifecycle"
+        replay.applied_event_count, expected_work_event_count,
+        "applied transition side effects should match exactly one full lifecycle \
+         (changeset_published is not a work.* event and is not counted)"
     );
     assert_eq!(
         replay.deduplicated_event_count,
