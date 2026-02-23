@@ -478,10 +478,6 @@ fn verify_termination_receipt_integrity_for_home(
     Ok(())
 }
 
-fn review_runs_dir_path() -> Result<PathBuf, String> {
-    Ok(review_runs_dir_for_home(&apm2_home_dir()?))
-}
-
 pub fn review_run_state_path(pr_number: u32, review_type: &str) -> Result<PathBuf, String> {
     Ok(review_run_state_path_for_home(
         &apm2_home_dir()?,
@@ -1024,80 +1020,6 @@ pub fn build_review_run_id(
     format!("pr{pr_number}-{review_type}-s{sequence_number}-{head}")
 }
 
-/// Hard cap on directory entries scanned when listing PR numbers.
-/// Prevents unbounded CPU time if the review-runs directory contains
-/// an adversarial number of entries (denial-of-service mitigation).
-/// We scan up to this many raw filesystem entries; within those entries
-/// only valid numeric PR directory names are collected.
-const MAX_REVIEW_DIR_ENTRIES: usize = 10_000;
-
-/// Maximum number of PR numbers retained after scanning. When more valid
-/// PR directories exist than this limit, only the highest (newest) PR
-/// numbers are kept — ensuring deterministic, recency-biased retention
-/// regardless of filesystem iteration order.
-const MAX_REVIEW_PR_NUMBERS: usize = 5_000;
-
-pub fn list_review_pr_numbers() -> Result<Vec<u32>, String> {
-    let root = review_runs_dir_path()?;
-    list_review_pr_numbers_from_dir(&root, MAX_REVIEW_DIR_ENTRIES, MAX_REVIEW_PR_NUMBERS)
-}
-
-/// Deterministic PR number listing with bounded scanning and retention.
-///
-/// Scans up to `scan_cap` directory entries, collecting valid numeric PR
-/// directory names. After scanning, the collected PR numbers are sorted
-/// in ascending order and deduplicated. If more than `retain_cap` unique
-/// PR numbers exist, only the **highest** (newest) are retained — this
-/// guarantees deterministic results regardless of filesystem iteration
-/// order. A warning is emitted to stderr when either cap is reached.
-fn list_review_pr_numbers_from_dir(
-    root: &Path,
-    scan_cap: usize,
-    retain_cap: usize,
-) -> Result<Vec<u32>, String> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let entries = fs::read_dir(root)
-        .map_err(|err| format!("failed to read reviews root {}: {err}", root.display()))?;
-    let mut numbers = Vec::new();
-    let mut scanned: usize = 0;
-    let mut scan_truncated = false;
-    for entry in entries {
-        scanned += 1;
-        if scanned > scan_cap {
-            scan_truncated = true;
-            break;
-        }
-        let Ok(entry) = entry else { continue };
-        if let Some(pr) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        {
-            numbers.push(pr);
-        }
-    }
-    numbers.sort_unstable();
-    numbers.dedup();
-    // Retain only the highest (newest) PR numbers when over the retention cap.
-    // Because `numbers` is sorted ascending, we drop the lowest prefix.
-    let retain_truncated = numbers.len() > retain_cap;
-    if retain_truncated {
-        let start = numbers.len() - retain_cap;
-        numbers.drain(..start);
-    }
-    if scan_truncated || retain_truncated {
-        eprintln!(
-            "warning: review-runs directory listing truncated \
-             (scanned={scanned}, scan_cap={scan_cap}, \
-             retained={}, retain_cap={retain_cap})",
-            numbers.len(),
-        );
-    }
-    Ok(numbers)
-}
-
 // ── ReviewStateFile persistence ─────────────────────────────────────────────
 
 impl ReviewStateFile {
@@ -1389,11 +1311,9 @@ pub fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, Str
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::{
         ReviewRunStateLoad, bind_review_run_state_integrity, build_review_run_id,
-        get_process_start_time, list_review_pr_numbers_from_dir, load_review_run_state_for_home,
+        get_process_start_time, load_review_run_state_for_home,
         load_review_run_state_strict_for_home, load_review_run_state_verified_for_home,
         next_review_sequence_number_for_home, parse_process_start_time, read_run_secret_for_home,
         review_lock_path_for_home, review_run_secret_path_for_home, review_run_state_path_for_home,
@@ -1772,85 +1692,5 @@ mod tests {
             },
             other => panic!("expected present state, got {other:?}"),
         }
-    }
-
-    // ── list_review_pr_numbers deterministic retention tests ─────────────
-
-    #[test]
-    fn test_list_review_pr_numbers_returns_sorted_unique() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        for pr in [10, 5, 20, 15, 5] {
-            fs::create_dir_all(root.join(pr.to_string())).expect("mkdir");
-        }
-        // Also create a non-numeric entry that should be ignored.
-        fs::create_dir_all(root.join("not-a-number")).expect("mkdir");
-
-        let result = list_review_pr_numbers_from_dir(root, 100, 100).expect("list");
-        assert_eq!(result, vec![5, 10, 15, 20]);
-    }
-
-    #[test]
-    fn test_list_review_pr_numbers_empty_dir() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let result = list_review_pr_numbers_from_dir(temp.path(), 100, 100).expect("list");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_list_review_pr_numbers_nonexistent_dir() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let result = list_review_pr_numbers_from_dir(&temp.path().join("does-not-exist"), 100, 100)
-            .expect("list");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_list_review_pr_numbers_retain_cap_keeps_highest() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        // Create PR directories 1..=20.
-        for pr in 1..=20u32 {
-            fs::create_dir_all(root.join(pr.to_string())).expect("mkdir");
-        }
-        // Retain only the top 5 — should keep 16, 17, 18, 19, 20.
-        let result = list_review_pr_numbers_from_dir(root, 10_000, 5).expect("list");
-        assert_eq!(result, vec![16, 17, 18, 19, 20]);
-    }
-
-    #[test]
-    fn test_list_review_pr_numbers_scan_cap_limits_entries() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        // Create 30 PR directories.
-        for pr in 1..=30u32 {
-            fs::create_dir_all(root.join(pr.to_string())).expect("mkdir");
-        }
-        // Scan only 10 entries — we get at most 10 PRs.
-        // The specific PRs depend on filesystem order, but the result
-        // must be sorted and deterministic for a given filesystem state.
-        let result = list_review_pr_numbers_from_dir(root, 10, 10_000).expect("list");
-        assert!(result.len() <= 10, "should scan at most 10 entries");
-        // Verify the result is sorted.
-        let mut sorted = result.clone();
-        sorted.sort_unstable();
-        assert_eq!(result, sorted, "result must be sorted");
-    }
-
-    #[test]
-    fn test_list_review_pr_numbers_retain_cap_deterministic() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        // Create PR directories 100..=200.
-        for pr in 100..=200u32 {
-            fs::create_dir_all(root.join(pr.to_string())).expect("mkdir");
-        }
-        // Retain top 10 — always 191..=200 regardless of filesystem order.
-        let result = list_review_pr_numbers_from_dir(root, 10_000, 10).expect("list");
-        assert_eq!(
-            result,
-            (191..=200).collect::<Vec<u32>>(),
-            "must deterministically retain highest PR numbers"
-        );
     }
 }

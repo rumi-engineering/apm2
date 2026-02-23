@@ -71,8 +71,7 @@ pub use gates::GateThroughputProfile;
 pub use lifecycle::VerdictValueArg;
 use serde::Serialize;
 use state::{
-    list_review_pr_numbers, load_review_run_state, load_review_run_state_strict, read_pulse_file,
-    review_run_state_path,
+    load_review_run_state, load_review_run_state_strict, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
@@ -175,8 +174,7 @@ struct DoctorLifecycleSnapshot {
     retry_budget_remaining: u32,
     updated_at: String,
     last_event_seq: u64,
-    #[serde(skip_serializing)]
-    lifecycle_sha: String,
+    lifecycle_sha: String, // DRA-004: emitted for SHA-alignment auditability
 }
 
 #[derive(Debug, Serialize)]
@@ -2566,19 +2564,14 @@ fn doctor_interrupt_flag() -> Result<Arc<AtomicBool>, String> {
 const MAX_TRACKED_PR_SUMMARIES: usize = 100;
 
 pub fn collect_tracked_pr_summaries(
-    fallback_owner_repo: Option<&str>,
+    _fallback_owner_repo: Option<&str>,
     repo_filter: Option<&str>,
 ) -> Result<Vec<DoctorTrackedPrSummary>, String> {
-    let mut pr_numbers = list_review_pr_numbers()?;
+    let mut candidates = lifecycle::list_all_tracked_prs()?;
+
     // Sort descending so we keep the most recent PRs when truncating.
-    pr_numbers.sort_unstable_by(|a, b| b.cmp(a));
-    let mut candidates = Vec::with_capacity(pr_numbers.len());
-    for pr_number in pr_numbers {
-        let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
-            continue;
-        };
-        candidates.push((pr_number, owner_repo));
-    }
+    candidates.sort_unstable_by(|(a_pr, _), (b_pr, _)| b_pr.cmp(a_pr));
+
     let selected = filter_tracked_pr_candidates(candidates, repo_filter, MAX_TRACKED_PR_SUMMARIES);
 
     let mut summaries = Vec::with_capacity(selected.len());
@@ -2622,27 +2615,11 @@ fn filter_tracked_pr_candidates(
     candidates
         .into_iter()
         .filter(|(_, owner_repo)| tracked_pr_matches_repo_filter(owner_repo, repo_filter))
+        .filter(|(_, owner_repo)| {
+            !owner_repo.starts_with("example/") && !owner_repo.starts_with("test/")
+        })
         .take(limit)
         .collect()
-}
-
-fn resolve_owner_repo_for_pr(pr_number: u32, fallback_owner_repo: Option<&str>) -> Option<String> {
-    for review_type in ["security", "quality"] {
-        if let Ok(Some(state)) = load_review_run_state_strict(pr_number, review_type) {
-            let owner_repo = state.owner_repo.trim().to_ascii_lowercase();
-            if !owner_repo.is_empty() {
-                return Some(owner_repo);
-            }
-        }
-    }
-    fallback_owner_repo.and_then(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        }
-    })
 }
 
 fn tracked_pr_matches_repo_filter(owner_repo: &str, repo_filter: Option<&str>) -> bool {
@@ -5147,8 +5124,14 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DoctorGateFailureSignal {
     None,
-    AlignedTerminalFailure { sha: String, source: DoctorFailureSource },
-    StaleFailure { sha: String, source: DoctorFailureSource },
+    AlignedTerminalFailure {
+        sha: String,
+        source: DoctorFailureSource,
+    },
+    StaleFailure {
+        sha: String,
+        source: DoctorFailureSource,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -5205,7 +5188,7 @@ impl DoctorDecisionFacts {
             .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
 
         let gate_progress_state = derive_doctor_gate_progress_state(input.gates, input.lifecycle);
-        
+
         let mut gate_failure_signal = DoctorGateFailureSignal::None;
 
         if let Some(attempt) = input.latest_push_attempt {
@@ -5242,14 +5225,20 @@ impl DoctorDecisionFacts {
             }
         }
 
-        if gate_failure_signal == DoctorGateFailureSignal::None && gate_progress_state == DoctorGateProgressState::TerminalFailed {
+        if gate_failure_signal == DoctorGateFailureSignal::None
+            && gate_progress_state == DoctorGateProgressState::TerminalFailed
+        {
             gate_failure_signal = DoctorGateFailureSignal::AlignedTerminalFailure {
                 sha: input.authoritative_sha.to_string(),
                 source: DoctorFailureSource::GateProjection,
             };
         }
 
-        let has_gate_failure_signal = matches!(gate_failure_signal, DoctorGateFailureSignal::AlignedTerminalFailure { .. } | DoctorGateFailureSignal::StaleFailure { .. });
+        let has_gate_failure_signal = matches!(
+            gate_failure_signal,
+            DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                | DoctorGateFailureSignal::StaleFailure { .. }
+        );
 
         let projection_gap_requires_fix = input.repair_signals.projection_comment_binding_missing
             && input.merge_readiness.all_verdicts_approve
@@ -5306,19 +5295,28 @@ fn doctor_decision_guard_triggered(rule: &DoctorDecisionRule, facts: &DoctorDeci
         DoctorDecisionGuard::MergeReady => facts.merge_ready,
         DoctorDecisionGuard::ShaFreshnessStale => {
             facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
-                && !matches!(facts.gate_failure_signal, DoctorGateFailureSignal::AlignedTerminalFailure { .. })
+                && !matches!(
+                    facts.gate_failure_signal,
+                    DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                )
         },
         DoctorDecisionGuard::ApproveEligible => {
             facts.all_verdicts_approve
                 && !facts.has_actionable_findings
                 && facts.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
                 && facts.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
-                && !matches!(facts.gate_failure_signal, DoctorGateFailureSignal::AlignedTerminalFailure { .. })
+                && !matches!(
+                    facts.gate_failure_signal,
+                    DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                )
         },
         DoctorDecisionGuard::MergeConflictsPresent => {
             facts.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts
         },
-        DoctorDecisionGuard::GateFailureSignal => matches!(facts.gate_failure_signal, DoctorGateFailureSignal::AlignedTerminalFailure { .. }),
+        DoctorDecisionGuard::GateFailureSignal => matches!(
+            facts.gate_failure_signal,
+            DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+        ),
         DoctorDecisionGuard::ImplementorRemediationResolved => {
             facts.requires_implementor_remediation && facts.all_verdicts_resolved
         },
@@ -5863,6 +5861,12 @@ impl DoctorGateProgressFacts {
         let mut has_in_flight_gate = false;
         let lifecycle_gates_failed =
             lifecycle.is_some_and(|entry| entry.state.eq_ignore_ascii_case("gates_failed"));
+        // NOTE: SHA alignment for the lifecycle gates_failed signal is enforced one
+        // level up in DoctorDecisionFacts::from_input (block 2), which sets
+        // StaleFailure before block 3 can branch on gate_progress_state ==
+        // TerminalFailed. This function is intentionally not SHA-aware; its
+        // output is consumed only by gate-progress rules that do not produce
+        // terminal actions directly. (DRA-001, DRA-002)
         let mut has_failed_gate = lifecycle_gates_failed;
         let mut has_passed_gate = false;
         for gate in gates {
@@ -8524,7 +8528,6 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
         let command = action.command.expect("wait command");
         assert!(command.contains("--wait-for-recommended-action"));
@@ -8734,7 +8737,6 @@ mod tests {
         };
         let action =
             build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 
@@ -8881,7 +8883,6 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
         let command = action.command.expect("wait command");
         assert!(command.contains("--wait-for-recommended-action"));
@@ -8916,7 +8917,6 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
         assert!(action.reason.contains("gates are still in progress"));
         let command = action.command.expect("wait command");
@@ -8982,7 +8982,6 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 
@@ -9017,7 +9016,6 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
         assert!(action.reason.contains("gates are still in progress"));
     }
@@ -9028,14 +9026,13 @@ mod tests {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = Vec::new();
-        
+
         let mut lifecycle = doctor_lifecycle_fixture("gates_failed", 1, 0, 12);
         // Make the lifecycle SHA mismatched
         lifecycle.lifecycle_sha = "some_other_stale_sha".to_string();
 
-        let mut readiness = doctor_merge_readiness_fixture(
-            super::DoctorMergeConflictStatus::Unknown,
-        );
+        let mut readiness =
+            doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown);
         readiness.sha_freshness_source = super::DoctorShaFreshnessSource::Unknown;
 
         let action = super::build_recommended_action(&super::DoctorActionInputs {
@@ -9059,8 +9056,8 @@ mod tests {
                         started_at: "2026-02-15T00:00:00Z".to_string(),
                         completion_status: None,
                         completion_summary: None,
-                        completion_token_hash: "".to_string(),
-                        completion_token_expires_at: "".to_string(),
+                        completion_token_hash: String::new(),
+                        completion_token_expires_at: String::new(),
                         elapsed_seconds: Some(10),
                         models_attempted: Vec::new(),
                         tool_call_count: None,
@@ -9076,7 +9073,6 @@ mod tests {
             merge_readiness: &readiness,
             latest_push_attempt: None,
         });
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 
@@ -9145,7 +9141,67 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_gate_failure_overrides_stale_identity_fix() {
+    fn test_build_recommended_action_waits_when_push_attempt_failed_stage_for_different_sha() {
+        // DRA-005: push attempt failed gate stage for different SHA -> does not trigger
+        // dispatch
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = Vec::new();
+        let push_attempt = super::DoctorPushAttemptSummary {
+            ts: "fixture-ts".to_string(),
+            sha: "deadbeefdeadbeefdeadbeefdeadbeef00000000".to_string(),
+            failed_stage: Some("gate_test".to_string()),
+            exit_code: Some(1),
+            duration_s: Some(30),
+            error_hint: Some("gate timeout".to_string()),
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 1,
+                    total_agents: 1,
+                    entries: vec![super::DoctorAgentSnapshot {
+                        agent_type: "security".to_string(),
+                        state: "running".to_string(),
+                        run_id: "run-1".to_string(),
+                        sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                        pid: Some(1234),
+                        pid_alive: true,
+                        started_at: "2026-02-15T00:00:00Z".to_string(),
+                        completion_status: None,
+                        completion_summary: None,
+                        completion_token_hash: String::new(),
+                        completion_token_expires_at: String::new(),
+                        elapsed_seconds: Some(10),
+                        models_attempted: Vec::new(),
+                        tool_call_count: None,
+                        log_line_count: None,
+                        last_activity_seconds_ago: Some(0),
+                        nudge_count: None,
+                    }],
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: Some(&push_attempt),
+        });
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
+    fn test_build_recommended_action_gate_projection_fail_triggers_dispatch_despite_stale_sha_freshness()
+     {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
@@ -9261,7 +9317,6 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 
@@ -9380,7 +9435,6 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 
@@ -9402,7 +9456,6 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
         assert!(
             action
@@ -9489,7 +9542,6 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        println!("{:#?}", action);
         assert_eq!(action.action, "wait");
     }
 

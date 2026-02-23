@@ -233,9 +233,9 @@ pub fn run_findings(
 ) -> Result<u8, String> {
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let resolved_sha = resolve_head_sha(&owner_repo, resolved_pr, sha)?;
-    let bundle = findings_store::load_findings_bundle(&owner_repo, resolved_pr, &resolved_sha)?;
+    let bundles = findings_store::load_all_findings_bundles(&owner_repo, resolved_pr)?;
 
-    let report = build_findings_report(&owner_repo, resolved_pr, &resolved_sha, bundle.as_ref());
+    let report = build_findings_report(&owner_repo, resolved_pr, &resolved_sha, &bundles);
     emit_report(&report, json_output)?;
 
     if report.fail_closed {
@@ -269,13 +269,13 @@ fn build_findings_report(
     owner_repo: &str,
     pr_number: u32,
     head_sha: &str,
-    bundle: Option<&FindingsBundle>,
+    bundles: &[FindingsBundle],
 ) -> FindingsReport {
     let mut errors = Vec::new();
     let mut dimensions = Vec::with_capacity(2);
 
     for dimension in [SECURITY_DIMENSION, CODE_QUALITY_DIMENSION] {
-        let view = build_dimension_findings(owner_repo, pr_number, head_sha, dimension, bundle);
+        let view = build_dimension_findings(owner_repo, pr_number, head_sha, dimension, bundles);
         if let Some(error) = &view.error {
             errors.push(format!("{}: {error}", view.dimension));
         }
@@ -310,7 +310,7 @@ fn build_dimension_findings(
     pr_number: u32,
     head_sha: &str,
     dimension: &str,
-    bundle: Option<&FindingsBundle>,
+    bundles: &[FindingsBundle],
 ) -> DimensionFindings {
     let resolved_verdict = match verdict_projection::resolve_verdict_for_dimension(
         owner_repo, pr_number, head_sha, dimension,
@@ -328,7 +328,7 @@ fn build_dimension_findings(
     };
 
     let mut findings = Vec::new();
-    if let Some(bundle) = bundle {
+    for bundle in bundles {
         if bundle.schema != findings_store::FINDINGS_BUNDLE_SCHEMA {
             return DimensionFindings {
                 dimension: dimension.to_string(),
@@ -342,11 +342,9 @@ fn build_dimension_findings(
             };
         }
         if let Some(stored_dimension) = findings_store::find_dimension(bundle, dimension) {
-            findings = stored_dimension
-                .findings
-                .iter()
-                .map(|entry| to_finding_record(owner_repo, pr_number, head_sha, dimension, entry))
-                .collect::<Vec<_>>();
+            findings.extend(stored_dimension.findings.iter().map(|entry| {
+                to_finding_record(owner_repo, pr_number, &bundle.head_sha, dimension, entry)
+            }));
         }
     }
 
@@ -532,7 +530,7 @@ mod tests {
             "guardian-intelligence/apm2",
             482,
             "0123456789abcdef0123456789abcdef01234567",
-            Some(&bundle),
+            &[bundle],
         );
 
         assert_eq!(report.overall_status, "PENDING");

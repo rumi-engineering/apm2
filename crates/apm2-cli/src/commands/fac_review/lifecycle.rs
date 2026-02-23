@@ -46,6 +46,7 @@ const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
 const MAX_PR_STATE_SCAN_ENTRIES: usize = 4096;
+const MAX_REPO_DIR_SCAN_ENTRIES: usize = 512;
 const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1264,6 +1265,55 @@ fn parse_pr_number_from_state_file_name(file_name: &str) -> Option<u32> {
         return None;
     }
     value.parse::<u32>().ok()
+}
+
+pub fn list_all_tracked_prs() -> Result<Vec<(u32, String)>, String> {
+    let pr_root = lifecycle_root()?.join("pr");
+    if !pr_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(&pr_root).map_err(|err| {
+        format!(
+            "failed to list lifecycle repos directory {}: {err}",
+            pr_root.display()
+        )
+    })?;
+
+    let mut tracked_prs = Vec::new();
+
+    for (repo_idx, entry) in entries.flatten().enumerate() {
+        if repo_idx >= MAX_REPO_DIR_SCAN_ENTRIES {
+            break;
+        }
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let repo_dir = entry.path();
+            if let Ok(pr_entries) = fs::read_dir(&repo_dir) {
+                for (idx, pr_entry) in pr_entries.enumerate() {
+                    if idx >= MAX_PR_STATE_SCAN_ENTRIES {
+                        break;
+                    }
+                    if let Ok(pr_entry) = pr_entry {
+                        let file_name = pr_entry.file_name().to_string_lossy().to_string();
+                        if let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) {
+                            // read the state to get the real owner_repo
+                            if let Ok(bytes) = fs::read(pr_entry.path()) {
+                                if let Ok(state) =
+                                    serde_json::from_slice::<PrLifecycleRecord>(&bytes)
+                                {
+                                    tracked_prs.push((pr_number, state.owner_repo));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracked_prs.sort_unstable();
+    tracked_prs.dedup();
+    Ok(tracked_prs)
 }
 
 fn list_repo_pr_numbers(owner_repo: &str) -> Result<Vec<u32>, String> {
