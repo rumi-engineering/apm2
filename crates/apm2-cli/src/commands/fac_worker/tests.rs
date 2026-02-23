@@ -1636,6 +1636,11 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
     let claimed_path = queue_root.join(CLAIMED_DIR).join("gates-test.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-test.json";
+    let claimed_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claimed_path)
+        .expect("open claimed lock file");
 
     let spec = make_receipt_test_spec();
     let boundary_trace = ChannelBoundaryTrace {
@@ -1661,6 +1666,7 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
         &spec,
         &claimed_path,
         claimed_file_name,
+        claimed_lock_file,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1726,6 +1732,11 @@ fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_tr
         .join("gates-lifecycle-illegal.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-lifecycle-illegal.json";
+    let claimed_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claimed_path)
+        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -1767,6 +1778,7 @@ fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_tr
         &spec,
         &claimed_path,
         claimed_file_name,
+        claimed_lock_file,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1819,6 +1831,11 @@ fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
         .join("gates-lease-binding.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-lease-binding.json";
+    let claimed_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claimed_path)
+        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -1862,6 +1879,7 @@ fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
         &spec,
         &claimed_path,
         claimed_file_name,
+        claimed_lock_file,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1916,6 +1934,11 @@ fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
         .join("gates-failure-summary.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-failure-summary.json";
+    let claimed_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claimed_path)
+        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -1957,6 +1980,7 @@ fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
         &spec,
         &claimed_path,
         claimed_file_name,
+        claimed_lock_file,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -2004,6 +2028,11 @@ fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
         .join("gates-bounded-reason.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-bounded-reason.json";
+    let claimed_lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&claimed_path)
+        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -2045,6 +2074,7 @@ fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
         &spec,
         &claimed_path,
         claimed_file_name,
+        claimed_lock_file,
         &queue_root,
         &fac_root,
         &boundary_trace,

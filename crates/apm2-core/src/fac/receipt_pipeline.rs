@@ -63,7 +63,7 @@ use super::receipt::{
 };
 use super::receipt_index::ReceiptIndexV1;
 use super::signed_receipt::{persist_signed_envelope, sign_receipt};
-use crate::fac::flock_util::acquire_exclusive_blocking;
+use crate::fac::flock_util::try_acquire_exclusive_nonblocking;
 
 // =============================================================================
 // Constants
@@ -89,6 +89,13 @@ const MAX_PATH_LENGTH: usize = 4096;
 
 /// Maximum length for a file name component (CTR-1504).
 const MAX_FILE_NAME_LENGTH: usize = 255;
+
+/// Maximum bounded wait for claimed-file lock acquisition during commit.
+///
+/// This prevents unbounded hangs when a caller accidentally holds the claimed
+/// lock while still tolerating short-lived contention from concurrent
+/// reconciler probes.
+const CLAIMED_LOCK_WAIT_TIMEOUT_MS: u64 = 1_000;
 
 // =============================================================================
 // Error Types
@@ -528,13 +535,25 @@ impl ReceiptWritePipeline {
                 });
             },
         };
-        acquire_exclusive_blocking(&claimed_file).map_err(|e| {
+        match try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
             ReceiptPipelineError::JobMoveFailed {
                 from: claimed_path.to_string_lossy().to_string(),
                 to: dest_dir.to_string_lossy().to_string(),
                 reason: format!("failed to acquire advisory lock on claimed file: {e}"),
             }
-        })?;
+        })? {
+            true => {},
+            false => {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!(
+                        "claimed file is already locked after {}ms timeout",
+                        CLAIMED_LOCK_WAIT_TIMEOUT_MS
+                    ),
+                });
+            },
+        }
         let _claimed_lock_guard = claimed_file;
 
         // Step 1: Persist the receipt (content-addressed, idempotent).
@@ -635,13 +654,25 @@ impl ReceiptWritePipeline {
                 });
             },
         };
-        acquire_exclusive_blocking(&claimed_file).map_err(|e| {
+        match try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
             ReceiptPipelineError::JobMoveFailed {
                 from: claimed_path.to_string_lossy().to_string(),
                 to: dest_dir.to_string_lossy().to_string(),
                 reason: format!("failed to acquire advisory lock on claimed file: {e}"),
             }
-        })?;
+        })? {
+            true => {},
+            false => {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!(
+                        "claimed file is already locked after {}ms timeout",
+                        CLAIMED_LOCK_WAIT_TIMEOUT_MS
+                    ),
+                });
+            },
+        }
         let _claimed_lock_guard = claimed_file;
 
         // Step 1: Persist the receipt (content-addressed, idempotent).
@@ -1036,6 +1067,25 @@ fn open_claimed_file_for_lock(path: &Path) -> std::io::Result<File> {
     }
 }
 
+/// Acquire claimed-file lock with bounded retry.
+///
+/// Uses non-blocking flock probes in a short loop to avoid unbounded waits.
+/// Returns `Ok(true)` when lock is acquired, `Ok(false)` on timeout, and
+/// `Err(_)` on flock probe failures.
+fn try_acquire_claimed_lock_with_timeout(file: &File) -> std::io::Result<bool> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(CLAIMED_LOCK_WAIT_TIMEOUT_MS);
+    loop {
+        if try_acquire_exclusive_nonblocking(file)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Locate an already-moved terminal job path for idempotent commit handling.
 ///
 /// Returns either the exact destination filename or a collision-safe filename
@@ -1332,6 +1382,49 @@ mod tests {
                 .job_terminal_path
                 .to_string_lossy()
                 .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn test_commit_fails_fast_when_claimed_file_lock_is_busy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-lock-busy");
+
+        // Hold the claimed-file flock from this process to emulate the worker's
+        // outer claimed lock. The pipeline must fail fast instead of blocking.
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed for lock");
+        crate::fac::flock_util::acquire_exclusive_blocking(&lock_file)
+            .expect("acquire outer claimed lock");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-lock-busy", FacJobOutcome::Completed);
+        let err = pipeline
+            .commit(
+                &receipt,
+                &claimed_path,
+                "job-lock-busy.json",
+                TerminalState::Completed,
+            )
+            .expect_err("lock contention must fail fast");
+
+        match err {
+            ReceiptPipelineError::JobMoveFailed { reason, .. } => {
+                assert!(
+                    reason.contains("already locked"),
+                    "expected lock-contention failure reason, got: {reason}"
+                );
+            },
+            other => panic!("expected JobMoveFailed on lock contention, got {other:?}"),
+        }
+        assert!(
+            claimed_path.exists(),
+            "claimed file must remain in place when commit cannot acquire lock"
         );
     }
 

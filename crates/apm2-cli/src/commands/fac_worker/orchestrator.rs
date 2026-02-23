@@ -104,6 +104,20 @@ pub(super) struct WorkerOrchestrator {
     staged_outcome: Option<JobOutcome>,
 }
 
+fn release_claimed_lock_for_terminal_transition(
+    claimed_lock_file: &mut Option<fs::File>,
+    job_id: &str,
+    phase: &str,
+) {
+    if claimed_lock_file.take().is_some() {
+        tracing::debug!(
+            job_id,
+            phase,
+            "released claimed-file lock before terminal queue transition"
+        );
+    }
+}
+
 fn emit_failed_lifecycle_event_before_denied_move(
     fac_root: &Path,
     spec: &FacJobSpecV1,
@@ -1906,6 +1920,7 @@ impl WorkerOrchestrator {
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                claimed_lock_file,
                 queue_root,
                 fac_root,
                 &boundary_trace,
@@ -2017,6 +2032,7 @@ impl WorkerOrchestrator {
             sbx_hash,
             resolved_net_hash,
         } = claimed;
+        let mut claimed_lock_file = Some(claimed_lock_file);
         if let Err(error) = run_preflight(
             fac_root,
             &lane_mgr,
@@ -2025,6 +2041,11 @@ impl WorkerOrchestrator {
         ) {
             let reason = format!("preflight failed: {error:?}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            release_claimed_lock_for_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "lane_prepared_preflight_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -2068,6 +2089,11 @@ impl WorkerOrchestrator {
             Err(e) => {
                 let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                release_claimed_lock_for_terminal_transition(
+                    &mut claimed_lock_file,
+                    &spec.job_id,
+                    "lane_prepared_profile_load_denied",
+                );
                 if let Err(commit_err) = commit_claimed_job_via_pipeline(
                     fac_root,
                     queue_root,
@@ -2153,6 +2179,11 @@ impl WorkerOrchestrator {
             Err(e) => {
                 let reason = format!("failed to create lane lease: {e}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                release_claimed_lock_for_terminal_transition(
+                    &mut claimed_lock_file,
+                    &spec.job_id,
+                    "lane_prepared_lease_build_denied",
+                );
                 if let Err(commit_err) = commit_claimed_job_via_pipeline(
                     fac_root,
                     queue_root,
@@ -2190,6 +2221,11 @@ impl WorkerOrchestrator {
         if let Err(e) = lane_lease.persist(&lane_dir) {
             let reason = format!("failed to persist lane lease: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            release_claimed_lock_for_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "lane_prepared_lease_persist_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -2225,6 +2261,11 @@ impl WorkerOrchestrator {
         }
 
         let lane_workspace = lane_mgr.lane_dir(&acquired_lane_id).join("workspace");
+        let Some(claimed_lock_file) = claimed_lock_file else {
+            return LanePreparedOutcome::Done(JobOutcome::skipped(
+                "claimed lock released unexpectedly before lane prepared success",
+            ));
+        };
 
         LanePreparedOutcome::Advanced(Box::new(LeasePersistedContext {
             acquired: LaneAcquiredContext {
@@ -2284,13 +2325,22 @@ impl WorkerOrchestrator {
         let ClaimedContext {
             claimed_path,
             claimed_file_name,
-            claimed_lock_file: _claimed_lock_file,
+            claimed_lock_file,
             boundary_trace,
             queue_trace,
             budget_trace,
             sbx_hash,
             resolved_net_hash,
         } = claimed;
+        let mut claimed_lock_file = Some(claimed_lock_file);
+        // Once the RUNNING lane lease is persisted, queue reconcile suppresses this
+        // job via lane active-job sets. Release the claimed lock before any terminal
+        // commit path to avoid self-deadlock in the receipt pipeline lock probe.
+        release_claimed_lock_for_terminal_transition(
+            &mut claimed_lock_file,
+            &spec.job_id,
+            "lane_lease_persisted_execution_phase",
+        );
 
         let job_wall_start = Instant::now();
         let lane_workspace = persisted_lane_workspace;

@@ -2788,10 +2788,27 @@ fn run_system_doctor_fix_with_hooks(
 
     match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
         Ok(receipt) => {
+            let still_active_flock_held = receipt
+                .queue_actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        apm2_core::fac::QueueRecoveryAction::StillActive { lane_id, .. }
+                            if lane_id == "flock_held"
+                    )
+                })
+                .count();
+            let has_running_lane = manager.all_lane_statuses().ok().is_some_and(|statuses| {
+                statuses
+                    .iter()
+                    .any(|status| status.state == LaneState::Running)
+            });
             if receipt.stale_leases_recovered > 0
                 || receipt.orphaned_jobs_requeued > 0
                 || receipt.orphaned_jobs_failed > 0
                 || receipt.torn_states_recovered > 0
+                || (still_active_flock_held > 0 && !has_running_lane)
             {
                 should_restart_worker = true;
             }
@@ -2801,13 +2818,15 @@ fn run_system_doctor_fix_with_hooks(
                 SystemDoctorFixActionStatus::Applied,
                 None,
                 format!(
-                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={}",
+                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={} still_active_flock_held={} running_lane_present={}",
                     receipt.lanes_inspected,
                     receipt.stale_leases_recovered,
                     receipt.orphaned_jobs_requeued,
                     receipt.orphaned_jobs_failed,
                     receipt.torn_states_recovered,
-                    receipt.lanes_marked_corrupt
+                    receipt.lanes_marked_corrupt,
+                    still_active_flock_held,
+                    has_running_lane
                 ),
             );
         },
@@ -8469,6 +8488,82 @@ mod tests {
                 .exists(),
             "claimed job should not remain in claimed after idempotent repair"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_restarts_worker_for_still_active_claimed_lock_without_running_lane() {
+        use fs2::FileExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let claimed_path = queue_root
+            .join("claimed")
+            .join("doctor-fix-flock-held-job.json");
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "doctor-fix-flock-held-job",
+            "kind": "gates",
+        });
+        std::fs::write(
+            &claimed_path,
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed job"),
+        )
+        .expect("write claimed job");
+
+        // Hold the claimed-file lock from this process so queue reconcile sees
+        // a still-active flock-held entry while no lane is RUNNING.
+        let claimed_lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed file for lock");
+        claimed_lock_file
+            .lock_exclusive()
+            .expect("acquire claimed lock");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should complete even when claimed lock is held"
+        );
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "still-active flock-held claimed jobs with no running lanes must trigger worker restart"
+        );
+        assert!(
+            claimed_path.exists(),
+            "doctor should not mutate the claimed file while flock-held"
+        );
+
+        drop(claimed_lock_file);
     }
 
     #[cfg(unix)]

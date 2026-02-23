@@ -399,11 +399,26 @@ pub(super) fn apply_gates_job_lifecycle_events(
     })
 }
 
+fn release_claimed_lock_before_terminal_transition(
+    claimed_lock_file: &mut Option<fs::File>,
+    job_id: &str,
+    phase: &str,
+) {
+    if claimed_lock_file.take().is_some() {
+        tracing::debug!(
+            job_id,
+            phase,
+            "released claimed-file lock before terminal queue transition"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_queued_gates_job(
     spec: &FacJobSpecV1,
     claimed_path: &Path,
     claimed_file_name: &str,
+    claimed_lock_file: fs::File,
     queue_root: &Path,
     fac_root: &Path,
     boundary_trace: &ChannelBoundaryTrace,
@@ -420,11 +435,17 @@ pub(super) fn execute_queued_gates_job(
     // TCK-00538: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
+    let mut claimed_lock_file = Some(claimed_lock_file);
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
         Ok(options) => options,
         Err(reason) => {
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "gates_parse_options_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -468,6 +489,11 @@ pub(super) fn execute_queued_gates_job(
                 options.workspace_root.display()
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "gates_resolve_head_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -508,6 +534,11 @@ pub(super) fn execute_queued_gates_job(
             spec.source.head_sha
         );
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        release_claimed_lock_before_terminal_transition(
+            &mut claimed_lock_file,
+            &spec.job_id,
+            "gates_head_mismatch_denied",
+        );
         if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
@@ -560,6 +591,11 @@ pub(super) fn execute_queued_gates_job(
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "gates_execution_error_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -601,6 +637,11 @@ pub(super) fn execute_queued_gates_job(
     if gate_run_result.exit_code == exit_codes::SUCCESS {
         if let Err(err) = lifecycle_update_result {
             let reason = format!("gates passed but lifecycle update failed: {err}");
+            release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "gates_lifecycle_update_denied",
+            );
             if let Err(commit_err) = commit_claimed_job_via_pipeline(
                 fac_root,
                 queue_root,
@@ -637,6 +678,11 @@ pub(super) fn execute_queued_gates_job(
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        release_claimed_lock_before_terminal_transition(
+            &mut claimed_lock_file,
+            &spec.job_id,
+            "gates_completed_commit",
+        );
         if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
@@ -661,6 +707,11 @@ pub(super) fn execute_queued_gates_job(
             toolchain_fingerprint,
         ) {
             eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
+            release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
+                &spec.job_id,
+                "gates_commit_failure_release_to_pending",
+            );
             if let Err(move_err) = release_claimed_job_to_pending(
                 claimed_path,
                 queue_root,
@@ -726,6 +777,11 @@ pub(super) fn execute_queued_gates_job(
         _ => truncate_receipt_reason(&base_reason),
     };
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    release_claimed_lock_before_terminal_transition(
+        &mut claimed_lock_file,
+        &spec.job_id,
+        "gates_failed_denied_commit",
+    );
     if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
         queue_root,
