@@ -384,7 +384,43 @@ enum PrePushExecutionError {
     GitPush(String),
 }
 
+const FAST_CHECKS_ALREADY_COMPLETED_ERROR: &str =
+    "internal invariant violation: fast checks already marked complete";
+const FAST_CHECKS_NOT_COMPLETED_ERROR: &str =
+    "internal invariant violation: fast checks must complete before gate execution";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushPreflightState {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastChecksToken {
+    _private: (),
+}
+
+impl PushPreflightState {
+    fn mark_fast_checks_completed(&mut self) -> Result<(), String> {
+        match self {
+            Self::Pending => {
+                *self = Self::Completed;
+                Ok(())
+            },
+            Self::Completed => Err(FAST_CHECKS_ALREADY_COMPLETED_ERROR.to_string()),
+        }
+    }
+
+    fn fast_checks_token(self) -> Result<FastChecksToken, String> {
+        match self {
+            Self::Pending => Err(FAST_CHECKS_NOT_COMPLETED_ERROR.to_string()),
+            Self::Completed => Ok(FastChecksToken { _private: () }),
+        }
+    }
+}
+
 fn run_pre_push_sequence_with<FGates, FSync, FPush>(
+    _fast_checks_token: FastChecksToken,
     mut run_gates_fn: FGates,
     mut sync_ruleset_fn: FSync,
     mut git_push_fn: FPush,
@@ -2560,7 +2596,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     // execution. This ordering is a push contract: no gate job may be enqueued
     // until identity/worktree/head checks complete successfully.
     let fast_checks_started = Instant::now();
-    let mut fast_checks_completed = false;
+    let mut preflight_state = PushPreflightState::Pending;
     emit_stage(
         "fast_checks_started",
         serde_json::json!({
@@ -2692,13 +2728,9 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             )
         );
     }
-    if fast_checks_completed {
-        fail_with_attempt!(
-            "fac_push_fast_checks_state_invalid",
-            "internal invariant violation: fast checks already marked complete"
-        );
+    if let Err(err) = preflight_state.mark_fast_checks_completed() {
+        fail_with_attempt!("fac_push_fast_checks_state_invalid", err);
     }
-    fast_checks_completed = true;
     emit_stage(
         "fast_checks_completed",
         serde_json::json!({
@@ -2720,13 +2752,14 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let mut ruleset_sync_error_hint: Option<String> = None;
     let mut ruleset_sync_executed = false;
     let mut ruleset_sync_passed = false;
-    if !fast_checks_completed {
-        fail_with_attempt!(
-            "fac_push_fast_checks_not_completed",
-            "internal invariant violation: fast checks must complete before gate execution"
-        );
-    }
+    let fast_checks_token = match preflight_state.fast_checks_token() {
+        Ok(token) => token,
+        Err(err) => {
+            fail_with_attempt!("fac_push_fast_checks_not_completed", err);
+        },
+    };
     let gate_outcome = match run_pre_push_sequence_with(
+        fast_checks_token,
         || {
             let _phase_progress = PushPhaseProgressTicker::start("gates", json_output);
             human_log!(
@@ -4471,12 +4504,44 @@ mod tests {
         }
     }
 
+    fn ready_fast_checks_token_for_tests() -> FastChecksToken {
+        let mut state = PushPreflightState::Pending;
+        state
+            .mark_fast_checks_completed()
+            .expect("fast checks should transition to completed in tests");
+        state
+            .fast_checks_token()
+            .expect("completed state should mint fast checks token in tests")
+    }
+
+    #[test]
+    fn push_preflight_state_requires_completed_checks_before_gate_token() {
+        let state = PushPreflightState::Pending;
+        let err = state
+            .fast_checks_token()
+            .expect_err("pending state must not mint gate token");
+        assert_eq!(err, FAST_CHECKS_NOT_COMPLETED_ERROR);
+    }
+
+    #[test]
+    fn push_preflight_state_rejects_duplicate_completion_transition() {
+        let mut state = PushPreflightState::Pending;
+        state
+            .mark_fast_checks_completed()
+            .expect("first completion transition should succeed");
+        let err = state
+            .mark_fast_checks_completed()
+            .expect_err("duplicate completion transition must fail closed");
+        assert_eq!(err, FAST_CHECKS_ALREADY_COMPLETED_ERROR);
+    }
+
     #[test]
     fn run_pre_push_sequence_with_enforces_gates_then_ruleset_sync_then_git_push() {
         let calls = std::cell::RefCell::new(Vec::new());
         let expected_results = seed_required_pass_results();
         let sha = "f".repeat(40);
         let outcome = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Ok(queued_outcome_with(
@@ -4504,6 +4569,7 @@ mod tests {
     fn run_pre_push_sequence_with_stops_before_remote_side_effects_on_gate_failure() {
         let calls = std::cell::RefCell::new(Vec::new());
         let error = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Err("gate failed".to_string())
@@ -4530,6 +4596,7 @@ mod tests {
     fn run_pre_push_sequence_with_stops_before_git_push_when_ruleset_sync_fails() {
         let calls = std::cell::RefCell::new(Vec::new());
         let error = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Ok(queued_outcome_with(
