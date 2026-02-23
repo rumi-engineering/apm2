@@ -3160,20 +3160,35 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         if self.is_frozen_internal() {
+            // TCK-00669 MINOR fix: Parse the numeric seq_id from the cursor
+            // string in Rust and compare `seq_id > ?` directly, instead of
+            // computing `printf('canonical-%020d', seq_id)` per row. This
+            // allows SQLite to use the index on `seq_id`.
+            let cursor_seq_id =
+                Self::parse_canonical_event_id(&normalized_cursor_event_id).unwrap_or(-1);
+
             let canonical_sql = format!(
                 "SELECT seq_id, event_type, session_id, actor_id, payload, \
                         COALESCE(signature, X''), timestamp_ns \
                  FROM events \
-                 WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND printf('canonical-%020d', seq_id) > ?)) \
+                 WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND seq_id > ?)) \
                    AND event_type IN ({placeholders}) \
                  ORDER BY timestamp_ns ASC, seq_id ASC \
                  LIMIT ?"
             );
 
+            let mut canonical_params = Vec::with_capacity(event_types.len() + 4);
+            canonical_params.push(Value::Integer(cursor_timestamp_i64));
+            canonical_params.push(Value::Integer(cursor_timestamp_i64));
+            canonical_params.push(Value::Integer(cursor_seq_id));
+            for event_type in event_types {
+                canonical_params.push(Value::Text((*event_type).to_string()));
+            }
+            canonical_params.push(Value::Integer(limit_i64));
+
             if let Ok(mut stmt) = conn.prepare(&canonical_sql) {
-                let params = build_params();
                 if let Ok(rows) = stmt.query_map(
-                    params_from_iter(params.iter()),
+                    params_from_iter(canonical_params.iter()),
                     Self::canonical_row_to_event,
                 ) {
                     events.extend(rows.filter_map(Result::ok));

@@ -96,12 +96,18 @@ pub(super) fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String
 /// Atomically claim a pending queue entry and hold an exclusive flock on the
 /// claimed inode for the caller's full processing lifetime.
 ///
-/// Synchronization model:
-/// - Open+lock the pending inode first.
-/// - If dual-write is enabled, attempt `fac.job.claimed` emission (best-effort,
-///   warning on failure).
-/// - Atomically rename `pending/<file>` -> `claimed/<file>`.
-/// - Keep the returned file descriptor alive until processing/commit finishes.
+/// Synchronization model (move-first ordering):
+/// 1. Open+lock the pending inode with an exclusive flock.
+/// 2. Atomically rename `pending/<file>` -> `claimed/<file>` FIRST.
+/// 3. After the successful move, read the claimed file and attempt
+///    `fac.job.claimed` lifecycle emission (best-effort, warning on failure).
+/// 4. Keep the returned file descriptor alive until processing/commit finishes.
+///
+/// Move-first is essential: if deserialization or emit fails after the move,
+/// the file is safely in `claimed/` where the orchestrator's existing path
+/// routes unreadable files to `denied/`. Without move-first, a malformed
+/// payload would leave the file stuck in `pending/` permanently (the original
+/// round-8 security bug).
 ///
 /// This ensures runtime reconcile's non-blocking flock probe never treats an
 /// actively executing claimed job as orphaned.
