@@ -9595,7 +9595,7 @@ mod tests {
     ///
     /// Proves: When both `ledger_events` (legacy) and `events` (canonical)
     /// tables exist, `poll_events` merges results from both sources and
-    /// synthesises `event_id` = `"canonical-{seq_id}"` for canonical rows.
+    /// synthesises `event_id` = `"canonical-{seq_id:020}"` for canonical rows.
     #[test]
     fn test_tailer_poll_events_discovers_canonical_events() {
         use prost::Message;

@@ -25,6 +25,7 @@ use apm2_core::fac::{
 use apm2_core::github::{parse_github_remote_url, resolve_apm2_home};
 use fs2::FileExt;
 
+use super::fac_queue_lifecycle_dual_write;
 use crate::commands::{fac_key_material, fac_secure_io};
 
 /// Queue subdirectory under `$APM2_HOME`.
@@ -238,6 +239,7 @@ pub(super) fn enqueue_job(
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
     write_mode: QueueWriteMode,
+    dual_write_enabled: bool,
 ) -> Result<PathBuf, String> {
     // TCK-00577: Gate 1 — service user write permission check.
     // If the gate passes, we do a direct write to pending/. If it denies,
@@ -248,7 +250,13 @@ pub(super) fn enqueue_job(
         Ok(()) => {
             // Caller is service user or UnsafeLocalWrite is active —
             // proceed with direct write to pending/.
-            enqueue_direct(queue_root, fac_root, spec, queue_bounds_policy)
+            enqueue_direct(
+                queue_root,
+                fac_root,
+                spec,
+                queue_bounds_policy,
+                dual_write_enabled,
+            )
         },
         Err(ServiceUserGateError::ServiceUserNotResolved {
             ref service_user,
@@ -305,6 +313,7 @@ fn enqueue_direct(
     fac_root: &Path,
     spec: &FacJobSpecV1,
     queue_bounds_policy: &QueueBoundsPolicy,
+    dual_write_enabled: bool,
 ) -> Result<PathBuf, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
@@ -399,6 +408,15 @@ fn enqueue_direct(
         return Err(format!(
             "queue bounds check failed (queue/quota_exceeded): {err}"
         ));
+    }
+
+    if dual_write_enabled
+        && let Err(err) =
+            fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, spec, "fac.queue_submit")
+    {
+        eprintln!(
+            "warning: dual-write lifecycle enqueue event failed (continuing with filesystem authoritative queue): {err}"
+        );
     }
 
     let filename = format!("{}.json", spec.job_id);
@@ -1123,6 +1141,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::ServiceUserOnly,
+            false,
         );
 
         // SAFETY: serialized through env_var_test_lock in test scope.
@@ -1184,6 +1203,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::ServiceUserOnly,
+            false,
         );
 
         // SAFETY: serialized through env_var_test_lock in test scope.
@@ -1217,6 +1237,7 @@ mod tests {
             &spec,
             &policy,
             QueueWriteMode::UnsafeLocalWrite,
+            false,
         );
 
         assert!(
@@ -1246,7 +1267,7 @@ mod tests {
         let spec = test_job_spec("test-perms-direct-001");
         let policy = QueueBoundsPolicy::default();
 
-        let result = enqueue_direct(&queue_root, &fac_root, &spec, &policy);
+        let result = enqueue_direct(&queue_root, &fac_root, &spec, &policy, false);
         assert!(result.is_ok(), "direct enqueue should succeed: {result:?}");
 
         // Queue root should be 0711.
@@ -1280,6 +1301,38 @@ mod tests {
         assert_eq!(
             br_mode, 0o1733,
             "broker_requests should be mode 01733, got {br_mode:04o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_direct_continues_when_dual_write_emit_fails() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+
+        // Symlink FAC root forces lifecycle emitter signer creation to fail
+        // (fac_key_material rejects symlink parents fail-closed), which drives
+        // the emit-failure path for this test.
+        let fac_root_real = dir.path().join("fac-real");
+        std::fs::create_dir_all(&fac_root_real).expect("create fac root");
+        let fac_root_link = dir.path().join("fac-link");
+        symlink(&fac_root_real, &fac_root_link).expect("create fac root symlink");
+
+        let spec = test_job_spec("test-direct-dual-write-emit-failure-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let path = enqueue_direct(&queue_root, &fac_root_link, &spec, &policy, true)
+            .expect("enqueue should continue when dual-write emit fails");
+        assert!(
+            path.starts_with(queue_root.join(PENDING_DIR)),
+            "direct enqueue should still persist to pending/: {path:?}"
+        );
+        assert!(path.exists(), "pending file should exist after enqueue");
+        assert!(
+            !fac_root_real.join("signing_key").exists(),
+            "test setup should force lifecycle emission failure via symlink FAC root"
         );
     }
 

@@ -127,7 +127,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use super::fac_gates_job::{GATES_JOB_OPTIONS_SCHEMA, GatesJobOptionsV1};
-use super::{fac_key_material, fac_secure_io};
+use super::{fac_key_material, fac_queue_lifecycle_dual_write, fac_secure_io};
 #[cfg(not(test))]
 use crate::commands::fac_review as fac_review_api;
 #[cfg(test)]

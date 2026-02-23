@@ -23,7 +23,8 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
 use ed25519_dalek::{Signer, Verifier};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
@@ -139,6 +140,8 @@ impl HashChainCheckpoint {
 }
 
 impl SqliteLedgerEventEmitter {
+    const CANONICAL_EVENT_ID_PREFIX: &'static str = "canonical-";
+    const CANONICAL_EVENT_ID_WIDTH: usize = 20;
     const LEDGER_CHAIN_GENESIS: &'static str = "genesis";
     const LEDGER_METADATA_TABLE: &'static str = "ledger_metadata";
     const HASH_CHAIN_UNINITIALIZED_VALUE: &'static str = "legacy-uninitialized";
@@ -265,6 +268,37 @@ impl SqliteLedgerEventEmitter {
         self.frozen.load(Ordering::Acquire)
     }
 
+    /// Returns the canonical synthetic event ID for a canonical `events`
+    /// table `seq_id`.
+    fn canonical_event_id_from_seq(seq_id: i64) -> String {
+        format!(
+            "{}{seq_id:0width$}",
+            Self::CANONICAL_EVENT_ID_PREFIX,
+            width = Self::CANONICAL_EVENT_ID_WIDTH
+        )
+    }
+
+    /// Parses the canonical synthetic `event_id` and returns its numeric
+    /// `seq_id` component.
+    fn parse_canonical_event_id(event_id: &str) -> Option<i64> {
+        event_id
+            .strip_prefix(Self::CANONICAL_EVENT_ID_PREFIX)?
+            .parse::<i64>()
+            .ok()
+    }
+
+    /// Normalizes canonical cursor IDs to the fixed-width representation.
+    ///
+    /// This preserves compatibility with older unpadded cursor IDs
+    /// (`canonical-9`) persisted before fixed-width canonical IDs were
+    /// introduced.
+    fn normalize_canonical_cursor_event_id(cursor_event_id: &str) -> String {
+        Self::parse_canonical_event_id(cursor_event_id).map_or_else(
+            || cursor_event_id.to_string(),
+            Self::canonical_event_id_from_seq,
+        )
+    }
+
     // ---- Freeze-aware canonical read helpers (TCK-00631 / Finding 1) ----
     //
     // When the freeze guard is active, new events are written to the
@@ -274,7 +308,7 @@ impl SqliteLedgerEventEmitter {
     //
     // Column mapping:
     //   events.seq_id       → SignedLedgerEvent.event_id  (synthesised as
-    // "canonical-{seq_id}")   events.event_type   →
+    // "canonical-{seq_id:020}")   events.event_type   →
     // SignedLedgerEvent.event_type   events.session_id   →
     // SignedLedgerEvent.work_id   events.actor_id     →
     // SignedLedgerEvent.actor_id   events.payload      →
@@ -286,7 +320,7 @@ impl SqliteLedgerEventEmitter {
     fn canonical_row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedLedgerEvent> {
         let seq_id: i64 = row.get(0)?;
         Ok(SignedLedgerEvent {
-            event_id: format!("canonical-{seq_id}"),
+            event_id: Self::canonical_event_id_from_seq(seq_id),
             event_type: row.get(1)?,
             work_id: row.get(2)?, // session_id maps to work_id
             actor_id: row.get(3)?,
@@ -2448,20 +2482,18 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // TCK-00631 / Finding 1: Handle canonical events whose synthesised
         // event_id starts with "canonical-".
         if self.is_frozen_internal() {
-            if let Some(seq_str) = event_id.strip_prefix("canonical-") {
-                if let Ok(seq_id) = seq_str.parse::<i64>() {
-                    return conn
-                        .query_row(
-                            "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                                    COALESCE(signature, X''), timestamp_ns \
-                             FROM events WHERE seq_id = ?1",
-                            params![seq_id],
-                            Self::canonical_row_to_event,
-                        )
-                        .optional()
-                        .ok()
-                        .flatten();
-                }
+            if let Some(seq_id) = Self::parse_canonical_event_id(event_id) {
+                return conn
+                    .query_row(
+                        "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                                COALESCE(signature, X''), timestamp_ns \
+                         FROM events WHERE seq_id = ?1",
+                        params![seq_id],
+                        Self::canonical_row_to_event,
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
             }
         }
 
@@ -3056,6 +3088,119 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         None
+    }
+
+    fn get_events_since(
+        &self,
+        cursor_timestamp_ns: u64,
+        cursor_event_id: &str,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Vec<SignedLedgerEvent> {
+        if limit == 0 || event_types.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let Ok(cursor_timestamp_i64) = i64::try_from(cursor_timestamp_ns) else {
+            return Vec::new();
+        };
+        let normalized_cursor_event_id = Self::normalize_canonical_cursor_event_id(cursor_event_id);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let placeholders = std::iter::repeat_n("?", event_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let build_params = || {
+            let mut params = Vec::with_capacity(event_types.len() + 4);
+            params.push(Value::Integer(cursor_timestamp_i64));
+            params.push(Value::Integer(cursor_timestamp_i64));
+            params.push(Value::Text(normalized_cursor_event_id.clone()));
+            for event_type in event_types {
+                params.push(Value::Text((*event_type).to_string()));
+            }
+            params.push(Value::Integer(limit_i64));
+            params
+        };
+
+        // Legacy branch intentionally orders by `event_id` (not `rowid`) for
+        // cursor pagination compatibility with mixed legacy+canonical reads.
+        // `get_events_since` persists only `(timestamp_ns, event_id)` cursors;
+        // when canonical freeze mode is active, the same cursor must be
+        // comparable across both tables using a single stable string key.
+        let legacy_sql = format!(
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns \
+             FROM ledger_events \
+             WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND event_id > ?)) \
+               AND event_type IN ({placeholders}) \
+             ORDER BY timestamp_ns ASC, event_id ASC \
+             LIMIT ?"
+        );
+
+        let mut events = Vec::with_capacity(limit.saturating_mul(2));
+
+        if let Ok(mut stmt) = conn.prepare(&legacy_sql) {
+            let params = build_params();
+            if let Ok(rows) = stmt.query_map(params_from_iter(params.iter()), |row| {
+                Ok(SignedLedgerEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    work_id: row.get(2)?,
+                    actor_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    signature: row.get(5)?,
+                    timestamp_ns: row.get(6)?,
+                })
+            }) {
+                events.extend(rows.filter_map(Result::ok));
+            }
+        }
+
+        if self.is_frozen_internal() {
+            // TCK-00669 MINOR fix: Parse the numeric seq_id from the cursor
+            // string in Rust and compare `seq_id > ?` directly, instead of
+            // computing `printf('canonical-%020d', seq_id)` per row. This
+            // allows SQLite to use the index on `seq_id`.
+            let cursor_seq_id =
+                Self::parse_canonical_event_id(&normalized_cursor_event_id).unwrap_or(-1);
+
+            let canonical_sql = format!(
+                "SELECT seq_id, event_type, session_id, actor_id, payload, \
+                        COALESCE(signature, X''), timestamp_ns \
+                 FROM events \
+                 WHERE (timestamp_ns > ? OR (timestamp_ns = ? AND seq_id > ?)) \
+                   AND event_type IN ({placeholders}) \
+                 ORDER BY timestamp_ns ASC, seq_id ASC \
+                 LIMIT ?"
+            );
+
+            let mut canonical_params = Vec::with_capacity(event_types.len() + 4);
+            canonical_params.push(Value::Integer(cursor_timestamp_i64));
+            canonical_params.push(Value::Integer(cursor_timestamp_i64));
+            canonical_params.push(Value::Integer(cursor_seq_id));
+            for event_type in event_types {
+                canonical_params.push(Value::Text((*event_type).to_string()));
+            }
+            canonical_params.push(Value::Integer(limit_i64));
+
+            if let Ok(mut stmt) = conn.prepare(&canonical_sql) {
+                if let Ok(rows) = stmt.query_map(
+                    params_from_iter(canonical_params.iter()),
+                    Self::canonical_row_to_event,
+                ) {
+                    events.extend(rows.filter_map(Result::ok));
+                }
+            }
+        }
+
+        events.sort_by(|left, right| {
+            (left.timestamp_ns, &left.event_id).cmp(&(right.timestamp_ns, &right.event_id))
+        });
+        events.truncate(limit);
+        events
     }
 
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
@@ -9203,6 +9348,102 @@ mod tests {
         // emit is different from the canonical synthesised one, but the
         // canonical lookup should still work).
         let _ = emit_result; // used above for proof that emit succeeded
+    }
+
+    /// TCK-00669 regression: `get_events_since` must not skip canonical rows
+    /// under same-timestamp cursor collisions once `seq_id` crosses 9.
+    ///
+    /// This test also verifies backward compatibility for previously persisted
+    /// unpadded cursor IDs by advancing the cursor as `canonical-<seq_id>`
+    /// (without zero padding) between paginated reads.
+    #[test]
+    fn test_get_events_since_canonical_cursor_collision_no_skip() {
+        use apm2_core::ledger::init_canonical_schema;
+
+        let conn = Connection::open_in_memory().expect("sqlite in-memory should open");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("legacy schema initialization should succeed");
+        init_canonical_schema(&conn).expect("canonical schema initialization should succeed");
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = SqliteLedgerEventEmitter::new(Arc::clone(&conn_arc), signing_key);
+
+        {
+            let conn_guard = conn_arc.lock().expect("sqlite lock should be available");
+            let frozen = emitter
+                .freeze_legacy_writes(&conn_guard)
+                .expect("freeze_legacy_writes should succeed");
+            assert!(frozen, "freeze_legacy_writes must return true");
+        }
+        assert!(emitter.is_frozen(), "emitter must be frozen");
+
+        let timestamp_ns = 1_700_000_000_000_000_000_u64;
+        let total_events = 12_u64;
+
+        for seq in 0..total_events {
+            let payload = format!(r#"{{"seq":{seq}}}"#);
+            emitter
+                .emit_session_event(
+                    "W-CURSOR-COLLISION",
+                    "fac.job.claimed",
+                    payload.as_bytes(),
+                    "uid:cursor-collision",
+                    timestamp_ns,
+                )
+                .expect("canonical session event emit should succeed");
+        }
+
+        let mut cursor_event_id = String::new();
+        let mut seen_seq_ids = Vec::new();
+        let mut pages = 0usize;
+
+        loop {
+            let batch =
+                emitter.get_events_since(timestamp_ns, &cursor_event_id, &["fac.job.claimed"], 4);
+            if batch.is_empty() {
+                break;
+            }
+
+            pages += 1;
+            assert!(
+                pages <= 10,
+                "pagination must converge without looping indefinitely"
+            );
+
+            for event in &batch {
+                let suffix = event
+                    .event_id
+                    .strip_prefix(SqliteLedgerEventEmitter::CANONICAL_EVENT_ID_PREFIX)
+                    .expect("canonical events must use canonical- prefix");
+                assert_eq!(
+                    suffix.len(),
+                    SqliteLedgerEventEmitter::CANONICAL_EVENT_ID_WIDTH,
+                    "canonical event IDs must be fixed-width zero padded"
+                );
+                seen_seq_ids.push(
+                    event
+                        .canonical_seq_id()
+                        .expect("canonical event must expose seq_id"),
+                );
+            }
+
+            let last_seq_id = *seen_seq_ids
+                .last()
+                .expect("at least one event must be seen in non-empty batch");
+            cursor_event_id = format!("canonical-{last_seq_id}");
+        }
+
+        assert!(
+            pages >= 3,
+            "bounded pagination must span multiple pages for >9 same-timestamp rows"
+        );
+        assert_eq!(
+            seen_seq_ids,
+            (1..=total_events).collect::<Vec<_>>(),
+            "get_events_since must return all canonical rows in seq_id order \
+             without skipping double-digit seq IDs"
+        );
     }
 
     /// BLOCKER regression: `get_event_by_evidence_identity` must scan at most

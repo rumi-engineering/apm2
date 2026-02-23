@@ -654,7 +654,86 @@ pub(super) fn commit_claimed_job_via_pipeline(
         );
     }
 
+    // TCK-00669 fix (f-798-code_quality-1771810793166416-0): Dual-write
+    // lifecycle emission is best-effort / advisory.  The filesystem pipeline
+    // commit above is authoritative — a lifecycle emit failure must never
+    // abort the terminal commit.  Warn-and-continue on any error.
+    //
+    // f-798-code_quality-1771812840679708-0 (QL-001): Pass the receipt
+    // content_hash from the pipeline commit result as the receipt_id for
+    // terminal lifecycle events, fulfilling the intent-to-receipt pattern
+    // for irreversible actions.
+    let receipt_id_for_lifecycle = Some(result.content_hash.clone());
+    match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
+        Ok(true) => {
+            let claimed_parent = claimed_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str());
+            if claimed_parent == Some(CLAIMED_DIR) {
+                if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_started(
+                    fac_root,
+                    spec,
+                    "fac.worker",
+                    "fac.worker",
+                ) {
+                    tracing::warn!(
+                        error = %err,
+                        "dual-write lifecycle started event failed (non-fatal)"
+                    );
+                }
+            }
+
+            if outcome == FacJobOutcome::Completed {
+                if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_completed(
+                    fac_root,
+                    spec,
+                    "completed",
+                    receipt_id_for_lifecycle,
+                    "fac.worker",
+                ) {
+                    tracing::warn!(
+                        error = %err,
+                        "dual-write lifecycle completed event failed (non-fatal)"
+                    );
+                }
+            } else {
+                let reason_class = lifecycle_failed_reason_class(outcome, denial_reason);
+                if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_failed(
+                    fac_root,
+                    spec,
+                    &reason_class,
+                    false,
+                    receipt_id_for_lifecycle,
+                    "fac.worker",
+                ) {
+                    tracing::warn!(
+                        error = %err,
+                        "dual-write lifecycle failed event failed (non-fatal)"
+                    );
+                }
+            }
+        },
+        Ok(false) => { /* dual-write disabled — nothing to emit */ },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "resolve lifecycle dual-write flag failed (non-fatal)"
+            );
+        },
+    }
+
     Ok(result.job_terminal_path)
+}
+
+fn lifecycle_failed_reason_class(
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+) -> String {
+    if let Some(code) = denial_reason {
+        return strip_json_string_quotes(&serialize_to_json_string(&code));
+    }
+    strip_json_string_quotes(&serialize_to_json_string(&outcome))
 }
 
 /// Handle a pipeline commit failure for a denial/failure path.

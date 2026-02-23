@@ -302,6 +302,16 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
 
+    /// Enables temporary dual-write of FAC queue filesystem mutations to the
+    /// queue lifecycle ledger vocabulary (`fac.job.*`) for migration
+    /// (TCK-00669).
+    ///
+    /// Default is `false` (fail-closed migration posture). When disabled, the
+    /// queue continues filesystem-only behavior. When enabled, queue mutation
+    /// paths emit lifecycle ledger events in addition to filesystem updates.
+    #[serde(default)]
+    pub queue_lifecycle_dual_write_enabled: bool,
+
     /// Whether sccache is explicitly enabled for FAC jobs (TCK-00553).
     ///
     /// Default is `false` (fail-closed). When `true`, `RUSTC_WRAPPER=sccache`
@@ -439,6 +449,7 @@ impl FacPolicyV1 {
             allowed_repo_ids: None,
             allowed_intents: None,
             queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy::default(),
+            queue_lifecycle_dual_write_enabled: false,
             sccache_enabled: false,
             sccache_dir: None,
             per_lane_log_max_bytes: default_per_lane_log_max_bytes(),

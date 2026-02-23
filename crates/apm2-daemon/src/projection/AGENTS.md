@@ -21,6 +21,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`ConfigBackedResolver`**: Config-backed continuity profile resolver for economics gate input assembly (TCK-00507)
 - **`ContinuityProfileResolver`**: Trait for resolving continuity profiles, sink snapshots, and continuity windows
 - **`DeferredReplayWorker`**: Worker that drains the deferred replay backlog after sink recovery, re-evaluating economics gate AND PCAC lifecycle enforcement for each replayed intent (TCK-00508)
+- **`JobLifecycleRehydrationReconciler`**: RFC-0032 queue projection reconciler that rebuilds filesystem witness state from `fac.job.*` ledger events with bounded event/fs-op budgets (TCK-00669)
 
 ### Security Model
 
@@ -36,6 +37,14 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Idempotent-insert replay prevention**: Duplicate `(work_id, changeset_digest)` intents are denied, preventing double-projection (TCK-00505).
 - **Fail-closed gate defaults**: Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, never default ALLOW. Gate init failure also denies events with economics selectors (TCK-00505)
 - **Post-projection admission**: Intent is inserted as PENDING before projection, then admitted only AFTER successful projection side effects, ensuring at-least-once semantics (TCK-00505)
+- **Bounded lifecycle replay**: Job lifecycle reconciliation must use cursor-bounded event reads (`get_events_since`) with fixed `max_events_per_tick`; full-ledger materialization per tick is forbidden (TCK-00669).
+- **Terminal witness preservation**: Unknown-file cleanup for job lifecycle repair is restricted to `pending/` ONLY; `claimed/` files are never cleaned up because the move-first claim implementation may leave in-flight jobs that exist on disk but not in the projection (claim emission failure). `completed/` and `denied/` witness files remain durable evidence even after in-memory projection eviction (TCK-00669).
+- **Quarantine lifecycle termination**: When `scan_pending_from_projection` quarantines a malformed pending file, it emits `fac.job.failed` to move the projection record to a terminal state. Without this emission, the reconciler would recreate the witness stub, the scanner would re-quarantine it, and the loop would repeat indefinitely (TCK-00669).
+- **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation returns `CapacityExhausted` (TCK-00669).
+- **Lifecycle-scoped cursor probe**: The reconciler determines caught-up status by probing for remaining lifecycle events (`get_events_since` with lifecycle type filters and limit=1) instead of comparing against the global ledger head. Non-lifecycle events do not prevent cleanup from running (TCK-00669).
+- **Capacity exhaustion backpressure**: When `apply_event` returns `CapacityExhausted`, the reconciler halts the current tick WITHOUT advancing the cursor. The event is retried on a future tick once terminal jobs complete and free capacity. This prevents permanent data loss from skipping valid enqueue events (TCK-00669).
+- **Worker-integrated reconciler tick**: The reconciler `tick()` is called at worker startup and before each scan cycle in the worker runtime loop. This ensures `scan_pending_from_projection` reads a fresh checkpoint reflecting recently emitted dual-write events. Tick errors are non-fatal; the worker falls back to filesystem scan (TCK-00669).
+- **Projection scan queue_job_id validation**: `scan_pending_from_projection` validates each `queue_job_id` from the checkpoint before using it for filesystem path construction. IDs containing path traversal sequences (`/`, `..`, `\`), non-alphanumeric characters (outside `a-zA-Z0-9_-`), or exceeding length bounds are skipped with a warning (TCK-00669).
 
 ## Key Types
 

@@ -248,7 +248,7 @@ impl SignedLedgerEvent {
     /// from the canonical `events` table.
     ///
     /// Canonical events are represented with synthesised IDs of the form
-    /// `canonical-<seq_id>`; legacy `ledger_events` rows return `None`.
+    /// `canonical-<seq_id:020>`; legacy `ledger_events` rows return `None`.
     #[must_use]
     pub fn canonical_seq_id(&self) -> Option<u64> {
         self.event_id
@@ -827,6 +827,43 @@ pub trait LedgerEventEmitter: Send + Sync {
                     envelope.get("evidence_id").and_then(|v| v.as_str()) == Some(evidence_id)
                 })
             })
+    }
+
+    /// Returns a bounded replay-ordered slice of events after the given
+    /// `(timestamp_ns, event_id)` cursor, filtered to `event_types`.
+    ///
+    /// The returned vector must be sorted by `(timestamp_ns, event_id)` and
+    /// contain at most `limit` entries.
+    ///
+    /// The default implementation performs an O(N) in-memory filter over
+    /// `get_all_events()`; backends with indexed storage should override this
+    /// with a bounded query.
+    fn get_events_since(
+        &self,
+        cursor_timestamp_ns: u64,
+        cursor_event_id: &str,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Vec<SignedLedgerEvent> {
+        if limit == 0 || event_types.is_empty() {
+            return Vec::new();
+        }
+
+        let mut events = self
+            .get_all_events()
+            .into_iter()
+            .filter(|event| {
+                event_types.contains(&event.event_type.as_str())
+                    && (event.timestamp_ns > cursor_timestamp_ns
+                        || (event.timestamp_ns == cursor_timestamp_ns
+                            && event.event_id.as_str() > cursor_event_id))
+            })
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            (left.timestamp_ns, &left.event_id).cmp(&(right.timestamp_ns, &right.event_id))
+        });
+        events.truncate(limit);
+        events
     }
 
     /// Queries all persisted ledger events in deterministic replay order.
@@ -3934,6 +3971,39 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                 (event.event_type == event_type).then(|| event.clone())
             })
         })
+    }
+
+    fn get_events_since(
+        &self,
+        cursor_timestamp_ns: u64,
+        cursor_event_id: &str,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Vec<SignedLedgerEvent> {
+        if limit == 0 || event_types.is_empty() {
+            return Vec::new();
+        }
+
+        let guard = self.events.read().expect("lock poisoned");
+        let (order, events) = &*guard;
+
+        let mut filtered = order
+            .iter()
+            .filter_map(|event_id| events.get(event_id))
+            .filter(|event| {
+                event_types.contains(&event.event_type.as_str())
+                    && (event.timestamp_ns > cursor_timestamp_ns
+                        || (event.timestamp_ns == cursor_timestamp_ns
+                            && event.event_id.as_str() > cursor_event_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        filtered.sort_by(|left, right| {
+            (left.timestamp_ns, &left.event_id).cmp(&(right.timestamp_ns, &right.event_id))
+        });
+        filtered.truncate(limit);
+        filtered
     }
 
     fn get_all_events(&self) -> Vec<SignedLedgerEvent> {

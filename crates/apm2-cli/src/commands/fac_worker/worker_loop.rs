@@ -901,6 +901,93 @@ pub(super) fn run_fac_worker_impl(
         orphan_policy: OrphanedJobPolicy::Requeue,
         limits: QueueReconcileLimits::default(),
     });
+
+    // f-798-code_quality-1771825106416871-0: Initialize the ledger-backed
+    // lifecycle reconciler when dual-write is enabled. The reconciler's
+    // `tick()` advances the projection checkpoint so that
+    // `scan_pending_from_projection` can use ledger-derived pickup lists.
+    //
+    // The reconciler is `Option` because it depends on dual-write being
+    // enabled AND the ledger emitter being openable. If either condition
+    // fails, we log a warning and fall back to filesystem-only scanning.
+    let lifecycle_reconciler: Option<
+        apm2_daemon::projection::job_lifecycle::JobLifecycleRehydrationReconciler,
+    > = if policy.queue_lifecycle_dual_write_enabled {
+        match fac_queue_lifecycle_dual_write::open_queue_lifecycle_emitter(&fac_root) {
+            Ok(emitter) => {
+                let config =
+                    apm2_daemon::projection::job_lifecycle::JobLifecycleReconcilerConfig::default();
+                let ledger: std::sync::Arc<
+                    dyn apm2_daemon::protocol::dispatch::LedgerEventEmitter,
+                > = std::sync::Arc::new(emitter);
+                Some(
+                    apm2_daemon::projection::job_lifecycle::JobLifecycleRehydrationReconciler::new(
+                        ledger,
+                        queue_root.clone(),
+                        config,
+                    ),
+                )
+            },
+            Err(e) => {
+                // Non-fatal: fall back to filesystem scan.
+                if json_output {
+                    emit_worker_event(
+                        "lifecycle_reconciler_init_error",
+                        serde_json::json!({
+                            "error": &e,
+                            "fallback": "filesystem_scan",
+                        }),
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: lifecycle reconciler init failed: {e}; \
+                         falling back to filesystem scan"
+                    );
+                }
+                None
+            },
+        }
+    } else {
+        None
+    };
+
+    // Startup tick: bring the projection checkpoint up to date before the
+    // first scan cycle so `scan_pending_from_projection` reads fresh state.
+    if let Some(ref reconciler) = lifecycle_reconciler {
+        match reconciler.tick() {
+            Ok(result) => {
+                if json_output {
+                    emit_worker_event(
+                        "lifecycle_reconciler_startup_tick",
+                        serde_json::json!({
+                            "processed_events": result.processed_events,
+                            "applied_fs_ops": result.applied_fs_ops,
+                            "cursor_timestamp_ns": result.cursor_timestamp_ns,
+                            "remaining_reconciles": result.remaining_reconciles,
+                        }),
+                    );
+                }
+            },
+            Err(e) => {
+                // Non-fatal: log warning and fall back to filesystem scan.
+                if json_output {
+                    emit_worker_event(
+                        "lifecycle_reconciler_startup_tick_error",
+                        serde_json::json!({
+                            "error": e.to_string(),
+                            "fallback": "filesystem_scan",
+                        }),
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: lifecycle reconciler startup tick failed: {e}; \
+                         falling back to filesystem scan"
+                    );
+                }
+            },
+        }
+    }
+
     let mut pending_wake_reason = Some(if watcher_mode.is_degraded() {
         WorkerWakeReason::WatcherDegraded
     } else {
@@ -1040,30 +1127,86 @@ pub(super) fn run_fac_worker_impl(
             repair_coordinator.settle_idle();
         }
 
-        // Scan pending directory (quarantines malformed files inline).
-        let candidates = match scan_pending(
-            &queue_root,
-            &fac_root,
-            &current_tuple_digest,
-            Some(toolchain_fingerprint.as_str()),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                output_worker_error(json_output, &format!("scan error: {e}"));
-                if once {
-                    if let Err(persist_err) = persist_queue_scheduler_state(
-                        &fac_root,
-                        &queue_state,
-                        broker.current_tick(),
-                        Some(&cost_model),
-                    ) {
-                        output_worker_error(json_output, &persist_err);
+        // f-798-code_quality-1771825106416871-0: Advance the lifecycle
+        // projection before scanning. This ensures `scan_pending_from_projection`
+        // reads a fresh checkpoint reflecting recently emitted dual-write events.
+        // Errors are non-fatal: log and fall back to filesystem scan.
+        if let Some(ref reconciler) = lifecycle_reconciler {
+            match reconciler.tick() {
+                Ok(result) => {
+                    if json_output && result.processed_events > 0 {
+                        emit_worker_event(
+                            "lifecycle_reconciler_tick",
+                            serde_json::json!({
+                                "processed_events": result.processed_events,
+                                "applied_fs_ops": result.applied_fs_ops,
+                                "cursor_timestamp_ns": result.cursor_timestamp_ns,
+                                "remaining_reconciles": result.remaining_reconciles,
+                            }),
+                        );
                     }
-                    return exit_codes::GENERIC_ERROR;
-                }
-                std::thread::sleep(Duration::from_secs(safety_nudge_secs.max(1)));
-                pending_wake_reason = Some(WorkerWakeReason::SafetyNudge);
-                continue;
+                },
+                Err(e) => {
+                    // Non-fatal: log warning; scan_pending_from_projection
+                    // will use stale checkpoint or fall back to filesystem scan.
+                    if json_output {
+                        emit_worker_event(
+                            "lifecycle_reconciler_tick_error",
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "fallback": "filesystem_scan",
+                            }),
+                        );
+                    } else {
+                        eprintln!(
+                            "WARNING: lifecycle reconciler tick failed: {e}; \
+                             falling back to filesystem scan"
+                        );
+                    }
+                },
+            }
+        }
+
+        // f-798-code_quality-1771812825696989-0 (QL-003): Prefer the ledger
+        // lifecycle projection for pickup selection when dual-write is enabled
+        // and a valid projection checkpoint exists. Fall back to filesystem
+        // scan if projection is unavailable.
+        let candidates = if policy.queue_lifecycle_dual_write_enabled {
+            scan_pending_from_projection(
+                &queue_root,
+                &fac_root,
+                &current_tuple_digest,
+                Some(toolchain_fingerprint.as_str()),
+            )
+        } else {
+            None
+        };
+        let candidates = match candidates {
+            Some(c) => c,
+            None => match scan_pending(
+                &queue_root,
+                &fac_root,
+                &current_tuple_digest,
+                Some(toolchain_fingerprint.as_str()),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    output_worker_error(json_output, &format!("scan error: {e}"));
+                    if once {
+                        if let Err(persist_err) = persist_queue_scheduler_state(
+                            &fac_root,
+                            &queue_state,
+                            broker.current_tick(),
+                            Some(&cost_model),
+                        ) {
+                            output_worker_error(json_output, &persist_err);
+                        }
+                        return exit_codes::GENERIC_ERROR;
+                    }
+                    std::thread::sleep(Duration::from_secs(safety_nudge_secs.max(1)));
+                    pending_wake_reason = Some(WorkerWakeReason::SafetyNudge);
+                    continue;
+                },
             },
         };
 

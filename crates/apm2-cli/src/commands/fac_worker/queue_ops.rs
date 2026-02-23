@@ -96,10 +96,18 @@ pub(super) fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String
 /// Atomically claim a pending queue entry and hold an exclusive flock on the
 /// claimed inode for the caller's full processing lifetime.
 ///
-/// Synchronization model:
-/// - Open+lock the pending inode first.
-/// - Atomically rename `pending/<file>` -> `claimed/<file>`.
-/// - Keep the returned file descriptor alive until processing/commit finishes.
+/// Synchronization model (move-first ordering):
+/// 1. Open+lock the pending inode with an exclusive flock.
+/// 2. Atomically rename `pending/<file>` -> `claimed/<file>` FIRST.
+/// 3. After the successful move, read the claimed file and attempt
+///    `fac.job.claimed` lifecycle emission (best-effort, warning on failure).
+/// 4. Keep the returned file descriptor alive until processing/commit finishes.
+///
+/// Move-first is essential: if deserialization or emit fails after the move,
+/// the file is safely in `claimed/` where the orchestrator's existing path
+/// routes unreadable files to `denied/`. Without move-first, a malformed
+/// payload would leave the file stuck in `pending/` permanently (the original
+/// round-8 security bug).
 ///
 /// This ensures runtime reconcile's non-blocking flock probe never treats an
 /// actively executing claimed job as orphaned.
@@ -107,6 +115,8 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
     pending_path: &Path,
     claimed_dir: &Path,
     file_name: &str,
+    fac_root: &Path,
+    dual_write_enabled: bool,
 ) -> Result<(PathBuf, fs::File), String> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
@@ -142,10 +152,109 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         )
     })?;
 
+    // ── STEP 1 (MOVE-FIRST): Atomically rename pending/ → claimed/ ─────
+    //
+    // f-798-security-1771812602410346-0 / f-798-code_quality-1771820119403543-0:
+    // The filesystem move MUST happen BEFORE any payload read or deserialization.
+    // This is the "move-first exception for claim" mandated by AGENTS.md.
+    //
+    // Without move-first, a malformed payload causes deserialization to fail,
+    // the function returns early, and the file remains permanently stuck in
+    // pending/ — exhausting QueueBoundsPolicy capacity over time. By moving
+    // first, the orchestrator's existing path routes unreadable claimed files
+    // to denied/.
+    //
+    // INVARIANT: No call to read_bounded() or deserialize_job_spec() may
+    // appear above this rename. The move is unconditional on payload content.
     let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
         .map_err(|err| format!("atomic claim failed: {err}"))?;
 
+    // ── STEP 2 (BEST-EFFORT): Post-move lifecycle emission ──────────────
+    //
+    // Only AFTER the move succeeds do we attempt to read and deserialize
+    // the (now claimed) file for dual-write lifecycle event emission.
+    // Both deserialization and emission failures are warn-and-continue:
+    // the filesystem claim is authoritative during QL-003 staged migration.
+    if dual_write_enabled {
+        match read_bounded(&claimed_path, MAX_JOB_SPEC_SIZE)
+            .and_then(|bytes| deserialize_job_spec(&bytes).map_err(|err| err.to_string()))
+        {
+            Ok(spec) => {
+                if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_claimed(
+                    fac_root,
+                    &spec,
+                    &spec.actuation.lease_id,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: dual-write lifecycle claim event failed \
+                         (continuing with filesystem authoritative queue): {err}"
+                    );
+                }
+            },
+            Err(err) => {
+                // Deserialization failed AFTER the file was moved to claimed/.
+                // The worker's run_idle_phase will subsequently handle this
+                // unreadable claimed file by moving it to denied/.
+                eprintln!(
+                    "worker: WARNING: dual-write lifecycle claim event skipped \
+                     (cannot deserialize claimed job, orchestrator will route \
+                     to denied/): {err}"
+                );
+            },
+        }
+    }
+
     Ok((claimed_path, claimed_lock_file))
+}
+
+pub(super) fn release_claimed_job_to_pending(
+    claimed_path: &Path,
+    queue_root: &Path,
+    claimed_file_name: &str,
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    // f-798-code_quality: Treat policy-read failures as "dual-write disabled"
+    // (graceful fallback). During QL-003 staged migration the dual-write
+    // feature is best-effort and the filesystem queue is authoritative.
+    // A policy/config read failure must not block recovery of claimed jobs —
+    // it would leave jobs stranded in `claimed/` indefinitely.
+    let dual_write_enabled =
+        match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                eprintln!(
+                    "worker: WARNING: cannot read queue lifecycle dual-write flag \
+                 for release_claimed_job_to_pending; proceeding with filesystem \
+                 authoritative queue: {err}"
+                );
+                false
+            },
+        };
+    if dual_write_enabled {
+        if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_released(
+            fac_root,
+            spec,
+            reason,
+            Some(spec.actuation.lease_id.clone()),
+            "fac.worker",
+        ) {
+            eprintln!(
+                "worker: WARNING: dual-write lifecycle release event failed (continuing with filesystem authoritative queue): {err}"
+            );
+        }
+    }
+
+    let moved_path = move_to_dir_safe(
+        claimed_path,
+        &queue_root.join(PENDING_DIR),
+        claimed_file_name,
+    )
+    .map_err(|err| format!("move claimed job back to pending failed: {err}"))?;
+
+    Ok(moved_path)
 }
 
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
@@ -200,6 +309,24 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
 
     let quarantine_dir = queue_root.join(QUARANTINE_DIR);
     let _ = fs::create_dir_all(&quarantine_dir);
+
+    let dual_write_fac_root = resolve_fac_root().ok();
+    let dual_write_enabled = dual_write_fac_root
+        .as_ref()
+        .and_then(|fac_root| {
+            match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
+                Ok(enabled) => Some(enabled),
+                Err(err) => {
+                    tracing::warn!(
+                        fac_root = %fac_root.display(),
+                        error = %err,
+                        "worker: cannot read queue lifecycle dual-write flag for broker promotion; proceeding with filesystem authoritative queue"
+                    );
+                    None
+                },
+            }
+        })
+        .unwrap_or(false);
 
     // Queue bounds policy is threaded from the loaded FAC policy by
     // the caller (run_fac_worker). This ensures broker-mediated
@@ -374,14 +501,14 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         };
 
         // Validate deserialization.
-        if deserialize_job_spec(&bytes).is_err() {
+        let Ok(spec) = deserialize_job_spec(&bytes) else {
             tracing::warn!(
                 path = %path.display(),
                 "TCK-00577: quarantining malformed broker request"
             );
             let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             continue;
-        }
+        };
 
         // ---- Begin enqueue lock critical section ----
         // Acquire the same process-level lockfile used by enqueue_direct
@@ -424,6 +551,22 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         // process (service user) with mode 0600, write the validated content,
         // fsync, then rename_noreplace into its final pending/ name. Only then
         // remove the original broker_requests file.
+        //
+        // QL-003 staged migration: attempt lifecycle enqueue event first
+        // (best-effort). Filesystem mutation still proceeds on emit failure.
+        if dual_write_enabled
+            && let Some(fac_root) = dual_write_fac_root.as_ref()
+            && let Err(err) =
+                fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, &spec, "fac.worker")
+        {
+            tracing::warn!(
+                path = %path.display(),
+                job_id = %spec.job_id,
+                error = %err,
+                "worker: dual-write lifecycle enqueue event failed during broker promotion (continuing with filesystem authoritative queue)"
+            );
+        }
+
         match promote_via_rewrite(&bytes, &pending_dir, &file_name) {
             Ok(_promoted_path) => {
                 // Lock released after successful promotion.
@@ -562,6 +705,200 @@ pub(super) fn promote_via_rewrite(
             dest.display()
         )),
     }
+}
+
+/// QL-003: Scan pending jobs from the ledger lifecycle projection when
+/// available (f-798-code_quality-1771812825696989-0).
+///
+/// Reads the reconciler checkpoint, extracts projected `Pending` jobs, and
+/// loads the corresponding `FacJobSpecV1` payloads from the `pending/`
+/// filesystem directory. The projection-derived list is ledger-authoritative:
+/// only jobs whose lifecycle events have been applied to the projection are
+/// included.
+///
+/// Returns `None` if the projection is unavailable (no checkpoint, corrupt
+/// checkpoint, or no pending jobs in projection). The caller should fall
+/// back to `scan_pending` (filesystem scan) in that case.
+pub(super) fn scan_pending_from_projection(
+    queue_root: &Path,
+    fac_root: &Path,
+    canonicalizer_tuple_digest: &str,
+    toolchain_fingerprint: Option<&str>,
+) -> Option<Vec<PendingCandidate>> {
+    use apm2_daemon::projection::job_lifecycle::{JobLifecycleCheckpointV1, ProjectedJobStatus};
+
+    let checkpoint_path = queue_root.join(".job_lifecycle_checkpoint.v1.json");
+    if !checkpoint_path.exists() {
+        return None;
+    }
+
+    let checkpoint: JobLifecycleCheckpointV1 = match apm2_daemon::fs_safe::bounded_read_json(
+        &checkpoint_path,
+        16 * 1024 * 1024, // MAX_CHECKPOINT_FILE_SIZE_BYTES
+    ) {
+        Ok(cp) => cp,
+        Err(_) => return None,
+    };
+
+    // Only use projection if the cursor has advanced (non-zero).
+    if checkpoint.cursor_timestamp_ns == 0 && checkpoint.cursor_event_id.is_empty() {
+        return None;
+    }
+
+    let pending_dir = queue_root.join(PENDING_DIR);
+    if !pending_dir.is_dir() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let mut scanned = 0usize;
+
+    for record in checkpoint.projection.jobs.values() {
+        if record.status != ProjectedJobStatus::Pending {
+            continue;
+        }
+        if scanned >= MAX_PENDING_SCAN_ENTRIES {
+            break;
+        }
+        scanned += 1;
+
+        // f-798-security-1771826098242190-0: Validate queue_job_id from the
+        // checkpoint before using it for path construction. If the checkpoint
+        // contains a malicious queue_job_id (e.g. "../../../etc/passwd" or an
+        // absolute path), skip the entry to prevent path traversal when
+        // constructing scan paths or quarantine target paths.
+        if !is_safe_queue_job_id(&record.queue_job_id) {
+            eprintln!(
+                "worker: WARNING: projection scan skipping entry with unsafe \
+                 queue_job_id {:?} (path traversal/overlong/invalid characters)",
+                record.queue_job_id,
+            );
+            continue;
+        }
+
+        // Construct the expected filename from the projection's queue_job_id.
+        let file_name = format!("{}.json", record.queue_job_id);
+        let path = pending_dir.join(&file_name);
+        if !path.exists() {
+            // File not yet materialized by reconciler; skip.
+            continue;
+        }
+
+        let bytes = match read_bounded(&path, MAX_JOB_SPEC_SIZE) {
+            Ok(b) => b,
+            Err(e) => {
+                let reason = format!("projection scan read failure: {e}");
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&[]),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
+                    &reason,
+                    canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
+                );
+                // f-798-code_quality-1771816907239154-0: Emit fac.job.failed so the
+                // projection moves this job to a terminal state, breaking the
+                // quarantine-recreate-quarantine infinite loop.
+                if let Err(emit_err) = fac_queue_lifecycle_dual_write::emit_job_failed_by_queue_id(
+                    fac_root,
+                    &record.job_id,
+                    &record.queue_job_id,
+                    &record.work_id,
+                    "malformed_payload_quarantined",
+                    false,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: lifecycle failed event emission after \
+                         quarantine skipped (non-fatal): {emit_err}"
+                    );
+                }
+                continue;
+            },
+        };
+
+        let spec = match deserialize_job_spec(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let reason = format!("projection scan deserialization failed: {e}");
+                let moved_path =
+                    move_to_dir_safe(&path, &queue_root.join(QUARANTINE_DIR), &file_name)
+                        .map(|p| {
+                            p.strip_prefix(queue_root)
+                                .unwrap_or(&p)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .ok();
+                let job_id = file_name.trim_end_matches(".json").to_string();
+                let _ = emit_scan_receipt(
+                    fac_root,
+                    &file_name,
+                    &job_id,
+                    &compute_job_spec_digest_preview(&bytes),
+                    FacJobOutcome::Quarantined,
+                    DenialReasonCode::MalformedSpec,
+                    moved_path.as_deref(),
+                    &reason,
+                    canonicalizer_tuple_digest,
+                    toolchain_fingerprint,
+                );
+                // f-798-code_quality-1771816907239154-0: Emit fac.job.failed so the
+                // projection moves this job to a terminal state, breaking the
+                // quarantine-recreate-quarantine infinite loop.
+                if let Err(emit_err) = fac_queue_lifecycle_dual_write::emit_job_failed_by_queue_id(
+                    fac_root,
+                    &record.job_id,
+                    &record.queue_job_id,
+                    &record.work_id,
+                    "malformed_payload_quarantined",
+                    false,
+                    "fac.worker",
+                ) {
+                    eprintln!(
+                        "worker: WARNING: lifecycle failed event emission after \
+                         quarantine skipped (non-fatal): {emit_err}"
+                    );
+                }
+                continue;
+            },
+        };
+
+        candidates.push(PendingCandidate {
+            path,
+            spec,
+            raw_bytes: bytes,
+        });
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Same deterministic ordering as scan_pending (INV-WRK-005).
+    candidates.sort_by(|a, b| {
+        a.spec
+            .priority
+            .cmp(&b.spec.priority)
+            .then_with(|| a.spec.enqueue_time.cmp(&b.spec.enqueue_time))
+            .then_with(|| a.spec.job_id.cmp(&b.spec.job_id))
+    });
+
+    Some(candidates)
 }
 
 /// Scans `queue/pending/` and returns sorted candidates.
@@ -1321,6 +1658,35 @@ pub(super) fn validate_worker_service_user_ownership(
         }
     }
     Ok(())
+}
+
+/// Maximum length for a `queue_job_id` used in path construction.
+///
+/// Mirrors `MAX_QUEUE_JOB_ID_LENGTH` from
+/// `apm2_daemon::projection::job_lifecycle`.
+const MAX_QUEUE_JOB_ID_PATH_LENGTH: usize = 256;
+
+/// Validates a `queue_job_id` from a projection checkpoint for filesystem
+/// safety BEFORE using it to construct file paths.
+///
+/// f-798-security-1771826098242190-0: Checkpoint-provided `queue_job_id` values
+/// could contain path traversal sequences (`../`, absolute paths), unsafe
+/// characters (`/`, `\`, NUL), or be overlong. This function rejects any ID
+/// that is not safe for use as a filename component.
+///
+/// Returns `true` if the ID is safe, `false` otherwise.
+pub(super) fn is_safe_queue_job_id(queue_job_id: &str) -> bool {
+    if queue_job_id.is_empty() {
+        return false;
+    }
+    if queue_job_id.len() > MAX_QUEUE_JOB_ID_PATH_LENGTH {
+        return false;
+    }
+    // Only allow alphanumeric, hyphen, and underscore — no `/`, `\`, `.`, or
+    // other characters that could be used for path traversal.
+    queue_job_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// Reads a file with bounded I/O (INV-WRK-001).
