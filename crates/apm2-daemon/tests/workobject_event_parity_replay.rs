@@ -306,6 +306,9 @@ fn parity_field_equivalence_across_daemon_dotted_and_protobuf() {
 fn replay_from_checkpoint_converges_to_identical_projection() {
     let work_id = "W-REPLAY-001";
     let actor_id = "actor:replay";
+
+    // TCK-00672: ChangeSetPublished must be observed BEFORE review-start and
+    // completion gates (CSID-004 fail-closed latest-changeset admission).
     let events = vec![
         dotted_opened_event(work_id, actor_id, 2_000, 1),
         dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 2_100, 2),
@@ -319,6 +322,15 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
             2_200,
             3,
         ),
+        // Publish changeset before review-start gate (CSID-004).
+        digest_context_event(
+            "changeset_published",
+            work_id,
+            actor_id,
+            [0x42; 32],
+            2_250,
+            4,
+        ),
         dotted_transition_event(
             work_id,
             actor_id,
@@ -327,16 +339,9 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
             "ready_for_review",
             2,
             2_300,
-            4,
-        ),
-        digest_context_event(
-            "changeset_published",
-            work_id,
-            actor_id,
-            [0x42; 32],
-            2_350,
             5,
         ),
+        // Review receipt for latest digest — required for completion admission.
         digest_context_event(
             "review_receipt_recorded",
             work_id,
@@ -358,6 +363,8 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
         replay.matches,
         "replay projection must match expected state"
     );
+    // 5 work.* events that mutate state (changeset_published and
+    // review_receipt_recorded are not work.* events).
     assert_eq!(replay.applied_event_count, 5);
     assert_eq!(replay.actual_state.completed_count(), 1);
 }
@@ -405,6 +412,9 @@ fn duplicate_delivery_is_deduplicated_without_duplicate_side_effects() {
 fn restart_recovery_replay_converges() {
     let work_id = "W-RESTART-001";
     let actor_id = "actor:restart";
+
+    // TCK-00672: ChangeSetPublished must be observed BEFORE review-start
+    // (CSID-004 fail-closed latest-changeset admission).
     let events = vec![
         dotted_opened_event(work_id, actor_id, 4_000, 1),
         dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 4_100, 2),
@@ -418,6 +428,15 @@ fn restart_recovery_replay_converges() {
             4_200,
             3,
         ),
+        // Publish changeset before review-start gate (CSID-004).
+        digest_context_event(
+            "changeset_published",
+            work_id,
+            actor_id,
+            [0x42; 32],
+            4_250,
+            4,
+        ),
         dotted_transition_event(
             work_id,
             actor_id,
@@ -426,7 +445,7 @@ fn restart_recovery_replay_converges() {
             "ready_for_review",
             2,
             4_300,
-            4,
+            5,
         ),
     ];
 
