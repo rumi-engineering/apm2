@@ -410,6 +410,15 @@ fn enqueue_direct(
         ));
     }
 
+    if dual_write_enabled
+        && let Err(err) =
+            fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, spec, "fac.queue_submit")
+    {
+        eprintln!(
+            "warning: dual-write lifecycle enqueue event failed (continuing with filesystem authoritative queue): {err}"
+        );
+    }
+
     let filename = format!("{}.json", spec.job_id);
     let target = pending_dir.join(filename);
 
@@ -432,11 +441,6 @@ fn enqueue_direct(
     // Lock is released on drop (implicit flock(LOCK_UN)) after the job
     // spec file has been persisted.
     drop(lock_file);
-
-    if dual_write_enabled {
-        fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, spec, "fac.queue_submit")
-            .map_err(|err| format!("dual-write lifecycle enqueue event failed: {err}"))?;
-    }
 
     Ok(target)
 }
@@ -1297,6 +1301,38 @@ mod tests {
         assert_eq!(
             br_mode, 0o1733,
             "broker_requests should be mode 01733, got {br_mode:04o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_direct_continues_when_dual_write_emit_fails() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let queue_root = dir.path().join("queue");
+
+        // Symlink FAC root forces lifecycle emitter signer creation to fail
+        // (fac_key_material rejects symlink parents fail-closed), which drives
+        // the emit-failure path for this test.
+        let fac_root_real = dir.path().join("fac-real");
+        std::fs::create_dir_all(&fac_root_real).expect("create fac root");
+        let fac_root_link = dir.path().join("fac-link");
+        symlink(&fac_root_real, &fac_root_link).expect("create fac root symlink");
+
+        let spec = test_job_spec("test-direct-dual-write-emit-failure-001");
+        let policy = QueueBoundsPolicy::default();
+
+        let path = enqueue_direct(&queue_root, &fac_root_link, &spec, &policy, true)
+            .expect("enqueue should continue when dual-write emit fails");
+        assert!(
+            path.starts_with(queue_root.join(PENDING_DIR)),
+            "direct enqueue should still persist to pending/: {path:?}"
+        );
+        assert!(path.exists(), "pending file should exist after enqueue");
+        assert!(
+            !fac_root_real.join("signing_key").exists(),
+            "test setup should force lifecycle emission failure via symlink FAC root"
         );
     }
 

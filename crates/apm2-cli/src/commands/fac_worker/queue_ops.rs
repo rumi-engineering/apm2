@@ -98,6 +98,8 @@ pub(super) fn acquire_enqueue_lock(queue_root: &Path) -> Result<fs::File, String
 ///
 /// Synchronization model:
 /// - Open+lock the pending inode first.
+/// - If dual-write is enabled, attempt `fac.job.claimed` emission (best-effort,
+///   warning on failure).
 /// - Atomically rename `pending/<file>` -> `claimed/<file>`.
 /// - Keep the returned file descriptor alive until processing/commit finishes.
 ///
@@ -154,18 +156,21 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         None
     };
 
-    let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
-        .map_err(|err| format!("atomic claim failed: {err}"))?;
-
     if let Some(spec) = dual_write_spec.as_ref() {
-        fac_queue_lifecycle_dual_write::emit_job_claimed(
+        if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_claimed(
             fac_root,
             spec,
             &spec.actuation.lease_id,
             "fac.worker",
-        )
-        .map_err(|err| format!("dual-write lifecycle claim event failed: {err}"))?;
+        ) {
+            eprintln!(
+                "worker: WARNING: dual-write lifecycle claim event failed (continuing with filesystem authoritative queue): {err}"
+            );
+        }
     }
+
+    let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
+        .map_err(|err| format!("atomic claim failed: {err}"))?;
 
     Ok((claimed_path, claimed_lock_file))
 }
@@ -178,23 +183,26 @@ pub(super) fn release_claimed_job_to_pending(
     spec: &FacJobSpecV1,
     reason: &str,
 ) -> Result<PathBuf, String> {
+    if fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root)? {
+        if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_released(
+            fac_root,
+            spec,
+            reason,
+            Some(spec.actuation.lease_id.clone()),
+            "fac.worker",
+        ) {
+            eprintln!(
+                "worker: WARNING: dual-write lifecycle release event failed (continuing with filesystem authoritative queue): {err}"
+            );
+        }
+    }
+
     let moved_path = move_to_dir_safe(
         claimed_path,
         &queue_root.join(PENDING_DIR),
         claimed_file_name,
     )
     .map_err(|err| format!("move claimed job back to pending failed: {err}"))?;
-
-    if fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root)? {
-        fac_queue_lifecycle_dual_write::emit_job_released(
-            fac_root,
-            spec,
-            reason,
-            Some(spec.actuation.lease_id.clone()),
-            "fac.worker",
-        )
-        .map_err(|err| format!("dual-write lifecycle release event failed: {err}"))?;
-    }
 
     Ok(moved_path)
 }
@@ -251,6 +259,24 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
 
     let quarantine_dir = queue_root.join(QUARANTINE_DIR);
     let _ = fs::create_dir_all(&quarantine_dir);
+
+    let dual_write_fac_root = resolve_fac_root().ok();
+    let dual_write_enabled = dual_write_fac_root
+        .as_ref()
+        .and_then(|fac_root| {
+            match fac_queue_lifecycle_dual_write::queue_lifecycle_dual_write_enabled(fac_root) {
+                Ok(enabled) => Some(enabled),
+                Err(err) => {
+                    tracing::warn!(
+                        fac_root = %fac_root.display(),
+                        error = %err,
+                        "worker: cannot read queue lifecycle dual-write flag for broker promotion; proceeding with filesystem authoritative queue"
+                    );
+                    None
+                },
+            }
+        })
+        .unwrap_or(false);
 
     // Queue bounds policy is threaded from the loaded FAC policy by
     // the caller (run_fac_worker). This ensures broker-mediated
@@ -425,14 +451,14 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         };
 
         // Validate deserialization.
-        if deserialize_job_spec(&bytes).is_err() {
+        let Ok(spec) = deserialize_job_spec(&bytes) else {
             tracing::warn!(
                 path = %path.display(),
                 "TCK-00577: quarantining malformed broker request"
             );
             let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             continue;
-        }
+        };
 
         // ---- Begin enqueue lock critical section ----
         // Acquire the same process-level lockfile used by enqueue_direct
@@ -475,6 +501,22 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         // process (service user) with mode 0600, write the validated content,
         // fsync, then rename_noreplace into its final pending/ name. Only then
         // remove the original broker_requests file.
+        //
+        // QL-003 staged migration: attempt lifecycle enqueue event first
+        // (best-effort). Filesystem mutation still proceeds on emit failure.
+        if dual_write_enabled
+            && let Some(fac_root) = dual_write_fac_root.as_ref()
+            && let Err(err) =
+                fac_queue_lifecycle_dual_write::emit_job_enqueued(fac_root, &spec, "fac.worker")
+        {
+            tracing::warn!(
+                path = %path.display(),
+                job_id = %spec.job_id,
+                error = %err,
+                "worker: dual-write lifecycle enqueue event failed during broker promotion (continuing with filesystem authoritative queue)"
+            );
+        }
+
         match promote_via_rewrite(&bytes, &pending_dir, &file_name) {
             Ok(_promoted_path) => {
                 // Lock released after successful promotion.
