@@ -2026,6 +2026,9 @@ message RecordWorkPrAssociationRequest {
   // If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
   // with this URL as the target.
   string pr_url = 5;
+  // If true, validate association compatibility only and do not emit
+  // `work.pr_associated` or LINKOUT side effects.
+  bool validate_only = 6;
 }
 
 message RecordWorkPrAssociationResponse {

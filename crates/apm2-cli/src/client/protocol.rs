@@ -2283,6 +2283,7 @@ impl OperatorClient {
         commit_sha: &str,
         lease_id: &str,
         pr_url: Option<&str>,
+        validate_only: bool,
     ) -> Result<RecordWorkPrAssociationResponse, ProtocolClientError> {
         let request = RecordWorkPrAssociationRequest {
             work_id: work_id.to_string(),
@@ -2290,6 +2291,7 @@ impl OperatorClient {
             commit_sha: commit_sha.to_string(),
             lease_id: lease_id.to_string(),
             pr_url: pr_url.unwrap_or_default().to_string(),
+            validate_only,
         };
         let request_bytes = encode_record_work_pr_association_request(&request);
 

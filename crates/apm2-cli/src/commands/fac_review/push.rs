@@ -2356,6 +2356,31 @@ fn validate_work_publication_chain_responses(
         return Err("changeset publication returned empty event_id".to_string());
     }
 
+    validate_work_pr_association_response(
+        expected_work_id,
+        expected_pr_number,
+        expected_commit_sha,
+        association,
+    )?;
+
+    if let Some(handoff) = handoff_entry {
+        validate_context_entry_publication_response("handoff", expected_work_id, handoff)?;
+    }
+    validate_context_entry_publication_response(
+        "implementer_terminal",
+        expected_work_id,
+        terminal_entry,
+    )?;
+
+    Ok(())
+}
+
+fn validate_work_pr_association_response(
+    expected_work_id: &str,
+    expected_pr_number: u32,
+    expected_commit_sha: &str,
+    association: &RecordWorkPrAssociationResponse,
+) -> Result<(), String> {
     validate_push_work_id(&association.work_id)?;
     if association.work_id != expected_work_id {
         return Err(format!(
@@ -2375,16 +2400,6 @@ fn validate_work_publication_chain_responses(
             association.commit_sha
         ));
     }
-
-    if let Some(handoff) = handoff_entry {
-        validate_context_entry_publication_response("handoff", expected_work_id, handoff)?;
-    }
-    validate_context_entry_publication_response(
-        "implementer_terminal",
-        expected_work_id,
-        terminal_entry,
-    )?;
-
     Ok(())
 }
 
@@ -2605,6 +2620,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                 "work_binding_resolution",
                 "clean_worktree",
                 "head_drift_check",
+                "work_pr_association_compatibility",
             ],
         }),
     );
@@ -2728,6 +2744,68 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             )
         );
     }
+    let existing_pr_number = find_existing_pr(repo, &branch);
+    attempt_pr_number = existing_pr_number;
+    if existing_pr_number > 0 {
+        let work_association_preflight_started = Instant::now();
+        emit_stage(
+            "work_association_preflight_started",
+            serde_json::json!({
+                "work_id": work_id,
+                "pr_number": existing_pr_number,
+                "head_sha": sha,
+                "lease_id": lease_id,
+            }),
+        );
+        let rpc_work_id = work_id.clone();
+        let rpc_lease_id = lease_id.clone();
+        let rpc_sha = sha.clone();
+        let preflight_response = match with_operator_client(async move {
+            let mut client = OperatorClient::connect(operator_socket).await?;
+            client
+                .record_work_pr_association(
+                    &rpc_work_id,
+                    u64::from(existing_pr_number),
+                    &rpc_sha,
+                    &rpc_lease_id,
+                    None,
+                    true,
+                )
+                .await
+        }) {
+            Ok(value) => value,
+            Err(err) => {
+                fail_with_attempt!(
+                    "fac_push_work_association_preflight_failed",
+                    format!(
+                        "failed preflight validation for existing PR #{existing_pr_number}: {err}"
+                    )
+                );
+            },
+        };
+        if let Err(err) = validate_work_pr_association_response(
+            &work_id,
+            existing_pr_number,
+            &sha,
+            &preflight_response,
+        ) {
+            fail_with_attempt!(
+                "fac_push_work_association_preflight_response_invalid",
+                format!("invalid PR association preflight response: {err}")
+            );
+        }
+        emit_stage(
+            "work_association_preflight_completed",
+            serde_json::json!({
+                "status": "pass",
+                "duration_secs": work_association_preflight_started.elapsed().as_secs(),
+                "work_id": work_id,
+                "pr_number": existing_pr_number,
+                "head_sha": sha,
+                "already_existed": preflight_response.already_existed,
+            }),
+        );
+    }
     if let Err(err) = preflight_state.mark_fast_checks_completed() {
         fail_with_attempt!("fac_push_fast_checks_state_invalid", err);
     }
@@ -2742,8 +2820,6 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         }),
     );
 
-    let existing_pr_number = find_existing_pr(repo, &branch);
-    attempt_pr_number = existing_pr_number;
     let mut git_push_duration_secs = 0_u64;
     let mut git_push_exit_code: Option<i32> = None;
     let mut git_push_error_hint: Option<String> = None;
@@ -3296,6 +3372,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                 &rpc_sha,
                 &rpc_lease_id,
                 Some(&rpc_pr_url),
+                false,
             )
             .await?;
         let handoff_entry = if let Some(handoff_entry_json) = rpc_handoff_entry_json {

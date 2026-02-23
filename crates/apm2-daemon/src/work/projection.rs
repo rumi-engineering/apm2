@@ -653,8 +653,6 @@ struct WorkEventEnvelopeJson {
     session_id: String,
     actor_id: String,
     payload: String,
-    #[serde(flatten)]
-    _extra_fields: BTreeMap<String, serde_json::Value>,
 }
 
 fn decode_canonical_work_event_payload(
