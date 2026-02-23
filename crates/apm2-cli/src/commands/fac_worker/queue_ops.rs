@@ -762,6 +762,20 @@ pub(super) fn scan_pending_from_projection(
         }
         scanned += 1;
 
+        // f-798-security-1771826098242190-0: Validate queue_job_id from the
+        // checkpoint before using it for path construction. If the checkpoint
+        // contains a malicious queue_job_id (e.g. "../../../etc/passwd" or an
+        // absolute path), skip the entry to prevent path traversal when
+        // constructing scan paths or quarantine target paths.
+        if !is_safe_queue_job_id(&record.queue_job_id) {
+            eprintln!(
+                "worker: WARNING: projection scan skipping entry with unsafe \
+                 queue_job_id {:?} (path traversal/overlong/invalid characters)",
+                record.queue_job_id,
+            );
+            continue;
+        }
+
         // Construct the expected filename from the projection's queue_job_id.
         let file_name = format!("{}.json", record.queue_job_id);
         let path = pending_dir.join(&file_name);
@@ -1644,6 +1658,35 @@ pub(super) fn validate_worker_service_user_ownership(
         }
     }
     Ok(())
+}
+
+/// Maximum length for a `queue_job_id` used in path construction.
+///
+/// Mirrors `MAX_QUEUE_JOB_ID_LENGTH` from
+/// `apm2_daemon::projection::job_lifecycle`.
+const MAX_QUEUE_JOB_ID_PATH_LENGTH: usize = 256;
+
+/// Validates a `queue_job_id` from a projection checkpoint for filesystem
+/// safety BEFORE using it to construct file paths.
+///
+/// f-798-security-1771826098242190-0: Checkpoint-provided `queue_job_id` values
+/// could contain path traversal sequences (`../`, absolute paths), unsafe
+/// characters (`/`, `\`, NUL), or be overlong. This function rejects any ID
+/// that is not safe for use as a filename component.
+///
+/// Returns `true` if the ID is safe, `false` otherwise.
+pub(super) fn is_safe_queue_job_id(queue_job_id: &str) -> bool {
+    if queue_job_id.is_empty() {
+        return false;
+    }
+    if queue_job_id.len() > MAX_QUEUE_JOB_ID_PATH_LENGTH {
+        return false;
+    }
+    // Only allow alphanumeric, hyphen, and underscore — no `/`, `\`, `.`, or
+    // other characters that could be used for path traversal.
+    queue_job_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// Reads a file with bounded I/O (INV-WRK-001).

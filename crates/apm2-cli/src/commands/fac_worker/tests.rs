@@ -5830,3 +5830,66 @@ fn test_orchestration_classification_routes_quarantine_with_job_id() {
         other => panic!("expected QuarantineJob classification, got {other:?}"),
     }
 }
+
+// =============================================================================
+// f-798-security-1771826098242190-0: Regression tests for queue_job_id
+// validation in scan_pending_from_projection.
+// =============================================================================
+
+#[test]
+fn is_safe_queue_job_id_rejects_path_traversal_with_slash() {
+    // queue_job_id containing "/" must be rejected.
+    assert!(!is_safe_queue_job_id("../etc/passwd"));
+    assert!(!is_safe_queue_job_id("foo/bar"));
+    assert!(!is_safe_queue_job_id("/absolute/path"));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_dot_dot_sequences() {
+    // queue_job_id containing ".." must be rejected (dots not in allowlist).
+    assert!(!is_safe_queue_job_id(".."));
+    assert!(!is_safe_queue_job_id("..%2f..%2fetc%2fpasswd"));
+    assert!(!is_safe_queue_job_id("a..b"));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_absolute_paths() {
+    assert!(!is_safe_queue_job_id("/etc/passwd"));
+    assert!(!is_safe_queue_job_id("/tmp/malicious"));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_overlong_names() {
+    let overlong = "a".repeat(257);
+    assert!(!is_safe_queue_job_id(&overlong));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_empty() {
+    assert!(!is_safe_queue_job_id(""));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_backslash() {
+    assert!(!is_safe_queue_job_id("foo\\bar"));
+    assert!(!is_safe_queue_job_id("..\\..\\windows\\system32"));
+}
+
+#[test]
+fn is_safe_queue_job_id_rejects_dots_and_spaces() {
+    // Dots and spaces are not in the alphanumeric/hyphen/underscore allowlist.
+    assert!(!is_safe_queue_job_id("."));
+    assert!(!is_safe_queue_job_id("foo bar"));
+    assert!(!is_safe_queue_job_id("job.json"));
+}
+
+#[test]
+fn is_safe_queue_job_id_accepts_valid_ids() {
+    assert!(is_safe_queue_job_id("valid-job-id"));
+    assert!(is_safe_queue_job_id("job_123_abc"));
+    assert!(is_safe_queue_job_id("UPPERCASE-id"));
+    assert!(is_safe_queue_job_id("a"));
+    // Exactly at length limit is allowed.
+    let at_limit = "a".repeat(256);
+    assert!(is_safe_queue_job_id(&at_limit));
+}

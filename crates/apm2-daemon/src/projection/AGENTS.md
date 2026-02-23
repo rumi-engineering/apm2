@@ -43,6 +43,8 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation returns `CapacityExhausted` (TCK-00669).
 - **Lifecycle-scoped cursor probe**: The reconciler determines caught-up status by probing for remaining lifecycle events (`get_events_since` with lifecycle type filters and limit=1) instead of comparing against the global ledger head. Non-lifecycle events do not prevent cleanup from running (TCK-00669).
 - **Capacity exhaustion backpressure**: When `apply_event` returns `CapacityExhausted`, the reconciler halts the current tick WITHOUT advancing the cursor. The event is retried on a future tick once terminal jobs complete and free capacity. This prevents permanent data loss from skipping valid enqueue events (TCK-00669).
+- **Worker-integrated reconciler tick**: The reconciler `tick()` is called at worker startup and before each scan cycle in the worker runtime loop. This ensures `scan_pending_from_projection` reads a fresh checkpoint reflecting recently emitted dual-write events. Tick errors are non-fatal; the worker falls back to filesystem scan (TCK-00669).
+- **Projection scan queue_job_id validation**: `scan_pending_from_projection` validates each `queue_job_id` from the checkpoint before using it for filesystem path construction. IDs containing path traversal sequences (`/`, `..`, `\`), non-alphanumeric characters (outside `a-zA-Z0-9_-`), or exceeding length bounds are skipped with a warning (TCK-00669).
 
 ## Key Types
 

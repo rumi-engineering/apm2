@@ -236,7 +236,14 @@ fn emit_event(
     Ok(())
 }
 
-fn open_queue_lifecycle_emitter(fac_root: &Path) -> Result<SqliteLedgerEventEmitter, String> {
+/// Opens the queue lifecycle `SQLite` ledger emitter for the given FAC root.
+///
+/// f-798-code_quality-1771825106416871-0: Made `pub(super)` so the worker
+/// runtime can create a `JobLifecycleRehydrationReconciler` that reads
+/// lifecycle events from the same authoritative ledger used by dual-write.
+pub(super) fn open_queue_lifecycle_emitter(
+    fac_root: &Path,
+) -> Result<SqliteLedgerEventEmitter, String> {
     let signer = fac_key_material::load_or_generate_persistent_signer(fac_root)?;
     let secret_key_bytes = signer.secret_key_bytes();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
