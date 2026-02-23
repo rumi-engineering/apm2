@@ -39,7 +39,9 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Post-projection admission**: Intent is inserted as PENDING before projection, then admitted only AFTER successful projection side effects, ensuring at-least-once semantics (TCK-00505)
 - **Bounded lifecycle replay**: Job lifecycle reconciliation must use cursor-bounded event reads (`get_events_since`) with fixed `max_events_per_tick`; full-ledger materialization per tick is forbidden (TCK-00669).
 - **Terminal witness preservation**: Unknown-file cleanup for job lifecycle repair is restricted to `pending/`; `completed/` and `denied/` witness files remain durable evidence even after in-memory projection eviction (TCK-00669).
-- **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation fails closed (TCK-00669).
+- **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation returns `CapacityExhausted` (TCK-00669).
+- **Lifecycle-scoped cursor probe**: The reconciler determines caught-up status by probing for remaining lifecycle events (`get_events_since` with lifecycle type filters and limit=1) instead of comparing against the global ledger head. Non-lifecycle events do not prevent cleanup from running (TCK-00669).
+- **Capacity exhaustion backpressure**: When `apply_event` returns `CapacityExhausted`, the reconciler halts the current tick WITHOUT advancing the cursor. The event is retried on a future tick once terminal jobs complete and free capacity. This prevents permanent data loss from skipping valid enqueue events (TCK-00669).
 
 ## Key Types
 

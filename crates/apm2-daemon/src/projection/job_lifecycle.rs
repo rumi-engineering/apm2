@@ -79,6 +79,14 @@ pub enum JobLifecycleProjectionError {
     /// Projection or checkpoint validation failed.
     #[error("job lifecycle validation failed: {0}")]
     Validation(String),
+    /// Projection is at capacity with no evictable terminal jobs.
+    ///
+    /// This is a transient condition — not a permanent defect in the event.
+    /// The caller must NOT advance the cursor past this event. Instead, halt
+    /// processing for the current tick and retry on a future tick after
+    /// terminal jobs complete and free capacity.
+    #[error("job lifecycle capacity exhausted: {0}")]
+    CapacityExhausted(String),
     /// Serialization error while persisting checkpoint.
     #[error("job lifecycle serialization failed: {0}")]
     Serialization(String),
@@ -199,7 +207,7 @@ impl JobLifecycleProjectionV1 {
     fn ensure_capacity_for_new_job(&mut self) -> Result<(), JobLifecycleProjectionError> {
         while self.jobs.len() >= MAX_PROJECTED_JOBS {
             if !self.evict_oldest_terminal_job() {
-                return Err(JobLifecycleProjectionError::Validation(format!(
+                return Err(JobLifecycleProjectionError::CapacityExhausted(format!(
                     "projected jobs at capacity ({MAX_PROJECTED_JOBS}) and no terminal jobs are available for eviction"
                 )));
             }
@@ -557,24 +565,39 @@ impl JobLifecycleRehydrationReconciler {
                     continue;
                 },
             };
-            // f-798-security-1771812596683957-0 and f-798-code_quality-1771812851882322-0:
-            // Handle apply_event failures (capacity Validation, invalid queue_job_id)
-            // as skip-and-advance defects. This prevents infinite replay loops when the
-            // projection is at capacity with no evictable terminal jobs, or when a
-            // semantically invalid queue_job_id passes decode but fails filesystem
-            // safety validation. Same poison-pill-resilience pattern as decode errors.
+            // f-798-code_quality-1771815588937622-0: Differentiate transient
+            // capacity exhaustion from permanent semantic validation failures.
+            //
+            // CapacityExhausted: The projection is full with no evictable
+            //   terminal jobs. This is transient — halt processing for this
+            //   tick WITHOUT advancing the cursor. The event will be retried
+            //   on a future tick after terminal jobs complete and free capacity.
+            //
+            // Validation (poison pill): The event is permanently malformed
+            //   (e.g. invalid queue_job_id). Skip and advance the cursor to
+            //   prevent infinite replay loops.
             let dirty_job_id = match checkpoint.projection.apply_event(
                 &lifecycle_event,
                 &event.event_id,
                 event.timestamp_ns,
             ) {
                 Ok(job_id) => job_id,
+                Err(JobLifecycleProjectionError::CapacityExhausted(ref msg)) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %msg,
+                        "halting tick: projection at capacity with no evictable \
+                         terminal jobs; event will be retried on future tick"
+                    );
+                    // Do NOT advance cursor — the event must be retried.
+                    break;
+                },
                 Err(JobLifecycleProjectionError::Validation(ref msg)) => {
                     warn!(
                         event_id = %event.event_id,
                         error = %msg,
                         "skipping lifecycle event that failed projection validation \
-                         (capacity or identity poison pill)"
+                         (identity poison pill)"
                     );
                     checkpoint.cursor_timestamp_ns = event.timestamp_ns;
                     checkpoint.cursor_event_id = event.event_id;
@@ -624,27 +647,31 @@ impl JobLifecycleRehydrationReconciler {
             }
         }
 
-        // f-798-security-1771812591501920-0 / f-798-security-1771814320321724-0:
-        // Only delete unknown files when the reconciler cursor is caught up to
-        // the ledger head.  During backlog processing, newly enqueued jobs
-        // (whose ledger events are ahead of the cursor) are NOT yet in the
-        // projection.  Deleting them would cause critical data loss — valid
-        // job payloads replaced by unexecutable witness stubs when the cursor
-        // catches up.
+        // f-798-security-1771815813540054-0 / f-798-code_quality-1771815601035651-0:
+        // Determine caught-up status by probing for remaining lifecycle events
+        // after the current cursor, rather than comparing against the global
+        // ledger head (`get_latest_event()`).
         //
-        // The check compares BOTH timestamp AND event_id against the latest
-        // ledger event.  Timestamp alone is insufficient because
-        // `get_events_since` is paginated — multiple events can share the
-        // same timestamp_ns.  When the reconciler processes some-but-not-all
-        // events at timestamp T (due to per-tick page limits), the cursor
-        // timestamp advances to T while `cursor_event_id` still points to an
-        // earlier event at T.  Without the event_id comparison, cleanup would
-        // fire prematurely and delete files for unprocessed events.
-        let cursor_caught_up = self.ledger.get_latest_event().is_none_or(|latest| {
-            checkpoint.cursor_timestamp_ns > latest.timestamp_ns
-                || (checkpoint.cursor_timestamp_ns == latest.timestamp_ns
-                    && checkpoint.cursor_event_id >= latest.event_id)
-        });
+        // The previous approach compared cursor position against the latest
+        // event across ALL event types (including non-lifecycle events like
+        // `work.transitioned`, `evidence.published`).  In production with
+        // continuous non-lifecycle events, the lifecycle cursor would never
+        // equal the global head — `cursor_caught_up` was always false —
+        // `cleanup_unknown_files` never ran — orphaned queue files accumulated
+        // unboundedly.
+        //
+        // The fix uses `get_events_since` with lifecycle type filters and a
+        // limit of 1 as a probe.  If no lifecycle events remain after the
+        // cursor, the projection is caught up and cleanup can safely fire.
+        // This also avoids the fragile lexicographic event_id comparison that
+        // broke with legacy EVT-UUID identifiers.
+        let remaining_lifecycle_events = self.ledger.get_events_since(
+            checkpoint.cursor_timestamp_ns,
+            &checkpoint.cursor_event_id,
+            &LIFECYCLE_EVENT_TYPES,
+            1,
+        );
+        let cursor_caught_up = remaining_lifecycle_events.is_empty();
 
         if applied_fs_ops < self.config.max_fs_ops_per_tick && cursor_caught_up {
             self.cleanup_unknown_files(&checkpoint.projection, &mut applied_fs_ops)?;
@@ -1236,8 +1263,8 @@ mod tests {
                 base_ts.saturating_add(MAX_PROJECTED_JOBS as u64 + 1),
             )
             .expect_err("overflow must fail when all slots are active");
-        let JobLifecycleProjectionError::Validation(message) = err else {
-            panic!("expected validation error when capacity is exhausted");
+        let JobLifecycleProjectionError::CapacityExhausted(message) = err else {
+            panic!("expected CapacityExhausted error when capacity is exhausted, got: {err:?}");
         };
         assert!(
             message.contains("no terminal jobs"),
@@ -1604,10 +1631,11 @@ mod tests {
     }
 
     #[test]
-    fn tick_skips_capacity_exhausted_event_and_advances_cursor() {
-        // f-798-security-1771812596683957-0: Verify that when projection is at
-        // MAX_PROJECTED_JOBS with no terminal jobs, apply_event capacity
-        // failure is treated as skip-and-advance (not infinite replay loop).
+    fn tick_backpressures_on_capacity_exhaustion_then_recovers() {
+        // f-798-code_quality-1771815588937622-0: Verify that when projection
+        // is at MAX_PROJECTED_JOBS with no terminal jobs, capacity exhaustion
+        // halts the tick WITHOUT advancing the cursor. The event is retried on
+        // a future tick after terminal jobs complete and free capacity.
         let tmp = tempfile::tempdir().expect("tempdir");
         let queue_root = make_queue_root(&tmp);
         let stub = Arc::new(StubLedgerEventEmitter::new());
@@ -1647,59 +1675,83 @@ mod tests {
         emit_lifecycle(
             &emitter,
             &FacJobLifecycleEventV1::new(
-                "intent:enqueue:overflow-skip",
+                "intent:enqueue:overflow-halt",
                 None,
                 FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
-                    identity: identity("overflow-skip"),
+                    identity: identity("overflow-halt"),
                     enqueue_epoch_ns: base_ts + MAX_PROJECTED_JOBS as u64 + 1,
                 }),
             ),
             base_ts + MAX_PROJECTED_JOBS as u64 + 1,
         );
-        // Emit a second valid event after the capacity-exhausted event.
-        emit_lifecycle(
-            &emitter,
-            &FacJobLifecycleEventV1::new(
-                "intent:started:active-0",
-                None,
-                FacJobLifecycleEventData::Started(FacJobStartedV1 {
-                    identity: identity("active-0"),
-                    worker_instance_id: "worker-1".to_string(),
-                    start_receipt_id: None,
-                }),
-            ),
-            base_ts + MAX_PROJECTED_JOBS as u64 + 2,
-        );
 
         let reconciler = JobLifecycleRehydrationReconciler::with_checkpoint_path(
             Arc::clone(&emitter),
             queue_root,
-            checkpoint_path,
+            checkpoint_path.clone(),
             JobLifecycleReconcilerConfig {
                 max_events_per_tick: 16,
                 max_fs_ops_per_tick: 16,
             },
         );
 
+        // First tick: capacity exhaustion halts without advancing cursor.
         let tick = reconciler
             .tick()
-            .expect("tick must succeed (skip capacity-exhausted event)");
-        // The overflow event is skipped, the started event for active-0 is
-        // processed.
+            .expect("tick must succeed (capacity exhaustion = backpressure, not error)");
         assert_eq!(
-            tick.processed_events, 1,
-            "valid events after capacity-exhausted poison pill must be processed"
+            tick.processed_events, 0,
+            "no events should be processed when capacity is exhausted"
         );
-        assert!(
-            tick.cursor_timestamp_ns >= base_ts + MAX_PROJECTED_JOBS as u64 + 2,
-            "cursor must advance past both the skipped and processed events"
+        assert_eq!(
+            tick.cursor_timestamp_ns, 0,
+            "cursor must NOT advance past the capacity-exhausted event"
         );
 
-        // Second tick must not replay the capacity-exhausted event.
-        let second = reconciler.tick().expect("second tick");
+        // Now simulate one of the active jobs completing (terminal) to free
+        // a slot. We load the checkpoint, mutate the first job to Failed
+        // status and add it to the eviction queue, then save.
+        let mut checkpoint: JobLifecycleCheckpointV1 =
+            fs_safe::bounded_read_json(&checkpoint_path, MAX_CHECKPOINT_FILE_SIZE_BYTES)
+                .expect("reload checkpoint");
+        let first_job_id = "fj1-active-0".to_string();
+        if let Some(record) = checkpoint.projection.jobs.get_mut(&first_job_id) {
+            record.status = ProjectedJobStatus::Failed;
+            record.reason_code = Some("test.recovery".to_string());
+        }
+        checkpoint
+            .projection
+            .terminal_job_eviction_order
+            .push_back(TerminalJobEvictionEntryV1 {
+                job_id: first_job_id,
+                last_event_timestamp_ns: base_ts,
+            });
+        fs_safe::atomic_write_json(&checkpoint_path, &checkpoint)
+            .expect("save checkpoint with freed slot");
+
+        // Second tick: the capacity-exhausted event is retried and now
+        // succeeds because a terminal job can be evicted.
+        let second = reconciler
+            .tick()
+            .expect("second tick must succeed after capacity freed");
         assert_eq!(
-            second.processed_events, 0,
-            "capacity-exhausted event must not be replayed"
+            second.processed_events, 1,
+            "capacity-exhausted event must be retried and processed on next tick"
+        );
+        assert!(
+            second.cursor_timestamp_ns > base_ts + MAX_PROJECTED_JOBS as u64,
+            "cursor must advance past the now-processed event"
+        );
+        // Verify the job was actually added to the projection.
+        let final_checkpoint: JobLifecycleCheckpointV1 =
+            fs_safe::bounded_read_json(&checkpoint_path, MAX_CHECKPOINT_FILE_SIZE_BYTES)
+                .expect("reload final checkpoint");
+        assert!(
+            final_checkpoint
+                .projection
+                .jobs
+                .contains_key("fj1-overflow-halt"),
+            "the previously-blocked enqueue event must now be in the projection"
         );
     }
 
@@ -1935,6 +1987,89 @@ mod tests {
         assert!(
             queue_root.join(PENDING_DIR).join("beta.json").exists(),
             "beta job should still exist in pending after being projected"
+        );
+    }
+
+    #[test]
+    fn cursor_caught_up_true_with_non_lifecycle_events_ahead() {
+        // f-798-security-1771815813540054-0 / f-798-code_quality-1771815601035651-0:
+        // Regression test: seed both lifecycle and non-lifecycle events at the
+        // same timestamp. Process all lifecycle events. Verify that
+        // `cursor_caught_up` evaluates to true (cleanup fires) even while
+        // non-lifecycle events are still "ahead" in the global ledger.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let ts = now_timestamp_ns();
+
+        // Emit a lifecycle event.
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:lifecycle-job",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("lifecycle-job"),
+                    enqueue_epoch_ns: ts,
+                }),
+            ),
+            ts,
+        );
+
+        // Emit a non-lifecycle event AFTER the lifecycle event. This simulates
+        // production where `work.transitioned` / `evidence.published` events
+        // continuously arrive and push the global ledger head ahead.
+        emitter
+            .emit_session_event(
+                "session-nonlc",
+                "work.transitioned",
+                b"non-lifecycle-payload",
+                "fac-worker",
+                ts + 1,
+            )
+            .expect("emit non-lifecycle event");
+
+        // Seed an orphan file in pending/ that should be cleaned up when the
+        // cursor is caught up to the lifecycle stream.
+        fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending");
+        fs::write(
+            queue_root.join(PENDING_DIR).join("orphan-nonlc.json"),
+            b"{}",
+        )
+        .expect("seed orphan file");
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 16,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        let tick = reconciler.tick().expect("tick");
+        assert_eq!(
+            tick.processed_events, 1,
+            "lifecycle event must be processed"
+        );
+        assert!(
+            queue_root
+                .join(PENDING_DIR)
+                .join("lifecycle-job.json")
+                .exists(),
+            "lifecycle job must exist in pending/"
+        );
+        // The orphan file must be cleaned up because the cursor is caught up
+        // to the lifecycle event stream, even though non-lifecycle events
+        // exist ahead in the global ledger.
+        assert!(
+            !queue_root
+                .join(PENDING_DIR)
+                .join("orphan-nonlc.json")
+                .exists(),
+            "orphan file must be cleaned up when cursor is caught up to \
+             lifecycle stream, regardless of non-lifecycle events ahead"
         );
     }
 }
