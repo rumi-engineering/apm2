@@ -2027,6 +2027,10 @@ pub struct RecordWorkPrAssociationRequest {
     /// with this URL as the target.
     #[prost(string, tag = "5")]
     pub pr_url: ::prost::alloc::string::String,
+    /// If true, validate association compatibility only and do not emit
+    /// `work.pr_associated` or LINKOUT side effects.
+    #[prost(bool, tag = "6")]
+    pub validate_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RecordWorkPrAssociationResponse {

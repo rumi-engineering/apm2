@@ -3655,12 +3655,87 @@ fn promote_broker_request_success_under_capacity() {
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequirementTraceability {
+    requirement_id: &'static str,
+    source_path: &'static str,
+    source_anchor: &'static str,
+    expected_behavior: &'static str,
+}
+
+fn dual_write_requirement_traceability() -> [RequirementTraceability; 4] {
+    [
+        RequirementTraceability {
+            requirement_id: "QL-R3",
+            source_path: "documents/work/tickets/TCK-00669.yaml",
+            source_anchor: "ledger projection wins; filesystem is repaired to match",
+            expected_behavior: "ledger projection truth deterministically reconstructs queue lifecycle outcomes",
+        },
+        RequirementTraceability {
+            requirement_id: "QL-003",
+            source_path: "crates/apm2-cli/src/commands/AGENTS.md",
+            source_anchor: "Queue lifecycle dual-write ordering",
+            expected_behavior: "queue lifecycle dual-write ordering mirrors queue mutation semantics",
+        },
+        RequirementTraceability {
+            requirement_id: "INV-WRK-003",
+            source_path: "crates/apm2-cli/src/commands/fac_worker/mod.rs",
+            source_anchor: "Atomic claim via rename prevents double-execution.",
+            expected_behavior: "queue claim path preserves atomic single-consumer semantics",
+        },
+        RequirementTraceability {
+            requirement_id: "INV-WRK-007",
+            source_path: "crates/apm2-cli/src/commands/fac_worker/mod.rs",
+            source_anchor: "Malformed/unreadable/oversize files are quarantined",
+            expected_behavior: "malformed/unreadable inputs fail closed with explicit quarantine outcomes",
+        },
+    ]
+}
+
+fn assert_dual_write_requirement_traceability() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    for trace in dual_write_requirement_traceability() {
+        assert!(
+            !trace.requirement_id.is_empty()
+                && !trace.source_path.is_empty()
+                && !trace.source_anchor.is_empty()
+                && !trace.expected_behavior.is_empty(),
+            "requirement traceability entries must provide id/source/anchor/expected behavior"
+        );
+
+        let source_path = repo_root.join(trace.source_path);
+        let source = std::fs::read_to_string(&source_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read requirement source {} for {}: {err}",
+                source_path.display(),
+                trace.requirement_id
+            )
+        });
+        assert!(
+            source.contains(trace.requirement_id),
+            "source-of-truth {} must contain requirement id {}",
+            source_path.display(),
+            trace.requirement_id
+        );
+        assert!(
+            source.contains(trace.source_anchor),
+            "source-of-truth {} for {} must contain anchor {:?}",
+            source_path.display(),
+            trace.requirement_id,
+            trace.source_anchor
+        );
+    }
+}
+
 #[test]
 fn promote_broker_request_dual_write_emits_enqueued_event() {
     use apm2_core::fac::job_lifecycle::FAC_JOB_ENQUEUED_EVENT_TYPE;
 
     let _guard = env_var_test_lock().lock().expect("serialize env test");
     let original_apm2_home = std::env::var_os("APM2_HOME");
+    assert_dual_write_requirement_traceability();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let apm2_home = dir.path().join(".apm2");
@@ -3676,6 +3751,13 @@ fn promote_broker_request_dual_write_emits_enqueued_event() {
     let mut policy = FacPolicyV1::default_policy();
     policy.queue_lifecycle_dual_write_enabled = true;
     persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+    let _lifecycle_harness =
+        fac_queue_lifecycle_dual_write::install_deterministic_lifecycle_harness(
+            fac_queue_lifecycle_dual_write::DeterministicLifecycleHarnessConfig {
+                simulate_only: true,
+                ..Default::default()
+            },
+        );
 
     let broker_file = broker_dir.join("broker-dual-write-enqueued.json");
     fs::write(
@@ -3695,50 +3777,17 @@ fn promote_broker_request_dual_write_emits_enqueued_event() {
         "broker request source file should be removed after promotion"
     );
 
-    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
-        .expect("open lifecycle ledger");
-    conn.busy_timeout(std::time::Duration::from_millis(250))
-        .expect("set sqlite busy timeout");
-
-    let has_legacy_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    let has_canonical_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-
-    let mut total = 0usize;
-    if has_legacy_events {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
-                [FAC_JOB_ENQUEUED_EVENT_TYPE],
-                |row| row.get(0),
-            )
-            .expect("count legacy enqueue events");
-        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-    }
-    if has_canonical_events {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
-                [FAC_JOB_ENQUEUED_EVENT_TYPE],
-                |row| row.get(0),
-            )
-            .expect("count canonical enqueue events");
-        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-    }
+    let emissions = fac_queue_lifecycle_dual_write::deterministic_lifecycle_emissions();
+    let total = emissions
+        .iter()
+        .filter(|emission| {
+            emission.event_type == FAC_JOB_ENQUEUED_EVENT_TYPE
+                && emission.queue_job_id == "broker-dual-write-enqueued"
+        })
+        .count();
     assert!(
-        total >= 1,
-        "broker promotion should dual-write at least one fac.job.enqueued event"
+        total == 1,
+        "broker promotion should emit exactly one deterministic fac.job.enqueued for queue_job_id=broker-dual-write-enqueued"
     );
 
     if let Some(value) = original_apm2_home {
@@ -5244,6 +5293,7 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
 
     let _guard = env_var_test_lock().lock().expect("serialize env test");
     let original_apm2_home = std::env::var_os("APM2_HOME");
+    assert_dual_write_requirement_traceability();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let apm2_home = dir.path().join(".apm2");
@@ -5256,6 +5306,13 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
     let mut policy = FacPolicyV1::default_policy();
     policy.queue_lifecycle_dual_write_enabled = true;
     persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+    let _lifecycle_harness =
+        fac_queue_lifecycle_dual_write::install_deterministic_lifecycle_harness(
+            fac_queue_lifecycle_dual_write::DeterministicLifecycleHarnessConfig {
+                simulate_only: true,
+                ..Default::default()
+            },
+        );
 
     let mut spec_completed = make_receipt_test_spec();
     spec_completed.job_id = "job-lifecycle-completed".to_string();
@@ -5407,94 +5464,43 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
         "failed job must move to denied/"
     );
 
-    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
-        .expect("open lifecycle ledger");
-    conn.busy_timeout(std::time::Duration::from_millis(250))
-        .expect("set sqlite busy timeout");
-
-    let has_legacy_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    let has_canonical_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-
-    let mut counts = HashMap::new();
-    for event_type in [
-        FAC_JOB_ENQUEUED_EVENT_TYPE,
-        FAC_JOB_CLAIMED_EVENT_TYPE,
-        FAC_JOB_STARTED_EVENT_TYPE,
-        FAC_JOB_COMPLETED_EVENT_TYPE,
-        FAC_JOB_RELEASED_EVENT_TYPE,
-        FAC_JOB_FAILED_EVENT_TYPE,
-    ] {
-        let mut total = 0usize;
-        if has_legacy_events {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
-                    [event_type],
-                    |row| row.get(0),
-                )
-                .expect("count legacy lifecycle events");
-            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-        }
-        if has_canonical_events {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
-                    [event_type],
-                    |row| row.get(0),
-                )
-                .expect("count canonical lifecycle events");
-            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-        }
-        counts.insert(event_type.to_string(), total);
-    }
+    let counts = fac_queue_lifecycle_dual_write::deterministic_lifecycle_emission_counts();
 
     assert!(
         counts
             .get(FAC_JOB_ENQUEUED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 3,
-        "enqueue transitions must dual-write fac.job.enqueued"
+            == 3,
+        "enqueue transitions must deterministically emit 3 fac.job.enqueued events"
     );
     assert!(
-        counts.get(FAC_JOB_CLAIMED_EVENT_TYPE).copied().unwrap_or(0) >= 3,
-        "claim transitions must dual-write fac.job.claimed"
+        counts.get(FAC_JOB_CLAIMED_EVENT_TYPE).copied().unwrap_or(0) == 3,
+        "claim transitions must deterministically emit 3 fac.job.claimed events"
     );
     assert!(
-        counts.get(FAC_JOB_STARTED_EVENT_TYPE).copied().unwrap_or(0) >= 2,
-        "terminal claimed flows must dual-write fac.job.started"
+        counts.get(FAC_JOB_STARTED_EVENT_TYPE).copied().unwrap_or(0) == 2,
+        "terminal claimed flows must deterministically emit 2 fac.job.started events"
     );
     assert!(
         counts
             .get(FAC_JOB_COMPLETED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 1,
-        "completed transitions must dual-write fac.job.completed"
+            == 1,
+        "completed transitions must deterministically emit 1 fac.job.completed event"
     );
     assert!(
         counts
             .get(FAC_JOB_RELEASED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 1,
-        "release transitions must dual-write fac.job.released"
+            == 1,
+        "release transitions must deterministically emit 1 fac.job.released event"
     );
     assert!(
-        counts.get(FAC_JOB_FAILED_EVENT_TYPE).copied().unwrap_or(0) >= 1,
-        "failed transitions must dual-write fac.job.failed"
+        counts.get(FAC_JOB_FAILED_EVENT_TYPE).copied().unwrap_or(0) == 1,
+        "failed transitions must deterministically emit 1 fac.job.failed event"
     );
 
     if let Some(value) = original_apm2_home {

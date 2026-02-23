@@ -33,6 +33,7 @@ ticket_meta:
     - Remove legacy work-event envelope decode branches from projection rebuild; enforce session-envelope contract (`event_type`, `session_id`, `actor_id`, `payload`) while allowing extension fields
     - Scope lease->work fallback to push publication paths only (RecordWorkPrAssociation + terminal/handoff context entry kinds) to preserve revocation semantics elsewhere
     - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
+    - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
     out_of_scope:
     - Daemon-side CI processor transitions (separate ticket)
   plan:
@@ -42,6 +43,7 @@ ticket_meta:
     - Ensure idempotent retries with stable dedupe keys and scoped lease->work recovery behavior
     - Make `--handoff-note` optional; always emit IMPLEMENTER_TERMINAL marker
     - Harden projection rebuild decoder to current session envelope contract and remove historical raw/payload-only branches
+    - Add early PR-association preflight to `fac push` fast checks (non-mutating validation path)
     - Add/maintain regression tests for idempotent push replay and lease-mapping recovery in publication closures
   definition_of_done:
     evidence_ids: []

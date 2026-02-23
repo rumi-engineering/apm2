@@ -816,28 +816,11 @@ impl SqliteLedgerEventEmitter {
             [],
         )?;
 
-        // TCK-00639 CODE QUALITY FIX: enforce single canonical
-        // `work.pr_associated` event per work_id to prevent PR flapping races
-        // where concurrent conflicting tuples could both commit.
-        let legacy_work_pr_singleton_dedup = conn.execute(
-            "DELETE FROM ledger_events WHERE rowid NOT IN ( \
-                 SELECT MIN(rowid) FROM ledger_events \
-                 WHERE event_type = 'work.pr_associated' \
-                 GROUP BY work_id \
-             ) AND event_type = 'work.pr_associated'",
-            [],
-        )?;
-        if legacy_work_pr_singleton_dedup > 0 {
-            warn!(
-                count = legacy_work_pr_singleton_dedup,
-                "deduped historical conflicting work.pr_associated rows by work_id in legacy ledger_events"
-            );
-            migration_changes_applied = true;
-        }
+        // Product semantics: a work item may publish multiple commits for the
+        // same PR over time. Keep tuple uniqueness, drop historical singleton
+        // index if present.
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_singleton_unique \
-             ON ledger_events(work_id) \
-             WHERE event_type = 'work.pr_associated'",
+            "DROP INDEX IF EXISTS idx_work_pr_associated_singleton_unique",
             [],
         )?;
 
@@ -970,25 +953,8 @@ impl SqliteLedgerEventEmitter {
                 [],
             )?;
 
-            let canonical_work_pr_singleton_dedup = conn.execute(
-                "DELETE FROM events WHERE rowid NOT IN ( \
-                     SELECT MIN(rowid) FROM events \
-                     WHERE event_type = 'work.pr_associated' \
-                     GROUP BY session_id \
-                 ) AND event_type = 'work.pr_associated'",
-                [],
-            )?;
-            if canonical_work_pr_singleton_dedup > 0 {
-                warn!(
-                    count = canonical_work_pr_singleton_dedup,
-                    "deduped historical conflicting work.pr_associated rows by work_id in canonical events"
-                );
-                migration_changes_applied = true;
-            }
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_singleton_unique \
-                 ON events(session_id) \
-                 WHERE event_type = 'work.pr_associated'",
+                "DROP INDEX IF EXISTS idx_canonical_work_pr_associated_singleton_unique",
                 [],
             )?;
         }

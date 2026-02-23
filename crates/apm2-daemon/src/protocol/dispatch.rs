@@ -3539,25 +3539,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
             // TCK-00639 SECURITY FIX: Enforce at-most-one
             // `work.pr_associated` per semantic identity
-            // (work_id, pr_number, commit_sha), mirroring SQLite UNIQUE
+            // `(work_id, pr_number, commit_sha)`, mirroring SQLite UNIQUE
             // index `idx_work_pr_associated_unique`.
             if let Some((pr_number, commit_sha)) = pr_associated_identity.as_ref() {
-                let already_has_association = events_by_work.get(session_id).is_some_and(|ids| {
-                    ids.iter().any(|id| {
-                        events
-                            .get(id)
-                            .is_some_and(|event| event.event_type == "work.pr_associated")
-                    })
-                });
-                if already_has_association {
-                    return Err(LedgerEventError::PersistenceFailed {
-                        message: format!(
-                            "UNIQUE constraint failed: idx_work_pr_associated_singleton_unique \
-                             (duplicate work.pr_associated for work_id '{session_id}')"
-                        ),
-                    });
-                }
-
                 let duplicate = events_by_work.get(session_id).is_some_and(|existing_ids| {
                     existing_ids.iter().any(|id| {
                         events.get(id).is_some_and(|existing| {
@@ -21033,6 +21017,24 @@ impl PrivilegedDispatcher {
         Some((associated.pr_number, associated.commit_sha))
     }
 
+    /// Returns true when the exact `(work_id, pr_number, commit_sha)` tuple
+    /// has already been recorded in `work.pr_associated` history.
+    fn has_work_pr_association_tuple(
+        &self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+    ) -> bool {
+        self.event_emitter
+            .get_events_by_work_id(work_id)
+            .into_iter()
+            .filter(|event| event.event_type == "work.pr_associated")
+            .filter_map(|event| Self::extract_work_pr_association_fields(&event.payload))
+            .any(|(existing_pr, existing_sha)| {
+                existing_pr == pr_number && existing_sha.eq_ignore_ascii_case(commit_sha)
+            })
+    }
+
     /// Deterministic dedupe key for PR LINKOUT publishing.
     ///
     /// The key is derived from `pr_url` so retries of the same URL produce the
@@ -21456,9 +21458,15 @@ impl PrivilegedDispatcher {
 
         // 8. Idempotency and canonical-association policy check.
         //
-        // Enforce single canonical association per `work_id`:
-        // - same tuple  => idempotent success (`already_existed=true`)
-        // - different   => reject (prevents PR flapping)
+        // Product contract:
+        // - A `work_id` is the durable work object, not a single commit.
+        // - PR anti-flap is enforced at PR-number granularity per work_id.
+        // - Commit SHA may advance for the same PR across pushes.
+        //
+        // Therefore:
+        // - different `pr_number` for same `work_id` => reject
+        // - same tuple `(work_id, pr_number, commit_sha)` => idempotent replay
+        // - same `(work_id, pr_number)` with new `commit_sha` => allowed update
         let mut already_existed = false;
         if let Some(existing) = self
             .event_emitter
@@ -21473,7 +21481,23 @@ impl PrivilegedDispatcher {
                 ));
             };
 
-            if existing_pr_number == request.pr_number && existing_commit_sha == request.commit_sha
+            if existing_pr_number != request.pr_number {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::FailedPrecondition,
+                    format!(
+                        "work_id '{}' is already associated with pr_number={}; \
+                         conflicting pr_number={} rejected",
+                        request.work_id, existing_pr_number, request.pr_number
+                    ),
+                ));
+            }
+
+            if existing_commit_sha.eq_ignore_ascii_case(&request.commit_sha)
+                || self.has_work_pr_association_tuple(
+                    &request.work_id,
+                    request.pr_number,
+                    &request.commit_sha,
+                )
             {
                 already_existed = true;
                 info!(
@@ -21482,20 +21506,18 @@ impl PrivilegedDispatcher {
                     commit_sha = %request.commit_sha,
                     "RecordWorkPrAssociation: idempotent no-op (same association already exists)"
                 );
-            } else {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::FailedPrecondition,
-                    format!(
-                        "work_id '{}' is already associated with (pr_number={}, commit_sha='{}'); \
-                         conflicting tuple (pr_number={}, commit_sha='{}') rejected",
-                        request.work_id,
-                        existing_pr_number,
-                        existing_commit_sha,
-                        request.pr_number,
-                        request.commit_sha
-                    ),
-                ));
             }
+        }
+
+        if request.validate_only {
+            return Ok(PrivilegedResponse::RecordWorkPrAssociation(
+                RecordWorkPrAssociationResponse {
+                    work_id: request.work_id,
+                    pr_number: request.pr_number,
+                    commit_sha: request.commit_sha,
+                    already_existed,
+                },
+            ));
         }
 
         // 9. Emit canonical work.pr_associated when this is a new association.
@@ -21550,53 +21572,58 @@ impl PrivilegedDispatcher {
                     );
                 },
                 Err(e) if e.to_string().contains("UNIQUE constraint") => {
-                    // Race-safe recovery: a concurrent writer committed first.
-                    let persisted = self.event_emitter.get_first_event_by_work_id_and_type(
+                    // Race-safe recovery: a concurrent writer may have committed
+                    // the same tuple first.
+                    if self.has_work_pr_association_tuple(
                         &request.work_id,
-                        "work.pr_associated",
-                    );
-                    let recovered = persisted
-                        .as_ref()
-                        .and_then(|event| Self::extract_work_pr_association_fields(&event.payload));
-
-                    match recovered {
-                        Some((existing_pr_number, existing_commit_sha))
-                            if existing_pr_number == request.pr_number
-                                && existing_commit_sha == request.commit_sha =>
+                        request.pr_number,
+                        &request.commit_sha,
+                    ) {
+                        already_existed = true;
+                        info!(
+                            work_id = %request.work_id,
+                            pr_number = request.pr_number,
+                            commit_sha = %request.commit_sha,
+                            "RecordWorkPrAssociation: UNIQUE race recovered as idempotent replay"
+                        );
+                    } else if let Some(existing) = self
+                        .event_emitter
+                        .get_first_event_by_work_id_and_type(&request.work_id, "work.pr_associated")
+                    {
+                        if let Some((existing_pr_number, existing_commit_sha)) =
+                            Self::extract_work_pr_association_fields(&existing.payload)
                         {
-                            already_existed = true;
-                            info!(
-                                work_id = %request.work_id,
-                                pr_number = request.pr_number,
-                                commit_sha = %request.commit_sha,
-                                "RecordWorkPrAssociation: UNIQUE race recovered as idempotent replay"
-                            );
-                        },
-                        Some((existing_pr_number, existing_commit_sha)) => {
-                            return Ok(PrivilegedResponse::error(
-                                PrivilegedErrorCode::FailedPrecondition,
-                                format!(
-                                    "work_id '{}' is already associated with \
-                                     (pr_number={}, commit_sha='{}'); conflicting tuple \
-                                     (pr_number={}, commit_sha='{}') rejected",
-                                    request.work_id,
-                                    existing_pr_number,
-                                    existing_commit_sha,
-                                    request.pr_number,
-                                    request.commit_sha
-                                ),
-                            ));
-                        },
-                        None => {
+                            if existing_pr_number != request.pr_number {
+                                return Ok(PrivilegedResponse::error(
+                                    PrivilegedErrorCode::FailedPrecondition,
+                                    format!(
+                                        "work_id '{}' is already associated with pr_number={}; \
+                                         conflicting pr_number={} rejected",
+                                        request.work_id, existing_pr_number, request.pr_number
+                                    ),
+                                ));
+                            }
                             return Ok(PrivilegedResponse::error(
                                 PrivilegedErrorCode::CapabilityRequestRejected,
                                 format!(
                                     "work.pr_associated UNIQUE constraint violation for work_id '{}' \
-                                     but persisted payload could not be decoded (fail-closed): {e}",
-                                    request.work_id
+                                     but tuple ({}, '{}') was not persisted (existing tuple starts with commit '{}'): {e}",
+                                    request.work_id,
+                                    request.pr_number,
+                                    request.commit_sha,
+                                    existing_commit_sha
                                 ),
                             ));
-                        },
+                        }
+                    } else {
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!(
+                                "work.pr_associated UNIQUE constraint violation for work_id '{}' \
+                                 but persisted payload could not be decoded (fail-closed): {e}",
+                                request.work_id
+                            ),
+                        ));
                     }
                 },
                 Err(e) => {
@@ -34346,6 +34373,7 @@ mod tests {
                 commit_sha: commit_sha.to_string(),
                 lease_id: lease_id.to_string(),
                 pr_url: String::new(),
+                validate_only: false,
             }
         }
 
@@ -35017,7 +35045,7 @@ mod tests {
         }
 
         #[test]
-        fn test_record_work_pr_association_rejects_flapping_commit_sha() {
+        fn test_record_work_pr_association_allows_same_pr_commit_progression() {
             let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
 
             let first = make_request(&work_id, 200, VALID_COMMIT_SHA, &lease_id);
@@ -35031,27 +35059,77 @@ mod tests {
                 "first association should succeed"
             );
 
-            let second = make_request(
-                &work_id,
-                200,
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                &lease_id,
-            );
+            let second_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let second = make_request(&work_id, 200, second_commit, &lease_id);
             let second_frame = encode_frame(&second);
             let second_response = dispatcher.dispatch(&second_frame, &ctx).unwrap();
             match second_response {
-                PrivilegedResponse::Error(err) => {
-                    assert_eq!(
-                        PrivilegedErrorCode::try_from(err.code),
-                        Ok(PrivilegedErrorCode::FailedPrecondition),
-                    );
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
                     assert!(
-                        err.message.contains("already associated"),
-                        "Expected flapping rejection message, got: {}",
-                        err.message
+                        !resp.already_existed,
+                        "new commit on same PR must append a new association tuple"
+                    );
+                    assert_eq!(resp.work_id, work_id);
+                    assert_eq!(resp.pr_number, 200);
+                    assert_eq!(resp.commit_sha, second_commit);
+                },
+                other => panic!("Expected success for same-PR commit progression, got: {other:?}"),
+            }
+
+            let replay = make_request(&work_id, 200, second_commit, &lease_id);
+            let replay_frame = encode_frame(&replay);
+            let replay_response = dispatcher.dispatch(&replay_frame, &ctx).unwrap();
+            match replay_response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(
+                        resp.already_existed,
+                        "exact tuple replay must stay idempotent"
                     );
                 },
-                other => panic!("Expected flapping error, got: {other:?}"),
+                other => panic!("Expected idempotent replay response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_record_work_pr_association_validate_only_has_no_side_effects() {
+            let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
+
+            let mut request = make_request(&work_id, 444, VALID_COMMIT_SHA, &lease_id);
+            request.validate_only = true;
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(
+                        !resp.already_existed,
+                        "first validation-only check should report no prior tuple"
+                    );
+                },
+                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
+            }
+
+            let pr_associated_count = dispatcher
+                .event_emitter
+                .get_events_by_work_id(&work_id)
+                .into_iter()
+                .filter(|event| event.event_type == "work.pr_associated")
+                .count();
+            assert_eq!(
+                pr_associated_count, 0,
+                "validate_only must not emit work.pr_associated events"
+            );
+
+            let normal_request = make_request(&work_id, 444, VALID_COMMIT_SHA, &lease_id);
+            let normal_frame = encode_frame(&normal_request);
+            let normal_response = dispatcher.dispatch(&normal_frame, &ctx).unwrap();
+            match normal_response {
+                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
+                    assert!(
+                        !resp.already_existed,
+                        "validate_only must not burn authority or pre-create tuples"
+                    );
+                },
+                other => panic!("Expected follow-up non-validate success, got: {other:?}"),
             }
         }
     }
