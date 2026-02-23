@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, apply_lane_env_overrides, build_job_environment,
-    compute_test_env_for_parallelism, ensure_lane_env_dirs,
+    FacPolicyV1, LaneLockGuard, LaneManager, build_job_environment,
+    compute_test_env_for_parallelism,
 };
 use blake3;
 use sha2::{Digest, Sha256};
@@ -1256,9 +1256,7 @@ fn build_pipeline_test_command(
     // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
     // to maintain lock/env coupling (round 2 fix: was previously hardcoded
     // to lane-00).
-    ensure_lane_env_dirs(lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, lane_dir);
-    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -1420,9 +1418,7 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
     // Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
-    ensure_lane_env_dirs(lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, lane_dir);
-    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
 
     Ok(policy_env.into_iter().collect())
 }
@@ -1447,8 +1443,8 @@ pub(super) struct EvidenceLaneContext {
     /// Path to the lane's root directory
     /// (`$APM2_HOME/private/fac/lanes/<lane_id>`). Used to derive per-lane
     /// env isolation directories (`HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
-    /// `XDG_CONFIG_HOME`) via `ensure_lane_env_dirs` +
-    /// `apply_lane_env_overrides`.
+    /// `XDG_CONFIG_HOME`) via
+    /// `policy_loader::apply_review_lane_environment`.
     ///
     /// SAFETY: This `lane_dir` corresponds to the lane protected by
     /// `_lane_guard`. Callers MUST use this `lane_dir` (not a hardcoded

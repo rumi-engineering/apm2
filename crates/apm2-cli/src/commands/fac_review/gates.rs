@@ -26,9 +26,8 @@ use apm2_core::fac::job_spec::{
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
     FacPolicyV1, LaneLeaseV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState,
-    apply_lane_env_overrides, build_job_environment, compute_test_env_for_parallelism,
-    current_time_iso8601, ensure_lane_env_dirs, lookup_job_receipt, parse_b3_256_digest,
-    parse_policy_hash, resolve_host_test_parallelism,
+    build_job_environment, compute_test_env_for_parallelism, current_time_iso8601,
+    lookup_job_receipt, parse_b3_256_digest, parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
@@ -4265,9 +4264,7 @@ fn compute_nextest_test_environment(
     // under $APM2_HOME/private/fac/lanes/lane-00.
     let fac_root = apm2_home.join("private/fac");
     let lane_dir = fac_root.join("lanes/lane-00");
-    ensure_lane_env_dirs(&lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, &lane_dir);
-    super::policy_loader::apply_stable_rustup_home_if_available(&mut policy_env, &ambient);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, &lane_dir, &ambient)?;
 
     // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy

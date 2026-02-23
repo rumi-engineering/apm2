@@ -2491,6 +2491,59 @@ fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogG
     })
 }
 
+fn record_gc_maintenance_action(
+    actions: &mut Vec<SystemDoctorFixAction>,
+    result: Result<fac_gc::DoctorGcMaintenanceSummary, String>,
+) -> bool {
+    match result {
+        Ok(summary) => {
+            let detail = format!(
+                "plan_targets={} actions={} errors={} bytes_freed={} migration_moved={} migration_failed={} migration_skipped={} receipt={}",
+                summary.plan_targets,
+                summary.actions_applied,
+                summary.errors,
+                summary.bytes_freed,
+                summary.migration_files_moved,
+                summary.migration_files_failed,
+                summary.migration_skipped,
+                summary.receipt_path.display()
+            );
+            let detail = match summary.migration_warning.as_ref() {
+                Some(warning) => format!("{detail}; migration_warning={warning}"),
+                None => detail,
+            };
+            if summary.errors == 0 {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    detail,
+                );
+            } else {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("partial_gc_with_errors: {detail}"),
+                );
+            }
+            false
+        },
+        Err(err) => {
+            push_system_doctor_fix_action(
+                actions,
+                SystemDoctorFixActionKind::GcMaintenance,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("autonomous GC maintenance unavailable: {err}"),
+            );
+            true
+        },
+    }
+}
+
 fn restart_worker_service_unit() -> Result<String, String> {
     let mut errors = Vec::new();
     for scope in SERVICE_SCOPES {
@@ -2534,11 +2587,15 @@ fn restart_worker_service_unit() -> Result<String, String> {
 type CollectSystemDoctorSnapshotFn =
     fn(&Path, &Path, bool, bool, Option<&str>) -> Result<DoctorSystemSnapshot, String>;
 type RestartWorkerServiceFn = fn() -> Result<String, String>;
+type CheckFacUnitLivenessFn = fn(&str, &str) -> FacUnitLiveness;
+type CheckFacLaneLivenessFn = fn(&str) -> FacUnitLiveness;
 
 #[derive(Clone, Copy)]
 struct SystemDoctorFixHooks {
     collect_snapshot: CollectSystemDoctorSnapshotFn,
     restart_worker: RestartWorkerServiceFn,
+    check_unit_liveness: CheckFacUnitLivenessFn,
+    check_lane_liveness: CheckFacLaneLivenessFn,
 }
 
 fn run_system_doctor_fix(
@@ -2559,6 +2616,8 @@ fn run_system_doctor_fix(
         SystemDoctorFixHooks {
             collect_snapshot: collect_system_doctor_snapshot,
             restart_worker: restart_worker_service_unit,
+            check_unit_liveness: check_fac_unit_liveness,
+            check_lane_liveness: check_fac_lane_liveness,
         },
     )
 }
@@ -2694,50 +2753,8 @@ fn run_system_doctor_fix_with_hooks(
         },
     }
 
-    match fac_gc::run_gc_for_doctor_fix() {
-        Ok(summary) => {
-            let detail = format!(
-                "plan_targets={} actions={} errors={} bytes_freed={} migration_moved={} migration_failed={} migration_skipped={} receipt={}",
-                summary.plan_targets,
-                summary.actions_applied,
-                summary.errors,
-                summary.bytes_freed,
-                summary.migration_files_moved,
-                summary.migration_files_failed,
-                summary.migration_skipped,
-                summary.receipt_path.display()
-            );
-            let detail = match summary.migration_warning.as_ref() {
-                Some(warning) => format!("{detail}; migration_warning={warning}"),
-                None => detail,
-            };
-            if summary.errors == 0 {
-                push_system_doctor_fix_action(
-                    &mut actions,
-                    SystemDoctorFixActionKind::GcMaintenance,
-                    SystemDoctorFixActionStatus::Applied,
-                    None,
-                    detail,
-                );
-            } else {
-                push_system_doctor_fix_action(
-                    &mut actions,
-                    SystemDoctorFixActionKind::GcMaintenance,
-                    SystemDoctorFixActionStatus::Applied,
-                    None,
-                    format!("partial_gc_with_errors: {detail}"),
-                );
-            }
-        },
-        Err(err) => {
-            push_system_doctor_fix_action(
-                &mut actions,
-                SystemDoctorFixActionKind::GcMaintenance,
-                SystemDoctorFixActionStatus::Skipped,
-                None,
-                format!("autonomous GC maintenance unavailable: {err}"),
-            );
-        },
+    if record_gc_maintenance_action(&mut actions, fac_gc::run_gc_for_doctor_fix()) {
+        action_failed = true;
     }
 
     match gc_stale_lane_logs(&fac_root, &manager) {
@@ -2843,8 +2860,8 @@ fn run_system_doctor_fix_with_hooks(
             &lane_id,
             job_id.as_deref(),
             reason_is_orphaned,
-            check_fac_unit_liveness,
-            check_fac_lane_liveness,
+            hooks.check_unit_liveness,
+            hooks.check_lane_liveness,
         ) {
             push_system_doctor_fix_action(
                 &mut actions,
@@ -7563,6 +7580,17 @@ mod tests {
         Ok("test-scope".to_string())
     }
 
+    fn doctor_fix_test_liveness_inactive_for_unit(
+        _lane_id: &str,
+        _job_id: &str,
+    ) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
+    }
+
+    fn doctor_fix_test_liveness_inactive_for_lane(_lane_id: &str) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
+    }
+
     fn ensure_queue_dirs_for_doctor_fix_test(queue_root: &Path) {
         for subdir in [
             "pending",
@@ -7960,6 +7988,63 @@ mod tests {
     }
 
     #[test]
+    fn test_record_gc_maintenance_action_marks_unavailable_as_failed() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(&mut actions, Err("boom".to_string()));
+        assert!(
+            failed,
+            "GC unavailability should signal doctor action failure"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Failed);
+        assert!(
+            actions[0]
+                .detail
+                .contains("autonomous GC maintenance unavailable"),
+            "unexpected detail: {}",
+            actions[0].detail
+        );
+    }
+
+    #[test]
+    fn test_record_gc_maintenance_action_partial_errors_are_non_fatal() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(
+            &mut actions,
+            Ok(fac_gc::DoctorGcMaintenanceSummary {
+                plan_targets: 2,
+                actions_applied: 1,
+                errors: 1,
+                bytes_freed: 1024,
+                receipt_path: PathBuf::from("/tmp/receipt.json"),
+                migration_files_moved: 0,
+                migration_files_failed: 0,
+                migration_skipped: true,
+                migration_warning: None,
+            }),
+        );
+        assert!(
+            !failed,
+            "GC partial action errors should remain non-fatal for doctor flow"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Applied);
+        assert!(
+            actions[0].detail.starts_with("partial_gc_with_errors:"),
+            "unexpected detail: {}",
+            actions[0].detail
+        );
+    }
+
+    #[test]
     fn test_lane_reset_liveness_guard_blocks_active_for_non_orphaned_reset() {
         let err =
             enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
@@ -8106,6 +8191,8 @@ mod tests {
             SystemDoctorFixHooks {
                 collect_snapshot: doctor_fix_test_collect_snapshot,
                 restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
             },
         );
         let second_exit = run_system_doctor_fix_with_hooks(
@@ -8118,6 +8205,8 @@ mod tests {
             SystemDoctorFixHooks {
                 collect_snapshot: doctor_fix_test_collect_snapshot,
                 restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
             },
         );
 
@@ -8204,6 +8293,8 @@ mod tests {
             SystemDoctorFixHooks {
                 collect_snapshot: doctor_fix_test_collect_snapshot,
                 restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
             },
         );
         assert_eq!(
