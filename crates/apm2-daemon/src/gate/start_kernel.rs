@@ -1519,10 +1519,20 @@ fn parse_changeset_publication_payload(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "changeset_published payload missing work_id".to_string())?;
 
-    // Security MAJOR: Cross-validate payload work_id against the verified
-    // envelope work_id/session_id from the ledger row. Mismatch means
-    // the payload is spoofing a different work item.
-    if !verified_work_id.is_empty() && payload_work_id != verified_work_id {
+    // Security BLOCKER (fail-closed): Cross-validate payload work_id against
+    // the verified envelope work_id/session_id from the ledger row.
+    //
+    // The `verified_work_id` comes from the ledger row's envelope identity
+    // column (`work_id` for legacy table, `session_id` for canonical table).
+    // Both columns are NOT NULL, so an empty string indicates a suspicious or
+    // corrupt envelope — reject rather than fall back to the untrusted payload.
+    if verified_work_id.is_empty() {
+        return Err(format!(
+            "changeset_published rejected: verified_work_id is empty in ledger envelope \
+             (fail-closed, event_id={event_id}, payload_work_id='{payload_work_id}')"
+        ));
+    }
+    if payload_work_id != verified_work_id {
         return Err(format!(
             "changeset_published work_id spoofing: payload work_id '{payload_work_id}' \
              does not match verified ledger work_id '{verified_work_id}' \
@@ -1821,6 +1831,35 @@ mod tests {
         );
         let pub_result = result.unwrap();
         assert_eq!(pub_result.publisher_actor_id, "actor:real");
+    }
+
+    /// When the ledger envelope `verified_work_id` is empty, the event
+    /// must be rejected (fail-closed) rather than falling back to the
+    /// untrusted payload `work_id`.
+    #[test]
+    fn empty_verified_work_id_rejected_fail_closed() {
+        use super::parse_changeset_publication_payload;
+
+        let payload = serde_json::to_vec(&json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x01; 32]),
+            "cas_hash": hex::encode([0x02; 32]),
+            "timestamp_ns": 123_456_789_u64,
+        }))
+        .expect("serialize payload");
+
+        // Empty verified_work_id — should be rejected, not fall-open.
+        let result =
+            parse_changeset_publication_payload(&payload, 0, "test-event", "actor:test", "");
+        assert!(
+            result.is_err(),
+            "empty verified_work_id must be rejected (fail-closed)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("verified_work_id is empty"),
+            "error should mention empty verified_work_id, got: {err}"
+        );
     }
 
     /// CSID-003 restart-safe idempotency: after marking N intents done, the

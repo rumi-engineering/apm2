@@ -1674,8 +1674,12 @@ fn parity_defect_to_record(defect: &ParityDefect, detected_at: u64) -> DefectRec
     let payload = serde_json::to_vec(defect).unwrap_or_default();
     let cas_hash = blake3::hash(&payload);
 
+    // Deterministic defect ID derived from CAS hash (first 16 bytes
+    // hex-encoded) to preserve replay consistency.
+    let defect_id = format!("DEF-PARITY-{}", hex::encode(&cas_hash.as_bytes()[..16]));
+
     DefectRecorded {
-        defect_id: format!("DEF-PARITY-{}", uuid::Uuid::new_v4()),
+        defect_id,
         defect_type: "WORK_EVENT_PARITY_MISMATCH".to_string(),
         cas_hash: cas_hash.as_bytes().to_vec(),
         source: DefectSource::SchemaReject as i32,
@@ -1695,8 +1699,12 @@ fn replay_failure_record(message: &str, detected_at: u64, work_id: &str) -> Defe
     let payload_bytes = payload.to_string().into_bytes();
     let cas_hash = blake3::hash(&payload_bytes);
 
+    // Deterministic defect ID derived from CAS hash (first 16 bytes
+    // hex-encoded) to preserve replay consistency.
+    let defect_id = format!("DEF-REPLAY-{}", hex::encode(&cas_hash.as_bytes()[..16]));
+
     DefectRecorded {
-        defect_id: format!("DEF-REPLAY-{}", uuid::Uuid::new_v4()),
+        defect_id,
         defect_type: "WORK_REPLAY_EQUIVALENCE_FAILURE".to_string(),
         cas_hash: cas_hash.as_bytes().to_vec(),
         source: DefectSource::SchemaReject as i32,
