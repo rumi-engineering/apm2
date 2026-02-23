@@ -674,13 +674,17 @@ daemon runtime executables:
 - **Move-first exception for claim (`fac.job.claimed`)**: The claim path
   (`claim_pending_job_with_exclusive_lock`) intentionally uses move-first
   ordering — the atomic `pending/` -> `claimed/` filesystem transition
-  executes before lifecycle event emission.  This is correct for
+  executes before lifecycle event emission or any payload read/deserialize.
+  No call to `read_bounded()` or `deserialize_job_spec()` appears before
+  `move_to_dir_safe()` in the function body.  This is correct for
   resilience: the filesystem move must not be blocked by payload
   deserialization (a malformed pending file would otherwise be permanently
   stuck in `pending/`, exhausting `QueueBoundsPolicy` capacity over time).
-  After the move, if emission fails, the file remains in `claimed/` where
-  the orchestrator handles it via the existing denial path.  This is the
-  correct behavior per the filesystem-authoritative migration contract.
+  After the move, if deserialization or emission fails, the file remains in
+  `claimed/` where the orchestrator handles it via the existing denial path.
+  This is the correct behavior per the filesystem-authoritative migration
+  contract.  Regression tests: `claim_pending_job_moves_malformed_payload_to_claimed_before_deserializing`
+  and `claim_pending_job_moves_binary_garbage_to_claimed` prove the invariant.
 - **Best-effort emission during migration**: When dual-write is enabled and
   lifecycle event emission fails, the worker/submitter logs a warning and
   still performs the filesystem mutation. During QL-003 staging, the

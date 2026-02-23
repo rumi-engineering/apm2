@@ -152,18 +152,29 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         )
     })?;
 
-    // f-798-security-1771812602410346-0: Move from pending/ to claimed/ FIRST.
-    // If deserialization fails (e.g. malformed JSON), the file was previously
-    // stuck in pending/ permanently (treated as lock failure, never retried).
-    // Over time malformed files exhaust QueueBoundsPolicy capacity. By moving
-    // first, the orchestrator's existing path moves unreadable claimed files
+    // ── STEP 1 (MOVE-FIRST): Atomically rename pending/ → claimed/ ─────
+    //
+    // f-798-security-1771812602410346-0 / f-798-code_quality-1771820119403543-0:
+    // The filesystem move MUST happen BEFORE any payload read or deserialization.
+    // This is the "move-first exception for claim" mandated by AGENTS.md.
+    //
+    // Without move-first, a malformed payload causes deserialization to fail,
+    // the function returns early, and the file remains permanently stuck in
+    // pending/ — exhausting QueueBoundsPolicy capacity over time. By moving
+    // first, the orchestrator's existing path routes unreadable claimed files
     // to denied/.
+    //
+    // INVARIANT: No call to read_bounded() or deserialize_job_spec() may
+    // appear above this rename. The move is unconditional on payload content.
     let claimed_path = move_to_dir_safe(pending_path, claimed_dir, file_name)
         .map_err(|err| format!("atomic claim failed: {err}"))?;
 
-    // After the successful move, attempt dual-write lifecycle emission.
-    // Deserialization and emit failures are warn-and-continue: the filesystem
-    // claim is authoritative.
+    // ── STEP 2 (BEST-EFFORT): Post-move lifecycle emission ──────────────
+    //
+    // Only AFTER the move succeeds do we attempt to read and deserialize
+    // the (now claimed) file for dual-write lifecycle event emission.
+    // Both deserialization and emission failures are warn-and-continue:
+    // the filesystem claim is authoritative during QL-003 staged migration.
     if dual_write_enabled {
         match read_bounded(&claimed_path, MAX_JOB_SPEC_SIZE)
             .and_then(|bytes| deserialize_job_spec(&bytes).map_err(|err| err.to_string()))

@@ -5519,6 +5519,118 @@ fn claim_pending_job_with_exclusive_lock_continues_when_dual_write_emit_fails() 
     );
 }
 
+/// Prove the move-first invariant for claim: a pending file with a payload
+/// that cannot be deserialized as `FacJobSpecV1` is still atomically moved
+/// to `claimed/` — deserialization failure does NOT block or revert the
+/// filesystem transition.
+///
+/// This is the regression test for the round-8 security finding: without
+/// move-first, malformed payloads would be permanently stuck in `pending/`,
+/// exhausting `QueueBoundsPolicy` capacity over time.
+#[test]
+fn claim_pending_job_moves_malformed_payload_to_claimed_before_deserializing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let queue_root = temp.path().join("queue");
+    let fac_root = temp.path().join("private").join("fac");
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    std::fs::create_dir_all(&fac_root).expect("create fac root");
+    std::fs::create_dir_all(&pending_dir).expect("create pending");
+    std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+    // Write a deliberately malformed payload that will fail FacJobSpecV1
+    // deserialization (missing required fields). This simulates the exact
+    // scenario from the finding: a pending file with corrupt/incomplete JSON.
+    let file_name = "malformed-claim-test.json";
+    let pending_path = pending_dir.join(file_name);
+    std::fs::write(
+        &pending_path,
+        b"{\"not_a_valid_spec\": true, \"garbage\": 42}",
+    )
+    .expect("write malformed pending spec");
+
+    // Claim with dual_write_enabled=true to exercise the post-move
+    // deserialization path (the code reads the claimed file AFTER the move
+    // and attempts to deserialize for lifecycle emission).
+    let result = claim_pending_job_with_exclusive_lock(
+        &pending_path,
+        &claimed_dir,
+        file_name,
+        &fac_root,
+        true, // dual_write_enabled
+    );
+
+    // The claim MUST succeed even though the payload is malformed.
+    let (claimed_path, _lock) = result.expect(
+        "claim must succeed for malformed payload — move-first invariant: \
+         deserialization failure must not block the pending->claimed transition",
+    );
+
+    // The file must no longer exist in pending/.
+    assert!(
+        !pending_path.exists(),
+        "malformed file must be removed from pending/ (move-first invariant)"
+    );
+
+    // The file must exist in claimed/.
+    assert!(
+        claimed_path.exists(),
+        "malformed file must exist in claimed/ after move-first claim"
+    );
+    assert!(
+        claimed_path.starts_with(&claimed_dir),
+        "claimed path must be inside claimed/ directory"
+    );
+
+    // Verify the content is still the malformed payload (not modified).
+    let content = std::fs::read_to_string(&claimed_path).expect("read claimed file");
+    assert!(
+        content.contains("not_a_valid_spec"),
+        "claimed file content must be preserved (the original malformed payload)"
+    );
+}
+
+/// Prove move-first with completely non-JSON binary payload (not even valid
+/// JSON). The pending->claimed move must still succeed.
+#[test]
+fn claim_pending_job_moves_binary_garbage_to_claimed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let queue_root = temp.path().join("queue");
+    let fac_root = temp.path().join("private").join("fac");
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    std::fs::create_dir_all(&fac_root).expect("create fac root");
+    std::fs::create_dir_all(&pending_dir).expect("create pending");
+    std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+    let file_name = "binary-garbage.json";
+    let pending_path = pending_dir.join(file_name);
+    // Write binary content that is not valid JSON at all.
+    std::fs::write(&pending_path, [0xFF, 0xFE, 0x00, 0x01, 0x80, 0x90])
+        .expect("write binary garbage");
+
+    let (claimed_path, _lock) = claim_pending_job_with_exclusive_lock(
+        &pending_path,
+        &claimed_dir,
+        file_name,
+        &fac_root,
+        true, // dual_write_enabled — forces the post-move deserialization attempt
+    )
+    .expect(
+        "claim must succeed for binary garbage — move-first invariant: \
+         the filesystem move is unconditional, deserialization is best-effort",
+    );
+
+    assert!(
+        !pending_path.exists(),
+        "binary garbage must be removed from pending/"
+    );
+    assert!(
+        claimed_path.exists(),
+        "binary garbage must exist in claimed/ after move-first"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn release_claimed_job_to_pending_continues_when_dual_write_emit_fails() {
