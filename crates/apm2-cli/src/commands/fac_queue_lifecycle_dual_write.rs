@@ -10,8 +10,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, Mutex};
 
 #[cfg(not(test))]
 use apm2_core::config::EcosystemConfig;
@@ -23,6 +22,7 @@ use apm2_core::fac::job_lifecycle::{
     FacJobStartedV1, MAX_JOB_LIFECYCLE_STRING_LENGTH, derive_content_addressable_job_id,
 };
 use apm2_core::fac::{FacJobSpecV1, MAX_POLICY_SIZE, deserialize_policy};
+use apm2_daemon::htf::{ClockConfig, HolonicClock};
 use apm2_daemon::ledger::SqliteLedgerEventEmitter;
 use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
 use rusqlite::Connection;
@@ -58,7 +58,7 @@ pub(super) fn emit_job_enqueued(
         None,
         FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
             identity,
-            enqueue_epoch_ns: now_timestamp_ns(),
+            enqueue_epoch_ns: now_timestamp_ns()?,
         }),
     );
     emit_event(fac_root, FAC_JOB_ENQUEUED_EVENT_TYPE, &event, actor_id)
@@ -79,7 +79,7 @@ pub(super) fn emit_job_claimed(
             identity,
             lease_id: lease_id.to_string(),
             actor_id: actor_id.to_string(),
-            claim_epoch_ns: now_timestamp_ns(),
+            claim_epoch_ns: now_timestamp_ns()?,
         }),
     );
     emit_event(fac_root, FAC_JOB_CLAIMED_EVENT_TYPE, &event, actor_id)
@@ -189,7 +189,7 @@ fn emit_event(
             event_type,
             &payload,
             actor_id,
-            now_timestamp_ns(),
+            now_timestamp_ns()?,
         )
         .map_err(|err| format!("emit lifecycle event `{event_type}`: {err}"))?;
     Ok(())
@@ -339,14 +339,19 @@ fn stable_intent_id(prefix: &str, digest: &str, discriminator: &str) -> String {
     format!("{prefix}:b3-256:{}", blake3::hash(raw.as_bytes()).to_hex())
 }
 
-fn now_timestamp_ns() -> u64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0));
-    elapsed
-        .as_secs()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::from(elapsed.subsec_nanos()))
+fn now_timestamp_ns() -> Result<u64, String> {
+    static HTF_CLOCK: LazyLock<Result<HolonicClock, String>> = LazyLock::new(|| {
+        HolonicClock::new(ClockConfig::default(), None)
+            .map_err(|err| format!("initialize HTF clock: {err}"))
+    });
+
+    let clock = HTF_CLOCK
+        .as_ref()
+        .map_err(|err| format!("initialize HTF clock: {err}"))?;
+    clock
+        .now_hlc()
+        .map(|hlc| hlc.wall_ns)
+        .map_err(|err| format!("read HTF timestamp: {err}"))
 }
 
 fn queue_job_id(event: &FacJobLifecycleEventV1) -> &str {
