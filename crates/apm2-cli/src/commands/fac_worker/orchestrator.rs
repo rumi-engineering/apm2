@@ -104,6 +104,55 @@ pub(super) struct WorkerOrchestrator {
     staged_outcome: Option<JobOutcome>,
 }
 
+fn emit_failed_lifecycle_event_before_denied_move(
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    dual_write_enabled: bool,
+    reason_class: &str,
+) {
+    if !dual_write_enabled {
+        return;
+    }
+
+    if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_failed(
+        fac_root,
+        spec,
+        reason_class,
+        false,
+        None,
+        "fac.worker",
+    ) {
+        eprintln!(
+            "worker: WARNING: dual-write lifecycle failed event emission failed before denied move (continuing with filesystem authoritative queue): {err}"
+        );
+    }
+}
+
+fn move_pending_job_to_denied_with_dual_write(
+    path: &Path,
+    queue_root: &Path,
+    file_name: &str,
+    fac_root: &Path,
+    spec: &FacJobSpecV1,
+    dual_write_enabled: bool,
+    reason_class: &str,
+) -> Option<String> {
+    emit_failed_lifecycle_event_before_denied_move(
+        fac_root,
+        spec,
+        dual_write_enabled,
+        reason_class,
+    );
+    move_to_dir_safe(path, &queue_root.join(DENIED_DIR), file_name)
+        .map(|p| {
+            p.strip_prefix(queue_root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string()
+        })
+        .ok()
+}
+
 impl WorkerOrchestrator {
     pub(super) const fn new() -> Self {
         Self {
@@ -377,14 +426,15 @@ impl WorkerOrchestrator {
                 dupe.matched_by,
                 dupe.existing_enqueue_time
             );
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -535,15 +585,15 @@ impl WorkerOrchestrator {
                 _ => {
                     let reason =
                         "stop_revoke missing RFC-0028 token (no unauth cancel)".to_string();
-                    let moved_path =
-                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                            .map(|p| {
-                                p.strip_prefix(queue_root)
-                                    .unwrap_or(&p)
-                                    .to_string_lossy()
-                                    .to_string()
-                            })
-                            .ok();
+                    let moved_path = move_pending_job_to_denied_with_dual_write(
+                        path,
+                        queue_root,
+                        &file_name,
+                        fac_root,
+                        spec,
+                        policy.queue_lifecycle_dual_write_enabled,
+                        "denied",
+                    );
                     if let Err(receipt_err) = emit_job_receipt(
                         fac_root,
                         spec,
@@ -585,15 +635,15 @@ impl WorkerOrchestrator {
                 Ok(check) => check,
                 Err(e) => {
                     let reason = format!("stop_revoke token validation failed: {e}");
-                    let moved_path =
-                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                            .map(|p| {
-                                p.strip_prefix(queue_root)
-                                    .unwrap_or(&p)
-                                    .to_string_lossy()
-                                    .to_string()
-                            })
-                            .ok();
+                    let moved_path = move_pending_job_to_denied_with_dual_write(
+                        path,
+                        queue_root,
+                        &file_name,
+                        fac_root,
+                        spec,
+                        policy.queue_lifecycle_dual_write_enabled,
+                        "denied",
+                    );
                     if let Err(receipt_err) = emit_job_receipt(
                         fac_root,
                         spec,
@@ -688,15 +738,15 @@ impl WorkerOrchestrator {
                     }
                 }
                 if let Some(reason) = perm_err {
-                    let moved_path =
-                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                            .map(|p| {
-                                p.strip_prefix(queue_root)
-                                    .unwrap_or(&p)
-                                    .to_string_lossy()
-                                    .to_string()
-                            })
-                            .ok();
+                    let moved_path = move_pending_job_to_denied_with_dual_write(
+                        path,
+                        queue_root,
+                        &file_name,
+                        fac_root,
+                        spec,
+                        policy.queue_lifecycle_dual_write_enabled,
+                        "denied",
+                    );
                     if let Err(receipt_err) = emit_job_receipt(
                         fac_root,
                         spec,
@@ -727,14 +777,15 @@ impl WorkerOrchestrator {
             // PCAC lifecycle: check if authority was already consumed.
             if is_authority_consumed(queue_root, &spec.job_id) {
                 let reason = format!("authority already consumed for job {}", spec.job_id);
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
                     spec,
@@ -1020,14 +1071,15 @@ impl WorkerOrchestrator {
             Some(t) if !t.is_empty() => t.as_str(),
             _ => {
                 let reason = "missing channel_context_token".to_string();
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 // (sbx_hash computed once at top of the idle phase)
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
@@ -1067,14 +1119,15 @@ impl WorkerOrchestrator {
             let reason = format!(
                 "invalid canonicalizer tuple digest: cannot parse b3-256 hex: {canonicalizer_tuple_digest}"
             );
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1105,14 +1158,15 @@ impl WorkerOrchestrator {
         // job_kind_to_intent — treat as hard denial to prevent fail-open bypass.
         let Some(expected_intent) = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind) else {
             let reason = format!("unknown job kind for intent binding: {}", spec.kind);
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -1156,14 +1210,15 @@ impl WorkerOrchestrator {
             Ok(check) => check,
             Err(e) => {
                 let reason = format!("token decode failed: {e}");
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 // (sbx_hash computed once at top of the idle phase)
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
@@ -1201,14 +1256,15 @@ impl WorkerOrchestrator {
                     .ct_eq(&binding.admitted_policy_root_digest),
             ) {
                 let reason = "policy digest mismatch within channel boundary binding".to_string();
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 // (sbx_hash computed once at top of the idle phase)
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
@@ -1240,14 +1296,15 @@ impl WorkerOrchestrator {
             binding.admitted_policy_root_digest
         } else {
             let reason = "missing boundary-flow policy binding".to_string();
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1277,14 +1334,15 @@ impl WorkerOrchestrator {
             || !bool::from(admitted_policy_root_digest.ct_eq(policy_digest))
         {
             let reason = "policy digest mismatch with admitted fac policy".to_string();
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1329,14 +1387,15 @@ impl WorkerOrchestrator {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1379,14 +1438,15 @@ impl WorkerOrchestrator {
             .and_then(|binding| binding.nonce.as_ref());
         let Some(nonce) = nonce else {
             let reason = "missing token nonce in channel context binding".to_string();
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
                 spec,
@@ -1420,15 +1480,15 @@ impl WorkerOrchestrator {
                     let reason =
                         format!("FATAL: token ledger WAL persist failed (fail-closed): {wal_err}");
                     eprintln!("worker: {reason}");
-                    let moved_path =
-                        move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                            .map(|p| {
-                                p.strip_prefix(queue_root)
-                                    .unwrap_or(&p)
-                                    .to_string_lossy()
-                                    .to_string()
-                            })
-                            .ok();
+                    let moved_path = move_pending_job_to_denied_with_dual_write(
+                        path,
+                        queue_root,
+                        &file_name,
+                        fac_root,
+                        spec,
+                        policy.queue_lifecycle_dual_write_enabled,
+                        "denied",
+                    );
                     if let Err(receipt_err) = emit_job_receipt(
                         fac_root,
                         spec,
@@ -1463,14 +1523,15 @@ impl WorkerOrchestrator {
                     _ => DenialReasonCode::TokenReplayDetected,
                 };
                 let reason = format!("token nonce replay/revocation check failed: {ledger_err}");
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
                     spec,
@@ -1508,14 +1569,15 @@ impl WorkerOrchestrator {
                 defect_reason: Some("admission health gate not passed".to_string()),
                 cost_estimate_ticks: None,
             };
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1595,14 +1657,15 @@ impl WorkerOrchestrator {
                 || "admission denied (no defect detail)".to_string(),
                 |defect| format!("admission denied: {}", defect.reason),
             );
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,
@@ -1652,14 +1715,15 @@ impl WorkerOrchestrator {
                     .deny_reason
                     .as_deref()
                     .unwrap_or("budget admission denied (no detail)");
-                let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                    .map(|p| {
-                        p.strip_prefix(queue_root)
-                            .unwrap_or(&p)
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .ok();
+                let moved_path = move_pending_job_to_denied_with_dual_write(
+                    path,
+                    queue_root,
+                    &file_name,
+                    fac_root,
+                    spec,
+                    policy.queue_lifecycle_dual_write_enabled,
+                    "denied",
+                );
                 // (sbx_hash computed once at top of the idle phase)
                 if let Err(receipt_err) = emit_job_receipt(
                     fac_root,
@@ -1694,14 +1758,15 @@ impl WorkerOrchestrator {
         // PCAC lifecycle: check if authority was already consumed (replay protection).
         if is_authority_consumed(queue_root, &spec.job_id) {
             let reason = format!("authority already consumed for job {}", spec.job_id);
-            let moved_path = move_to_dir_safe(path, &queue_root.join(DENIED_DIR), &file_name)
-                .map(|p| {
-                    p.strip_prefix(queue_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .ok();
+            let moved_path = move_pending_job_to_denied_with_dual_write(
+                path,
+                queue_root,
+                &file_name,
+                fac_root,
+                spec,
+                policy.queue_lifecycle_dual_write_enabled,
+                "denied",
+            );
             // (sbx_hash computed once at top of the idle phase)
             if let Err(receipt_err) = emit_job_receipt(
                 fac_root,

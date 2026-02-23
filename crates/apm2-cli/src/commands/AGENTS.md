@@ -665,6 +665,20 @@ daemon runtime executables:
   cannot be acquired, the broker request is deferred to the next cycle
   (not promoted).
 
+### Queue lifecycle dual-write ordering (TCK-00669 / QL-003 migration)
+
+- **Event-first for queue mutations**: Lifecycle dual-write emission is
+  attempted before filesystem mutation on enqueue (`fac.job.enqueued`),
+  claim (`fac.job.claimed`), release (`fac.job.released`), and pre-claim
+  deny transitions (`fac.job.failed`).
+- **Best-effort emission during migration**: When dual-write is enabled and
+  lifecycle event emission fails, the worker/submitter logs a warning and
+  still performs the filesystem mutation. During QL-003 staging, the
+  filesystem queue remains authoritative.
+- **Broker promotion parity**: Broker request promotion into `pending/`
+  now attempts `fac.job.enqueued` dual-write using the same event-first,
+  warning-on-failure behavior.
+
 ### Configured policy threading (TCK-00577 round 3)
 
 - **Broker promotion enforces configured policy**: `promote_broker_requests`

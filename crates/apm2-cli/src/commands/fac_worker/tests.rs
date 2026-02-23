@@ -3620,6 +3620,99 @@ fn promote_broker_request_success_under_capacity() {
 }
 
 #[test]
+fn promote_broker_request_dual_write_emits_enqueued_event() {
+    use apm2_core::fac::job_lifecycle::FAC_JOB_ENQUEUED_EVENT_TYPE;
+
+    let _guard = env_var_test_lock().lock().expect("serialize env test");
+    let original_apm2_home = std::env::var_os("APM2_HOME");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let apm2_home = dir.path().join(".apm2");
+    let fac_root = apm2_home.join("private").join("fac");
+    let queue_root = apm2_home.join("queue");
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let broker_dir = queue_root.join(BROKER_REQUESTS_DIR);
+
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    ensure_queue_dirs(&queue_root).expect("create queue dirs");
+    set_env_var_for_test("APM2_HOME", &apm2_home);
+
+    let mut policy = FacPolicyV1::default_policy();
+    policy.queue_lifecycle_dual_write_enabled = true;
+    persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+
+    let broker_file = broker_dir.join("broker-dual-write-enqueued.json");
+    fs::write(
+        &broker_file,
+        make_valid_broker_request_json("broker-dual-write-enqueued"),
+    )
+    .expect("write broker request");
+
+    promote_broker_requests(&queue_root, &QueueBoundsPolicy::default());
+
+    assert!(
+        pending_dir.join("broker-dual-write-enqueued.json").exists(),
+        "broker request should be promoted to pending/"
+    );
+    assert!(
+        !broker_file.exists(),
+        "broker request source file should be removed after promotion"
+    );
+
+    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
+        .expect("open lifecycle ledger");
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .expect("set sqlite busy timeout");
+
+    let has_legacy_events = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    let has_canonical_events = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+
+    let mut total = 0usize;
+    if has_legacy_events {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
+                [FAC_JOB_ENQUEUED_EVENT_TYPE],
+                |row| row.get(0),
+            )
+            .expect("count legacy enqueue events");
+        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+    }
+    if has_canonical_events {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                [FAC_JOB_ENQUEUED_EVENT_TYPE],
+                |row| row.get(0),
+            )
+            .expect("count canonical enqueue events");
+        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+    }
+    assert!(
+        total >= 1,
+        "broker promotion should dual-write at least one fac.job.enqueued event"
+    );
+
+    if let Some(value) = original_apm2_home {
+        set_env_var_for_test("APM2_HOME", value);
+    } else {
+        remove_env_var_for_test("APM2_HOME");
+    }
+}
+
+#[test]
 fn promote_broker_request_uses_enqueue_lock() {
     // Verify that the enqueue lockfile is created during promotion,
     // demonstrating that the lock mechanism is engaged.
@@ -5373,6 +5466,112 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
     } else {
         remove_env_var_for_test("APM2_HOME");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn claim_pending_job_with_exclusive_lock_continues_when_dual_write_emit_fails() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let queue_root = temp.path().join("queue");
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    std::fs::create_dir_all(&pending_dir).expect("create pending");
+    std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+    let private_dir = temp.path().join("private");
+    std::fs::create_dir_all(&private_dir).expect("create private");
+    let fac_root_real = private_dir.join("fac-real");
+    std::fs::create_dir_all(&fac_root_real).expect("create fac root");
+    let fac_root_link = private_dir.join("fac-link");
+    symlink(&fac_root_real, &fac_root_link).expect("create fac root symlink");
+
+    let file_name = "claim-dual-write-emit-fail.json";
+    let pending_path = pending_dir.join(file_name);
+    std::fs::write(
+        &pending_path,
+        make_valid_broker_request_json("claim-dual-write-emit-fail"),
+    )
+    .expect("write pending spec");
+
+    let (claimed_path, claimed_lock_file) = claim_pending_job_with_exclusive_lock(
+        &pending_path,
+        &claimed_dir,
+        file_name,
+        &fac_root_link,
+        true,
+    )
+    .expect("claim should continue when lifecycle emit fails");
+    drop(claimed_lock_file);
+
+    assert!(
+        !pending_path.exists(),
+        "pending job should be moved to claimed even when emit fails"
+    );
+    assert!(
+        claimed_path.exists(),
+        "claimed job should exist after claim"
+    );
+    assert!(
+        !fac_root_real.join("signing_key").exists(),
+        "test setup should force lifecycle emission failure via symlink FAC root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_claimed_job_to_pending_continues_when_dual_write_emit_fails() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let queue_root = temp.path().join("queue");
+    let pending_dir = queue_root.join(PENDING_DIR);
+    let claimed_dir = queue_root.join(CLAIMED_DIR);
+    std::fs::create_dir_all(&pending_dir).expect("create pending");
+    std::fs::create_dir_all(&claimed_dir).expect("create claimed");
+
+    let private_dir = temp.path().join("private");
+    std::fs::create_dir_all(&private_dir).expect("create private");
+    let fac_root_real = private_dir.join("fac-real");
+    std::fs::create_dir_all(&fac_root_real).expect("create fac root");
+    let fac_root_link = private_dir.join("fac-link");
+    symlink(&fac_root_real, &fac_root_link).expect("create fac root symlink");
+
+    let mut policy = FacPolicyV1::default_policy();
+    policy.queue_lifecycle_dual_write_enabled = true;
+    persist_policy(&fac_root_real, &policy).expect("persist dual-write policy");
+
+    let job_id = "release-dual-write-emit-fail";
+    let file_name = format!("{job_id}.json");
+    let job_json = make_valid_broker_request_json(job_id);
+    let spec: FacJobSpecV1 = serde_json::from_str(&job_json).expect("parse job spec");
+    let claimed_path = claimed_dir.join(&file_name);
+    std::fs::write(&claimed_path, job_json.as_bytes()).expect("write claimed spec");
+
+    let moved_path = release_claimed_job_to_pending(
+        &claimed_path,
+        &queue_root,
+        &file_name,
+        &fac_root_link,
+        &spec,
+        "dual_write_emit_failure_test",
+    )
+    .expect("release should continue when lifecycle emit fails");
+
+    assert!(
+        !claimed_path.exists(),
+        "claimed file should be moved back to pending"
+    );
+    assert!(moved_path.exists(), "released job should exist in pending");
+    assert!(
+        moved_path.starts_with(queue_root.join(PENDING_DIR)),
+        "released job should move to pending/: {moved_path:?}"
+    );
+    assert!(
+        !fac_root_real.join("signing_key").exists(),
+        "test setup should force lifecycle emission failure via symlink FAC root"
+    );
 }
 
 #[test]
