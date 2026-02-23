@@ -1342,11 +1342,23 @@ mod tests {
         }
     }
 
+    fn make_work_opened_session_envelope_payload(work_id: &str, spec_hash: Vec<u8>) -> Vec<u8> {
+        let opened_payload =
+            helpers::work_opened_payload(work_id, "TICKET", spec_hash, vec![], vec![]);
+        serde_json::to_vec(&serde_json::json!({
+            "event_type": "work.opened",
+            "session_id": work_id,
+            "actor_id": "actor:test",
+            "payload": hex::encode(opened_payload),
+        }))
+        .expect("work.opened session envelope should encode")
+    }
+
     fn work_opened_event(work_id: &str, timestamp_ns: u64) -> SignedLedgerEvent {
         signed_event(
             "work.opened",
             work_id,
-            helpers::work_opened_payload(work_id, "TICKET", vec![0x11; 32], vec![], vec![]),
+            make_work_opened_session_envelope_payload(work_id, vec![0x11; 32]),
             timestamp_ns,
         )
     }
