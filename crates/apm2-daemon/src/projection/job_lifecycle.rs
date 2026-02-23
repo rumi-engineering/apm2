@@ -6,8 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -715,7 +713,10 @@ impl JobLifecycleRehydrationReconciler {
             })?;
             #[cfg(unix)]
             {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o711)).map_err(|err| {
+                // f-798-security-1771823867144734-0: Use fd-based chmod
+                // (O_NOFOLLOW + fchmod/fchmodat) instead of path-based
+                // fs::set_permissions to prevent TOCTOU symlink traversal.
+                ensure_directory_mode_nofollow(&path, 0o711).map_err(|err| {
                     JobLifecycleProjectionError::Io(format!(
                         "set queue dir mode 0711 {}: {err}",
                         path.display()
@@ -733,13 +734,15 @@ impl JobLifecycleRehydrationReconciler {
         })?;
         #[cfg(unix)]
         {
-            fs::set_permissions(&broker_requests_path, fs::Permissions::from_mode(0o1733))
-                .map_err(|err| {
-                    JobLifecycleProjectionError::Io(format!(
-                        "set queue dir mode 01733 {}: {err}",
-                        broker_requests_path.display()
-                    ))
-                })?;
+            // f-798-security-1771823867144734-0: Use fd-based chmod
+            // (O_NOFOLLOW + fchmod/fchmodat) instead of path-based
+            // fs::set_permissions to prevent TOCTOU symlink traversal.
+            ensure_directory_mode_nofollow(&broker_requests_path, 0o1733).map_err(|err| {
+                JobLifecycleProjectionError::Io(format!(
+                    "set queue dir mode 01733 {}: {err}",
+                    broker_requests_path.display()
+                ))
+            })?;
         }
         Ok(())
     }
@@ -925,21 +928,38 @@ impl JobLifecycleRehydrationReconciler {
     }
 }
 
+/// Minimal extraction struct for the session event JSON envelope.
+///
+/// f-798-security-1771823853285993-0: Replaces `serde_json::Value` to prevent
+/// unbounded-depth allocation from adversarial nested JSON payloads. Only the
+/// `payload` hex field is extracted; all other fields are ignored without
+/// allocating memory for them.
+#[derive(Deserialize)]
+struct LifecyclePayloadEnvelope<'a> {
+    #[serde(default)]
+    payload: Option<&'a str>,
+}
+
 fn decode_lifecycle_event(
     signed_event: &SignedLedgerEvent,
 ) -> Result<FacJobLifecycleEventV1, JobLifecycleProjectionError> {
     // Session events are persisted as JSON envelope with `payload` hex.
-    if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&signed_event.payload)
-        && let Some(payload_hex) = envelope.get("payload").and_then(serde_json::Value::as_str)
+    // f-798-security-1771823853285993-0: Use a minimal typed struct instead of
+    // serde_json::Value to bound memory to exactly the `payload` field length,
+    // preventing unbounded-depth allocation from adversarial nested JSON.
+    if let Ok(envelope) =
+        serde_json::from_slice::<LifecyclePayloadEnvelope<'_>>(&signed_event.payload)
     {
-        let inner_payload = hex::decode(payload_hex).map_err(|err| {
-            JobLifecycleProjectionError::Decode(format!(
-                "event {} payload hex decode: {err}",
-                signed_event.event_id
-            ))
-        })?;
-        return FacJobLifecycleEventV1::decode_bounded(&inner_payload)
-            .map_err(|err| map_lifecycle_decode_error(&err));
+        if let Some(payload_hex) = envelope.payload {
+            let inner_payload = hex::decode(payload_hex).map_err(|err| {
+                JobLifecycleProjectionError::Decode(format!(
+                    "event {} payload hex decode: {err}",
+                    signed_event.event_id
+                ))
+            })?;
+            return FacJobLifecycleEventV1::decode_bounded(&inner_payload)
+                .map_err(|err| map_lifecycle_decode_error(&err));
+        }
     }
 
     // Test paths may inject raw lifecycle payload bytes directly.
@@ -993,6 +1013,75 @@ fn validate_queue_job_id(queue_job_id: &str) -> Result<(), String> {
     {
         return Err(format!("unsafe queue_job_id: {queue_job_id:?}"));
     }
+    Ok(())
+}
+
+/// Sets directory permissions via an fd opened with `O_NOFOLLOW`, preventing
+/// TOCTOU symlink traversal between `create_dir_all` and permission
+/// application.
+///
+/// f-798-security-1771823867144734-0: On Linux, uses `O_PATH | O_DIRECTORY |
+/// O_NOFOLLOW` to get a descriptor, then `fchmodat(fd, "", mode,
+/// AT_EMPTY_PATH)` to set permissions on the verified inode. On other Unix
+/// targets, uses `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` +
+/// `nix::sys::stat::fchmod`. This eliminates the TOCTOU window in which the
+/// path could be replaced by a symlink between `create_dir_all` and
+/// `set_permissions`.
+#[cfg(unix)]
+fn ensure_directory_mode_nofollow(path: &Path, mode: u32) -> Result<(), String> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+
+    // Open without following symlinks. Linux uses `O_PATH` so we can recover
+    // mode-000 directories; other Unix targets use `O_RDONLY` and then `fchmod`
+    // directly on the opened descriptor.
+    #[cfg(target_os = "linux")]
+    let open_flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let open_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+
+    let dir_fd = match open(path, open_flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ELOOP | Errno::ENOTDIR) => {
+            // O_NOFOLLOW returns ELOOP for symlinks. Fail closed.
+            return Err(format!(
+                "refusing to set permissions on symlink/non-directory at {} (fail-closed)",
+                path.display()
+            ));
+        },
+        Err(e) => return Err(format!("cannot open directory {}: {e}", path.display())),
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mode = mode as libc::mode_t;
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            // SAFETY:
+            // - `dir_fd` is a live fd returned by `open`.
+            // - `c""` is a valid NUL-terminated empty C string.
+            // - `AT_EMPTY_PATH` targets the opened path object directly.
+            libc::fchmodat(dir_fd.as_raw_fd(), c"".as_ptr(), mode, libc::AT_EMPTY_PATH)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!(
+                "cannot set mode {mode:#o} on {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::sys::stat::fchmod;
+        fchmod(&dir_fd, Mode::from_bits_truncate(mode))
+            .map_err(|e| format!("cannot set mode {mode:#o} on {}: {e}", path.display()))?;
+    }
+
     Ok(())
 }
 
