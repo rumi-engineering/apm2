@@ -478,6 +478,8 @@ pub enum GateOrchestratorEvent {
     PolicyResolved {
         /// The work ID.
         work_id: String,
+        /// The changeset digest this policy resolution is bound to.
+        changeset_digest: [u8; 32],
         /// The policy resolution hash.
         policy_hash: [u8; 32],
         /// Timestamp (ms since epoch).
@@ -558,6 +560,26 @@ pub enum GateOrchestratorEvent {
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
+}
+
+impl GateOrchestratorEvent {
+    /// Returns the `work_id` from any event variant.
+    ///
+    /// Every variant carries a `work_id` field that identifies the work item
+    /// this event is bound to. This is used by the receipt writer to emit
+    /// events under the correct ledger `session_id` (which maps to `work_id`).
+    #[must_use]
+    pub fn work_id(&self) -> &str {
+        match self {
+            Self::PolicyResolved { work_id, .. }
+            | Self::GateLeaseIssued { work_id, .. }
+            | Self::GateExecutorSpawned { work_id, .. }
+            | Self::GateReceiptCollected { work_id, .. }
+            | Self::GateTimedOut { work_id, .. }
+            | Self::GateTimeoutReceiptGenerated { work_id, .. }
+            | Self::AllGatesCompleted { work_id, .. } => work_id,
+        }
+    }
 }
 
 // =============================================================================
@@ -1096,6 +1118,7 @@ impl GateOrchestrator {
         // PolicyResolved is ALWAYS first (ordering invariant).
         events.push(GateOrchestratorEvent::PolicyResolved {
             work_id: publication.work_id.clone(),
+            changeset_digest: publication.changeset_digest,
             policy_hash,
             timestamp_ms: now_ms,
         });

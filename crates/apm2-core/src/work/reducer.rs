@@ -8,7 +8,7 @@ use tracing::warn;
 
 use super::error::WorkError;
 use super::state::{Work, WorkState, WorkType};
-use crate::events::{WorkEvent, work_event};
+use crate::events::{DefectRecorded, DefectSource, WorkEvent, work_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
@@ -179,6 +179,11 @@ impl WorkReducerState {
 #[derive(Debug, Default)]
 pub struct WorkReducer {
     state: WorkReducerState,
+    /// Structured defect records for identity-chain violations (`STEP_09`).
+    ///
+    /// Accumulated during event processing. Consumers should drain this
+    /// after each reduce cycle to persist defects via the ledger.
+    identity_chain_defects: Vec<DefectRecorded>,
 }
 
 impl WorkReducer {
@@ -188,6 +193,20 @@ impl WorkReducer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drains accumulated identity-chain defect records (`STEP_09`).
+    ///
+    /// Consumers should call this after each reduce cycle to retrieve and
+    /// persist defect records via the ledger.
+    pub fn drain_identity_chain_defects(&mut self) -> Vec<DefectRecorded> {
+        std::mem::take(&mut self.identity_chain_defects)
+    }
+
+    /// Returns the number of pending identity-chain defects.
+    #[must_use]
+    pub fn identity_chain_defect_count(&self) -> usize {
+        self.identity_chain_defects.len()
     }
 
     /// Canonical merge receipt event types (explicit allowlist).
@@ -249,6 +268,12 @@ impl WorkReducer {
                     "SECURITY: digest-bound event skipped: payload work_id does not match \
                      signed envelope work_id — possible cross-work state injection"
                 );
+                self.record_cross_work_injection_defect(
+                    &event.event_type,
+                    envelope_work_id,
+                    &payload_work_id,
+                    event.timestamp_ns,
+                );
                 return;
             }
             envelope_work_id.clone()
@@ -273,7 +298,7 @@ impl WorkReducer {
                         .ci_receipt_digest_by_work
                         .insert(authoritative_work_id, changeset_digest);
                 } else {
-                    self.log_stale_digest_observation(
+                    self.record_stale_digest_defect(
                         "gate_receipt",
                         &event.event_type,
                         &authoritative_work_id,
@@ -287,7 +312,7 @@ impl WorkReducer {
                         .review_receipt_digest_by_work
                         .insert(authoritative_work_id, changeset_digest);
                 } else {
-                    self.log_stale_digest_observation(
+                    self.record_stale_digest_defect(
                         "review_receipt",
                         &event.event_type,
                         &authoritative_work_id,
@@ -302,7 +327,7 @@ impl WorkReducer {
                         .merge_receipt_digest_by_work
                         .insert(authoritative_work_id, changeset_digest);
                 } else {
-                    self.log_stale_digest_observation(
+                    self.record_stale_digest_defect(
                         "merge_receipt",
                         event_type,
                         &authoritative_work_id,
@@ -323,9 +348,13 @@ impl WorkReducer {
             .is_some_and(|latest| *latest == incoming)
     }
 
-    /// Logs a structured stale-digest observation.
-    fn log_stale_digest_observation(
-        &self,
+    /// Records a structured identity-chain defect for a stale or unbound
+    /// changeset digest observation (`STEP_09`).
+    ///
+    /// Replaces warn-only logging with a machine-readable `DefectRecorded`
+    /// that is accumulated in `WorkReducer::identity_chain_defects`.
+    fn record_stale_digest_defect(
+        &mut self,
         stage: &str,
         event_type: &str,
         work_id: &str,
@@ -344,6 +373,56 @@ impl WorkReducer {
             latest_digest = %latest,
             "stale or unbound changeset digest ignored by work reducer"
         );
+
+        let reason = format!(
+            "STALE_DIGEST:{stage}:{event_type}:{work_id}:incoming={},latest={latest}",
+            hex::encode(incoming_digest),
+        );
+        let mut cas_preimage = Vec::new();
+        cas_preimage.extend_from_slice(work_id.as_bytes());
+        cas_preimage.extend_from_slice(&incoming_digest);
+        cas_preimage.extend_from_slice(reason.as_bytes());
+        let cas_hash = *blake3::hash(&cas_preimage).as_bytes();
+
+        self.identity_chain_defects.push(DefectRecorded {
+            defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
+            defect_type: "IDENTITY_CHAIN_STALE_DIGEST".to_string(),
+            cas_hash: cas_hash.to_vec(),
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: work_id.to_string(),
+            severity: "S2".to_string(),
+            detected_at: 0,
+            time_envelope_ref: None,
+        });
+    }
+
+    /// Records a structured defect for a cross-work injection attempt.
+    fn record_cross_work_injection_defect(
+        &mut self,
+        event_type: &str,
+        envelope_work_id: &str,
+        payload_work_id: &str,
+        detected_at_ns: u64,
+    ) {
+        let reason = format!(
+            "CROSS_WORK_INJECTION:{event_type}:envelope={envelope_work_id},payload={payload_work_id}",
+        );
+        let mut cas_preimage = Vec::new();
+        cas_preimage.extend_from_slice(envelope_work_id.as_bytes());
+        cas_preimage.extend_from_slice(payload_work_id.as_bytes());
+        cas_preimage.extend_from_slice(reason.as_bytes());
+        let cas_hash = *blake3::hash(&cas_preimage).as_bytes();
+
+        self.identity_chain_defects.push(DefectRecorded {
+            defect_id: format!("DEF-IDENTITY-CHAIN-{}", uuid::Uuid::new_v4()),
+            defect_type: "IDENTITY_CHAIN_CROSS_WORK_INJECTION".to_string(),
+            cas_hash: cas_hash.to_vec(),
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: envelope_work_id.to_string(),
+            severity: "S1".to_string(),
+            detected_at: detected_at_ns,
+            time_envelope_ref: None,
+        });
     }
 
     /// Returns the latest authoritative changeset digest for `work_id`.
@@ -368,7 +447,7 @@ impl WorkReducer {
     /// - `Ok(false)` when transition must be denied as stale/unbound.
     /// - `Err(...)` for explicit unauthorized transition attempts.
     fn enforce_stage_boundary_guards(
-        &self,
+        &mut self,
         work_id: &str,
         from_state: WorkState,
         to_state: WorkState,
@@ -418,7 +497,7 @@ impl WorkReducer {
                     return Ok(false);
                 };
                 if incoming_digest != latest_digest {
-                    self.log_stale_digest_observation(
+                    self.record_stale_digest_defect(
                         "ci_transition",
                         "work.transitioned",
                         work_id,
@@ -457,7 +536,7 @@ impl WorkReducer {
                 .copied()
             {
                 if !self.is_digest_latest(work_id, review_digest) {
-                    self.log_stale_digest_observation(
+                    self.record_stale_digest_defect(
                         "review_start",
                         "work.transitioned",
                         work_id,
@@ -525,7 +604,7 @@ impl WorkReducer {
     /// Fail-closed: when no changeset has been published for this work (no
     /// entry in `latest_changeset_by_work`), completion is denied. A published
     /// changeset is required for merge admission (CSID-004).
-    fn completion_latest_digest_admitted(&self, work_id: &str, merge_receipt_id: &str) -> bool {
+    fn completion_latest_digest_admitted(&mut self, work_id: &str, merge_receipt_id: &str) -> bool {
         let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
             // Fail-closed: no changeset published — deny completion.
             warn!(
@@ -548,7 +627,7 @@ impl WorkReducer {
             return false;
         };
         if incoming_digest != latest_digest {
-            self.log_stale_digest_observation(
+            self.record_stale_digest_defect(
                 "merge_admission",
                 "work.completed",
                 work_id,
@@ -961,6 +1040,7 @@ impl Reducer for WorkReducer {
 
     fn reset(&mut self) {
         self.state = WorkReducerState::default();
+        self.identity_chain_defects.clear();
     }
 }
 

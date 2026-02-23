@@ -43,6 +43,23 @@ pub struct WorkAuthorityStatus {
     /// Structured dependency diagnostics for consumers such as doctor/work
     /// status.
     pub dependency_diagnostics: Vec<WorkDependencyDiagnostic>,
+    // STEP_10: FAC identity chain surface.
+    /// Latest changeset digest (32 bytes) from `ChangeSetPublished`.
+    pub latest_changeset_digest: Option<[u8; 32]>,
+    /// Event ID of the `ChangeSetPublished` that established the latest
+    /// changeset identity binding.
+    pub changeset_published_event_id: Option<String>,
+    /// CAS hash (32 bytes) of the `ChangeSetBundleV1` for the latest
+    /// changeset.
+    pub bundle_cas_hash: Option<[u8; 32]>,
+    /// Gate status for the latest changeset digest.
+    pub gate_status: Option<String>,
+    /// Review status for the latest changeset digest.
+    pub review_status: Option<String>,
+    /// Merge status for the latest changeset digest.
+    pub merge_status: Option<String>,
+    /// Number of identity-chain defects recorded for this work item.
+    pub identity_chain_defect_count: u32,
 }
 
 /// Authority-layer errors.
@@ -301,6 +318,43 @@ impl ProjectionWorkAuthority {
         let dependency_evaluation =
             projection.evaluate_work_dependencies(&work.work_id, evaluation_time_ns);
 
+        // STEP_10: Derive FAC identity chain status from projection
+        // reducer state.
+        let latest_digest = projection.latest_changeset_digest(&work.work_id);
+        let gate_status = latest_digest
+            .and_then(|ld| {
+                projection.ci_receipt_digest(&work.work_id).map(|ci| {
+                    if ci == ld {
+                        "passed".to_string()
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+        let review_status = latest_digest
+            .and_then(|ld| {
+                projection.review_receipt_digest(&work.work_id).map(|rd| {
+                    if rd == ld {
+                        "passed".to_string()
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+        let merge_status = latest_digest
+            .and_then(|ld| {
+                projection.merge_receipt_digest(&work.work_id).map(|md| {
+                    if md == ld {
+                        "merged".to_string()
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+
         WorkAuthorityStatus {
             work_id: work.work_id.clone(),
             state: work.state,
@@ -311,6 +365,13 @@ impl ProjectionWorkAuthority {
             claimed_at_ns: work.claimed_at,
             implementer_claim_blocked: dependency_evaluation.implementer_claim_blocked,
             dependency_diagnostics: dependency_evaluation.diagnostics,
+            latest_changeset_digest: latest_digest,
+            changeset_published_event_id: None,
+            bundle_cas_hash: None,
+            gate_status,
+            review_status,
+            merge_status,
+            identity_chain_defect_count: 0,
         }
     }
 
