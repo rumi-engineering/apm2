@@ -437,6 +437,7 @@ pub fn build_nextest_command() -> Vec<String> {
         "cargo".to_string(),
         "nextest".to_string(),
         "run".to_string(),
+        "--offline".to_string(),
         "--workspace".to_string(),
         "--all-features".to_string(),
         "--config-file".to_string(),
@@ -461,6 +462,7 @@ pub fn gate_command_for_attestation(
         "clippy" => Some(vec![
             "cargo".to_string(),
             "clippy".to_string(),
+            "--offline".to_string(),
             "--workspace".to_string(),
             "--all-targets".to_string(),
             "--all-features".to_string(),
@@ -471,6 +473,7 @@ pub fn gate_command_for_attestation(
         "doc" => Some(vec![
             "cargo".to_string(),
             "doc".to_string(),
+            "--offline".to_string(),
             "--workspace".to_string(),
             "--no-deps".to_string(),
         ]),
