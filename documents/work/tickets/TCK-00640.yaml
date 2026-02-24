@@ -95,8 +95,6 @@ ticket_meta:
     - "Push/work-current identity resolution now fail closed when branch-derived `TCK-*` alias is unresolved; implicit global active-work fallback is disabled to prevent cross-PR/work misbinding."
     - "Projection fallback for identity recovery is now explicit-only (`--lease-id`/`--session-id`) when no alias context is derivable."
     - "Work projection replay now performs deterministic PR rebind migration from legacy non-ticket work IDs to canonical `W-TCK-*` work IDs, preventing projection rebuild failure under mixed historical associations."
-    - "PublishChangeSet now starts gate lifecycle from authoritative changeset identity (`GateOrchestrator::start_for_changeset(GateStartInfo)`) and persists canonical startup events (`gate.policy_resolved`, `gate.lease_issued`)."
-    - "SessionDispatcher no longer contains session-termination gate-start hooks; SessionTerminated is lifecycle/accounting only."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
