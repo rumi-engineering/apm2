@@ -537,7 +537,25 @@ pub(super) fn emit_job_receipt_internal(
         toolchain_fingerprint, // TCK-00538: toolchain fingerprint
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
-    let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
+    let result = persist_content_addressed_receipt(&receipts_dir, &receipt).map_err(|err| {
+        if let Some(path) = moved_job_path
+            && matches!(outcome, FacJobOutcome::Denied | FacJobOutcome::Quarantined)
+        {
+            return match restore_terminal_job_to_pending_after_receipt_failure(fac_root, path) {
+                Ok(Some(restored_path)) => format!(
+                    "persist receipt failed: {err}; restored moved job to pending at {}",
+                    restored_path.display()
+                ),
+                Ok(None) => format!(
+                    "persist receipt failed: {err}; moved job path no longer present for restore ({path})"
+                ),
+                Err(restore_err) => format!(
+                    "persist receipt failed: {err}; restore-to-pending failed for {path}: {restore_err}"
+                ),
+            };
+        }
+        err
+    })?;
 
     // TCK-00576: Best-effort signed envelope alongside receipt.
     if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
@@ -555,6 +573,34 @@ pub(super) fn emit_job_receipt_internal(
     }
 
     Ok(result)
+}
+
+fn restore_terminal_job_to_pending_after_receipt_failure(
+    fac_root: &Path,
+    moved_job_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    let relative = Path::new(moved_job_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("moved_job_path must be a relative normal path".to_string());
+    }
+
+    let queue_root = fac_root.join("queue");
+    let terminal_path = queue_root.join(relative);
+    if !terminal_path.exists() {
+        return Ok(None);
+    }
+    let file_name = terminal_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| "terminal job path missing UTF-8 file name".to_string())?;
+
+    move_to_dir_safe(&terminal_path, &queue_root.join(PENDING_DIR), file_name)
+        .map(Some)
+        .map_err(|err| format!("move terminal job back to pending: {err}"))
 }
 
 /// Commit a claimed job through the `ReceiptWritePipeline`: persist receipt,

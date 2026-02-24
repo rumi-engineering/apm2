@@ -1234,6 +1234,64 @@ fn test_emit_job_receipt_channel_boundary_defect_path_sets_canonicalizer_digest(
 }
 
 #[test]
+fn test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fac_root = dir.path().join("private").join("fac");
+    let queue_root = fac_root.join("queue");
+    fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+    fs::create_dir_all(queue_root.join(DENIED_DIR)).expect("create denied dir");
+
+    let spec = make_receipt_test_spec();
+    let denied_file_name = format!("{}.json", spec.job_id);
+    let denied_relative_path = format!("{DENIED_DIR}/{denied_file_name}");
+    let denied_path = queue_root.join(DENIED_DIR).join(&denied_file_name);
+    fs::write(
+        &denied_path,
+        serde_json::to_vec_pretty(&spec).expect("serialize denied job spec"),
+    )
+    .expect("write denied job file");
+
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    fs::write(fac_root.join(FAC_RECEIPTS_DIR), b"receipts-dir-blocker")
+        .expect("write receipts dir blocker file");
+
+    let err = emit_job_receipt(
+        &fac_root,
+        &spec,
+        FacJobOutcome::Denied,
+        Some(DenialReasonCode::ValidationFailed),
+        "validation failed",
+        None,
+        None,
+        None,
+        None,
+        Some(&CanonicalizerTupleV1::from_current().compute_digest()),
+        Some(&denied_relative_path),
+        &spec.job_spec_digest,
+        None,
+        None,
+        None,
+        None, // bytes_backend
+        None,
+    )
+    .expect_err("receipt persistence should fail when receipts path is not a directory");
+    assert!(
+        err.contains("restored moved job to pending"),
+        "error should report pending restore path, got: {err}"
+    );
+
+    let restored_pending_path = queue_root.join(PENDING_DIR).join(&denied_file_name);
+    assert!(
+        restored_pending_path.exists(),
+        "denied file must be restored to pending on receipt persist failure"
+    );
+    assert!(
+        !denied_path.exists(),
+        "denied file must be removed after pending restore"
+    );
+}
+
+#[test]
 fn test_scan_pending_quarantines_malformed_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let queue_root = dir.path().join("queue");

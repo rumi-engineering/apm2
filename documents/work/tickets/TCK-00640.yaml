@@ -72,6 +72,8 @@ ticket_meta:
     - "`work.pr_associated` tuple uniqueness now normalizes commit SHA case via case-insensitive partial unique indexes for both legacy and canonical sqlite event tables."
     - "Gates/warm pipeline-commit failures now stay fail-closed in `claimed/` for reconcile recovery (no authority-token requeue replay loops)."
     - "One-shot worker cycles (`run_fac_worker(..., once=true)`) now skip queue watcher and watchdog thread startup, preventing in-process thread/inotify accumulation during inline `fac push` fallback."
+    - "Gates wait FSM was rewritten to explicit probe/evaluate/detect/act/sleep states with bounded inline cooldown, eliminating busy-spin inline fallback loops."
+    - "Direct receipt-emission paths now fail closed when receipt persistence fails after terminal move: denied/quarantined files are restored to `queue/pending` for reconcile-safe retry instead of remaining terminal-without-receipt."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
@@ -87,6 +89,8 @@ ticket_meta:
     - "`cargo test -p apm2-daemon sqlite_work_registry_schema_creates_lease_lookup_index -- --nocapture`"
     - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
     - "`cargo test -p apm2-cli one_shot_worker_skips_background_runtime_primitives -- --nocapture`"
+    - "`cargo test -p apm2-cli gates_wait_machine -- --nocapture`"
+    - "`cargo test -p apm2-cli test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure -- --nocapture`"
     - "`cargo test -p apm2-daemon tck_00639_work_pr_associated_unique_constraint_is_case_insensitive -- --nocapture`"
     - "`cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture`"
     full_package:
