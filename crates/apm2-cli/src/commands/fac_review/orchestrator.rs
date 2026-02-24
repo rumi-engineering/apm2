@@ -28,6 +28,10 @@ use super::state::{
     try_acquire_review_lease, upsert_review_state_entry, write_pulse_file,
     write_review_run_completion_receipt_for_home, write_review_run_state,
 };
+use super::target::{
+    REVIEW_CTX_HEAD_SHA_ENV, REVIEW_CTX_OWNER_REPO_ENV, REVIEW_CTX_PR_NUMBER_ENV,
+    REVIEW_CTX_REVIEW_TYPE_ENV, REVIEW_CTX_RUN_ID_ENV,
+};
 use super::types::{
     DISPATCH_LOCK_ACQUIRE_TIMEOUT, ExecutionContext, LIVENESS_REPORT_INTERVAL, LOOP_SLEEP,
     MAX_RESTART_ATTEMPTS, PULSE_POLL_INTERVAL, ReviewKind, ReviewModelSelection, ReviewRunState,
@@ -206,9 +210,31 @@ const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
 
 fn required_verdict_command(review_kind: ReviewKind) -> String {
     format!(
-        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\"",
+        "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\"",
         verdict_dimension_for_kind(review_kind)
     )
+}
+
+fn build_reviewer_context_env(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    review_type: &str,
+    run_id: &str,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            REVIEW_CTX_OWNER_REPO_ENV.to_string(),
+            owner_repo.to_string(),
+        ),
+        (REVIEW_CTX_PR_NUMBER_ENV.to_string(), pr_number.to_string()),
+        (REVIEW_CTX_HEAD_SHA_ENV.to_string(), head_sha.to_string()),
+        (
+            REVIEW_CTX_REVIEW_TYPE_ENV.to_string(),
+            review_type.to_string(),
+        ),
+        (REVIEW_CTX_RUN_ID_ENV.to_string(), run_id.to_string()),
+    ]
 }
 
 fn seeded_pending_run_identity(
@@ -1142,13 +1168,19 @@ fn run_single_review(
 
         let (owner, repo) = split_owner_repo(owner_repo)?;
         if matches!(spawn_mode, SpawnMode::Initial) {
-            let prompt_content =
-                build_prompt_content(&prompt_template, pr_url, &current_head_sha, owner, repo)?;
+            let prompt_content = build_prompt_content(
+                &prompt_template,
+                pr_url,
+                pr_number,
+                &current_head_sha,
+                owner,
+                repo,
+            )?;
             fs::write(&prompt_path, prompt_content)
                 .map_err(|err| format!("failed to write prompt file: {err}"))?;
         }
 
-        let spawn_cmd = match &spawn_mode {
+        let mut spawn_cmd = match &spawn_mode {
             SpawnMode::Initial => build_spawn_command_for_backend(
                 current_model.backend,
                 &prompt_path,
@@ -1171,6 +1203,13 @@ fn run_single_review(
                 )
             },
         };
+        spawn_cmd.env.extend(build_reviewer_context_env(
+            owner_repo,
+            pr_number,
+            &current_head_sha,
+            review_type,
+            &run_id,
+        ));
 
         let _provider_slot_lease = match acquire_provider_slot(current_model.backend) {
             Ok(lease) => lease,
@@ -1963,8 +2002,9 @@ mod tests {
     use super::{
         MISSING_VERDICT_DECISION_RULES, MISSING_VERDICT_NUDGE_PROMPT_MAX_CHARS,
         MissingVerdictDecisionFacts, MissingVerdictDecisionState, ReviewKind,
-        build_missing_verdict_nudge_message, derive_missing_verdict_decision_state,
-        required_verdict_command, seeded_pending_run_identity, should_dedupe_on_lease_contention,
+        build_missing_verdict_nudge_message, build_reviewer_context_env,
+        derive_missing_verdict_decision_state, required_verdict_command,
+        seeded_pending_run_identity, should_dedupe_on_lease_contention,
     };
     use crate::commands::fac_review::types::{
         ReviewBackend, ReviewRunState, ReviewRunStatus, ReviewStateEntry,
@@ -2028,9 +2068,41 @@ mod tests {
     #[test]
     fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
         let command = required_verdict_command(ReviewKind::Quality);
-        assert!(command.starts_with("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(command.starts_with("apm2 fac review verdict set"));
         assert!(command.contains("--dimension code-quality"));
-        assert!(!command.contains("--sha"));
+        assert!(command.contains("--pr $PR_NUMBER"));
+        assert!(command.contains("--sha $HEAD_SHA"));
+    }
+
+    #[test]
+    fn reviewer_context_env_contains_required_identifiers() {
+        let vars = build_reviewer_context_env(
+            "guardian-intelligence/apm2",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            "security",
+            "pr640-security-s7-01234567",
+        );
+        let map = vars
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            map.get("APM2_FAC_OWNER_REPO"),
+            Some(&"guardian-intelligence/apm2".to_string())
+        );
+        assert_eq!(map.get("APM2_FAC_PR_NUMBER"), Some(&"640".to_string()));
+        assert_eq!(
+            map.get("APM2_FAC_HEAD_SHA"),
+            Some(&"0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+        assert_eq!(
+            map.get("APM2_FAC_REVIEW_TYPE"),
+            Some(&"security".to_string())
+        );
+        assert_eq!(
+            map.get("APM2_FAC_RUN_ID"),
+            Some(&"pr640-security-s7-01234567".to_string())
+        );
     }
 
     #[test]
@@ -2043,7 +2115,7 @@ mod tests {
         let message = build_missing_verdict_nudge_message(ReviewKind::Security, &prompt_path);
 
         assert!(message.contains("RESUME TASK"));
-        assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(message.contains("apm2 fac review verdict set"));
         assert!(message.contains("--dimension security"));
         assert!(message.contains("...[truncated]"));
     }

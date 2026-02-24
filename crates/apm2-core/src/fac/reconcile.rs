@@ -1453,14 +1453,27 @@ fn recover_stale_lease(
 /// This is a subset of the full `LaneManager::run_lane_cleanup` that can run
 /// without knowledge of the workspace path or git state.
 fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
-    use super::safe_rmtree::safe_rmtree_v1;
+    use super::safe_rmtree::{
+        MAX_LOG_DIR_ENTRIES, normalize_user_owned_dir_modes_for_safe_delete,
+        safe_rmtree_v1_with_entry_limit,
+    };
 
     let mut failures: Vec<String> = Vec::new();
 
     // Prune tmp/ directory.
     let tmp_dir = lane_dir.join("tmp");
     if tmp_dir.exists() {
-        if let Err(e) = safe_rmtree_v1(&tmp_dir, lane_dir) {
+        if let Err(e) =
+            normalize_user_owned_dir_modes_for_safe_delete(&tmp_dir, MAX_LOG_DIR_ENTRIES)
+        {
+            eprintln!(
+                "WARNING: best-effort lane cleanup: tmp permission repair failed for {}: {e}",
+                lane_dir.display()
+            );
+            failures.push(format!("tmp permission repair failed: {e}"));
+        } else if let Err(e) =
+            safe_rmtree_v1_with_entry_limit(&tmp_dir, lane_dir, MAX_LOG_DIR_ENTRIES)
+        {
             eprintln!(
                 "WARNING: best-effort lane cleanup: tmp prune failed for {}: {e}",
                 lane_dir.display()
@@ -1477,7 +1490,20 @@ fn best_effort_lane_cleanup(lane_dir: &Path) -> Option<String> {
         }
         let env_dir = lane_dir.join(env_subdir);
         if env_dir.exists() {
-            if let Err(e) = safe_rmtree_v1(&env_dir, lane_dir) {
+            if let Err(e) =
+                normalize_user_owned_dir_modes_for_safe_delete(&env_dir, MAX_LOG_DIR_ENTRIES)
+            {
+                eprintln!(
+                    "WARNING: best-effort lane cleanup: env dir permission repair failed for {}: {e}",
+                    env_dir.display()
+                );
+                failures.push(format!(
+                    "env dir permission repair failed for {}: {e}",
+                    env_dir.display()
+                ));
+            } else if let Err(e) =
+                safe_rmtree_v1_with_entry_limit(&env_dir, lane_dir, MAX_LOG_DIR_ENTRIES)
+            {
                 eprintln!(
                     "WARNING: best-effort lane cleanup: env dir prune failed for {}: {e}",
                     env_dir.display()
@@ -3603,6 +3629,49 @@ mod tests {
         assert!(
             !lease_path.exists(),
             "stale lease file should be removed after successful cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stale_lease_recovery_repairs_write_only_tmp_subtrees() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, fac_root, queue_root) = setup_fac_and_queue(3);
+        let lane_dir = fac_root.join("lanes").join("lane-00");
+        fs::set_permissions(&lane_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tmp_dir = lane_dir.join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}").unwrap();
+
+        fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            fs::Permissions::from_mode(0o333),
+        )
+        .unwrap();
+        fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o333)).unwrap();
+
+        write_lease(
+            &fac_root,
+            "lane-00",
+            "job-write-only-tmp",
+            999_999_999,
+            LaneState::Running,
+        );
+
+        let receipt =
+            reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false)
+                .unwrap();
+        assert_eq!(receipt.stale_leases_recovered, 1);
+
+        assert!(
+            !tmp_dir.exists(),
+            "write-only tmp subtree should be removed during stale lease recovery"
         );
     }
 

@@ -176,6 +176,97 @@ fn resolve_head_for_path(path: &Path) -> Result<String, String> {
     Ok(sha.to_ascii_lowercase())
 }
 
+fn detached_worktree_root_for_home(home: &Path) -> PathBuf {
+    home.join("review_worktrees")
+}
+
+fn detached_worktree_path_for_sha(home: &Path, expected_sha: &str) -> PathBuf {
+    detached_worktree_root_for_home(home).join(expected_sha)
+}
+
+fn git_commit_object_exists(expected_sha: &str) -> Result<bool, String> {
+    let object_ref = format!("{expected_sha}^{{commit}}");
+    let output = Command::new("git")
+        .args(["cat-file", "-e", &object_ref])
+        .output()
+        .map_err(|err| format!("failed to execute `git cat-file -e {object_ref}`: {err}"))?;
+    Ok(output.status.success())
+}
+
+fn remove_detached_worktree(path: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute `git worktree remove --force {}`: {err}",
+                path.display()
+            )
+        })?;
+    if output.status.success() || !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).map_err(|err| {
+        format!(
+            "failed to remove stale detached worktree {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn materialize_detached_worktree_for_sha(expected_sha: &str) -> Result<Option<PathBuf>, String> {
+    if !git_commit_object_exists(expected_sha)? {
+        return Ok(None);
+    }
+
+    let home = apm2_home_dir()?;
+    let detached_root = detached_worktree_root_for_home(&home);
+    fac_permissions::ensure_dir_with_mode(&detached_root).map_err(|err| {
+        format!(
+            "failed to create detached worktree root {}: {err}",
+            detached_root.display()
+        )
+    })?;
+    let detached_path = detached_worktree_path_for_sha(&home, expected_sha);
+
+    if detached_path.exists() {
+        if resolve_head_for_path(&detached_path)
+            .is_ok_and(|sha| sha.eq_ignore_ascii_case(expected_sha))
+        {
+            return Ok(Some(detached_path));
+        }
+        remove_detached_worktree(&detached_path)?;
+    }
+
+    let output = Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&detached_path)
+        .arg(expected_sha)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute `git worktree add --detach {} {expected_sha}`: {err}",
+                detached_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        if detached_path.exists()
+            && resolve_head_for_path(&detached_path)
+                .is_ok_and(|sha| sha.eq_ignore_ascii_case(expected_sha))
+        {
+            return Ok(Some(detached_path));
+        }
+        return Err(format!(
+            "`git worktree add --detach {}` failed: {}",
+            detached_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(Some(detached_path))
+}
+
 pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, String> {
     super::types::validate_expected_head_sha(expected_sha)?;
     let expected_sha = expected_sha.to_ascii_lowercase();
@@ -209,6 +300,14 @@ pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, St
             cwd.display()
         );
         return Ok(cwd);
+    }
+
+    if let Some(detached_path) = materialize_detached_worktree_for_sha(&expected_sha)? {
+        eprintln!(
+            "WARNING: no active worktree found for sha={expected_sha}; using detached worktree {}",
+            detached_path.display()
+        );
+        return Ok(detached_path);
     }
 
     Err(format!(
@@ -256,6 +355,23 @@ fn read_fresh_pending_dispatch_for_home(
     Ok(None)
 }
 
+fn wait_for_fresh_pending_dispatch_for_home(
+    home: &Path,
+    key: &DispatchIdempotencyKey,
+    timeout: Duration,
+) -> Result<Option<PendingDispatchEntry>, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(entry) = read_fresh_pending_dispatch_for_home(home, key)? {
+            return Ok(Some(entry));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn write_pending_dispatch_for_home(
     home: &Path,
     key: &DispatchIdempotencyKey,
@@ -293,7 +409,7 @@ fn write_pending_dispatch_for_home(
 
 fn pending_dispatch_is_live(entry: &PendingDispatchEntry) -> bool {
     if let Some(pid) = entry.pid {
-        return is_process_alive(pid);
+        return process_is_alive_with_identity(pid, entry.proc_start_time);
     }
     if let Some(unit) = entry.unit.as_deref() {
         return is_systemd_unit_active(unit);
@@ -373,8 +489,20 @@ fn is_process_alive(pid: u32) -> bool {
     super::state::is_process_alive(pid)
 }
 
-fn run_state_has_live_process(state: &ReviewRunState) -> bool {
-    state.pid.is_some_and(is_process_alive)
+fn process_is_alive_with_identity(pid: u32, recorded_proc_start_time: Option<u64>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    let Some(recorded_start_time) = recorded_proc_start_time else {
+        return false;
+    };
+    get_process_start_time(pid).is_some_and(|observed| observed == recorded_start_time)
+}
+
+fn run_state_has_live_runtime_handle(state: &ReviewRunState) -> bool {
+    state
+        .pid
+        .is_some_and(|pid| process_is_alive_with_identity(pid, state.proc_start_time))
 }
 
 pub(super) fn verify_process_identity(
@@ -895,6 +1023,29 @@ fn resume_dispatch_after_head_drift_for_home<F>(
 where
     F: Fn(&Path, u32, ReviewKind, &str, u64) -> Result<DispatchReviewResult, String>,
 {
+    // Acquire the review lease before superseding stale lineage so we do not
+    // fork a second reviewer while another live owner still exists.
+    let review_lease = match try_acquire_review_lease_for_home(
+        home,
+        &key.owner_repo,
+        key.pr_number,
+        &key.review_type,
+    ) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            return Err(format!(
+                "dispatch resume blocked for {}#{} {}: review lease still held by another owner; retry dispatch",
+                key.owner_repo, key.pr_number, key.review_type
+            ));
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to acquire review lease for {}#{} {} during drift resume: {err}",
+                key.owner_repo, key.pr_number, key.review_type
+            ));
+        },
+    };
+
     let mut superseded = state.clone();
     superseded.status = ReviewRunStatus::Failed;
     superseded.terminal_reason = Some(TERMINAL_SHA_DRIFT_SUPERSEDED.to_string());
@@ -927,6 +1078,7 @@ where
         },
     };
     write_pending_dispatch_for_home(home, key, &started)?;
+    let _ = review_lease;
 
     attach_run_state_contract_for_home(
         home,
@@ -1053,7 +1205,7 @@ where
             }
 
             if !state.status.is_terminal() && state.head_sha.eq_ignore_ascii_case(&key.head_sha) {
-                if run_state_has_live_process(&state) {
+                if run_state_has_live_runtime_handle(&state) {
                     return Ok(DispatchReviewResult {
                         review_type: key.review_type.clone(),
                         mode: "joined".to_string(),
@@ -1067,31 +1219,22 @@ where
                         log_file: None,
                     });
                 }
-                if state.pid.is_none() {
-                    if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
-                        return attach_run_state_contract_for_home(
-                            home,
-                            key,
-                            DispatchReviewResult {
-                                review_type: key.review_type.clone(),
-                                mode: "joined".to_string(),
-                                run_state: "unknown".to_string(),
-                                run_id: None,
-                                sequence_number: None,
-                                terminal_reason: None,
-                                pid: pending.pid,
-                                proc_start_time: pending.proc_start_time,
-                                unit: pending.unit,
-                                log_file: pending.log_file,
-                            },
-                        );
-                    }
-                    return fail_closed_dispatch(
+                if let Some(pending) = read_fresh_pending_dispatch_for_home(home, key)? {
+                    return attach_run_state_contract_for_home(
                         home,
                         key,
-                        TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
-                        "matching run-state has no pid and no live pending marker",
-                        Some(state.sequence_number.saturating_add(1).max(1)),
+                        DispatchReviewResult {
+                            review_type: key.review_type.clone(),
+                            mode: "joined".to_string(),
+                            run_state: "unknown".to_string(),
+                            run_id: None,
+                            sequence_number: None,
+                            terminal_reason: None,
+                            pid: pending.pid,
+                            proc_start_time: pending.proc_start_time,
+                            unit: pending.unit,
+                            log_file: pending.log_file,
+                        },
                     );
                 }
             }
@@ -1177,22 +1320,17 @@ where
                                 spawn_review,
                             );
                         }
-                        let detail = match state.pid {
-                            Some(pid) => format!(
-                                "stale run-state pid={pid} is not live and no live pending marker old_head={} run_id={}",
-                                state.head_sha, state.run_id
-                            ),
-                            None => format!(
-                                "stale run-state has no pid and no live pending marker old_head={} run_id={}",
-                                state.head_sha, state.run_id
-                            ),
-                        };
-                        return fail_closed_dispatch(
+                        // No live stale process and no pending marker means
+                        // there is no ownership ambiguity to resolve. Resume
+                        // deterministically by superseding stale lineage.
+                        return resume_dispatch_after_head_drift_for_home(
                             home,
+                            workspace_root,
                             key,
-                            TERMINAL_STALE_HEAD_AMBIGUITY,
-                            &detail,
-                            Some(state.sequence_number.saturating_add(1).max(1)),
+                            review_kind,
+                            dispatch_epoch,
+                            &state,
+                            spawn_review,
                         );
                     },
                 }
@@ -1211,31 +1349,55 @@ where
     ) {
         Ok(Some(lease)) => lease,
         Ok(None) => {
-            // Lease held — enrich the response with current run state so callers
-            // can see which run_id/pid they joined.
-            let (run_state_str, run_id, seq, pid, pst) =
-                match load_review_run_state_for_home(home, key.pr_number, &key.review_type) {
-                    Ok(ReviewRunStateLoad::Present(state)) => (
-                        state.status.as_str().to_string(),
-                        Some(state.run_id),
-                        Some(state.sequence_number),
-                        state.pid,
-                        state.proc_start_time,
-                    ),
-                    _ => ("unknown".to_string(), None, None, None, None),
-                };
-            return Ok(DispatchReviewResult {
-                review_type: key.review_type.clone(),
-                mode: "joined".to_string(),
-                run_state: run_state_str,
-                run_id,
-                sequence_number: seq,
-                terminal_reason: None,
-                pid,
-                proc_start_time: pst,
-                unit: None,
-                log_file: None,
-            });
+            // Lease contention is expected while a dispatcher seeds runtime
+            // state. Wait briefly for a live pending marker before returning a
+            // transient retryable error.
+            if let Some(pending) =
+                wait_for_fresh_pending_dispatch_for_home(home, key, Duration::from_millis(750))?
+            {
+                return attach_run_state_contract_for_home(
+                    home,
+                    key,
+                    DispatchReviewResult {
+                        review_type: key.review_type.clone(),
+                        mode: "joined".to_string(),
+                        run_state: "unknown".to_string(),
+                        run_id: None,
+                        sequence_number: None,
+                        terminal_reason: None,
+                        pid: pending.pid,
+                        proc_start_time: pending.proc_start_time,
+                        unit: pending.unit,
+                        log_file: pending.log_file,
+                    },
+                );
+            }
+
+            if let Ok(ReviewRunStateLoad::Present(state)) =
+                load_review_run_state_for_home(home, key.pr_number, &key.review_type)
+            {
+                let same_head_non_terminal = !state.status.is_terminal()
+                    && state.head_sha.eq_ignore_ascii_case(&key.head_sha);
+                if same_head_non_terminal && run_state_has_live_runtime_handle(&state) {
+                    return Ok(DispatchReviewResult {
+                        review_type: key.review_type.clone(),
+                        mode: "joined".to_string(),
+                        run_state: state.status.as_str().to_string(),
+                        run_id: Some(state.run_id),
+                        sequence_number: Some(state.sequence_number),
+                        terminal_reason: state.terminal_reason,
+                        pid: state.pid,
+                        proc_start_time: state.proc_start_time,
+                        unit: None,
+                        log_file: None,
+                    });
+                }
+            }
+
+            return Err(format!(
+                "dispatch lease held for {}#{} {} but no verified live runtime handle is available; retry dispatch",
+                key.owner_repo, key.pr_number, key.review_type
+            ));
         },
         Err(err) => {
             return Err(format!(
@@ -1627,6 +1789,7 @@ fn spawn_detached_review(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::Duration;
@@ -1636,18 +1799,35 @@ mod tests {
         build_systemd_setenv_args, dispatch_single_review_for_home_with_spawn,
         dispatch_single_review_for_home_with_spawn_force,
         dispatch_single_review_for_home_with_spawn_force_workspace_and_lock,
-        first_existing_dispatch_executable, run_state_has_live_process,
-        strip_deleted_executable_suffix, write_pending_dispatch_for_home,
+        first_existing_dispatch_executable, resolve_head_for_path, resolve_worktree_for_sha,
+        run_state_has_live_runtime_handle, strip_deleted_executable_suffix,
+        write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
         get_process_start_time, load_review_run_state_for_home, review_run_state_path_for_home,
-        write_review_run_state_for_home,
+        try_acquire_review_lease_for_home, write_review_run_state_for_home,
     };
     use crate::commands::fac_review::types::{
         ReviewKind, ReviewRunState, ReviewRunStatus, TERMINAL_AMBIGUOUS_DISPATCH_OWNERSHIP,
         TERMINAL_DISPATCH_LOCK_TIMEOUT, TERMINAL_SHA_DRIFT_SUPERSEDED,
         TERMINAL_STALE_HEAD_AMBIGUITY,
     };
+
+    fn git_checked(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
     fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
         ReviewRunState {
@@ -1774,14 +1954,27 @@ mod tests {
 
     #[test]
     fn run_state_liveness_requires_pid() {
-        assert!(!run_state_has_live_process(&sample_run_state(None)));
+        assert!(!run_state_has_live_runtime_handle(&sample_run_state(None)));
     }
 
     #[test]
     fn run_state_liveness_rejects_dead_pid() {
-        assert!(!run_state_has_live_process(&sample_run_state(Some(
+        assert!(!run_state_has_live_runtime_handle(&sample_run_state(Some(
             dead_pid_for_test()
         ))));
+    }
+
+    #[test]
+    fn run_state_liveness_rejects_missing_proc_start_time() {
+        let pid = spawn_long_lived_pid();
+        let mut state = sample_run_state(Some(pid));
+        state.proc_start_time = None;
+        assert!(!run_state_has_live_runtime_handle(&state));
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     #[test]
@@ -1828,6 +2021,60 @@ mod tests {
         assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
 
         cleanup_children(&spawned_children);
+    }
+
+    #[test]
+    fn resolve_worktree_for_sha_materializes_detached_sha_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo dir");
+        git_checked(&repo, &["init"]);
+        git_checked(&repo, &["config", "user.email", "test@example.com"]);
+        git_checked(&repo, &["config", "user.name", "Test User"]);
+
+        fs::write(repo.join("file.txt"), "first\n").expect("write first file");
+        git_checked(&repo, &["add", "file.txt"]);
+        git_checked(&repo, &["commit", "-m", "first"]);
+        let first_sha = git_checked(&repo, &["rev-parse", "HEAD"]);
+
+        fs::write(repo.join("file.txt"), "second\n").expect("write second file");
+        git_checked(&repo, &["add", "file.txt"]);
+        git_checked(&repo, &["commit", "-m", "second"]);
+        let second_sha = git_checked(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            first_sha, second_sha,
+            "fixture requires two distinct commits"
+        );
+
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("switch to repo cwd");
+
+        let resolved = resolve_worktree_for_sha(&first_sha).expect("resolve detached worktree");
+        let resolved_sha = resolve_head_for_path(&resolved).expect("resolve detached head");
+        let apm2_home = crate::commands::fac_review::types::apm2_home_dir().expect("apm2 home");
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        assert_eq!(
+            resolved_sha.to_ascii_lowercase(),
+            first_sha.to_ascii_lowercase(),
+            "detached worktree must point at requested sha"
+        );
+        assert!(
+            resolved.starts_with(&apm2_home),
+            "detached worktree should live under APM2 home"
+        );
+        assert_ne!(
+            resolved, repo,
+            "resolver should not return cwd when cwd head does not match requested sha"
+        );
+
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&resolved)
+            .status();
     }
 
     #[test]
@@ -1999,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_head_no_live_handle_fails_closed() {
+    fn test_stale_head_no_live_handle_resumes_dispatch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
 
@@ -2009,10 +2256,86 @@ mod tests {
         stale_state.sequence_number = 3;
         write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
 
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
         let key = dispatch_key("2222222222222222222222222222222222222222");
         let spawn =
-            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
-                panic!("spawn must not be called for unresolved stale-head ownership");
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
+                    unit: None,
+                    log_file: None,
+                })
+            };
+
+        let result = dispatch_single_review_for_home_with_spawn(
+            home,
+            &key,
+            ReviewKind::Security,
+            42,
+            &spawn,
+        )
+        .expect("dispatch with stale no-pid lineage should resume deterministically");
+        assert_eq!(result.mode, "drift_resumed");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+
+        match load_review_run_state_for_home(home, 441, "security").expect("load state") {
+            ReviewRunStateLoad::Present(state) => {
+                assert_eq!(state.head_sha, "2222222222222222222222222222222222222222");
+                assert_eq!(state.sequence_number, 4);
+                assert_eq!(
+                    state.previous_run_id.as_deref(),
+                    Some("pr441-security-s3-11111111")
+                );
+                assert_eq!(
+                    state.previous_head_sha.as_deref(),
+                    Some("1111111111111111111111111111111111111111")
+                );
+            },
+            other => panic!("expected present run-state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stale_head_resume_fails_when_review_lease_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+
+        let mut stale_state = sample_run_state(None);
+        stale_state.head_sha = "1111111111111111111111111111111111111111".to_string();
+        stale_state.run_id = "pr441-security-s3-11111111".to_string();
+        stale_state.sequence_number = 3;
+        write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
+
+        let held_lease = try_acquire_review_lease_for_home(home, "example/repo", 441, "security")
+            .expect("acquire test review lease")
+            .expect("lease must be available in test");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
+        let key = dispatch_key("2222222222222222222222222222222222222222");
+        let spawn =
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
+                    unit: None,
+                    log_file: None,
+                })
             };
 
         let err = dispatch_single_review_for_home_with_spawn(
@@ -2022,28 +2345,17 @@ mod tests {
             42,
             &spawn,
         )
-        .expect_err("dispatch with no stale live handle must fail closed");
+        .expect_err("stale head resume must not spawn while review lease is held");
         assert!(
-            err.contains(TERMINAL_STALE_HEAD_AMBIGUITY),
+            err.contains("review lease still held"),
             "unexpected error: {err}"
         );
-
-        match load_review_run_state_for_home(home, 441, "security").expect("load state") {
-            ReviewRunStateLoad::Present(state) => {
-                assert_eq!(state.status, ReviewRunStatus::Failed);
-                assert_eq!(
-                    state.terminal_reason.as_deref(),
-                    Some(TERMINAL_STALE_HEAD_AMBIGUITY)
-                );
-                assert_eq!(state.head_sha, "2222222222222222222222222222222222222222");
-                assert_eq!(state.sequence_number, 4);
-            },
-            other => panic!("expected present run-state, got {other:?}"),
-        }
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 0);
+        drop(held_lease);
     }
 
     #[test]
-    fn test_stale_head_dead_pid_no_marker_fails_closed() {
+    fn test_stale_head_dead_pid_no_marker_resumes_dispatch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();
 
@@ -2053,34 +2365,49 @@ mod tests {
         stale_state.sequence_number = 7;
         write_review_run_state_for_home(home, &stale_state).expect("seed stale state");
 
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_ref = Arc::clone(&spawn_count);
         let key = dispatch_key("4444444444444444444444444444444444444444");
         let spawn =
-            |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
-                panic!("spawn must not be called for stale dead-pid ambiguity");
+            move |_: u32, _: ReviewKind, _: &str, _: u64| -> Result<DispatchReviewResult, String> {
+                spawn_count_ref.fetch_add(1, Ordering::SeqCst);
+                Ok(DispatchReviewResult {
+                    review_type: "security".to_string(),
+                    mode: "started".to_string(),
+                    run_state: "pending".to_string(),
+                    run_id: None,
+                    sequence_number: None,
+                    terminal_reason: None,
+                    pid: Some(dead_pid_for_test()),
+                    proc_start_time: None,
+                    unit: None,
+                    log_file: None,
+                })
             };
 
-        let err = dispatch_single_review_for_home_with_spawn(
+        let result = dispatch_single_review_for_home_with_spawn(
             home,
             &key,
             ReviewKind::Security,
             43,
             &spawn,
         )
-        .expect_err("dispatch with stale dead pid and no marker must fail closed");
-        assert!(
-            err.contains(TERMINAL_STALE_HEAD_AMBIGUITY),
-            "unexpected error: {err}"
-        );
+        .expect("dispatch with stale dead-pid lineage should resume deterministically");
+        assert_eq!(result.mode, "drift_resumed");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
 
         match load_review_run_state_for_home(home, 441, "security").expect("load state") {
             ReviewRunStateLoad::Present(state) => {
-                assert_eq!(state.status, ReviewRunStatus::Failed);
-                assert_eq!(
-                    state.terminal_reason.as_deref(),
-                    Some(TERMINAL_STALE_HEAD_AMBIGUITY)
-                );
                 assert_eq!(state.head_sha, "4444444444444444444444444444444444444444");
                 assert_eq!(state.sequence_number, 8);
+                assert_eq!(
+                    state.previous_run_id.as_deref(),
+                    Some("pr441-security-s7-33333333")
+                );
+                assert_eq!(
+                    state.previous_head_sha.as_deref(),
+                    Some("3333333333333333333333333333333333333333")
+                );
             },
             other => panic!("expected present run-state, got {other:?}"),
         }

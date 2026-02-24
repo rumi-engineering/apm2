@@ -404,6 +404,7 @@ pub(super) fn execute_queued_gates_job(
     spec: &FacJobSpecV1,
     claimed_path: &Path,
     claimed_file_name: &str,
+    claimed_lock_guard: &ClaimedJobLockGuardV1,
     queue_root: &Path,
     fac_root: &Path,
     boundary_trace: &ChannelBoundaryTrace,
@@ -425,12 +426,13 @@ pub(super) fn execute_queued_gates_job(
         Ok(options) => options,
         Err(reason) => {
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -468,12 +470,13 @@ pub(super) fn execute_queued_gates_job(
                 options.workspace_root.display()
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -508,12 +511,13 @@ pub(super) fn execute_queued_gates_job(
             spec.source.head_sha
         );
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -560,12 +564,13 @@ pub(super) fn execute_queued_gates_job(
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -601,12 +606,13 @@ pub(super) fn execute_queued_gates_job(
     if gate_run_result.exit_code == exit_codes::SUCCESS {
         if let Err(err) = lifecycle_update_result {
             let reason = format!("gates passed but lifecycle update failed: {err}");
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -637,12 +643,13 @@ pub(super) fn execute_queued_gates_job(
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Completed,
             None,
             "gates completed",
@@ -660,22 +667,13 @@ pub(super) fn execute_queued_gates_job(
             None, // bytes_backend
             toolchain_fingerprint,
         ) {
-            eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
-            if let Err(move_err) = release_claimed_job_to_pending(
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "completed gates job",
                 claimed_path,
                 queue_root,
                 claimed_file_name,
-                fac_root,
-                spec,
-                "gates_pipeline_commit_failed",
-            ) {
-                eprintln!(
-                    "worker: WARNING: failed to return claimed gates job to pending: {move_err}"
-                );
-            }
-            return JobOutcome::skipped_pipeline_commit(format!(
-                "pipeline commit failed for gates job: {commit_err}"
-            ));
+            );
         }
 
         // TCK-00540 BLOCKER fix: After the receipt is committed, rebind
@@ -726,12 +724,13 @@ pub(super) fn execute_queued_gates_job(
         _ => truncate_receipt_reason(&base_reason),
     };
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-    if let Err(commit_err) = commit_claimed_job_via_pipeline(
+    if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
         fac_root,
         queue_root,
         spec,
         claimed_path,
         claimed_file_name,
+        claimed_lock_guard,
         FacJobOutcome::Denied,
         Some(DenialReasonCode::ValidationFailed),
         &reason,
@@ -772,6 +771,7 @@ pub(super) fn handle_stop_revoke(
     spec: &FacJobSpecV1,
     claimed_path: &Path,
     claimed_file_name: &str,
+    claimed_lock_guard: &ClaimedJobLockGuardV1,
     queue_root: &Path,
     fac_root: &Path,
     boundary_trace: &ChannelBoundaryTrace,
@@ -796,12 +796,13 @@ pub(super) fn handle_stop_revoke(
                 spec.job_id
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::MalformedSpec),
                 &reason,
@@ -855,12 +856,13 @@ pub(super) fn handle_stop_revoke(
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Completed,
                 None,
                 &format!("stop_revoke: target {target_job_id} already {terminal_state}"),
@@ -897,12 +899,13 @@ pub(super) fn handle_stop_revoke(
         );
         eprintln!("worker: {reason}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -955,12 +958,13 @@ pub(super) fn handle_stop_revoke(
         let reason =
             format!("stop_revoke failed: systemctl stop failed for target {target_job_id}: {e}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -1042,12 +1046,13 @@ pub(super) fn handle_stop_revoke(
                 );
                 eprintln!("worker: {deny_reason}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
                     spec,
                     claimed_path,
                     claimed_file_name,
+                    claimed_lock_guard,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::StopRevokeFailed),
                     &deny_reason,
@@ -1087,12 +1092,13 @@ pub(super) fn handle_stop_revoke(
             );
             eprintln!("worker: {deny_reason}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::StopRevokeFailed),
                 &deny_reason,
@@ -1145,12 +1151,13 @@ pub(super) fn handle_stop_revoke(
             format!("stop_revoke failed: cannot move target {target_job_id} to cancelled: {e}");
         eprintln!("worker: {reason}");
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::StopRevokeFailed),
             &reason,
@@ -1184,12 +1191,13 @@ pub(super) fn handle_stop_revoke(
     // Receipt persistence, index update, and job move happen in a crash-safe
     // order via a single ReceiptWritePipeline::commit() call.
     let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
-    if let Err(commit_err) = commit_claimed_job_via_pipeline(
+    if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
         fac_root,
         queue_root,
         spec,
         claimed_path,
         claimed_file_name,
+        claimed_lock_guard,
         FacJobOutcome::Completed,
         None,
         &format!("stop_revoke completed for target {target_job_id}"),
@@ -1238,6 +1246,7 @@ pub(super) fn execute_warm_job(
     spec: &FacJobSpecV1,
     claimed_path: &Path,
     claimed_file_name: &str,
+    claimed_lock_guard: &ClaimedJobLockGuardV1,
     queue_root: &Path,
     fac_root: &Path,
     signer: &Signer,
@@ -1291,12 +1300,13 @@ pub(super) fn execute_warm_job(
                         let _ = LaneLeaseV1::remove(lane_dir);
                         // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                         // (claimed/ -> denied/ transition).
-                        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                             fac_root,
                             queue_root,
                             spec,
                             claimed_path,
                             claimed_file_name,
+                            claimed_lock_guard,
                             FacJobOutcome::Denied,
                             Some(DenialReasonCode::ValidationFailed),
                             &reason,
@@ -1347,12 +1357,13 @@ pub(super) fn execute_warm_job(
         let _ = LaneLeaseV1::remove(lane_dir);
         // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
         // (claimed/ -> denied/ transition).
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -1385,12 +1396,13 @@ pub(super) fn execute_warm_job(
         let _ = LaneLeaseV1::remove(lane_dir);
         // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
         // (claimed/ -> denied/ transition).
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             claimed_path,
             claimed_file_name,
+            claimed_lock_guard,
             FacJobOutcome::Denied,
             Some(DenialReasonCode::ValidationFailed),
             &reason,
@@ -1485,12 +1497,13 @@ pub(super) fn execute_warm_job(
             let _ = LaneLeaseV1::remove(lane_dir);
             // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
             // (claimed/ -> denied/ transition).
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -1551,12 +1564,13 @@ pub(super) fn execute_warm_job(
                         let _ = LaneLeaseV1::remove(lane_dir);
                         // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                         // (claimed/ -> denied/ transition).
-                        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                             fac_root,
                             queue_root,
                             spec,
                             claimed_path,
                             claimed_file_name,
+                            claimed_lock_guard,
                             FacJobOutcome::Denied,
                             Some(DenialReasonCode::ValidationFailed),
                             &reason,
@@ -1615,12 +1629,13 @@ pub(super) fn execute_warm_job(
                 let _ = LaneLeaseV1::remove(lane_dir);
                 // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                 // (claimed/ -> denied/ transition).
-                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
                     spec,
                     claimed_path,
                     claimed_file_name,
+                    claimed_lock_guard,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::ValidationFailed),
                     &reason,
@@ -1719,12 +1734,13 @@ pub(super) fn execute_warm_job(
             let _ = LaneLeaseV1::remove(lane_dir);
             // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
             // (claimed/ -> denied/ transition).
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 claimed_path,
                 claimed_file_name,
+                claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -1806,12 +1822,13 @@ pub(super) fn execute_warm_job(
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     // Receipt persistence, index update, and job move happen in a crash-safe
     // order via a single ReceiptWritePipeline::commit() call.
-    if let Err(commit_err) = commit_claimed_job_via_pipeline(
+    if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
         fac_root,
         queue_root,
         spec,
         claimed_path,
         claimed_file_name,
+        claimed_lock_guard,
         FacJobOutcome::Completed,
         None,
         "warm completed",
@@ -1831,19 +1848,13 @@ pub(super) fn execute_warm_job(
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        if let Err(move_err) = release_claimed_job_to_pending(
+        return handle_pipeline_commit_failure(
+            &commit_err,
+            "completed warm job",
             claimed_path,
             queue_root,
             claimed_file_name,
-            fac_root,
-            spec,
-            "warm_pipeline_commit_failed",
-        ) {
-            eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
-        }
-        return JobOutcome::skipped_pipeline_commit(format!(
-            "pipeline commit failed for warm job: {commit_err}"
-        ));
+        );
     }
 
     // Post-completion lane cleanup (same as standard jobs).

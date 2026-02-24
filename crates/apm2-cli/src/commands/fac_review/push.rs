@@ -9,11 +9,21 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
-use apm2_core::fac::{parse_b3_256_digest, parse_policy_hash};
+use apm2_core::fac::work_cas_schemas::{
+    WORK_CONTEXT_ENTRY_V1_SCHEMA, WorkContextEntryV1, WorkContextKind,
+};
+use apm2_core::fac::{
+    ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo, parse_b3_256_digest,
+    parse_policy_hash,
+};
+use apm2_daemon::protocol::{
+    PublishChangeSetResponse, PublishWorkContextEntryResponse, RecordWorkPrAssociationResponse,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -32,8 +42,16 @@ use super::types::{
     DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
     sanitize_for_path,
 };
-use super::{github_projection, lifecycle, projection_store, state, verdict_projection};
+use super::{
+    gate_checks, github_projection, lifecycle, projection_store, state, verdict_projection,
+};
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_pr::sync_required_status_ruleset;
+use crate::commands::work_identity::{
+    derive_adhoc_session_id, extract_tck_from_text, normalize_non_empty_arg,
+    validate_lease_id as validate_push_lease_id, validate_session_id as validate_push_session_id,
+    validate_work_id as validate_push_work_id,
+};
 use crate::exit_codes::codes as exit_codes;
 
 const REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
@@ -51,34 +69,8 @@ const PUSH_QUEUE_GATES_PIDS_MAX: u64 = 1536;
 const PUSH_QUEUE_GATES_CPU_QUOTA: &str = "auto";
 const PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const PUSH_ATTEMPT_MALFORMED_WARN_LIMIT: usize = 3;
-
-/// Extract `TCK-xxxxx` from arbitrary text.
-fn extract_tck_from_text(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    if bytes.len() < 9 {
-        return None;
-    }
-
-    for idx in 0..=bytes.len() - 9 {
-        if &bytes[idx..idx + 4] != b"TCK-" {
-            continue;
-        }
-
-        let digits = &bytes[idx + 4..idx + 9];
-        if !digits.iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-
-        if idx + 9 < bytes.len() && bytes[idx + 9].is_ascii_digit() {
-            continue;
-        }
-
-        let matched = std::str::from_utf8(&bytes[idx..idx + 9]).ok()?;
-        return Some(matched.to_string());
-    }
-
-    None
-}
+const PUSH_PROGRESS_TICK_SECS: u64 = 10;
+const PUSH_EXPLICIT_FALLBACK_REQUIRED_MESSAGE: &str = "Refusing implicit projection fallback to prevent cross-ticket misbinding; pass `--work-id` or `--ticket-alias`, or explicitly request projection fallback with `--lease-id`/`--session-id`.";
 
 /// Resolve TCK id from branch first, then worktree directory name.
 fn resolve_tck_id(branch: &str, worktree_dir: &Path) -> Result<String, String> {
@@ -363,6 +355,7 @@ fn update_pr(repo: &str, pr_number: u32, title: &str, body: &str) -> Result<(), 
 
 fn run_blocking_evidence_gates(
     sha: &str,
+    work_id: Option<&str>,
     write_mode: QueueWriteMode,
 ) -> Result<QueuedGatesOutcome, String> {
     let request = QueuedGatesRequest {
@@ -381,6 +374,7 @@ fn run_blocking_evidence_gates(
         // ServiceUserOnly; only bypass when --unsafe-local-write is
         // explicitly passed at the top-level FacCommand.
         write_mode,
+        work_id_override: work_id.map(ToString::to_string),
     };
     let outcome = run_queued_gates_and_collect(&request)?;
     validate_queued_gates_outcome_for_push(sha, outcome)
@@ -393,7 +387,43 @@ enum PrePushExecutionError {
     GitPush(String),
 }
 
+const FAST_CHECKS_ALREADY_COMPLETED_ERROR: &str =
+    "internal invariant violation: fast checks already marked complete";
+const FAST_CHECKS_NOT_COMPLETED_ERROR: &str =
+    "internal invariant violation: fast checks must complete before gate execution";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushPreflightState {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastChecksToken {
+    _private: (),
+}
+
+impl PushPreflightState {
+    fn mark_fast_checks_completed(&mut self) -> Result<(), String> {
+        match self {
+            Self::Pending => {
+                *self = Self::Completed;
+                Ok(())
+            },
+            Self::Completed => Err(FAST_CHECKS_ALREADY_COMPLETED_ERROR.to_string()),
+        }
+    }
+
+    fn fast_checks_token(self) -> Result<FastChecksToken, String> {
+        match self {
+            Self::Pending => Err(FAST_CHECKS_NOT_COMPLETED_ERROR.to_string()),
+            Self::Completed => Ok(FastChecksToken { _private: () }),
+        }
+    }
+}
+
 fn run_pre_push_sequence_with<FGates, FSync, FPush>(
+    _fast_checks_token: FastChecksToken,
     mut run_gates_fn: FGates,
     mut sync_ruleset_fn: FSync,
     mut git_push_fn: FPush,
@@ -989,24 +1019,35 @@ where
                             thread::sleep(delay);
                             continue;
                         }
-                    } else {
-                        // BF-001 (TCK-00626 round 4): Non-terminal joined
-                        // with no PID — assume unit-based supervision is
-                        // keeping the dispatch alive. In the systemd detached
-                        // path, dispatches are created with unit-based
-                        // supervision and no PID recorded, so pid=None is the
-                        // normal steady-state for healthy unit-supervised
-                        // reviews. Treating these as dead would cause
-                        // spurious retry loops and duplicate dispatches.
-                        // Only apply PID identity checks when a PID IS
-                        // present (the branch above).
+                    } else if let Some(unit) = result
+                        .unit
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                    {
                         if emit_logs {
                             eprintln!(
                                 "fac push: {review_type} dispatch returned 'joined' with no PID in non-terminal \
-                                 state '{}'; assuming unit-supervised liveness",
+                                 state '{}'; using unit handle {unit}",
                                 result.run_state,
                             );
                         }
+                    } else {
+                        let err = format!(
+                            "{review_type} joined dispatch missing runtime handle in non-terminal state (run_state={})",
+                            result.run_state
+                        );
+                        let delay = retry_delay_or_fail(
+                            &mut retry_counts,
+                            retry_budget,
+                            review_type,
+                            "dispatch_contract",
+                            PushRetryClass::DispatchTransient,
+                            &err,
+                            emit_logs,
+                        )?;
+                        thread::sleep(delay);
+                        continue;
                     }
                 }
                 break result;
@@ -1417,15 +1458,22 @@ pub(super) fn load_latest_push_attempt_for_sha(
     Ok(latest)
 }
 
-fn stage_from_gate_name(gate_name: &str) -> &'static str {
+fn stage_from_gate_name(gate_name: &str) -> Option<&'static str> {
     match gate_name {
-        "rustfmt" => "gate_fmt",
-        "clippy" => "gate_clippy",
-        "doc" => "gate_doc",
-        // Collapse all non-fmt/clippy/doc gates into test stage in the fixed
-        // push-attempt schema.
-        _ => "gate_test",
+        "rustfmt" => Some("gate_fmt"),
+        "clippy" => Some("gate_clippy"),
+        "doc" => Some("gate_doc"),
+        "test" => Some("gate_test"),
+        _ => None,
     }
+}
+
+fn stage_from_gate_result(gate_name: &str, passed: bool) -> Option<&'static str> {
+    stage_from_gate_name(gate_name).or_else(|| (!passed).then_some("gate_test"))
+}
+
+fn stage_from_failed_gate_name(gate_name: &str) -> &'static str {
+    stage_from_gate_name(gate_name).unwrap_or("gate_test")
 }
 
 fn normalize_error_hint(value: &str) -> Option<String> {
@@ -1448,6 +1496,14 @@ fn parse_failed_gates_from_error(error: &str) -> Vec<String> {
         .filter(|gate| !gate.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn summarize_native_gate_failure(output: &str, fallback: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("ERROR:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .map_or_else(|| fallback.to_string(), ToString::to_string)
 }
 
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
@@ -1559,14 +1615,867 @@ fn gate_error_hint_from_result(result: &EvidenceGateResult) -> Option<String> {
     latest_gate_error_hint(&result.gate_name)
 }
 
-pub fn run_push(
-    repo: &str,
-    remote: &str,
-    branch: Option<&str>,
-    ticket: Option<&Path>,
-    json_output: bool,
-    write_mode: QueueWriteMode,
-) -> u8 {
+struct PushPhaseProgressTicker {
+    stop_tx: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PushPhaseProgressTicker {
+    fn start(phase: &'static str, json_output: bool) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let phase_name = phase.to_string();
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            let mut tick = 0_u64;
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(PUSH_PROGRESS_TICK_SECS)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        tick = tick.saturating_add(1);
+                        let elapsed_seconds = started.elapsed().as_secs();
+                        if json_output {
+                            let _ = emit_jsonl(&StageEvent {
+                                event: "push_progress".to_string(),
+                                ts: ts_now(),
+                                extra: serde_json::json!({
+                                    "phase": phase_name.as_str(),
+                                    "tick": tick,
+                                    "elapsed_seconds": elapsed_seconds,
+                                    "interval_seconds": PUSH_PROGRESS_TICK_SECS,
+                                }),
+                            });
+                        } else {
+                            eprintln!(
+                                "fac push: still running phase={phase_name} elapsed={elapsed_seconds}s"
+                            );
+                        }
+                    },
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PushPhaseProgressTicker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn parse_handoff_note(handoff_note_arg: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = handoff_note_arg else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("`--handoff-note` cannot be empty when provided".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn with_operator_client<T>(
+    f: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
+) -> Result<T, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
+    rt.block_on(f).map_err(|err| err.to_string())
+}
+
+fn resolve_ticket_alias_to_work_id(
+    ticket_alias: &str,
+    operator_socket: &Path,
+) -> Result<Option<String>, String> {
+    let ticket_alias_for_rpc = ticket_alias.to_string();
+    let resolved = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&ticket_alias_for_rpc).await
+    })?;
+    if !resolved.found {
+        return Ok(None);
+    }
+    validate_push_work_id(&resolved.work_id)?;
+    Ok(Some(resolved.work_id))
+}
+
+const fn push_projection_fallback_requested(
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    lease_filter.is_some() || session_filter.is_some()
+}
+
+fn unresolved_push_alias_message(ticket_alias: &str) -> String {
+    format!(
+        "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
+         Refusing projection fallback to prevent cross-ticket misbinding. \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         then claim it (or pass explicit `--work-id`)."
+    )
+}
+
+fn is_active_push_fallback_status(status: &str) -> bool {
+    match status.trim().to_ascii_uppercase().as_str() {
+        // Current canonical work states surfaced by daemon work projection,
+        // plus legacy/in-flight aliases preserved during migration windows.
+        "CLAIMED" | "IN_PROGRESS" | "INPROGRESS" | "SPAWNED" | "RUNNING" => true,
+        _ => false,
+    }
+}
+
+fn matches_push_fallback_candidate(
+    work_item: &apm2_daemon::protocol::WorkStatusResponse,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    if !is_active_push_fallback_status(&work_item.status) {
+        return false;
+    }
+
+    let Some(role_raw) = work_item.role else {
+        return false;
+    };
+    let role = apm2_daemon::protocol::WorkRole::try_from(role_raw);
+    if role != Ok(apm2_daemon::protocol::WorkRole::Implementer) {
+        return false;
+    }
+
+    if let Some(expected_lease_id) = lease_filter {
+        let observed_lease_id = work_item
+            .lease_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_lease_id != Some(expected_lease_id) {
+            return false;
+        }
+    }
+
+    if let Some(expected_session_id) = session_filter {
+        let observed_session_id = work_item
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_session_id != Some(expected_session_id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn select_push_fallback_work_id_from_list(
+    work_items: &[apm2_daemon::protocol::WorkStatusResponse],
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let mut candidates = BTreeSet::new();
+    for work_item in work_items {
+        if !matches_push_fallback_candidate(work_item, lease_filter, session_filter) {
+            continue;
+        }
+        let work_id = work_item.work_id.trim();
+        if work_id.is_empty() {
+            continue;
+        }
+        if validate_push_work_id(work_id).is_err() {
+            continue;
+        }
+        candidates.insert(work_id.to_string());
+    }
+
+    match candidates.len() {
+        0 => Err(
+            "daemon fallback could not identify an active Implementer work item; pass `--work-id` \
+             explicitly or ensure ticket alias reconciliation is populated"
+                .to_string(),
+        ),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| "internal error: fallback candidate set unexpectedly empty".to_string()),
+        _ => {
+            let candidate_list = candidates.into_iter().collect::<Vec<_>>().join(", ");
+            Err(format!(
+                "daemon fallback found multiple active Implementer work items ({candidate_list}); \
+                 pass `--work-id` explicitly"
+            ))
+        },
+    }
+}
+
+fn resolve_push_work_id_from_projection_fallback(
+    operator_socket: &Path,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let list_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(false).await
+    })?;
+
+    select_push_fallback_work_id_from_list(&list_response.work_items, lease_filter, session_filter)
+}
+
+fn validate_explicit_ticket_alias_binding(
+    work_id: &str,
+    ticket_alias: &str,
+    resolved_work_id: Option<&str>,
+) -> Result<String, String> {
+    match resolved_work_id {
+        Some(resolved) if resolved == work_id => Ok(ticket_alias.to_string()),
+        Some(resolved) => Err(format!(
+            "`--work-id` mismatch: provided `{work_id}` but ticket alias \
+             `{ticket_alias}` resolved to `{resolved}`",
+        )),
+        None => Err(format!(
+            "ticket alias `{ticket_alias}` did not resolve to a canonical work_id; \
+             explicit `--ticket-alias` inputs are fail-closed"
+        )),
+    }
+}
+
+fn resolve_work_id_for_push(
+    work_id_arg: Option<&str>,
+    ticket_alias_arg: Option<&str>,
+    lease_id_arg: Option<&str>,
+    session_id_arg: Option<&str>,
+    branch: &str,
+    worktree_dir: &Path,
+    operator_socket: &Path,
+) -> Result<(String, Option<String>), String> {
+    let trimmed_work_id = normalize_non_empty_arg(work_id_arg);
+    let alias = normalize_non_empty_arg(ticket_alias_arg);
+    let requested_lease_id = normalize_non_empty_arg(lease_id_arg);
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(session_id_arg);
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
+
+    match (trimmed_work_id, alias.as_deref()) {
+        (Some(work_id), Some(ticket_alias)) => {
+            validate_push_work_id(&work_id)?;
+            let resolved_work_id = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?;
+            let verified_alias = validate_explicit_ticket_alias_binding(
+                &work_id,
+                ticket_alias,
+                resolved_work_id.as_deref(),
+            )?;
+            Ok((work_id, Some(verified_alias)))
+        },
+        (Some(work_id), None) => {
+            validate_push_work_id(&work_id)?;
+            Ok((work_id, None))
+        },
+        (None, Some(ticket_alias)) => {
+            if let Some(work_id) = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)? {
+                return Ok((work_id, Some(ticket_alias.to_string())));
+            }
+            Err(format!(
+                "ticket alias `{ticket_alias}` did not resolve to a canonical work_id; \
+                 explicit `--ticket-alias` inputs are fail-closed"
+            ))
+        },
+        (None, None) => match resolve_tck_id(branch, worktree_dir) {
+            Ok(derived_alias) => {
+                if let Some(work_id) =
+                    resolve_ticket_alias_to_work_id(&derived_alias, operator_socket)?
+                {
+                    return Ok((work_id, Some(derived_alias)));
+                }
+                Err(unresolved_push_alias_message(&derived_alias))
+            },
+            Err(derive_err) => {
+                if !push_projection_fallback_requested(
+                    requested_lease_id.as_deref(),
+                    requested_session_id.as_deref(),
+                ) {
+                    return Err(format!(
+                        "{derive_err} {PUSH_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
+                    ));
+                }
+                let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                    operator_socket,
+                    requested_lease_id.as_deref(),
+                    requested_session_id.as_deref(),
+                )
+                .map_err(|fallback_err| {
+                    format!("{derive_err} Projection fallback also failed: {fallback_err}")
+                })?;
+                Ok((fallback_work_id, None))
+            },
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushRuntimeBinding {
+    lease_id: String,
+    session_id: String,
+    session_id_source: PushSessionIdSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushSessionIdSource {
+    Requested,
+    DaemonStatus,
+    DerivedAdhoc,
+}
+
+impl PushSessionIdSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::DaemonStatus => "daemon_status",
+            Self::DerivedAdhoc => "derived_adhoc",
+        }
+    }
+}
+
+fn resolve_runtime_binding_from_inputs(
+    work_id: &str,
+    requested_lease_id: Option<String>,
+    requested_session_id: Option<String>,
+    status_lease_id: Option<String>,
+    status_session_id: Option<String>,
+) -> Result<PushRuntimeBinding, String> {
+    validate_push_work_id(work_id)?;
+
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
+    if let Some(ref lease_id) = status_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    if let Some(ref session_id) = status_session_id {
+        validate_push_session_id(session_id)?;
+    }
+
+    if let (Some(requested), Some(observed)) = (&requested_lease_id, &status_lease_id)
+        && requested != observed
+    {
+        return Err(format!(
+            "`--lease-id` mismatch for work_id `{work_id}`: provided `{requested}` but daemon reports `{observed}`"
+        ));
+    }
+    if let (Some(requested), Some(observed)) = (&requested_session_id, &status_session_id)
+        && requested != observed
+    {
+        return Err(format!(
+            "`--session-id` mismatch for work_id `{work_id}`: provided `{requested}` but daemon reports active `{observed}`"
+        ));
+    }
+
+    let lease_id = requested_lease_id.or(status_lease_id).ok_or_else(|| {
+        format!(
+            "no active lease_id found for work_id `{work_id}`; pass `--lease-id` \
+             or claim work before running `fac push`"
+        )
+    })?;
+    validate_push_lease_id(&lease_id)?;
+
+    let (session_id, session_id_source) = requested_session_id.map_or_else(
+        || {
+            status_session_id.map_or_else(
+                || {
+                    (
+                        derive_adhoc_session_id(work_id, &lease_id),
+                        PushSessionIdSource::DerivedAdhoc,
+                    )
+                },
+                |from_status| (from_status, PushSessionIdSource::DaemonStatus),
+            )
+        },
+        |requested| (requested, PushSessionIdSource::Requested),
+    );
+    validate_push_session_id(&session_id)?;
+
+    Ok(PushRuntimeBinding {
+        lease_id,
+        session_id,
+        session_id_source,
+    })
+}
+
+fn resolve_runtime_binding_for_push(
+    work_id: &str,
+    lease_id_arg: Option<&str>,
+    session_id_arg: Option<&str>,
+    operator_socket: &Path,
+) -> Result<PushRuntimeBinding, String> {
+    let requested_lease_id = normalize_non_empty_arg(lease_id_arg);
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_push_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(session_id_arg);
+    if let Some(ref session_id) = requested_session_id {
+        validate_push_session_id(session_id)?;
+    }
+
+    let work_id_owned = work_id.to_string();
+    let status_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_owned).await
+    })?;
+
+    let status_lease_id = normalize_non_empty_arg(status_response.lease_id.as_deref());
+    let status_session_id = normalize_non_empty_arg(status_response.session_id.as_deref());
+
+    resolve_runtime_binding_from_inputs(
+        work_id,
+        requested_lease_id,
+        requested_session_id,
+        status_lease_id,
+        status_session_id,
+    )
+}
+
+fn make_push_session_dedupe_key(session_id: &str) -> Result<String, String> {
+    validate_push_session_id(session_id)?;
+    Ok(session_id.to_string())
+}
+
+fn parse_git_base_ref_commit(base_ref: &str) -> Result<(HashAlgo, String), String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base_ref}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|err| format!("failed to resolve base ref `{base_ref}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve base ref `{base_ref}`: {}",
+            stderr.trim()
+        ));
+    }
+    let object_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let is_hex = object_id.as_bytes().iter().all(u8::is_ascii_hexdigit);
+    if !is_hex {
+        return Err(format!(
+            "base commit id for `{base_ref}` is not hexadecimal: `{object_id}`"
+        ));
+    }
+    let algo = match object_id.len() {
+        40 => HashAlgo::Sha1,
+        64 => HashAlgo::Sha256,
+        other => {
+            return Err(format!(
+                "unsupported base commit id length for `{base_ref}`: {other}"
+            ));
+        },
+    };
+    Ok((algo, object_id))
+}
+
+fn parse_git_diff_manifest(base_ref: &str, head_sha: &str) -> Result<Vec<FileChange>, String> {
+    let range = format!("{base_ref}..{head_sha}");
+    let output = Command::new("git")
+        .args(["diff", "--name-status", "--find-renames", "-z", &range])
+        .output()
+        .map_err(|err| format!("failed to collect diff manifest for `{range}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to collect diff manifest for `{range}`: {}",
+            stderr.trim()
+        ));
+    }
+
+    parse_git_name_status_manifest_z(&output.stdout, &range)
+}
+
+fn parse_git_numstat_binary_detected(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let mut parts = trimmed.splitn(3, '\t');
+        let inserted = parts.next().unwrap_or_default().trim();
+        let deleted = parts.next().unwrap_or_default().trim();
+        inserted == "-" || deleted == "-"
+    })
+}
+
+fn detect_binary_changes(base_ref: &str, head_sha: &str) -> Result<bool, String> {
+    let range = format!("{base_ref}..{head_sha}");
+    let output = Command::new("git")
+        .args(["diff", "--numstat", "--find-renames", &range])
+        .output()
+        .map_err(|err| format!("failed to collect numstat for `{range}`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to collect numstat for `{range}`: {}",
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_git_numstat_binary_detected(&stdout))
+}
+
+fn parse_dirty_worktree_entries(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn ensure_clean_worktree_for_push() -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|err| format!("failed to inspect git working tree status: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to inspect git working tree status: {}",
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let entries = parse_dirty_worktree_entries(&stdout);
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let preview = entries
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if entries.len() > 10 {
+        format!(" (+{} more)", entries.len() - 10)
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "working tree is dirty; commit or stash changes before `fac push` \
+         (detected {} entries: {preview}{suffix})",
+        entries.len()
+    ))
+}
+
+fn parse_git_name_status_manifest_z(raw: &[u8], range: &str) -> Result<Vec<FileChange>, String> {
+    let mut manifest = Vec::new();
+    let mut tokens = raw
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty());
+    while let Some(status_bytes) = tokens.next() {
+        let status = std::str::from_utf8(status_bytes)
+            .map_err(|_| format!("diff manifest contains non-UTF8 status token for `{range}`"))?;
+
+        let status_prefix = status.chars().next().unwrap_or('M');
+        let parse_path = |bytes: &[u8], label: &str| -> Result<String, String> {
+            std::str::from_utf8(bytes)
+                .map(ToString::to_string)
+                .map_err(|_| {
+                    format!("diff manifest contains non-UTF8 {label} path token for `{range}`")
+                })
+        };
+
+        match status_prefix {
+            'R' => {
+                let old_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after rename status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "rename old"))?;
+                let new_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after rename status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "rename new"))?;
+                manifest.push(FileChange {
+                    path: new_path,
+                    change_kind: ChangeKind::Rename,
+                    old_path: Some(old_path),
+                });
+            },
+            'C' => {
+                let old_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after copy status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "copy old"))?;
+                let new_path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "diff manifest for `{range}` truncated after copy status `{status}`"
+                        )
+                    })
+                    .and_then(|value| parse_path(value, "copy new"))?;
+                manifest.push(FileChange {
+                    path: new_path,
+                    change_kind: ChangeKind::Modify,
+                    old_path: Some(old_path),
+                });
+            },
+            'A' | 'D' | 'M' | 'T' | 'U' | 'X' | 'B' => {
+                let path = tokens
+                    .next()
+                    .ok_or_else(|| {
+                        format!("diff manifest for `{range}` truncated after status `{status}`")
+                    })
+                    .and_then(|value| parse_path(value, "file"))?;
+                let change_kind = match status_prefix {
+                    'A' => ChangeKind::Add,
+                    'D' => ChangeKind::Delete,
+                    _ => ChangeKind::Modify,
+                };
+                manifest.push(FileChange {
+                    path,
+                    change_kind,
+                    old_path: None,
+                });
+            },
+            _ => {
+                return Err(format!(
+                    "diff manifest for `{range}` contains unsupported status `{status}`"
+                ));
+            },
+        }
+    }
+    Ok(manifest)
+}
+
+fn build_changeset_bundle_json(remote: &str, sha: &str) -> Result<Vec<u8>, String> {
+    let base_ref = resolve_commit_history_base_ref(remote)?;
+    let (base_algo, base_object_id) = parse_git_base_ref_commit(&base_ref)?;
+    let manifest = parse_git_diff_manifest(&base_ref, sha)?;
+    let binary_detected = detect_binary_changes(&base_ref, sha)?;
+    let diff_range = format!("{base_ref}..{sha}");
+    let diff_bytes = Command::new("git")
+        .args(["diff", "--binary", &diff_range])
+        .output()
+        .map_err(|err| format!("failed to collect diff bytes for `{diff_range}`: {err}"))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(output.stdout)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!(
+                    "failed to collect diff bytes for `{diff_range}`: {}",
+                    stderr.trim()
+                ))
+            }
+        })?;
+
+    let changeset_id_suffix = &sha[..sha.len().min(12)];
+    let bundle = ChangeSetBundleV1::builder()
+        .changeset_id(format!("cs-{changeset_id_suffix}"))
+        .base(GitObjectRef {
+            algo: base_algo,
+            object_kind: "commit".to_string(),
+            object_id: base_object_id,
+        })
+        .diff_hash(*blake3::hash(&diff_bytes).as_bytes())
+        .file_manifest(manifest)
+        .binary_detected(binary_detected)
+        .build()
+        .map_err(|err| format!("failed to build changeset bundle: {err}"))?;
+
+    serde_json::to_vec(&bundle)
+        .map_err(|err| format!("failed to serialize changeset bundle: {err}"))
+}
+
+fn build_context_entry_json(
+    work_id: &str,
+    kind: WorkContextKind,
+    dedupe_key: &str,
+    body: String,
+    metadata: Option<serde_json::Value>,
+) -> Result<Vec<u8>, String> {
+    let entry = WorkContextEntryV1 {
+        schema: WORK_CONTEXT_ENTRY_V1_SCHEMA.to_string(),
+        work_id: work_id.to_string(),
+        entry_id: "placeholder".to_string(),
+        kind,
+        dedupe_key: dedupe_key.to_string(),
+        source_session_id: None,
+        actor_id: None,
+        body: Some(body),
+        metadata,
+        tags: vec!["fac_push".to_string()],
+        created_at_ns: None,
+    };
+    serde_json::to_vec(&entry)
+        .map_err(|err| format!("failed to serialize work context entry: {err}"))
+}
+
+fn validate_context_entry_publication_response(
+    label: &str,
+    expected_work_id: &str,
+    response: &PublishWorkContextEntryResponse,
+) -> Result<(), String> {
+    validate_push_work_id(&response.work_id)?;
+    if response.work_id != expected_work_id {
+        return Err(format!(
+            "{label} work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            response.work_id
+        ));
+    }
+    if response.entry_id.trim().is_empty() {
+        return Err(format!("{label} entry_id is empty"));
+    }
+    if !response.entry_id.starts_with("CTX-") {
+        return Err(format!(
+            "{label} entry_id must start with `CTX-`, got `{}`",
+            response.entry_id
+        ));
+    }
+    if response.evidence_id != response.entry_id {
+        return Err(format!(
+            "{label} evidence_id mismatch: entry_id=`{}` evidence_id=`{}`",
+            response.entry_id, response.evidence_id
+        ));
+    }
+    if response.cas_hash.trim().is_empty() {
+        return Err(format!("{label} cas_hash is empty"));
+    }
+    Ok(())
+}
+
+fn validate_work_publication_chain_responses(
+    expected_work_id: &str,
+    expected_pr_number: u32,
+    expected_commit_sha: &str,
+    changeset: &PublishChangeSetResponse,
+    association: &RecordWorkPrAssociationResponse,
+    handoff_entry: Option<&PublishWorkContextEntryResponse>,
+    terminal_entry: &PublishWorkContextEntryResponse,
+) -> Result<(), String> {
+    validate_push_work_id(expected_work_id)?;
+    validate_push_work_id(&changeset.work_id)?;
+    if changeset.work_id != expected_work_id {
+        return Err(format!(
+            "changeset publication work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            changeset.work_id
+        ));
+    }
+    if changeset.changeset_digest.trim().is_empty() {
+        return Err("changeset publication returned empty changeset_digest".to_string());
+    }
+    if changeset.cas_hash.trim().is_empty() {
+        return Err("changeset publication returned empty cas_hash".to_string());
+    }
+    if changeset.event_id.trim().is_empty() {
+        return Err("changeset publication returned empty event_id".to_string());
+    }
+
+    validate_work_pr_association_response(
+        expected_work_id,
+        expected_pr_number,
+        expected_commit_sha,
+        association,
+    )?;
+
+    if let Some(handoff) = handoff_entry {
+        validate_context_entry_publication_response("handoff", expected_work_id, handoff)?;
+    }
+    validate_context_entry_publication_response(
+        "implementer_terminal",
+        expected_work_id,
+        terminal_entry,
+    )?;
+
+    Ok(())
+}
+
+fn validate_work_pr_association_response(
+    expected_work_id: &str,
+    expected_pr_number: u32,
+    expected_commit_sha: &str,
+    association: &RecordWorkPrAssociationResponse,
+) -> Result<(), String> {
+    validate_push_work_id(&association.work_id)?;
+    if association.work_id != expected_work_id {
+        return Err(format!(
+            "PR association work_id mismatch: expected `{expected_work_id}` but daemon returned `{}`",
+            association.work_id
+        ));
+    }
+    if association.pr_number != u64::from(expected_pr_number) {
+        return Err(format!(
+            "PR association number mismatch: expected `{expected_pr_number}` but daemon returned `{}`",
+            association.pr_number
+        ));
+    }
+    if association.commit_sha != expected_commit_sha {
+        return Err(format!(
+            "PR association commit mismatch: expected `{expected_commit_sha}` but daemon returned `{}`",
+            association.commit_sha
+        ));
+    }
+    Ok(())
+}
+
+pub(super) struct PushInvocation<'a> {
+    pub repo: &'a str,
+    pub remote: &'a str,
+    pub branch: Option<&'a str>,
+    pub ticket: Option<&'a Path>,
+    pub work_id_arg: Option<&'a str>,
+    pub ticket_alias_arg: Option<&'a str>,
+    pub lease_id_arg: Option<&'a str>,
+    pub session_id_arg: Option<&'a str>,
+    pub handoff_note_arg: Option<&'a str>,
+    pub json_output: bool,
+    pub write_mode: QueueWriteMode,
+    pub operator_socket: &'a Path,
+}
+
+pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
+    let repo = invocation.repo;
+    let remote = invocation.remote;
+    let branch = invocation.branch;
+    let ticket = invocation.ticket;
+    let work_id_arg = invocation.work_id_arg;
+    let ticket_alias_arg = invocation.ticket_alias_arg;
+    let lease_id_arg = invocation.lease_id_arg;
+    let session_id_arg = invocation.session_id_arg;
+    let handoff_note_arg = invocation.handoff_note_arg;
+    let json_output = invocation.json_output;
+    let write_mode = invocation.write_mode;
+    let operator_socket = invocation.operator_socket;
     macro_rules! emit_machine_error {
         ($error:expr, $message:expr) => {{
             if json_output {
@@ -1743,6 +2652,25 @@ pub fn run_push(
         }};
     }
 
+    // Explicitly stage fast, fail-closed checks before any time-consuming gate
+    // execution. This ordering is a push contract: no gate job may be enqueued
+    // until identity/worktree/head checks complete successfully.
+    let fast_checks_started = Instant::now();
+    let mut preflight_state = PushPreflightState::Pending;
+    emit_stage(
+        "fast_checks_started",
+        serde_json::json!({
+            "checks": [
+                "ticket_metadata_resolution",
+                "fac_review_machine_spec_snapshot_guard",
+                "work_binding_resolution",
+                "clean_worktree",
+                "head_drift_check",
+                "work_pr_association_compatibility",
+            ],
+        }),
+    );
+
     // Resolve metadata deterministically from TCK identity.
     let worktree_dir = match std::env::current_dir() {
         Ok(path) => path,
@@ -1759,6 +2687,33 @@ pub fn run_push(
             fail_with_attempt!("fac_push_repo_root_resolution_failed", err);
         },
     };
+    let machine_spec_guard_started = Instant::now();
+    let machine_spec_guard = match gate_checks::run_fac_review_machine_spec_guard(&repo_root) {
+        Ok(check) => check,
+        Err(err) => {
+            fail_with_attempt!("fac_push_machine_spec_fast_check_failed", err);
+        },
+    };
+    emit_stage(
+        "fast_check_machine_spec_snapshot_completed",
+        serde_json::json!({
+            "status": if machine_spec_guard.passed { "pass" } else { "fail" },
+            "duration_secs": machine_spec_guard_started.elapsed().as_secs(),
+        }),
+    );
+    if !machine_spec_guard.passed {
+        let message = summarize_native_gate_failure(
+            &machine_spec_guard.output,
+            "FAC review machine spec snapshot guard failed",
+        );
+        fail_with_attempt!(
+            "fac_push_machine_spec_snapshot_stale",
+            format!(
+                "{message}; regenerate and commit documents/reviews/fac_review_state_machine.cac.json before `apm2 fac push`"
+            )
+        );
+    }
+
     let commit_history = match collect_commit_history(remote, &branch) {
         Ok(value) => value,
         Err(err) => {
@@ -1784,6 +2739,66 @@ pub fn run_push(
         metadata.ticket_path.display()
     );
 
+    let handoff_note = match parse_handoff_note(handoff_note_arg) {
+        Ok(note) => note,
+        Err(err) => {
+            fail_with_attempt!("fac_push_handoff_note_invalid", err);
+        },
+    };
+
+    let (work_id, resolved_ticket_alias) = match resolve_work_id_for_push(
+        work_id_arg,
+        ticket_alias_arg,
+        lease_id_arg,
+        session_id_arg,
+        &branch,
+        &worktree_dir,
+        operator_socket,
+    ) {
+        Ok(binding) => binding,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_id_resolution_failed", err);
+        },
+    };
+    let runtime_binding = match resolve_runtime_binding_for_push(
+        &work_id,
+        lease_id_arg,
+        session_id_arg,
+        operator_socket,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_runtime_binding_resolution_failed", err);
+        },
+    };
+    let lease_id = runtime_binding.lease_id;
+    let session_id = runtime_binding.session_id;
+    let session_id_source = runtime_binding.session_id_source;
+    emit_stage(
+        "work_binding_resolved",
+        serde_json::json!({
+            "work_id": work_id,
+            "ticket_alias": resolved_ticket_alias,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "session_id_source": session_id_source.as_str(),
+        }),
+    );
+    human_log!(
+        "fac push: bound work_id={} lease_id={} session_id={} (source={}){}",
+        work_id,
+        lease_id,
+        session_id,
+        session_id_source.as_str(),
+        resolved_ticket_alias
+            .as_deref()
+            .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
+    );
+
+    if let Err(err) = ensure_clean_worktree_for_push() {
+        fail_with_attempt!("fac_push_dirty_worktree", err);
+    }
+
     // Step 1: fail closed on HEAD drift before running queued gates.
     let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -1802,9 +2817,82 @@ pub fn run_push(
             )
         );
     }
-
     let existing_pr_number = find_existing_pr(repo, &branch);
     attempt_pr_number = existing_pr_number;
+    if existing_pr_number > 0 {
+        let work_association_preflight_started = Instant::now();
+        emit_stage(
+            "work_association_preflight_started",
+            serde_json::json!({
+                "work_id": work_id,
+                "pr_number": existing_pr_number,
+                "head_sha": sha,
+                "lease_id": lease_id,
+            }),
+        );
+        let rpc_work_id = work_id.clone();
+        let rpc_lease_id = lease_id.clone();
+        let rpc_sha = sha.clone();
+        let preflight_response = match with_operator_client(async move {
+            let mut client = OperatorClient::connect(operator_socket).await?;
+            client
+                .record_work_pr_association(
+                    &rpc_work_id,
+                    u64::from(existing_pr_number),
+                    &rpc_sha,
+                    &rpc_lease_id,
+                    None,
+                    true,
+                )
+                .await
+        }) {
+            Ok(value) => value,
+            Err(err) => {
+                fail_with_attempt!(
+                    "fac_push_work_association_preflight_failed",
+                    format!(
+                        "failed preflight validation for existing PR #{existing_pr_number}: {err}"
+                    )
+                );
+            },
+        };
+        if let Err(err) = validate_work_pr_association_response(
+            &work_id,
+            existing_pr_number,
+            &sha,
+            &preflight_response,
+        ) {
+            fail_with_attempt!(
+                "fac_push_work_association_preflight_response_invalid",
+                format!("invalid PR association preflight response: {err}")
+            );
+        }
+        emit_stage(
+            "work_association_preflight_completed",
+            serde_json::json!({
+                "status": "pass",
+                "duration_secs": work_association_preflight_started.elapsed().as_secs(),
+                "work_id": work_id,
+                "pr_number": existing_pr_number,
+                "head_sha": sha,
+                "already_existed": preflight_response.already_existed,
+            }),
+        );
+    }
+    if let Err(err) = preflight_state.mark_fast_checks_completed() {
+        fail_with_attempt!("fac_push_fast_checks_state_invalid", err);
+    }
+    emit_stage(
+        "fast_checks_completed",
+        serde_json::json!({
+            "duration_secs": fast_checks_started.elapsed().as_secs(),
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "head_sha": sha,
+        }),
+    );
+
     let mut git_push_duration_secs = 0_u64;
     let mut git_push_exit_code: Option<i32> = None;
     let mut git_push_error_hint: Option<String> = None;
@@ -1813,17 +2901,25 @@ pub fn run_push(
     let mut ruleset_sync_error_hint: Option<String> = None;
     let mut ruleset_sync_executed = false;
     let mut ruleset_sync_passed = false;
+    let fast_checks_token = match preflight_state.fast_checks_token() {
+        Ok(token) => token,
+        Err(err) => {
+            fail_with_attempt!("fac_push_fast_checks_not_completed", err);
+        },
+    };
     let gate_outcome = match run_pre_push_sequence_with(
+        fast_checks_token,
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("gates", json_output);
             human_log!(
                 "fac push: enqueuing evidence gates job (blocking; external worker if present, inline fallback otherwise)"
             );
             emit_stage("gates_started", serde_json::json!({}));
             let gates_started = Instant::now();
-            let gate_outcome = match run_blocking_evidence_gates(&sha, write_mode) {
+            let gate_outcome = match run_blocking_evidence_gates(&sha, Some(&work_id), write_mode) {
                 Ok(outcome) => {
                     for gate in &outcome.gate_results {
-                        let stage = stage_from_gate_name(&gate.gate_name);
+                        let stage = stage_from_gate_result(&gate.gate_name, gate.passed);
                         let log_path = gate
                             .log_path
                             .as_ref()
@@ -1836,15 +2932,17 @@ pub fn run_push(
                                 normalize_error_hint(&format!("gate {} failed", gate.gate_name))
                             })
                         };
-                        if gate.passed {
-                            attempt.set_stage_pass(stage, gate.duration_secs);
-                        } else {
-                            attempt.set_stage_fail(
-                                stage,
-                                gate.duration_secs,
-                                None,
-                                error_hint.clone(),
-                            );
+                        if let Some(stage_name) = stage {
+                            if gate.passed {
+                                attempt.set_stage_pass(stage_name, gate.duration_secs);
+                            } else {
+                                attempt.set_stage_fail(
+                                    stage_name,
+                                    gate.duration_secs,
+                                    None,
+                                    error_hint.clone(),
+                                );
+                            }
                         }
                         if json_output {
                             let status = if gate.passed { "pass" } else { "fail" }.to_string();
@@ -1893,20 +2991,22 @@ pub fn run_push(
                     let mut mapped_any = false;
                     if let Some(cache) = GateCache::load(&sha) {
                         for (gate_name, gate_result) in cache.gates {
-                            let stage = stage_from_gate_name(&gate_name);
-                            mapped_any = true;
-                            if gate_result.status.eq_ignore_ascii_case("PASS") {
-                                attempt.set_stage_pass(stage, gate_result.duration_secs);
-                            } else {
-                                let hint = latest_gate_error_hint(&gate_name).or_else(|| {
-                                    normalize_error_hint(&format!("gate {gate_name} failed"))
-                                });
-                                attempt.set_stage_fail(
-                                    stage,
-                                    gate_result.duration_secs,
-                                    None,
-                                    hint,
-                                );
+                            let passed = gate_result.status.eq_ignore_ascii_case("PASS");
+                            if let Some(stage_name) = stage_from_gate_result(&gate_name, passed) {
+                                mapped_any = true;
+                                if passed {
+                                    attempt.set_stage_pass(stage_name, gate_result.duration_secs);
+                                } else {
+                                    let hint = latest_gate_error_hint(&gate_name).or_else(|| {
+                                        normalize_error_hint(&format!("gate {gate_name} failed"))
+                                    });
+                                    attempt.set_stage_fail(
+                                        stage_name,
+                                        gate_result.duration_secs,
+                                        None,
+                                        hint,
+                                    );
+                                }
                             }
                             if json_output {
                                 let normalized_status = gate_result.status.to_ascii_lowercase();
@@ -1955,18 +3055,20 @@ pub fn run_push(
                         let duration = gates_started.elapsed().as_secs();
                         let failed_gates = parse_failed_gates_from_error(&err);
                         if failed_gates.is_empty() {
-                            for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
-                                attempt.set_stage_fail(
-                                    stage,
-                                    duration,
-                                    None,
-                                    normalize_error_hint(&err),
-                                );
-                            }
+                            // Preserve accurate push-attempt timing: when we
+                            // cannot attribute a failure to a specific gate,
+                            // record only the synthetic "test" stage instead
+                            // of marking all stages with the same duration.
+                            attempt.set_stage_fail(
+                                "gate_test",
+                                duration,
+                                None,
+                                normalize_error_hint(&err),
+                            );
                         } else {
                             for gate_name in &failed_gates {
                                 attempt.set_stage_fail(
-                                    stage_from_gate_name(gate_name),
+                                    stage_from_failed_gate_name(gate_name),
                                     duration,
                                     None,
                                     normalize_error_hint(&err),
@@ -2036,6 +3138,7 @@ pub fn run_push(
             Ok(gate_outcome)
         },
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("ruleset_sync", json_output);
             emit_stage("ruleset_sync_started", serde_json::json!({}));
             let sync_started = Instant::now();
             match sync_required_status_ruleset(repo, None, None, false) {
@@ -2089,6 +3192,7 @@ pub fn run_push(
             }
         },
         || {
+            let _phase_progress = PushPhaseProgressTicker::start("git_push", json_output);
             let git_push_started = Instant::now();
             let push_output = Command::new("git")
                 .args(["push", "--force", remote, &branch])
@@ -2197,6 +3301,7 @@ pub fn run_push(
 
     // Step 2: create or update PR.
     let pr_update_started = Instant::now();
+    let pr_update_progress = PushPhaseProgressTicker::start("pr_update", json_output);
     let pr_number = find_existing_pr(repo, &branch);
     let pr_number = if pr_number == 0 {
         match create_pr(repo, &metadata.title, &metadata.body) {
@@ -2238,6 +3343,7 @@ pub fn run_push(
         pr_number
     };
     attempt_pr_number = pr_number;
+    drop(pr_update_progress);
     emit_stage(
         "pr_updated",
         serde_json::json!({
@@ -2245,8 +3351,187 @@ pub fn run_push(
             "url": format!("https://github.com/{repo}/pull/{pr_number}"),
         }),
     );
+
+    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    let dedupe_key = match make_push_session_dedupe_key(&session_id) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_session_dedupe_key_failed", err);
+        },
+    };
+    emit_stage(
+        "work_publication_started",
+        serde_json::json!({
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "pr_number": pr_number,
+            "dedupe_key": dedupe_key,
+            "handoff_note_present": handoff_note.is_some(),
+        }),
+    );
+
+    let bundle_bytes = match build_changeset_bundle_json(remote, &sha) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail_with_attempt!("fac_push_changeset_bundle_failed", err);
+        },
+    };
+    let handoff_entry_json = if let Some(handoff_note) = handoff_note {
+        Some(
+            match build_context_entry_json(
+                &work_id,
+                WorkContextKind::HandoffNote,
+                &dedupe_key,
+                handoff_note,
+                Some(serde_json::json!({
+                    "repo": repo,
+                    "branch": branch,
+                    "pr_number": pr_number,
+                    "head_sha": sha,
+                    "ticket_alias": resolved_ticket_alias,
+                    "source": "fac.push",
+                    "session_id": session_id,
+                    "lease_id": lease_id,
+                })),
+            ) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    fail_with_attempt!("fac_push_handoff_entry_build_failed", err);
+                },
+            },
+        )
+    } else {
+        None
+    };
+    let terminal_entry_json = match build_context_entry_json(
+        &work_id,
+        WorkContextKind::ImplementerTerminal,
+        &dedupe_key,
+        format!(
+            "fac push session complete\nrepo: {repo}\npr: #{pr_number}\nbranch: {branch}\nhead_sha: {sha}\n"
+        ),
+        Some(serde_json::json!({
+            "repo": repo,
+            "branch": branch,
+            "pr_number": pr_number,
+            "head_sha": sha,
+            "ticket_alias": resolved_ticket_alias,
+            "source": "fac.push",
+            "mode": "implementer_terminal",
+            "session_id": session_id,
+            "lease_id": lease_id,
+        })),
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            fail_with_attempt!("fac_push_terminal_entry_build_failed", err);
+        },
+    };
+
+    let rpc_work_id = work_id.clone();
+    let rpc_lease_id = lease_id.clone();
+    let rpc_sha = sha.clone();
+    let rpc_pr_url = pr_url;
+    let rpc_dedupe_key = dedupe_key.clone();
+    let rpc_bundle_bytes = bundle_bytes;
+    let rpc_handoff_entry_json = handoff_entry_json;
+    let rpc_terminal_entry_json = terminal_entry_json;
+    let work_publication_progress =
+        PushPhaseProgressTicker::start("work_publication_rpc", json_output);
+    let rpc_result = match with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        let changeset = client
+            .publish_changeset(&rpc_work_id, &rpc_lease_id, rpc_bundle_bytes)
+            .await?;
+        let association = client
+            .record_work_pr_association(
+                &rpc_work_id,
+                u64::from(pr_number),
+                &rpc_sha,
+                &rpc_lease_id,
+                Some(&rpc_pr_url),
+                false,
+            )
+            .await?;
+        let handoff_entry = if let Some(handoff_entry_json) = rpc_handoff_entry_json {
+            Some(
+                client
+                    .publish_work_context_entry(
+                        &rpc_work_id,
+                        "HANDOFF_NOTE",
+                        &rpc_dedupe_key,
+                        handoff_entry_json,
+                        &rpc_lease_id,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let terminal_entry = client
+            .publish_work_context_entry(
+                &rpc_work_id,
+                "IMPLEMENTER_TERMINAL",
+                &rpc_dedupe_key,
+                rpc_terminal_entry_json,
+                &rpc_lease_id,
+            )
+            .await?;
+        Ok::<_, ProtocolClientError>((changeset, association, handoff_entry, terminal_entry))
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_publication_failed", err);
+        },
+    };
+    drop(work_publication_progress);
+    let (changeset_response, pr_association_response, handoff_response, terminal_response) =
+        rpc_result;
+    if let Err(err) = validate_work_publication_chain_responses(
+        &work_id,
+        pr_number,
+        &sha,
+        &changeset_response,
+        &pr_association_response,
+        handoff_response.as_ref(),
+        &terminal_response,
+    ) {
+        fail_with_attempt!(
+            "fac_push_work_publication_response_invalid",
+            format!("daemon returned invalid publication chain response: {err}")
+        );
+    }
+    emit_stage(
+        "work_publication_completed",
+        serde_json::json!({
+            "work_id": work_id,
+            "changeset_digest": changeset_response.changeset_digest,
+            "changeset_event_id": changeset_response.event_id,
+            "changeset_cas_hash": changeset_response.cas_hash,
+            "pr_number": pr_association_response.pr_number,
+            "pr_association_already_existed": pr_association_response.already_existed,
+            "handoff_entry_id": handoff_response.as_ref().map(|response| response.entry_id.clone()),
+            "implementer_terminal_entry_id": terminal_response.entry_id,
+            "lease_id": lease_id,
+            "session_id": session_id,
+            "dedupe_key": dedupe_key,
+        }),
+    );
+    let handoff_entry_display = handoff_response
+        .as_ref()
+        .map_or("none", |response| response.entry_id.as_str());
+    human_log!(
+        "fac push: published work projection chain (work_id={}, changeset={}, handoff_entry={}, implementer_terminal_entry={})",
+        work_id,
+        changeset_response.changeset_digest,
+        handoff_entry_display,
+        terminal_response.entry_id
+    );
+
     let mut successful_projection_targets = Vec::new();
     successful_projection_targets.push("pr_metadata");
+    successful_projection_targets.push("work_projection");
     match fetch_pr_base_sha(repo, pr_number) {
         Ok(base_sha) => {
             if let Err(err) = projection_store::save_prepare_base_snapshot(
@@ -2335,6 +3620,7 @@ pub fn run_push(
     // by doctor-first remediation surfaces.
     let dispatch_started = Instant::now();
     emit_stage("dispatch_started", serde_json::json!({}));
+    let dispatch_progress = PushPhaseProgressTicker::start("dispatch_reviews", json_output);
     let mut emitted_reviews_dispatched = false;
     let dispatch_warning = match dispatch_reviews_with(
         repo,
@@ -2421,6 +3707,7 @@ pub fn run_push(
             }
         },
     };
+    drop(dispatch_progress);
     let has_dispatch_warning = dispatch_warning.is_some();
     emit_stage(
         "dispatch_completed",
@@ -2555,6 +3842,510 @@ mod tests {
     fn ensure_projection_success_for_push_rejects_empty_set() {
         let err = ensure_projection_success_for_push(&[]).expect_err("empty set must fail");
         assert!(err.contains("at least one successful projection"));
+    }
+
+    #[test]
+    fn validate_push_work_id_accepts_canonical_value() {
+        validate_push_work_id("W-12345-abcdef").expect("canonical work_id must pass");
+    }
+
+    #[test]
+    fn validate_push_work_id_rejects_non_canonical_value() {
+        let err = validate_push_work_id("owner/repo").expect_err("non-canonical work_id must fail");
+        assert!(err.contains("must start with `W-`"));
+    }
+
+    #[test]
+    fn parse_handoff_note_allows_omission() {
+        let parsed = parse_handoff_note(None).expect("omitted handoff note should be accepted");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_handoff_note_rejects_empty_when_provided() {
+        let err = parse_handoff_note(Some("   ")).expect_err("blank handoff note must be rejected");
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn parse_handoff_note_trims_when_provided() {
+        let parsed = parse_handoff_note(Some("  ready for review  "))
+            .expect("non-empty handoff note should be accepted");
+        assert_eq!(parsed.as_deref(), Some("ready for review"));
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_accepts_matching_resolution() {
+        let alias =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-12345678"))
+                .expect("matching alias resolution should be accepted");
+        assert_eq!(alias, "TCK-00640");
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_rejects_mismatched_resolution() {
+        let err =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-87654321"))
+                .expect_err("mismatched alias resolution must fail closed");
+        assert!(err.contains("`--work-id` mismatch"));
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_rejects_unresolved_alias() {
+        let err = validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", None)
+            .expect_err("unresolved explicit alias must fail closed");
+        assert!(err.contains("fail-closed"));
+    }
+
+    #[test]
+    fn push_projection_fallback_requested_requires_explicit_filters() {
+        assert!(!push_projection_fallback_requested(None, None));
+        assert!(push_projection_fallback_requested(Some("L-123"), None));
+        assert!(push_projection_fallback_requested(None, Some("S-123")));
+    }
+
+    #[test]
+    fn unresolved_push_alias_message_includes_fail_closed_guidance() {
+        let msg = unresolved_push_alias_message("TCK-00640");
+        assert!(msg.contains("TCK-00640"));
+        assert!(msg.contains("Refusing projection fallback"));
+        assert!(msg.contains("apm2 fac work open --from-ticket"));
+    }
+
+    fn sample_daemon_work_item(
+        work_id: &str,
+        status: &str,
+        role: Option<apm2_daemon::protocol::WorkRole>,
+        lease_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> apm2_daemon::protocol::WorkStatusResponse {
+        apm2_daemon::protocol::WorkStatusResponse {
+            work_id: work_id.to_string(),
+            status: status.to_string(),
+            actor_id: Some("actor:test".to_string()),
+            role: role.map(|value| value as i32),
+            session_id: session_id.map(str::to_string),
+            lease_id: lease_id.map(str::to_string),
+            created_at_ns: 0,
+            claimed_at_ns: None,
+            implementer_claim_blocked: false,
+            dependency_diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_prefers_unique_implementer() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-gate-executor",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::GateExecutor),
+                Some("L-gate"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-implementer"),
+                None,
+            ),
+        ];
+
+        let selected = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect("unique implementer candidate should resolve");
+        assert_eq!(selected, "W-implementer");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_fails_closed_on_ambiguity() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-implementer-1",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-1"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer-2",
+                "SPAWNED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-2"),
+                Some("S-2"),
+            ),
+        ];
+
+        let err = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect_err("ambiguous implementer candidates must fail closed");
+        assert!(err.contains("multiple active Implementer work items"));
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_honors_lease_filter() {
+        let rows = vec![
+            sample_daemon_work_item(
+                "W-implementer-1",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-target"),
+                None,
+            ),
+            sample_daemon_work_item(
+                "W-implementer-2",
+                "CLAIMED",
+                Some(apm2_daemon::protocol::WorkRole::Implementer),
+                Some("L-other"),
+                None,
+            ),
+        ];
+
+        let selected = select_push_fallback_work_id_from_list(&rows, Some("L-target"), None)
+            .expect("lease filter should disambiguate candidate selection");
+        assert_eq!(selected, "W-implementer-1");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_requires_session_match_when_filter_provided() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "CLAIMED",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-target"),
+            None,
+        )];
+
+        let err = select_push_fallback_work_id_from_list(
+            &rows,
+            Some("L-target"),
+            Some("S-backfill"),
+        )
+        .expect_err(
+            "missing daemon session metadata must fail closed when session filter is explicit",
+        );
+        assert!(err.contains("could not identify an active Implementer work item"));
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_accepts_in_progress_status() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "IN_PROGRESS",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-target"),
+            Some("S-target"),
+        )];
+
+        let selected =
+            select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-target"))
+                .expect("IN_PROGRESS should be treated as an active status");
+        assert_eq!(selected, "W-implementer-1");
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_rejects_missing_role() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer-1",
+            "CLAIMED",
+            None,
+            Some("L-target"),
+            Some("S-target"),
+        )];
+
+        let err = select_push_fallback_work_id_from_list(&rows, Some("L-target"), Some("S-target"))
+            .expect_err("missing role must fail closed");
+        assert!(err.contains("could not identify an active Implementer work item"));
+    }
+
+    #[test]
+    fn select_push_fallback_work_id_from_list_rejects_non_active_status() {
+        let rows = vec![sample_daemon_work_item(
+            "W-implementer",
+            "COMPLETED",
+            Some(apm2_daemon::protocol::WorkRole::Implementer),
+            Some("L-implementer"),
+            None,
+        )];
+
+        let err = select_push_fallback_work_id_from_list(&rows, None, None)
+            .expect_err("non-active statuses must not be selected for fallback");
+        assert!(err.contains("could not identify an active Implementer work item"));
+    }
+
+    #[test]
+    fn make_push_session_dedupe_key_uses_session_id() {
+        let dedupe = make_push_session_dedupe_key("S-1234-5678")
+            .expect("session id dedupe key should be accepted");
+        assert_eq!(dedupe, "S-1234-5678");
+    }
+
+    #[test]
+    fn make_push_session_dedupe_key_rejects_invalid_session_id() {
+        let err = make_push_session_dedupe_key("session/1")
+            .expect_err("invalid session id should be rejected");
+        assert!(err.contains("must start with `S-`") || err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_prefers_requested_session_when_daemon_session_missing() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            Some("S-requested-123".to_string()),
+            Some("L-lease-123".to_string()),
+            None,
+        )
+        .expect("requested session should be used when daemon status has no active session");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert_eq!(binding.session_id, "S-requested-123");
+        assert_eq!(binding.session_id_source, PushSessionIdSource::Requested);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_uses_daemon_session_when_not_requested() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            None,
+            None,
+            Some("L-lease-123".to_string()),
+            Some("S-daemon-999".to_string()),
+        )
+        .expect("daemon session should be used when no request override is provided");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert_eq!(binding.session_id, "S-daemon-999");
+        assert_eq!(binding.session_id_source, PushSessionIdSource::DaemonStatus);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_derives_adhoc_session_when_missing() {
+        let binding = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            None,
+            Some("L-lease-123".to_string()),
+            None,
+        )
+        .expect("missing daemon session should derive deterministic ad-hoc session");
+        assert_eq!(binding.lease_id, "L-lease-123");
+        assert!(binding.session_id.starts_with("S-adhoc-"));
+        assert_eq!(binding.session_id_source, PushSessionIdSource::DerivedAdhoc);
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_rejects_lease_mismatch() {
+        let err = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-requested".to_string()),
+            None,
+            Some("L-daemon".to_string()),
+            None,
+        )
+        .expect_err("lease mismatch must fail closed");
+        assert!(err.contains("`--lease-id` mismatch"));
+    }
+
+    #[test]
+    fn resolve_runtime_binding_from_inputs_rejects_session_mismatch() {
+        let err = resolve_runtime_binding_from_inputs(
+            "W-TCK-00640",
+            Some("L-lease-123".to_string()),
+            Some("S-requested".to_string()),
+            Some("L-lease-123".to_string()),
+            Some("S-daemon".to_string()),
+        )
+        .expect_err("session mismatch must fail closed");
+        assert!(err.contains("`--session-id` mismatch"));
+    }
+
+    fn sample_changeset_response(work_id: &str) -> PublishChangeSetResponse {
+        PublishChangeSetResponse {
+            changeset_digest: "b3-256:abc123".to_string(),
+            cas_hash: "b3-256:def456".to_string(),
+            work_id: work_id.to_string(),
+            event_id: "evt-123".to_string(),
+        }
+    }
+
+    fn sample_pr_association_response(
+        work_id: &str,
+        pr_number: u32,
+        commit_sha: &str,
+    ) -> RecordWorkPrAssociationResponse {
+        RecordWorkPrAssociationResponse {
+            work_id: work_id.to_string(),
+            pr_number: u64::from(pr_number),
+            commit_sha: commit_sha.to_string(),
+            already_existed: false,
+        }
+    }
+
+    fn sample_context_response(work_id: &str, entry_id: &str) -> PublishWorkContextEntryResponse {
+        PublishWorkContextEntryResponse {
+            entry_id: entry_id.to_string(),
+            evidence_id: entry_id.to_string(),
+            cas_hash: "b3-256:ctx".to_string(),
+            work_id: work_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_accepts_valid_payload() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let handoff = sample_context_response("W-TCK-00640", "CTX-123");
+        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+
+        validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            Some(&handoff),
+            &terminal,
+        )
+        .expect("valid publication chain should be accepted");
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_rejects_pr_number_mismatch() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            999,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+
+        let err = validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            None,
+            &terminal,
+        )
+        .expect_err("pr number mismatch must fail closed");
+        assert!(err.contains("PR association number mismatch"));
+    }
+
+    #[test]
+    fn validate_work_publication_chain_responses_rejects_non_context_entry_id() {
+        let changeset = sample_changeset_response("W-TCK-00640");
+        let association = sample_pr_association_response(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let terminal = sample_context_response("W-TCK-00640", "bad-entry");
+
+        let err = validate_work_publication_chain_responses(
+            "W-TCK-00640",
+            640,
+            "0123456789abcdef0123456789abcdef01234567",
+            &changeset,
+            &association,
+            None,
+            &terminal,
+        )
+        .expect_err("non-CTX entry id must fail closed");
+        assert!(err.contains("entry_id must start with `CTX-`"));
+    }
+
+    #[test]
+    fn derive_adhoc_session_id_is_deterministic_and_prefixed() {
+        let first = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
+        let second = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
+        let different = derive_adhoc_session_id("W-TCK-00640", "L-lease-456");
+
+        assert_eq!(
+            first, second,
+            "adhoc session derivation must be deterministic"
+        );
+        assert_ne!(
+            first, different,
+            "different lease_id must produce different ad-hoc session ids"
+        );
+        assert!(
+            first.starts_with("S-adhoc-"),
+            "derived ad-hoc session id must be canonical: {first}"
+        );
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_parses_add_modify_delete() {
+        let raw = b"A\0added.rs\0M\0mod.rs\0D\0deleted.rs\0";
+        let manifest =
+            parse_git_name_status_manifest_z(raw, "base..head").expect("manifest should parse");
+        assert_eq!(manifest.len(), 3);
+        assert_eq!(manifest[0].path, "added.rs");
+        assert_eq!(manifest[0].change_kind, ChangeKind::Add);
+        assert_eq!(manifest[1].path, "mod.rs");
+        assert_eq!(manifest[1].change_kind, ChangeKind::Modify);
+        assert_eq!(manifest[2].path, "deleted.rs");
+        assert_eq!(manifest[2].change_kind, ChangeKind::Delete);
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_parses_rename_and_copy() {
+        let raw = b"R100\0old.rs\0new.rs\0C100\0src.rs\0dst.rs\0";
+        let manifest =
+            parse_git_name_status_manifest_z(raw, "base..head").expect("manifest should parse");
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0].change_kind, ChangeKind::Rename);
+        assert_eq!(manifest[0].old_path.as_deref(), Some("old.rs"));
+        assert_eq!(manifest[0].path, "new.rs");
+        assert_eq!(manifest[1].change_kind, ChangeKind::Modify);
+        assert_eq!(manifest[1].old_path.as_deref(), Some("src.rs"));
+        assert_eq!(manifest[1].path, "dst.rs");
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_rejects_truncated_rename_tokens() {
+        let raw = b"R100\0only-old.rs\0";
+        let err = parse_git_name_status_manifest_z(raw, "base..head")
+            .expect_err("truncated rename should fail");
+        assert!(err.contains("truncated"));
+    }
+
+    #[test]
+    fn parse_git_name_status_manifest_z_rejects_unsupported_status() {
+        let raw = b"Z\0mystery.rs\0";
+        let err = parse_git_name_status_manifest_z(raw, "base..head")
+            .expect_err("unsupported status should fail");
+        assert!(err.contains("unsupported status"));
+    }
+
+    #[test]
+    fn parse_git_numstat_binary_detected_flags_binary_rows() {
+        let raw = "12\t4\tsrc/lib.rs\n-\t-\tassets/logo.png\n";
+        assert!(
+            parse_git_numstat_binary_detected(raw),
+            "numstat parser must detect binary rows marked with '-'"
+        );
+    }
+
+    #[test]
+    fn parse_git_numstat_binary_detected_ignores_text_only_rows() {
+        let raw = "12\t4\tsrc/lib.rs\n1\t0\tREADME.md\n";
+        assert!(
+            !parse_git_numstat_binary_detected(raw),
+            "numstat parser must not report binary when all rows are text"
+        );
+    }
+
+    #[test]
+    fn parse_dirty_worktree_entries_filters_blank_lines() {
+        let entries = parse_dirty_worktree_entries(" M src/main.rs\n\n?? new-file.txt\n");
+        assert_eq!(
+            entries,
+            vec!["M src/main.rs".to_string(), "?? new-file.txt".to_string()]
+        );
     }
 
     #[test]
@@ -2702,6 +4493,35 @@ mod tests {
             failed.error_hint.as_deref(),
             Some("ruleset drift not synchronized")
         );
+    }
+
+    #[test]
+    fn gate_stage_mapping_skips_unknown_passes_and_maps_unknown_failures_to_test_stage() {
+        assert_eq!(stage_from_gate_result("workspace_integrity", true), None);
+        assert_eq!(
+            stage_from_gate_result("workspace_integrity", false),
+            Some("gate_test")
+        );
+        assert_eq!(
+            stage_from_failed_gate_name("workspace_integrity"),
+            "gate_test"
+        );
+    }
+
+    #[test]
+    fn gate_stage_mapping_preserves_primary_test_duration() {
+        let mut record = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        let test_stage = stage_from_gate_result("test", true).expect("test stage");
+        record.set_stage_pass(test_stage, 83);
+        assert_eq!(record.gate_test.duration_s, 83);
+
+        for gate in ["workspace_integrity", "review_artifact_lint"] {
+            if let Some(stage_name) = stage_from_gate_result(gate, true) {
+                record.set_stage_pass(stage_name, 0);
+            }
+        }
+
+        assert_eq!(record.gate_test.duration_s, 83);
     }
 
     #[test]
@@ -2907,12 +4727,44 @@ mod tests {
         }
     }
 
+    fn ready_fast_checks_token_for_tests() -> FastChecksToken {
+        let mut state = PushPreflightState::Pending;
+        state
+            .mark_fast_checks_completed()
+            .expect("fast checks should transition to completed in tests");
+        state
+            .fast_checks_token()
+            .expect("completed state should mint fast checks token in tests")
+    }
+
+    #[test]
+    fn push_preflight_state_requires_completed_checks_before_gate_token() {
+        let state = PushPreflightState::Pending;
+        let err = state
+            .fast_checks_token()
+            .expect_err("pending state must not mint gate token");
+        assert_eq!(err, FAST_CHECKS_NOT_COMPLETED_ERROR);
+    }
+
+    #[test]
+    fn push_preflight_state_rejects_duplicate_completion_transition() {
+        let mut state = PushPreflightState::Pending;
+        state
+            .mark_fast_checks_completed()
+            .expect("first completion transition should succeed");
+        let err = state
+            .mark_fast_checks_completed()
+            .expect_err("duplicate completion transition must fail closed");
+        assert_eq!(err, FAST_CHECKS_ALREADY_COMPLETED_ERROR);
+    }
+
     #[test]
     fn run_pre_push_sequence_with_enforces_gates_then_ruleset_sync_then_git_push() {
         let calls = std::cell::RefCell::new(Vec::new());
         let expected_results = seed_required_pass_results();
         let sha = "f".repeat(40);
         let outcome = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Ok(queued_outcome_with(
@@ -2940,6 +4792,7 @@ mod tests {
     fn run_pre_push_sequence_with_stops_before_remote_side_effects_on_gate_failure() {
         let calls = std::cell::RefCell::new(Vec::new());
         let error = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Err("gate failed".to_string())
@@ -2966,6 +4819,7 @@ mod tests {
     fn run_pre_push_sequence_with_stops_before_git_push_when_ruleset_sync_fails() {
         let calls = std::cell::RefCell::new(Vec::new());
         let error = run_pre_push_sequence_with(
+            ready_fast_checks_token_for_tests(),
             || {
                 calls.borrow_mut().push("gates");
                 Ok(queued_outcome_with(
@@ -3294,6 +5148,21 @@ mod tests {
     fn parse_failed_gates_from_error_returns_empty_without_marker() {
         let parsed = parse_failed_gates_from_error("gates failed with exit code 1");
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn summarize_native_gate_failure_prefers_first_error_line() {
+        let summary = summarize_native_gate_failure(
+            "INFO: start\nERROR: stale snapshot\nERROR: additional detail\n",
+            "fallback",
+        );
+        assert_eq!(summary, "stale snapshot");
+    }
+
+    #[test]
+    fn summarize_native_gate_failure_uses_fallback_when_no_error_lines() {
+        let summary = summarize_native_gate_failure("INFO: clean\n", "fallback summary");
+        assert_eq!(summary, "fallback summary");
     }
 
     #[test]

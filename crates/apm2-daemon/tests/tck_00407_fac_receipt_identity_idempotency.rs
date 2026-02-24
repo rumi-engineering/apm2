@@ -69,7 +69,7 @@ fn claim_work(
     dispatcher: &apm2_daemon::protocol::dispatch::PrivilegedDispatcher,
     ctx: &ConnectionContext,
     actor_id: &str,
-) -> String {
+) -> (String, String) {
     let claim_request = ClaimWorkRequest {
         actor_id: actor_id.to_string(),
         role: WorkRole::Implementer.into(),
@@ -81,7 +81,7 @@ fn claim_work(
         .dispatch(&encode_claim_work_request(&claim_request), ctx)
         .expect("ClaimWork should dispatch");
     match response {
-        PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+        PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
         other => panic!("Expected ClaimWork response, got {other:?}"),
     }
 }
@@ -210,13 +210,12 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
     let peer = make_peer_credentials();
     let ctx = make_privileged_ctx(&peer);
     let actor_id = derive_actor_id(&peer);
-    let work_id = claim_work(dispatcher, &ctx, &actor_id);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx, &actor_id);
 
-    let lease_id = "lease-tck-00407-001";
     register_authoritative_lease(
         dispatcher,
         &cas,
-        lease_id,
+        &lease_id,
         &work_id,
         "gate-tck-00407",
         &actor_id,
@@ -228,7 +227,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
     let changeset_digest = vec![0x42; 32];
 
     let request = IngestReviewReceiptRequest {
-        lease_id: lease_id.to_string(),
+        lease_id: lease_id.clone(),
         receipt_id: "RR-TCK-00407-001".to_string(),
         reviewer_actor_id: actor_id,
         changeset_digest,
@@ -269,7 +268,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
         "duplicate semantic receipt request must not create a second review_receipt_recorded row"
     );
     assert_eq!(
-        count_review_receipt_events(dispatcher, lease_id),
+        count_review_receipt_events(dispatcher, &lease_id),
         0,
         "canonical work_id binding must prevent lease_id aliasing in work_id index"
     );
@@ -278,7 +277,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
         .event_emitter()
         .get_event_by_receipt_identity(
             "RR-TCK-00407-001",
-            lease_id,
+            &lease_id,
             &work_id,
             &hex::encode([0x42u8; 32]),
         )
@@ -296,7 +295,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
         serde_json::from_slice(&semantic_event.payload).expect("payload must be JSON");
     assert_eq!(
         payload.get("lease_id").and_then(serde_json::Value::as_str),
-        Some(lease_id),
+        Some(lease_id.as_str()),
         "receipt payload must preserve lease_id binding"
     );
     assert_eq!(

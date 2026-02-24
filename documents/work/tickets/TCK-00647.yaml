@@ -46,3 +46,18 @@ ticket_meta:
     - Existing SpawnEpisode authorization and gate behavior remains fail-closed.
   notes:
     security: "Session boundary pin completeness is promotion-blocking per RFC-0018 \xA76.3; missing pins must be recorded as defects."
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.
