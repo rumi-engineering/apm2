@@ -158,6 +158,17 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 
 ### ANTI-3
 
+[CONTRACT: CTR-2628] Orchestrator-Kernel Cursor Selection.
+- New orchestrator-kernel consumers MUST NOT assume epoch timestamps are the cursor.
+- REJECT IF: a `LedgerReader` implementation hardcodes `CompositeCursor` when the
+  underlying ledger has a natural sequence or commit-index cursor.
+- ENFORCE BY: choose a `KernelCursor` implementation matching ledger truth
+  (sequence number, commit index, or `CompositeCursor` for timestamp+id ledgers).
+  See `crates/apm2-core/src/orchestrator_kernel/types.rs` for the `KernelCursor` trait
+  and `CompositeCursor` as the default.
+
+### ANTI-4
+
 [HAZARD: RSK-2618] Incomplete Struct/Enum Field Updates.
 - REJECT IF: adding a field/variant does not update constructors, matches, serialization, and invariants.
 - REJECT IF: `match` expressions use `..` or default arms for structs/enums that appear in SCP boundaries (hides missing field handling).

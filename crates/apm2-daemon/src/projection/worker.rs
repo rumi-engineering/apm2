@@ -1733,13 +1733,12 @@ pub struct PrMetadata {
 /// Default tailer ID for the projection worker.
 const DEFAULT_TAILER_ID: &str = "projection_worker";
 
-impl CursorEvent for SignedLedgerEvent {
-    fn timestamp_ns(&self) -> u64 {
-        self.timestamp_ns
-    }
-
-    fn event_id(&self) -> &str {
-        &self.event_id
+impl CursorEvent<CompositeCursor> for SignedLedgerEvent {
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.timestamp_ns,
+            event_id: self.event_id.clone(),
+        }
     }
 }
 
@@ -1748,13 +1747,12 @@ struct CursorPoint<'a> {
     event_id: &'a str,
 }
 
-impl CursorEvent for CursorPoint<'_> {
-    fn timestamp_ns(&self) -> u64 {
-        self.timestamp_ns
-    }
-
-    fn event_id(&self) -> &str {
-        self.event_id
+impl CursorEvent<CompositeCursor> for CursorPoint<'_> {
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.timestamp_ns,
+            event_id: self.event_id.to_string(),
+        }
     }
 }
 
