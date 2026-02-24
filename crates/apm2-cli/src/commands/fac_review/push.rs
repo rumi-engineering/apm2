@@ -71,6 +71,7 @@ const PUSH_QUEUE_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const PUSH_ATTEMPT_MALFORMED_WARN_LIMIT: usize = 3;
 const PUSH_PROGRESS_TICK_SECS: u64 = 10;
 const PUSH_EXPLICIT_FALLBACK_REQUIRED_MESSAGE: &str = "Refusing implicit projection fallback to prevent cross-ticket misbinding; pass `--work-id` or `--ticket-alias`, or explicitly request projection fallback with `--lease-id`/`--session-id`.";
+const PUSH_METADATA_SCHEMA: &str = "apm2.fac_push_metadata.v1";
 
 /// Resolve TCK id from branch first, then worktree directory name.
 fn resolve_tck_id(branch: &str, worktree_dir: &Path) -> Result<String, String> {
@@ -205,47 +206,20 @@ fn collect_commit_history(remote: &str, branch: &str) -> Result<Vec<CommitSummar
     Ok(fallback)
 }
 
-fn ticket_path_for_tck(repo_root: &Path, tck: &str) -> PathBuf {
-    repo_root
-        .join("documents")
-        .join("work")
-        .join("tickets")
-        .join(format!("{tck}.yaml"))
-}
-
-fn load_ticket_body(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read ticket body at {}: {err}", path.display()))
-}
-
-fn load_ticket_title(path: &Path, body: &str) -> Result<String, String> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|err| format!("failed to parse ticket YAML at {}: {err}", path.display()))?;
-
-    let Some(title) = parsed
-        .get("ticket_meta")
-        .and_then(|value| value.get("ticket"))
-        .and_then(|value| value.get("title"))
-        .and_then(serde_yaml::Value::as_str)
-        .map(str::trim)
+fn title_subject_from_commit_history(commit_history: &[CommitSummary]) -> String {
+    commit_history
+        .last()
+        .map(|entry| entry.message.trim().replace('\n', " "))
         .filter(|value| !value.is_empty())
-    else {
-        return Err(format!(
-            "missing `ticket_meta.ticket.title` in {}",
-            path.display()
-        ));
-    };
-
-    Ok(title.to_string())
+        .unwrap_or_else(|| "FAC push update".to_string())
 }
 
-fn render_ticket_body_markdown(
-    body: &str,
+fn render_push_body_markdown(
+    work_id: &str,
+    ticket_alias: Option<&str>,
+    branch: &str,
     commit_history: &[CommitSummary],
 ) -> Result<String, String> {
-    let mut parsed: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|err| format!("failed to parse ticket YAML for PR body rendering: {err}"))?;
-
     let history_entries = commit_history
         .iter()
         .map(|entry| {
@@ -262,21 +236,37 @@ fn render_ticket_body_markdown(
         })
         .collect::<Vec<_>>();
 
-    let root = parsed
-        .as_mapping_mut()
-        .ok_or_else(|| "ticket YAML root must be a mapping".to_string())?;
-    let metadata_key = serde_yaml::Value::String("fac_push_metadata".to_string());
-    let mut metadata_mapping = match root.remove(&metadata_key) {
-        Some(serde_yaml::Value::Mapping(value)) => value,
-        Some(_) | None => serde_yaml::Mapping::new(),
-    };
+    let mut root = serde_yaml::Mapping::new();
+    root.insert(
+        serde_yaml::Value::String("schema".to_string()),
+        serde_yaml::Value::String("apm2.fac_push_metadata.v1".to_string()),
+    );
+    root.insert(
+        serde_yaml::Value::String("work_id".to_string()),
+        serde_yaml::Value::String(work_id.to_string()),
+    );
+    if let Some(alias) = ticket_alias {
+        root.insert(
+            serde_yaml::Value::String("ticket_alias".to_string()),
+            serde_yaml::Value::String(alias.to_string()),
+        );
+    }
+    root.insert(
+        serde_yaml::Value::String("branch".to_string()),
+        serde_yaml::Value::String(branch.to_string()),
+    );
+
+    let mut metadata_mapping = serde_yaml::Mapping::new();
     metadata_mapping.insert(
         serde_yaml::Value::String("commit_history".to_string()),
         serde_yaml::Value::Sequence(history_entries),
     );
-    root.insert(metadata_key, serde_yaml::Value::Mapping(metadata_mapping));
+    root.insert(
+        serde_yaml::Value::String("fac_push_metadata".to_string()),
+        serde_yaml::Value::Mapping(metadata_mapping),
+    );
 
-    let mut rendered = serde_yaml::to_string(&parsed)
+    let mut rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
         .map_err(|err| format!("failed to render PR description YAML: {err}"))?;
     if let Some(stripped) = rendered.strip_prefix("---\n") {
         rendered = stripped.to_string();
@@ -285,51 +275,39 @@ fn render_ticket_body_markdown(
     Ok(format!("```yaml\n{normalized}\n```"))
 }
 
-fn validate_ticket_path_matches_tck(ticket_path: &Path, tck: &str) -> Result<(), String> {
-    let Some(stem) = ticket_path.file_stem().and_then(|value| value.to_str()) else {
-        return Err(format!(
-            "invalid --ticket path `{}`; expected filename `{tck}.yaml`",
-            ticket_path.display()
-        ));
-    };
-
-    if stem != tck {
-        return Err(format!(
-            "--ticket path `{}` does not match derived TCK `{tck}`; expected filename `{tck}.yaml`",
-            ticket_path.display()
-        ));
-    }
-
-    Ok(())
-}
-
 #[derive(Debug)]
 struct PrMetadata {
     title: String,
     body: String,
-    ticket_path: PathBuf,
 }
 
 fn resolve_pr_metadata(
     branch: &str,
     worktree_dir: &Path,
-    repo_root: &Path,
     commit_history: &[CommitSummary],
-    ticket: Option<&Path>,
+    work_id: &str,
+    resolved_ticket_alias: Option<&str>,
 ) -> Result<PrMetadata, String> {
-    let tck_id = resolve_tck_id(branch, worktree_dir)?;
-    if let Some(ticket_path) = ticket {
-        validate_ticket_path_matches_tck(ticket_path, &tck_id)?;
-    }
-
-    let canonical_ticket_path = ticket_path_for_tck(repo_root, &tck_id);
-    let raw_body = load_ticket_body(&canonical_ticket_path)?;
-    let ticket_title = load_ticket_title(&canonical_ticket_path, &raw_body)?;
-    let body = render_ticket_body_markdown(&raw_body, commit_history)?;
+    validate_push_work_id(work_id)?;
+    let inferred_ticket_alias = resolved_ticket_alias
+        .map(ToString::to_string)
+        .or_else(|| resolve_tck_id(branch, worktree_dir).ok());
+    let title_prefix = inferred_ticket_alias
+        .as_deref()
+        .unwrap_or(work_id)
+        .to_string();
+    let body = render_push_body_markdown(
+        work_id,
+        inferred_ticket_alias.as_deref(),
+        branch,
+        commit_history,
+    )?;
     Ok(PrMetadata {
-        title: format!("{tck_id}: {ticket_title}"),
+        title: format!(
+            "{title_prefix}: {}",
+            title_subject_from_commit_history(commit_history)
+        ),
         body,
-        ticket_path: canonical_ticket_path,
     })
 }
 
@@ -578,6 +556,60 @@ fn validate_queued_gates_outcome_for_push(
     }
     validate_gate_results_for_pass(sha, &outcome.gate_results)?;
     Ok(outcome)
+}
+
+fn validate_head_stability_for_gates(
+    captured_head_sha: &str,
+    current_head_sha: &str,
+) -> Result<(), String> {
+    validate_head_stability_for_phase(captured_head_sha, current_head_sha, "before gate execution")
+}
+
+fn validate_head_stability_for_git_push(
+    captured_head_sha: &str,
+    current_head_sha: &str,
+) -> Result<(), String> {
+    validate_head_stability_for_phase(captured_head_sha, current_head_sha, "before git push")
+}
+
+fn validate_head_stability_for_phase(
+    captured_head_sha: &str,
+    current_head_sha: &str,
+    phase: &str,
+) -> Result<(), String> {
+    if current_head_sha.eq_ignore_ascii_case(captured_head_sha) {
+        return Ok(());
+    }
+    Err(format!(
+        "HEAD drift detected {phase} (captured={captured_head_sha}, current={current_head_sha}); refusing mixed-SHA push"
+    ))
+}
+
+fn resolve_head_sha() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to execute `git rev-parse HEAD`: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "git rev-parse HEAD returned non-zero status".to_string()
+        } else {
+            format!("git rev-parse HEAD returned non-zero status: {stderr}")
+        });
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err("git rev-parse HEAD returned empty SHA".to_string());
+    }
+    Ok(sha)
+}
+
+fn build_git_push_refspec(captured_head_sha: &str, branch: &str) -> String {
+    format!(
+        "{captured_head_sha}:refs/heads/{}",
+        branch.trim_start_matches("refs/heads/")
+    )
 }
 
 fn expected_gate_names() -> BTreeSet<String> {
@@ -1728,6 +1760,203 @@ fn unresolved_push_alias_message(ticket_alias: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrBodyWorkBinding {
+    work_id: String,
+    ticket_alias: Option<String>,
+}
+
+fn extract_yaml_fenced_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut active_fence_width = None::<usize>;
+    let mut collecting_yaml = false;
+    let mut current_lines = Vec::new();
+
+    for raw_line in markdown.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(fence_width) = active_fence_width {
+            if trimmed.chars().count() == fence_width && trimmed.chars().all(|ch| ch == '`') {
+                if collecting_yaml {
+                    blocks.push(current_lines.join("\n"));
+                }
+                active_fence_width = None;
+                collecting_yaml = false;
+                current_lines.clear();
+                continue;
+            }
+            if collecting_yaml {
+                current_lines.push(raw_line.to_string());
+            }
+            continue;
+        }
+
+        let fence_width = trimmed.chars().take_while(|ch| *ch == '`').count();
+        if fence_width < 3 {
+            continue;
+        }
+        let info = trimmed[fence_width..].trim();
+        if info.eq_ignore_ascii_case("yaml") || info.is_empty() {
+            active_fence_width = Some(fence_width);
+            collecting_yaml = true;
+            current_lines.clear();
+        }
+    }
+
+    blocks
+}
+
+fn parse_pr_body_work_binding(body: &str) -> Result<Option<PrBodyWorkBinding>, String> {
+    let mut resolved = None::<PrBodyWorkBinding>;
+    for yaml_block in extract_yaml_fenced_blocks(body) {
+        let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_block) else {
+            continue;
+        };
+        let Some(schema) = parsed.get("schema").and_then(serde_yaml::Value::as_str) else {
+            continue;
+        };
+        if schema.trim() != PUSH_METADATA_SCHEMA {
+            continue;
+        }
+
+        let work_id = parsed
+            .get("work_id")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "PR metadata `{PUSH_METADATA_SCHEMA}` is missing required non-empty `work_id`"
+                )
+            })?
+            .to_string();
+        validate_push_work_id(&work_id)?;
+
+        let ticket_alias = parsed
+            .get("ticket_alias")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(alias) = ticket_alias.as_deref()
+            && extract_tck_from_text(alias).as_deref() != Some(alias)
+        {
+            return Err(format!(
+                "PR metadata `{PUSH_METADATA_SCHEMA}` contains non-canonical `ticket_alias` `{alias}`"
+            ));
+        }
+
+        let candidate = PrBodyWorkBinding {
+            work_id,
+            ticket_alias,
+        };
+        if let Some(existing) = resolved.as_ref() {
+            if existing != &candidate {
+                return Err(format!(
+                    "PR metadata `{PUSH_METADATA_SCHEMA}` contains conflicting work bindings (`{}` vs `{}`); refusing ambiguous work resolution",
+                    existing.work_id, candidate.work_id
+                ));
+            }
+        } else {
+            resolved = Some(candidate);
+        }
+    }
+    Ok(resolved)
+}
+
+fn fetch_pr_body_with_snapshot_fallback(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<String, String> {
+    match github_projection::fetch_pr_body(owner_repo, pr_number) {
+        Ok(body) if !body.trim().is_empty() => Ok(body),
+        first_result => {
+            let snapshot = projection_store::load_pr_body_snapshot(owner_repo, pr_number)?;
+            if let Some(body) = snapshot.as_ref()
+                && !body.trim().is_empty()
+            {
+                return Ok(body.clone());
+            }
+            match first_result {
+                Ok(body) => Ok(body),
+                Err(err) => Err(err),
+            }
+        },
+    }
+}
+
+fn resolve_authoritative_pr_work_binding(
+    owner_repo: &str,
+    pr_number: Option<u32>,
+) -> Result<Option<PrBodyWorkBinding>, String> {
+    let Some(pr_number) = pr_number.filter(|value| *value > 0) else {
+        return Ok(None);
+    };
+    let body = fetch_pr_body_with_snapshot_fallback(owner_repo, pr_number).map_err(|err| {
+        format!("failed to load PR #{pr_number} body for authoritative work binding: {err}")
+    })?;
+    parse_pr_body_work_binding(&body)
+}
+
+fn enforce_authoritative_pr_work_binding(
+    existing_pr_number: Option<u32>,
+    authoritative_binding: Option<&PrBodyWorkBinding>,
+    candidate_work_id: &str,
+) -> Result<(), String> {
+    let Some(pr_number) = existing_pr_number.filter(|value| *value > 0) else {
+        return Ok(());
+    };
+    let Some(binding) = authoritative_binding else {
+        return Ok(());
+    };
+    if binding.work_id == candidate_work_id {
+        return Ok(());
+    }
+    Err(format!(
+        "existing PR #{pr_number} is bound to work_id `{}` via `{PUSH_METADATA_SCHEMA}`; \
+         refusing candidate `{candidate_work_id}` to prevent cross-PR misbinding. \
+         Remediation: pass `--work-id {}` or update PR metadata with the authoritative binding.",
+        binding.work_id, binding.work_id
+    ))
+}
+
+fn refresh_existing_pr_number_for_preflight_with<FFind, FBinding>(
+    candidate_work_id: &str,
+    find_pr_number: FFind,
+    resolve_binding: FBinding,
+) -> Result<u32, String>
+where
+    FFind: FnOnce() -> u32,
+    FBinding: FnOnce(Option<u32>) -> Result<Option<PrBodyWorkBinding>, String>,
+{
+    let refreshed_pr_number = find_pr_number();
+    if let Some(pr_number) = (refreshed_pr_number > 0).then_some(refreshed_pr_number) {
+        let authoritative_binding = resolve_binding(Some(pr_number)).map_err(|err| {
+            format!("failed to resolve authoritative work binding for PR #{pr_number}: {err}")
+        })?;
+        enforce_authoritative_pr_work_binding(
+            Some(pr_number),
+            authoritative_binding.as_ref(),
+            candidate_work_id,
+        )
+        .map_err(|err| {
+            format!("authoritative PR work binding refresh failed for PR #{pr_number}: {err}")
+        })?;
+    }
+    Ok(refreshed_pr_number)
+}
+
+fn refresh_existing_pr_number_for_preflight(
+    owner_repo: &str,
+    branch: &str,
+    candidate_work_id: &str,
+) -> Result<u32, String> {
+    refresh_existing_pr_number_for_preflight_with(
+        candidate_work_id,
+        || find_existing_pr(owner_repo, branch),
+        |pr_number| resolve_authoritative_pr_work_binding(owner_repo, pr_number),
+    )
+}
+
 fn is_active_push_fallback_status(status: &str) -> bool {
     match status.trim().to_ascii_uppercase().as_str() {
         // Current canonical work states surfaced by daemon work projection,
@@ -1850,43 +2079,75 @@ fn validate_explicit_ticket_alias_binding(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkIdResolutionArgs<'a> {
+    work_id: Option<&'a str>,
+    ticket_alias: Option<&'a str>,
+    lease_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkIdResolutionContext<'a> {
+    owner_repo: &'a str,
+    existing_pr_number: Option<u32>,
+    branch: &'a str,
+    worktree_dir: &'a Path,
+    operator_socket: &'a Path,
+}
+
 fn resolve_work_id_for_push(
-    work_id_arg: Option<&str>,
-    ticket_alias_arg: Option<&str>,
-    lease_id_arg: Option<&str>,
-    session_id_arg: Option<&str>,
-    branch: &str,
-    worktree_dir: &Path,
-    operator_socket: &Path,
+    args: WorkIdResolutionArgs<'_>,
+    context: WorkIdResolutionContext<'_>,
 ) -> Result<(String, Option<String>), String> {
-    let trimmed_work_id = normalize_non_empty_arg(work_id_arg);
-    let alias = normalize_non_empty_arg(ticket_alias_arg);
-    let requested_lease_id = normalize_non_empty_arg(lease_id_arg);
+    let trimmed_work_id = normalize_non_empty_arg(args.work_id);
+    let alias = normalize_non_empty_arg(args.ticket_alias);
+    let requested_lease_id = normalize_non_empty_arg(args.lease_id);
     if let Some(ref lease_id) = requested_lease_id {
         validate_push_lease_id(lease_id)?;
     }
-    let requested_session_id = normalize_non_empty_arg(session_id_arg);
+    let requested_session_id = normalize_non_empty_arg(args.session_id);
     if let Some(ref session_id) = requested_session_id {
         validate_push_session_id(session_id)?;
     }
+    let authoritative_pr_binding =
+        resolve_authoritative_pr_work_binding(context.owner_repo, context.existing_pr_number)?;
 
     match (trimmed_work_id, alias.as_deref()) {
         (Some(work_id), Some(ticket_alias)) => {
             validate_push_work_id(&work_id)?;
-            let resolved_work_id = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?;
+            let resolved_work_id =
+                resolve_ticket_alias_to_work_id(ticket_alias, context.operator_socket)?;
             let verified_alias = validate_explicit_ticket_alias_binding(
                 &work_id,
                 ticket_alias,
                 resolved_work_id.as_deref(),
             )?;
+            enforce_authoritative_pr_work_binding(
+                context.existing_pr_number,
+                authoritative_pr_binding.as_ref(),
+                &work_id,
+            )?;
             Ok((work_id, Some(verified_alias)))
         },
         (Some(work_id), None) => {
             validate_push_work_id(&work_id)?;
+            enforce_authoritative_pr_work_binding(
+                context.existing_pr_number,
+                authoritative_pr_binding.as_ref(),
+                &work_id,
+            )?;
             Ok((work_id, None))
         },
         (None, Some(ticket_alias)) => {
-            if let Some(work_id) = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)? {
+            if let Some(work_id) =
+                resolve_ticket_alias_to_work_id(ticket_alias, context.operator_socket)?
+            {
+                enforce_authoritative_pr_work_binding(
+                    context.existing_pr_number,
+                    authoritative_pr_binding.as_ref(),
+                    &work_id,
+                )?;
                 return Ok((work_id, Some(ticket_alias.to_string())));
             }
             Err(format!(
@@ -1894,34 +2155,48 @@ fn resolve_work_id_for_push(
                  explicit `--ticket-alias` inputs are fail-closed"
             ))
         },
-        (None, None) => match resolve_tck_id(branch, worktree_dir) {
-            Ok(derived_alias) => {
-                if let Some(work_id) =
-                    resolve_ticket_alias_to_work_id(&derived_alias, operator_socket)?
-                {
-                    return Ok((work_id, Some(derived_alias)));
-                }
-                Err(unresolved_push_alias_message(&derived_alias))
-            },
-            Err(derive_err) => {
-                if !push_projection_fallback_requested(
-                    requested_lease_id.as_deref(),
-                    requested_session_id.as_deref(),
-                ) {
-                    return Err(format!(
-                        "{derive_err} {PUSH_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
-                    ));
-                }
-                let fallback_work_id = resolve_push_work_id_from_projection_fallback(
-                    operator_socket,
-                    requested_lease_id.as_deref(),
-                    requested_session_id.as_deref(),
-                )
-                .map_err(|fallback_err| {
-                    format!("{derive_err} Projection fallback also failed: {fallback_err}")
-                })?;
-                Ok((fallback_work_id, None))
-            },
+        (None, None) => {
+            if let Some(binding) = authoritative_pr_binding.as_ref() {
+                return Ok((binding.work_id.clone(), binding.ticket_alias.clone()));
+            }
+            if let Some(pr_number) = context.existing_pr_number.filter(|value| *value > 0) {
+                return Err(format!(
+                    "existing PR #{pr_number} was detected for branch `{}` but no `{PUSH_METADATA_SCHEMA}` work binding was found in PR metadata. \
+                     Refusing implicit alias resolution to prevent cross-PR misbinding. \
+                     Remediation: pass explicit `--work-id <W-...>` (or `--ticket-alias <TCK-...>`) and re-run `apm2 fac push`.",
+                    context.branch
+                ));
+            }
+
+            match resolve_tck_id(context.branch, context.worktree_dir) {
+                Ok(derived_alias) => {
+                    if let Some(work_id) =
+                        resolve_ticket_alias_to_work_id(&derived_alias, context.operator_socket)?
+                    {
+                        return Ok((work_id, Some(derived_alias)));
+                    }
+                    Err(unresolved_push_alias_message(&derived_alias))
+                },
+                Err(derive_err) => {
+                    if !push_projection_fallback_requested(
+                        requested_lease_id.as_deref(),
+                        requested_session_id.as_deref(),
+                    ) {
+                        return Err(format!(
+                            "{derive_err} {PUSH_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
+                        ));
+                    }
+                    let fallback_work_id = resolve_push_work_id_from_projection_fallback(
+                        context.operator_socket,
+                        requested_lease_id.as_deref(),
+                        requested_session_id.as_deref(),
+                    )
+                    .map_err(|fallback_err| {
+                        format!("{derive_err} Projection fallback also failed: {fallback_err}")
+                    })?;
+                    Ok((fallback_work_id, None))
+                },
+            }
         },
     }
 }
@@ -2452,7 +2727,6 @@ pub(super) struct PushInvocation<'a> {
     pub repo: &'a str,
     pub remote: &'a str,
     pub branch: Option<&'a str>,
-    pub ticket: Option<&'a Path>,
     pub work_id_arg: Option<&'a str>,
     pub ticket_alias_arg: Option<&'a str>,
     pub lease_id_arg: Option<&'a str>,
@@ -2467,7 +2741,6 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let repo = invocation.repo;
     let remote = invocation.remote;
     let branch = invocation.branch;
-    let ticket = invocation.ticket;
     let work_id_arg = invocation.work_id_arg;
     let ticket_alias_arg = invocation.ticket_alias_arg;
     let lease_id_arg = invocation.lease_id_arg;
@@ -2537,12 +2810,12 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     };
 
     // Resolve HEAD SHA for logging.
-    let sha = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            let message = "failed to resolve HEAD SHA";
+    let sha = match resolve_head_sha() {
+        Ok(value) => value,
+        Err(err) => {
+            let message = format!("failed to resolve HEAD SHA: {err}");
             human_log!("ERROR: {message}");
-            emit_machine_error!("fac_push_head_resolution_failed", message);
+            emit_machine_error!("fac_push_head_resolution_failed", &message);
             return exit_codes::GENERIC_ERROR;
         },
     };
@@ -2661,7 +2934,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         "fast_checks_started",
         serde_json::json!({
             "checks": [
-                "ticket_metadata_resolution",
+                "push_metadata_resolution",
                 "fac_review_machine_spec_snapshot_guard",
                 "work_binding_resolution",
                 "clean_worktree",
@@ -2721,24 +2994,6 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         },
     };
 
-    let metadata =
-        match resolve_pr_metadata(&branch, &worktree_dir, &repo_root, &commit_history, ticket) {
-            Ok(value) => value,
-            Err(err) => {
-                fail_with_attempt!(
-                    "fac_push_ticket_resolution_failed",
-                    format!(
-                        "{err}; expected ticket file under documents/work/tickets/TCK-xxxxx.yaml"
-                    )
-                );
-            },
-        };
-    human_log!(
-        "fac push: metadata title={} body={}",
-        metadata.title,
-        metadata.ticket_path.display()
-    );
-
     let handoff_note = match parse_handoff_note(handoff_note_arg) {
         Ok(note) => note,
         Err(err) => {
@@ -2747,13 +3002,19 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     };
 
     let (work_id, resolved_ticket_alias) = match resolve_work_id_for_push(
-        work_id_arg,
-        ticket_alias_arg,
-        lease_id_arg,
-        session_id_arg,
-        &branch,
-        &worktree_dir,
-        operator_socket,
+        WorkIdResolutionArgs {
+            work_id: work_id_arg,
+            ticket_alias: ticket_alias_arg,
+            lease_id: lease_id_arg,
+            session_id: session_id_arg,
+        },
+        WorkIdResolutionContext {
+            owner_repo: repo,
+            existing_pr_number: (attempt_pr_number > 0).then_some(attempt_pr_number),
+            branch: &branch,
+            worktree_dir: &worktree_dir,
+            operator_socket,
+        },
     ) {
         Ok(binding) => binding,
         Err(err) => {
@@ -2795,30 +3056,60 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
     );
 
+    let metadata = match resolve_pr_metadata(
+        &branch,
+        &worktree_dir,
+        &commit_history,
+        &work_id,
+        resolved_ticket_alias.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_metadata_resolution_failed", err);
+        },
+    };
+    human_log!("fac push: metadata title={}", metadata.title);
+
     if let Err(err) = ensure_clean_worktree_for_push() {
         fail_with_attempt!("fac_push_dirty_worktree", err);
     }
 
     // Step 1: fail closed on HEAD drift before running queued gates.
-    let current_head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
+    let current_head = match resolve_head_sha() {
+        Ok(value) => value,
+        Err(err) => {
             fail_with_attempt!(
                 "fac_push_head_reresolution_failed",
-                "failed to re-resolve HEAD SHA before gates"
+                format!("failed to re-resolve HEAD SHA before gates: {err}")
             );
         },
     };
-    if !current_head.eq_ignore_ascii_case(&sha) {
-        fail_with_attempt!(
-            "fac_push_head_drift_detected",
-            format!(
-                "HEAD drift detected before gate execution (captured={sha}, current={current_head}); refusing mixed-SHA gate run"
-            )
-        );
+    if let Err(err) = validate_head_stability_for_gates(&sha, &current_head) {
+        fail_with_attempt!("fac_push_head_drift_detected", err);
     }
-    let existing_pr_number = find_existing_pr(repo, &branch);
-    attempt_pr_number = existing_pr_number;
+    let existing_pr_number = match refresh_existing_pr_number_for_preflight(repo, &branch, &work_id)
+    {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_association_preflight_refresh_failed", err);
+        },
+    };
+    if existing_pr_number != attempt_pr_number {
+        emit_stage(
+            "work_association_preflight_pr_refreshed",
+            serde_json::json!({
+                "cached_pr_number": attempt_pr_number,
+                "current_pr_number": existing_pr_number,
+                "changed": true,
+            }),
+        );
+        human_log!(
+            "fac push: refreshed branch PR mapping before preflight (cached #{}, current #{})",
+            attempt_pr_number,
+            existing_pr_number
+        );
+        attempt_pr_number = existing_pr_number;
+    }
     if existing_pr_number > 0 {
         let work_association_preflight_started = Instant::now();
         emit_stage(
@@ -3194,8 +3485,12 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         || {
             let _phase_progress = PushPhaseProgressTicker::start("git_push", json_output);
             let git_push_started = Instant::now();
+            let current_head = resolve_head_sha()
+                .map_err(|err| format!("failed to re-resolve HEAD SHA before git push: {err}"))?;
+            validate_head_stability_for_git_push(&sha, &current_head)?;
+            let refspec = build_git_push_refspec(&sha, &branch);
             let push_output = Command::new("git")
-                .args(["push", "--force", remote, &branch])
+                .args(["push", "--force", remote, "--", &refspec])
                 .output();
             match push_output {
                 Ok(o) if o.status.success() => {
@@ -3910,6 +4205,162 @@ mod tests {
         assert!(msg.contains("TCK-00640"));
         assert!(msg.contains("Refusing projection fallback"));
         assert!(msg.contains("apm2 fac work open --from-ticket"));
+    }
+
+    #[test]
+    fn parse_pr_body_work_binding_extracts_authoritative_work_id() {
+        let body = r"
+Some PR text
+
+```yaml
+schema: apm2.fac_push_metadata.v1
+work_id: W-TCK-00640-R2
+ticket_alias: TCK-00640
+fac_push_metadata:
+  commit_history: []
+```
+";
+        let parsed = parse_pr_body_work_binding(body)
+            .expect("valid pr metadata must parse")
+            .expect("binding should be present");
+        assert_eq!(parsed.work_id, "W-TCK-00640-R2");
+        assert_eq!(parsed.ticket_alias.as_deref(), Some("TCK-00640"));
+    }
+
+    #[test]
+    fn parse_pr_body_work_binding_rejects_conflicting_metadata_blocks() {
+        let body = r"
+```yaml
+schema: apm2.fac_push_metadata.v1
+work_id: W-TCK-00640
+```
+```yaml
+schema: apm2.fac_push_metadata.v1
+work_id: W-TCK-00640-R2
+```
+";
+        let err = parse_pr_body_work_binding(body)
+            .expect_err("conflicting metadata blocks must fail closed");
+        assert!(err.contains("conflicting work bindings"));
+    }
+
+    #[test]
+    fn parse_pr_body_work_binding_rejects_non_canonical_ticket_alias() {
+        let body = r"
+```yaml
+schema: apm2.fac_push_metadata.v1
+work_id: W-TCK-00640
+ticket_alias: ticket-640
+```
+";
+        let err = parse_pr_body_work_binding(body)
+            .expect_err("non-canonical ticket alias must fail closed");
+        assert!(err.contains("non-canonical `ticket_alias`"));
+    }
+
+    #[test]
+    fn enforce_authoritative_pr_work_binding_rejects_mismatched_candidate() {
+        let authoritative = PrBodyWorkBinding {
+            work_id: "W-TCK-00640-R2".to_string(),
+            ticket_alias: Some("TCK-00640".to_string()),
+        };
+        let err =
+            enforce_authoritative_pr_work_binding(Some(805), Some(&authoritative), "W-TCK-00640")
+                .expect_err("mismatched candidate must fail closed");
+        assert!(err.contains("existing PR #805"));
+        assert!(err.contains("W-TCK-00640-R2"));
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_skips_binding_when_no_pr_exists() {
+        let mut resolve_called = false;
+        let refreshed = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 0,
+            |_| {
+                resolve_called = true;
+                Ok(None)
+            },
+        )
+        .expect("no PR mapping should resolve cleanly");
+        assert_eq!(refreshed, 0);
+        assert!(
+            !resolve_called,
+            "binding resolver must not run without a PR"
+        );
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_revalidates_authoritative_binding() {
+        let refreshed = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 805,
+            |_| {
+                Ok(Some(PrBodyWorkBinding {
+                    work_id: "W-TCK-00640-R2".to_string(),
+                    ticket_alias: Some("TCK-00640".to_string()),
+                }))
+            },
+        )
+        .expect("authoritative binding should validate");
+        assert_eq!(refreshed, 805);
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_rejects_mismatched_binding() {
+        let err = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 805,
+            |_| {
+                Ok(Some(PrBodyWorkBinding {
+                    work_id: "W-TCK-00999".to_string(),
+                    ticket_alias: Some("TCK-00999".to_string()),
+                }))
+            },
+        )
+        .expect_err("mismatched authoritative binding must fail closed");
+        assert!(err.contains("authoritative PR work binding refresh failed"));
+        assert!(err.contains("PR #805"));
+    }
+
+    #[test]
+    fn validate_head_stability_for_gates_rejects_mismatch() {
+        let err = validate_head_stability_for_gates("abcd", "dcba")
+            .expect_err("mismatched head must fail closed");
+        assert!(err.contains("HEAD drift detected"));
+        assert!(err.contains("captured=abcd"));
+        assert!(err.contains("current=dcba"));
+    }
+
+    #[test]
+    fn validate_head_stability_for_gates_accepts_case_insensitive_match() {
+        validate_head_stability_for_gates("ABCD", "abcd")
+            .expect("case-insensitive sha match must pass");
+    }
+
+    #[test]
+    fn validate_head_stability_for_git_push_rejects_mismatch() {
+        let err = validate_head_stability_for_git_push("abcd", "dcba")
+            .expect_err("mismatched head before git push must fail closed");
+        assert!(err.contains("before git push"));
+        assert!(err.contains("captured=abcd"));
+        assert!(err.contains("current=dcba"));
+    }
+
+    #[test]
+    fn build_git_push_refspec_uses_captured_head_sha() {
+        assert_eq!(
+            build_git_push_refspec("0123abcd", "ticket/RFC-0032/TCK-00640"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-00640"
+        );
+    }
+
+    #[test]
+    fn build_git_push_refspec_normalizes_heads_prefix() {
+        assert_eq!(
+            build_git_push_refspec("0123abcd", "refs/heads/ticket/RFC-0032/TCK-00640"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-00640"
+        );
     }
 
     fn sample_daemon_work_item(
@@ -4892,85 +5343,38 @@ mod tests {
     }
 
     #[test]
-    fn ticket_path_for_tck_uses_canonical_location() {
-        let path = ticket_path_for_tck(Path::new("/repo"), "TCK-00412");
-        assert_eq!(
-            path,
-            PathBuf::from("/repo/documents/work/tickets/TCK-00412.yaml")
-        );
-    }
-
-    #[test]
-    fn validate_ticket_path_matches_tck_accepts_matching_filename() {
-        let result = validate_ticket_path_matches_tck(
-            Path::new("documents/work/tickets/TCK-00412.yaml"),
-            "TCK-00412",
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_ticket_path_matches_tck_rejects_mismatch() {
-        let err = validate_ticket_path_matches_tck(
-            Path::new("documents/work/tickets/TCK-00411.yaml"),
-            "TCK-00412",
-        )
-        .expect_err("mismatch should fail");
-        assert!(err.contains("does not match derived TCK"));
-    }
-
-    #[test]
-    fn load_ticket_body_reads_raw_contents() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let ticket_path = temp_dir.path().join("TCK-00412.yaml");
-        std::fs::write(
-            &ticket_path,
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n",
-        )
-        .expect("write ticket");
-
-        let content = load_ticket_body(&ticket_path).expect("load ticket body");
-        assert_eq!(content, "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n");
-    }
-
-    #[test]
-    fn load_ticket_title_reads_plain_title() {
-        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
-        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Title Value\"\n";
-        let title = load_ticket_title(ticket_path, body).expect("title should parse");
-        assert_eq!(title, "Title Value");
-    }
-
-    #[test]
-    fn load_ticket_title_fails_when_missing() {
-        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
-        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n";
-        let err = load_ticket_title(ticket_path, body).expect_err("missing title should fail");
-        assert!(err.contains("ticket_meta.ticket.title"));
-    }
-
-    #[test]
     fn parse_commit_history_parses_short_sha_and_message() {
         let parsed = parse_commit_history("abc12345\tfirst change\ndef67890\tsecond change\n");
         assert_eq!(parsed, sample_commit_history());
     }
 
     #[test]
-    fn render_ticket_body_markdown_includes_commit_history_metadata() {
-        let rendered = render_ticket_body_markdown(
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n",
+    fn title_subject_from_commit_history_uses_last_commit_message() {
+        let subject = title_subject_from_commit_history(&sample_commit_history());
+        assert_eq!(subject, "second change");
+    }
+
+    #[test]
+    fn render_push_body_markdown_includes_work_identity_and_commit_history() {
+        let rendered = render_push_body_markdown(
+            "W-TCK-00412",
+            Some("TCK-00412"),
+            "ticket/RFC-0018/TCK-00412",
             &sample_commit_history(),
         )
-        .expect("render ticket body");
+        .expect("render push body");
         let yaml = parse_yaml_from_markdown_fence(&rendered);
 
-        let ticket_id = yaml
-            .get("ticket_meta")
-            .and_then(|value| value.get("ticket"))
-            .and_then(|value| value.get("id"))
+        let work_id = yaml
+            .get("work_id")
             .and_then(serde_yaml::Value::as_str)
-            .expect("ticket id");
-        assert_eq!(ticket_id, "TCK-00412");
+            .expect("work id");
+        assert_eq!(work_id, "W-TCK-00412");
+        let ticket_alias = yaml
+            .get("ticket_alias")
+            .and_then(serde_yaml::Value::as_str)
+            .expect("ticket alias");
+        assert_eq!(ticket_alias, "TCK-00412");
 
         let history = yaml
             .get("fac_push_metadata")
@@ -4993,24 +5397,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pr_metadata_branch_tck_yields_title_and_markdown_body() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        let ticket_path = tickets_dir.join("TCK-00412.yaml");
-        let ticket_content = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n";
-        fs::write(&ticket_path, ticket_content).expect("write ticket");
-
+    fn resolve_pr_metadata_prefers_resolved_ticket_alias_prefix() {
         let metadata = resolve_pr_metadata(
             "ticket/RFC-0018/TCK-00412",
             Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
             &sample_commit_history(),
-            None,
+            "W-TCK-00412",
+            Some("TCK-00412"),
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00412: Any");
+        assert_eq!(metadata.title, "TCK-00412: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         let history = yaml
             .get("fac_push_metadata")
@@ -5018,72 +5414,44 @@ mod tests {
             .and_then(serde_yaml::Value::as_sequence)
             .expect("commit history");
         assert_eq!(history.len(), 2);
-        assert_eq!(metadata.ticket_path, ticket_path);
     }
 
     #[test]
-    fn resolve_pr_metadata_uses_worktree_fallback() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        let ticket_path = tickets_dir.join("TCK-00444.yaml");
-        let ticket_content =
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n";
-        fs::write(&ticket_path, ticket_content).expect("write ticket");
-
+    fn resolve_pr_metadata_uses_branch_derived_alias_when_not_explicitly_supplied() {
         let metadata = resolve_pr_metadata(
             "feat/no-ticket",
             Path::new("/tmp/apm2-TCK-00444"),
-            repo_root,
             &sample_commit_history(),
+            "W-TCK-00444",
             None,
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00444: Fallback Title");
+        assert_eq!(metadata.title, "TCK-00444: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
-        let history = yaml
-            .get("fac_push_metadata")
-            .and_then(|value| value.get("commit_history"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .expect("commit history");
-        assert_eq!(history.len(), 2);
-        assert_eq!(metadata.ticket_path, ticket_path);
+        assert_eq!(
+            yaml.get("ticket_alias")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("ticket alias"),
+            "TCK-00444"
+        );
     }
 
     #[test]
-    fn resolve_pr_metadata_rejects_ticket_mismatch() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        fs::write(tickets_dir.join("TCK-00412.yaml"), "ticket_meta:\n").expect("write ticket");
-
-        let err = resolve_pr_metadata(
-            "ticket/RFC-0018/TCK-00412",
+    fn resolve_pr_metadata_falls_back_to_work_id_when_no_ticket_context_exists() {
+        let metadata = resolve_pr_metadata(
+            "feat/no-ticket",
             Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
             &sample_commit_history(),
-            Some(Path::new("documents/work/tickets/TCK-00411.yaml")),
-        )
-        .expect_err("mismatch should fail");
-        assert!(err.contains("does not match derived TCK"));
-    }
-
-    #[test]
-    fn resolve_pr_metadata_fails_when_canonical_ticket_missing() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let err = resolve_pr_metadata(
-            "ticket/RFC-0018/TCK-00412",
-            Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
-            &sample_commit_history(),
+            "W-12345678",
             None,
         )
-        .expect_err("missing ticket should fail");
-        assert!(err.contains("failed to read ticket body"));
-        assert!(err.contains("TCK-00412.yaml"));
+        .expect("metadata should resolve using work_id fallback");
+        assert_eq!(metadata.title, "W-12345678: second change");
+        let yaml = parse_yaml_from_markdown_fence(&metadata.body);
+        assert!(
+            yaml.get("ticket_alias").is_none(),
+            "ticket_alias should be absent without alias context"
+        );
     }
 
     #[test]

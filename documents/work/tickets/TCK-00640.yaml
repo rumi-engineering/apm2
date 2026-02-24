@@ -36,6 +36,7 @@ ticket_meta:
     - Restore daemon authoritative lease/work continuity for pre-cutover claims by allowing controlled `work_claims` fallback when `gate_lease_issued` rows are absent; authoritative lease rows must take precedence
     - Ensure migration fallback fails closed on ambiguous lease bindings and invalid empty bindings
     - Keep lease fallback lookup bounded and indexed (`work_claims.lease_id`) to avoid unbounded scans
+    - Use existing `apm2 work open --from-ticket ...` for any remaining ticket->work backfill; do not add a new migration command under this ticket
     - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
     - Prevent one-shot inline worker fallback cycles from spawning persistent queue watcher/watchdog threads so `fac push` cannot leak inotify instances/threads under retries
     - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
@@ -48,12 +49,14 @@ ticket_meta:
     - Enforce case-insensitive `(work_id, pr_number, commit_sha)` uniqueness for `work.pr_associated` in both legacy and canonical sqlite schemas
     out_of_scope:
     - Daemon-side CI processor transitions (separate ticket)
+    - Adding a dedicated `apm2 fac work migrate-ticket-yaml` command
   plan:
     steps:
     - Keep CLI argument surface for explicit work binding while defaulting to branch alias/work-claim resolution for manual operator flow
     - Thread resolved `work_id` through PublishChangeSet, PR association, and context publication calls
     - Ensure idempotent retries with stable dedupe keys and scoped lease->work recovery behavior
     - Harden daemon lease validator fallback semantics (authoritative precedence, ambiguity refusal, indexed lookup path)
+    - Keep ticket->work backfill operationally on existing `apm2 work open --from-ticket` flow (no new migration CLI surface)
     - Make `--handoff-note` optional; always emit IMPLEMENTER_TERMINAL marker
     - Harden projection rebuild decoder to current session envelope contract and remove historical raw/payload-only branches
     - Add early PR-association preflight to `fac push` fast checks (non-mutating validation path)
@@ -105,6 +108,9 @@ ticket_meta:
     - "`cargo test -p apm2-cli repair_run_state_present_with_inconsistent_runtime_handle_rebuilds_state -- --nocapture`"
     - "`cargo test -p apm2-daemon sqlite_lease_validator_ -- --nocapture`"
     - "`cargo test -p apm2-daemon sqlite_work_registry_schema_creates_lease_lookup_index -- --nocapture`"
+    - "`cargo test -p apm2-daemon protocol::dispatch::tests::publish_changeset:: -- --nocapture`"
+    - "`cargo test -p apm2-daemon --test tck_00388_gate_orchestrator -- --nocapture`"
+    - "`cargo test -p apm2-daemon --test tck_00418_fac_htf_authority_gates -- --nocapture`"
     - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
     - "`cargo test -p apm2-core test_commit_with_claimed_lock_succeeds_with_outer_lock_held -- --nocapture`"
     - "`cargo test -p apm2-core test_commit_fails_fast_when_claimed_file_lock_is_busy -- --nocapture`"

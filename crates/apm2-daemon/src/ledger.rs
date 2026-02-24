@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::fac::{REVIEW_RECEIPT_RECORDED_PREFIX, SelectionDecision};
+use apm2_core::work::helpers;
 use ed25519_dalek::{Signer, Verifier};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -88,6 +89,46 @@ struct EventHashInput<'a> {
 }
 
 const REDUNDANCY_RECEIPT_CONSUMED_EVENT: &str = "redundancy_receipt_consumed";
+
+fn work_transitioned_session_envelope(
+    transition: &WorkTransition<'_>,
+) -> Result<serde_json::Value, LedgerEventError> {
+    let canonical_from_state = helpers::normalize_work_state_label(transition.from_state)
+        .ok_or_else(|| LedgerEventError::ValidationFailed {
+            message: format!(
+                "invalid from_state '{}' for work_transitioned payload",
+                transition.from_state
+            ),
+        })?;
+    let canonical_to_state =
+        helpers::normalize_work_state_label(transition.to_state).ok_or_else(|| {
+            LedgerEventError::ValidationFailed {
+                message: format!(
+                    "invalid to_state '{}' for work_transitioned payload",
+                    transition.to_state
+                ),
+            }
+        })?;
+    let reducer_payload = helpers::work_transitioned_payload_with_sequence(
+        transition.work_id,
+        canonical_from_state,
+        canonical_to_state,
+        transition.rationale_code,
+        transition.previous_transition_count,
+    );
+    Ok(serde_json::json!({
+        "event_type": "work_transitioned",
+        "session_id": transition.work_id,
+        "actor_id": transition.actor_id,
+        "payload": hex::encode(reducer_payload),
+        "work_id": transition.work_id,
+        "from_state": canonical_from_state,
+        "to_state": canonical_to_state,
+        "rationale_code": transition.rationale_code,
+        "previous_transition_count": transition.previous_transition_count,
+        "timestamp_ns": transition.timestamp_ns,
+    }))
+}
 
 /// Hard scan limit for bounded reverse-scan lookups such as
 /// `get_event_by_evidence_identity` and `canonical_get_evidence_by_identity`.
@@ -4339,19 +4380,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         &self,
         transition: &WorkTransition<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // Build payload as JSON with work transition data
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
-        // malleability per LAW-09 (Temporal Pinning & Freshness)
-        let payload = serde_json::json!({
-            "event_type": "work_transitioned",
-            "work_id": transition.work_id,
-            "from_state": transition.from_state,
-            "to_state": transition.to_state,
-            "rationale_code": transition.rationale_code,
-            "previous_transition_count": transition.previous_transition_count,
-            "actor_id": transition.actor_id,
-            "timestamp_ns": transition.timestamp_ns,
-        });
+        let payload = work_transitioned_session_envelope(transition)?;
         let conn = self
             .conn
             .lock()
@@ -4504,16 +4533,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let transition_count = transition_count as u32;
 
-        let transition_payload = serde_json::json!({
-            "event_type": "work_transitioned",
-            "work_id": claim.work_id,
-            "from_state": "Open",
-            "to_state": "Claimed",
-            "rationale_code": "work_claimed_via_ipc",
-            "previous_transition_count": transition_count,
-            "actor_id": actor_id,
-            "timestamp_ns": timestamp_ns,
-        });
+        let transition = WorkTransition {
+            work_id: &claim.work_id,
+            from_state: "Open",
+            to_state: "Claimed",
+            rationale_code: "work_claimed_via_ipc",
+            previous_transition_count: transition_count,
+            actor_id,
+            timestamp_ns,
+        };
+        let transition_payload = work_transitioned_session_envelope(&transition)?;
         let (transition_event, transition_event_hash) = self
             .build_signed_event_with_prev_hash(
                 "work_transitioned",
@@ -4643,16 +4672,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let transition_count = transition_count as u32;
 
-        let transition_payload = serde_json::json!({
-            "event_type": "work_transitioned",
-            "work_id": work_id,
-            "from_state": "Claimed",
-            "to_state": "InProgress",
-            "rationale_code": "episode_spawned_via_ipc",
-            "previous_transition_count": transition_count,
-            "actor_id": actor_id,
-            "timestamp_ns": timestamp_ns,
-        });
+        let transition = WorkTransition {
+            work_id,
+            from_state: "Claimed",
+            to_state: "InProgress",
+            rationale_code: "episode_spawned_via_ipc",
+            previous_transition_count: transition_count,
+            actor_id,
+            timestamp_ns,
+        };
+        let transition_payload = work_transitioned_session_envelope(&transition)?;
         let (transition_event, transition_event_hash) = self
             .build_signed_event_with_prev_hash(
                 "work_transitioned",
@@ -7132,8 +7161,8 @@ mod tests {
         assert_eq!(events[1].event_type, "work_transitioned");
 
         let payload: serde_json::Value = serde_json::from_slice(&events[1].payload).unwrap();
-        assert_eq!(payload["from_state"], "Open");
-        assert_eq!(payload["to_state"], "Claimed");
+        assert_eq!(payload["from_state"], "OPEN");
+        assert_eq!(payload["to_state"], "CLAIMED");
         assert_eq!(payload["previous_transition_count"], 0);
     }
 
@@ -7181,8 +7210,8 @@ mod tests {
         assert_eq!(events[3].event_type, "work_transitioned");
 
         let payload: serde_json::Value = serde_json::from_slice(&events[3].payload).unwrap();
-        assert_eq!(payload["from_state"], "Claimed");
-        assert_eq!(payload["to_state"], "InProgress");
+        assert_eq!(payload["from_state"], "CLAIMED");
+        assert_eq!(payload["to_state"], "IN_PROGRESS");
         // After claim lifecycle, there's 1 transition, so
         // previous_transition_count for InProgress should be 1
         assert_eq!(payload["previous_transition_count"], 1);
