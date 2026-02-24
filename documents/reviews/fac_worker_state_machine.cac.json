@@ -15,9 +15,6 @@
     },
     "source_of_truth_refs": [
       "documents/reviews/fac_worker_requirements.cac.json",
-      "documents/work/tickets/TCK-00664.json",
-      "documents/work/tickets/TCK-00660.json",
-      "documents/work/tickets/TCK-00577.json",
       "documents/rfcs/RFC-0019/"
     ],
     "stable_id": "dcp://apm2.fac/machine/fac-worker@v1",
