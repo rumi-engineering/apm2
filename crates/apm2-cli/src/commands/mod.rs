@@ -77,6 +77,7 @@ pub mod process;
 pub mod role_launch;
 pub mod tool;
 pub mod work;
+mod work_identity;
 
 #[cfg(test)]
 pub struct EnvVarTestLock(std::sync::Mutex<()>);

@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
@@ -16,23 +17,27 @@ use apm2_core::fac::{
     LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
     LogRetentionConfig, MAX_LOG_DIR_ENTRIES, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
-    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeError, SafeRmtreeOutcome,
-    TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1,
-    check_fac_lane_liveness, check_fac_unit_liveness, execute_gc, plan_gc_with_log_retention,
-    safe_rmtree_v1, safe_rmtree_v1_with_entry_limit, verify_pid_identity,
+    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, check_fac_lane_liveness, check_fac_unit_liveness,
+    execute_gc, normalize_user_owned_dir_modes_for_safe_delete, plan_gc_with_log_retention,
+    safe_rmtree_v1_with_entry_limit, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
+use crate::commands::work_identity::{
+    derive_adhoc_session_id, extract_tck_from_text, normalize_non_empty_arg, validate_lease_id,
+    validate_session_id, validate_work_id,
+};
 use crate::commands::{
     fac_broker, fac_economics, fac_gc, fac_policy, fac_pr, fac_preflight, fac_quarantine,
-    fac_review,
+    fac_review, work,
 };
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
@@ -68,6 +73,8 @@ const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
 const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
 const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
 const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
+const WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
+const WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE: &str = "Refusing implicit projection fallback to prevent cross-ticket misbinding; pass `--ticket-alias`/`--work-id` context or explicitly request fallback via `--lease-id`/`--session-id`.";
 
 // =============================================================================
 // Command Types
@@ -140,7 +147,8 @@ pub enum FacSubcommand {
 
     /// Query projection-backed work authority via daemon operator IPC.
     ///
-    /// Displays work status or lists work items from runtime projection state.
+    /// Resolves current work identity, displays work status, lists work items,
+    /// and resolves ticket aliases from runtime projection state.
     /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
 
@@ -194,9 +202,9 @@ pub enum FacSubcommand {
 
     /// Push code and create/update PR (lean push).
     ///
-    /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// blocks on evidence gates, synchronizes ruleset projection, and
-    /// dispatches reviews.
+    /// Resolves current work binding (`work_id/lease_id/session_id`), pushes to
+    /// remote, creates or updates a PR, blocks on evidence gates,
+    /// synchronizes ruleset projection, and dispatches reviews.
     Push(PushArgs),
 
     /// Show local pipeline, evidence, and review log paths.
@@ -242,6 +250,10 @@ pub enum FacSubcommand {
     /// Inspect FAC broker state and health.
     Broker(BrokerArgs),
     /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
+    ///
+    /// `apm2 fac doctor --fix` now runs this maintenance pass automatically.
+    /// This command remains available as an explicit/manual operator override.
+    #[command(hide = true)]
     Gc(fac_gc::GcArgs),
     /// Manage quarantined and denied jobs.
     Quarantine(fac_quarantine::QuarantineArgs),
@@ -655,6 +667,15 @@ pub struct ServicesStatusArgs {}
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
+    /// Open a work item from a ticket YAML using RFC-0032 `OpenWork`.
+    Open(WorkOpenArgs),
+
+    /// Claim an existing work item using RFC-0032 `ClaimWorkV2`.
+    Claim(WorkClaimArgs),
+
+    /// Resolve current work identity from branch/worktree alias or projection.
+    Current(WorkCurrentArgs),
+
     /// Show projection-backed work status from daemon authority.
     Status(WorkStatusArgs),
 
@@ -682,6 +703,82 @@ pub struct WorkListArgs {
     /// Return only claimable work items.
     #[arg(long, default_value_t = false)]
     pub claimable_only: bool,
+}
+
+/// Arguments for `apm2 fac work current`.
+#[derive(Debug, Args)]
+pub struct WorkCurrentArgs {
+    /// Optional branch name override. Defaults to the current branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Optional ticket alias override (for example `TCK-00640`).
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
+
+    /// Optional lease filter for explicit projection fallback disambiguation.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
+
+    /// Optional session filter for explicit projection fallback disambiguation.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+}
+
+/// Arguments for `apm2 fac work open`.
+#[derive(Debug, Args)]
+pub struct WorkOpenArgs {
+    /// Ticket YAML path to open as `WorkSpec`.
+    #[arg(long = "from-ticket")]
+    pub from_ticket: PathBuf,
+
+    /// Governing lease ID for PCAC admission.
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkClaimRoleArg {
+    /// Claim as implementer (Open -> Claimed).
+    Implementer,
+    /// Claim as reviewer (`ReadyForReview` -> Review).
+    Reviewer,
+    /// Claim as coordinator (Open -> Claimed).
+    Coordinator,
+}
+
+impl WorkClaimRoleArg {
+    const fn to_work_role(self) -> WorkRole {
+        match self {
+            Self::Implementer => WorkRole::Implementer,
+            Self::Reviewer => WorkRole::Reviewer,
+            Self::Coordinator => WorkRole::Coordinator,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementer => "implementer",
+            Self::Reviewer => "reviewer",
+            Self::Coordinator => "coordinator",
+        }
+    }
+}
+
+/// Arguments for `apm2 fac work claim`.
+#[derive(Debug, Args)]
+pub struct WorkClaimArgs {
+    /// Canonical work ID to claim (`W-...`).
+    #[arg(long = "work-id")]
+    pub work_id: String,
+
+    /// Governing lease ID for PCAC admission (`L-...`).
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+
+    /// Claim role.
+    #[arg(long, value_enum, default_value = "implementer")]
+    pub role: WorkClaimRoleArg,
 }
 
 /// Arguments for `apm2 fac work resolve-alias`.
@@ -1099,6 +1196,43 @@ pub struct PushArgs {
     /// id.
     #[arg(long)]
     pub ticket: Option<PathBuf>,
+
+    /// Canonical work identifier to bind projection and daemon publication.
+    /// If omitted, `fac push` derives work binding via ticket alias and
+    /// fail-closed TCK alias resolution.
+    /// Projection fallback is only used when explicitly requested with
+    /// `--lease-id`/`--session-id`.
+    /// Use `apm2 fac work current` to inspect.
+    /// If no work exists yet, create/claim one via `apm2 fac work open` and
+    /// `apm2 fac work claim`.
+    #[arg(long = "work-id")]
+    pub work_id: Option<String>,
+
+    /// Optional ticket alias (for example `TCK-00640`) used to resolve
+    /// canonical `work_id` via daemon projection authority.
+    /// If omitted, branch/worktree TCK derivation applies.
+    /// Unresolved aliases fail closed to prevent cross-ticket misbinding.
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
+
+    /// Optional governing lease identifier for privileged work RPC calls.
+    /// When omitted, `fac push` resolves `lease_id` from daemon work status.
+    /// Use `apm2 fac work current` to inspect the daemon-resolved value.
+    /// For ad-hoc workflows, pass a governing lease from `apm2 fac work claim`.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
+
+    /// Optional implementer session identifier for terminal-contract dedupe.
+    /// When omitted, `fac push` resolves `session_id` from daemon work status.
+    /// If daemon status does not expose one but a lease is available, `fac
+    /// push` derives deterministic `S-adhoc-*` session identity from
+    /// (`work_id`,`lease_id`).
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+
+    /// Optional handoff note body to publish as `HANDOFF_NOTE`.
+    #[arg(long = "handoff-note")]
+    pub handoff_note: Option<String>,
 }
 
 /// Arguments for `apm2 fac logs`.
@@ -1214,6 +1348,9 @@ pub struct ReviewPrepareArgs {
     pub pr: Option<u32>,
 
     /// Optional head SHA override (defaults to PR head SHA).
+    ///
+    /// Note: prepare JSON output inlines review payloads only up to a bounded
+    /// line budget; oversized payloads are returned as artifact references.
     #[arg(long)]
     pub sha: Option<String>,
 }
@@ -1622,6 +1759,7 @@ enum SystemDoctorFixActionStatus {
 enum SystemDoctorFixActionKind {
     LaneReconcile,
     QueueReconcileApply,
+    GcMaintenance,
     LaneLogGc,
     LaneStatusScan,
     LaneTmpCorruptionDetection,
@@ -1676,11 +1814,26 @@ enum DoctorLaneResetError {
 struct DoctorLaneResetSummary {
     files_deleted: u64,
     dirs_deleted: u64,
+    deferred_cleanup_roots: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TmpScrubSummary {
     entries_deleted: u64,
+    deferred_cleanup_roots: u64,
+}
+
+#[derive(Debug)]
+enum DoctorSubdirDeleteOutcome {
+    Deleted {
+        files_deleted: u64,
+        dirs_deleted: u64,
+    },
+    AlreadyAbsent,
+    DeferredCleanup {
+        deferred_path: PathBuf,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2015,8 +2168,21 @@ fn detect_lane_tmp_corruption_with_entry_limit(
     let mut scanned_entries: usize = 0;
 
     while let Some(scan_dir) = dirs_to_scan.pop() {
-        let entries = std::fs::read_dir(&scan_dir)
-            .map_err(|err| format!("failed to read tmp dir {}: {err}", scan_dir.display()))?;
+        let entries = match std::fs::read_dir(&scan_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(Some(format!(
+                    "tmp scan permission denied at {} (will require scrub/reset)",
+                    scan_dir.display()
+                )));
+            },
+            Err(err) => {
+                return Err(format!(
+                    "failed to read tmp dir {}: {err}",
+                    scan_dir.display()
+                ));
+            },
+        };
         for entry in entries {
             scanned_entries = scanned_entries.saturating_add(1);
             if scanned_entries > max_entries {
@@ -2030,6 +2196,12 @@ fn detect_lane_tmp_corruption_with_entry_limit(
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(Some(format!(
+                        "tmp metadata permission denied at {} (will require scrub/reset)",
+                        path.display()
+                    )));
+                },
                 Err(err) => {
                     return Err(format!(
                         "failed to stat tmp entry {}: {err}",
@@ -2100,29 +2272,48 @@ fn doctor_reset_lane_once(
 
     let mut total_files: u64 = 0;
     let mut total_dirs: u64 = 0;
+    let mut deferred_cleanup_roots: u64 = 0;
     let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
     for subdir in &subdirs {
         let subdir_path = lane_dir.join(subdir);
-        match safe_rmtree_v1(&subdir_path, lanes_root) {
-            Ok(SafeRmtreeOutcome::Deleted {
+        match delete_path_for_recovery(
+            &subdir_path,
+            lanes_root,
+            &lane_dir,
+            subdir,
+            MAX_LOG_DIR_ENTRIES,
+        ) {
+            Ok(DoctorSubdirDeleteOutcome::Deleted {
                 files_deleted,
                 dirs_deleted,
             }) => {
                 total_files = total_files.saturating_add(files_deleted);
                 total_dirs = total_dirs.saturating_add(dirs_deleted);
             },
-            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
+            Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent) => {},
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path,
+                reason,
+            }) => {
+                deferred_cleanup_roots = deferred_cleanup_roots.saturating_add(1);
+                refused_receipts.push(RefusedDeleteReceipt {
+                    root: deferred_path,
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: format!("deferred cleanup: {reason}"),
+                    mark_corrupt: false,
+                });
+            },
             Err(err) => {
                 refused_receipts.push(RefusedDeleteReceipt {
                     root: subdir_path,
                     allowed_parent: lanes_root.to_path_buf(),
-                    reason: err.to_string(),
+                    reason: err,
                     mark_corrupt: true,
                 });
             },
         }
     }
-    if !refused_receipts.is_empty() {
+    if refused_receipts.iter().any(|receipt| receipt.mark_corrupt) {
         return Err(DoctorLaneResetError::RefusedDelete {
             receipts: refused_receipts,
         });
@@ -2142,13 +2333,137 @@ fn doctor_reset_lane_once(
     Ok(DoctorLaneResetSummary {
         files_deleted: total_files,
         dirs_deleted: total_dirs,
+        deferred_cleanup_roots,
     })
 }
 
+#[cfg(test)]
 fn refused_delete_mentions_tmp(receipts: &[RefusedDeleteReceipt]) -> bool {
-    receipts
-        .iter()
-        .any(|receipt| receipt.root.file_name().and_then(|name| name.to_str()) == Some("tmp"))
+    receipts.iter().any(|receipt| {
+        receipt
+            .root
+            .components()
+            .any(|component| component.as_os_str() == "tmp")
+    })
+}
+
+fn next_doctor_orphan_path(lane_dir: &Path, label: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    lane_dir.join(format!(".doctor-orphan-{label}-{pid}-{stamp}"))
+}
+
+fn rotate_path_to_doctor_orphan(
+    path: &Path,
+    lane_dir: &Path,
+    label: &str,
+) -> Result<Option<PathBuf>, String> {
+    for attempt in 0..16 {
+        let mut target = next_doctor_orphan_path(lane_dir, label);
+        if attempt > 0 {
+            target = lane_dir.join(format!(
+                "{}-{attempt}",
+                target
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("doctor-orphan")
+            ));
+        }
+        match std::fs::rename(path, &target) {
+            Ok(()) => return Ok(Some(target)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                if attempt == 15 {
+                    return Err(format!(
+                        "failed to rotate {} for deferred cleanup: {err}",
+                        path.display()
+                    ));
+                }
+            },
+        }
+    }
+    Err(format!(
+        "failed to rotate {} for deferred cleanup (retry budget exhausted)",
+        path.display()
+    ))
+}
+
+fn delete_path_for_recovery(
+    target_path: &Path,
+    allowed_parent: &Path,
+    lane_dir: &Path,
+    orphan_label: &str,
+    entry_limit: usize,
+) -> Result<DoctorSubdirDeleteOutcome, String> {
+    let metadata = match std::fs::symlink_metadata(target_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent);
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to stat {} before cleanup: {err}",
+                target_path.display()
+            ));
+        },
+    };
+
+    if metadata.is_dir() {
+        let deletion_attempt =
+            normalize_user_owned_dir_modes_for_safe_delete(target_path, entry_limit)
+                .map_err(|err| format!("permission repair failed: {err}"))
+                .and_then(|_| {
+                    safe_rmtree_v1_with_entry_limit(target_path, allowed_parent, entry_limit)
+                        .map_err(|err| err.to_string())
+                });
+
+        return match deletion_attempt {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }),
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent),
+            Err(reason) => {
+                let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                    .ok_or_else(|| {
+                    format!(
+                        "cleanup failed and path vanished before defer: {} ({reason})",
+                        target_path.display()
+                    )
+                })?;
+                Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                    deferred_path: deferred,
+                    reason,
+                })
+            },
+        };
+    }
+
+    match std::fs::remove_file(target_path) {
+        Ok(()) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+            files_deleted: 1,
+            dirs_deleted: 0,
+        }),
+        Err(remove_err) => {
+            let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                .ok_or_else(|| {
+                    format!(
+                        "failed to remove non-directory path {}: {remove_err}",
+                        target_path.display()
+                    )
+                })?;
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path: deferred,
+                reason: format!("failed to remove non-directory path: {remove_err}"),
+            })
+        },
+    }
 }
 
 fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSummary, String> {
@@ -2189,52 +2504,29 @@ fn scrub_lane_tmp_dir_with_entry_limit(
     let lane_dir = manager.lane_dir(lane_id);
     let tmp_dir = lane_dir.join("tmp");
     let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
-
-    let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TmpScrubSummary { entries_deleted: 0 });
-        },
-        Err(err) => {
-            return Err(format!(
-                "failed to stat tmp dir {}: {err}",
-                tmp_dir.display()
-            ));
-        },
-    };
-
-    if !tmp_meta.is_dir() {
-        std::fs::remove_file(&tmp_dir)
-            .map_err(|err| format!("failed to remove non-directory tmp path: {err}"))?;
-        ensure_tmp_dir_exists(&tmp_dir)?;
-        return Ok(TmpScrubSummary { entries_deleted: 1 });
-    }
-
-    // Delete the tmp tree in one bounded traversal, then recreate it.
-    // This prevents per-entry nested traversals from multiplying bounds.
-    let scrubbed =
-        safe_rmtree_v1_with_entry_limit(&tmp_dir, &lane_dir, effective_limit).map_err(|err| {
-            match err {
-                SafeRmtreeError::TooManyEntries { .. } => format!(
-                    "tmp scrub refused directory {} due to entry bound (> {})",
-                    tmp_dir.display(),
-                    effective_limit
-                ),
-                _ => format!("tmp scrub failed to delete {}: {err}", tmp_dir.display()),
-            }
-        })?;
-
+    let cleanup_outcome =
+        delete_path_for_recovery(&tmp_dir, &lane_dir, &lane_dir, "tmp-scrub", effective_limit)?;
     ensure_tmp_dir_exists(&tmp_dir)?;
 
-    let entries_deleted = match scrubbed {
-        SafeRmtreeOutcome::Deleted {
+    let (entries_deleted, deferred_cleanup_roots) = match cleanup_outcome {
+        DoctorSubdirDeleteOutcome::Deleted {
             files_deleted,
             dirs_deleted,
-        } => files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
-        SafeRmtreeOutcome::AlreadyAbsent => 0,
+        } => (
+            files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
+            0_u64,
+        ),
+        DoctorSubdirDeleteOutcome::AlreadyAbsent => (0_u64, 0_u64),
+        DoctorSubdirDeleteOutcome::DeferredCleanup {
+            deferred_path: _,
+            reason: _,
+        } => (0_u64, 1_u64),
     };
 
-    Ok(TmpScrubSummary { entries_deleted })
+    Ok(TmpScrubSummary {
+        entries_deleted,
+        deferred_cleanup_roots,
+    })
 }
 
 fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogGcSummary, String> {
@@ -2274,6 +2566,59 @@ fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogG
         errors: receipt.errors.len(),
         bytes_freed,
     })
+}
+
+fn record_gc_maintenance_action(
+    actions: &mut Vec<SystemDoctorFixAction>,
+    result: Result<fac_gc::DoctorGcMaintenanceSummary, String>,
+) -> bool {
+    match result {
+        Ok(summary) => {
+            let detail = format!(
+                "plan_targets={} actions={} errors={} bytes_freed={} migration_moved={} migration_failed={} migration_skipped={} receipt={}",
+                summary.plan_targets,
+                summary.actions_applied,
+                summary.errors,
+                summary.bytes_freed,
+                summary.migration_files_moved,
+                summary.migration_files_failed,
+                summary.migration_skipped,
+                summary.receipt_path.display()
+            );
+            let detail = match summary.migration_warning.as_ref() {
+                Some(warning) => format!("{detail}; migration_warning={warning}"),
+                None => detail,
+            };
+            if summary.errors == 0 {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    detail,
+                );
+            } else {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("partial_gc_with_errors: {detail}"),
+                );
+            }
+            false
+        },
+        Err(err) => {
+            push_system_doctor_fix_action(
+                actions,
+                SystemDoctorFixActionKind::GcMaintenance,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("autonomous GC maintenance unavailable: {err}"),
+            );
+            true
+        },
+    }
 }
 
 fn restart_worker_service_unit() -> Result<String, String> {
@@ -2319,11 +2664,15 @@ fn restart_worker_service_unit() -> Result<String, String> {
 type CollectSystemDoctorSnapshotFn =
     fn(&Path, &Path, bool, bool, Option<&str>) -> Result<DoctorSystemSnapshot, String>;
 type RestartWorkerServiceFn = fn() -> Result<String, String>;
+type CheckFacUnitLivenessFn = fn(&str, &str) -> FacUnitLiveness;
+type CheckFacLaneLivenessFn = fn(&str) -> FacUnitLiveness;
 
 #[derive(Clone, Copy)]
 struct SystemDoctorFixHooks {
     collect_snapshot: CollectSystemDoctorSnapshotFn,
     restart_worker: RestartWorkerServiceFn,
+    check_unit_liveness: CheckFacUnitLivenessFn,
+    check_lane_liveness: CheckFacLaneLivenessFn,
 }
 
 fn run_system_doctor_fix(
@@ -2344,6 +2693,8 @@ fn run_system_doctor_fix(
         SystemDoctorFixHooks {
             collect_snapshot: collect_system_doctor_snapshot,
             restart_worker: restart_worker_service_unit,
+            check_unit_liveness: check_fac_unit_liveness,
+            check_lane_liveness: check_fac_lane_liveness,
         },
     )
 }
@@ -2444,10 +2795,27 @@ fn run_system_doctor_fix_with_hooks(
 
     match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
         Ok(receipt) => {
+            let still_active_flock_held = receipt
+                .queue_actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        apm2_core::fac::QueueRecoveryAction::StillActive { lane_id, .. }
+                            if lane_id == "flock_held"
+                    )
+                })
+                .count();
+            let has_running_lane = manager.all_lane_statuses().ok().is_some_and(|statuses| {
+                statuses
+                    .iter()
+                    .any(|status| status.state == LaneState::Running)
+            });
             if receipt.stale_leases_recovered > 0
                 || receipt.orphaned_jobs_requeued > 0
                 || receipt.orphaned_jobs_failed > 0
                 || receipt.torn_states_recovered > 0
+                || (still_active_flock_held > 0 && !has_running_lane)
             {
                 should_restart_worker = true;
             }
@@ -2457,13 +2825,15 @@ fn run_system_doctor_fix_with_hooks(
                 SystemDoctorFixActionStatus::Applied,
                 None,
                 format!(
-                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={}",
+                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={} still_active_flock_held={} running_lane_present={}",
                     receipt.lanes_inspected,
                     receipt.stale_leases_recovered,
                     receipt.orphaned_jobs_requeued,
                     receipt.orphaned_jobs_failed,
                     receipt.torn_states_recovered,
-                    receipt.lanes_marked_corrupt
+                    receipt.lanes_marked_corrupt,
+                    still_active_flock_held,
+                    has_running_lane
                 ),
             );
         },
@@ -2477,6 +2847,10 @@ fn run_system_doctor_fix_with_hooks(
                 format!("queue reconcile failed: {err}"),
             );
         },
+    }
+
+    if record_gc_maintenance_action(&mut actions, fac_gc::run_gc_for_doctor_fix()) {
+        action_failed = true;
     }
 
     match gc_stale_lane_logs(&fac_root, &manager) {
@@ -2582,8 +2956,8 @@ fn run_system_doctor_fix_with_hooks(
             &lane_id,
             job_id.as_deref(),
             reason_is_orphaned,
-            check_fac_unit_liveness,
-            check_fac_lane_liveness,
+            hooks.check_unit_liveness,
+            hooks.check_lane_liveness,
         ) {
             push_system_doctor_fix_action(
                 &mut actions,
@@ -2611,8 +2985,8 @@ fn run_system_doctor_fix_with_hooks(
                         SystemDoctorFixActionStatus::Applied,
                         Some(&lane_id),
                         format!(
-                            "tmp scrubbed (entries_deleted={})",
-                            scrub_summary.entries_deleted
+                            "tmp scrubbed (entries_deleted={}, deferred_cleanup_roots={})",
+                            scrub_summary.entries_deleted, scrub_summary.deferred_cleanup_roots
                         ),
                     );
                 },
@@ -2640,8 +3014,10 @@ fn run_system_doctor_fix_with_hooks(
                     SystemDoctorFixActionStatus::Applied,
                     Some(&lane_id),
                     format!(
-                        "reset complete (files_deleted={}, dirs_deleted={})",
-                        reset_summary.files_deleted, reset_summary.dirs_deleted
+                        "reset complete (files_deleted={}, dirs_deleted={}, deferred_cleanup_roots={})",
+                        reset_summary.files_deleted,
+                        reset_summary.dirs_deleted,
+                        reset_summary.deferred_cleanup_roots
                     ),
                 );
             },
@@ -2656,76 +3032,6 @@ fn run_system_doctor_fix_with_hooks(
                         pid.unwrap_or(0)
                     ),
                 );
-            },
-            Err(DoctorLaneResetError::RefusedDelete { receipts })
-                if refused_delete_mentions_tmp(&receipts) =>
-            {
-                if let Err(detail) = enforce_lane_reset_liveness_for_context(
-                    &lane_id,
-                    job_id.as_deref(),
-                    reason_is_orphaned,
-                    check_fac_unit_liveness,
-                    check_fac_lane_liveness,
-                ) {
-                    push_system_doctor_fix_action(
-                        &mut actions,
-                        reset_action,
-                        SystemDoctorFixActionStatus::Blocked,
-                        Some(&lane_id),
-                        format!("reset blocked before retry scrub: {detail}"),
-                    );
-                    continue;
-                }
-                match scrub_lane_tmp_dir(&manager, &lane_id) {
-                    Ok(scrub_summary) => {
-                        push_system_doctor_fix_action(
-                            &mut actions,
-                            SystemDoctorFixActionKind::LaneTmpScrub,
-                            SystemDoctorFixActionStatus::Applied,
-                            Some(&lane_id),
-                            format!(
-                                "tmp scrubbed (entries_deleted={})",
-                                scrub_summary.entries_deleted
-                            ),
-                        );
-                        match doctor_reset_lane_once(&manager, &lane_id) {
-                            Ok(reset_summary) => {
-                                lane_resets_applied = true;
-                                should_restart_worker = true;
-                                push_system_doctor_fix_action(
-                                    &mut actions,
-                                    reset_action,
-                                    SystemDoctorFixActionStatus::Applied,
-                                    Some(&lane_id),
-                                    format!(
-                                        "reset complete after tmp scrub (files_deleted={}, dirs_deleted={})",
-                                        reset_summary.files_deleted, reset_summary.dirs_deleted
-                                    ),
-                                );
-                            },
-                            Err(err) => {
-                                action_failed = true;
-                                push_system_doctor_fix_action(
-                                    &mut actions,
-                                    reset_action,
-                                    SystemDoctorFixActionStatus::Failed,
-                                    Some(&lane_id),
-                                    format!("reset still failing after tmp scrub: {err:?}"),
-                                );
-                            },
-                        }
-                    },
-                    Err(err) => {
-                        action_failed = true;
-                        push_system_doctor_fix_action(
-                            &mut actions,
-                            SystemDoctorFixActionKind::LaneTmpScrub,
-                            SystemDoctorFixActionStatus::Failed,
-                            Some(&lane_id),
-                            err,
-                        );
-                    },
-                }
             },
             Err(DoctorLaneResetError::RefusedDelete { receipts }) => {
                 action_failed = true;
@@ -3274,6 +3580,15 @@ pub fn run_fac(
             },
         },
         FacSubcommand::Work(args) => match &args.subcommand {
+            WorkSubcommand::Open(open_args) => {
+                run_work_open(open_args, operator_socket, json_output)
+            },
+            WorkSubcommand::Claim(claim_args) => {
+                run_work_claim(claim_args, operator_socket, json_output)
+            },
+            WorkSubcommand::Current(current_args) => {
+                run_work_current(current_args, operator_socket, json_output)
+            },
             WorkSubcommand::Status(status_args) => {
                 run_work_status(status_args, operator_socket, json_output)
             },
@@ -3438,14 +3753,20 @@ pub fn run_fac(
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_push(
-                &repo,
-                &args.remote,
-                args.branch.as_deref(),
-                args.ticket.as_deref(),
-                output_json,
-                cmd.queue_write_mode(),
-            )
+            fac_review::run_push(&fac_review::PushRunConfig {
+                repo: &repo,
+                remote: &args.remote,
+                branch: args.branch.as_deref(),
+                ticket: args.ticket.as_deref(),
+                work_id: args.work_id.as_deref(),
+                ticket_alias: args.ticket_alias.as_deref(),
+                lease_id: args.lease_id.as_deref(),
+                session_id: args.session_id.as_deref(),
+                handoff_note: args.handoff_note.as_deref(),
+                json_output: output_json,
+                write_mode: cmd.queue_write_mode(),
+                operator_socket,
+            })
         },
         FacSubcommand::Logs(args) => {
             let output_json = json_output;
@@ -3746,6 +4067,386 @@ fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerErro
     Ok(max_seq.saturating_sub(limit).max(1))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkCurrentResolutionSource {
+    TicketAlias,
+    BranchAlias,
+    ProjectionFallback,
+}
+
+impl WorkCurrentResolutionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TicketAlias => "ticket_alias",
+            Self::BranchAlias => "branch_alias",
+            Self::ProjectionFallback => "projection_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkCurrentResolution {
+    work_id: String,
+    ticket_alias: Option<String>,
+    source: WorkCurrentResolutionSource,
+}
+
+fn with_operator_client<T>(
+    future: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
+) -> Result<T, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
+    rt.block_on(future).map_err(|err| err.to_string())
+}
+
+fn resolve_current_branch_name() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to resolve current branch: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve current branch: {}",
+            stderr.trim()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err("git returned empty branch name".to_string());
+    }
+    Ok(branch)
+}
+
+fn resolve_ticket_alias_to_work_id_via_daemon(
+    ticket_alias: &str,
+    operator_socket: &Path,
+) -> Result<Option<String>, String> {
+    let ticket_alias_owned = ticket_alias.to_string();
+    let response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&ticket_alias_owned).await
+    })?;
+    if !response.found {
+        return Ok(None);
+    }
+    validate_work_id(&response.work_id)?;
+    Ok(Some(response.work_id))
+}
+
+const fn work_current_projection_fallback_requested(
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    lease_filter.is_some() || session_filter.is_some()
+}
+
+fn unresolved_work_current_alias_message(ticket_alias: &str) -> String {
+    format!(
+        "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
+         Refusing projection fallback to prevent cross-ticket misbinding. \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         then claim it (or provide explicit `--ticket-alias`)."
+    )
+}
+
+fn is_active_work_fallback_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "CLAIMED" | "IN_PROGRESS" | "INPROGRESS" | "SPAWNED" | "RUNNING"
+    )
+}
+
+fn matches_work_current_fallback_candidate(
+    work_item: &apm2_daemon::protocol::WorkStatusResponse,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    if !is_active_work_fallback_status(&work_item.status) {
+        return false;
+    }
+    let Some(role_raw) = work_item.role else {
+        return false;
+    };
+    if WorkRole::try_from(role_raw).ok() != Some(WorkRole::Implementer) {
+        return false;
+    }
+
+    if let Some(expected_lease_id) = lease_filter {
+        let observed_lease_id = work_item
+            .lease_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_lease_id != Some(expected_lease_id) {
+            return false;
+        }
+    }
+
+    if let Some(expected_session_id) = session_filter {
+        let observed_session_id = work_item
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_session_id != Some(expected_session_id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn select_work_current_fallback_work_id(
+    work_items: &[apm2_daemon::protocol::WorkStatusResponse],
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for work_item in work_items {
+        if !matches_work_current_fallback_candidate(work_item, lease_filter, session_filter) {
+            continue;
+        }
+        let work_id = work_item.work_id.trim();
+        if work_id.is_empty() {
+            continue;
+        }
+        if validate_work_id(work_id).is_err() {
+            continue;
+        }
+        candidates.insert(work_id.to_string());
+    }
+
+    match candidates.len() {
+        0 => Err(
+            "projection fallback could not identify an active Implementer work item; pass `--ticket-alias` or provide `--lease-id`/`--session-id` filters"
+                .to_string(),
+        ),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| "internal error: fallback candidate set unexpectedly empty".to_string()),
+        _ => {
+            let candidate_list = candidates.into_iter().collect::<Vec<_>>().join(", ");
+            Err(format!(
+                "projection fallback found multiple active Implementer work items ({candidate_list}); pass `--ticket-alias` or `--lease-id`/`--session-id` to disambiguate"
+            ))
+        },
+    }
+}
+
+fn resolve_work_current_from_projection_fallback(
+    operator_socket: &Path,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let list_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(false).await
+    })?;
+    select_work_current_fallback_work_id(&list_response.work_items, lease_filter, session_filter)
+}
+
+fn resolve_work_current_identity(
+    args: &WorkCurrentArgs,
+    operator_socket: &Path,
+    worktree_dir: &Path,
+) -> Result<(WorkCurrentResolution, Option<String>), String> {
+    let requested_lease_id = normalize_non_empty_arg(args.lease_id.as_deref());
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(args.session_id.as_deref());
+    if let Some(ref session_id) = requested_session_id {
+        validate_session_id(session_id)?;
+    }
+
+    let branch = normalize_non_empty_arg(args.branch.as_deref())
+        .map_or_else(|| resolve_current_branch_name().ok(), Some);
+    let fallback_requested = work_current_projection_fallback_requested(
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    );
+
+    let explicit_alias = normalize_non_empty_arg(args.ticket_alias.as_deref());
+    if let Some(alias) = explicit_alias {
+        if let Some(work_id) = resolve_ticket_alias_to_work_id_via_daemon(&alias, operator_socket)?
+        {
+            return Ok((
+                WorkCurrentResolution {
+                    work_id,
+                    ticket_alias: Some(alias),
+                    source: WorkCurrentResolutionSource::TicketAlias,
+                },
+                branch,
+            ));
+        }
+        return Err(format!(
+            "ticket alias `{alias}` did not resolve to a canonical work_id; explicit `--ticket-alias` inputs are fail-closed"
+        ));
+    }
+
+    if let Some(branch_value) = branch.as_deref() {
+        if let Some(derived_alias) = extract_tck_from_text(branch_value).or_else(|| {
+            worktree_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(extract_tck_from_text)
+        }) {
+            if let Some(work_id) =
+                resolve_ticket_alias_to_work_id_via_daemon(&derived_alias, operator_socket)?
+            {
+                return Ok((
+                    WorkCurrentResolution {
+                        work_id,
+                        ticket_alias: Some(derived_alias),
+                        source: WorkCurrentResolutionSource::BranchAlias,
+                    },
+                    branch,
+                ));
+            }
+            return Err(unresolved_work_current_alias_message(&derived_alias));
+        }
+    }
+
+    if !fallback_requested {
+        return Err(branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "could not derive TCK from branch/worktree context. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}",
+                    worktree_dir.display()
+                )
+            },
+        ));
+    }
+
+    let fallback_work_id = resolve_work_current_from_projection_fallback(
+        operator_socket,
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    )
+    .map_err(|fallback_err| {
+        branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "projection fallback failed and no branch context was available: {fallback_err}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} Projection fallback also failed: {fallback_err}",
+                    worktree_dir.display()
+                )
+            },
+        )
+    })?;
+    Ok((
+        WorkCurrentResolution {
+            work_id: fallback_work_id,
+            ticket_alias: None,
+            source: WorkCurrentResolutionSource::ProjectionFallback,
+        },
+        branch,
+    ))
+}
+
+/// Execute the work current command.
+fn run_work_current(args: &WorkCurrentArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    #[derive(Debug, Serialize)]
+    struct WorkCurrentJson {
+        work_id: String,
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ticket_alias: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lease_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    }
+
+    let worktree_dir = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "current_dir_failed",
+                &format!("Failed to resolve current working directory: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let (resolution, branch) =
+        match resolve_work_current_identity(args, operator_socket, &worktree_dir) {
+            Ok(value) => value,
+            Err(error) => {
+                return output_error(
+                    json_output,
+                    "work_current_resolution_failed",
+                    &error,
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        };
+
+    let work_id_for_status = resolution.work_id.clone();
+    let status_response = match with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_for_status).await
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            return output_error(
+                json_output,
+                "work_current_status_failed",
+                &error,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let role = status_response
+        .role
+        .and_then(|value| WorkRole::try_from(value).ok())
+        .map(|value| format!("{value:?}"));
+
+    let output = WorkCurrentJson {
+        work_id: resolution.work_id,
+        source: resolution.source.as_str().to_string(),
+        ticket_alias: resolution.ticket_alias,
+        branch,
+        status: status_response.status,
+        actor_id: status_response.actor_id,
+        role,
+        lease_id: status_response.lease_id,
+        session_id: status_response.session_id,
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+    );
+    exit_codes::SUCCESS
+}
+
 // =============================================================================
 // Work Status Command
 // =============================================================================
@@ -3847,6 +4548,173 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
                 serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
             );
 
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
+/// Execute the work open command by reusing the hardened `apm2 work open`
+/// implementation.
+fn run_work_open(args: &WorkOpenArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    if args.lease_id.trim().is_empty() {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            "Lease ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    if let Err(err) = validate_lease_id(args.lease_id.trim()) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let cmd = work::WorkCommand {
+        json: json_output,
+        subcommand: work::WorkSubcommand::Open(work::OpenArgs {
+            from_ticket: args.from_ticket.to_string_lossy().to_string(),
+            lease_id: args.lease_id.trim().to_string(),
+        }),
+    };
+    work::run_work(&cmd, operator_socket)
+}
+
+#[derive(Debug, Serialize)]
+struct WorkClaimJson {
+    work_id: String,
+    role: String,
+    issued_lease_id: String,
+    authority_bindings_hash: String,
+    evidence_id: String,
+    already_claimed: bool,
+    session_id: String,
+}
+
+/// Execute the work claim command via RFC-0032 `ClaimWorkV2`.
+fn run_work_claim(args: &WorkClaimArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    let work_id = args.work_id.trim();
+    if let Err(err) = validate_work_id(work_id) {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    let lease_id = args.lease_id.trim();
+    if let Err(err) = validate_lease_id(lease_id) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let requested_role = args.role.to_work_role();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client
+            .claim_work_v2(work_id, requested_role, lease_id)
+            .await
+    });
+
+    match result {
+        Ok(response) => {
+            if let Err(err) = validate_work_id(&response.work_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("daemon returned invalid work_id in ClaimWorkV2 response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if let Err(err) = validate_lease_id(&response.issued_lease_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!(
+                        "daemon returned invalid issued_lease_id in ClaimWorkV2 response: {err}"
+                    ),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.authority_bindings_hash.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty authority_bindings_hash in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.evidence_id.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty evidence_id in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+
+            let session_id = derive_adhoc_session_id(&response.work_id, &response.issued_lease_id);
+            if let Err(err) = validate_session_id(&session_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("failed to derive canonical session_id from claim response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            let payload = WorkClaimJson {
+                work_id: response.work_id,
+                role: args.role.as_str().to_string(),
+                issued_lease_id: response.issued_lease_id,
+                authority_bindings_hash: response.authority_bindings_hash,
+                evidence_id: response.evidence_id,
+                already_claimed: response.already_claimed,
+                session_id,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Work claim recorded");
+                println!("  Work ID:                 {}", payload.work_id);
+                println!("  Role:                    {}", payload.role);
+                println!("  Issued Lease ID:         {}", payload.issued_lease_id);
+                println!("  Session ID:              {}", payload.session_id);
+                println!(
+                    "  Authority Bindings Hash: {}",
+                    payload.authority_bindings_hash
+                );
+                println!("  Evidence ID:             {}", payload.evidence_id);
+                if payload.already_claimed {
+                    println!("  Idempotency:             already claimed");
+                }
+            }
             exit_codes::SUCCESS
         },
         Err(error) => handle_protocol_error(json_output, &error),
@@ -4003,33 +4871,17 @@ struct WorkInfo {
 /// Extracts work-related information from an event if it matches the `work_id`.
 #[cfg(test)]
 fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
-    // TCK-00398 Phase 1 compatibility:
-    // - Prefer metadata-derived work_id (`session_id`) when present.
-    // - Fall back to payload work_id for legacy rows where the daemon stores
-    //   episode IDs in `work_id`.
-    let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok();
-
-    let metadata_work_id_match = event.session_id == work_id;
-    let payload_work_id_match = payload
-        .as_ref()
-        .and_then(|v| v.get("work_id"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|id| id == work_id);
-
-    if !metadata_work_id_match && !payload_work_id_match {
+    if event.session_id != work_id {
         return None;
     }
 
+    let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok();
     Some(WorkInfo {
         episode_id: payload
             .as_ref()
             .and_then(|v| v.get("episode_id"))
             .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| {
-                (event.event_type == "episode_spawned" && payload_work_id_match)
-                    .then(|| event.session_id.clone())
-            }),
+            .map(String::from),
     })
 }
 
@@ -6827,6 +7679,64 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
     }
 
+    #[test]
+    fn work_claim_role_arg_maps_to_protocol_role() {
+        assert_eq!(
+            WorkClaimRoleArg::Implementer.to_work_role(),
+            WorkRole::Implementer
+        );
+        assert_eq!(WorkClaimRoleArg::Implementer.as_str(), "implementer");
+        assert_eq!(
+            WorkClaimRoleArg::Reviewer.to_work_role(),
+            WorkRole::Reviewer
+        );
+        assert_eq!(WorkClaimRoleArg::Reviewer.as_str(), "reviewer");
+        assert_eq!(
+            WorkClaimRoleArg::Coordinator.to_work_role(),
+            WorkRole::Coordinator
+        );
+        assert_eq!(WorkClaimRoleArg::Coordinator.as_str(), "coordinator");
+    }
+
+    #[test]
+    fn derive_adhoc_session_id_is_deterministic() {
+        let first = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let second = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let third = derive_adhoc_session_id("W-TCK-00640", "L-issued-002");
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+        assert!(first.starts_with("S-adhoc-"));
+    }
+
+    #[test]
+    fn fac_work_open_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "open",
+            "--from-ticket",
+            "documents/work/tickets/TCK-00640.yaml",
+            "--lease-id",
+            "L-governing-001",
+        ]);
+    }
+
+    #[test]
+    fn fac_work_claim_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "claim",
+            "--work-id",
+            "W-TCK-00640",
+            "--lease-id",
+            "L-governing-001",
+            "--role",
+            "implementer",
+        ]);
+    }
+
     // KNOWN ISSUE (f-685-security-1771186259820160-0): Apm2HomeGuard mutates
     // process-wide environment variables via std::env::set_var, which is inherently
     // racy under parallel test execution. This is a pre-existing pattern used
@@ -6918,6 +7828,17 @@ mod tests {
         }
         DOCTOR_FIX_TEST_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);
         Ok("test-scope".to_string())
+    }
+
+    fn doctor_fix_test_liveness_inactive_for_unit(
+        _lane_id: &str,
+        _job_id: &str,
+    ) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
+    }
+
+    fn doctor_fix_test_liveness_inactive_for_lane(_lane_id: &str) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
     }
 
     fn ensure_queue_dirs_for_doctor_fix_test(queue_root: &Path) {
@@ -7058,6 +7979,47 @@ mod tests {
         assert!(detail.contains("transient.tmp"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_permission_denied_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager
+            .lane_dir(lane_id)
+            .join("tmp")
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("permission-denied tmp tree should be detected");
+        assert!(
+            detail.contains("permission denied"),
+            "unexpected detail: {detail}"
+        );
+    }
+
     #[test]
     fn test_detect_lane_tmp_corruption_with_entry_limit_fails_closed() {
         let home = tempfile::tempdir().expect("temp dir");
@@ -7140,7 +8102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_lane_tmp_dir_with_entry_limit_fails_closed() {
+    fn test_scrub_lane_tmp_dir_with_entry_limit_defers_cleanup_when_entry_limit_exceeded() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -7157,12 +8119,62 @@ mod tests {
                 .expect("write nested tmp file");
         }
 
-        let err = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
-            .expect_err("tmp scrub should fail when entry limit is exceeded");
-        assert!(
-            err.contains("entry bound"),
-            "expected entry bound failure, got: {err}"
+        let scrub = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
+            .expect("tmp scrub should succeed via deferred cleanup fallback");
+        assert_eq!(
+            scrub.deferred_cleanup_roots, 1,
+            "entry-limit overflow should defer old tmp tree instead of failing"
         );
+        assert!(
+            manager.lane_dir(lane_id).join("tmp").is_dir(),
+            "tmp directory must be recreated after deferred cleanup fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scrub_lane_tmp_dir_repairs_write_only_broker_requests_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request-1.json"), b"{\"op\":\"a\"}")
+            .expect("write broker request 1");
+        std::fs::write(nested_dir.join("request-2.json"), b"{\"op\":\"b\"}")
+            .expect("write broker request 2");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id)
+            .expect("tmp scrub should recover from write-only broker_requests tree");
+        assert!(
+            scrub.entries_deleted >= 2,
+            "expected scrub to delete broker request files, got {scrub:?}"
+        );
+
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
     }
 
     #[test]
@@ -7222,6 +8234,63 @@ mod tests {
         assert_eq!(
             payload.get("action").and_then(|value| value.as_str()),
             Some("lane_tmp_corruption_detected")
+        );
+    }
+
+    #[test]
+    fn test_record_gc_maintenance_action_marks_unavailable_as_failed() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(&mut actions, Err("boom".to_string()));
+        assert!(
+            failed,
+            "GC unavailability should signal doctor action failure"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Failed);
+        assert!(
+            actions[0]
+                .detail
+                .contains("autonomous GC maintenance unavailable"),
+            "unexpected detail: {}",
+            actions[0].detail
+        );
+    }
+
+    #[test]
+    fn test_record_gc_maintenance_action_partial_errors_are_non_fatal() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(
+            &mut actions,
+            Ok(fac_gc::DoctorGcMaintenanceSummary {
+                plan_targets: 2,
+                actions_applied: 1,
+                errors: 1,
+                bytes_freed: 1024,
+                receipt_path: PathBuf::from("/tmp/receipt.json"),
+                migration_files_moved: 0,
+                migration_files_failed: 0,
+                migration_skipped: true,
+                migration_warning: None,
+            }),
+        );
+        assert!(
+            !failed,
+            "GC partial action errors should remain non-fatal for doctor flow"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Applied);
+        assert!(
+            actions[0].detail.starts_with("partial_gc_with_errors:"),
+            "unexpected detail: {}",
+            actions[0].detail
         );
     }
 
@@ -7372,6 +8441,8 @@ mod tests {
             SystemDoctorFixHooks {
                 collect_snapshot: doctor_fix_test_collect_snapshot,
                 restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
             },
         );
         let second_exit = run_system_doctor_fix_with_hooks(
@@ -7384,6 +8455,8 @@ mod tests {
             SystemDoctorFixHooks {
                 collect_snapshot: doctor_fix_test_collect_snapshot,
                 restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
             },
         );
 
@@ -7416,6 +8489,172 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_restarts_worker_for_still_active_claimed_lock_without_running_lane() {
+        use fs2::FileExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let claimed_path = queue_root
+            .join("claimed")
+            .join("doctor-fix-flock-held-job.json");
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "doctor-fix-flock-held-job",
+            "kind": "gates",
+        });
+        std::fs::write(
+            &claimed_path,
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed job"),
+        )
+        .expect("write claimed job");
+
+        // Hold the claimed-file lock from this process so queue reconcile sees
+        // a still-active flock-held entry while no lane is RUNNING.
+        let claimed_lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed file for lock");
+        claimed_lock_file
+            .lock_exclusive()
+            .expect("acquire claimed lock");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should complete even when claimed lock is held"
+        );
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "still-active flock-held claimed jobs with no running lanes must trigger worker restart"
+        );
+        assert!(
+            claimed_path.exists(),
+            "doctor should not mutate the claimed file while flock-held"
+        );
+
+        drop(claimed_lock_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_recovers_from_write_only_tmp_residue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let lane_id = "lane-00";
+        manager
+            .mark_corrupt(
+                lane_id,
+                "tmp cleanup permission denied during worker crash",
+                None,
+            )
+            .expect("mark lane corrupt");
+
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should auto-recover write-only tmp residue"
+        );
+
+        let status = manager
+            .lane_status(lane_id)
+            .expect("load lane status after doctor --fix");
+        assert_ne!(
+            status.state,
+            LaneState::Corrupt,
+            "lane should not remain CORRUPT after doctor fix"
+        );
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none(),
+            "doctor fix should clear the corrupt marker"
+        );
+        assert!(tmp_dir.is_dir(), "doctor fix should restore tmp directory");
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after doctor fix")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after doctor fix");
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "lane reset recovery should restart worker exactly once"
+        );
+    }
+
     #[test]
     fn test_work_status_response_serialization() {
         let response = WorkStatusResponse {
@@ -7435,6 +8674,128 @@ mod tests {
         let restored: WorkStatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.work_id, "work-123");
         assert_eq!(restored.status, "CLAIMED");
+    }
+
+    fn daemon_work_item_for_current_tests(
+        work_id: &str,
+        status: &str,
+        role: Option<WorkRole>,
+        lease_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> apm2_daemon::protocol::WorkStatusResponse {
+        apm2_daemon::protocol::WorkStatusResponse {
+            work_id: work_id.to_string(),
+            status: status.to_string(),
+            role: role.map(|value| value as i32),
+            lease_id: lease_id.map(ToString::to_string),
+            session_id: session_id.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_tck_from_text_accepts_valid_pattern() {
+        assert_eq!(
+            extract_tck_from_text("ticket/RFC-0018/TCK-00640"),
+            Some("TCK-00640".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tck_from_text_rejects_invalid_pattern() {
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-006400"), None);
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_returns_single_candidate() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "BLOCKED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, None, None)
+            .expect("single active implementer candidate should be selected");
+        assert_eq!(selected, "W-AAA111");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_honors_filters() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, Some("L-222"), Some("S-222"))
+            .expect("lease/session filter should isolate a single candidate");
+        assert_eq!(selected, "W-BBB222");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_errors_on_ambiguity() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "RUNNING",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let error = select_work_current_fallback_work_id(&items, None, None)
+            .expect_err("multiple active candidates must fail closed");
+        assert!(error.contains("multiple active Implementer work items"));
+    }
+
+    #[test]
+    fn work_current_projection_fallback_requested_requires_explicit_filters() {
+        assert!(!work_current_projection_fallback_requested(None, None));
+        assert!(work_current_projection_fallback_requested(
+            Some("L-123"),
+            None
+        ));
+        assert!(work_current_projection_fallback_requested(
+            None,
+            Some("S-123")
+        ));
+    }
+
+    #[test]
+    fn unresolved_work_current_alias_message_includes_fail_closed_guidance() {
+        let msg = unresolved_work_current_alias_message("TCK-00640");
+        assert!(msg.contains("TCK-00640"));
+        assert!(msg.contains("Refusing projection fallback"));
+        assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
 
     #[test]
@@ -7562,13 +8923,12 @@ mod tests {
     #[test]
     fn test_extract_work_info_success() {
         let payload = serde_json::json!({
-            "work_id": "work-123",
             "actor_id": "actor-1",
             "role": "implementer"
         });
         let event = EventRecord::new(
             "work_claimed",
-            "session-1",
+            "work-123",
             "actor-1",
             serde_json::to_vec(&payload).unwrap(),
         );
@@ -7581,13 +8941,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_work_info_metadata_first_for_legacy_rows() {
+    fn test_extract_work_info_matches_session_metadata() {
         let payload = serde_json::json!({
             "role": "implementer"
         });
         let event = EventRecord::new(
             "work_claimed",
-            "work-123", // legacy compat maps work_id -> session_id
+            "work-123",
             "actor-from-row",
             serde_json::to_vec(&payload).unwrap(),
         );
@@ -7595,25 +8955,27 @@ mod tests {
         let info = extract_work_info(&event, "work-123").expect("should match via metadata");
         assert!(
             info.episode_id.is_none(),
-            "legacy work rows should not infer episode_id"
+            "work rows should not infer episode_id when payload omits it"
         );
     }
 
     #[test]
-    fn test_extract_work_info_payload_fallback_for_episode_rows() {
+    fn test_extract_work_info_rejects_payload_only_match() {
         let payload = serde_json::json!({
-            "work_id": "work-123"
+            "work_id": "work-123",
+            "episode_id": "episode-001"
         });
         let event = EventRecord::new(
             "episode_spawned",
-            "episode-001", // daemon stores episode_id in legacy work_id column
+            "session-001",
             "daemon",
             serde_json::to_vec(&payload).unwrap(),
         );
 
-        let info =
-            extract_work_info(&event, "work-123").expect("should match via payload fallback");
-        assert_eq!(info.episode_id.as_deref(), Some("episode-001"));
+        assert!(
+            extract_work_info(&event, "work-123").is_none(),
+            "payload-only work_id match must be rejected"
+        );
     }
 
     #[test]

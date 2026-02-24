@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00640
     title: 'RFC-0032 Phase 2: extend `apm2 fac push` to bind work_id + emit terminal contract markers'
-    status: OPEN
+    status: IN_PROGRESS
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032
@@ -16,6 +16,7 @@ ticket_meta:
     responsibility_domains:
     - DOMAIN_CLI
     - DOMAIN_PROTOCOL
+    - DOMAIN_DAEMON
   dependencies:
     tickets:
     - ticket_id: TCK-00638
@@ -26,24 +27,134 @@ ticket_meta:
       reason: Needs ticket-alias -> work_id resolution
   scope:
     in_scope:
-    - Add `--work-id <W-...>` to `apm2 fac push` (and/or `--ticket-alias` resolution) and ensure work_id is bound through PublishChangeSet
-    - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE), PublishWorkContextEntry(IMPLEMENTER_TERMINAL)'
-    - 'Enforce hard terminal contract: HANDOFF_NOTE and IMPLEMENTER_TERMINAL must exist per session attempt'
-    - Do not emit any `work.transitioned` events from CLI; CLI only publishes changeset + context markers
+    - Resolve `work_id` deterministically for `apm2 fac push` via priority order: explicit `--work-id`, explicit/derived ticket alias (`TCK-*`) via daemon alias authority; unresolved alias must fail closed (no implicit global fallback)
+    - Allow daemon projection fallback only when explicitly requested (`--lease-id`/`--session-id`) and no branch/worktree TCK alias context is available
+    - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id, lease_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE optional), PublishWorkContextEntry(IMPLEMENTER_TERMINAL required)'
+    - Enforce terminal contract from ledger+CAS truth: IMPLEMENTER_TERMINAL is mandatory per push attempt; HANDOFF_NOTE is optional
+    - Keep CLI non-authoritative for lifecycle transitions (no direct `work.transitioned` emission)
+    - Remove legacy work-event envelope decode branches from projection rebuild; enforce session-envelope contract (`event_type`, `session_id`, `actor_id`, `payload`) while allowing extension fields
+    - Restore daemon authoritative lease/work continuity for pre-cutover claims by allowing controlled `work_claims` fallback when `gate_lease_issued` rows are absent; authoritative lease rows must take precedence
+    - Ensure migration fallback fails closed on ambiguous lease bindings and invalid empty bindings
+    - Keep lease fallback lookup bounded and indexed (`work_claims.lease_id`) to avoid unbounded scans
+    - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
+    - Prevent one-shot inline worker fallback cycles from spawning persistent queue watcher/watchdog threads so `fac push` cannot leak inotify instances/threads under retries
+    - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
+    - Run FAC review machine-spec snapshot fast check before queued gates; fail closed when `documents/reviews/fac_review_state_machine.cac.json` is stale relative to code-generated spec
+    - Preserve queue claim lock ownership through terminal transition commit paths so no second worker can re-claim mid-transition
+    - Enforce CLCK single-owner lock lifecycle (`claim -> execute -> terminal_commit -> release`) via `ClaimedJobLockGuardV1` across worker and orchestrator terminal paths
+    - Add guarded receipt pipeline commit APIs that skip lock reacquire when a live claimed lock guard is supplied; keep legacy pipeline commit for non-worker callers
+    - Bind claimed-lock continuity evidence into terminal receipts (`claimed_lock_continuity_v1`, `claimed_lock_acquired_at_epoch_ms`, `claimed_lock_release_phase`)
+    - Ensure control-lane `stop_revoke` terminal commits use the same claimed lock guard continuity contract as non-control-lane jobs
+    - Enforce case-insensitive `(work_id, pr_number, commit_sha)` uniqueness for `work.pr_associated` in both legacy and canonical sqlite schemas
     out_of_scope:
     - Daemon-side CI processor transitions (separate ticket)
   plan:
     steps:
-    - Update CLI args in `crates/apm2-cli/src/commands/fac_review/push.rs` to accept work-id / ticket-alias
-    - Thread resolved work_id into existing PublishChangeSet request path
-    - Call RecordWorkPrAssociation and PublishWorkContextEntry RPCs; ensure retries are safe (idempotent dedupe keys)
-    - 'Add CLI-level validation: require handoff note text and ensure dedupe_key=session_id is used'
-    - 'Add integration test: run fac push twice and verify no duplicate context entries/evidence events'
+    - Keep CLI argument surface for explicit work binding while defaulting to branch alias/work-claim resolution for manual operator flow
+    - Thread resolved `work_id` through PublishChangeSet, PR association, and context publication calls
+    - Ensure idempotent retries with stable dedupe keys and scoped lease->work recovery behavior
+    - Harden daemon lease validator fallback semantics (authoritative precedence, ambiguity refusal, indexed lookup path)
+    - Make `--handoff-note` optional; always emit IMPLEMENTER_TERMINAL marker
+    - Harden projection rebuild decoder to current session envelope contract and remove historical raw/payload-only branches
+    - Add early PR-association preflight to `fac push` fast checks (non-mutating validation path)
+    - Keep claimed lock file descriptor held until terminal queue mutation finishes
+    - Harden PR-association tuple dedupe/indexes to normalize commit SHA case
+    - Add/maintain regression tests for idempotent push replay and lease-mapping recovery in publication closures
+    - Keep one-shot worker runtime minimal (no long-lived background watcher/watchdog) to avoid EMFILE under repeated inline fallback cycles
+  implementation_status:
+    completed_in_this_pr:
+    - "`apm2 fac push` requires canonical work binding for publication paths and enforces IMPLEMENTER_TERMINAL publication on every push attempt."
+    - "`--handoff-note` is optional; HANDOFF_NOTE context publication is conditional while IMPLEMENTER_TERMINAL remains mandatory."
+    - "Fast preflight checks (including PR association compatibility) execute before expensive gate execution."
+    - "Fast preflight now includes FAC review machine-spec snapshot consistency guard and fails closed before gate enqueue when snapshot drift is detected."
+    - "Projection rebuild rejects historical raw protobuf/payload-only work envelopes and requires the canonical session envelope contract."
+    - "Review dispatch/runtime joins are fail-closed on missing runtime handles and PID identity mismatches."
+    - "`fac review prepare` now bounds inline output (2000-line limit) and returns artifact references/metadata for oversized payloads."
+    - "Reviewer subprocess context now carries authoritative PR/head/run identifiers via environment propagation."
+    - "Sqlite lease validation now recovers lease->work and executor actor bindings from persisted `work_claims` when legacy claims predate canonical `gate_lease_issued` rows."
+    - "`PublishChangeSetRequest` now requires `lease_id`; daemon enforces strict lease->work->claim->actor binding before CAS or ledger mutation."
+    - "Lease fallback is fail-closed on ambiguous `lease_id -> (work_id, actor_id)` mappings and rejects empty bindings."
+    - "Privileged PCAC lifecycle helpers now resolve claims strictly by `(lease_id, work_id)` and no longer use role-agnostic claim fallback."
+    - "IngestReviewReceipt now enforces strict lease-scoped claim binding with fail-closed denial when the authoritative lease claim is missing, even if unrelated same-work claims exist."
+    - "Work-claim schema now includes `idx_work_claims_lease_id` to keep fallback lookup deterministic and performant."
+    - "Work status runtime-binding branch now uses clippy-clean `lease_id.is_empty()` guard ordering (no behavior change)."
+    - "Worker claimed-lock handling now retains the lock through terminal queue transition to close TOCTOU re-claim races."
+    - "Claimed lock continuity is now modeled as `ClaimedJobLockGuardV1` and threaded from atomic claim through all worker/orchestrator terminal commit paths."
+    - "Receipt pipeline now supports guarded commit APIs (`commit_with_claimed_lock`, `commit_signed_with_claimed_lock`) that do not perform secondary lock acquisition."
+    - "Terminal job receipts now carry CLCK continuity evidence fields for audit (`claimed_lock_continuity_v1`, `claimed_lock_acquired_at_epoch_ms`, `claimed_lock_release_phase`)."
+    - "Control-lane stop_revoke path now retains and uses the same claimed lock guard for terminal commit as regular lanes."
+    - "`work.pr_associated` tuple uniqueness now normalizes commit SHA case via case-insensitive partial unique indexes for both legacy and canonical sqlite event tables."
+    - "Authoritative ledger emitter now rejects `work.pr_associated` PR-number flapping per work_id (`WORK_PR_BINDING_CONFLICT`) under concurrent writes."
+    - "Gates/warm pipeline-commit failures now stay fail-closed in `claimed/` for reconcile recovery (no authority-token requeue replay loops)."
+    - "One-shot worker cycles (`run_fac_worker(..., once=true)`) now skip queue watcher and watchdog thread startup, preventing in-process thread/inotify accumulation during inline `fac push` fallback."
+    - "Gates wait FSM was rewritten to explicit probe/evaluate/detect/act/sleep states with bounded inline cooldown, eliminating busy-spin inline fallback loops."
+    - "Direct receipt-emission paths now fail closed when receipt persistence fails after terminal move: denied/quarantined files are restored to `queue/pending` for reconcile-safe retry instead of remaining terminal-without-receipt."
+    - "Push/work-current identity resolution now fail closed when branch-derived `TCK-*` alias is unresolved; implicit global active-work fallback is disabled to prevent cross-PR/work misbinding."
+    - "Projection fallback for identity recovery is now explicit-only (`--lease-id`/`--session-id`) when no alias context is derivable."
+    - "Work projection replay now performs deterministic PR rebind migration from legacy non-ticket work IDs to canonical `W-TCK-*` work IDs, preventing projection rebuild failure under mixed historical associations."
+  remaining_focus:
+    - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
+  verification_matrix:
+    targeted_tests:
+    - "`cargo test -p apm2-cli dispatch::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli prepare::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli target::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli load_pr_identity_by_head_sha -- --nocapture`"
+    - "`cargo test -p apm2-cli reviewer_context_env_contains_required_identifiers -- --nocapture`"
+    - "`cargo test -p apm2-cli diagnose_present_run_state_marks -- --nocapture`"
+    - "`cargo test -p apm2-cli repair_run_state_present_with_inconsistent_runtime_handle_rebuilds_state -- --nocapture`"
+    - "`cargo test -p apm2-daemon sqlite_lease_validator_ -- --nocapture`"
+    - "`cargo test -p apm2-daemon sqlite_work_registry_schema_creates_lease_lookup_index -- --nocapture`"
+    - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
+    - "`cargo test -p apm2-core test_commit_with_claimed_lock_succeeds_with_outer_lock_held -- --nocapture`"
+    - "`cargo test -p apm2-core test_commit_fails_fast_when_claimed_file_lock_is_busy -- --nocapture`"
+    - "`cargo test -p apm2-cli one_shot_worker_skips_background_runtime_primitives -- --nocapture`"
+    - "`cargo test -p apm2-cli gates_wait_machine -- --nocapture`"
+    - "`cargo test -p apm2-cli fac_review_machine_spec_guard -- --nocapture`"
+    - "`cargo test -p apm2-cli fac_review_machine_spec_snapshot_is_current -- --nocapture`"
+    - "`cargo test -p apm2-cli test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure -- --nocapture`"
+    - "`cargo test -p apm2-daemon tck_00639_work_pr_associated_unique_constraint_is_case_insensitive -- --nocapture`"
+    - "`cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture`"
+    - "`cargo test -p apm2-daemon test_ingest_review_receipt_denies_when_authoritative_lease_claim_missing -- --nocapture`"
+    - "`cargo test -p apm2-daemon --test tck_00407_fac_receipt_identity_idempotency -- --nocapture`"
+    full_package:
+    - "`cargo test -p apm2-cli`"
+    static_checks:
+    - "`cargo fmt --all`"
+    - "`cargo clippy -p apm2-cli --all-targets --all-features -- -D warnings`"
   definition_of_done:
     evidence_ids: []
     criteria:
-    - '`apm2 fac push` binds changeset publication to a specific work_id and records required terminal markers.'
-    - The terminal contract is enforceable from ledger+CAS alone (no local files required for truth).
+    - '`apm2 fac push` binds changeset publication to an authoritative `work_id` and records required terminal markers.'
+    - "PublishChangeSet is lease-bound (`work_id + lease_id`) and denied on any authoritative binding mismatch before side effects."
+    - Terminal closure semantics are enforceable from ledger+CAS alone (IMPLEMENTER_TERMINAL required, HANDOFF_NOTE optional).
+    - Projection-backed work identity recovery no longer fails on extension fields in current session envelopes.
     - CLI does not emit work transitions; CI/system actors remain the only sources of CI transitions.
+    - Queue terminal transitions are serialized by retaining the claimed lock until transition commit completion.
+    - Worker/orchestrator terminal commits use guarded pipeline APIs and perform no secondary claimed-file lock acquisition while guard continuity is active.
+    - Terminal receipts produced from guarded commit paths include CLCK evidence fields required for continuity audit.
+    - One-shot inline worker fallback cannot leak long-lived watcher/watchdog runtime primitives across retries.
+    - PR association idempotency is robust to commit SHA case variants in both legacy and canonical ledger storage.
+    - Projection replay remains available (non-bricking) when historical ledgers contain legacy-to-canonical PR association migration events.
+    - Fast-check phase fails before queued gates when FAC review machine-spec snapshot drift is present.
   notes:
     verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-PR-BIND-001
+    - INV-FAC-PR-BIND-002
+    - INV-CLCK-001
+    - INV-CLCK-002
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.

@@ -5,6 +5,10 @@
 //! authoritative `SQLite` ledger stream in addition to filesystem mutations.
 #![allow(dead_code)] // Staged migration helper: additional emit_* paths wire in follow-up tickets.
 
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::BTreeMap;
 #[cfg(not(test))]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,8 @@ use apm2_daemon::htf::{ClockConfig, HolonicClock};
 use apm2_daemon::ledger::SqliteLedgerEventEmitter;
 use apm2_daemon::protocol::dispatch::LedgerEventEmitter;
 use rusqlite::Connection;
+#[cfg(test)]
+use serde::Serialize;
 
 use super::{fac_key_material, fac_secure_io};
 
@@ -33,6 +39,88 @@ use super::{fac_key_material, fac_secure_io};
 const DEFAULT_CONFIG_FILE: &str = "ecosystem.toml";
 #[cfg(test)]
 const TEST_QUEUE_LIFECYCLE_LEDGER_DB: &str = "queue_lifecycle_ledger.db";
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DeterministicLifecycleEmission {
+    pub event_type: String,
+    pub queue_job_id: String,
+    pub actor_id: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeterministicFailureStep {
+    pub event_type: String,
+    pub queue_job_id: Option<String>,
+    pub times: usize,
+    pub error_message: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct DeterministicLifecycleHarnessConfig {
+    pub simulate_only: bool,
+    pub failure_steps: Vec<DeterministicFailureStep>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DeterministicLifecycleHarnessState {
+    active: bool,
+    simulate_only: bool,
+    failure_steps: Vec<DeterministicFailureStep>,
+    emissions: Vec<DeterministicLifecycleEmission>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DETERMINISTIC_LIFECYCLE_HARNESS: RefCell<DeterministicLifecycleHarnessState> =
+        RefCell::new(DeterministicLifecycleHarnessState::default());
+}
+
+#[cfg(test)]
+pub(super) struct DeterministicLifecycleHarnessGuard;
+
+#[cfg(test)]
+impl Drop for DeterministicLifecycleHarnessGuard {
+    fn drop(&mut self) {
+        DETERMINISTIC_LIFECYCLE_HARNESS.with(|state| {
+            *state.borrow_mut() = DeterministicLifecycleHarnessState::default();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_deterministic_lifecycle_harness(
+    config: DeterministicLifecycleHarnessConfig,
+) -> DeterministicLifecycleHarnessGuard {
+    DETERMINISTIC_LIFECYCLE_HARNESS.with(|state| {
+        *state.borrow_mut() = DeterministicLifecycleHarnessState {
+            active: true,
+            simulate_only: config.simulate_only,
+            failure_steps: config.failure_steps,
+            emissions: Vec::new(),
+        };
+    });
+    DeterministicLifecycleHarnessGuard
+}
+
+#[cfg(test)]
+pub(super) fn deterministic_lifecycle_emissions() -> Vec<DeterministicLifecycleEmission> {
+    DETERMINISTIC_LIFECYCLE_HARNESS.with(|state| state.borrow().emissions.clone())
+}
+
+#[cfg(test)]
+pub(super) fn deterministic_lifecycle_emission_counts() -> BTreeMap<String, usize> {
+    let emissions = deterministic_lifecycle_emissions();
+    let mut counts = BTreeMap::new();
+    for emission in emissions {
+        let entry = counts.entry(emission.event_type).or_insert(0);
+        *entry += 1;
+    }
+    counts
+}
 
 pub(super) fn queue_lifecycle_dual_write_enabled(fac_root: &Path) -> Result<bool, String> {
     let policy_path = fac_root.join("policy").join("fac_policy.v1.json");
@@ -217,6 +305,11 @@ fn emit_event(
     event: &FacJobLifecycleEventV1,
     actor_id: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = deterministic_lifecycle_emit_override(event_type, event, actor_id) {
+        return result;
+    }
+
     let payload = event
         .encode_bounded()
         .map_err(|err| format!("encode lifecycle event: {err}"))?;
@@ -234,6 +327,45 @@ fn emit_event(
         )
         .map_err(|err| format!("emit lifecycle event `{event_type}`: {err}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+fn deterministic_lifecycle_emit_override(
+    event_type: &str,
+    event: &FacJobLifecycleEventV1,
+    actor_id: &str,
+) -> Option<Result<(), String>> {
+    DETERMINISTIC_LIFECYCLE_HARNESS.with(|state_cell| {
+        let mut state = state_cell.borrow_mut();
+        if !state.active {
+            return None;
+        }
+
+        let queue_job_id = queue_job_id(event).to_string();
+        state.emissions.push(DeterministicLifecycleEmission {
+            event_type: event_type.to_string(),
+            queue_job_id: queue_job_id.clone(),
+            actor_id: actor_id.to_string(),
+        });
+
+        if let Some(step) = state.failure_steps.iter_mut().find(|step| {
+            step.times > 0
+                && step.event_type == event_type
+                && step
+                    .queue_job_id
+                    .as_ref()
+                    .is_none_or(|candidate| candidate == &queue_job_id)
+        }) {
+            step.times = step.times.saturating_sub(1);
+            return Some(Err(step.error_message.clone()));
+        }
+
+        if state.simulate_only {
+            return Some(Ok(()));
+        }
+
+        None
+    })
 }
 
 /// Opens the queue lifecycle `SQLite` ledger emitter for the given FAC root.
@@ -257,7 +389,46 @@ pub(super) fn open_queue_lifecycle_emitter(
             )
         })?;
     }
-    let conn = Connection::open(&db_path)
+    let mut conn = open_queue_lifecycle_connection(&db_path)?;
+    if let Err(err) = SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key) {
+        if should_reinitialize_empty_lifecycle_ledger(&conn, &err).map_err(|reason| {
+            format!(
+                "inspect queue lifecycle ledger init failure {}: {reason}",
+                db_path.display()
+            )
+        })? {
+            tracing::warn!(
+                ledger_path = %db_path.display(),
+                error = %err,
+                "queue lifecycle ledger init failed on empty DB; rebuilding local lifecycle ledger"
+            );
+            drop(conn);
+            remove_lifecycle_ledger_files(&db_path)?;
+            conn = open_queue_lifecycle_connection(&db_path)?;
+            SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key).map_err(
+                |retry_err| {
+                    format!(
+                        "init queue lifecycle ledger schema {} after rebuild: {retry_err}",
+                        db_path.display()
+                    )
+                },
+            )?;
+        } else {
+            return Err(format!(
+                "init queue lifecycle ledger schema {}: {err}",
+                db_path.display()
+            ));
+        }
+    }
+
+    Ok(SqliteLedgerEventEmitter::new(
+        Arc::new(Mutex::new(conn)),
+        signing_key,
+    ))
+}
+
+fn open_queue_lifecycle_connection(db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(db_path)
         .map_err(|err| format!("open queue lifecycle ledger {}: {err}", db_path.display()))?;
     // f-798-code_quality-1771816912391438-0: Set busy_timeout to prevent
     // SQLITE_BUSY under concurrent queue mutation load (multiple workers
@@ -271,17 +442,58 @@ pub(super) fn open_queue_lifecycle_emitter(
                 db_path.display()
             )
         })?;
-    SqliteLedgerEventEmitter::init_schema_with_signing_key(&conn, &signing_key).map_err(|err| {
-        format!(
-            "init queue lifecycle ledger schema {}: {err}",
-            db_path.display()
-        )
-    })?;
+    Ok(conn)
+}
 
-    Ok(SqliteLedgerEventEmitter::new(
-        Arc::new(Mutex::new(conn)),
-        signing_key,
-    ))
+fn should_reinitialize_empty_lifecycle_ledger(
+    conn: &Connection,
+    init_err: &rusqlite::Error,
+) -> Result<bool, String> {
+    if !matches!(init_err, rusqlite::Error::InvalidQuery) {
+        return Ok(false);
+    }
+    lifecycle_event_count(conn).map(|count| count == 0)
+}
+
+fn lifecycle_event_count(conn: &Connection) -> Result<u64, String> {
+    let mut total = 0u64;
+    for table in ["ledger_events", "events"] {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = conn
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|err| format!("count rows in {table}: {err}"))?;
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| format!("negative row count reported for {table}: {count}"))?;
+        total = total.saturating_add(count_u64);
+    }
+    Ok(total)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("check table existence for {table}: {err}"))
+}
+
+fn remove_lifecycle_ledger_files(db_path: &Path) -> Result<(), String> {
+    for suffix in ["", "-wal", "-shm"] {
+        let target = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if let Err(err) = std::fs::remove_file(&target)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "remove lifecycle ledger artifact {}: {err}",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,7 +586,7 @@ fn identity_from_spec(spec: &FacJobSpecV1) -> Result<FacJobIdentityV1, String> {
         blake3::hash(spec.source.head_sha.as_bytes()).to_hex()
     );
     let preimage = FacJobIdentityPreimageV1 {
-        work_id: spec.source.repo_id.clone(),
+        work_id: spec.source.work_id.clone(),
         changeset_digest: changeset_digest.clone(),
         gate_profile: gate_profile.clone(),
         revision: spec.job_spec_digest.clone(),

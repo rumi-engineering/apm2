@@ -67,7 +67,7 @@ fn make_secure_cas_dir() -> (TempDir, std::path::PathBuf) {
 fn claim_work(
     dispatcher: &apm2_daemon::protocol::dispatch::PrivilegedDispatcher,
     ctx: &ConnectionContext,
-) -> String {
+) -> (String, String) {
     let claim_request = ClaimWorkRequest {
         actor_id: "tck-00412-test-actor".to_string(),
         role: WorkRole::Implementer.into(),
@@ -78,7 +78,12 @@ fn claim_work(
         .dispatch(&encode_claim_work_request(&claim_request), ctx)
         .expect("ClaimWork should dispatch");
     match claim_response {
-        PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+        PrivilegedResponse::ClaimWork(resp) => {
+            dispatcher
+                .lease_validator()
+                .register_lease(&resp.lease_id, &resp.work_id, "gate-test");
+            (resp.work_id, resp.lease_id)
+        },
         other => panic!("Expected ClaimWork response, got {other:?}"),
     }
 }
@@ -153,7 +158,7 @@ fn tck_00412_publish_changeset_production_with_cas_semantic_idempotency() {
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
-    let work_id = claim_work(dispatcher, &ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx);
 
     let canonical_bundle = serde_json::to_vec(&make_valid_bundle("cs-prod-semantic")).unwrap();
     let noncanonical_bundle = make_noncanonical_bundle_json("cs-prod-semantic");
@@ -162,6 +167,7 @@ fn tck_00412_publish_changeset_production_with_cas_semantic_idempotency() {
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id: lease_id.clone(),
                 bundle_bytes: canonical_bundle,
             }),
             &ctx,
@@ -178,6 +184,7 @@ fn tck_00412_publish_changeset_production_with_cas_semantic_idempotency() {
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes: noncanonical_bundle,
             }),
             &ctx,
@@ -227,12 +234,13 @@ fn tck_00412_publish_changeset_fails_closed_without_cas() {
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
-    let work_id = claim_work(dispatcher, &ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx);
 
     let response = dispatcher
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes: serde_json::to_vec(&make_valid_bundle("cs-no-cas")).unwrap(),
             }),
             &ctx,
@@ -274,7 +282,7 @@ fn tck_00412_publish_changeset_rejects_ownership_mismatch_before_mutation() {
     let dispatcher = state.privileged_dispatcher();
     let owner_ctx = make_privileged_ctx(1000, 1000);
     let non_owner_ctx = make_privileged_ctx(2000, 2000);
-    let work_id = claim_work(dispatcher, &owner_ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &owner_ctx);
 
     let bundle_bytes = serde_json::to_vec(&make_valid_bundle("cs-owner-mismatch")).unwrap();
     let expected_hash = *blake3::hash(&bundle_bytes).as_bytes();
@@ -283,6 +291,7 @@ fn tck_00412_publish_changeset_rejects_ownership_mismatch_before_mutation() {
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             }),
             &non_owner_ctx,
@@ -333,7 +342,7 @@ fn tck_00412_publish_changeset_rejects_invalid_bundle() {
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
-    let work_id = claim_work(dispatcher, &ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx);
 
     let mut bundle = make_valid_bundle("cs-invalid-bundle");
     bundle.diff_format = "custom_diff".to_string();
@@ -345,6 +354,7 @@ fn tck_00412_publish_changeset_rejects_invalid_bundle() {
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             }),
             &ctx,
@@ -396,7 +406,7 @@ fn tck_00412_publish_changeset_rejects_digest_mismatch() {
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
-    let work_id = claim_work(dispatcher, &ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx);
 
     let mut bundle = make_valid_bundle("cs-digest-mismatch");
     bundle.changeset_digest = [0xAA; 32];
@@ -407,6 +417,7 @@ fn tck_00412_publish_changeset_rejects_digest_mismatch() {
         .dispatch(
             &encode_publish_changeset_request(&PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             }),
             &ctx,
@@ -469,7 +480,7 @@ fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
 
     let dispatcher = state.privileged_dispatcher();
     let ctx = make_privileged_ctx(1000, 1000);
-    let work_id = claim_work(dispatcher, &ctx);
+    let (work_id, lease_id) = claim_work(dispatcher, &ctx);
 
     let bundle_bytes = serde_json::to_vec(&make_valid_bundle("cs-concurrent")).unwrap();
     let barrier = Barrier::new(NUM_THREADS);
@@ -481,6 +492,7 @@ fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
                     let thread_ctx = make_privileged_ctx(1000, 1000);
                     let request = PublishChangeSetRequest {
                         work_id: work_id.clone(),
+                        lease_id: lease_id.clone(),
                         bundle_bytes: bundle_bytes.clone(),
                     };
                     let encoded = encode_publish_changeset_request(&request);

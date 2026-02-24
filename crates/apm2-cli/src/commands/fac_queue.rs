@@ -646,6 +646,7 @@ mod tests {
             source: apm2_core::fac::job_spec::JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: "test/repo".to_string(),
+                work_id: "W-TEST".to_string(),
                 head_sha: "a".repeat(40),
                 patch: None,
             },

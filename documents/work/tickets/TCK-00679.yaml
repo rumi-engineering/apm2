@@ -1,0 +1,170 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00679"
+    title: "FAC: safe_rmtree_v1 cannot recover lanes with sandboxed 0333-mode broker_requests directories"
+    status: "IN_PROGRESS"
+    severity: "major"
+    component: "fac/lane"
+    tags: ["recovery-gap", "safe-rmtree", "lane-corruption", "broker-requests", "sandbox"]
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0019"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER", "AGENT_REVIEWER"]
+    responsibility_domains: ["DOMAIN_FAC", "DOMAIN_LANE", "DOMAIN_SANDBOX"]
+  dependencies:
+    tickets: []
+
+root_cause_analysis:
+  summary: |
+    When a gate process is killed mid-run (e.g., worker restart, OOM, timeout),
+    the lane tmp directory retains residue from the sandboxed execution
+    environment. This residue includes `broker_requests` directories created
+    with mode 0333 (write-only, used for sandboxed gate->broker IPC). When the
+    lane cleanup path invokes `safe_rmtree_v1`, it fails with EPERM on
+    `openat()` because 0333 lacks the read bit needed to enumerate directory
+    contents.
+
+    This leaves the lane in CORRUPT state with no automated recovery path.
+    `apm2 fac doctor --fix` also fails at the `lane_tmp_scrub` step for the
+    same reason. The only fix is manual `chmod -R u+rwX` on the lane tmp
+    directory before retrying doctor or reset.
+
+    This is a recurring issue — observed at least 3 times across two sessions
+    (2026-02-22 03:xx UTC, 2026-02-22 ~17:xx UTC, 2026-02-23 ~06:38 UTC).
+
+    Likely triggered by orchestrators running `apm2 fac gc`.
+
+  observed_compounding_failures: |
+    Two distinct corruption events were observed on lane-00 in a single session:
+
+    1. Primary (this ticket): 0333-mode broker_requests tmp residue after worker
+       crash. Lane entered CORRUPT with ~2024 stale tmp entries. The rm -rf used
+       to clear was unnecessarily destructive — `chmod -R u+rwX` followed by
+       `apm2 fac doctor --fix` would have sufficed per the workaround above.
+
+    2. Secondary (separate issue, compounding): After clearing the 0333 corruption,
+       lane-00's next gate run failed because its rustup home had no toolchains
+       installed (~/.apm2/private/fac/lanes/lane-00/home/.rustup/toolchains/ was
+       empty). The lane attempted to download nightly-2025-12-01 from
+       static.rust-lang.org but failed with DNS resolution errors inside the
+       sandbox (network isolation prevents downloads). Lane-01 had toolchains
+       correctly provisioned; lane-00 did not. This indicates lane re-bootstrap
+       after CORRUPT recovery does not re-seed the rustup toolchain directory.
+       Workaround was to symlink lane-01's toolchains into lane-00.
+
+    These are two distinct failure modes that compound: the 0333 permission bug
+    prevents automated recovery, and the lack of toolchain health-checking after
+    recovery leaves the lane unable to execute gates even once cleaned.
+    The rustup toolchain gap is tracked as a candidate for a follow-on ticket
+    (RMTREE-004 or separate TCK).
+
+  chain:
+    - id: "RC-01"
+      title: "Gate processes run inside systemd scopes with restricted permissions"
+      detail: |
+        The broker_requests IPC directories are created mode 0333 (d-wx-wx-wx)
+        so sandboxed gates can write request files but not list/read them.
+    - id: "RC-02"
+      title: "safe_rmtree_v1 requires read bit for directory traversal"
+      detail: |
+        `safe_rmtree_v1` uses `openat(O_DIRECTORY)` to traverse and enumerate
+        child entries before deletion. This requires the read bit on directories.
+    - id: "RC-03"
+      title: "openat fails on 0333 directories -> lane marked CORRUPT"
+      detail: |
+        When mode is 0333, `openat` returns EACCES -> safe_rmtree aborts ->
+        lane cleanup fails -> lane marked CORRUPT.
+    - id: "RC-04"
+      title: "All files are owned by the same user — chmod u+r is sufficient"
+      detail: |
+        All files are owned by the same user (ubuntu:ubuntu), so `chmod u+r`
+        is sufficient — no privilege escalation needed.
+
+  reproduction: |
+    1. Start a gate job that creates broker_requests dirs (any gates job)
+    2. Kill the worker mid-run: `systemctl --user restart apm2-worker.service`
+    3. Observe lane-00 (or whichever lane was active) enters CORRUPT state
+    4. `apm2 fac doctor --fix` fails at lane_tmp_scrub with:
+       "I/O error during openat directory .../broker_requests: Permission denied
+       (os error 13)"
+    5. Lane remains CORRUPT until manual intervention
+
+  current_workaround: |
+    chmod -R u+rwX ~/.apm2/private/fac/lanes/<lane-id>/tmp/
+    apm2 fac doctor --fix
+
+  error_signature: |
+    lane cleanup failed: temp directory prune failed during temp_prune:
+    I/O error during openat directory
+    /home/ubuntu/.apm2/private/fac/lanes/lane-00/tmp/.tmpXXXXXX/queue/broker_requests:
+    Permission denied (os error 13) (failure_step=temp_prune)
+
+scope:
+  in_scope:
+    - id: "RMTREE-001"
+      title: "Residual hardening: keep mode-normalization fail-closed under adversarial trees"
+      detail: |
+        The core pre-delete normalization path now repairs user-owned directories
+        via handle-relative operations and bounded traversal. Remaining work is
+        hardening/verification:
+          - preserve symlink refusal and ownership checks under race pressure
+          - preserve Linux portability by avoiding unsupported chmod flag usage
+            (`AT_SYMLINK_NOFOLLOW`/`NoFollowSymlink`) for directory mode repair
+            while still operating via an `O_NOFOLLOW|O_DIRECTORY` handle
+          - keep global directory-scan and depth bounds enforced
+          - maintain deterministic error surfaces for doctor/lane recovery flows
+
+    - id: "RMTREE-003"
+      title: "Integration test: kill worker mid-gate, verify lane auto-recovers"
+      detail: |
+        Add a test that simulates worker crash during gate execution and
+        verifies the lane recovers within 60s without manual intervention.
+  requirement_clarifications:
+    - "safe_rmtree pre-delete normalization must use handle-based directory operations (no symlink-following chmod path) and bounded traversal to prevent TOCTOU/DoS regressions."
+    - "Directory mode repair must remain Linux-compatible: no `fchmodat` nofollow flag combinations rejected by the kernel; safety comes from nofollow directory handles."
+    - "Lane recovery must remain doctor-driven and deterministic under repeated crash/restart cycles."
+
+  out_of_scope:
+    - "Changing broker_requests creation mode from 0333 to 0700 (Option C — may be considered separately)"
+    - "Adding --force-unsafe-cleanup flag (Option B — unnecessary if Option A works)"
+
+  affected_paths:
+    - "crates/apm2-core/src/fac/safe_rmtree.rs"    # safe_rmtree_v1 implementation
+    - "crates/apm2-core/src/fac/lane.rs"           # lane cleanup/state transitions
+    - "crates/apm2-core/src/fac/reconcile.rs"      # lane recovery scrub path
+    - "crates/apm2-cli/src/commands/fac.rs"        # doctor --fix lane_tmp_scrub orchestration
+
+impact: |
+  - Reduces effective lane pool by 1 per occurrence (33% capacity loss with 3 lanes)
+  - Requires operator intervention to recover — no self-healing
+  - Accumulates tmp residue (observed 2024-20361 entries per incident)
+  - Any worker restart or crash during gate execution triggers this
+  - Frequency: ~1-3 times per day under active workload with periodic worker restarts
+
+definition_of_done:
+  criteria:
+    - "Lane cleanup recovers from 0333-mode directories without manual chmod"
+    - "doctor --fix succeeds on lanes corrupted by permission-denied tmp residue"
+    - "No CORRUPT lanes after worker restart during active gate execution"
+    - "Directory mode normalization does not fail with `EOPNOTSUPP` on Linux kernels when repairing user-owned directories."
+    - "Integration test: kill worker mid-gate, verify lane auto-recovers within 60s"
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.

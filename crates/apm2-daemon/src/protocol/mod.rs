@@ -179,6 +179,8 @@ pub use dispatch::{
     encode_auditor_launch_projection_request,
     // Request encoding helpers
     encode_claim_work_request,
+    // TCK-00635: OpenWork encoding
+    encode_claim_work_v2_request,
     encode_consensus_byzantine_evidence_request,
     encode_consensus_metrics_request,
     // TCK-00345: Consensus query encoding helpers
@@ -191,12 +193,13 @@ pub use dispatch::{
     // TCK-00342: Process management encoding helpers
     encode_list_processes_request,
     encode_login_credential_request,
-    // TCK-00635: OpenWork encoding
     encode_open_work_request,
     // TCK-00452: Orchestrator projection encoding
     encode_orchestrator_launch_projection_request,
     encode_process_status_request,
     encode_publish_changeset_request,
+    encode_publish_work_context_entry_request,
+    encode_record_work_pr_association_request,
     encode_refresh_credential_request,
     encode_reload_process_request,
     encode_remove_credential_request,
@@ -248,6 +251,8 @@ pub use messages::{
     CasRef,
     ClaimWorkRequest,
     ClaimWorkResponse,
+    ClaimWorkV2Request,
+    ClaimWorkV2Response,
     ConsensusByzantineEvidenceRequest,
     ConsensusByzantineEvidenceResponse,
     ConsensusError,
@@ -307,8 +312,12 @@ pub use messages::{
     PublishChangeSetResponse,
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
     PulseEnvelopeV1,
     PulseEvent,
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
     RefreshCredentialRequest,

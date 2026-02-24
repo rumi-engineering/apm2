@@ -418,6 +418,10 @@ fn build_warm_job_spec(
         source: JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: repo_id.to_string(),
+            work_id: format!(
+                "W-LEGACY-{}",
+                &blake3::hash(repo_id.as_bytes()).to_hex()[..24]
+            ),
             head_sha: head_sha.to_string(),
             patch: None,
         },

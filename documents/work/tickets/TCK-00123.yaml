@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00123
     title: Implement RFC Council Evolution and Human Docs Skill
-    status: IN_PROGRESS
+    status: MERGED
   binds:
     rfc_id: MAINTENANCE
     requirements:
