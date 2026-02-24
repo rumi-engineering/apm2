@@ -8701,6 +8701,7 @@ type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkIdResolutionMode {
     StrictLeaseMapping,
+    StrictLeaseMappingAllowClaimFallback,
 }
 
 /// Lifecycle selectors returned from privileged PCAC enforcement.
@@ -10865,8 +10866,6 @@ impl PrivilegedDispatcher {
     ///
     /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
     /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
-    /// Falls back to role-agnostic `get_claim` only for legacy leases
-    /// that pre-date multi-role registration.
     ///
     /// If the lease validator cannot resolve lease->work mapping, callers may
     /// provide a `work_id_hint` and this function will attempt a claim-scoped
@@ -10890,40 +10889,34 @@ impl PrivilegedDispatcher {
             work_id_hint,
             work_id_resolution_mode,
         ) {
-            // Role-scoped lookup: find the claim whose lease_id matches
-            // exactly. This prevents cross-role policy confusion when
-            // multiple roles (implementer, reviewer, coordinator) have
-            // claims on the same work_id with different policies.
-            let claim = self
-                .work_registry
-                .get_claim_by_lease_id(&work_id, lease_id)
-                .or_else(|| {
-                    // Fallback for legacy leases that were registered
-                    // before multi-role support. Role-agnostic lookup is
-                    // acceptable here because legacy workflows only ever
-                    // had one claim per work_id.
-                    self.work_registry.get_claim(&work_id)
-                });
-            if let Some(claim) = claim {
-                let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            lease_id = %lease_id,
-                            work_id = %work_id,
-                            tier_value = claim.policy_resolution.resolved_risk_tier,
-                            "invalid risk tier value in policy resolution — \
-                             defaulting to Tier4 (fail-closed)"
-                        );
-                        RiskTier::Tier4
-                    });
-                (tier, claim.policy_resolution.resolved_policy_hash)
-            } else {
-                warn!(
-                    lease_id = %lease_id,
-                    work_id = %work_id,
-                    "work claim not found for lease — defaulting to Tier4 (fail-closed)"
-                );
-                (RiskTier::Tier4, fallback_policy_hash)
+            match self.resolve_claim_for_pcac_revalidation(
+                &work_id,
+                lease_id,
+                work_id_resolution_mode,
+            ) {
+                Ok(claim) => {
+                    let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
+                        .unwrap_or_else(|_| {
+                            warn!(
+                                lease_id = %lease_id,
+                                work_id = %work_id,
+                                tier_value = claim.policy_resolution.resolved_risk_tier,
+                                "invalid risk tier value in policy resolution — \
+                                 defaulting to Tier4 (fail-closed)"
+                            );
+                            RiskTier::Tier4
+                        });
+                    (tier, claim.policy_resolution.resolved_policy_hash)
+                },
+                Err(error) => {
+                    warn!(
+                        lease_id = %lease_id,
+                        work_id = %work_id,
+                        error = %error,
+                        "work claim resolution failed for lease — defaulting to Tier4 (fail-closed)"
+                    );
+                    (RiskTier::Tier4, fallback_policy_hash)
+                },
             }
         } else {
             warn!(
@@ -10970,10 +10963,40 @@ impl PrivilegedDispatcher {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
+    /// Resolves the authoritative claim to use for privileged PCAC checks.
     ///
-    /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
-    /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
+    /// All modes require lease->work resolution to succeed first.
+    /// `StrictLeaseMappingAllowClaimFallback` permits claim recovery by
+    /// `work_id` only after authoritative lease mapping has succeeded.
+    fn resolve_claim_for_pcac_revalidation(
+        &self,
+        work_id: &str,
+        lease_id: &str,
+        work_id_resolution_mode: WorkIdResolutionMode,
+    ) -> Result<WorkClaim, String> {
+        if let Some(claim) = self.work_registry.get_claim_by_lease_id(work_id, lease_id) {
+            return Ok(claim);
+        }
+
+        if work_id_resolution_mode == WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback {
+            if let Some(claim) = self.work_registry.get_claim(work_id) {
+                warn!(
+                    lease_id = %lease_id,
+                    work_id = %work_id,
+                    role = ?claim.role,
+                    claim_lease_id = %claim.lease_id,
+                    "PCAC claim lookup used controlled fallback after authoritative lease->work resolution"
+                );
+                return Ok(claim);
+            }
+        }
+
+        Err(format!(
+            "work claim missing for lease '{lease_id}' and work '{work_id}'"
+        ))
+    }
+
+    /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
     ///
     /// Fail-closed: missing lease/work/policy bindings return an error.
     fn derive_privileged_pcac_revalidation_inputs(
@@ -10999,15 +11022,8 @@ impl PrivilegedDispatcher {
             work_id_hint,
             work_id_resolution_mode,
         )?;
-        // Role-scoped lookup: resolve the exact claim bound to this lease_id
-        // to prevent cross-role policy confusion when multiple roles have
-        // claims on the same work_id.
-        let claim = self
-            .work_registry
-            .get_claim_by_lease_id(&work_id, lease_id)
-            .ok_or_else(|| {
-                format!("work claim missing for lease '{lease_id}' and work '{work_id}'")
-            })?;
+        let claim =
+            self.resolve_claim_for_pcac_revalidation(&work_id, lease_id, work_id_resolution_mode)?;
         if claim.policy_resolution.policy_resolved_ref.is_empty() {
             return Err(format!(
                 "policy_resolved_ref missing for lease '{lease_id}' and work '{work_id}'"
@@ -11083,13 +11099,9 @@ impl PrivilegedDispatcher {
                     ),
                 )
             })?;
-        // Role-scoped lookup: resolve the exact claim bound to this
-        // lease_id to prevent cross-role policy confusion when multiple
-        // roles have claims on the same work_id.
         let claim = self
-            .work_registry
-            .get_claim_by_lease_id(&work_id, lease_id)
-            .ok_or_else(|| {
+            .resolve_claim_for_pcac_revalidation(&work_id, lease_id, work_id_resolution_mode)
+            .map_err(|_| {
                 PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
@@ -18395,7 +18407,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
             changeset_digest,
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
         );
         if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
             warn!(
@@ -18410,8 +18422,15 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
-        let Some(claim_for_receipt) = self.work_registry.get_claim(&lease_for_receipt.work_id)
-        else {
+        let claim_for_receipt = self
+            .work_registry
+            .get_claim_by_lease_id(&lease_for_receipt.work_id, &request.lease_id)
+            .or_else(|| {
+                self.work_registry
+                    .get_claim_for_role(&lease_for_receipt.work_id, WorkRole::Reviewer)
+            })
+            .or_else(|| self.work_registry.get_claim(&lease_for_receipt.work_id));
+        let Some(claim_for_receipt) = claim_for_receipt else {
             return Ok(deny_response_for_authority_context(
                 DenyCondition::MissingAuthorityContext,
                 format!(
@@ -18687,7 +18706,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(authoritative_work_id.as_str()),
-                WorkIdResolutionMode::StrictLeaseMapping,
+                WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -18807,7 +18826,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
