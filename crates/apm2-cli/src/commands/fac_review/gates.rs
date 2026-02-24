@@ -7367,16 +7367,6 @@ time.sleep(20)\n",
             ],
         );
         run_git(&repo, &["commit", "-m", "add review fixtures"]);
-        run_git(
-            &repo,
-            &[
-                "add",
-                "documents/reviews/test-safety-allowlist.txt",
-                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
-                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
-            ],
-        );
-        run_git(&repo, &["commit", "-m", "add review fixtures"]);
         let cargo_path = bin_dir.join("cargo");
         fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
             .expect("set fake cargo mode");
@@ -8016,8 +8006,7 @@ time.sleep(20)\n",
         let preflight_status_text = String::from_utf8_lossy(&preflight_status.stdout);
         assert!(
             preflight_status_text.trim().is_empty(),
-            "benchmark fixture repo must start clean, found:\n{}",
-            preflight_status_text
+            "benchmark fixture repo must start clean, found:\n{preflight_status_text}",
         );
 
         // ---- Run 1 (cold): exercises the full gate pipeline ----
