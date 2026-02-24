@@ -1495,8 +1495,7 @@ fn summarize_native_gate_failure(output: &str, fallback: &str) -> String {
         .lines()
         .find_map(|line| line.strip_prefix("ERROR:").map(str::trim))
         .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| fallback.to_string())
+        .map_or_else(|| fallback.to_string(), ToString::to_string)
 }
 
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
