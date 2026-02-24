@@ -7474,6 +7474,13 @@ time.sleep(20)\n",
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
+        let machine_spec = crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+            .expect("render FAC review machine spec snapshot fixture");
+        fs::write(
+            review_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec,
+        )
+        .expect("write FAC review machine spec snapshot fixture");
         run_git(
             &repo,
             &[
@@ -7481,6 +7488,7 @@ time.sleep(20)\n",
                 "documents/reviews/test-safety-allowlist.txt",
                 "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
                 "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+                "documents/reviews/fac_review_state_machine.cac.json",
             ],
         );
         run_git(&repo, &["commit", "-m", "add review fixtures"]);
@@ -8070,6 +8078,13 @@ time.sleep(20)\n",
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
+        let machine_spec = crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+            .expect("render FAC review machine spec snapshot fixture");
+        fs::write(
+            review_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec,
+        )
+        .expect("write FAC review machine spec snapshot fixture");
 
         run_git(
             &repo,
@@ -8078,6 +8093,7 @@ time.sleep(20)\n",
                 "documents/reviews/test-safety-allowlist.txt",
                 "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
                 "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+                "documents/reviews/fac_review_state_machine.cac.json",
             ],
         );
         run_git(&repo, &["commit", "-m", "add review fixtures"]);
@@ -8141,7 +8157,11 @@ time.sleep(20)\n",
             None,
         )
         .expect("run1 (cold) should complete the full pipeline successfully");
-        assert!(run1.passed, "run1 must pass all evidence gates");
+        assert!(
+            run1.passed,
+            "run1 must pass all evidence gates; run1_summary={}",
+            serde_json::to_string(&run1).expect("serialize run1 summary"),
+        );
         assert!(
             run1.total_gate_count > 0,
             "pipeline must execute at least one evidence gate"
@@ -8206,6 +8226,7 @@ time.sleep(20)\n",
             "doc",
             "clippy",
             "test_safety_guard",
+            "fac_review_machine_spec_snapshot",
             "test",
             "workspace_integrity",
             "review_artifact_lint",
@@ -8320,6 +8341,17 @@ time.sleep(20)\n",
         let (run2_cache_hits, run2_cache_misses) = compute_cache_counts(&run2_gate_results);
         #[allow(clippy::cast_possible_truncation)]
         let run2_total_gates = run2_gate_results.len() as u32;
+        let run2_non_hit_details: Vec<String> = run2_gate_results
+            .iter()
+            .filter_map(|result| match result.cache_decision.as_ref() {
+                Some(decision) if decision.hit => None,
+                Some(decision) => Some(format!(
+                    "{}:miss(reason={},dim={:?})",
+                    result.gate_name, decision.reason_code, decision.first_mismatch_dimension
+                )),
+                None => Some(format!("{}:no-cache-decision", result.gate_name)),
+            })
+            .collect();
 
         assert_eq!(
             run2_total_gates, run1.total_gate_count,
@@ -8337,7 +8369,7 @@ time.sleep(20)\n",
             run2_cache_hits, run1.total_gate_count,
             "run2 cache_hit_count ({run2_cache_hits}) must equal run1 gate count ({}); \
              all evidence gates should have been served from the seeded v3 cache \
-             (cache_misses={run2_cache_misses})",
+             (cache_misses={run2_cache_misses}, non_hit_details={run2_non_hit_details:?})",
             run1.total_gate_count,
         );
 
