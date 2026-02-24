@@ -37,6 +37,7 @@ The crate is organized around several architectural layers:
 | `reducer` | Event-sourcing reducer framework for deterministic state projection from the append-only ledger | [src/reducer/AGENTS.md](src/reducer/AGENTS.md) |
 | `state` | Persists daemon and process state to disk for crash recovery and restart resilience | [src/state/AGENTS.md](src/state/AGENTS.md) |
 | `schema_registry` | Distributed schema governance with fail-closed validation for the consensus layer | [src/schema_registry/AGENTS.md](src/schema_registry/AGENTS.md) |
+| `orchestrator_kernel` | Cursor-generic Observe-Plan-Execute-Receipt control loop harness reusable across daemon orchestrators. Cursor type is determined by each `LedgerReader` via the `KernelCursor` trait; `CompositeCursor` is the default for timestamp+id ledgers. | -- |
 
 ### Process Management
 

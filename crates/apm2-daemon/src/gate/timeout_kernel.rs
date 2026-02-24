@@ -178,13 +178,12 @@ enum TimeoutObservedKind {
     },
 }
 
-impl CursorEvent for TimeoutObservedEvent {
-    fn timestamp_ns(&self) -> u64 {
-        self.timestamp_ns
-    }
-
-    fn event_id(&self) -> &str {
-        &self.event_id
+impl CursorEvent<CompositeCursor> for TimeoutObservedEvent {
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.timestamp_ns,
+            event_id: self.event_id.clone(),
+        }
     }
 }
 
@@ -793,6 +792,7 @@ enum TimeoutLedgerReader {
 }
 
 impl LedgerReader<TimeoutObservedEvent> for TimeoutLedgerReader {
+    type Cursor = CompositeCursor;
     type Error = String;
 
     async fn poll(
@@ -1424,7 +1424,7 @@ enum TimeoutCursorStore {
     Memory(MemoryTimeoutCursorStore),
 }
 
-impl CursorStore for TimeoutCursorStore {
+impl CursorStore<CompositeCursor> for TimeoutCursorStore {
     type Error = String;
 
     async fn load(&self) -> Result<CompositeCursor, Self::Error> {

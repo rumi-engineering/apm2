@@ -145,7 +145,7 @@ where
     D::Error: Display,
     LR: LedgerReader<Event>,
     LR::Error: Display,
-    CS: CursorStore,
+    CS: CursorStore<LR::Cursor>,
     CS::Error: Display,
     IS: IntentStore<Intent, IntentKey>,
     IS::Error: Display,
@@ -153,7 +153,7 @@ where
     EJ::Error: Display,
     RW: ReceiptWriter<Receipt>,
     RW::Error: Display,
-    Event: CursorEvent,
+    Event: CursorEvent<LR::Cursor>,
     Intent: Clone,
     IntentKey: Clone,
 {
@@ -328,13 +328,12 @@ mod tests {
         id: String,
     }
 
-    impl CursorEvent for TestEvent {
-        fn timestamp_ns(&self) -> u64 {
-            self.ts
-        }
-
-        fn event_id(&self) -> &str {
-            &self.id
+    impl CursorEvent<CompositeCursor> for TestEvent {
+        fn cursor(&self) -> CompositeCursor {
+            CompositeCursor {
+                timestamp_ns: self.ts,
+                event_id: self.id.clone(),
+            }
         }
     }
 
@@ -344,6 +343,7 @@ mod tests {
     }
 
     impl LedgerReader<TestEvent> for TestLedgerReader {
+        type Cursor = CompositeCursor;
         type Error = String;
 
         async fn poll(
@@ -360,7 +360,7 @@ mod tests {
         cursor: Mutex<CompositeCursor>,
     }
 
-    impl CursorStore for TestCursorStore {
+    impl CursorStore<CompositeCursor> for TestCursorStore {
         type Error = String;
 
         async fn load(&self) -> Result<CompositeCursor, Self::Error> {
@@ -804,6 +804,7 @@ mod tests {
     }
 
     impl LedgerReader<TestEvent> for CursorAwareLedgerReader {
+        type Cursor = CompositeCursor;
         type Error = String;
 
         async fn poll(
@@ -815,13 +816,15 @@ mod tests {
                 .events
                 .iter()
                 .filter(|event| {
-                    event.ts > cursor.timestamp_ns
-                        || (event.ts == cursor.timestamp_ns
-                            && event.id.as_str() > cursor.event_id.as_str())
+                    let ec = CursorEvent::<CompositeCursor>::cursor(*event);
+                    ec > *cursor
                 })
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+            out.sort_by(|a, b| {
+                CursorEvent::<CompositeCursor>::cursor(a)
+                    .cmp(&CursorEvent::<CompositeCursor>::cursor(b))
+            });
             out.truncate(limit);
             Ok(out)
         }
