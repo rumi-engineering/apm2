@@ -1,74 +1,43 @@
-//! FAC (Forge Admission Cycle) productivity CLI commands.
+//! FAC (Forge Admission Cycle) operational CLI surface.
 //!
-//! This module implements the `apm2 fac` subcommands for ledger/CAS-oriented
-//! debugging and productivity per TCK-00333 and RFC-0019.
+//! `apm2 fac` is JSON-first: command responses are machine-readable by default
+//! and intended for `jq`/automation.
 //!
-//! # Commands
-//!
-//! - `apm2 fac work status <work_id>` - Show projection-backed work status via
-//!   daemon
-//! - `apm2 fac work list` - List projection-known work items via daemon
-//! - `apm2 fac role-launch <work_id> <role> --role-spec-hash ...` - Perform
-//!   fail-closed hash-binding admission checks and emit launch receipt
-//! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
-//!   log index
-//! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
-//! - `apm2 fac context rebuild <role> <episode_id>` - Rebuild role-scoped
-//!   context
-//! - `apm2 fac review run --pr <N>` - Run FAC review orchestration (parallel,
-//!   multi-model; defaults from local branch mapping when omitted)
-//! - `apm2 fac review prepare` - Materialize local review inputs (diff/history)
-//! - `apm2 fac review findings` - Retrieve SHA-bound review findings in a
-//!   structured FAC-native format
-//! - `apm2 fac review verdict` - Show/set SHA-bound approve/deny verdicts per
-//!   review dimension
-//! - `apm2 fac services status` - Inspect daemon/worker managed service health
-//! - `apm2 fac restart --pr <PR_NUMBER>` - Intelligent pipeline restart from
-//!   optimal point
-//! - `apm2 fac recover --pr <N>` - Repair/reconcile local FAC lifecycle state
-//! - `apm2 fac review tail` - Tail FAC review NDJSON telemetry stream
-//!
-//! # Design
-//!
-//! Most commands operate directly on ledger and CAS files for crash-only
-//! debugging. Work lifecycle authority surfaces (`fac work status/list`) route
-//! through daemon operator IPC so runtime authority remains projection-backed.
-//!
-//! # Exit Codes (RFC-0018)
-//!
-//! - 0: Success
-//! - 10: Validation error
-//! - 12: Not found
-//! - 1: Generic error
-//!
-//! # Contract References
-//!
-//! - TCK-00333: FAC productivity CLI/scripts (ledger/CAS oriented debug UX)
-//! - RFC-0019: FAC v0 requirements
+//! Most subcommands provide operator and diagnostics surfaces over FAC runtime
+//! state. The worker runtime entrypoint is service-managed and hidden from
+//! normal help output.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    LANE_ENV_DIRS, LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager,
-    LaneReconcileReceiptV1, LaneState, LaneStatusV1, PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER,
-    ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER, RefusedDeleteReceipt,
-    SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
-    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, safe_rmtree_v1, verify_pid_identity,
+    FAC_UNIT_LIVENESS_UNAVAILABLE_REASON, FacUnitLiveness, GcActionKind, GcPlan, LANE_ENV_DIRS,
+    LaneCorruptMarkerV1, LaneInitReceiptV1, LaneLeaseV1, LaneManager, LaneState, LaneStatusV1,
+    LogRetentionConfig, MAX_LOG_DIR_ENTRIES, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, ProcessIdentity, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
+    RefusedDeleteReceipt, SUMMARY_RECEIPT_SCHEMA, SafeRmtreeOutcome, TOOL_EXECUTION_RECEIPT_SCHEMA,
+    TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1, check_fac_lane_liveness, check_fac_unit_liveness,
+    execute_gc, normalize_user_owned_dir_modes_for_safe_delete, plan_gc_with_log_retention,
+    safe_rmtree_v1_with_entry_limit, verify_pid_identity,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use apm2_daemon::protocol::WorkRole;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 pub use crate::commands::fac_broker::BrokerArgs;
 use crate::commands::role_launch::{self, RoleLaunchArgs};
+use crate::commands::work_identity::{
+    derive_adhoc_session_id, extract_tck_from_text, normalize_non_empty_arg, validate_lease_id,
+    validate_session_id, validate_work_id,
+};
 use crate::commands::{
     fac_broker, fac_economics, fac_gc, fac_policy, fac_pr, fac_preflight, fac_quarantine,
-    fac_review,
+    fac_review, work,
 };
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
@@ -101,18 +70,19 @@ const SERVICE_STATUS_PROPERTIES: [&str; 7] = [
     "ActiveEnterTimestampMonotonic",
     "WatchdogUSec",
 ];
+const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
+const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
+const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
+const WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
+const WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE: &str = "Refusing implicit projection fallback to prevent cross-ticket misbinding; pass `--ticket-alias`/`--work-id` context or explicitly request fallback via `--lease-id`/`--session-id`.";
 
 // =============================================================================
 // Command Types
 // =============================================================================
 
-/// FAC command group.
+/// FAC command group (JSON-first).
 #[derive(Debug, Args)]
 pub struct FacCommand {
-    /// Emit JSON/JSONL output.
-    #[arg(long, default_value_t = true)]
-    pub json: bool,
-
     /// Path to ledger database (defaults to `$APM2_DATA_DIR/ledger.db`).
     #[arg(long)]
     pub ledger_path: Option<PathBuf>,
@@ -177,11 +147,16 @@ pub enum FacSubcommand {
 
     /// Query projection-backed work authority via daemon operator IPC.
     ///
-    /// Displays work status or lists work items from runtime projection state.
+    /// Resolves current work identity, displays work status, lists work items,
+    /// and resolves ticket aliases from runtime projection state.
     /// This is the authoritative runtime surface for work lifecycle reads.
     Work(WorkArgs),
 
-    /// Check daemon health and prerequisites.
+    /// Doctor-first FAC health and remediation surface.
+    ///
+    /// Use `apm2 fac doctor` for read-only diagnostics.
+    /// Use `apm2 fac doctor --fix` for host/runtime remediation.
+    /// Use `apm2 fac doctor --pr <N> --fix` for bounded PR-scoped repair.
     Doctor(DoctorArgs),
 
     /// Install apm2 globally and realign binary paths.
@@ -227,23 +202,10 @@ pub enum FacSubcommand {
 
     /// Push code and create/update PR (lean push).
     ///
-    /// Pushes to remote, creates or updates a PR from ticket YAML metadata,
-    /// blocks on evidence gates, synchronizes ruleset projection, and
-    /// dispatches reviews.
+    /// Resolves current work binding (`work_id/lease_id/session_id`), pushes to
+    /// remote, creates or updates a PR, blocks on evidence gates,
+    /// synchronizes ruleset projection, and dispatches reviews.
     Push(PushArgs),
-
-    /// Restart the evidence/review pipeline from the optimal point.
-    ///
-    /// Reads local authoritative FAC verdict artifacts and determines whether
-    /// to re-run evidence gates, dispatch reviews, or no-op.
-    Restart(RestartArgs),
-
-    /// Repair or reconcile local FAC lifecycle state.
-    ///
-    /// Reaps stale agent registry entries and can refresh local PR identity
-    /// from authoritative remote state.
-    #[command(hide = true)]
-    Recover(RecoverArgs),
 
     /// Show local pipeline, evidence, and review log paths.
     ///
@@ -255,21 +217,24 @@ pub enum FacSubcommand {
     #[command(hide = true)]
     Pipeline(PipelineArgs),
 
-    /// Run and observe FAC review orchestration for pull requests.
+    /// Internal: detached reviewer runtime entrypoint (hidden from help).
+    #[command(hide = true)]
+    Reviewer(ReviewerExecArgs),
+
+    /// Review control surfaces for pull requests.
     ///
-    /// Provides VPS-oriented review execution and observability with
-    /// parallel `security + quality` orchestration, model fallback, and
-    /// NDJSON telemetry under `~/.apm2`.
+    /// Provides prepared-input generation, finding/verdict mutation, and
+    /// NDJSON telemetry inspection for `security` and `quality` review lanes.
     Review(ReviewArgs),
 
-    /// Queue consumer with RFC-0028 authorization + RFC-0029 admission gating.
+    /// Internal worker runtime entrypoint (service-managed).
     ///
-    /// Scans `$APM2_HOME/queue/pending/` for job specs, validates against
-    /// RFC-0028 channel context tokens and RFC-0029 admission, then
-    /// atomically claims and executes valid jobs.
+    /// In normal operation this runs under `apm2-worker.service`, wakes on
+    /// queue filesystem signals, and performs runtime claimed-queue self-heal.
+    #[command(hide = true)]
     Worker(WorkerArgs),
 
-    /// Job lifecycle management (cancel).
+    /// Job lifecycle management (show/cancel).
     ///
     /// Provides cancellation semantics for pending, claimed, and running jobs.
     /// Cancelling a pending job moves it to `cancelled/` with a receipt.
@@ -285,6 +250,10 @@ pub enum FacSubcommand {
     /// Inspect FAC broker state and health.
     Broker(BrokerArgs),
     /// Garbage collect stale FAC artifacts under `~/.apm2/private/fac`.
+    ///
+    /// `apm2 fac doctor --fix` now runs this maintenance pass automatically.
+    /// This command remains available as an explicit/manual operator override.
+    #[command(hide = true)]
     Gc(fac_gc::GcArgs),
     /// Manage quarantined and denied jobs.
     Quarantine(fac_quarantine::QuarantineArgs),
@@ -314,11 +283,6 @@ pub enum FacSubcommand {
     /// Import validates RFC-0028 channel boundary and RFC-0029 economics
     /// receipts, rejecting bundles that fail either check (fail-closed).
     Bundle(BundleArgs),
-    /// Reconcile queue and lane state after crash or unclean shutdown.
-    ///
-    /// Detects stale lane leases (PID dead, lock released), orphaned claimed
-    /// jobs, and recovers them deterministically. All actions emit receipts.
-    Reconcile(ReconcileArgs),
     /// Introspect FAC queue state (forensics-first UX).
     ///
     /// Shows job counts by directory, oldest pending job, and
@@ -355,8 +319,7 @@ pub enum FacSubcommand {
     /// rates, GC freed bytes, and disk preflight failures (TCK-00551).
     ///
     /// Scans the receipt index and GC receipt store for the observation
-    /// window and computes aggregate metrics. Supports `--json` for
-    /// automation.
+    /// window and computes aggregate metrics. Output is JSON by default.
     Metrics(MetricsArgs),
     /// Manage FAC caches: nuke (destructive purge with receipts).
     ///
@@ -380,10 +343,6 @@ pub struct MetricsArgs {
     /// When omitted, defaults to now.
     #[arg(long)]
     pub until: Option<u64>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac warm`.
@@ -407,10 +366,6 @@ pub struct WarmArgs {
     /// Maximum wait time in seconds (requires --wait).
     #[arg(long, default_value_t = 1200)]
     pub wait_timeout_secs: u64,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac bench`.
@@ -441,10 +396,6 @@ pub struct BenchArgs {
     /// CPU quota for each gate run.
     #[arg(long, default_value = "200%")]
     pub cpu_quota: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac gates`.
@@ -484,10 +435,6 @@ pub struct GatesArgs {
     /// --gate-profile).
     #[arg(long, default_value = "auto")]
     pub cpu_quota: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 
     /// Wait for queued gates job completion (default).
     ///
@@ -531,18 +478,10 @@ pub struct PreflightCredentialArgs {
     /// Ignored in `runtime` mode.
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct PreflightAuthorizationArgs {
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct PreflightAuthorizationArgs {}
 
 /// Arguments for `apm2 fac work`.
 #[derive(Debug, Args)]
@@ -568,17 +507,17 @@ pub struct DoctorArgs {
     )]
     pub repo: Option<String>,
 
-    /// Execute doctor-prescribed recovery actions for the PR.
+    /// Execute doctor-prescribed repair actions.
+    ///
+    /// Without `--pr`, runs host/runtime remediation (`apm2 fac doctor --fix`).
+    /// With `--pr <N>`, runs bounded PR-scoped lifecycle/reviewer remediation
+    /// (`apm2 fac doctor --pr <N> --fix`).
     #[arg(long, default_value_t = false)]
     pub fix: bool,
 
-    /// Output in JSON format.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
     /// Upgrade credential checks from WARN to ERROR.
     ///
-    /// Use this when running GitHub-facing workflows (push, review run)
+    /// Use this when running GitHub-facing workflows (push, doctor --pr --fix)
     /// that require valid credentials. Without this flag, missing credentials
     /// produce WARN; with it, they produce ERROR and cause a non-zero exit.
     #[arg(long, default_value_t = false)]
@@ -594,10 +533,6 @@ pub struct DoctorArgs {
     /// Wait until doctor recommends an action other than `wait`.
     #[arg(long, visible_alias = "wait", default_value_t = false)]
     pub wait_for_recommended_action: bool,
-
-    /// Poll cadence while waiting for recommended action.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=10))]
-    pub poll_interval_seconds: u64,
 
     /// Maximum wait time while waiting for recommended action.
     #[arg(
@@ -620,10 +555,6 @@ pub struct DoctorArgs {
 /// Arguments for `apm2 fac install`.
 #[derive(Debug, Args)]
 pub struct InstallArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
     /// Allow partial success when some service restarts fail.
     ///
     /// By default, `apm2 fac install` treats restart failure of any
@@ -652,7 +583,6 @@ pub enum DoctorExitActionArg {
     Done,
     Approve,
     DispatchImplementor,
-    RestartReviews,
 }
 
 impl DoctorExitActionArg {
@@ -664,7 +594,6 @@ impl DoctorExitActionArg {
             Self::Done => "done",
             Self::Approve => "approve",
             Self::DispatchImplementor => "dispatch_implementor",
-            Self::RestartReviews => "restart_reviews",
         }
     }
 }
@@ -733,20 +662,32 @@ pub enum ServicesSubcommand {
 }
 
 #[derive(Debug, Args)]
-pub struct ServicesStatusArgs {
-    /// Output in JSON format.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct ServicesStatusArgs {}
 
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
+    /// Open a work item from a ticket YAML using RFC-0032 `OpenWork`.
+    Open(WorkOpenArgs),
+
+    /// Claim an existing work item using RFC-0032 `ClaimWorkV2`.
+    Claim(WorkClaimArgs),
+
+    /// Resolve current work identity from branch/worktree alias or projection.
+    Current(WorkCurrentArgs),
+
     /// Show projection-backed work status from daemon authority.
     Status(WorkStatusArgs),
 
     /// List projection-known work items from daemon authority.
     List(WorkListArgs),
+
+    /// Resolve a ticket alias to a canonical `work_id` via projections.
+    ///
+    /// Uses `AliasReconciliationGate::resolve_ticket_alias` for CAS-backed
+    /// `WorkSpec` lookup. Returns the canonical `work_id` when exactly one
+    /// match is found, or reports not-found / ambiguity (fail-closed).
+    ResolveAlias(ResolveAliasArgs),
 }
 
 /// Arguments for `apm2 fac work status`.
@@ -754,10 +695,6 @@ pub enum WorkSubcommand {
 pub struct WorkStatusArgs {
     /// Work identifier to query.
     pub work_id: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac work list`.
@@ -766,10 +703,90 @@ pub struct WorkListArgs {
     /// Return only claimable work items.
     #[arg(long, default_value_t = false)]
     pub claimable_only: bool,
+}
 
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
+/// Arguments for `apm2 fac work current`.
+#[derive(Debug, Args)]
+pub struct WorkCurrentArgs {
+    /// Optional branch name override. Defaults to the current branch.
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Optional ticket alias override (for example `TCK-00640`).
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
+
+    /// Optional lease filter for explicit projection fallback disambiguation.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
+
+    /// Optional session filter for explicit projection fallback disambiguation.
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
+}
+
+/// Arguments for `apm2 fac work open`.
+#[derive(Debug, Args)]
+pub struct WorkOpenArgs {
+    /// Ticket YAML path to open as `WorkSpec`.
+    #[arg(long = "from-ticket")]
+    pub from_ticket: PathBuf,
+
+    /// Governing lease ID for PCAC admission.
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkClaimRoleArg {
+    /// Claim as implementer (Open -> Claimed).
+    Implementer,
+    /// Claim as reviewer (`ReadyForReview` -> Review).
+    Reviewer,
+    /// Claim as coordinator (Open -> Claimed).
+    Coordinator,
+}
+
+impl WorkClaimRoleArg {
+    const fn to_work_role(self) -> WorkRole {
+        match self {
+            Self::Implementer => WorkRole::Implementer,
+            Self::Reviewer => WorkRole::Reviewer,
+            Self::Coordinator => WorkRole::Coordinator,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementer => "implementer",
+            Self::Reviewer => "reviewer",
+            Self::Coordinator => "coordinator",
+        }
+    }
+}
+
+/// Arguments for `apm2 fac work claim`.
+#[derive(Debug, Args)]
+pub struct WorkClaimArgs {
+    /// Canonical work ID to claim (`W-...`).
+    #[arg(long = "work-id")]
+    pub work_id: String,
+
+    /// Governing lease ID for PCAC admission (`L-...`).
+    #[arg(long = "lease-id")]
+    pub lease_id: String,
+
+    /// Claim role.
+    #[arg(long, value_enum, default_value = "implementer")]
+    pub role: WorkClaimRoleArg,
+}
+
+/// Arguments for `apm2 fac work resolve-alias`.
+#[derive(Debug, Args)]
+pub struct ResolveAliasArgs {
+    /// Ticket alias to resolve (e.g. "TCK-00636").
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: String,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -799,10 +816,6 @@ pub struct EpisodeInspectArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts`.
@@ -855,10 +868,6 @@ pub enum ReceiptSubcommand {
 pub struct ReceiptShowArgs {
     /// Receipt hash (hex-encoded BLAKE3).
     pub receipt_hash: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts list`.
@@ -876,10 +885,6 @@ pub struct ReceiptListArgs {
     /// for equal timestamps.
     #[arg(long)]
     pub since: Option<u64>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts status`.
@@ -887,19 +892,11 @@ pub struct ReceiptListArgs {
 pub struct ReceiptStatusArgs {
     /// Job ID to look up.
     pub job_id: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts reindex`.
 #[derive(Debug, Args)]
-pub struct ReceiptReindexArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct ReceiptReindexArgs {}
 
 /// Arguments for `apm2 fac receipts verify` (TCK-00576).
 #[derive(Debug, Args)]
@@ -907,10 +904,6 @@ pub struct ReceiptVerifyArgs {
     /// Receipt content hash (BLAKE3 hex, with or without `b3-256:` prefix)
     /// or path to a `.sig.json` signed envelope file.
     pub digest_or_path: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac receipts merge` (TCK-00543).
@@ -923,10 +916,6 @@ pub struct ReceiptMergeArgs {
     /// Target receipt directory to merge into.
     #[arg(long)]
     pub into: std::path::PathBuf,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac context`.
@@ -959,10 +948,6 @@ pub struct ContextRebuildArgs {
     /// Maximum number of events to scan from the end of the ledger.
     #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
     pub limit: u64,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac lane`.
@@ -980,13 +965,6 @@ pub enum LaneSubcommand {
     /// Reports each lane's state derived from lock state, lease records,
     /// and PID liveness checks. Detects stale leases from crashed jobs.
     Status(LaneStatusArgs),
-    /// Reset a lane by deleting its workspace, target, and logs.
-    ///
-    /// Refuses to reset a RUNNING lane unless `--force` is provided.
-    /// With `--force`, attempts to kill the lane's process before
-    /// cleaning up. Uses `safe_rmtree_v1` which refuses symlink
-    /// traversal and crossing filesystem boundaries.
-    Reset(LaneResetArgs),
     /// Initialize the lane pool: create directories and write default profiles.
     ///
     /// Bootstraps a fresh `$APM2_HOME` into a ready lane pool with one
@@ -994,18 +972,11 @@ pub enum LaneSubcommand {
     /// Lane count is configurable via `$APM2_FAC_LANE_COUNT` (default: 3,
     /// max: 32).
     Init(LaneInitArgs),
-    /// Reconcile lane state: repair missing directories and profiles.
-    ///
-    /// Inspects all configured lanes and repairs missing directories or
-    /// profiles. Lanes that cannot be repaired are marked CORRUPT.
-    /// Existing corrupt markers are reported but not cleared (use
-    /// `apm2 fac lane reset` to clear them).
-    Reconcile(LaneReconcileArgs),
     /// Mark a lane as CORRUPT with an operator-provided reason.
     ///
     /// Writes a `corrupt.v1.json` marker file into the lane directory.
     /// A CORRUPT lane refuses all future job leases until an operator
-    /// clears the marker via `apm2 fac lane reset`.
+    /// clears the marker via `apm2 fac doctor --fix`.
     ///
     /// This is an operator tool for manually quarantining a lane when
     /// automated detection has not yet triggered (e.g., suspected data
@@ -1020,42 +991,11 @@ pub struct LaneStatusArgs {
     /// CORRUPT).
     #[arg(long)]
     pub state: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac lane reset`.
-#[derive(Debug, Args)]
-pub struct LaneResetArgs {
-    /// Lane identifier to reset (e.g., `lane-00`).
-    pub lane_id: String,
-
-    /// Force reset even if lane is RUNNING. Kills the lane's process first.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac lane init` (TCK-00539).
 #[derive(Debug, Args)]
-pub struct LaneInitArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac lane reconcile` (TCK-00539).
-#[derive(Debug, Args)]
-pub struct LaneReconcileArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct LaneInitArgs {}
 
 /// Arguments for `apm2 fac lane mark-corrupt` (TCK-00570).
 #[derive(Debug, Args)]
@@ -1071,42 +1011,14 @@ pub struct LaneMarkCorruptArgs {
     /// marker to an evidence artifact.
     #[arg(long)]
     pub receipt_digest: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
-/// Arguments for `apm2 fac reconcile`.
-#[derive(Debug, Args)]
-pub struct ReconcileArgs {
-    /// Report what would be done without mutating state.
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Apply all recovery mutations.
-    #[arg(long, default_value_t = false)]
-    pub apply: bool,
-
-    /// Policy for orphaned claimed jobs: "requeue" (default) or "mark-failed".
-    #[arg(long, default_value = "requeue")]
-    pub orphan_policy: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac worker`.
+/// Arguments for internal `apm2 fac worker` entrypoint.
 #[derive(Debug, Args)]
 pub struct WorkerArgs {
     /// Process exactly one job and exit.
     #[arg(long, default_value_t = false)]
     pub once: bool,
-
-    /// Seconds between queue scans in continuous mode.
-    #[arg(long, default_value_t = 5)]
-    pub poll_interval_secs: u64,
 
     /// Maximum total jobs to process before exiting (0 = unlimited).
     #[arg(long, default_value_t = 0)]
@@ -1115,10 +1027,6 @@ pub struct WorkerArgs {
     /// Print computed systemd unit properties for each selected job.
     #[arg(long, default_value_t = false)]
     pub print_unit: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac job`.
@@ -1147,8 +1055,7 @@ pub enum JobSubcommand {
     /// Show detailed information about a job.
     ///
     /// Displays the job spec, latest receipt, current queue directory state,
-    /// and pointers to related log files. Supports `--json` for machine-
-    /// readable output.
+    /// and pointers to related log files.
     Show(JobShowArgs),
 }
 
@@ -1157,10 +1064,6 @@ pub enum JobSubcommand {
 pub struct JobShowArgs {
     /// The job ID to inspect.
     pub job_id: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac job cancel`.
@@ -1172,10 +1075,6 @@ pub struct CancelArgs {
     /// Reason for cancellation (recorded in receipt).
     #[arg(long, default_value = "operator-initiated cancellation")]
     pub reason: String,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac queue`.
@@ -1199,11 +1098,7 @@ pub enum QueueSubcommand {
 
 /// Arguments for `apm2 fac queue status`.
 #[derive(Debug, Args)]
-pub struct QueueStatusArgs {
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct QueueStatusArgs {}
 
 /// Arguments for `apm2 fac verify`.
 #[derive(Debug, Args)]
@@ -1240,10 +1135,6 @@ pub struct ContainmentArgs {
     /// sccache should be auto-disabled.
     #[arg(long, default_value_t = false)]
     pub sccache_enabled: bool,
-
-    /// Output in JSON format.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac bundle`.
@@ -1281,10 +1172,6 @@ pub struct BundleExportArgs {
     /// Defaults to `$APM2_HOME/private/fac/bundles/<job_id>/`.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac bundle import`.
@@ -1292,10 +1179,6 @@ pub struct BundleExportArgs {
 pub struct BundleImportArgs {
     /// Path to the evidence bundle manifest JSON file.
     pub path: PathBuf,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac push`.
@@ -1314,63 +1197,42 @@ pub struct PushArgs {
     #[arg(long)]
     pub ticket: Option<PathBuf>,
 
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+    /// Canonical work identifier to bind projection and daemon publication.
+    /// If omitted, `fac push` derives work binding via ticket alias and
+    /// fail-closed TCK alias resolution.
+    /// Projection fallback is only used when explicitly requested with
+    /// `--lease-id`/`--session-id`.
+    /// Use `apm2 fac work current` to inspect.
+    /// If no work exists yet, create/claim one via `apm2 fac work open` and
+    /// `apm2 fac work claim`.
+    #[arg(long = "work-id")]
+    pub work_id: Option<String>,
 
-/// Arguments for `apm2 fac restart`.
-#[derive(Debug, Args)]
-pub struct RestartArgs {
-    /// Pull request number (auto-detected from current branch if omitted).
-    #[arg(long)]
-    pub pr: Option<u32>,
+    /// Optional ticket alias (for example `TCK-00640`) used to resolve
+    /// canonical `work_id` via daemon projection authority.
+    /// If omitted, branch/worktree TCK derivation applies.
+    /// Unresolved aliases fail closed to prevent cross-ticket misbinding.
+    #[arg(long = "ticket-alias")]
+    pub ticket_alias: Option<String>,
 
-    /// Restart everything regardless of current CI state.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
+    /// Optional governing lease identifier for privileged work RPC calls.
+    /// When omitted, `fac push` resolves `lease_id` from daemon work status.
+    /// Use `apm2 fac work current` to inspect the daemon-resolved value.
+    /// For ad-hoc workflows, pass a governing lease from `apm2 fac work claim`.
+    #[arg(long = "lease-id")]
+    pub lease_id: Option<String>,
 
-    /// Refresh local projection identity from authoritative PR head before
-    /// restart strategy resolution.
-    #[arg(long, default_value_t = false)]
-    pub refresh_identity: bool,
+    /// Optional implementer session identifier for terminal-contract dedupe.
+    /// When omitted, `fac push` resolves `session_id` from daemon work status.
+    /// If daemon status does not expose one but a lease is available, `fac
+    /// push` derives deterministic `S-adhoc-*` session identity from
+    /// (`work_id`,`lease_id`).
+    #[arg(long = "session-id")]
+    pub session_id: Option<String>,
 
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for `apm2 fac recover`.
-#[derive(Debug, Args)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct RecoverArgs {
-    /// Pull request number (auto-detected from local branch if omitted).
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Force lifecycle recovery from the current local SHA.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
-
-    /// Refresh local projection identity from current authoritative PR head.
-    #[arg(long, default_value_t = false)]
-    pub refresh_identity: bool,
-
-    /// Reap stale/dead agent entries for the target PR.
-    #[arg(long, default_value_t = false)]
-    pub reap_stale_agents: bool,
-
-    /// Reset local lifecycle state for the target PR.
-    #[arg(long, default_value_t = false)]
-    pub reset_lifecycle: bool,
-
-    /// Run all recovery operations for the target PR.
-    #[arg(long, default_value_t = false)]
-    pub all: bool,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
+    /// Optional handoff note body to publish as `HANDOFF_NOTE`.
+    #[arg(long = "handoff-note")]
+    pub handoff_note: Option<String>,
 }
 
 /// Arguments for `apm2 fac logs`.
@@ -1391,10 +1253,6 @@ pub struct LogsArgs {
     /// `tool_output` selectors: `tool_output:v1:<sha>:<gate>`
     #[arg(long)]
     pub selector: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac pipeline` (hidden, internal).
@@ -1407,10 +1265,26 @@ pub struct PipelineArgs {
     /// Commit SHA to run pipeline against.
     #[arg(long)]
     pub sha: String,
+}
 
-    /// Emit JSON output for this command.
+/// Arguments for internal detached reviewer execution.
+#[derive(Debug, Args)]
+pub struct ReviewerExecArgs {
+    /// Pull request number.
+    #[arg(long)]
+    pub pr: u32,
+
+    /// Review lane (`security` or `quality`).
+    #[arg(long = "type", value_enum)]
+    pub review_type: ReviewStatusTypeArg,
+
+    /// Expected pull request head SHA (40 hex).
+    #[arg(long)]
+    pub expected_head_sha: String,
+
+    /// Force rerun for same-SHA terminal states.
     #[arg(long, default_value_t = false)]
-    pub json: bool,
+    pub force: bool,
 }
 
 /// Arguments for `apm2 fac review`.
@@ -1423,16 +1297,11 @@ pub struct ReviewArgs {
 /// Review subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ReviewSubcommand {
-    /// Run FAC review orchestration for a pull request URL.
-    Run(ReviewRunArgs),
     /// Materialize local review inputs (diff + commit history) under FAC
     /// private storage.
     Prepare(ReviewPrepareArgs),
     /// Append one structured SHA-bound finding to local FAC findings.
     Finding(ReviewFindingArgs),
-    /// Compatibility shim for deprecated `review comment` (maps to finding).
-    #[command(hide = true)]
-    Comment(ReviewCommentArgs),
     /// Retrieve structured SHA-bound review findings for a PR head SHA.
     Findings(ReviewFindingsArgs),
     /// Show or set explicit verdict state per review dimension.
@@ -1441,39 +1310,6 @@ pub enum ReviewSubcommand {
     Tail(ReviewTailArgs),
     /// Terminate a running reviewer process for a specific PR and type.
     Terminate(ReviewTerminateArgs),
-}
-
-/// Arguments for `apm2 fac review run`.
-#[derive(Debug, Args)]
-pub struct ReviewRunArgs {
-    /// Pull request number (auto-detected from local branch if omitted).
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Review selection (`all`, `security`, or `quality`).
-    #[arg(
-        long = "type",
-        alias = "review-type",
-        value_enum,
-        default_value_t = fac_review::ReviewRunType::All
-    )]
-    pub review_type: fac_review::ReviewRunType,
-
-    /// Optional expected head SHA (40 hex) to fail closed on stale review
-    /// start.
-    #[arg(long)]
-    pub expected_head_sha: Option<String>,
-
-    /// Force re-running on the same SHA even when a terminal run already
-    /// exists for this review type.
-    ///
-    /// This does not bypass merge-conflict checks against `main`.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Review lane filter for `apm2 fac review terminate`.
@@ -1502,14 +1338,6 @@ pub struct ReviewFindingsArgs {
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
-
-    /// Deprecated compatibility flag; ignored because findings are local-only.
-    #[arg(long, default_value_t = false, hide = true)]
-    pub refresh: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review prepare`.
@@ -1520,12 +1348,11 @@ pub struct ReviewPrepareArgs {
     pub pr: Option<u32>,
 
     /// Optional head SHA override (defaults to PR head SHA).
+    ///
+    /// Note: prepare JSON output inlines review payloads only up to a bounded
+    /// line budget; oversized payloads are returned as artifact references.
     #[arg(long)]
     pub sha: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review finding`.
@@ -1582,38 +1409,6 @@ pub struct ReviewFindingArgs {
     /// Optional evidence pointer (selector or local path hint).
     #[arg(long)]
     pub evidence_pointer: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-/// Arguments for deprecated `apm2 fac review comment` compatibility shim.
-#[derive(Debug, Args)]
-pub struct ReviewCommentArgs {
-    /// Pull request number.
-    #[arg(long)]
-    pub pr: Option<u32>,
-
-    /// Optional head SHA override (defaults to local PR identity SHA).
-    #[arg(long)]
-    pub sha: Option<String>,
-
-    /// Review dimension (`security` or `code-quality`).
-    #[arg(long = "type", value_enum)]
-    pub review_type: fac_review::ReviewCommentTypeArg,
-
-    /// Finding severity (`blocker`, `major`, `minor`, `nit`).
-    #[arg(long, value_enum)]
-    pub severity: fac_review::ReviewCommentSeverityArg,
-
-    /// Finding body text (when omitted, read from stdin).
-    #[arg(long)]
-    pub body: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review verdict`.
@@ -1642,10 +1437,6 @@ pub struct ReviewVerdictShowArgs {
     /// Optional head SHA override (defaults to PR head SHA).
     #[arg(long)]
     pub sha: Option<String>,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review verdict set`.
@@ -1683,10 +1474,6 @@ pub struct ReviewVerdictSetArgs {
     /// is written.
     #[arg(long, default_value_t = false)]
     pub keep_prepared_inputs: bool,
-
-    /// Emit JSON output for this command.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review tail`.
@@ -1699,10 +1486,6 @@ pub struct ReviewTailArgs {
     /// Follow mode (stream appended events).
     #[arg(long, default_value_t = false)]
     pub follow: bool,
-
-    /// Emit JSON output for this command (no-op; output is already NDJSON).
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 /// Arguments for `apm2 fac review terminate`.
@@ -1715,15 +1498,54 @@ pub struct ReviewTerminateArgs {
     /// Reviewer type to terminate (security or quality).
     #[arg(long = "type", value_enum)]
     pub review_type: ReviewStatusTypeArg,
-
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 // =============================================================================
 // Response Types
 // =============================================================================
+
+/// Response for work status command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WorkDependencyDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Structured dependency diagnostic for work status consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDependencyDiagnostic {
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Severity classification.
+    pub severity: WorkDependencyDiagnosticSeverity,
+    /// Human-readable detail.
+    pub message: String,
+    /// Deterministic edge identifier.
+    pub edge_id: String,
+    /// Source work item ID.
+    pub from_work_id: String,
+    /// Target work item ID.
+    pub to_work_id: String,
+    /// Source work state, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_work_state: Option<String>,
+    /// Whether a waiver is active.
+    pub waived: bool,
+    /// Waiver identifier, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_id: Option<String>,
+    /// Waiver expiry timestamp, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_expires_at_ns: Option<u64>,
+    /// Remaining waiver lifetime, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_remaining_ns: Option<u64>,
+    /// Whether this edge was added late.
+    pub late_edge: bool,
+}
 
 /// Response for work status command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1750,6 +1572,13 @@ pub struct WorkStatusResponse {
     /// Ledger sequence ID of the latest event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_seq_id: Option<u64>,
+    /// Whether implementer claim is currently blocked by unsatisfied
+    /// incoming BLOCKS dependencies.
+    #[serde(default)]
+    pub implementer_claim_blocked: bool,
+    /// Structured dependency diagnostics from projection authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_diagnostics: Vec<WorkDependencyDiagnostic>,
 }
 
 /// Response for episode inspect command.
@@ -1870,6 +1699,28 @@ struct ServiceStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OrphanedSystemdUnitDiagnostic {
+    /// Lane whose stale lease has orphaned systemd evidence.
+    pub lane_id: String,
+    /// Job bound to the stale lease.
+    pub job_id: String,
+    /// Lease PID observed as dead/reused.
+    pub pid: u32,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+    /// Liveness verdict for associated units ("active" or "unknown").
+    pub liveness: String,
+    /// Human-readable detail for operators.
+    pub detail: String,
+    /// Remediation guidance for operators.
+    pub recommended_action: String,
+    /// Active associated unit names (if known).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_units: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServicesStatusResponse {
     /// Overall health: "healthy" if all services are healthy, "degraded"
     /// otherwise.
@@ -1886,6 +1737,111 @@ struct ServicesStatusResponse {
     /// daemon's internal health checks are passing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_health: Option<apm2_core::fac::broker_health_ipc::BrokerHealthIpcStatus>,
+    /// Stale-lease reclaim blockers caused by orphaned systemd units.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_systemd_units: Vec<OrphanedSystemdUnitDiagnostic>,
+    /// Probe error for orphaned-systemd-unit diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphaned_systemd_unit_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SystemDoctorFixActionStatus {
+    Applied,
+    Skipped,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum SystemDoctorFixActionKind {
+    LaneReconcile,
+    QueueReconcileApply,
+    GcMaintenance,
+    LaneLogGc,
+    LaneStatusScan,
+    LaneTmpCorruptionDetection,
+    LaneTmpCorruptionDetected,
+    LaneTmpScrub,
+    LaneResetOrphanedSystemdUnit,
+    LaneResetTmpCorruption,
+    LaneResetCleanupRecovery,
+    QueueReconcilePostLaneReset,
+    WorkerRestart,
+    DoctorPostCheck,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemDoctorFixAction {
+    pub action: SystemDoctorFixActionKind,
+    pub status: SystemDoctorFixActionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemDoctorFixResponse {
+    pub schema: String,
+    pub actions: Vec<SystemDoctorFixAction>,
+    pub checks_before: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    pub checks_after: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked_prs: Vec<fac_review::DoctorTrackedPrSummary>,
+    pub had_errors_before: bool,
+    pub has_errors_after: bool,
+}
+
+#[derive(Debug)]
+struct DoctorSystemSnapshot {
+    checks: Vec<crate::commands::daemon::DaemonDoctorCheck>,
+    tracked_prs: Vec<fac_review::DoctorTrackedPrSummary>,
+    has_critical_error: bool,
+}
+
+#[derive(Debug)]
+enum DoctorLaneResetError {
+    Running { pid: Option<u32> },
+    RefusedDelete { receipts: Vec<RefusedDeleteReceipt> },
+    Other(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorLaneResetSummary {
+    files_deleted: u64,
+    dirs_deleted: u64,
+    deferred_cleanup_roots: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TmpScrubSummary {
+    entries_deleted: u64,
+    deferred_cleanup_roots: u64,
+}
+
+#[derive(Debug)]
+enum DoctorSubdirDeleteOutcome {
+    Deleted {
+        files_deleted: u64,
+        dirs_deleted: u64,
+    },
+    AlreadyAbsent,
+    DeferredCleanup {
+        deferred_path: PathBuf,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaneLogGcSummary {
+    targets: usize,
+    actions_applied: usize,
+    errors: usize,
+    bytes_freed: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1913,6 +1869,1317 @@ impl ServiceScope {
 }
 
 const SERVICE_SCOPES: [ServiceScope; 2] = [ServiceScope::User, ServiceScope::System];
+
+fn describe_orphaned_unit_liveness(liveness: FacUnitLiveness) -> (String, String, Vec<String>) {
+    match liveness {
+        FacUnitLiveness::Active { active_units } => {
+            let preview = active_units
+                .iter()
+                .take(4)
+                .map(std::string::String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = if preview.is_empty() {
+                format!(
+                    "associated systemd units still active (count={})",
+                    active_units.len()
+                )
+            } else {
+                let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                format!(
+                    "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                    active_units.len()
+                )
+            };
+            ("active".to_string(), detail, active_units)
+        },
+        FacUnitLiveness::Unknown { reason } => (
+            "unknown".to_string(),
+            format!("systemd liveness probe inconclusive ({reason}); fail-closed"),
+            Vec::new(),
+        ),
+        FacUnitLiveness::Inactive => (
+            "inactive".to_string(),
+            "no active associated systemd units".to_string(),
+            Vec::new(),
+        ),
+    }
+}
+
+fn enforce_lane_reset_liveness_guard<F>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    probe: F,
+) -> Result<(), String>
+where
+    F: Fn(&str, &str) -> FacUnitLiveness,
+{
+    let Some(job_id) = job_id else {
+        return Err("reset blocked: cannot verify unit liveness without lease job_id".to_string());
+    };
+    let liveness = probe(lane_id, job_id);
+    if matches!(liveness, FacUnitLiveness::Inactive) {
+        return Ok(());
+    }
+
+    let (state, detail, active_units) = describe_orphaned_unit_liveness(liveness);
+    if active_units.is_empty() {
+        Err(format!("reset blocked while liveness={state}: {detail}"))
+    } else {
+        Err(format!(
+            "reset blocked while liveness={state}: {detail}; active_units={}",
+            active_units.join(", ")
+        ))
+    }
+}
+
+fn enforce_lane_reset_liveness_for_context<F, G>(
+    lane_id: &str,
+    job_id: Option<&str>,
+    reason_is_orphaned: bool,
+    unit_probe: F,
+    lane_probe: G,
+) -> Result<(), String>
+where
+    F: Fn(&str, &str) -> FacUnitLiveness,
+    G: Fn(&str) -> FacUnitLiveness,
+{
+    if job_id.is_some() {
+        return enforce_lane_reset_liveness_guard(lane_id, job_id, unit_probe);
+    }
+
+    if reason_is_orphaned {
+        return Err(
+            "reset blocked: orphaned-systemd lane is missing lease job_id for liveness verification"
+                .to_string(),
+        );
+    }
+
+    let liveness = lane_probe(lane_id);
+    match liveness {
+        FacUnitLiveness::Inactive => Ok(()),
+        FacUnitLiveness::Unknown { reason }
+            if reason.contains(FAC_UNIT_LIVENESS_UNAVAILABLE_REASON) =>
+        {
+            // No reachable systemd scope on this host; allow non-orphaned
+            // manual recovery when no lane/job identity exists.
+            Ok(())
+        },
+        other => {
+            let (state, detail, active_units) = describe_orphaned_unit_liveness(other);
+            if active_units.is_empty() {
+                Err(format!("reset blocked while liveness={state}: {detail}"))
+            } else {
+                Err(format!(
+                    "reset blocked while liveness={state}: {detail}; active_units={}",
+                    active_units.join(", ")
+                ))
+            }
+        },
+    }
+}
+
+fn collect_orphaned_systemd_units(
+    fac_root: &Path,
+) -> Result<Vec<OrphanedSystemdUnitDiagnostic>, String> {
+    let lane_mgr = LaneManager::new(fac_root.to_path_buf())
+        .map_err(|err| format!("lane manager init failed: {err}"))?;
+    let mut diagnostics = Vec::new();
+
+    for lane_id in LaneManager::default_lane_ids() {
+        let lane_dir = lane_mgr.lane_dir(&lane_id);
+        let lease = LaneLeaseV1::load(&lane_dir)
+            .map_err(|err| format!("failed to load lease for {lane_id}: {err}"))?;
+        let Some(lease) = lease else {
+            continue;
+        };
+        if !matches!(
+            lease.state,
+            LaneState::Running | LaneState::Leased | LaneState::Cleanup
+        ) {
+            continue;
+        }
+        let identity = verify_pid_identity(lease.pid, lease.proc_start_time_ticks);
+        if !matches!(
+            identity,
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+        ) {
+            continue;
+        }
+
+        let (liveness_state, detail, active_units) =
+            describe_orphaned_unit_liveness(check_fac_unit_liveness(&lane_id, &lease.job_id));
+        if liveness_state == "inactive" {
+            continue;
+        }
+        diagnostics.push(OrphanedSystemdUnitDiagnostic {
+            lane_id: lane_id.clone(),
+            job_id: lease.job_id.clone(),
+            pid: lease.pid,
+            reason_code: ORPHANED_SYSTEMD_UNIT_REASON_CODE.to_string(),
+            liveness: liveness_state,
+            detail,
+            recommended_action:
+                "run stop_revoke for the target job to stop active units, then run `apm2 fac doctor --fix`".to_string(),
+            active_units,
+        });
+    }
+
+    Ok(diagnostics)
+}
+
+fn push_system_doctor_fix_action(
+    actions: &mut Vec<SystemDoctorFixAction>,
+    action: SystemDoctorFixActionKind,
+    status: SystemDoctorFixActionStatus,
+    lane_id: Option<&str>,
+    detail: impl Into<String>,
+) {
+    actions.push(SystemDoctorFixAction {
+        action,
+        status,
+        lane_id: lane_id.map(std::string::ToString::to_string),
+        detail: detail.into(),
+    });
+}
+
+const fn system_doctor_fix_exit_code(
+    action_failed: bool,
+    has_blocked_actions: bool,
+    has_errors_after: bool,
+) -> u8 {
+    if action_failed || has_blocked_actions || has_errors_after {
+        exit_codes::GENERIC_ERROR
+    } else {
+        exit_codes::SUCCESS
+    }
+}
+
+fn collect_system_doctor_snapshot(
+    operator_socket: &Path,
+    config_path: &Path,
+    full: bool,
+    include_tracked_prs: bool,
+    repo_filter: Option<&str>,
+) -> Result<DoctorSystemSnapshot, String> {
+    let (mut checks, has_critical_error) =
+        crate::commands::daemon::collect_doctor_checks(operator_socket, config_path, full)
+            .map_err(|err| err.to_string())?;
+    let tracked_prs = if include_tracked_prs {
+        match fac_review::collect_tracked_pr_summaries(repo_filter, repo_filter) {
+            Ok(value) => value,
+            Err(err) => {
+                checks.push(crate::commands::daemon::DaemonDoctorCheck {
+                    name: "tracked_pr_summary".to_string(),
+                    status: "WARN",
+                    message: format!("failed to build tracked PR doctor summary: {err}"),
+                });
+                Vec::new()
+            },
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(DoctorSystemSnapshot {
+        checks,
+        tracked_prs,
+        has_critical_error,
+    })
+}
+
+fn emit_system_doctor_snapshot(snapshot: &DoctorSystemSnapshot) {
+    let payload = serde_json::json!({
+        "schema": FAC_DOCTOR_SYSTEM_SCHEMA,
+        "checks": snapshot.checks,
+        "tracked_prs": snapshot.tracked_prs,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+fn load_lane_reason_hint(manager: &LaneManager, status: &LaneStatusV1) -> Option<String> {
+    if let Some(reason) = status.corrupt_reason.as_ref() {
+        return Some(reason.clone());
+    }
+    if status.state != LaneState::Corrupt {
+        return None;
+    }
+    let lease = LaneLeaseV1::load(&manager.lane_dir(&status.lane_id))
+        .ok()
+        .flatten()?;
+    if lease.state == LaneState::Corrupt && lease.pid == 0 {
+        return Some(lease.job_id);
+    }
+    None
+}
+
+#[cfg(test)]
+fn should_attempt_cleanup_scrub(reason_hint: &str) -> bool {
+    let reason = reason_hint.to_ascii_lowercase();
+    reason.contains("more than") && reason.contains("entries")
+        || reason.contains("unexpected file type")
+        || reason.contains("symlink detected")
+        || reason.contains("tmp")
+}
+
+fn is_tmp_residue_name(name: &str) -> bool {
+    name.starts_with(".tmp")
+        || name.starts_with("tmp.")
+        || Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+}
+
+fn detect_lane_tmp_corruption(
+    manager: &LaneManager,
+    lane_id: &str,
+) -> Result<Option<String>, String> {
+    detect_lane_tmp_corruption_with_entry_limit(manager, lane_id, MAX_TMP_SCRUB_ENTRIES)
+}
+
+fn detect_lane_tmp_corruption_with_entry_limit(
+    manager: &LaneManager,
+    lane_id: &str,
+    max_entries: usize,
+) -> Result<Option<String>, String> {
+    let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+    let tmp_meta = match std::fs::symlink_metadata(&tmp_dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to stat tmp dir {}: {err}",
+                tmp_dir.display()
+            ));
+        },
+    };
+
+    if !tmp_meta.is_dir() {
+        return Ok(Some(format!(
+            "tmp path is not a directory: {}",
+            tmp_dir.display()
+        )));
+    }
+
+    let mut dirs_to_scan = vec![tmp_dir];
+    let mut scanned_entries: usize = 0;
+
+    while let Some(scan_dir) = dirs_to_scan.pop() {
+        let entries = match std::fs::read_dir(&scan_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(Some(format!(
+                    "tmp scan permission denied at {} (will require scrub/reset)",
+                    scan_dir.display()
+                )));
+            },
+            Err(err) => {
+                return Err(format!(
+                    "failed to read tmp dir {}: {err}",
+                    scan_dir.display()
+                ));
+            },
+        };
+        for entry in entries {
+            scanned_entries = scanned_entries.saturating_add(1);
+            if scanned_entries > max_entries {
+                return Ok(Some(format!(
+                    "tmp entry count exceeded bound (>{max_entries})"
+                )));
+            }
+
+            let entry = entry.map_err(|err| format!("failed to read tmp entry: {err}"))?;
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(Some(format!(
+                        "tmp metadata permission denied at {} (will require scrub/reset)",
+                        path.display()
+                    )));
+                },
+                Err(err) => {
+                    return Err(format!(
+                        "failed to stat tmp entry {}: {err}",
+                        path.display()
+                    ));
+                },
+            };
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Ok(Some(format!(
+                    "tmp contains symlink entry {}",
+                    path.display()
+                )));
+            }
+            if file_type.is_dir() {
+                dirs_to_scan.push(path);
+                continue;
+            }
+            if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if is_tmp_residue_name(&name) {
+                    return Ok(Some(format!(
+                        "tmp contains transient residue entry {}",
+                        path.display()
+                    )));
+                }
+                continue;
+            }
+            return Ok(Some(format!(
+                "tmp contains unsupported file type at {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn doctor_reset_lane_once(
+    manager: &LaneManager,
+    lane_id: &str,
+) -> Result<DoctorLaneResetSummary, DoctorLaneResetError> {
+    manager.ensure_directories().map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to ensure directories: {err}"))
+    })?;
+
+    let _lock_guard = manager
+        .acquire_lock(lane_id)
+        .map_err(|err| DoctorLaneResetError::Other(format!("failed to acquire lock: {err}")))?;
+    let status = manager
+        .lane_status(lane_id)
+        .map_err(|err| DoctorLaneResetError::Other(format!("failed to load lane status: {err}")))?;
+    if status.state == LaneState::Running {
+        return Err(DoctorLaneResetError::Running { pid: status.pid });
+    }
+
+    let lane_dir = manager.lane_dir(lane_id);
+    let Some(lanes_root) = lane_dir.parent() else {
+        return Err(DoctorLaneResetError::Other(format!(
+            "lane directory {} has no parent",
+            lane_dir.display()
+        )));
+    };
+
+    let mut subdirs: Vec<&str> = vec!["workspace", "target", "logs"];
+    subdirs.extend_from_slice(LANE_ENV_DIRS);
+
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 0;
+    let mut deferred_cleanup_roots: u64 = 0;
+    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
+    for subdir in &subdirs {
+        let subdir_path = lane_dir.join(subdir);
+        match delete_path_for_recovery(
+            &subdir_path,
+            lanes_root,
+            &lane_dir,
+            subdir,
+            MAX_LOG_DIR_ENTRIES,
+        ) {
+            Ok(DoctorSubdirDeleteOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => {
+                total_files = total_files.saturating_add(files_deleted);
+                total_dirs = total_dirs.saturating_add(dirs_deleted);
+            },
+            Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent) => {},
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path,
+                reason,
+            }) => {
+                deferred_cleanup_roots = deferred_cleanup_roots.saturating_add(1);
+                refused_receipts.push(RefusedDeleteReceipt {
+                    root: deferred_path,
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: format!("deferred cleanup: {reason}"),
+                    mark_corrupt: false,
+                });
+            },
+            Err(err) => {
+                refused_receipts.push(RefusedDeleteReceipt {
+                    root: subdir_path,
+                    allowed_parent: lanes_root.to_path_buf(),
+                    reason: err,
+                    mark_corrupt: true,
+                });
+            },
+        }
+    }
+    if refused_receipts.iter().any(|receipt| receipt.mark_corrupt) {
+        return Err(DoctorLaneResetError::RefusedDelete {
+            receipts: refused_receipts,
+        });
+    }
+
+    LaneLeaseV1::remove(&lane_dir).map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to remove lane lease: {err}"))
+    })?;
+    LaneCorruptMarkerV1::remove(manager.fac_root(), lane_id).map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to clear corrupt marker: {err}"))
+    })?;
+
+    manager.ensure_directories().map_err(|err| {
+        DoctorLaneResetError::Other(format!("failed to re-create lane directories: {err}"))
+    })?;
+
+    Ok(DoctorLaneResetSummary {
+        files_deleted: total_files,
+        dirs_deleted: total_dirs,
+        deferred_cleanup_roots,
+    })
+}
+
+#[cfg(test)]
+fn refused_delete_mentions_tmp(receipts: &[RefusedDeleteReceipt]) -> bool {
+    receipts.iter().any(|receipt| {
+        receipt
+            .root
+            .components()
+            .any(|component| component.as_os_str() == "tmp")
+    })
+}
+
+fn next_doctor_orphan_path(lane_dir: &Path, label: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    lane_dir.join(format!(".doctor-orphan-{label}-{pid}-{stamp}"))
+}
+
+fn rotate_path_to_doctor_orphan(
+    path: &Path,
+    lane_dir: &Path,
+    label: &str,
+) -> Result<Option<PathBuf>, String> {
+    for attempt in 0..16 {
+        let mut target = next_doctor_orphan_path(lane_dir, label);
+        if attempt > 0 {
+            target = lane_dir.join(format!(
+                "{}-{attempt}",
+                target
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("doctor-orphan")
+            ));
+        }
+        match std::fs::rename(path, &target) {
+            Ok(()) => return Ok(Some(target)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                if attempt == 15 {
+                    return Err(format!(
+                        "failed to rotate {} for deferred cleanup: {err}",
+                        path.display()
+                    ));
+                }
+            },
+        }
+    }
+    Err(format!(
+        "failed to rotate {} for deferred cleanup (retry budget exhausted)",
+        path.display()
+    ))
+}
+
+fn delete_path_for_recovery(
+    target_path: &Path,
+    allowed_parent: &Path,
+    lane_dir: &Path,
+    orphan_label: &str,
+    entry_limit: usize,
+) -> Result<DoctorSubdirDeleteOutcome, String> {
+    let metadata = match std::fs::symlink_metadata(target_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent);
+        },
+        Err(err) => {
+            return Err(format!(
+                "failed to stat {} before cleanup: {err}",
+                target_path.display()
+            ));
+        },
+    };
+
+    if metadata.is_dir() {
+        let deletion_attempt =
+            normalize_user_owned_dir_modes_for_safe_delete(target_path, entry_limit)
+                .map_err(|err| format!("permission repair failed: {err}"))
+                .and_then(|_| {
+                    safe_rmtree_v1_with_entry_limit(target_path, allowed_parent, entry_limit)
+                        .map_err(|err| err.to_string())
+                });
+
+        return match deletion_attempt {
+            Ok(SafeRmtreeOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+                files_deleted,
+                dirs_deleted,
+            }),
+            Ok(SafeRmtreeOutcome::AlreadyAbsent) => Ok(DoctorSubdirDeleteOutcome::AlreadyAbsent),
+            Err(reason) => {
+                let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                    .ok_or_else(|| {
+                    format!(
+                        "cleanup failed and path vanished before defer: {} ({reason})",
+                        target_path.display()
+                    )
+                })?;
+                Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                    deferred_path: deferred,
+                    reason,
+                })
+            },
+        };
+    }
+
+    match std::fs::remove_file(target_path) {
+        Ok(()) => Ok(DoctorSubdirDeleteOutcome::Deleted {
+            files_deleted: 1,
+            dirs_deleted: 0,
+        }),
+        Err(remove_err) => {
+            let deferred = rotate_path_to_doctor_orphan(target_path, lane_dir, orphan_label)?
+                .ok_or_else(|| {
+                    format!(
+                        "failed to remove non-directory path {}: {remove_err}",
+                        target_path.display()
+                    )
+                })?;
+            Ok(DoctorSubdirDeleteOutcome::DeferredCleanup {
+                deferred_path: deferred,
+                reason: format!("failed to remove non-directory path: {remove_err}"),
+            })
+        },
+    }
+}
+
+fn scrub_lane_tmp_dir(manager: &LaneManager, lane_id: &str) -> Result<TmpScrubSummary, String> {
+    scrub_lane_tmp_dir_with_entry_limit(manager, lane_id, MAX_TMP_SCRUB_ENTRIES)
+}
+
+fn ensure_tmp_dir_exists(tmp_dir: &Path) -> Result<(), String> {
+    match std::fs::create_dir(tmp_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(tmp_dir).map_err(|meta_err| {
+                format!(
+                    "failed to verify existing tmp path {}: {meta_err}",
+                    tmp_dir.display()
+                )
+            })?;
+            if meta.is_dir() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "tmp path {} exists but is not a directory",
+                    tmp_dir.display()
+                ))
+            }
+        },
+        Err(err) => Err(format!(
+            "failed to create tmp directory {}: {err}",
+            tmp_dir.display()
+        )),
+    }
+}
+
+fn scrub_lane_tmp_dir_with_entry_limit(
+    manager: &LaneManager,
+    lane_id: &str,
+    max_entries_per_dir: usize,
+) -> Result<TmpScrubSummary, String> {
+    let lane_dir = manager.lane_dir(lane_id);
+    let tmp_dir = lane_dir.join("tmp");
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
+    let cleanup_outcome =
+        delete_path_for_recovery(&tmp_dir, &lane_dir, &lane_dir, "tmp-scrub", effective_limit)?;
+    ensure_tmp_dir_exists(&tmp_dir)?;
+
+    let (entries_deleted, deferred_cleanup_roots) = match cleanup_outcome {
+        DoctorSubdirDeleteOutcome::Deleted {
+            files_deleted,
+            dirs_deleted,
+        } => (
+            files_deleted.saturating_add(dirs_deleted.saturating_sub(1)),
+            0_u64,
+        ),
+        DoctorSubdirDeleteOutcome::AlreadyAbsent => (0_u64, 0_u64),
+        DoctorSubdirDeleteOutcome::DeferredCleanup {
+            deferred_path: _,
+            reason: _,
+        } => (0_u64, 1_u64),
+    };
+
+    Ok(TmpScrubSummary {
+        entries_deleted,
+        deferred_cleanup_roots,
+    })
+}
+
+fn gc_stale_lane_logs(fac_root: &Path, manager: &LaneManager) -> Result<LaneLogGcSummary, String> {
+    let gc_plan =
+        plan_gc_with_log_retention(fac_root, manager, 0, 0, &LogRetentionConfig::default())
+            .map_err(|err| format!("failed to build lane log GC plan: {err:?}"))?;
+
+    let targets: Vec<_> = gc_plan
+        .targets
+        .into_iter()
+        .filter(|target| {
+            matches!(
+                target.kind,
+                GcActionKind::LaneLogRetention | GcActionKind::LaneLog
+            )
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(LaneLogGcSummary {
+            targets: 0,
+            actions_applied: 0,
+            errors: 0,
+            bytes_freed: 0,
+        });
+    }
+
+    let target_count = targets.len();
+    let receipt = execute_gc(&GcPlan { targets });
+    let bytes_freed = receipt
+        .actions
+        .iter()
+        .fold(0_u64, |acc, action| acc.saturating_add(action.bytes_freed));
+
+    Ok(LaneLogGcSummary {
+        targets: target_count,
+        actions_applied: receipt.actions.len(),
+        errors: receipt.errors.len(),
+        bytes_freed,
+    })
+}
+
+fn record_gc_maintenance_action(
+    actions: &mut Vec<SystemDoctorFixAction>,
+    result: Result<fac_gc::DoctorGcMaintenanceSummary, String>,
+) -> bool {
+    match result {
+        Ok(summary) => {
+            let detail = format!(
+                "plan_targets={} actions={} errors={} bytes_freed={} migration_moved={} migration_failed={} migration_skipped={} receipt={}",
+                summary.plan_targets,
+                summary.actions_applied,
+                summary.errors,
+                summary.bytes_freed,
+                summary.migration_files_moved,
+                summary.migration_files_failed,
+                summary.migration_skipped,
+                summary.receipt_path.display()
+            );
+            let detail = match summary.migration_warning.as_ref() {
+                Some(warning) => format!("{detail}; migration_warning={warning}"),
+                None => detail,
+            };
+            if summary.errors == 0 {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    detail,
+                );
+            } else {
+                push_system_doctor_fix_action(
+                    actions,
+                    SystemDoctorFixActionKind::GcMaintenance,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("partial_gc_with_errors: {detail}"),
+                );
+            }
+            false
+        },
+        Err(err) => {
+            push_system_doctor_fix_action(
+                actions,
+                SystemDoctorFixActionKind::GcMaintenance,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("autonomous GC maintenance unavailable: {err}"),
+            );
+            true
+        },
+    }
+}
+
+fn restart_worker_service_unit() -> Result<String, String> {
+    let mut errors = Vec::new();
+    for scope in SERVICE_SCOPES {
+        let mut command = Command::new("systemctl");
+        if let Some(scope_flag) = scope.scope_flag() {
+            command.arg(scope_flag);
+        }
+        let output = command
+            .args(["restart", "apm2-worker.service"])
+            .output()
+            .map_err(|err| {
+                format!(
+                    "failed to execute systemctl in {} scope: {err}",
+                    scope.label()
+                )
+            });
+        match output {
+            Ok(output) if output.status.success() => return Ok(scope.label().to_string()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                errors.push(format!(
+                    "{} scope restart failed: {}",
+                    scope.label(),
+                    if stderr.is_empty() {
+                        format!("exit {}", output.status.code().unwrap_or(-1))
+                    } else {
+                        stderr
+                    }
+                ));
+            },
+            Err(err) => errors.push(err),
+        }
+    }
+
+    Err(format!(
+        "failed to restart apm2-worker.service in all scopes: {}",
+        errors.join("; ")
+    ))
+}
+
+type CollectSystemDoctorSnapshotFn =
+    fn(&Path, &Path, bool, bool, Option<&str>) -> Result<DoctorSystemSnapshot, String>;
+type RestartWorkerServiceFn = fn() -> Result<String, String>;
+type CheckFacUnitLivenessFn = fn(&str, &str) -> FacUnitLiveness;
+type CheckFacLaneLivenessFn = fn(&str) -> FacUnitLiveness;
+
+#[derive(Clone, Copy)]
+struct SystemDoctorFixHooks {
+    collect_snapshot: CollectSystemDoctorSnapshotFn,
+    restart_worker: RestartWorkerServiceFn,
+    check_unit_liveness: CheckFacUnitLivenessFn,
+    check_lane_liveness: CheckFacLaneLivenessFn,
+}
+
+fn run_system_doctor_fix(
+    operator_socket: &Path,
+    config_path: &Path,
+    full: bool,
+    include_tracked_prs: bool,
+    repo_filter: Option<&str>,
+    json_output: bool,
+) -> u8 {
+    run_system_doctor_fix_with_hooks(
+        operator_socket,
+        config_path,
+        full,
+        include_tracked_prs,
+        repo_filter,
+        json_output,
+        SystemDoctorFixHooks {
+            collect_snapshot: collect_system_doctor_snapshot,
+            restart_worker: restart_worker_service_unit,
+            check_unit_liveness: check_fac_unit_liveness,
+            check_lane_liveness: check_fac_lane_liveness,
+        },
+    )
+}
+
+fn run_system_doctor_fix_with_hooks(
+    operator_socket: &Path,
+    config_path: &Path,
+    full: bool,
+    include_tracked_prs: bool,
+    repo_filter: Option<&str>,
+    json_output: bool,
+    hooks: SystemDoctorFixHooks,
+) -> u8 {
+    use apm2_core::fac::{OrphanedJobPolicy, reconcile_on_startup};
+    use apm2_core::github::resolve_apm2_home;
+
+    let before_snapshot = match (hooks.collect_snapshot)(
+        operator_socket,
+        config_path,
+        full,
+        include_tracked_prs,
+        repo_filter,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "fac_doctor_failed",
+                &format!("failed to collect pre-fix doctor checks: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let Some(home) = resolve_apm2_home() else {
+        return output_error(
+            json_output,
+            "fac_doctor_fix_home_unresolved",
+            "cannot resolve APM2 home for doctor --fix",
+            exit_codes::GENERIC_ERROR,
+        );
+    };
+    let fac_root = home.join("private").join("fac");
+    let queue_root = home.join("queue");
+
+    let manager = match LaneManager::new(fac_root.clone()) {
+        Ok(manager) => manager,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "fac_doctor_fix_lane_manager_init_failed",
+                &format!("failed to initialize lane manager: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let mut actions: Vec<SystemDoctorFixAction> = Vec::new();
+    let mut action_failed = false;
+    let mut should_restart_worker = false;
+    let mut lane_resets_applied = false;
+
+    match manager.reconcile_lanes() {
+        Ok(receipt) => {
+            let has_lane_errors = receipt.lanes_failed > 0
+                || receipt.lanes_marked_corrupt > 0
+                || receipt.infrastructure_failures > 0;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneReconcile,
+                if has_lane_errors {
+                    SystemDoctorFixActionStatus::Blocked
+                } else {
+                    SystemDoctorFixActionStatus::Applied
+                },
+                None,
+                format!(
+                    "inspected={} repaired={} marked_corrupt={} failed={} infra_failures={}",
+                    receipt.lanes_inspected,
+                    receipt.lanes_repaired,
+                    receipt.lanes_marked_corrupt,
+                    receipt.lanes_failed,
+                    receipt.infrastructure_failures
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneReconcile,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("lane reconcile failed: {err}"),
+            );
+        },
+    }
+
+    match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
+        Ok(receipt) => {
+            let still_active_flock_held = receipt
+                .queue_actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        apm2_core::fac::QueueRecoveryAction::StillActive { lane_id, .. }
+                            if lane_id == "flock_held"
+                    )
+                })
+                .count();
+            let has_running_lane = manager.all_lane_statuses().ok().is_some_and(|statuses| {
+                statuses
+                    .iter()
+                    .any(|status| status.state == LaneState::Running)
+            });
+            if receipt.stale_leases_recovered > 0
+                || receipt.orphaned_jobs_requeued > 0
+                || receipt.orphaned_jobs_failed > 0
+                || receipt.torn_states_recovered > 0
+                || (still_active_flock_held > 0 && !has_running_lane)
+            {
+                should_restart_worker = true;
+            }
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::QueueReconcileApply,
+                SystemDoctorFixActionStatus::Applied,
+                None,
+                format!(
+                    "lanes_inspected={} stale_leases_recovered={} orphaned_jobs_requeued={} orphaned_jobs_failed={} torn_states_recovered={} lanes_marked_corrupt={} still_active_flock_held={} running_lane_present={}",
+                    receipt.lanes_inspected,
+                    receipt.stale_leases_recovered,
+                    receipt.orphaned_jobs_requeued,
+                    receipt.orphaned_jobs_failed,
+                    receipt.torn_states_recovered,
+                    receipt.lanes_marked_corrupt,
+                    still_active_flock_held,
+                    has_running_lane
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::QueueReconcileApply,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("queue reconcile failed: {err}"),
+            );
+        },
+    }
+
+    if record_gc_maintenance_action(&mut actions, fac_gc::run_gc_for_doctor_fix()) {
+        action_failed = true;
+    }
+
+    match gc_stale_lane_logs(&fac_root, &manager) {
+        Ok(summary) if summary.targets == 0 => {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Skipped,
+                None,
+                "no stale lane log targets matched retention policy",
+            );
+        },
+        Ok(summary) if summary.errors == 0 => {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Applied,
+                None,
+                format!(
+                    "targets={} actions={} bytes_freed={}",
+                    summary.targets, summary.actions_applied, summary.bytes_freed
+                ),
+            );
+        },
+        Ok(summary) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!(
+                    "targets={} actions={} errors={} bytes_freed={}",
+                    summary.targets, summary.actions_applied, summary.errors, summary.bytes_freed
+                ),
+            );
+        },
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneLogGc,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                err,
+            );
+        },
+    }
+
+    let lane_statuses = match manager.all_lane_statuses() {
+        Ok(statuses) => statuses,
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneStatusScan,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("failed to load lane statuses: {err}"),
+            );
+            Vec::new()
+        },
+    };
+
+    for status in lane_statuses {
+        if status.state != LaneState::Corrupt {
+            continue;
+        }
+
+        let lane_id = status.lane_id.clone();
+        let reason_hint = load_lane_reason_hint(&manager, &status).unwrap_or_default();
+        let reason_is_orphaned = reason_hint.contains(ORPHANED_SYSTEMD_UNIT_REASON_CODE);
+        let tmp_trigger_detail = match detect_lane_tmp_corruption(&manager, &lane_id) {
+            Ok(value) => value,
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::LaneTmpCorruptionDetection,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    err,
+                );
+                None
+            },
+        };
+        let reason_is_tmp_corrupt = tmp_trigger_detail.is_some();
+
+        let reset_action = if reason_is_orphaned {
+            SystemDoctorFixActionKind::LaneResetOrphanedSystemdUnit
+        } else if reason_is_tmp_corrupt {
+            SystemDoctorFixActionKind::LaneResetTmpCorruption
+        } else {
+            SystemDoctorFixActionKind::LaneResetCleanupRecovery
+        };
+        let job_id = status.job_id.clone().or_else(|| {
+            LaneLeaseV1::load(&manager.lane_dir(&lane_id))
+                .ok()
+                .flatten()
+                .map(|lease| lease.job_id)
+        });
+        if let Err(detail) = enforce_lane_reset_liveness_for_context(
+            &lane_id,
+            job_id.as_deref(),
+            reason_is_orphaned,
+            hooks.check_unit_liveness,
+            hooks.check_lane_liveness,
+        ) {
+            push_system_doctor_fix_action(
+                &mut actions,
+                reset_action,
+                SystemDoctorFixActionStatus::Blocked,
+                Some(&lane_id),
+                detail,
+            );
+            continue;
+        }
+
+        if let Some(detail) = tmp_trigger_detail.as_ref() {
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
+                SystemDoctorFixActionStatus::Applied,
+                Some(&lane_id),
+                detail.clone(),
+            );
+            match scrub_lane_tmp_dir(&manager, &lane_id) {
+                Ok(scrub_summary) => {
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        SystemDoctorFixActionKind::LaneTmpScrub,
+                        SystemDoctorFixActionStatus::Applied,
+                        Some(&lane_id),
+                        format!(
+                            "tmp scrubbed (entries_deleted={}, deferred_cleanup_roots={})",
+                            scrub_summary.entries_deleted, scrub_summary.deferred_cleanup_roots
+                        ),
+                    );
+                },
+                Err(err) => {
+                    action_failed = true;
+                    push_system_doctor_fix_action(
+                        &mut actions,
+                        SystemDoctorFixActionKind::LaneTmpScrub,
+                        SystemDoctorFixActionStatus::Failed,
+                        Some(&lane_id),
+                        err,
+                    );
+                    continue;
+                },
+            }
+        }
+
+        match doctor_reset_lane_once(&manager, &lane_id) {
+            Ok(reset_summary) => {
+                lane_resets_applied = true;
+                should_restart_worker = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Applied,
+                    Some(&lane_id),
+                    format!(
+                        "reset complete (files_deleted={}, dirs_deleted={}, deferred_cleanup_roots={})",
+                        reset_summary.files_deleted,
+                        reset_summary.dirs_deleted,
+                        reset_summary.deferred_cleanup_roots
+                    ),
+                );
+            },
+            Err(DoctorLaneResetError::Running { pid }) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Blocked,
+                    Some(&lane_id),
+                    format!(
+                        "lane is RUNNING (pid={}); refusing non-force reset",
+                        pid.unwrap_or(0)
+                    ),
+                );
+            },
+            Err(DoctorLaneResetError::RefusedDelete { receipts }) => {
+                action_failed = true;
+                let detail = receipts
+                    .iter()
+                    .map(|receipt| format!("{}: {}", receipt.root.display(), receipt.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    format!("reset refused: {detail}"),
+                );
+            },
+            Err(DoctorLaneResetError::Other(err)) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    reset_action,
+                    SystemDoctorFixActionStatus::Failed,
+                    Some(&lane_id),
+                    err,
+                );
+            },
+        }
+    }
+
+    if lane_resets_applied {
+        match reconcile_on_startup(&fac_root, &queue_root, OrphanedJobPolicy::Requeue, false) {
+            Ok(receipt) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!(
+                        "post-reset reconcile complete (stale_leases_recovered={}, orphaned_jobs_requeued={}, orphaned_jobs_failed={}, torn_states_recovered={})",
+                        receipt.stale_leases_recovered,
+                        receipt.orphaned_jobs_requeued,
+                        receipt.orphaned_jobs_failed,
+                        receipt.torn_states_recovered
+                    ),
+                );
+            },
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+                    SystemDoctorFixActionStatus::Failed,
+                    None,
+                    format!("post-reset queue reconcile failed: {err}"),
+                );
+            },
+        }
+    } else {
+        push_system_doctor_fix_action(
+            &mut actions,
+            SystemDoctorFixActionKind::QueueReconcilePostLaneReset,
+            SystemDoctorFixActionStatus::Skipped,
+            None,
+            "no lane reset actions applied; post-reset reconcile skipped",
+        );
+    }
+
+    if should_restart_worker {
+        match (hooks.restart_worker)() {
+            Ok(scope) => {
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::WorkerRestart,
+                    SystemDoctorFixActionStatus::Applied,
+                    None,
+                    format!("restarted apm2-worker.service in {scope} scope"),
+                );
+            },
+            Err(err) => {
+                action_failed = true;
+                push_system_doctor_fix_action(
+                    &mut actions,
+                    SystemDoctorFixActionKind::WorkerRestart,
+                    SystemDoctorFixActionStatus::Failed,
+                    None,
+                    err,
+                );
+            },
+        }
+    } else {
+        push_system_doctor_fix_action(
+            &mut actions,
+            SystemDoctorFixActionKind::WorkerRestart,
+            SystemDoctorFixActionStatus::Skipped,
+            None,
+            "no repair actions required worker restart",
+        );
+    }
+
+    let after_snapshot = match (hooks.collect_snapshot)(
+        operator_socket,
+        config_path,
+        full,
+        include_tracked_prs,
+        repo_filter,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            action_failed = true;
+            push_system_doctor_fix_action(
+                &mut actions,
+                SystemDoctorFixActionKind::DoctorPostCheck,
+                SystemDoctorFixActionStatus::Failed,
+                None,
+                format!("failed to collect post-fix checks: {err}"),
+            );
+            DoctorSystemSnapshot {
+                checks: Vec::new(),
+                tracked_prs: Vec::new(),
+                has_critical_error: true,
+            }
+        },
+    };
+
+    let response = SystemDoctorFixResponse {
+        schema: FAC_DOCTOR_SYSTEM_FIX_SCHEMA.to_string(),
+        actions,
+        checks_before: before_snapshot.checks,
+        checks_after: after_snapshot.checks,
+        tracked_prs: after_snapshot.tracked_prs,
+        had_errors_before: before_snapshot.has_critical_error,
+        has_errors_after: after_snapshot.has_critical_error,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+    );
+
+    let has_blocked_actions = response
+        .actions
+        .iter()
+        .any(|action| action.status == SystemDoctorFixActionStatus::Blocked);
+    system_doctor_fix_exit_code(
+        action_failed,
+        has_blocked_actions,
+        after_snapshot.has_critical_error,
+    )
+}
 
 fn run_services_status(_json_output: bool) -> u8 {
     let current_boot_micros = read_boot_time_micros();
@@ -1985,6 +3252,22 @@ fn run_services_status(_json_output: bool) -> u8 {
         }
     }
 
+    let (orphaned_systemd_units, orphaned_systemd_unit_error) = fac_root.as_ref().map_or_else(
+        || (Vec::new(), None),
+        |root| match collect_orphaned_systemd_units(root) {
+            Ok(units) => {
+                if !units.is_empty() {
+                    degraded = true;
+                }
+                (units, None)
+            },
+            Err(err) => {
+                degraded = true;
+                (Vec::new(), Some(err))
+            },
+        },
+    );
+
     let overall_health = if degraded { "degraded" } else { "healthy" }.to_string();
 
     let response = ServicesStatusResponse {
@@ -1992,6 +3275,8 @@ fn run_services_status(_json_output: bool) -> u8 {
         services: services.clone(),
         worker_heartbeat,
         broker_health,
+        orphaned_systemd_units,
+        orphaned_systemd_unit_error,
     };
     if let Ok(json) = serde_json::to_string_pretty(&response) {
         println!("{json}");
@@ -2192,7 +3477,6 @@ pub fn run_fac(
     // TCK-00606 S12 invariant: FAC commands are machine-output only.
     let machine_output = subcommand_requests_machine_output(&cmd.subcommand);
     let json_output = machine_output;
-    let resolve_json = |_subcommand_json: bool| -> bool { machine_output };
 
     // TCK-00577 round 3: Enqueue-class commands (push, gates, warm) may be
     // invoked by non-service-user callers in a service-user-owned deployment.
@@ -2247,7 +3531,6 @@ pub fn run_fac(
             | FacSubcommand::Services(_)
             | FacSubcommand::Worker(_)
             | FacSubcommand::Broker(_)
-            | FacSubcommand::Recover(_)
             | FacSubcommand::Gc(_)
             | FacSubcommand::Quarantine(_)
             | FacSubcommand::Job(_)
@@ -2255,7 +3538,6 @@ pub fn run_fac(
             | FacSubcommand::Warm(_)
             | FacSubcommand::Bench(_)
             | FacSubcommand::Bundle(_)
-            | FacSubcommand::Reconcile(_)
             | FacSubcommand::Queue(_)
             | FacSubcommand::Policy(_)
             | FacSubcommand::Economics(_)
@@ -2263,10 +3545,13 @@ pub fn run_fac(
             | FacSubcommand::Config(_)
             | FacSubcommand::Metrics(_)
             | FacSubcommand::Caches(_)
+            | FacSubcommand::Reviewer(_)
     ) {
         if let Err(e) = crate::commands::daemon::ensure_daemon_running(operator_socket, config_path)
         {
-            eprintln!("WARNING: Could not auto-start daemon: {e}");
+            if !machine_output {
+                eprintln!("WARNING: Could not auto-start daemon: {e}");
+            }
         }
     }
 
@@ -2279,7 +3564,7 @@ pub fn run_fac(
             args.pids_max,
             &args.cpu_quota,
             args.gate_profile,
-            resolve_json(args.json),
+            json_output,
             args.wait && !args.no_wait,
             args.wait_timeout_secs,
             cmd.queue_write_mode(),
@@ -2288,27 +3573,39 @@ pub fn run_fac(
             PreflightSubcommand::Credential(credential_args) => fac_preflight::run_credential(
                 credential_args.mode,
                 &credential_args.paths,
-                resolve_json(credential_args.json),
+                json_output,
             ),
-            PreflightSubcommand::Authorization(auth_args) => {
-                fac_preflight::run_workflow_authorization(resolve_json(auth_args.json))
+            PreflightSubcommand::Authorization(_auth_args) => {
+                fac_preflight::run_workflow_authorization(json_output)
             },
         },
         FacSubcommand::Work(args) => match &args.subcommand {
+            WorkSubcommand::Open(open_args) => {
+                run_work_open(open_args, operator_socket, json_output)
+            },
+            WorkSubcommand::Claim(claim_args) => {
+                run_work_claim(claim_args, operator_socket, json_output)
+            },
+            WorkSubcommand::Current(current_args) => {
+                run_work_current(current_args, operator_socket, json_output)
+            },
             WorkSubcommand::Status(status_args) => {
-                run_work_status(status_args, operator_socket, resolve_json(status_args.json))
+                run_work_status(status_args, operator_socket, json_output)
             },
             WorkSubcommand::List(list_args) => {
-                run_work_list(list_args, operator_socket, resolve_json(list_args.json))
+                run_work_list(list_args, operator_socket, json_output)
+            },
+            WorkSubcommand::ResolveAlias(resolve_args) => {
+                run_resolve_alias(resolve_args, operator_socket, json_output)
             },
         },
         FacSubcommand::Install(args) => crate::commands::fac_install::run_install(
-            resolve_json(args.json),
+            json_output,
             args.allow_partial,
             args.workspace_root.as_deref(),
         ),
         FacSubcommand::Doctor(args) => {
-            let output_json = resolve_json(args.json);
+            let output_json = json_output;
             if args.machine_spec {
                 match fac_review::fac_review_machine_spec_json_string(output_json) {
                     Ok(rendered) => {
@@ -2333,14 +3630,6 @@ pub fn run_fac(
                     exit_codes::GENERIC_ERROR,
                 );
             }
-            if args.fix && args.pr.is_none() {
-                return output_error(
-                    output_json,
-                    "fac_doctor_fix_requires_pr",
-                    "`apm2 fac doctor --fix` requires `--pr <N>`",
-                    exit_codes::GENERIC_ERROR,
-                );
-            }
             if args.wait_for_recommended_action && args.fix {
                 return output_error(
                     output_json,
@@ -2362,63 +3651,43 @@ pub fn run_fac(
                 fac_review::run_doctor(
                     &repo,
                     pr,
+                    operator_socket,
                     args.fix,
                     output_json,
                     args.wait_for_recommended_action,
-                    args.poll_interval_seconds,
                     args.wait_timeout_seconds,
                     &exit_on,
                 )
+            } else if args.fix {
+                run_system_doctor_fix(
+                    operator_socket,
+                    config_path,
+                    args.full,
+                    args.tracked_prs || args.full,
+                    args.repo.as_deref(),
+                    output_json,
+                )
             } else {
-                let (mut checks, has_critical_error) =
-                    match crate::commands::daemon::collect_doctor_checks(
-                        operator_socket,
-                        config_path,
-                        args.full,
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return output_error(
-                                output_json,
-                                "fac_doctor_failed",
-                                &err.to_string(),
-                                exit_codes::GENERIC_ERROR,
-                            );
-                        },
-                    };
-                let include_tracked_prs = args.tracked_prs || args.full;
-                let tracked_prs = if include_tracked_prs {
-                    let repo_hint = args.repo.clone();
-                    match fac_review::collect_tracked_pr_summaries(
-                        repo_hint.as_deref(),
-                        args.repo.as_deref(),
-                    ) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let message =
-                                format!("failed to build tracked PR doctor summary: {err}");
-                            checks.push(crate::commands::daemon::DaemonDoctorCheck {
-                                name: "tracked_pr_summary".to_string(),
-                                status: "WARN",
-                                message,
-                            });
-                            Vec::new()
-                        },
-                    }
-                } else {
-                    Vec::new()
+                let snapshot = match collect_system_doctor_snapshot(
+                    operator_socket,
+                    config_path,
+                    args.full,
+                    args.tracked_prs || args.full,
+                    args.repo.as_deref(),
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        return output_error(
+                            output_json,
+                            "fac_doctor_failed",
+                            &err,
+                            exit_codes::GENERIC_ERROR,
+                        );
+                    },
                 };
-                let payload = serde_json::json!({
-                    "schema": "apm2.fac.doctor.system.v1",
-                    "checks": checks,
-                    "tracked_prs": tracked_prs,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-                );
+                emit_system_doctor_snapshot(&snapshot);
 
-                if has_critical_error {
+                if snapshot.has_critical_error {
                     exit_codes::GENERIC_ERROR
                 } else {
                     exit_codes::SUCCESS
@@ -2426,12 +3695,10 @@ pub fn run_fac(
             }
         },
         FacSubcommand::Services(args) => match &args.subcommand {
-            ServicesSubcommand::Status(status_args) => {
-                run_services_status(resolve_json(status_args.json))
-            },
+            ServicesSubcommand::Status(_status_args) => run_services_status(json_output),
         },
         FacSubcommand::RoleLaunch(args) => {
-            let output_json = resolve_json(false);
+            let output_json = json_output;
             match role_launch::handle_role_launch(
                 args,
                 &ledger_path,
@@ -2456,106 +3723,53 @@ pub fn run_fac(
             }
         },
         FacSubcommand::Episode(args) => match &args.subcommand {
-            EpisodeSubcommand::Inspect(inspect_args) => run_episode_inspect(
-                inspect_args,
-                &ledger_path,
-                &cas_path,
-                resolve_json(inspect_args.json),
-            ),
+            EpisodeSubcommand::Inspect(inspect_args) => {
+                run_episode_inspect(inspect_args, &ledger_path, &cas_path, json_output)
+            },
         },
         FacSubcommand::Receipts(args) => match &args.subcommand {
             ReceiptSubcommand::Show(show_args) => {
-                run_receipt_show(show_args, &cas_path, resolve_json(show_args.json))
+                run_receipt_show(show_args, &cas_path, json_output)
             },
-            ReceiptSubcommand::List(list_args) => {
-                run_receipt_list(list_args, resolve_json(list_args.json))
-            },
-            ReceiptSubcommand::Status(status_args) => {
-                run_receipt_status(status_args, resolve_json(status_args.json))
-            },
-            ReceiptSubcommand::Reindex(reindex_args) => {
-                run_receipt_reindex(resolve_json(reindex_args.json))
-            },
-            ReceiptSubcommand::Verify(verify_args) => {
-                run_receipt_verify(verify_args, resolve_json(verify_args.json))
-            },
-            ReceiptSubcommand::Merge(merge_args) => {
-                run_receipt_merge(merge_args, resolve_json(merge_args.json))
-            },
+            ReceiptSubcommand::List(list_args) => run_receipt_list(list_args, json_output),
+            ReceiptSubcommand::Status(status_args) => run_receipt_status(status_args, json_output),
+            ReceiptSubcommand::Reindex(_reindex_args) => run_receipt_reindex(json_output),
+            ReceiptSubcommand::Verify(verify_args) => run_receipt_verify(verify_args, json_output),
+            ReceiptSubcommand::Merge(merge_args) => run_receipt_merge(merge_args, json_output),
         },
         FacSubcommand::Context(args) => match &args.subcommand {
-            ContextSubcommand::Rebuild(rebuild_args) => run_context_rebuild(
-                rebuild_args,
-                &ledger_path,
-                &cas_path,
-                resolve_json(rebuild_args.json),
-            ),
+            ContextSubcommand::Rebuild(rebuild_args) => {
+                run_context_rebuild(rebuild_args, &ledger_path, &cas_path, json_output)
+            },
         },
         FacSubcommand::Lane(args) => match &args.subcommand {
-            LaneSubcommand::Status(status_args) => {
-                run_lane_status(status_args, resolve_json(status_args.json))
-            },
-            LaneSubcommand::Reset(reset_args) => {
-                run_lane_reset(reset_args, resolve_json(reset_args.json))
-            },
-            LaneSubcommand::Init(init_args) => {
-                run_lane_init(init_args, resolve_json(init_args.json))
-            },
-            LaneSubcommand::Reconcile(reconcile_args) => {
-                run_lane_reconcile(reconcile_args, resolve_json(reconcile_args.json))
-            },
-            LaneSubcommand::MarkCorrupt(mark_args) => {
-                run_lane_mark_corrupt(mark_args, resolve_json(mark_args.json))
-            },
+            LaneSubcommand::Status(status_args) => run_lane_status(status_args, json_output),
+            LaneSubcommand::Init(init_args) => run_lane_init(init_args, json_output),
+            LaneSubcommand::MarkCorrupt(mark_args) => run_lane_mark_corrupt(mark_args, json_output),
         },
         FacSubcommand::Push(args) => {
-            let output_json = resolve_json(args.json);
+            let output_json = json_output;
             let repo = match derive_fac_repo_or_exit(machine_output) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
-            fac_review::run_push(
-                &repo,
-                &args.remote,
-                args.branch.as_deref(),
-                args.ticket.as_deref(),
-                output_json,
-                cmd.queue_write_mode(),
-            )
-        },
-        FacSubcommand::Restart(args) => {
-            let output_json = resolve_json(args.json);
-            let repo = match derive_fac_repo_or_exit(machine_output) {
-                Ok(value) => value,
-                Err(code) => return code,
-            };
-            fac_review::run_restart(
-                &repo,
-                args.pr,
-                args.force,
-                args.refresh_identity,
-                output_json,
-            )
-        },
-        FacSubcommand::Recover(args) => {
-            let output_json = resolve_json(args.json);
-            let repo = match derive_fac_repo_or_exit(output_json) {
-                Ok(value) => value,
-                Err(code) => return code,
-            };
-            fac_review::run_recover(
-                &repo,
-                args.pr,
-                args.force,
-                args.refresh_identity,
-                args.reap_stale_agents,
-                args.reset_lifecycle,
-                args.all,
-                output_json,
-            )
+            fac_review::run_push(&fac_review::PushRunConfig {
+                repo: &repo,
+                remote: &args.remote,
+                branch: args.branch.as_deref(),
+                ticket: args.ticket.as_deref(),
+                work_id: args.work_id.as_deref(),
+                ticket_alias: args.ticket_alias.as_deref(),
+                lease_id: args.lease_id.as_deref(),
+                session_id: args.session_id.as_deref(),
+                handoff_note: args.handoff_note.as_deref(),
+                json_output: output_json,
+                write_mode: cmd.queue_write_mode(),
+                operator_socket,
+            })
         },
         FacSubcommand::Logs(args) => {
-            let output_json = resolve_json(args.json);
+            let output_json = json_output;
             let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
@@ -2569,31 +3783,31 @@ pub fn run_fac(
             )
         },
         FacSubcommand::Pipeline(args) => {
-            let output_json = resolve_json(args.json);
+            let output_json = json_output;
             let repo = match derive_fac_repo_or_exit(output_json) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
             fac_review::run_pipeline(&repo, args.pr, &args.sha, output_json)
         },
+        FacSubcommand::Reviewer(args) => {
+            let output_json = json_output;
+            let repo = match derive_fac_repo_or_exit(output_json) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
+            fac_review::run_internal_reviewer(
+                &repo,
+                args.pr,
+                args.review_type.as_str(),
+                &args.expected_head_sha,
+                args.force,
+                output_json,
+            )
+        },
         FacSubcommand::Review(args) => match &args.subcommand {
-            ReviewSubcommand::Run(run_args) => {
-                let output_json = resolve_json(run_args.json);
-                let repo = match derive_fac_repo_or_exit(machine_output) {
-                    Ok(value) => value,
-                    Err(code) => return code,
-                };
-                fac_review::run_review(
-                    &repo,
-                    run_args.pr,
-                    run_args.review_type,
-                    run_args.expected_head_sha.as_deref(),
-                    run_args.force,
-                    output_json,
-                )
-            },
             ReviewSubcommand::Prepare(prepare_args) => {
-                let output_json = resolve_json(prepare_args.json);
+                let output_json = json_output;
                 let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -2606,7 +3820,7 @@ pub fn run_fac(
                 )
             },
             ReviewSubcommand::Finding(finding_args) => {
-                let output_json = resolve_json(finding_args.json);
+                let output_json = json_output;
                 let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -2629,24 +3843,8 @@ pub fn run_fac(
                     output_json,
                 )
             },
-            ReviewSubcommand::Comment(comment_args) => {
-                let output_json = resolve_json(comment_args.json);
-                let repo = match derive_fac_repo_or_exit(output_json) {
-                    Ok(value) => value,
-                    Err(code) => return code,
-                };
-                fac_review::run_comment_compat(
-                    &repo,
-                    comment_args.pr,
-                    comment_args.sha.as_deref(),
-                    comment_args.review_type,
-                    comment_args.severity,
-                    comment_args.body.as_deref(),
-                    output_json,
-                )
-            },
             ReviewSubcommand::Findings(findings_args) => {
-                let output_json = resolve_json(findings_args.json);
+                let output_json = json_output;
                 let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -2655,13 +3853,12 @@ pub fn run_fac(
                     &repo,
                     findings_args.pr,
                     findings_args.sha.as_deref(),
-                    findings_args.refresh,
                     output_json,
                 )
             },
             ReviewSubcommand::Verdict(verdict_args) => match &verdict_args.subcommand {
                 ReviewVerdictSubcommand::Show(show_args) => {
-                    let output_json = resolve_json(show_args.json);
+                    let output_json = json_output;
                     let repo = match derive_fac_repo_or_exit(output_json) {
                         Ok(value) => value,
                         Err(code) => return code,
@@ -2674,7 +3871,7 @@ pub fn run_fac(
                     )
                 },
                 ReviewVerdictSubcommand::Set(set_args) => {
-                    let output_json = resolve_json(set_args.json);
+                    let output_json = json_output;
                     let repo = match derive_fac_repo_or_exit(output_json) {
                         Ok(value) => value,
                         Err(code) => return code,
@@ -2697,7 +3894,7 @@ pub fn run_fac(
                 fac_review::run_tail(tail_args.lines, tail_args.follow)
             },
             ReviewSubcommand::Terminate(term_args) => {
-                let output_json = resolve_json(term_args.json);
+                let output_json = json_output;
                 let repo = match derive_fac_repo_or_exit(output_json) {
                     Ok(value) => value,
                     Err(code) => return code,
@@ -2712,25 +3909,22 @@ pub fn run_fac(
         },
         FacSubcommand::Worker(args) => crate::commands::fac_worker::run_fac_worker(
             args.once,
-            args.poll_interval_secs,
             args.max_jobs,
-            resolve_json(args.json),
+            json_output,
             args.print_unit,
         ),
         FacSubcommand::Job(args) => match &args.subcommand {
             JobSubcommand::Cancel(cancel_args) => {
-                crate::commands::fac_job::run_cancel(cancel_args, resolve_json(cancel_args.json))
+                crate::commands::fac_job::run_cancel(cancel_args, json_output)
             },
-            JobSubcommand::Show(show_args) => crate::commands::fac_job::run_job_show(
-                &show_args.job_id,
-                resolve_json(show_args.json),
-            ),
+            JobSubcommand::Show(show_args) => {
+                crate::commands::fac_job::run_job_show(&show_args.job_id, json_output)
+            },
         },
         FacSubcommand::Queue(args) => match &args.subcommand {
-            QueueSubcommand::Status(status_args) => crate::commands::fac_queue::run_queue_status(
-                status_args,
-                resolve_json(status_args.json),
-            ),
+            QueueSubcommand::Status(status_args) => {
+                crate::commands::fac_queue::run_queue_status(status_args, json_output)
+            },
         },
         FacSubcommand::Pr(args) => fac_pr::run_pr(args, json_output),
         FacSubcommand::Broker(args) => fac_broker::run_broker(args, json_output),
@@ -2738,7 +3932,7 @@ pub fn run_fac(
         FacSubcommand::Quarantine(args) => fac_quarantine::run_quarantine(args, json_output),
         FacSubcommand::Verify(args) => match &args.subcommand {
             VerifySubcommand::Containment(containment_args) => {
-                run_verify_containment(containment_args, resolve_json(containment_args.json))
+                run_verify_containment(containment_args, json_output)
             },
         },
         FacSubcommand::Warm(args) => crate::commands::fac_warm::run_fac_warm(
@@ -2746,7 +3940,7 @@ pub fn run_fac(
             &args.lane,
             args.wait,
             args.wait_timeout_secs,
-            resolve_json(args.json),
+            json_output,
             cmd.queue_write_mode(),
         ),
         FacSubcommand::Bench(args) => crate::commands::fac_bench::run_fac_bench(
@@ -2756,125 +3950,27 @@ pub fn run_fac(
             &args.memory_max,
             args.pids_max,
             &args.cpu_quota,
-            resolve_json(args.json),
+            json_output,
             cmd.queue_write_mode(),
         ),
         FacSubcommand::Bundle(args) => match &args.subcommand {
-            BundleSubcommand::Export(export_args) => {
-                run_bundle_export(export_args, resolve_json(export_args.json))
-            },
-            BundleSubcommand::Import(import_args) => {
-                run_bundle_import(import_args, resolve_json(import_args.json))
-            },
+            BundleSubcommand::Export(export_args) => run_bundle_export(export_args, json_output),
+            BundleSubcommand::Import(import_args) => run_bundle_import(import_args, json_output),
         },
-        FacSubcommand::Reconcile(args) => run_reconcile(args, resolve_json(args.json)),
         FacSubcommand::Policy(args) => fac_policy::run_policy_command(args, json_output),
         FacSubcommand::Economics(args) => fac_economics::run_economics_command(args, json_output),
-        FacSubcommand::Bootstrap(args) => {
-            crate::commands::fac_bootstrap::run_bootstrap(args, operator_socket, config_path)
-        },
+        FacSubcommand::Bootstrap(args) => crate::commands::fac_bootstrap::run_bootstrap(
+            args,
+            operator_socket,
+            config_path,
+            json_output,
+        ),
         FacSubcommand::Config(args) => {
             crate::commands::fac_config::run_config_command(args, json_output)
         },
         FacSubcommand::Metrics(args) => run_metrics(args, json_output),
         FacSubcommand::Caches(args) => {
             crate::commands::fac_caches::run_caches_command(args, json_output)
-        },
-    }
-}
-
-/// Execute `apm2 fac reconcile`.
-fn run_reconcile(args: &ReconcileArgs, json_output: bool) -> u8 {
-    use apm2_core::fac::{OrphanedJobPolicy, reconcile_on_startup};
-    use apm2_core::github::resolve_apm2_home;
-
-    let Some(home) = resolve_apm2_home() else {
-        if json_output {
-            let err_json = serde_json::json!({"error": "cannot resolve APM2 home"});
-            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-        } else {
-            eprintln!("ERROR: cannot resolve APM2 home directory");
-        }
-        return crate::exit_codes::codes::GENERIC_ERROR;
-    };
-    let fac_root = home.join("private").join("fac");
-    let queue_root = home.join("queue");
-
-    // Parse orphan policy.
-    let orphan_policy = match args.orphan_policy.as_str() {
-        "requeue" => OrphanedJobPolicy::Requeue,
-        "mark-failed" => OrphanedJobPolicy::MarkFailed,
-        other => {
-            if json_output {
-                let err_json = serde_json::json!({
-                    "error": format!("invalid orphan-policy: {other}, expected requeue or mark-failed")
-                });
-                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-            } else {
-                eprintln!(
-                    "ERROR: invalid --orphan-policy '{other}', expected 'requeue' or 'mark-failed'"
-                );
-            }
-            return crate::exit_codes::codes::GENERIC_ERROR;
-        },
-    };
-
-    // Determine mode: --dry-run takes priority; without flags, default to dry-run.
-    let dry_run = !args.apply;
-
-    if !dry_run && args.dry_run {
-        // Contradiction: both --dry-run and --apply specified.
-        if json_output {
-            let err_json =
-                serde_json::json!({"error": "cannot specify both --dry-run and --apply"});
-            println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-        } else {
-            eprintln!("ERROR: cannot specify both --dry-run and --apply");
-        }
-        return crate::exit_codes::codes::GENERIC_ERROR;
-    }
-
-    match reconcile_on_startup(&fac_root, &queue_root, orphan_policy, dry_run) {
-        Ok(receipt) => {
-            if json_output {
-                if let Ok(json) = serde_json::to_string_pretty(&receipt) {
-                    println!("{json}");
-                }
-            } else {
-                let mode = if dry_run { "DRY RUN" } else { "APPLIED" };
-                println!("Reconciliation complete ({mode}):");
-                println!("  Lanes inspected:          {}", receipt.lanes_inspected);
-                println!(
-                    "  Stale leases recovered:   {}",
-                    receipt.stale_leases_recovered
-                );
-                println!(
-                    "  Claimed files inspected:  {}",
-                    receipt.claimed_files_inspected
-                );
-                println!(
-                    "  Orphaned jobs requeued:    {}",
-                    receipt.orphaned_jobs_requeued
-                );
-                println!(
-                    "  Orphaned jobs failed:      {}",
-                    receipt.orphaned_jobs_failed
-                );
-                println!(
-                    "  Lanes marked corrupt:      {}",
-                    receipt.lanes_marked_corrupt
-                );
-            }
-            0
-        },
-        Err(e) => {
-            if json_output {
-                let err_json = serde_json::json!({"error": e.to_string()});
-                println!("{}", serde_json::to_string(&err_json).unwrap_or_default());
-            } else {
-                eprintln!("ERROR: reconciliation failed: {e}");
-            }
-            crate::exit_codes::codes::GENERIC_ERROR
         },
     }
 }
@@ -2892,10 +3988,9 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Context(_)
         | FacSubcommand::Lane(_)
         | FacSubcommand::Push(_)
-        | FacSubcommand::Restart(_)
-        | FacSubcommand::Recover(_)
         | FacSubcommand::Logs(_)
         | FacSubcommand::Pipeline(_)
+        | FacSubcommand::Reviewer(_)
         | FacSubcommand::Review(_)
         | FacSubcommand::Worker(_)
         | FacSubcommand::Job(_)
@@ -2907,7 +4002,6 @@ const fn subcommand_requests_machine_output(subcommand: &FacSubcommand) -> bool 
         | FacSubcommand::Warm(_)
         | FacSubcommand::Bench(_)
         | FacSubcommand::Bundle(_)
-        | FacSubcommand::Reconcile(_)
         | FacSubcommand::Queue(_)
         | FacSubcommand::Policy(_)
         | FacSubcommand::Economics(_)
@@ -2971,6 +4065,386 @@ fn open_ledger(path: &Path) -> Result<Ledger, LedgerError> {
 fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerError> {
     let max_seq = ledger.head_sync()?;
     Ok(max_seq.saturating_sub(limit).max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkCurrentResolutionSource {
+    TicketAlias,
+    BranchAlias,
+    ProjectionFallback,
+}
+
+impl WorkCurrentResolutionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TicketAlias => "ticket_alias",
+            Self::BranchAlias => "branch_alias",
+            Self::ProjectionFallback => "projection_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkCurrentResolution {
+    work_id: String,
+    ticket_alias: Option<String>,
+    source: WorkCurrentResolutionSource,
+}
+
+fn with_operator_client<T>(
+    future: impl std::future::Future<Output = Result<T, ProtocolClientError>>,
+) -> Result<T, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
+    rt.block_on(future).map_err(|err| err.to_string())
+}
+
+fn resolve_current_branch_name() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to resolve current branch: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to resolve current branch: {}",
+            stderr.trim()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err("git returned empty branch name".to_string());
+    }
+    Ok(branch)
+}
+
+fn resolve_ticket_alias_to_work_id_via_daemon(
+    ticket_alias: &str,
+    operator_socket: &Path,
+) -> Result<Option<String>, String> {
+    let ticket_alias_owned = ticket_alias.to_string();
+    let response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&ticket_alias_owned).await
+    })?;
+    if !response.found {
+        return Ok(None);
+    }
+    validate_work_id(&response.work_id)?;
+    Ok(Some(response.work_id))
+}
+
+const fn work_current_projection_fallback_requested(
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    lease_filter.is_some() || session_filter.is_some()
+}
+
+fn unresolved_work_current_alias_message(ticket_alias: &str) -> String {
+    format!(
+        "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
+         Refusing projection fallback to prevent cross-ticket misbinding. \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         then claim it (or provide explicit `--ticket-alias`)."
+    )
+}
+
+fn is_active_work_fallback_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "CLAIMED" | "IN_PROGRESS" | "INPROGRESS" | "SPAWNED" | "RUNNING"
+    )
+}
+
+fn matches_work_current_fallback_candidate(
+    work_item: &apm2_daemon::protocol::WorkStatusResponse,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    if !is_active_work_fallback_status(&work_item.status) {
+        return false;
+    }
+    let Some(role_raw) = work_item.role else {
+        return false;
+    };
+    if WorkRole::try_from(role_raw).ok() != Some(WorkRole::Implementer) {
+        return false;
+    }
+
+    if let Some(expected_lease_id) = lease_filter {
+        let observed_lease_id = work_item
+            .lease_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_lease_id != Some(expected_lease_id) {
+            return false;
+        }
+    }
+
+    if let Some(expected_session_id) = session_filter {
+        let observed_session_id = work_item
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if observed_session_id != Some(expected_session_id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn select_work_current_fallback_work_id(
+    work_items: &[apm2_daemon::protocol::WorkStatusResponse],
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for work_item in work_items {
+        if !matches_work_current_fallback_candidate(work_item, lease_filter, session_filter) {
+            continue;
+        }
+        let work_id = work_item.work_id.trim();
+        if work_id.is_empty() {
+            continue;
+        }
+        if validate_work_id(work_id).is_err() {
+            continue;
+        }
+        candidates.insert(work_id.to_string());
+    }
+
+    match candidates.len() {
+        0 => Err(
+            "projection fallback could not identify an active Implementer work item; pass `--ticket-alias` or provide `--lease-id`/`--session-id` filters"
+                .to_string(),
+        ),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| "internal error: fallback candidate set unexpectedly empty".to_string()),
+        _ => {
+            let candidate_list = candidates.into_iter().collect::<Vec<_>>().join(", ");
+            Err(format!(
+                "projection fallback found multiple active Implementer work items ({candidate_list}); pass `--ticket-alias` or `--lease-id`/`--session-id` to disambiguate"
+            ))
+        },
+    }
+}
+
+fn resolve_work_current_from_projection_fallback(
+    operator_socket: &Path,
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<String, String> {
+    let list_response = with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_list(false).await
+    })?;
+    select_work_current_fallback_work_id(&list_response.work_items, lease_filter, session_filter)
+}
+
+fn resolve_work_current_identity(
+    args: &WorkCurrentArgs,
+    operator_socket: &Path,
+    worktree_dir: &Path,
+) -> Result<(WorkCurrentResolution, Option<String>), String> {
+    let requested_lease_id = normalize_non_empty_arg(args.lease_id.as_deref());
+    if let Some(ref lease_id) = requested_lease_id {
+        validate_lease_id(lease_id)?;
+    }
+    let requested_session_id = normalize_non_empty_arg(args.session_id.as_deref());
+    if let Some(ref session_id) = requested_session_id {
+        validate_session_id(session_id)?;
+    }
+
+    let branch = normalize_non_empty_arg(args.branch.as_deref())
+        .map_or_else(|| resolve_current_branch_name().ok(), Some);
+    let fallback_requested = work_current_projection_fallback_requested(
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    );
+
+    let explicit_alias = normalize_non_empty_arg(args.ticket_alias.as_deref());
+    if let Some(alias) = explicit_alias {
+        if let Some(work_id) = resolve_ticket_alias_to_work_id_via_daemon(&alias, operator_socket)?
+        {
+            return Ok((
+                WorkCurrentResolution {
+                    work_id,
+                    ticket_alias: Some(alias),
+                    source: WorkCurrentResolutionSource::TicketAlias,
+                },
+                branch,
+            ));
+        }
+        return Err(format!(
+            "ticket alias `{alias}` did not resolve to a canonical work_id; explicit `--ticket-alias` inputs are fail-closed"
+        ));
+    }
+
+    if let Some(branch_value) = branch.as_deref() {
+        if let Some(derived_alias) = extract_tck_from_text(branch_value).or_else(|| {
+            worktree_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(extract_tck_from_text)
+        }) {
+            if let Some(work_id) =
+                resolve_ticket_alias_to_work_id_via_daemon(&derived_alias, operator_socket)?
+            {
+                return Ok((
+                    WorkCurrentResolution {
+                        work_id,
+                        ticket_alias: Some(derived_alias),
+                        source: WorkCurrentResolutionSource::BranchAlias,
+                    },
+                    branch,
+                ));
+            }
+            return Err(unresolved_work_current_alias_message(&derived_alias));
+        }
+    }
+
+    if !fallback_requested {
+        return Err(branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "could not derive TCK from branch/worktree context. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}",
+                    worktree_dir.display()
+                )
+            },
+        ));
+    }
+
+    let fallback_work_id = resolve_work_current_from_projection_fallback(
+        operator_socket,
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    )
+    .map_err(|fallback_err| {
+        branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "projection fallback failed and no branch context was available: {fallback_err}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} Projection fallback also failed: {fallback_err}",
+                    worktree_dir.display()
+                )
+            },
+        )
+    })?;
+    Ok((
+        WorkCurrentResolution {
+            work_id: fallback_work_id,
+            ticket_alias: None,
+            source: WorkCurrentResolutionSource::ProjectionFallback,
+        },
+        branch,
+    ))
+}
+
+/// Execute the work current command.
+fn run_work_current(args: &WorkCurrentArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    #[derive(Debug, Serialize)]
+    struct WorkCurrentJson {
+        work_id: String,
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ticket_alias: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lease_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    }
+
+    let worktree_dir = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            return output_error(
+                json_output,
+                "current_dir_failed",
+                &format!("Failed to resolve current working directory: {err}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let (resolution, branch) =
+        match resolve_work_current_identity(args, operator_socket, &worktree_dir) {
+            Ok(value) => value,
+            Err(error) => {
+                return output_error(
+                    json_output,
+                    "work_current_resolution_failed",
+                    &error,
+                    exit_codes::VALIDATION_ERROR,
+                );
+            },
+        };
+
+    let work_id_for_status = resolution.work_id.clone();
+    let status_response = match with_operator_client(async move {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_status(&work_id_for_status).await
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            return output_error(
+                json_output,
+                "work_current_status_failed",
+                &error,
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let role = status_response
+        .role
+        .and_then(|value| WorkRole::try_from(value).ok())
+        .map(|value| format!("{value:?}"));
+
+    let output = WorkCurrentJson {
+        work_id: resolution.work_id,
+        source: resolution.source.as_str().to_string(),
+        ticket_alias: resolution.ticket_alias,
+        branch,
+        status: status_response.status,
+        actor_id: status_response.actor_id,
+        role,
+        lease_id: status_response.lease_id,
+        session_id: status_response.session_id,
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+    );
+    exit_codes::SUCCESS
 }
 
 // =============================================================================
@@ -3080,23 +4554,311 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
     }
 }
 
+/// Execute the work open command by reusing the hardened `apm2 work open`
+/// implementation.
+fn run_work_open(args: &WorkOpenArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    if args.lease_id.trim().is_empty() {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            "Lease ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    if let Err(err) = validate_lease_id(args.lease_id.trim()) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let cmd = work::WorkCommand {
+        json: json_output,
+        subcommand: work::WorkSubcommand::Open(work::OpenArgs {
+            from_ticket: args.from_ticket.to_string_lossy().to_string(),
+            lease_id: args.lease_id.trim().to_string(),
+        }),
+    };
+    work::run_work(&cmd, operator_socket)
+}
+
+#[derive(Debug, Serialize)]
+struct WorkClaimJson {
+    work_id: String,
+    role: String,
+    issued_lease_id: String,
+    authority_bindings_hash: String,
+    evidence_id: String,
+    already_claimed: bool,
+    session_id: String,
+}
+
+/// Execute the work claim command via RFC-0032 `ClaimWorkV2`.
+fn run_work_claim(args: &WorkClaimArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    let work_id = args.work_id.trim();
+    if let Err(err) = validate_work_id(work_id) {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+    let lease_id = args.lease_id.trim();
+    if let Err(err) = validate_lease_id(lease_id) {
+        return output_error(
+            json_output,
+            "invalid_lease_id",
+            &err,
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let requested_role = args.role.to_work_role();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client
+            .claim_work_v2(work_id, requested_role, lease_id)
+            .await
+    });
+
+    match result {
+        Ok(response) => {
+            if let Err(err) = validate_work_id(&response.work_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("daemon returned invalid work_id in ClaimWorkV2 response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if let Err(err) = validate_lease_id(&response.issued_lease_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!(
+                        "daemon returned invalid issued_lease_id in ClaimWorkV2 response: {err}"
+                    ),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.authority_bindings_hash.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty authority_bindings_hash in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            if response.evidence_id.trim().is_empty() {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    "daemon returned empty evidence_id in ClaimWorkV2 response",
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+
+            let session_id = derive_adhoc_session_id(&response.work_id, &response.issued_lease_id);
+            if let Err(err) = validate_session_id(&session_id) {
+                return output_error(
+                    json_output,
+                    "invalid_claim_response",
+                    &format!("failed to derive canonical session_id from claim response: {err}"),
+                    exit_codes::GENERIC_ERROR,
+                );
+            }
+            let payload = WorkClaimJson {
+                work_id: response.work_id,
+                role: args.role.as_str().to_string(),
+                issued_lease_id: response.issued_lease_id,
+                authority_bindings_hash: response.authority_bindings_hash,
+                evidence_id: response.evidence_id,
+                already_claimed: response.already_claimed,
+                session_id,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Work claim recorded");
+                println!("  Work ID:                 {}", payload.work_id);
+                println!("  Role:                    {}", payload.role);
+                println!("  Issued Lease ID:         {}", payload.issued_lease_id);
+                println!("  Session ID:              {}", payload.session_id);
+                println!(
+                    "  Authority Bindings Hash: {}",
+                    payload.authority_bindings_hash
+                );
+                println!("  Evidence ID:             {}", payload.evidence_id);
+                if payload.already_claimed {
+                    println!("  Idempotency:             already claimed");
+                }
+            }
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
+/// Execute the work resolve-alias command (TCK-00636).
+///
+/// Resolves a ticket alias to a canonical `work_id` via daemon
+/// `AliasReconciliationGate::resolve_ticket_alias`.
+fn run_resolve_alias(args: &ResolveAliasArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    // Validate ticket alias
+    if args.ticket_alias.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_ticket_alias",
+            "Ticket alias cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.resolve_ticket_alias(&args.ticket_alias).await
+    });
+
+    match result {
+        Ok(response) => {
+            #[derive(Serialize)]
+            struct ResolveAliasJson {
+                ticket_alias: String,
+                found: bool,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                work_id: Option<String>,
+            }
+
+            let output = ResolveAliasJson {
+                ticket_alias: response.ticket_alias,
+                found: response.found,
+                work_id: if response.found {
+                    Some(response.work_id)
+                } else {
+                    None
+                },
+            };
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+            );
+
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
 fn fac_work_status_from_daemon(
     response: apm2_daemon::protocol::WorkStatusResponse,
 ) -> WorkStatusResponse {
-    let role = response
-        .role
+    let apm2_daemon::protocol::WorkStatusResponse {
+        work_id,
+        status,
+        actor_id,
+        role,
+        session_id,
+        lease_id,
+        implementer_claim_blocked,
+        dependency_diagnostics,
+        ..
+    } = response;
+
+    let role = role
         .and_then(|value| WorkRole::try_from(value).ok())
         .map(|role| format!("{role:?}"));
 
+    let dependency_diagnostics = dependency_diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let severity =
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::try_from(
+                    diagnostic.severity,
+                )
+                .unwrap_or(
+                    apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Error,
+                );
+
+            let severity = match severity {
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Info => {
+                    WorkDependencyDiagnosticSeverity::Info
+                },
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Warning => {
+                    WorkDependencyDiagnosticSeverity::Warning
+                },
+                apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Error
+                | apm2_daemon::protocol::messages::WorkDependencyDiagnosticSeverity::Unspecified => {
+                    WorkDependencyDiagnosticSeverity::Error
+                },
+            };
+
+            WorkDependencyDiagnostic {
+                reason_code: diagnostic.reason_code,
+                severity,
+                message: diagnostic.message,
+                edge_id: diagnostic.edge_id,
+                from_work_id: diagnostic.from_work_id,
+                to_work_id: diagnostic.to_work_id,
+                from_work_state: diagnostic.from_work_state,
+                waived: diagnostic.waived,
+                waiver_id: diagnostic.waiver_id,
+                waiver_expires_at_ns: diagnostic.waiver_expires_at_ns,
+                waiver_remaining_ns: diagnostic.waiver_remaining_ns,
+                late_edge: diagnostic.late_edge,
+            }
+        })
+        .collect();
+
     WorkStatusResponse {
-        work_id: response.work_id,
-        status: response.status,
-        actor_id: response.actor_id,
+        work_id,
+        status,
+        actor_id,
         role,
-        latest_episode_id: response.session_id,
-        latest_receipt_hash: response.lease_id,
+        latest_episode_id: session_id,
+        latest_receipt_hash: lease_id,
         event_count: 1,
         latest_seq_id: None,
+        implementer_claim_blocked,
+        dependency_diagnostics,
     }
 }
 
@@ -3109,33 +4871,17 @@ struct WorkInfo {
 /// Extracts work-related information from an event if it matches the `work_id`.
 #[cfg(test)]
 fn extract_work_info(event: &EventRecord, work_id: &str) -> Option<WorkInfo> {
-    // TCK-00398 Phase 1 compatibility:
-    // - Prefer metadata-derived work_id (`session_id`) when present.
-    // - Fall back to payload work_id for legacy rows where the daemon stores
-    //   episode IDs in `work_id`.
-    let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok();
-
-    let metadata_work_id_match = event.session_id == work_id;
-    let payload_work_id_match = payload
-        .as_ref()
-        .and_then(|v| v.get("work_id"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|id| id == work_id);
-
-    if !metadata_work_id_match && !payload_work_id_match {
+    if event.session_id != work_id {
         return None;
     }
 
+    let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok();
     Some(WorkInfo {
         episode_id: payload
             .as_ref()
             .and_then(|v| v.get("episode_id"))
             .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| {
-                (event.event_type == "episode_spawned" && payload_work_id_match)
-                    .then(|| event.session_id.clone())
-            }),
+            .map(String::from),
     })
 }
 
@@ -4418,7 +6164,6 @@ struct LaneStateSummary {
 /// Execute `apm2 fac lane status`.
 ///
 /// Reports lane states derived from lock state + lease record + PID liveness.
-/// Supports human-readable and JSON output modes.
 fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
     let manager = match LaneManager::from_default_home() {
         Ok(m) => m,
@@ -4529,307 +6274,6 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Lane Reset Command (TCK-00516)
-// =============================================================================
-
-/// Execute `apm2 fac lane reset <lane_id>`.
-///
-/// Resets a lane by deleting its workspace, target, logs, and per-lane env
-/// isolation subdirectories (`home`, `tmp`, `xdg_cache`, `xdg_config`,
-/// `xdg_data`, `xdg_state`, `xdg_runtime`) using
-/// `safe_rmtree_v1` (symlink-safe, boundary-enforced deletion).
-///
-/// # State Machine
-///
-/// - IDLE: resets all lane subdirs, removes lease, remains IDLE.
-/// - CORRUPT: resets all lane subdirs, removes lease, transitions to IDLE.
-/// - LEASED/CLEANUP: resets all lane subdirs, removes lease, transitions to
-///   IDLE.
-/// - RUNNING: refuses unless `--force` is provided. With `--force`, kills the
-///   process first, then resets.
-///
-/// # Security
-///
-/// Deletion is performed via `safe_rmtree_v1` which refuses:
-/// - Symlink traversal at any depth
-/// - Crossing filesystem boundaries
-/// - Unexpected file types (FIFOs, sockets, devices)
-/// - Deletion outside the allowed parent boundary
-fn run_lane_reset(args: &LaneResetArgs, json_output: bool) -> u8 {
-    let manager = match LaneManager::from_default_home() {
-        Ok(m) => m,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to initialize lane manager: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-    run_lane_reset_with_manager(&manager, args, json_output)
-}
-
-fn run_lane_reset_with_manager(
-    manager: &LaneManager,
-    args: &LaneResetArgs,
-    json_output: bool,
-) -> u8 {
-    // Ensure directories exist
-    if let Err(e) = manager.ensure_directories() {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!("Failed to ensure lane directories: {e}"),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    // Acquire exclusive lock for the lane BEFORE any status reads or
-    // mutations. The lock is held across the entire reset operation
-    // (status check + force-kill + deletion + lease cleanup) to prevent
-    // concurrent writers from racing the reset.
-    let _lock_guard = match manager.acquire_lock(&args.lane_id) {
-        Ok(guard) => guard,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to acquire lock for lane {}: {e}", args.lane_id),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Get current lane status (under lock)
-    let status = match manager.lane_status(&args.lane_id) {
-        Ok(s) => s,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to query lane status: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    // Check if lane is RUNNING and refuse without --force
-    if status.state == LaneState::Running && !args.force {
-        return output_error(
-            json_output,
-            "lane_running",
-            &format!(
-                "Lane {} is RUNNING (pid={}). Use --force to kill the process and reset.",
-                args.lane_id,
-                status.pid.unwrap_or(0)
-            ),
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
-
-    // With --force on a RUNNING lane, attempt to kill the process (under lock).
-    // If kill fails (identity mismatch, unknown identity, EPERM, etc.), abort
-    // the reset and mark CORRUPT
-    // to prevent deleting directories of a still-running process.
-    if status.state == LaneState::Running && args.force {
-        let lane_dir = manager.lane_dir(&args.lane_id);
-        let lease = LaneLeaseV1::load(&lane_dir).ok().flatten();
-        let pid = lease.as_ref().map(|lease| lease.pid).or(status.pid);
-        let expected_start_ticks = lease.as_ref().and_then(|lease| lease.proc_start_time_ticks);
-
-        if let Some(pid) = pid {
-            if !kill_process_best_effort(pid, expected_start_ticks) {
-                let corrupt_reason = format!(
-                    "failed to kill process {} for lane {} -- process identity was unknown or process may still be running",
-                    pid, args.lane_id
-                );
-                persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
-                return output_error(
-                    json_output,
-                    "kill_failed",
-                    &corrupt_reason,
-                    exit_codes::GENERIC_ERROR,
-                );
-            }
-        }
-    }
-
-    // Perform safe deletion of all lane subdirectories (under lock)
-    let lane_dir = manager.lane_dir(&args.lane_id);
-    let Some(lanes_root) = lane_dir.parent() else {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!(
-                "Lane directory {} has no parent directory",
-                lane_dir.display()
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    };
-
-    // TCK-00575: Include all per-lane env isolation directories (home, tmp,
-    // xdg_cache, xdg_config, xdg_data, xdg_state, xdg_runtime) in the reset
-    // so that stale env state does not
-    // persist across lane reuses.
-    let mut subdirs: Vec<&str> = vec!["workspace", "target", "logs"];
-    subdirs.extend_from_slice(LANE_ENV_DIRS);
-
-    let mut total_files: u64 = 0;
-    let mut total_dirs: u64 = 0;
-    let mut refused_receipts: Vec<RefusedDeleteReceipt> = Vec::new();
-
-    for subdir in &subdirs {
-        let subdir_path = lane_dir.join(subdir);
-        match safe_rmtree_v1(&subdir_path, lanes_root) {
-            Ok(SafeRmtreeOutcome::Deleted {
-                files_deleted,
-                dirs_deleted,
-            }) => {
-                total_files = total_files.saturating_add(files_deleted);
-                total_dirs = total_dirs.saturating_add(dirs_deleted);
-            },
-            Ok(SafeRmtreeOutcome::AlreadyAbsent) => {},
-            Err(e) => {
-                let receipt = RefusedDeleteReceipt {
-                    root: subdir_path.clone(),
-                    allowed_parent: lanes_root.to_path_buf(),
-                    reason: e.to_string(),
-                    mark_corrupt: true,
-                };
-                refused_receipts.push(receipt);
-            },
-        }
-    }
-
-    // If any deletions were refused, mark lane as CORRUPT (under lock)
-    if !refused_receipts.is_empty() {
-        let corrupt_reason = refused_receipts
-            .iter()
-            .map(|r| r.reason.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        // Persist CORRUPT state to the lease file so that lane_status
-        // reflects the corruption even after restart.
-        persist_corrupt_lease(manager, &args.lane_id, &corrupt_reason);
-
-        let response = serde_json::json!({
-            "lane_id": args.lane_id,
-            "status": "CORRUPT",
-            "reason": corrupt_reason,
-            "refused_receipts": refused_receipts.iter().map(|r| {
-                serde_json::json!({
-                    "root": r.root.display().to_string(),
-                    "allowed_parent": r.allowed_parent.display().to_string(),
-                    "reason": r.reason,
-                    "mark_corrupt": r.mark_corrupt,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_default()
-        );
-
-        return exit_codes::GENERIC_ERROR;
-    }
-
-    // Remove the lease file to transition lane to IDLE (under lock)
-    let lane_dir_owned = manager.lane_dir(&args.lane_id);
-    if let Err(e) = LaneLeaseV1::remove(&lane_dir_owned) {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!("Failed to remove lease for lane {}: {e}", args.lane_id),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-
-    if let Err(e) = LaneCorruptMarkerV1::remove(manager.fac_root(), &args.lane_id) {
-        return output_error(
-            json_output,
-            "lane_error",
-            &format!(
-                "Failed to clear corrupt marker for lane {}: {e}",
-                args.lane_id
-            ),
-            exit_codes::GENERIC_ERROR,
-        );
-    }
-    if !json_output {
-        eprintln!("Corrupt marker cleared for lane {}", args.lane_id);
-    }
-
-    // Re-create the empty subdirectories for the reset lane so it is
-    // ready for reuse. This calls ensure_directories() which re-inits
-    // all lanes, not just the reset lane. This is acceptable because
-    // ensure_directories is idempotent (mkdir -p semantics) and only
-    // creates directories that don't already exist.
-    if let Err(e) = manager.ensure_directories() {
-        eprintln!("WARNING: failed to re-create lane directories: {e}");
-    }
-
-    // Lock is released here when _lock_guard drops.
-
-    let response = serde_json::json!({
-        "lane_id": args.lane_id,
-        "status": "IDLE",
-        "files_deleted": total_files,
-        "dirs_deleted": total_dirs,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response).unwrap_or_default()
-    );
-
-    exit_codes::SUCCESS
-}
-
-/// Persist a CORRUPT lease to the lane directory so that `lane_status`
-/// reports CORRUPT even after restart.
-///
-/// This is best-effort: if the lease write fails, a warning is printed
-/// but the overall CORRUPT error flow continues (fail-closed: the lane
-/// is already in a bad state).
-fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
-    let lane_dir = manager.lane_dir(lane_id);
-    // Truncate reason to avoid exceeding string length limits.
-    // Use char_indices to find a safe UTF-8 boundary instead of byte
-    // slicing, which would panic on multi-byte characters.
-    let truncated_reason = if reason.len() > 200 {
-        let truncated: String = reason
-            .char_indices()
-            .take_while(|&(i, _)| i < 197)
-            .map(|(_, c)| c)
-            .collect();
-        format!("{truncated}...")
-    } else {
-        reason.to_string()
-    };
-
-    match LaneLeaseV1::new(
-        lane_id,
-        &truncated_reason,
-        0, // pid=0: no running process
-        LaneState::Corrupt,
-        "1970-01-01T00:00:00Z", // sentinel timestamp
-        "corrupt",
-        "corrupt",
-    ) {
-        Ok(lease) => {
-            if let Err(e) = lease.persist(&lane_dir) {
-                eprintln!("WARNING: failed to persist CORRUPT lease for lane {lane_id}: {e}");
-            }
-        },
-        Err(e) => {
-            eprintln!("WARNING: failed to create CORRUPT lease for lane {lane_id}: {e}");
-        },
-    }
-}
-
-// =============================================================================
 // Lane Mark-Corrupt Command (TCK-00570)
 // =============================================================================
 
@@ -4837,13 +6281,13 @@ fn persist_corrupt_lease(manager: &LaneManager, lane_id: &str, reason: &str) {
 ///
 /// Operator workflow: manually mark a lane as CORRUPT with a reason string.
 /// The lane refuses all future job leases until an operator clears the marker
-/// via `apm2 fac lane reset`.
+/// via `apm2 fac doctor --fix`.
 ///
 /// # State Machine
 ///
 /// - Any state except RUNNING: writes `corrupt.v1.json` marker.
 /// - Already CORRUPT: returns an error (marker already exists).
-/// - RUNNING: returns an error (use `apm2 fac lane reset --force` instead).
+/// - RUNNING: returns an error (stop work and run `apm2 fac doctor --fix`).
 ///
 /// # Security
 ///
@@ -4906,13 +6350,13 @@ fn run_lane_mark_corrupt_with_manager(
         },
     };
 
-    // Refuse to mark a RUNNING lane -- operator should use `lane reset --force`.
+    // Refuse to mark a RUNNING lane.
     if status.state == LaneState::Running {
         return output_error(
             json_output,
             "lane_running",
             &format!(
-                "Lane {} is RUNNING (pid={}). Stop the job first or use `apm2 fac lane reset --force`.",
+                "Lane {} is RUNNING (pid={}). Stop active work first, then run `apm2 fac doctor --fix`.",
                 args.lane_id,
                 status.pid.unwrap_or(0)
             ),
@@ -4926,7 +6370,7 @@ fn run_lane_mark_corrupt_with_manager(
             json_output,
             "already_corrupt",
             &format!(
-                "Lane {} is already CORRUPT (reason: {}). Use `apm2 fac lane reset` to clear.",
+                "Lane {} is already CORRUPT (reason: {}). Run `apm2 fac doctor --fix` to reconcile.",
                 args.lane_id,
                 status.corrupt_reason.as_deref().unwrap_or("unknown")
             ),
@@ -4993,7 +6437,7 @@ fn run_lane_mark_corrupt_with_manager(
 
     if !json_output {
         eprintln!(
-            "Lane {} marked as CORRUPT. Use `apm2 fac lane reset` to clear.",
+            "Lane {} marked as CORRUPT. Run `apm2 fac doctor --fix` to reconcile.",
             args.lane_id
         );
     }
@@ -5082,189 +6526,6 @@ fn print_lane_init_receipt(receipt: &LaneInitReceiptV1) {
 }
 
 // =============================================================================
-// Lane Reconcile Command (TCK-00539)
-// =============================================================================
-
-/// Execute `apm2 fac lane reconcile`.
-///
-/// Inspects all lanes and repairs missing directories or profiles. Lanes
-/// that cannot be repaired are marked CORRUPT.
-fn run_lane_reconcile(_args: &LaneReconcileArgs, json_output: bool) -> u8 {
-    let manager = match LaneManager::from_default_home() {
-        Ok(m) => m,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_error",
-                &format!("Failed to initialize lane manager: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    let receipt = match manager.reconcile_lanes() {
-        Ok(r) => r,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "lane_reconcile_error",
-                &format!("Lane reconcile failed: {e}"),
-                exit_codes::GENERIC_ERROR,
-            );
-        },
-    };
-
-    if json_output {
-        match serde_json::to_string_pretty(&receipt) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                return output_error(
-                    json_output,
-                    "serialization_error",
-                    &format!("Failed to serialize reconcile receipt: {e}"),
-                    exit_codes::GENERIC_ERROR,
-                );
-            },
-        }
-    } else {
-        print_lane_reconcile_receipt(&receipt);
-    }
-
-    if receipt.lanes_marked_corrupt > 0
-        || receipt.lanes_failed > 0
-        || receipt.infrastructure_failures > 0
-    {
-        exit_codes::GENERIC_ERROR
-    } else {
-        exit_codes::SUCCESS
-    }
-}
-
-/// Print a human-readable reconcile receipt.
-fn print_lane_reconcile_receipt(receipt: &LaneReconcileReceiptV1) {
-    println!("Lane reconciliation complete");
-    println!();
-    println!("  Lanes inspected:          {}", receipt.lanes_inspected);
-    println!("  Lanes OK:                 {}", receipt.lanes_ok);
-    println!("  Lanes repaired:           {}", receipt.lanes_repaired);
-    println!(
-        "  Lanes marked corrupt:     {}",
-        receipt.lanes_marked_corrupt
-    );
-    println!("  Lanes failed:             {}", receipt.lanes_failed);
-    println!(
-        "  Infrastructure failures:  {}",
-        receipt.infrastructure_failures
-    );
-
-    if !receipt.actions.is_empty() {
-        println!();
-        println!("  Actions:");
-        for action in &receipt.actions {
-            let detail = action.detail.as_deref().unwrap_or("");
-            println!(
-                "    {:<12} {:<30} {:?} {}",
-                action.lane_id, action.action, action.outcome, detail
-            );
-        }
-    }
-}
-
-/// Best-effort process kill using SIGTERM then SIGKILL.
-///
-/// Returns `true` if the process is confirmed dead (ESRCH) or was
-/// successfully killed, `false` if the process could not be signaled
-/// (EPERM or other errors). The caller MUST abort the reset and mark
-/// the lane CORRUPT if this returns `false`.
-///
-/// # PID Reuse Safety
-///
-/// Stale lease PIDs may have been reused by a different process. Before
-/// sending signals, we verify process identity using
-/// `verify_pid_identity(pid, expected_start_ticks)`:
-///
-/// - `AliveMatch` => safe to signal.
-/// - `Dead` => already gone (success).
-/// - `AliveMismatch` => original owner is gone (success, do not signal reused
-///   PID).
-/// - `Unknown` => fail-closed, do not signal.
-///
-/// # Blocking Wait (intentional)
-///
-/// This function blocks the calling thread for up to ~5.2 seconds while
-/// waiting for the process to exit after SIGTERM. This is acceptable because
-/// `kill_process_best_effort` is called exclusively from the `apm2 fac lane
-/// reset --force` CLI command, which is an interactive operator action that
-/// expects synchronous completion before proceeding with directory deletion.
-/// The blocking wait ensures the process has actually exited before we
-/// attempt to delete its workspace.
-fn kill_process_best_effort(pid: u32, expected_start_ticks: Option<u64>) -> bool {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-
-        match verify_pid_identity(pid, expected_start_ticks) {
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-            ProcessIdentity::Unknown => return false,
-            ProcessIdentity::AliveMatch => {},
-        }
-
-        let Ok(pid_i32) = i32::try_from(pid) else {
-            return false;
-        };
-        let nix_pid = Pid::from_raw(pid_i32);
-
-        // Send SIGTERM first (graceful shutdown request).
-        match signal::kill(nix_pid, Signal::SIGTERM) {
-            Ok(()) => {},
-            Err(nix::errno::Errno::ESRCH) => return true, // already gone
-            Err(_) => return false,                       /* EPERM or other: can't signal, don't
-                                                            * proceed */
-        }
-
-        // Wait for graceful shutdown (up to 5 seconds, polling every 100ms).
-        // See doc comment above for why this blocking wait is intentional.
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            match verify_pid_identity(pid, expected_start_ticks) {
-                ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-                ProcessIdentity::AliveMatch => {},
-                ProcessIdentity::Unknown => return false,
-            }
-        }
-
-        // Re-check identity immediately before SIGKILL to avoid signaling a
-        // reused PID if ownership changed during the SIGTERM wait window.
-        match verify_pid_identity(pid, expected_start_ticks) {
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch => return true,
-            ProcessIdentity::AliveMatch => {},
-            ProcessIdentity::Unknown => return false,
-        }
-
-        // Process still alive after 5s -- send SIGKILL (uncatchable).
-        match signal::kill(nix_pid, Signal::SIGKILL) {
-            Err(nix::errno::Errno::ESRCH) => return true,
-            Err(_) => return false,
-            Ok(()) => {},
-        }
-
-        // Final wait for SIGKILL to take effect.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        matches!(
-            verify_pid_identity(pid, expected_start_ticks),
-            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -5341,8 +6602,7 @@ fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
 
 /// Output an error as pretty-printed JSON to stdout.
 ///
-/// TCK-00606 S12: FAC commands are JSON-only. The `json_output` parameter
-/// is retained for call-site compatibility but is always `true` at runtime.
+/// TCK-00606 S12: FAC commands are JSON-only.
 fn output_error(_json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     let error = ErrorResponse {
         error: code.to_string(),
@@ -5389,7 +6649,7 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
 
 /// Runs the `apm2 fac verify containment` command.
 fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
-    let use_json = json_output || args.json;
+    let use_json = json_output;
     let pid = args.pid.unwrap_or_else(std::process::id);
 
     let verdict = match apm2_core::fac::verify_containment(pid, args.sccache_enabled) {
@@ -6317,39 +7577,41 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     let job_receipts: Vec<apm2_core::fac::FacJobReceiptV1> =
         verified_window.into_iter().map(|(_idx, r)| r).collect();
 
-    if truncated {
-        eprintln!(
-            "warning: verified receipt count exceeds MAX_METRICS_RECEIPTS \
-             ({MAX_METRICS_RECEIPTS}); latency and denial-reason details are \
-             computed from the first {MAX_METRICS_RECEIPTS} receipts only \
-             (aggregate counts cover all verified receipts)"
-        );
-    }
+    if !json_output {
+        if truncated {
+            eprintln!(
+                "warning: verified receipt count exceeds MAX_METRICS_RECEIPTS \
+                 ({MAX_METRICS_RECEIPTS}); latency and denial-reason details are \
+                 computed from the first {MAX_METRICS_RECEIPTS} receipts only \
+                 (aggregate counts cover all verified receipts)"
+            );
+        }
 
-    if unverified_headers_skipped > 0 {
-        eprintln!(
-            "warning: {unverified_headers_skipped} receipt index header(s) failed \
-             content-hash verification and were excluded from aggregate counts. \
-             This may indicate index corruption or tampered receipt files."
-        );
-    }
+        if unverified_headers_skipped > 0 {
+            eprintln!(
+                "warning: {unverified_headers_skipped} receipt index header(s) failed \
+                 content-hash verification and were excluded from aggregate counts. \
+                 This may indicate index corruption or tampered receipt files."
+            );
+        }
 
-    if timestamp_mismatches > 0 {
-        eprintln!(
-            "warning: {timestamp_mismatches} receipt index header(s) had a \
-             timestamp_secs mismatch versus the verified receipt payload. \
-             These receipts were excluded from metrics. This is a strong tamper \
-             indicator: the receipt index may have been modified to shift \
-             receipts across observation window boundaries."
-        );
-    }
+        if timestamp_mismatches > 0 {
+            eprintln!(
+                "warning: {timestamp_mismatches} receipt index header(s) had a \
+                 timestamp_secs mismatch versus the verified receipt payload. \
+                 These receipts were excluded from metrics. This is a strong tamper \
+                 indicator: the receipt index may have been modified to shift \
+                 receipts across observation window boundaries."
+            );
+        }
 
-    if index_may_be_incomplete {
-        eprintln!(
-            "warning: receipt index is at capacity and may not contain all \
-             receipts in the store. Aggregate counts may undercount. \
-             Run `apm2 fac reindex` to rebuild."
-        );
+        if index_may_be_incomplete {
+            eprintln!(
+                "warning: receipt index is at capacity and may not contain all \
+                 receipts in the store. Aggregate counts may undercount. \
+                 Run `apm2 fac reindex` to rebuild."
+            );
+        }
     }
 
     // Load GC receipts.
@@ -6399,6 +7661,8 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use apm2_core::fac::LANE_CORRUPT_MARKER_SCHEMA;
     use clap::Parser;
 
@@ -6406,9 +7670,6 @@ mod tests {
 
     #[derive(Parser, Debug)]
     struct FacLogsCliHarness {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-
         #[command(subcommand)]
         subcommand: FacSubcommand,
     }
@@ -6416,6 +7677,64 @@ mod tests {
     fn assert_fac_command_parses(args: &[&str]) {
         FacLogsCliHarness::try_parse_from(args.iter().copied())
             .unwrap_or_else(|err| panic!("failed to parse `{}`: {err}", args.join(" ")));
+    }
+
+    #[test]
+    fn work_claim_role_arg_maps_to_protocol_role() {
+        assert_eq!(
+            WorkClaimRoleArg::Implementer.to_work_role(),
+            WorkRole::Implementer
+        );
+        assert_eq!(WorkClaimRoleArg::Implementer.as_str(), "implementer");
+        assert_eq!(
+            WorkClaimRoleArg::Reviewer.to_work_role(),
+            WorkRole::Reviewer
+        );
+        assert_eq!(WorkClaimRoleArg::Reviewer.as_str(), "reviewer");
+        assert_eq!(
+            WorkClaimRoleArg::Coordinator.to_work_role(),
+            WorkRole::Coordinator
+        );
+        assert_eq!(WorkClaimRoleArg::Coordinator.as_str(), "coordinator");
+    }
+
+    #[test]
+    fn derive_adhoc_session_id_is_deterministic() {
+        let first = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let second = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
+        let third = derive_adhoc_session_id("W-TCK-00640", "L-issued-002");
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+        assert!(first.starts_with("S-adhoc-"));
+    }
+
+    #[test]
+    fn fac_work_open_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "open",
+            "--from-ticket",
+            "documents/work/tickets/TCK-00640.yaml",
+            "--lease-id",
+            "L-governing-001",
+        ]);
+    }
+
+    #[test]
+    fn fac_work_claim_command_parses() {
+        assert_fac_command_parses(&[
+            "apm2",
+            "work",
+            "claim",
+            "--work-id",
+            "W-TCK-00640",
+            "--lease-id",
+            "L-governing-001",
+            "--role",
+            "implementer",
+        ]);
     }
 
     // KNOWN ISSUE (f-685-security-1771186259820160-0): Apm2HomeGuard mutates
@@ -6478,8 +7797,66 @@ mod tests {
         }
     }
 
+    static DOCTOR_FIX_TEST_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DOCTOR_FIX_TEST_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn doctor_fix_test_collect_snapshot(
+        _operator_socket: &Path,
+        _config_path: &Path,
+        _full: bool,
+        _include_tracked_prs: bool,
+        _repo_filter: Option<&str>,
+    ) -> Result<DoctorSystemSnapshot, String> {
+        if std::env::var_os("APM2_TEST_FORCE_DOCTOR_SNAPSHOT_ERR").is_some() {
+            return Err("forced snapshot error".to_string());
+        }
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(DoctorSystemSnapshot {
+            checks: vec![crate::commands::daemon::DaemonDoctorCheck {
+                name: "stub_snapshot".to_string(),
+                status: "OK",
+                message: "simulated deterministic doctor snapshot".to_string(),
+            }],
+            tracked_prs: Vec::new(),
+            has_critical_error: false,
+        })
+    }
+
+    fn doctor_fix_test_restart_worker() -> Result<String, String> {
+        if std::env::var_os("APM2_TEST_FORCE_DOCTOR_RESTART_ERR").is_some() {
+            return Err("forced restart error".to_string());
+        }
+        DOCTOR_FIX_TEST_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok("test-scope".to_string())
+    }
+
+    fn doctor_fix_test_liveness_inactive_for_unit(
+        _lane_id: &str,
+        _job_id: &str,
+    ) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
+    }
+
+    fn doctor_fix_test_liveness_inactive_for_lane(_lane_id: &str) -> FacUnitLiveness {
+        FacUnitLiveness::Inactive
+    }
+
+    fn ensure_queue_dirs_for_doctor_fix_test(queue_root: &Path) {
+        for subdir in [
+            "pending",
+            "claimed",
+            "completed",
+            "denied",
+            "quarantine",
+            "cancelled",
+        ] {
+            std::fs::create_dir_all(queue_root.join(subdir))
+                .unwrap_or_else(|err| panic!("create queue/{subdir}: {err}"));
+        }
+    }
+
     #[test]
-    fn test_lane_reset_clears_corrupt_marker() {
+    fn test_doctor_lane_reset_clears_corrupt_marker() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -6500,16 +7877,8 @@ mod tests {
         let status = manager.lane_status(lane_id).expect("initial lane status");
         assert_eq!(status.state, LaneState::Corrupt);
 
-        let exit_code = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(exit_code, exit_codes::SUCCESS);
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
         assert!(
             LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
                 .expect("load marker")
@@ -6523,7 +7892,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_reset_removes_all_per_lane_env_dirs() {
+    fn test_doctor_lane_reset_removes_all_per_lane_env_dirs() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -6549,44 +7918,740 @@ mod tests {
             std::fs::write(target.join("stale-state"), b"stale").expect("write stale state");
         }
 
-        let exit_code = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(exit_code, exit_codes::SUCCESS);
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
 
         for target in &reset_targets {
             assert!(
                 target.exists(),
-                "target {} should be recreated by lane reset",
+                "target {} should be recreated by doctor lane reset",
                 target.display()
             );
             assert!(
                 !target.join("stale-state").exists(),
-                "stale-state in {} should be deleted by lane reset",
+                "stale-state in {} should be deleted by doctor lane reset",
                 target.display()
             );
         }
     }
 
     #[test]
-    fn test_kill_process_best_effort_treats_pid_identity_mismatch_as_already_gone() {
-        let pid = std::process::id();
-        let start_ticks =
-            apm2_core::fac::read_proc_start_time_ticks(pid).expect("read current pid start ticks");
+    fn test_detect_lane_tmp_corruption_flags_transient_residue() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let residue = manager.lane_dir(lane_id).join("tmp").join(".tmp-stale");
+        std::fs::write(&residue, b"stale residue").expect("write residue");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("residue should be detected");
+        assert!(detail.contains("transient residue"));
+        assert!(detail.contains(".tmp-stale"));
+    }
+
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_nested_transient_residue() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let residue = nested_dir.join("transient.tmp");
+        std::fs::write(&residue, b"stale residue").expect("write nested residue");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("nested residue should be detected");
+        assert!(detail.contains("transient residue"));
+        assert!(detail.contains("transient.tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_lane_tmp_corruption_flags_permission_denied_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager
+            .lane_dir(lane_id)
+            .join("tmp")
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let detection =
+            detect_lane_tmp_corruption(&manager, lane_id).expect("tmp corruption detection");
+        let detail = detection.expect("permission-denied tmp tree should be detected");
         assert!(
-            kill_process_best_effort(pid, Some(start_ticks.saturating_add(1))),
-            "mismatched pid identity should be treated as stale owner gone"
+            detail.contains("permission denied"),
+            "unexpected detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn test_detect_lane_tmp_corruption_with_entry_limit_fails_closed() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        for idx in 0..4 {
+            std::fs::write(nested_dir.join(format!("file-{idx}.txt")), b"data")
+                .expect("write nested file");
+        }
+
+        let detection = detect_lane_tmp_corruption_with_entry_limit(&manager, lane_id, 2)
+            .expect("tmp corruption detection should succeed");
+        let detail = detection.expect("entry limit overflow should be detected");
+        assert!(
+            detail.contains("entry count exceeded bound (>2)"),
+            "unexpected entry bound detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_removes_nested_entries() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+
+        std::fs::write(tmp_dir.join(".tmp-residue"), b"stale").expect("write residue file");
+        std::fs::write(tmp_dir.join("leftover.txt"), b"leftover").expect("write leftover file");
+        let nested_dir = tmp_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        std::fs::write(nested_dir.join("nested.log"), b"nested").expect("write nested file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
+        assert!(
+            scrub.entries_deleted >= 3,
+            "expected scrub to delete multiple entries, got {}",
+            scrub.entries_deleted
+        );
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_recreates_tmp_when_path_is_file() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        std::fs::remove_dir(&tmp_dir).expect("remove tmp dir");
+        std::fs::write(&tmp_dir, b"not-a-dir").expect("write tmp file");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id).expect("tmp scrub should succeed");
+        assert_eq!(scrub.entries_deleted, 1);
+        assert!(
+            tmp_dir.is_dir(),
+            "tmp path should be recreated as directory after scrub"
+        );
+    }
+
+    #[test]
+    fn test_scrub_lane_tmp_dir_with_entry_limit_defers_cleanup_when_entry_limit_exceeded() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let nested_dir = manager.lane_dir(lane_id).join("tmp").join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create nested tmp dir");
+        for idx in 0..4 {
+            std::fs::write(nested_dir.join(format!("file-{idx}.tmp")), b"tmp")
+                .expect("write nested tmp file");
+        }
+
+        let scrub = scrub_lane_tmp_dir_with_entry_limit(&manager, lane_id, 2)
+            .expect("tmp scrub should succeed via deferred cleanup fallback");
+        assert_eq!(
+            scrub.deferred_cleanup_roots, 1,
+            "entry-limit overflow should defer old tmp tree instead of failing"
+        );
+        assert!(
+            manager.lane_dir(lane_id).join("tmp").is_dir(),
+            "tmp directory must be recreated after deferred cleanup fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scrub_lane_tmp_dir_repairs_write_only_broker_requests_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request-1.json"), b"{\"op\":\"a\"}")
+            .expect("write broker request 1");
+        std::fs::write(nested_dir.join("request-2.json"), b"{\"op\":\"b\"}")
+            .expect("write broker request 2");
+
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let scrub = scrub_lane_tmp_dir(&manager, lane_id)
+            .expect("tmp scrub should recover from write-only broker_requests tree");
+        assert!(
+            scrub.entries_deleted >= 2,
+            "expected scrub to delete broker request files, got {scrub:?}"
+        );
+
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after scrub")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after scrub");
+    }
+
+    #[test]
+    fn test_gc_stale_lane_logs_reports_over_quota_lane_log_targets() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let fac_root = home.path().join("private").join("fac");
+
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+
+        let lane_id = "lane-00";
+        let logs_dir = manager.lane_dir(lane_id).join("logs");
+        let mut created_job_dirs = Vec::new();
+        for idx in 0..6 {
+            let job_dir = logs_dir.join(format!("job-{idx:02}"));
+            std::fs::create_dir_all(&job_dir).expect("create job log directory");
+            let file = std::fs::File::create(job_dir.join("build.log")).expect("create build.log");
+            // Sparse file: 20 MiB logical size without heavy write I/O.
+            file.set_len(20 * 1024 * 1024)
+                .expect("set sparse file size");
+            created_job_dirs.push(job_dir);
+        }
+        let _oldest_dir = created_job_dirs
+            .into_iter()
+            .min()
+            .expect("at least one created job log dir");
+
+        let summary =
+            gc_stale_lane_logs(manager.fac_root(), &manager).expect("lane log gc should succeed");
+        assert!(
+            summary.targets >= 1,
+            "expected at least one lane log gc target, got {}",
+            summary.targets
         );
         assert_eq!(
-            apm2_core::fac::verify_pid_identity(pid, Some(start_ticks)),
-            apm2_core::fac::ProcessIdentity::AliveMatch,
-            "current process must remain alive after mismatch refusal"
+            summary.actions_applied + summary.errors,
+            summary.targets,
+            "every target must resolve to exactly one action or error"
+        );
+        assert!(
+            summary.actions_applied > 0 || summary.errors > 0,
+            "gc should report at least one applied action or error for non-empty target set"
+        );
+    }
+
+    #[test]
+    fn test_system_doctor_fix_action_kind_serializes_as_snake_case() {
+        let payload = serde_json::to_value(SystemDoctorFixAction {
+            action: SystemDoctorFixActionKind::LaneTmpCorruptionDetected,
+            status: SystemDoctorFixActionStatus::Blocked,
+            lane_id: Some("lane-00".to_string()),
+            detail: "tmp residue detected".to_string(),
+        })
+        .expect("serialize doctor action");
+        assert_eq!(
+            payload.get("action").and_then(|value| value.as_str()),
+            Some("lane_tmp_corruption_detected")
+        );
+    }
+
+    #[test]
+    fn test_record_gc_maintenance_action_marks_unavailable_as_failed() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(&mut actions, Err("boom".to_string()));
+        assert!(
+            failed,
+            "GC unavailability should signal doctor action failure"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Failed);
+        assert!(
+            actions[0]
+                .detail
+                .contains("autonomous GC maintenance unavailable"),
+            "unexpected detail: {}",
+            actions[0].detail
+        );
+    }
+
+    #[test]
+    fn test_record_gc_maintenance_action_partial_errors_are_non_fatal() {
+        let mut actions = Vec::new();
+        let failed = record_gc_maintenance_action(
+            &mut actions,
+            Ok(fac_gc::DoctorGcMaintenanceSummary {
+                plan_targets: 2,
+                actions_applied: 1,
+                errors: 1,
+                bytes_freed: 1024,
+                receipt_path: PathBuf::from("/tmp/receipt.json"),
+                migration_files_moved: 0,
+                migration_files_failed: 0,
+                migration_skipped: true,
+                migration_warning: None,
+            }),
+        );
+        assert!(
+            !failed,
+            "GC partial action errors should remain non-fatal for doctor flow"
+        );
+        assert_eq!(actions.len(), 1, "exactly one action should be emitted");
+        assert!(matches!(
+            actions[0].action,
+            SystemDoctorFixActionKind::GcMaintenance
+        ));
+        assert_eq!(actions[0].status, SystemDoctorFixActionStatus::Applied);
+        assert!(
+            actions[0].detail.starts_with("partial_gc_with_errors:"),
+            "unexpected detail: {}",
+            actions[0].detail
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_active_for_non_orphaned_reset() {
+        let err =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Active {
+                    active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+                }
+            })
+            .expect_err("active liveness must block reset");
+        assert!(
+            err.contains("reset blocked while liveness=active"),
+            "expected active liveness block detail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_blocks_missing_job_id() {
+        let err = enforce_lane_reset_liveness_guard("lane-00", None, |_lane_id, _job_id| {
+            FacUnitLiveness::Inactive
+        })
+        .expect_err("missing job_id must block direct job-based guard");
+        assert!(
+            err.contains("cannot verify unit liveness without lease job_id"),
+            "unexpected missing-job_id guard detail: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_guard_allows_inactive() {
+        let result =
+            enforce_lane_reset_liveness_guard("lane-00", Some("job-123"), |_lane_id, _job_id| {
+                FacUnitLiveness::Inactive
+            });
+        assert!(result.is_ok(), "inactive liveness should allow reset");
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_for_orphaned() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            true,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        )
+        .expect_err("orphaned missing job_id must block");
+        assert!(err.contains("orphaned-systemd lane is missing lease job_id"));
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_lane_inactive() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Inactive,
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when lane probe is inactive"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_allows_missing_job_id_when_systemd_unavailable() {
+        let result = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Unknown {
+                reason: FAC_UNIT_LIVENESS_UNAVAILABLE_REASON.to_string(),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "non-orphaned missing job_id should allow when systemd probe is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_lane_reset_liveness_context_blocks_missing_job_id_when_lane_active() {
+        let err = enforce_lane_reset_liveness_for_context(
+            "lane-00",
+            None,
+            false,
+            |_lane_id, _job_id| FacUnitLiveness::Inactive,
+            |_lane_id| FacUnitLiveness::Active {
+                active_units: vec!["apm2-fac-job-lane-00-job-123.service".to_string()],
+            },
+        )
+        .expect_err("active lane-wide liveness must block missing-job_id reset");
+        assert!(err.contains("reset blocked while liveness=active"));
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_error_for_blocked_actions() {
+        let exit_code = system_doctor_fix_exit_code(false, true, false);
+        assert_eq!(exit_code, exit_codes::GENERIC_ERROR);
+    }
+
+    #[test]
+    fn test_system_doctor_fix_exit_code_returns_success_when_clean() {
+        let exit_code = system_doctor_fix_exit_code(false, false, false);
+        assert_eq!(exit_code, exit_codes::SUCCESS);
+    }
+
+    #[test]
+    fn test_system_doctor_fix_is_idempotent_across_repeated_runs() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "doctor-fix-idempotent-job",
+            "kind": "test",
+        });
+        std::fs::write(
+            queue_root
+                .join("claimed")
+                .join("doctor-fix-idempotent-job.json"),
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed job"),
+        )
+        .expect("write claimed job");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let first_exit = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        let second_exit = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+
+        assert_eq!(first_exit, exit_codes::SUCCESS);
+        assert_eq!(second_exit, exit_codes::SUCCESS);
+        assert_eq!(
+            DOCTOR_FIX_TEST_SNAPSHOT_CALLS.load(Ordering::SeqCst),
+            4,
+            "each doctor --fix run should collect exactly one pre and one post snapshot"
+        );
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "repeated doctor --fix runs should converge; worker restart should not repeat after first repair"
+        );
+        let pending_entries: Vec<_> = std::fs::read_dir(queue_root.join("pending"))
+            .expect("read pending dir after doctor fix")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !pending_entries.is_empty(),
+            "first run should requeue claimed job into pending deterministically"
+        );
+        assert!(
+            !queue_root
+                .join("claimed")
+                .join("doctor-fix-idempotent-job.json")
+                .exists(),
+            "claimed job should not remain in claimed after idempotent repair"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_restarts_worker_for_still_active_claimed_lock_without_running_lane() {
+        use fs2::FileExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let claimed_path = queue_root
+            .join("claimed")
+            .join("doctor-fix-flock-held-job.json");
+        let claimed_job = serde_json::json!({
+            "schema": "apm2.fac.job_spec.v1",
+            "job_id": "doctor-fix-flock-held-job",
+            "kind": "gates",
+        });
+        std::fs::write(
+            &claimed_path,
+            serde_json::to_vec_pretty(&claimed_job).expect("serialize claimed job"),
+        )
+        .expect("write claimed job");
+
+        // Hold the claimed-file lock from this process so queue reconcile sees
+        // a still-active flock-held entry while no lane is RUNNING.
+        let claimed_lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed file for lock");
+        claimed_lock_file
+            .lock_exclusive()
+            .expect("acquire claimed lock");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should complete even when claimed lock is held"
+        );
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "still-active flock-held claimed jobs with no running lanes must trigger worker restart"
+        );
+        assert!(
+            claimed_path.exists(),
+            "doctor should not mutate the claimed file while flock-held"
+        );
+
+        drop(claimed_lock_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_doctor_fix_recovers_from_write_only_tmp_residue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp dir");
+        let _home_guard = Apm2HomeGuard::new(home.path());
+
+        let fac_root = home.path().join("private").join("fac");
+        let queue_root = home.path().join("queue");
+        let manager = LaneManager::new(fac_root).expect("create lane manager");
+        manager
+            .ensure_directories()
+            .expect("create lanes and directories");
+        ensure_queue_dirs_for_doctor_fix_test(&queue_root);
+
+        let lane_id = "lane-00";
+        manager
+            .mark_corrupt(
+                lane_id,
+                "tmp cleanup permission denied during worker crash",
+                None,
+            )
+            .expect("mark lane corrupt");
+
+        let tmp_dir = manager.lane_dir(lane_id).join("tmp");
+        let nested_dir = tmp_dir
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        std::fs::create_dir_all(&nested_dir).expect("create nested broker_requests dir");
+        std::fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+        std::fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            std::fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        std::fs::set_permissions(&nested_dir, std::fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        DOCTOR_FIX_TEST_RESTART_CALLS.store(0, Ordering::SeqCst);
+        DOCTOR_FIX_TEST_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+
+        let exit_code = run_system_doctor_fix_with_hooks(
+            Path::new("/tmp/test-operator.sock"),
+            Path::new("/tmp/test-ecosystem.toml"),
+            false,
+            false,
+            None,
+            true,
+            SystemDoctorFixHooks {
+                collect_snapshot: doctor_fix_test_collect_snapshot,
+                restart_worker: doctor_fix_test_restart_worker,
+                check_unit_liveness: doctor_fix_test_liveness_inactive_for_unit,
+                check_lane_liveness: doctor_fix_test_liveness_inactive_for_lane,
+            },
+        );
+        assert_eq!(
+            exit_code,
+            exit_codes::SUCCESS,
+            "doctor --fix should auto-recover write-only tmp residue"
+        );
+
+        let status = manager
+            .lane_status(lane_id)
+            .expect("load lane status after doctor --fix");
+        assert_ne!(
+            status.state,
+            LaneState::Corrupt,
+            "lane should not remain CORRUPT after doctor fix"
+        );
+        assert!(
+            LaneCorruptMarkerV1::load(manager.fac_root(), lane_id)
+                .expect("load marker")
+                .is_none(),
+            "doctor fix should clear the corrupt marker"
+        );
+        assert!(tmp_dir.is_dir(), "doctor fix should restore tmp directory");
+        let remaining = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir after doctor fix")
+            .count();
+        assert_eq!(remaining, 0, "tmp dir should be empty after doctor fix");
+        assert_eq!(
+            DOCTOR_FIX_TEST_RESTART_CALLS.load(Ordering::SeqCst),
+            1,
+            "lane reset recovery should restart worker exactly once"
         );
     }
 
@@ -6601,12 +8666,136 @@ mod tests {
             latest_receipt_hash: None,
             event_count: 5,
             latest_seq_id: Some(42),
+            implementer_claim_blocked: false,
+            dependency_diagnostics: vec![],
         };
 
         let json = serde_json::to_string(&response).unwrap();
         let restored: WorkStatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.work_id, "work-123");
         assert_eq!(restored.status, "CLAIMED");
+    }
+
+    fn daemon_work_item_for_current_tests(
+        work_id: &str,
+        status: &str,
+        role: Option<WorkRole>,
+        lease_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> apm2_daemon::protocol::WorkStatusResponse {
+        apm2_daemon::protocol::WorkStatusResponse {
+            work_id: work_id.to_string(),
+            status: status.to_string(),
+            role: role.map(|value| value as i32),
+            lease_id: lease_id.map(ToString::to_string),
+            session_id: session_id.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_tck_from_text_accepts_valid_pattern() {
+        assert_eq!(
+            extract_tck_from_text("ticket/RFC-0018/TCK-00640"),
+            Some("TCK-00640".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tck_from_text_rejects_invalid_pattern() {
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-006400"), None);
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_returns_single_candidate() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "BLOCKED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, None, None)
+            .expect("single active implementer candidate should be selected");
+        assert_eq!(selected, "W-AAA111");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_honors_filters() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let selected = select_work_current_fallback_work_id(&items, Some("L-222"), Some("S-222"))
+            .expect("lease/session filter should isolate a single candidate");
+        assert_eq!(selected, "W-BBB222");
+    }
+
+    #[test]
+    fn select_work_current_fallback_work_id_errors_on_ambiguity() {
+        let items = vec![
+            daemon_work_item_for_current_tests(
+                "W-AAA111",
+                "CLAIMED",
+                Some(WorkRole::Implementer),
+                Some("L-111"),
+                Some("S-111"),
+            ),
+            daemon_work_item_for_current_tests(
+                "W-BBB222",
+                "RUNNING",
+                Some(WorkRole::Implementer),
+                Some("L-222"),
+                Some("S-222"),
+            ),
+        ];
+        let error = select_work_current_fallback_work_id(&items, None, None)
+            .expect_err("multiple active candidates must fail closed");
+        assert!(error.contains("multiple active Implementer work items"));
+    }
+
+    #[test]
+    fn work_current_projection_fallback_requested_requires_explicit_filters() {
+        assert!(!work_current_projection_fallback_requested(None, None));
+        assert!(work_current_projection_fallback_requested(
+            Some("L-123"),
+            None
+        ));
+        assert!(work_current_projection_fallback_requested(
+            None,
+            Some("S-123")
+        ));
+    }
+
+    #[test]
+    fn unresolved_work_current_alias_message_includes_fail_closed_guidance() {
+        let msg = unresolved_work_current_alias_message("TCK-00640");
+        assert!(msg.contains("TCK-00640"));
+        assert!(msg.contains("Refusing projection fallback"));
+        assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
 
     #[test]
@@ -6734,13 +8923,12 @@ mod tests {
     #[test]
     fn test_extract_work_info_success() {
         let payload = serde_json::json!({
-            "work_id": "work-123",
             "actor_id": "actor-1",
             "role": "implementer"
         });
         let event = EventRecord::new(
             "work_claimed",
-            "session-1",
+            "work-123",
             "actor-1",
             serde_json::to_vec(&payload).unwrap(),
         );
@@ -6753,13 +8941,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_work_info_metadata_first_for_legacy_rows() {
+    fn test_extract_work_info_matches_session_metadata() {
         let payload = serde_json::json!({
             "role": "implementer"
         });
         let event = EventRecord::new(
             "work_claimed",
-            "work-123", // legacy compat maps work_id -> session_id
+            "work-123",
             "actor-from-row",
             serde_json::to_vec(&payload).unwrap(),
         );
@@ -6767,25 +8955,27 @@ mod tests {
         let info = extract_work_info(&event, "work-123").expect("should match via metadata");
         assert!(
             info.episode_id.is_none(),
-            "legacy work rows should not infer episode_id"
+            "work rows should not infer episode_id when payload omits it"
         );
     }
 
     #[test]
-    fn test_extract_work_info_payload_fallback_for_episode_rows() {
+    fn test_extract_work_info_rejects_payload_only_match() {
         let payload = serde_json::json!({
-            "work_id": "work-123"
+            "work_id": "work-123",
+            "episode_id": "episode-001"
         });
         let event = EventRecord::new(
             "episode_spawned",
-            "episode-001", // daemon stores episode_id in legacy work_id column
+            "session-001",
             "daemon",
             serde_json::to_vec(&payload).unwrap(),
         );
 
-        let info =
-            extract_work_info(&event, "work-123").expect("should match via payload fallback");
-        assert_eq!(info.episode_id.as_deref(), Some("episode-001"));
+        assert!(
+            extract_work_info(&event, "work-123").is_none(),
+            "payload-only work_id match must be rejected"
+        );
     }
 
     #[test]
@@ -6960,36 +9150,6 @@ mod tests {
     }
 
     #[test]
-    fn test_logs_subcommand_json_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "logs", "--pr", "615", "--json"])
-            .expect("logs parser should accept subcommand json flag");
-
-        assert!(!parsed.json);
-        match parsed.subcommand {
-            FacSubcommand::Logs(args) => {
-                assert_eq!(args.pr, Some(615));
-                assert!(args.json);
-            },
-            other => panic!("expected logs subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_logs_global_json_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "logs", "--pr", "615"])
-            .expect("logs parser should accept global json flag");
-
-        assert!(parsed.json);
-        match parsed.subcommand {
-            FacSubcommand::Logs(args) => {
-                assert_eq!(args.pr, Some(615));
-                assert!(!args.json);
-            },
-            other => panic!("expected logs subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_gates_timeout_default_is_600_seconds() {
         let parsed = FacLogsCliHarness::try_parse_from(["fac", "gates"])
             .expect("gates parser should apply defaults");
@@ -7043,31 +9203,6 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_credential_runtime_flags_parse() {
-        let parsed = FacLogsCliHarness::try_parse_from([
-            "fac",
-            "preflight",
-            "credential",
-            "runtime",
-            "--json",
-        ])
-        .expect("preflight credential runtime should parse");
-        match parsed.subcommand {
-            FacSubcommand::Preflight(args) => match args.subcommand {
-                PreflightSubcommand::Credential(credential_args) => {
-                    assert_eq!(credential_args.mode, fac_preflight::CredentialMode::Runtime);
-                    assert!(credential_args.paths.is_empty());
-                    assert!(credential_args.json);
-                },
-                other @ PreflightSubcommand::Authorization(_) => {
-                    panic!("expected preflight credential subcommand, got {other:?}")
-                },
-            },
-            other => panic!("expected preflight subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_preflight_credential_lint_paths_parse() {
         let parsed = FacLogsCliHarness::try_parse_from([
             "fac",
@@ -7091,7 +9226,6 @@ mod tests {
                         credential_args.paths[1],
                         PathBuf::from("crates/apm2-cli/src/commands/fac_preflight.rs")
                     );
-                    assert!(!credential_args.json);
                 },
                 other @ PreflightSubcommand::Authorization(_) => {
                     panic!("expected preflight credential subcommand, got {other:?}")
@@ -7102,69 +9236,74 @@ mod tests {
     }
 
     #[test]
-    fn test_preflight_authorization_flags_parse() {
-        let parsed =
-            FacLogsCliHarness::try_parse_from(["fac", "preflight", "authorization", "--json"])
-                .expect("preflight authorization should parse");
+    fn test_recover_subcommand_removed_from_cli() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "recover", "--pr", "615"]);
+        assert!(
+            parsed.is_err(),
+            "fac recover must be removed; use fac doctor --fix"
+        );
+    }
+
+    #[test]
+    fn test_review_run_subcommand_removed_from_cli() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "review", "run", "--pr", "615"]);
+        assert!(
+            parsed.is_err(),
+            "fac review run must be removed; use fac doctor --pr <N> --fix"
+        );
+    }
+
+    #[test]
+    fn test_internal_reviewer_subcommand_parses() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "reviewer",
+            "--pr",
+            "615",
+            "--type",
+            "security",
+            "--expected-head-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ])
+        .expect("hidden internal reviewer command should parse");
         match parsed.subcommand {
-            FacSubcommand::Preflight(args) => match args.subcommand {
-                PreflightSubcommand::Authorization(auth_args) => {
-                    assert!(auth_args.json);
-                },
-                other @ PreflightSubcommand::Credential(_) => {
-                    panic!("expected preflight authorization subcommand, got {other:?}")
-                },
+            FacSubcommand::Reviewer(args) => {
+                assert_eq!(args.pr, 615);
+                assert_eq!(args.review_type, ReviewStatusTypeArg::Security);
+                assert_eq!(
+                    args.expected_head_sha,
+                    "0123456789abcdef0123456789abcdef01234567"
+                );
             },
-            other => panic!("expected preflight subcommand, got {other:?}"),
+            other => panic!("expected reviewer subcommand, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_subcommand_machine_output_detection_for_nested_json() {
-        let review_findings = FacSubcommand::Review(ReviewArgs {
-            subcommand: ReviewSubcommand::Findings(ReviewFindingsArgs {
-                pr: Some(615),
-                sha: None,
-                refresh: false,
-                json: true,
-            }),
-        });
-        assert!(subcommand_requests_machine_output(&review_findings));
+    fn test_review_comment_subcommand_removed_from_cli() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "review", "comment"]);
+        assert!(
+            parsed.is_err(),
+            "fac review comment compatibility shim must be removed"
+        );
+    }
 
-        let recover = FacSubcommand::Recover(RecoverArgs {
-            pr: Some(615),
-            force: false,
-            refresh_identity: false,
-            reap_stale_agents: false,
-            reset_lifecycle: false,
-            all: false,
-            json: true,
-        });
-        assert!(subcommand_requests_machine_output(&recover));
+    #[test]
+    fn test_fac_restart_subcommand_removed_from_cli() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "restart", "--pr", "615"]);
+        assert!(
+            parsed.is_err(),
+            "fac restart must be removed; use fac doctor --pr <N> --fix"
+        );
+    }
 
-        let restart = FacSubcommand::Restart(RestartArgs {
-            pr: Some(615),
-            force: false,
-            refresh_identity: false,
-            json: false,
-        });
-        assert!(subcommand_requests_machine_output(&restart));
-
-        let worker = FacSubcommand::Worker(WorkerArgs {
-            once: true,
-            poll_interval_secs: 1,
-            max_jobs: 1,
-            print_unit: false,
-            json: false,
-        });
-        assert!(subcommand_requests_machine_output(&worker));
-
-        let preflight = FacSubcommand::Preflight(PreflightArgs {
-            subcommand: PreflightSubcommand::Authorization(PreflightAuthorizationArgs {
-                json: true,
-            }),
-        });
-        assert!(subcommand_requests_machine_output(&preflight));
+    #[test]
+    fn test_review_restart_subcommand_removed_from_cli() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "review", "restart", "--pr", "615"]);
+        assert!(
+            parsed.is_err(),
+            "fac review restart must be removed; use fac doctor --pr <N> --fix"
+        );
     }
 
     #[test]
@@ -7180,6 +9319,38 @@ mod tests {
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_doctor_fix_without_pr_parses_for_system_reconcile() {
+        let parsed = FacLogsCliHarness::try_parse_from(["fac", "doctor", "--fix"])
+            .expect("doctor --fix without --pr should parse");
+        match parsed.subcommand {
+            FacSubcommand::Doctor(args) => {
+                assert!(args.fix);
+                assert!(args.pr.is_none());
+            },
+            other => panic!("expected doctor subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_should_attempt_cleanup_scrub_matches_entry_limit_reason() {
+        assert!(should_attempt_cleanup_scrub(
+            "directory /tmp/lane/tmp has more than 10000 entries"
+        ));
+        assert!(!should_attempt_cleanup_scrub("operator-marked corrupt"));
+    }
+
+    #[test]
+    fn test_refused_delete_mentions_tmp_matches_tmp_root() {
+        let receipts = vec![RefusedDeleteReceipt {
+            root: PathBuf::from("/tmp/apm2/private/fac/lanes/lane-00/tmp"),
+            allowed_parent: PathBuf::from("/tmp/apm2/private/fac/lanes"),
+            reason: "directory has more than 10000 entries".to_string(),
+            mark_corrupt: true,
+        }];
+        assert!(refused_delete_mentions_tmp(&receipts));
     }
 
     #[test]
@@ -7234,8 +9405,6 @@ mod tests {
             "--pr",
             "615",
             "--wait-for-recommended-action",
-            "--poll-interval-seconds",
-            "2",
             "--wait-timeout-seconds",
             "30",
             "--exit-on",
@@ -7246,7 +9415,6 @@ mod tests {
             FacSubcommand::Doctor(args) => {
                 assert_eq!(args.pr, Some(615));
                 assert!(args.wait_for_recommended_action);
-                assert_eq!(args.poll_interval_seconds, 2);
                 assert_eq!(args.wait_timeout_seconds, 30);
                 assert_eq!(
                     args.exit_on,
@@ -7268,6 +9436,23 @@ mod tests {
             },
             other => panic!("expected doctor subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_doctor_poll_interval_seconds_flag_removed() {
+        let parsed = FacLogsCliHarness::try_parse_from([
+            "fac",
+            "doctor",
+            "--pr",
+            "615",
+            "--wait-for-recommended-action",
+            "--poll-interval-seconds",
+            "2",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "doctor --poll-interval-seconds must be removed; wait cadence is internal-only"
+        );
     }
 
     #[test]
@@ -7473,7 +9658,6 @@ mod tests {
             DoctorExitActionArg::Done.as_str(),
             DoctorExitActionArg::Approve.as_str(),
             DoctorExitActionArg::DispatchImplementor.as_str(),
-            DoctorExitActionArg::RestartReviews.as_str(),
         ];
         enum_actions.sort_unstable();
 
@@ -7485,8 +9669,8 @@ mod tests {
 
     #[test]
     fn test_review_prompt_command_sequence_parses_with_verdict_surface() {
-        assert_fac_command_parses(&["fac", "review", "prepare", "--json"]);
-        assert_fac_command_parses(&["fac", "review", "findings", "--json"]);
+        assert_fac_command_parses(&["fac", "review", "prepare"]);
+        assert_fac_command_parses(&["fac", "review", "findings"]);
         assert_fac_command_parses(&[
             "fac",
             "review",
@@ -7505,21 +9689,8 @@ mod tests {
             "Compromise of CI runner",
             "--location",
             "src/parser.rs:88",
-            "--json",
         ]);
-        assert_fac_command_parses(&[
-            "fac",
-            "review",
-            "comment",
-            "--type",
-            "code-quality",
-            "--severity",
-            "minor",
-            "--body",
-            "Legacy compatibility shim still accepted",
-            "--json",
-        ]);
-        assert_fac_command_parses(&["fac", "review", "findings", "--refresh", "--json"]);
+        assert_fac_command_parses(&["fac", "review", "findings"]);
         assert_fac_command_parses(&[
             "fac",
             "review",
@@ -7531,7 +9702,6 @@ mod tests {
             "approve",
             "--reason",
             "PASS for 0123456789abcdef0123456789abcdef01234567",
-            "--json",
         ]);
         assert_fac_command_parses(&[
             "fac",
@@ -7544,152 +9714,39 @@ mod tests {
             "deny",
             "--reason",
             "BLOCKER/MAJOR findings for 0123456789abcdef0123456789abcdef01234567",
-            "--json",
         ]);
     }
 
     #[test]
-    fn test_lane_reset_and_worker_commands_parse() {
-        assert_fac_command_parses(&["fac", "lane", "reset", "lane-00"]);
-        assert_fac_command_parses(&["fac", "lane", "reset", "lane-07", "--force"]);
+    fn test_doctor_and_worker_commands_parse() {
+        assert_fac_command_parses(&["fac", "doctor", "--fix"]);
         assert_fac_command_parses(&["fac", "worker", "--once"]);
-        assert_fac_command_parses(&[
-            "fac",
-            "worker",
-            "--poll-interval-secs",
-            "2",
-            "--max-jobs",
-            "5",
-        ]);
+        assert_fac_command_parses(&["fac", "worker", "--max-jobs", "5"]);
     }
 
     #[test]
-    fn test_services_status_json_flag_parses() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "services", "status", "--json"])
-            .expect("services status should parse");
-
-        match parsed.subcommand {
-            FacSubcommand::Services(args) => match args.subcommand {
-                ServicesSubcommand::Status(status_args) => {
-                    assert!(status_args.json);
-                },
-            },
-            other => panic!("expected services subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_services_global_json_flag_parses_with_status() {
-        let parsed = FacLogsCliHarness::try_parse_from(["fac", "--json", "services", "status"])
-            .expect("global json with services status should parse");
-
-        assert!(parsed.json);
-        match parsed.subcommand {
-            FacSubcommand::Services(args) => match args.subcommand {
-                ServicesSubcommand::Status(status_args) => {
-                    assert!(!status_args.json);
-                },
-            },
-            other => panic!("expected services subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_receipts_leaf_json_flags_parse() {
-        let list = FacLogsCliHarness::try_parse_from(["fac", "receipts", "list", "--json"])
-            .expect("receipts list --json should parse");
-        match list.subcommand {
-            FacSubcommand::Receipts(args) => match args.subcommand {
-                ReceiptSubcommand::List(list_args) => assert!(list_args.json),
-                other => panic!("expected receipts list subcommand, got {other:?}"),
-            },
-            other => panic!("expected receipts command, got {other:?}"),
-        }
-
-        let status =
-            FacLogsCliHarness::try_parse_from(["fac", "receipts", "status", "job-123", "--json"])
-                .expect("receipts status --json should parse");
-        match status.subcommand {
-            FacSubcommand::Receipts(args) => match args.subcommand {
-                ReceiptSubcommand::Status(status_args) => assert!(status_args.json),
-                other => panic!("expected receipts status subcommand, got {other:?}"),
-            },
-            other => panic!("expected receipts command, got {other:?}"),
-        }
-
-        let reindex = FacLogsCliHarness::try_parse_from(["fac", "receipts", "reindex", "--json"])
-            .expect("receipts reindex --json should parse");
-        match reindex.subcommand {
-            FacSubcommand::Receipts(args) => match args.subcommand {
-                ReceiptSubcommand::Reindex(reindex_args) => assert!(reindex_args.json),
-                other => panic!("expected receipts reindex subcommand, got {other:?}"),
-            },
-            other => panic!("expected receipts command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_receipts_verify_json_flag_parses() {
-        let verify = FacLogsCliHarness::try_parse_from([
-            "fac",
-            "receipts",
-            "verify",
-            "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-            "--json",
-        ])
-        .expect("receipts verify --json should parse");
-        match verify.subcommand {
-            FacSubcommand::Receipts(args) => match args.subcommand {
-                ReceiptSubcommand::Verify(verify_args) => {
-                    assert!(verify_args.json);
-                    assert_eq!(
-                        verify_args.digest_or_path,
-                        "b3-256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                    );
-                },
-                other => panic!("expected receipts verify subcommand, got {other:?}"),
-            },
-            other => panic!("expected receipts command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_receipts_merge_json_flag_parses() {
-        let merge = FacLogsCliHarness::try_parse_from([
-            "fac",
-            "receipts",
-            "merge",
-            "--from",
-            "/tmp/source",
-            "--into",
-            "/tmp/target",
-            "--json",
-        ])
-        .expect("receipts merge --json should parse");
-        match merge.subcommand {
-            FacSubcommand::Receipts(args) => match args.subcommand {
-                ReceiptSubcommand::Merge(merge_args) => {
-                    assert!(merge_args.json);
-                    assert_eq!(merge_args.from, std::path::PathBuf::from("/tmp/source"));
-                    assert_eq!(merge_args.into, std::path::PathBuf::from("/tmp/target"));
-                },
-                other => panic!("expected receipts merge subcommand, got {other:?}"),
-            },
-            other => panic!("expected receipts command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_job_cancel_json_flag_parses() {
+    fn test_worker_poll_interval_secs_flag_removed() {
         let parsed =
-            FacLogsCliHarness::try_parse_from(["fac", "job", "cancel", "job-123", "--json"])
-                .expect("job cancel --json should parse");
-        match parsed.subcommand {
-            FacSubcommand::Job(args) => match args.subcommand {
-                JobSubcommand::Cancel(cancel_args) => assert!(cancel_args.json),
-                JobSubcommand::Show(_) => panic!("expected cancel subcommand, got show"),
-            },
-            other => panic!("expected job command, got {other:?}"),
+            FacLogsCliHarness::try_parse_from(["fac", "worker", "--poll-interval-secs", "2"]);
+        assert!(
+            parsed.is_err(),
+            "fac worker --poll-interval-secs must be removed; safety nudge interval is internal-only"
+        );
+    }
+
+    #[test]
+    fn test_legacy_json_flags_removed_from_fac_commands() {
+        for command in [
+            vec!["fac", "doctor", "--json"],
+            vec!["fac", "lane", "init", "--json"],
+            vec!["fac", "install", "--json"],
+            vec!["fac", "config", "show", "--json"],
+            vec!["fac", "review", "findings", "--json"],
+        ] {
+            assert!(
+                FacLogsCliHarness::try_parse_from(command).is_err(),
+                "legacy --json shim must remain removed from FAC command parsing",
+            );
         }
     }
 
@@ -7816,7 +9873,6 @@ mod tests {
         let export_args = BundleExportArgs {
             job_id: "test-rt-job".to_string(),
             output_dir: Some(output_dir.clone()),
-            json: false,
         };
         let export_exit = run_bundle_export(&export_args, false);
         assert_eq!(
@@ -7851,7 +9907,6 @@ mod tests {
 
         let import_args = BundleImportArgs {
             path: manifest_path,
-            json: false,
         };
         let import_exit = run_bundle_import(&import_args, false);
         assert_eq!(
@@ -8221,7 +10276,6 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 reason: "operator maintenance".to_string(),
                 receipt_digest: None,
-                json: true,
             },
             true,
         );
@@ -8266,7 +10320,6 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 reason: "cleanup failed".to_string(),
                 receipt_digest: Some(digest.clone()),
-                json: true,
             },
             true,
         );
@@ -8298,7 +10351,6 @@ mod tests {
                 lane_id: "lane-00".to_string(),
                 reason: "test".to_string(),
                 receipt_digest: Some("not-a-digest".to_string()),
-                json: true,
             },
             true,
         );
@@ -8315,7 +10367,6 @@ mod tests {
                 lane_id: "lane-00".to_string(),
                 reason: "test".to_string(),
                 receipt_digest: Some("b3-256:deadbeef".to_string()),
-                json: true,
             },
             true,
         );
@@ -8335,7 +10386,6 @@ mod tests {
                     "b3-256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"
                         .to_string(),
                 ),
-                json: true,
             },
             true,
         );
@@ -8365,7 +10415,6 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 reason: "first mark".to_string(),
                 receipt_digest: None,
-                json: true,
             },
             true,
         );
@@ -8378,7 +10427,6 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 reason: "second mark".to_string(),
                 receipt_digest: None,
-                json: true,
             },
             true,
         );
@@ -8413,7 +10461,6 @@ mod tests {
                 lane_id: "lane-00".to_string(),
                 reason: long_reason,
                 receipt_digest: None,
-                json: true,
             },
             true,
         );
@@ -8425,7 +10472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_mark_corrupt_then_reset_clears() {
+    fn test_lane_mark_corrupt_then_doctor_reset_clears() {
         let home = tempfile::tempdir().expect("temp dir");
         let fac_root = home.path().join("private").join("fac");
 
@@ -8443,23 +10490,14 @@ mod tests {
                 lane_id: lane_id.to_string(),
                 reason: "mark then reset".to_string(),
                 receipt_digest: None,
-                json: true,
             },
             true,
         );
         assert_eq!(mark_exit, exit_codes::SUCCESS);
 
-        // Reset the lane.
-        let reset_exit = run_lane_reset_with_manager(
-            &manager,
-            &LaneResetArgs {
-                lane_id: lane_id.to_string(),
-                force: false,
-                json: false,
-            },
-            false,
-        );
-        assert_eq!(reset_exit, exit_codes::SUCCESS);
+        // Reset the lane through doctor remediation logic.
+        let reset = doctor_reset_lane_once(&manager, lane_id);
+        assert!(reset.is_ok(), "doctor reset should succeed: {reset:?}");
 
         // Marker should be cleared.
         assert!(

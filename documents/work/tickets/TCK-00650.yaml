@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00650
     title: 'RFC-0032 Phase 5: merge completion alignment (fix merge_executor `gate_receipt_id` misuse; emit merge receipt + work.completed coherently)'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

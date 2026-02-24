@@ -364,6 +364,7 @@ fn tck_00550_job_without_broker_token_denied() {
         JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "org/repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         },
@@ -395,6 +396,7 @@ fn tck_00550_job_with_empty_token_denied() {
         JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "org/repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "b".repeat(40),
             patch: None,
         },

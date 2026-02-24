@@ -17,9 +17,8 @@ use super::types::{
     now_iso8601_millis, validate_expected_head_sha,
 };
 use super::{lifecycle, projection_store};
-use crate::exit_codes::codes as exit_codes;
 
-const RECOVER_SUMMARY_SCHEMA: &str = "apm2.fac.recover_summary.v4";
+const REPAIR_SUMMARY_SCHEMA: &str = "apm2.fac.repair_summary.v1";
 const OPERATION_REPAIR_RUN_STATE: &str = "repair_run_state";
 const OPERATION_REPAIR_REGISTRY: &str = "repair_registry_integrity";
 
@@ -29,6 +28,7 @@ enum RunStateRepairCondition {
     Missing,
     Corrupt,
     Ambiguous,
+    InconsistentRuntimeHandle,
 }
 
 impl RunStateRepairCondition {
@@ -37,6 +37,7 @@ impl RunStateRepairCondition {
             Self::Missing => "missing",
             Self::Corrupt => "corrupt",
             Self::Ambiguous => "ambiguous",
+            Self::InconsistentRuntimeHandle => "inconsistent_runtime_handle",
         }
     }
 }
@@ -47,6 +48,7 @@ enum RunStateRepairAction {
     BaselineCreated,
     Canonicalized,
     RebuiltFromCandidate,
+    RebuiltFromPresent,
 }
 
 impl RunStateRepairAction {
@@ -55,6 +57,7 @@ impl RunStateRepairAction {
             Self::BaselineCreated => "baseline_created",
             Self::Canonicalized => "canonicalized",
             Self::RebuiltFromCandidate => "rebuilt_from_candidate",
+            Self::RebuiltFromPresent => "rebuilt_from_present",
         }
     }
 }
@@ -84,7 +87,7 @@ struct RunStateRepairOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct RecoverSummary {
+pub(super) struct RepairSummary {
     schema: String,
     owner_repo: String,
     pr_number: u32,
@@ -102,7 +105,7 @@ pub(super) struct RecoverSummary {
     run_state_repairs: Vec<RunStateRepairOutcome>,
 }
 
-impl RecoverSummary {
+impl RepairSummary {
     pub(super) fn into_doctor_repairs(self) -> Vec<super::DoctorRepairApplied> {
         let mut repairs = Vec::new();
         if let Some(reaped) = self.reaped_agents {
@@ -174,16 +177,16 @@ impl RecoverSummary {
 
 #[allow(clippy::fn_params_excessive_bools)]
 const fn resolve_operation_set(
-    force: bool,
     refresh_identity: bool,
     reap_stale_agents: bool,
     reset_lifecycle: bool,
     repair_registry_integrity: bool,
     all: bool,
+    run_state_repair_requested: bool,
 ) -> (bool, bool, bool, bool) {
     let mut do_reap = reap_stale_agents;
     let mut do_refresh = refresh_identity;
-    let mut do_reset = reset_lifecycle || force;
+    let mut do_reset = reset_lifecycle;
     let mut do_repair_registry = repair_registry_integrity;
 
     if all {
@@ -191,7 +194,12 @@ const fn resolve_operation_set(
         do_refresh = true;
         do_reset = true;
         do_repair_registry = true;
-    } else if !do_reap && !do_refresh && !do_reset && !do_repair_registry {
+    } else if !do_reap
+        && !do_refresh
+        && !do_reset
+        && !do_repair_registry
+        && !run_state_repair_requested
+    {
         // Safe default: recover staleness and identity drift without mutating
         // lifecycle state unless explicitly requested.
         do_reap = true;
@@ -513,7 +521,29 @@ fn repair_run_state_for_review_type(
 ) -> Result<Option<RunStateRepairOutcome>, String> {
     let canonical = state::review_run_state_path_for_home(home, pr_number, review_type);
     match state::load_review_run_state_for_home(home, pr_number, review_type)? {
-        ReviewRunStateLoad::Present(_) => Ok(None),
+        ReviewRunStateLoad::Present(state) => {
+            let Some(_detail) = present_run_state_repair_detail(review_type, &state) else {
+                return Ok(None);
+            };
+            let repaired = write_baseline_run_state_for_repair(
+                home,
+                owner_repo,
+                pr_number,
+                review_type,
+                head_sha,
+                Some(&state),
+            )?;
+            Ok(Some(RunStateRepairOutcome {
+                review_type: review_type.to_string(),
+                condition: RunStateRepairCondition::InconsistentRuntimeHandle,
+                action: RunStateRepairAction::RebuiltFromPresent,
+                canonical_path: canonical.display().to_string(),
+                source_candidate: None,
+                quarantined_paths: Vec::new(),
+                before: Some(run_state_snapshot(&state)),
+                after: run_state_snapshot(&repaired),
+            }))
+        },
         ReviewRunStateLoad::Missing { .. } => {
             let repaired = write_baseline_run_state_for_repair(
                 home,
@@ -569,6 +599,38 @@ fn repair_run_state_for_review_type(
             )?))
         },
     }
+}
+
+fn present_run_state_repair_detail(review_type: &str, state: &ReviewRunState) -> Option<String> {
+    if state.status.is_terminal() {
+        return None;
+    }
+    if state.status == ReviewRunStatus::Alive && state.pid.is_none() {
+        return Some(format!(
+            "{review_type} run-state is Alive but missing pid (run_id={})",
+            state.run_id
+        ));
+    }
+    if let Some(pid) = state.pid {
+        let Some(expected_start_time) = state.proc_start_time else {
+            return Some(format!(
+                "{review_type} run-state has pid={pid} but missing proc_start_time (run_id={})",
+                state.run_id
+            ));
+        };
+        if !state::is_process_alive(pid) {
+            return Some(format!(
+                "{review_type} run-state references dead pid={pid} (run_id={})",
+                state.run_id
+            ));
+        }
+        if state::get_process_start_time(pid) != Some(expected_start_time) {
+            return Some(format!(
+                "{review_type} run-state process identity mismatch pid={pid} expected_start={expected_start_time}",
+            ));
+        }
+    }
+    None
 }
 
 fn repair_run_states_for_pr(
@@ -633,57 +695,7 @@ fn resolve_recovery_head_sha(
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-pub fn run_recover(
-    repo: &str,
-    pr_number: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    reap_stale_agents: bool,
-    reset_lifecycle: bool,
-    all: bool,
-    _json_output: bool,
-) -> u8 {
-    let run_state_review_types = if all {
-        vec!["security".to_string(), "quality".to_string()]
-    } else {
-        Vec::new()
-    };
-
-    match run_recover_inner(
-        repo,
-        pr_number,
-        force,
-        refresh_identity,
-        reap_stale_agents,
-        reset_lifecycle,
-        false,
-        all,
-        run_state_review_types,
-    ) {
-        Ok(summary) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-            );
-            exit_codes::SUCCESS
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_recover_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-fn run_recover_inner(
+fn run_repair_inner(
     repo: &str,
     pr_number: Option<u32>,
     force: bool,
@@ -693,21 +705,21 @@ fn run_recover_inner(
     repair_registry_integrity: bool,
     all: bool,
     run_state_review_types: Vec<String>,
-) -> Result<RecoverSummary, String> {
+) -> Result<RepairSummary, String> {
     lifecycle::ensure_machine_artifact()?;
     let (owner_repo, resolved_pr) = resolve_pr_target(repo, pr_number)?;
     let home = apm2_home_dir()?;
 
+    let run_state_review_types = normalize_run_state_review_types(run_state_review_types)?;
+    let do_run_state_repair = !run_state_review_types.is_empty();
     let (do_reap, do_refresh, do_reset, do_repair_registry) = resolve_operation_set(
-        force,
         refresh_identity,
         reap_stale_agents,
         reset_lifecycle,
         repair_registry_integrity,
         all,
+        do_run_state_repair,
     );
-    let run_state_review_types = normalize_run_state_review_types(run_state_review_types)?;
-    let do_run_state_repair = !run_state_review_types.is_empty();
 
     let mut head_sha = if do_refresh || do_reset || do_run_state_repair {
         match resolve_recovery_head_sha(
@@ -780,7 +792,7 @@ fn run_recover_inner(
             &owner_repo,
             resolved_pr,
             current_head_sha,
-            "recover",
+            "repair",
         )
         .map_err(|err| format!("failed to refresh local projection identity: {err}"))?;
         refreshed_identity = true;
@@ -804,8 +816,8 @@ fn run_recover_inner(
 
     let summary_head_sha = head_sha.take().unwrap_or_default();
 
-    Ok(RecoverSummary {
-        schema: RECOVER_SUMMARY_SCHEMA.to_string(),
+    Ok(RepairSummary {
+        schema: REPAIR_SUMMARY_SCHEMA.to_string(),
         owner_repo,
         pr_number: resolved_pr,
         head_sha: summary_head_sha,
@@ -830,8 +842,8 @@ pub(super) fn run_repair_plan(
     repair_registry_integrity: bool,
     all: bool,
     run_state_review_types: Vec<String>,
-) -> Result<RecoverSummary, String> {
-    run_recover_inner(
+) -> Result<RepairSummary, String> {
+    run_repair_inner(
         repo,
         pr_number,
         force,
@@ -847,7 +859,7 @@ pub(super) fn run_repair_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        OPERATION_REPAIR_REGISTRY, RecoverSummary, normalize_run_state_review_types,
+        OPERATION_REPAIR_REGISTRY, RepairSummary, normalize_run_state_review_types,
         repair_run_state_for_review_type, resolve_operation_set,
     };
     use crate::commands::fac_review::lifecycle::BypassRegistryRepairOutcome;
@@ -884,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn default_recover_operation_set_runs_all() {
+    fn default_operation_set_enables_reap_and_refresh() {
         let (reap, refresh, reset, repair_registry) =
             resolve_operation_set(false, false, false, false, false, false);
         assert!(reap);
@@ -896,7 +908,7 @@ mod tests {
     #[test]
     fn explicit_operation_set_respects_flags() {
         let (reap, refresh, reset, repair_registry) =
-            resolve_operation_set(false, true, true, false, false, false);
+            resolve_operation_set(true, true, false, false, false, false);
         assert!(reap);
         assert!(refresh);
         assert!(!reset);
@@ -904,19 +916,19 @@ mod tests {
     }
 
     #[test]
-    fn force_implies_lifecycle_reset() {
+    fn defaults_do_not_enable_lifecycle_reset_without_explicit_request() {
         let (reap, refresh, reset, repair_registry) =
-            resolve_operation_set(true, false, false, false, false, false);
-        assert!(!reap);
-        assert!(!refresh);
-        assert!(reset);
+            resolve_operation_set(false, false, false, false, false, false);
+        assert!(reap);
+        assert!(refresh);
+        assert!(!reset);
         assert!(!repair_registry);
     }
 
     #[test]
     fn all_flag_enables_everything() {
         let (reap, refresh, reset, repair_registry) =
-            resolve_operation_set(false, false, false, false, false, true);
+            resolve_operation_set(false, false, false, false, true, false);
         assert!(reap);
         assert!(refresh);
         assert!(reset);
@@ -926,7 +938,7 @@ mod tests {
     #[test]
     fn explicit_registry_repair_respects_flag() {
         let (reap, refresh, reset, repair_registry) =
-            resolve_operation_set(false, false, false, false, true, false);
+            resolve_operation_set(false, false, false, true, false, false);
         assert!(!reap);
         assert!(!refresh);
         assert!(!reset);
@@ -934,9 +946,19 @@ mod tests {
     }
 
     #[test]
-    fn recover_summary_reports_registry_repair_operation() {
-        let summary = RecoverSummary {
-            schema: "apm2.fac.recover_summary.v4".to_string(),
+    fn run_state_repair_only_does_not_enable_reap_or_refresh_defaults() {
+        let (reap, refresh, reset, repair_registry) =
+            resolve_operation_set(false, false, false, false, false, true);
+        assert!(!reap);
+        assert!(!refresh);
+        assert!(!reset);
+        assert!(!repair_registry);
+    }
+
+    #[test]
+    fn repair_summary_reports_registry_repair_operation() {
+        let summary = RepairSummary {
+            schema: "apm2.fac.repair_summary.v1".to_string(),
             owner_repo: "example/repo".to_string(),
             pr_number: 444,
             head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1011,6 +1033,36 @@ mod tests {
         assert_eq!(state.status, ReviewRunStatus::Failed);
         assert_eq!(
             state.terminal_reason.as_deref(),
+            Some(TERMINAL_REPAIR_STATE_REBUILT)
+        );
+    }
+
+    #[test]
+    fn repair_run_state_present_with_inconsistent_runtime_handle_rebuilds_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let pr_number = 441;
+        let review_type = "security";
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut state = sample_state(pr_number, review_type, head_sha);
+        state.proc_start_time = None;
+        write_review_run_state_for_home(home, &state).expect("write inconsistent run-state");
+
+        let outcome =
+            repair_run_state_for_review_type(home, "example/repo", pr_number, review_type, None)
+                .expect("repair run-state")
+                .expect("inconsistent run-state should be repaired");
+
+        assert_eq!(outcome.review_type, review_type);
+        assert_eq!(
+            outcome.condition.as_str(),
+            "inconsistent_runtime_handle",
+            "repair outcome must classify inconsistent runtime handle"
+        );
+        assert!(outcome.before.is_some());
+        assert_eq!(outcome.after.status, "failed");
+        assert_eq!(
+            outcome.after.terminal_reason.as_deref(),
             Some(TERMINAL_REPAIR_STATE_REBUILT)
         );
     }

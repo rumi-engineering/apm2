@@ -1,0 +1,210 @@
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00676"
+    title: "apm2-daemon: add OrchestratorKernel SQLite adapter kit (cursor store + intent store + effect journal) with spawn_blocking and refactor gate timeout kernel to use it"
+    status: "OPEN"
+  binds:
+    prd_id: "PRD-PLACEHOLDER"
+    rfc_id: "RFC-0020"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_IMPLEMENTER", "AGENT_REVIEWER"]
+    responsibility_domains: ["DOMAIN_DAEMON", "DOMAIN_RUNTIME", "DOMAIN_DATA"]
+  dependencies:
+    tickets:
+      - id: "TCK-00677"
+        reason: "Adapter kit should implement the finalized orchestrator_kernel trait surface (cursor-generic)."
+
+root_cause_analysis:
+  summary: |
+    The OrchestratorKernel pattern (observe -> plan -> execute -> receipt with durable cursor,
+    durable intent buffer, and idempotent effect journal) is now used in at least one place:
+    the gate timeout kernel (crates/apm2-daemon/src/gate/timeout_kernel.rs).
+
+    However, gate_timeout_kernel currently implements bespoke persistence building blocks:
+      - SqliteTimeoutCursorStore (table: gate_timeout_kernel_cursor)
+      - SqliteTimeoutIntentStore (table: gate_timeout_intents)
+      - GateTimeoutEffectJournal (separate sqlite file gate_timeout_effect_journal.sqlite)
+    and does so with direct rusqlite calls inside async trait methods (no spawn_blocking).
+
+    If we start adopting OrchestratorKernel broadly (FAC review, gate orchestration loops, queue reapers),
+    implementors will clone these bespoke stores, proliferating subtly different schemas and
+    reintroducing blocking-in-async hazards.
+
+    We need one daemon-side "adapter kit" that:
+      - is mechanically extracted from existing patterns (projection intent_buffer is a strong anchor),
+      - centralizes schema and semantics,
+      - is easy to use correctly and hard to bypass.
+
+scope:
+  in_scope:
+    - id: "OK-ADAPT-001"
+      title: "Create daemon-side OrchestratorRuntime SQLite schema + adapters"
+      detail: |
+        Add a new module namespace, e.g.:
+          crates/apm2-daemon/src/orchestrator_runtime/
+            mod.rs
+            sqlite.rs
+            memory.rs
+            AGENTS.md
+
+        Provide a single initialization entrypoint:
+          - fn init_orchestrator_runtime_schema(conn: &Connection) -> Result<(), String>
+
+        Create shared tables (single table per concern, keyed by orchestrator_id):
+          1) Cursor store table:
+             CREATE TABLE IF NOT EXISTS orchestrator_kernel_cursors (
+               orchestrator_id TEXT PRIMARY KEY,
+               cursor_json TEXT NOT NULL,
+               updated_at_ns INTEGER NOT NULL
+             );
+
+          2) Intent store table:
+             CREATE TABLE IF NOT EXISTS orchestrator_kernel_intents (
+               orchestrator_id TEXT NOT NULL,
+               intent_key TEXT NOT NULL,
+               intent_json TEXT NOT NULL,
+               state TEXT NOT NULL CHECK (state IN ('pending','blocked','completed')),
+               created_at_ns INTEGER NOT NULL,
+               updated_at_ns INTEGER NOT NULL,
+               blocked_reason TEXT,
+               PRIMARY KEY(orchestrator_id, intent_key)
+             );
+             CREATE INDEX IF NOT EXISTS ok_intents_pending_idx
+               ON orchestrator_kernel_intents(orchestrator_id, state, created_at_ns, intent_key);
+
+          3) Effect journal table:
+             CREATE TABLE IF NOT EXISTS orchestrator_kernel_effect_journal (
+               orchestrator_id TEXT NOT NULL,
+               intent_key TEXT NOT NULL,
+               state TEXT NOT NULL CHECK (state IN ('started','completed','unknown')),
+               updated_at_ns INTEGER NOT NULL,
+               PRIMARY KEY(orchestrator_id, intent_key)
+             );
+
+        Adapter implementations (must satisfy apm2-core orchestrator_kernel traits):
+          - SqliteCursorStore<C: KernelCursor>
+              * load_cursor() -> Option<C> from cursor_json (serde_json)
+              * store_cursor(&C)
+          - SqliteIntentStore<I: Serialize+DeserializeOwned + Send + Sync + 'static>
+              * enqueue_many(&[I]) idempotent (INSERT OR IGNORE)
+              * dequeue_batch(limit) returns pending intents ordered by created_at_ns, intent_key
+              * mark_done / mark_blocked / mark_retryable with correct state transitions
+              * mark_retryable MUST move intent "to the back" by setting created_at_ns = now
+                (preserve existing semantics relied on by current tests).
+          - SqliteEffectJournal<K: ToString + ...> keyed by intent_key string
+              * query_state / record_started / record_completed / record_retryable
+              * resolve_in_doubt MUST fail-closed (Deny with reason) unless domain-specific reconciliation exists.
+
+        Async correctness requirement:
+          - Every rusqlite operation in these adapters MUST be performed in spawn_blocking.
+          - The adapters should expose only async methods to callers so they cannot accidentally
+            call blocking operations on the tokio executor.
+
+    - id: "OK-ADAPT-002"
+      title: "Provide memory adapters for deterministic unit tests"
+      detail: |
+        Provide MemoryCursorStore, MemoryIntentStore, MemoryEffectJournal implementing the same traits,
+        and add conformance tests that compare behavior with sqlite adapters (state transitions, ordering,
+        idempotent enqueue, retryable moves-to-back).
+
+    - id: "OK-ADAPT-003"
+      title: "Refactor gate timeout kernel to use orchestrator_runtime adapters"
+      detail: |
+        Update crates/apm2-daemon/src/gate/timeout_kernel.rs to remove:
+          - SqliteTimeoutCursorStore / MemoryTimeoutCursorStore
+          - SqliteTimeoutIntentStore / MemoryTimeoutIntentStore
+          - GateTimeoutEffectJournal (and gate_timeout_effect_journal.sqlite file usage)
+
+        Replace them with orchestrator_runtime adapters:
+          - Orchestrator ID constant: "gate_timeout_kernel"
+          - Cursor store uses shared orchestrator_kernel_cursors table
+          - Intent store uses shared orchestrator_kernel_intents table
+          - Effect journal uses shared orchestrator_kernel_effect_journal table
+
+        Migration strategy (must be safe and idempotent):
+          - If legacy tables/files exist (gate_timeout_kernel_cursor, gate_timeout_intents,
+            gate_timeout_effect_journal.sqlite), migrate their rows into the shared tables on startup
+            *once* (only if shared tables have no rows for orchestrator_id).
+          - After successful migration, either:
+              A) leave legacy artifacts in place but unused, OR
+              B) rename legacy artifacts to *.migrated (preferred for clarity) to prevent accidental reuse.
+          - Migration must not emit duplicate receipts. Prefer conservative migration:
+              - For effect journal: treat unknown/started as Unknown (fail-closed) in new table.
+
+        Ensure tests in timeout_kernel.rs are updated to target the new adapters.
+
+    - id: "OK-ADAPT-004"
+      title: "Documentation + enforcement against per-orchestrator sqlite tables"
+      detail: |
+        Documentation:
+          - Add crates/apm2-daemon/src/orchestrator_runtime/AGENTS.md explaining:
+              * what the adapter kit provides,
+              * required table schema (single shared tables),
+              * how to instantiate stores with orchestrator_id,
+              * spawn_blocking requirement for rusqlite in async.
+
+        Enforcement:
+          - Update code-quality reviewer prompt (or via TCK-00678) with an invariant:
+              "If a PR introduces a new orchestrator kernel consumer, it MUST use orchestrator_runtime
+               adapters for cursor/intent/effect journal. New per-orchestrator tables for these
+               concerns are a MAJOR finding."
+          - Provide reviewer checklist + greppable triggers:
+              * "CREATE TABLE IF NOT EXISTS .*_cursor"
+              * "CREATE TABLE IF NOT EXISTS .*_intent"
+              * "effect_journal_state"
+              * "Connection::open(" used to create new sqlite files for effect journal
+
+  out_of_scope:
+    - Porting FAC review or other orchestrators onto the kernel (follow-on tickets).
+    - Building a generic workflow engine beyond the kernel adapters.
+    - Changing domain-specific state stores (e.g., observed leases) that are not kernel-generic.
+
+implementation_notes:
+  critical_structural_boundaries:
+    - id: "IMPL-OK-ADAPT-01"
+      title: "Do not block the tokio runtime"
+      detail: |
+        The adapter kit exists in part to prevent the existing anti-pattern:
+          async fn ... { rusqlite query ... } // blocking on executor
+        All adapters must use spawn_blocking internally.
+    - id: "IMPL-OK-ADAPT-02"
+      title: "Orchestrator ID is part of the durability boundary"
+      detail: |
+        Orchestrator ID must be a stable constant; changing it loses cursor and intent durability.
+        Document this as an invariant in AGENTS.md and in code comments.
+
+documentation_and_enforcement:
+  documentation_deliverables:
+    - "New orchestrator_runtime/AGENTS.md with usage examples and invariants."
+    - "Update gate timeout kernel comments to point to orchestrator_runtime adapters."
+  enforcement_deliverables:
+    - "Code-quality reviewer invariant updated to forbid per-orchestrator cursor/intent/effect journal stores."
+    - "Safe-patterns doc updated with 'OrchestratorKernel Storage Kit' pattern."
+
+plan:
+  steps:
+    - "Create orchestrator_runtime module with sqlite schema init + adapters."
+    - "Implement memory adapters and conformance tests."
+    - "Implement migration from legacy gate_timeout_* artifacts to shared tables."
+    - "Refactor GateTimeoutKernel::new to use orchestrator_runtime stores and remove gate_timeout_effect_journal.sqlite usage."
+    - "Update/replace existing timeout_kernel tests to cover new adapters and migration behavior."
+    - "Write documentation + add reviewer enforcement artifacts."
+
+definition_of_done:
+  criteria:
+    - "Gate timeout kernel uses orchestrator_runtime adapters for cursor/intent/effect journal."
+    - "No rusqlite operations remain on async paths without spawn_blocking in these adapters."
+    - "Conformance tests exist for sqlite vs memory store semantics (enqueue idempotency, dequeue ordering, retryable move-to-back, state transitions)."
+    - "Migration from legacy artifacts is safe, idempotent, and documented."
+    - "Docs and reviewer enforcement guidance exist to prevent reintroduction of per-orchestrator kernel tables."
+
+risks:
+  - id: "R-OK-ADAPT-01"
+    title: "Schema migration could inadvertently drop pending intents or effect states"
+    mitigation: |
+      Use additive migration: copy into new tables only when the new tables are empty for the orchestrator_id.
+      Never delete old artifacts automatically in the first iteration; prefer rename to *.migrated after successful copy.

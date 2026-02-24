@@ -7,7 +7,7 @@
 //! - Pulse-file based SHA freshness checks and resume flow
 //! - Liveness-based stall detection and bounded model fallback
 //! - Idempotent detached dispatch + projection snapshots for GitHub surfaces
-//! - Intelligent pipeline restart (`apm2 fac restart`) with CI state analysis
+//! - Doctor-first remediation and CI state analysis
 
 mod backend;
 #[cfg(test)]
@@ -44,13 +44,14 @@ mod projection_store;
 mod push;
 mod readiness;
 mod recovery;
-mod restart;
+mod repair_cycle;
 mod state;
 mod target;
 mod timeout_policy;
 mod types;
 mod verdict_projection;
 
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -65,16 +66,12 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 // Re-export public API for use by `fac.rs`
 use dispatch::dispatch_single_review_with_force;
 use events::review_events_path;
-pub use finding::{
-    ReviewFindingSeverityArg as ReviewCommentSeverityArg, ReviewFindingSeverityArg,
-    ReviewFindingTypeArg as ReviewCommentTypeArg, ReviewFindingTypeArg,
-};
+pub use finding::{ReviewFindingSeverityArg, ReviewFindingTypeArg};
 pub use gates::GateThroughputProfile;
 pub use lifecycle::VerdictValueArg;
 use serde::Serialize;
 use state::{
-    list_review_pr_numbers, load_review_run_state, load_review_run_state_strict, read_pulse_file,
-    review_run_state_path,
+    load_review_run_state, load_review_run_state_strict, read_pulse_file, review_run_state_path,
 };
 pub use types::ReviewRunType;
 use types::{
@@ -82,6 +79,7 @@ use types::{
     TERMINATE_TIMEOUT, validate_expected_head_sha,
 };
 
+use crate::client::protocol::OperatorClient;
 use crate::exit_codes::codes as exit_codes;
 
 const DOCTOR_SCHEMA: &str = "apm2.fac.review.doctor.v1";
@@ -109,18 +107,33 @@ const DOCTOR_LOG_SCAN_CHUNK_BYTES: usize = 8 * 1024;
 const DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS: i64 = 300;
 const DOCTOR_DISPATCH_PENDING_WARNING_SECONDS: i64 = 120;
 const DOCTOR_WAIT_TIMEOUT_DEFAULT_SECONDS: u64 = 1200;
+const DOCTOR_WAIT_POLL_INTERVAL_SECONDS: u64 = 1;
+const DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS: u64 = 1000;
+const DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS: u64 = 15;
+const DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC: u32 = 24;
+const DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN: usize = 64;
+const DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY: usize = 512;
+const DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS: usize = 3;
+const DOCTOR_WAIT_PULSE_RECONNECT_BACKOFF_MILLIS: u64 = 250;
 const DOCTOR_WAIT_TIMEOUT_EXIT_CODE: u8 = 2;
 const DOCTOR_FIX_MAX_PASSES: usize = 3;
 const FAC_REVIEW_MACHINE_TRACEABILITY_SCHEMA: &str = "apm2.fac.review.machine_traceability.v1";
 const FAC_REVIEW_MACHINE_REQUIREMENT_IDS: &[&str] = &[
     "DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR",
-    "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+    "DR-002-RUNNING_GATE_SUPPRESSES_FIX",
     "DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY",
     "DR-004-DOCTOR_RULE_ORDER_IS_STRICT",
     "DR-005-WAIT_RETURNS_ON_TERMINAL_ACTION",
     "DR-006-EVERGREEN_CAC_STATE_MACHINE_SOURCE",
     "DR-007-CLI_EXIT_ON_ACTION_SET_IS_CANONICAL",
     "DR-008-MACHINE_VERIFIABLE_ARTIFACTS",
+    "DRA-001",
+    "DRA-002",
+    "DRA-003",
+    "DRA-004",
+    "DRA-005",
+    "DRA-006",
+    "DRA-007",
 ];
 const FAC_REVIEW_MACHINE_REQUIREMENT_DR006_ARTIFACT_REFS: &[&str] = &[
     "documents/reviews/fac_review_state_machine.cac.json",
@@ -132,6 +145,7 @@ const FAC_REVIEW_MACHINE_REQUIREMENT_DR007_ARTIFACT_REFS: &[&str] = &[
 ];
 const FAC_REVIEW_MACHINE_REQUIREMENT_DR008_ARTIFACT_REFS: &[&str] =
     &["documents/reviews/fac_review_state_machine.cac.json"];
+const DOCTOR_WAIT_PULSE_TOPICS: &[&str] = &["work.>", "work_graph.>", "gate.>", "ledger.head"];
 
 #[derive(Debug, Serialize)]
 struct DoctorHealthItem {
@@ -160,6 +174,7 @@ struct DoctorLifecycleSnapshot {
     retry_budget_remaining: u32,
     updated_at: String,
     last_event_seq: u64,
+    lifecycle_sha: String, // DRA-004: emitted for SHA-alignment auditability
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +233,33 @@ enum DoctorWaitState {
     PollEmit,
     Sleep,
     CollectSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorWaitMode {
+    PulsePrimary,
+    PollingFallback,
+}
+
+impl DoctorWaitMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PulsePrimary => "pulse_primary",
+            Self::PollingFallback => "polling_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorWaitWakeReason {
+    Pulse,
+    Timer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorWaitLoopControl {
+    Exit(u8),
+    Fallback { next_tick: u64, reason: String },
 }
 
 impl DoctorWaitState {
@@ -356,6 +398,10 @@ pub struct DoctorRecommendedAction {
     pub priority: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip)]
+    pub follow_up_fix: bool,
+    #[serde(skip)]
+    pub follow_up_force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,12 +420,16 @@ enum DoctorRunStateCondition {
     Missing,
     Corrupt,
     Ambiguous,
+    InconsistentRuntimeHandle,
     Unavailable,
 }
 
 impl DoctorRunStateCondition {
     const fn requires_repair(self) -> bool {
-        matches!(self, Self::Corrupt | Self::Ambiguous)
+        matches!(
+            self,
+            Self::Corrupt | Self::Ambiguous | Self::InconsistentRuntimeHandle
+        )
     }
 }
 
@@ -420,7 +470,7 @@ struct DoctorRepairSignals {
     agent_registry_capacity_exceeded: bool,
     dead_active_agent_present: bool,
     run_state_repair_required: bool,
-    run_state_force_repair_required: bool,
+    projection_comment_binding_missing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -437,6 +487,7 @@ struct DoctorPrSummary {
     worktree_status: DoctorWorktreeStatus,
     github_projection: DoctorGithubProjectionStatus,
     recommended_action: DoctorRecommendedAction,
+    gate_failure_signal: DoctorGateFailureSignal,
     agents: Option<DoctorAgentSection>,
     run_state_diagnostics: Vec<DoctorRunStateDiagnostic>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -449,6 +500,7 @@ struct DoctorPrSummary {
 
 struct DoctorActionInputs<'a> {
     pr_number: u32,
+    authoritative_sha: &'a str,
     repair_signals: &'a DoctorRepairSignals,
     lifecycle: Option<&'a DoctorLifecycleSnapshot>,
     gates: &'a [DoctorGateSnapshot],
@@ -466,6 +518,7 @@ pub struct DoctorTrackedPrSummary {
     pub owner_repo: String,
     pub lifecycle_state: String,
     pub recommended_action: DoctorRecommendedAction,
+    pub gate_failure_signal: DoctorGateFailureSignal,
     pub active_agents: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_seconds_ago: Option<i64>,
@@ -597,14 +650,14 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "test_build_recommended_action_dispatches_implementor_on_failed_gates_with_pending_verdicts",
                 "test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed",
                 "test_build_recommended_action_dispatches_implementor_when_push_attempt_failed_gate_stage",
-                "test_build_recommended_action_gate_failure_overrides_stale_identity_restart",
+                "test_build_recommended_action_gate_failure_overrides_stale_identity_fix",
                 "upsert_doctor_gate_snapshot_prefers_failed_over_inflight",
                 "derive_doctor_gate_progress_state_treats_lifecycle_gates_failed_as_terminal_failed",
                 "test_build_recommended_action_dispatch_implementor_has_command"
             ]
         }),
         serde_json::json!({
-            "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_RESTART",
+            "requirement_id": "DR-002-RUNNING_GATE_SUPPRESSES_FIX",
             "implemented_by": [
                 "derive_doctor_gate_progress_state",
                 "DoctorDecisionState::WaitForGates"
@@ -653,6 +706,58 @@ pub fn fac_review_machine_spec_json() -> serde_json::Value {
                 "doctor_wait_machine_exits_on_interrupt_when_action_is_not_terminal",
                 "doctor_wait_machine_exits_on_timeout_when_not_interrupted"
             ]
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-001",
+            "implemented_by": [
+                "DoctorDecisionFacts::from_input",
+                "DoctorGateFailureSignal"
+            ],
+            "regression_tests": [
+                "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+            ]
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-002",
+            "implemented_by": [
+                "DoctorDecisionGuard::ShaFreshnessStale",
+                "DoctorDecisionGuard::ApproveEligible"
+            ],
+            "regression_tests": []
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-003",
+            "implemented_by": [
+                "DoctorDecisionGuard::GateFailureSignal"
+            ],
+            "regression_tests": []
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-004",
+            "implemented_by": [
+                "DoctorPrSummary::gate_failure_signal",
+                "DoctorTrackedPrSummary::gate_failure_signal"
+            ],
+            "regression_tests": []
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-005",
+            "implemented_by": [
+                "DoctorDecisionFacts::from_input"
+            ],
+            "regression_tests": [
+                "test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale"
+            ]
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-006",
+            "implemented_by": [],
+            "regression_tests": []
+        }),
+        serde_json::json!({
+            "requirement_id": "DRA-007",
+            "implemented_by": [],
+            "regression_tests": []
         }),
     ];
 
@@ -1253,68 +1358,468 @@ fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     }
 }
 
-fn emit_run_ndjson_since(
-    offset: u64,
-    pr_number: u32,
-    run_ids: &[String],
-    to_stderr: bool,
-) -> Result<(), String> {
-    let path = review_events_path()?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut file =
-        File::open(&path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|err| format!("failed to seek {}: {err}", path.display()))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+#[derive(Debug, Clone, Default)]
+struct DoctorPulseMetadata {
+    pulse_id: Option<String>,
+    topic: Option<String>,
+    event_type: Option<String>,
+    ledger_cursor: Option<u64>,
+}
 
-    for line in buf.lines() {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let matches_pr = parsed
-            .get("pr_number")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|value| value == u64::from(pr_number));
-        if !matches_pr {
-            continue;
-        }
-        if run_ids.is_empty() {
-            if to_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
-            }
-            continue;
-        }
-        let run_id = parsed.get("run_id").and_then(serde_json::Value::as_str);
-        if run_id.is_some_and(|id| run_ids.iter().any(|candidate| candidate == id)) {
-            if to_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
-            }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DoctorPulseFingerprint {
+    pulse_id: Option<String>,
+    ledger_cursor: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DoctorPulseDeduper {
+    capacity: usize,
+    entries: VecDeque<DoctorPulseFingerprint>,
+    index: HashSet<DoctorPulseFingerprint>,
+}
+
+impl DoctorPulseDeduper {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: VecDeque::new(),
+            index: HashSet::new(),
         }
     }
-    Ok(())
+
+    fn insert_if_new(&mut self, pulse: &DoctorPulseMetadata) -> bool {
+        let Some(fingerprint) = pulse.fingerprint() else {
+            return true;
+        };
+        if self.index.contains(&fingerprint) {
+            return false;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self.entries.pop_front()
+        {
+            self.index.remove(&oldest);
+        }
+        self.index.insert(fingerprint.clone());
+        self.entries.push_back(fingerprint);
+        true
+    }
+}
+
+impl DoctorPulseMetadata {
+    fn fingerprint(&self) -> Option<DoctorPulseFingerprint> {
+        if self.pulse_id.is_none() && self.ledger_cursor.is_none() {
+            return None;
+        }
+        Some(DoctorPulseFingerprint {
+            pulse_id: self.pulse_id.clone(),
+            ledger_cursor: self.ledger_cursor,
+        })
+    }
+}
+
+struct DoctorPulseSubscription {
+    runtime: tokio::runtime::Runtime,
+    client: OperatorClient,
+    subscription_id: String,
+    operator_socket: PathBuf,
+    client_sub_id: String,
+    topic_patterns: Vec<String>,
+    since_ledger_cursor: u64,
+}
+
+impl DoctorPulseSubscription {
+    fn connect(
+        operator_socket: &Path,
+        repo: &str,
+        pr_number: u32,
+    ) -> Result<(Self, usize, usize), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to build pulse runtime: {err}"))?;
+
+        let topic_patterns = doctor_wait_pulse_topic_patterns();
+        let client_sub_id = build_doctor_pulse_client_sub_id(repo, pr_number);
+        let (client, response) = runtime.block_on(async {
+            let mut client = OperatorClient::connect(operator_socket)
+                .await
+                .map_err(|err| format!("operator pulse connect failed: {err}"))?;
+            let response = client
+                .subscribe_pulse(
+                    &client_sub_id,
+                    &topic_patterns,
+                    0,
+                    DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC,
+                )
+                .await
+                .map_err(|err| format!("operator pulse subscribe failed: {err}"))?;
+            Ok::<_, String>((client, response))
+        })?;
+
+        let accepted_count = response.accepted_patterns.len();
+        let rejected_count = response.rejected_patterns.len();
+
+        let mut subscription = Self {
+            runtime,
+            client,
+            subscription_id: response.subscription_id,
+            operator_socket: operator_socket.to_path_buf(),
+            client_sub_id,
+            topic_patterns,
+            since_ledger_cursor: response.effective_since_cursor,
+        };
+        if accepted_count == 0 {
+            let _ = subscription.close();
+            return Err("pulse subscription accepted no patterns".to_string());
+        }
+
+        Ok((subscription, accepted_count, rejected_count))
+    }
+
+    fn wait_for_pulse(&mut self, timeout: Duration) -> Result<Option<DoctorPulseMetadata>, String> {
+        let pulse = self
+            .runtime
+            .block_on(async { self.client.wait_for_pulse(timeout).await })
+            .map_err(|err| format!("pulse wait failed: {err}"))?;
+        let Some(event) = pulse else {
+            return Ok(None);
+        };
+
+        let mut metadata = DoctorPulseMetadata::default();
+        if let Some(envelope) = event.envelope {
+            self.since_ledger_cursor = self.since_ledger_cursor.max(envelope.ledger_cursor);
+            metadata.pulse_id = (!envelope.pulse_id.is_empty()).then_some(envelope.pulse_id);
+            metadata.topic = (!envelope.topic.is_empty()).then_some(envelope.topic);
+            metadata.event_type = (!envelope.event_type.is_empty()).then_some(envelope.event_type);
+            metadata.ledger_cursor = Some(envelope.ledger_cursor);
+        }
+        Ok(Some(metadata))
+    }
+
+    fn reconnect(&mut self) -> Result<(usize, usize), String> {
+        let _ = self.close();
+
+        let operator_socket = self.operator_socket.clone();
+        let client_sub_id = self.client_sub_id.clone();
+        let topic_patterns = self.topic_patterns.clone();
+        let since_ledger_cursor = self.since_ledger_cursor;
+
+        let (client, response) = self.runtime.block_on(async move {
+            let mut client = OperatorClient::connect(&operator_socket)
+                .await
+                .map_err(|err| format!("operator pulse reconnect failed: {err}"))?;
+            let response = client
+                .subscribe_pulse(
+                    &client_sub_id,
+                    &topic_patterns,
+                    since_ledger_cursor,
+                    DOCTOR_WAIT_PULSE_MAX_PULSES_PER_SEC,
+                )
+                .await
+                .map_err(|err| format!("operator pulse resubscribe failed: {err}"))?;
+            Ok::<_, String>((client, response))
+        })?;
+
+        let accepted_count = response.accepted_patterns.len();
+        let rejected_count = response.rejected_patterns.len();
+        if accepted_count == 0 {
+            return Err("pulse reconnect accepted no patterns".to_string());
+        }
+
+        self.client = client;
+        self.subscription_id = response.subscription_id;
+        self.since_ledger_cursor = self
+            .since_ledger_cursor
+            .max(response.effective_since_cursor);
+        Ok((accepted_count, rejected_count))
+    }
+
+    fn close(&mut self) -> Result<bool, String> {
+        let subscription_id = self.subscription_id.clone();
+        let response = self
+            .runtime
+            .block_on(async { self.client.unsubscribe_pulse(&subscription_id).await })
+            .map_err(|err| format!("failed to unsubscribe pulse subscription: {err}"))?;
+        Ok(response.removed)
+    }
+}
+
+fn doctor_wait_pulse_topic_patterns() -> Vec<String> {
+    DOCTOR_WAIT_PULSE_TOPICS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn build_doctor_pulse_client_sub_id(repo: &str, pr_number: u32) -> String {
+    let prefix = format!("fac-doctor-pr{pr_number}-");
+    let mut sanitized = String::with_capacity(repo.len());
+    for ch in repo.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    let sanitized = sanitized.trim_matches('-');
+    let repo_part = if sanitized.is_empty() {
+        "repo"
+    } else {
+        sanitized
+    };
+
+    let remaining = DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN.saturating_sub(prefix.len());
+    let trimmed_repo = repo_part.chars().take(remaining.max(1)).collect::<String>();
+    format!("{prefix}{trimmed_repo}")
+}
+
+const fn doctor_wait_should_collect_summary(
+    mode: DoctorWaitMode,
+    wake_reason: DoctorWaitWakeReason,
+    timer_backstop_due: bool,
+) -> bool {
+    match mode {
+        DoctorWaitMode::PulsePrimary => {
+            matches!(wake_reason, DoctorWaitWakeReason::Pulse) || timer_backstop_due
+        },
+        DoctorWaitMode::PollingFallback => true,
+    }
+}
+
+fn emit_doctor_wait_degraded_mode_event(json_output: bool, pr_number: u32, reason: &str) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_degraded".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "from_mode": DoctorWaitMode::PulsePrimary.as_str(),
+                "to_mode": DoctorWaitMode::PollingFallback.as_str(),
+                "reason": reason,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait degraded event: {err}");
+        }
+    } else {
+        eprintln!("doctor wait: degraded to polling fallback for PR #{pr_number}: {reason}");
+    }
+}
+
+fn emit_doctor_pulse_subscribed_event(
+    json_output: bool,
+    pr_number: u32,
+    accepted_count: usize,
+    rejected_count: usize,
+    since_ledger_cursor: u64,
+    reconnect_attempt: Option<usize>,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_subscribed".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "accepted_patterns": accepted_count,
+                "rejected_patterns": rejected_count,
+                "since_ledger_cursor": since_ledger_cursor,
+                "reconnect_attempt": reconnect_attempt,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse subscribe event: {err}");
+        }
+    } else if let Some(attempt) = reconnect_attempt {
+        eprintln!(
+            "doctor wait: pulse reconnected on attempt {attempt} (accepted_patterns={accepted_count}, rejected_patterns={rejected_count}, since_cursor={since_ledger_cursor})"
+        );
+    } else {
+        eprintln!(
+            "doctor wait: pulse subscription active (accepted_patterns={accepted_count}, rejected_patterns={rejected_count}, since_cursor={since_ledger_cursor})"
+        );
+    }
+}
+
+fn emit_doctor_pulse_reconnect_event(
+    json_output: bool,
+    pr_number: u32,
+    attempt: usize,
+    outcome: &str,
+    reason: &str,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_reconnect".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "attempt": attempt,
+                "outcome": outcome,
+                "reason": reason,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse reconnect event: {err}");
+        }
+    } else {
+        eprintln!(
+            "doctor wait: pulse reconnect attempt {attempt} outcome={outcome} reason={reason}"
+        );
+    }
+}
+
+fn emit_doctor_pulse_skipped_event(
+    json_output: bool,
+    pr_number: u32,
+    reason: &str,
+    pulse: &DoctorPulseMetadata,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_pulse_skipped".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "pr_number": pr_number,
+                "reason": reason,
+                "pulse_id": pulse.pulse_id,
+                "topic": pulse.topic,
+                "event_type": pulse.event_type,
+                "ledger_cursor": pulse.ledger_cursor,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor pulse skipped event: {err}");
+        }
+    }
+}
+
+fn emit_doctor_wait_timer_backstop_event(
+    json_output: bool,
+    pr_number: u32,
+    tick: u64,
+    elapsed_seconds: u64,
+) {
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_timer_backstop".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "tick": tick,
+                "pr_number": pr_number,
+                "elapsed_seconds": elapsed_seconds,
+                "interval_seconds": DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait timer backstop event: {err}");
+        }
+    } else {
+        eprintln!("doctor wait: timer backstop tick={tick} elapsed={elapsed_seconds}s");
+    }
+}
+
+fn doctor_wait_pulse_is_relevant(pulse: &DoctorPulseMetadata) -> bool {
+    if let Some(topic) = pulse.topic.as_deref()
+        && (topic == "ledger.head"
+            || topic.starts_with("work.")
+            || topic.starts_with("work_graph.")
+            || topic.starts_with("gate."))
+    {
+        return true;
+    }
+
+    let Some(event_type) = pulse.event_type.as_deref() else {
+        return false;
+    };
+    let normalized = event_type.to_ascii_lowercase();
+    normalized.starts_with("work.")
+        || normalized.starts_with("work_graph.")
+        || normalized.starts_with("gate.")
+        || matches!(
+            normalized.as_str(),
+            "ledger.head"
+                | "kernelevent"
+                | "workopened"
+                | "worktransitioned"
+                | "workedgeadded"
+                | "workedgeremoved"
+                | "workedgewaived"
+                | "gatereceipt"
+        )
+}
+
+fn close_doctor_pulse_subscription(subscription: &mut DoctorPulseSubscription) {
+    match subscription.close() {
+        Ok(true) => {},
+        Ok(false) => {
+            eprintln!("WARNING: pulse subscription close returned removed=false");
+        },
+        Err(err) => {
+            eprintln!("WARNING: failed to unsubscribe pulse subscription: {err}");
+        },
+    }
+}
+
+fn attempt_doctor_pulse_reconnect(
+    pulse_subscription: &mut DoctorPulseSubscription,
+    json_output: bool,
+    pr_number: u32,
+    wait_error: &str,
+) -> Result<(), String> {
+    let mut last_error = wait_error.to_string();
+    for attempt in 1..=DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS {
+        let delay = Duration::from_millis(
+            DOCTOR_WAIT_PULSE_RECONNECT_BACKOFF_MILLIS.saturating_mul(attempt as u64),
+        );
+        thread::sleep(delay);
+
+        match pulse_subscription.reconnect() {
+            Ok((accepted_count, rejected_count)) => {
+                emit_doctor_pulse_subscribed_event(
+                    json_output,
+                    pr_number,
+                    accepted_count,
+                    rejected_count,
+                    pulse_subscription.since_ledger_cursor,
+                    Some(attempt),
+                );
+                emit_doctor_pulse_reconnect_event(
+                    json_output,
+                    pr_number,
+                    attempt,
+                    "recovered",
+                    wait_error,
+                );
+                return Ok(());
+            },
+            Err(err) => {
+                emit_doctor_pulse_reconnect_event(
+                    json_output,
+                    pr_number,
+                    attempt,
+                    "retry_failed",
+                    &err,
+                );
+                last_error = err;
+            },
+        }
+    }
+
+    Err(format!(
+        "{wait_error}; reconnect exhausted after {DOCTOR_WAIT_PULSE_RECONNECT_MAX_ATTEMPTS} attempts: {last_error}"
+    ))
 }
 
 /// Run doctor diagnostics for a specific PR.
 ///
-/// Doctor remains machine-oriented by default. In wait mode, JSON output
-/// streams NDJSON heartbeats plus a final result event; text mode prints
-/// periodic status lines to stderr and emits the final summary JSON to stdout.
+/// Doctor is machine-oriented by default. In wait mode, output streams NDJSON
+/// heartbeats plus a terminal result event.
 #[allow(clippy::too_many_arguments)]
 pub fn run_doctor(
     repo: &str,
     pr_number: u32,
+    operator_socket: &Path,
     fix: bool,
     json_output: bool,
     wait_for_recommended_action: bool,
-    poll_interval_seconds: u64,
     wait_timeout_seconds: u64,
     exit_on: &[String],
 ) -> u8 {
@@ -1324,10 +1829,17 @@ pub fn run_doctor(
         for pass in 1..=DOCTOR_FIX_MAX_PASSES {
             let pre_repair = run_doctor_inner(repo, pr_number, Vec::new(), false);
             let plan = derive_doctor_repair_plan(&pre_repair);
-            if !plan.has_operations() {
+            let pre_follow_up_fix = doctor_recommended_action_requests_follow_up_fix(&pre_repair);
+            let pre_follow_up_force = doctor_recommended_follow_up_fix_force(&pre_repair);
+            if !plan.has_operations() && !pre_follow_up_fix {
                 break;
             }
-            let plan_fingerprint = plan.fingerprint();
+            let plan_fingerprint = format!(
+                "{} follow_up_fix={} follow_up_force={}",
+                plan.fingerprint(),
+                pre_follow_up_fix,
+                pre_follow_up_force
+            );
             if !attempted_plan_fingerprints.insert(plan_fingerprint.clone()) {
                 let err = format!(
                     "doctor fix did not converge for PR #{pr_number}; repeated repair plan `{plan_fingerprint}`"
@@ -1338,96 +1850,83 @@ pub fn run_doctor(
                 return exit_codes::GENERIC_ERROR;
             }
 
-            let force_repair = doctor_requires_force_repair(&pre_repair);
-            match recovery::run_repair_plan(
-                repo,
-                Some(pr_number),
-                force_repair,
-                plan.refresh_identity,
-                plan.reap_stale_agents,
-                plan.reset_lifecycle,
-                plan.repair_registry_integrity,
-                false,
-                plan.run_state_review_types,
-            ) {
-                Ok(summary) => {
-                    let mut doctor_repairs = summary.into_doctor_repairs();
-                    repairs_applied.append(&mut doctor_repairs);
-
-                    let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                    if doctor_recommended_action_requests_restart(&post_repair) {
-                        let force_restart = doctor_recommended_restart_force(&post_repair);
-                        match restart::run_restart_for_doctor_fix(
-                            repo,
-                            pr_number,
-                            force_restart,
-                            true,
-                        ) {
-                            Ok(restart_summary) => {
-                                let dispatched_count = restart_summary
-                                    .reviews_dispatched
-                                    .as_ref()
-                                    .map_or(0, Vec::len);
-                                repairs_applied.push(DoctorRepairApplied {
-                                    operation: "restart_reviews".to_string(),
-                                    before: Some(format!(
-                                        "force={force_restart} reason={}",
-                                        post_repair.recommended_action.reason
-                                    )),
-                                    after: Some(format!(
-                                        "strategy={} evidence_passed={} dispatched_reviews={}",
-                                        restart_summary.strategy.label(),
-                                        restart_summary.evidence_passed.map_or_else(
-                                            || "none".to_string(),
-                                            |passed| { passed.to_string() }
-                                        ),
-                                        dispatched_count
-                                    )),
-                                });
-                            },
-                            Err(err) => {
-                                if let Err(emit_err) =
-                                    jsonl::emit_json_error("fac_doctor_fix_restart_failed", &err)
-                                {
-                                    eprintln!(
-                                        "WARNING: failed to emit doctor fix restart error: {emit_err}"
-                                    );
-                                }
-                                return exit_codes::GENERIC_ERROR;
-                            },
+            if plan.has_operations() {
+                let force_repair = doctor_requires_force_repair(&pre_repair);
+                match recovery::run_repair_plan(
+                    repo,
+                    Some(pr_number),
+                    force_repair,
+                    plan.refresh_identity,
+                    plan.reap_stale_agents,
+                    plan.reset_lifecycle,
+                    plan.repair_registry_integrity,
+                    false,
+                    plan.run_state_review_types,
+                ) {
+                    Ok(summary) => {
+                        let mut doctor_repairs = summary.into_doctor_repairs();
+                        repairs_applied.append(&mut doctor_repairs);
+                    },
+                    Err(err) => {
+                        if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err)
+                        {
+                            eprintln!("WARNING: failed to emit doctor fix error: {emit_err}");
                         }
-                    }
+                        return exit_codes::GENERIC_ERROR;
+                    },
+                }
 
-                    let follow_up = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                    if follow_up.recommended_action.action != "fix" {
-                        break;
-                    }
-                    let follow_up_plan = derive_doctor_repair_plan(&follow_up);
-                    if !follow_up_plan.has_operations() {
-                        break;
-                    }
-                    if pass == DOCTOR_FIX_MAX_PASSES {
-                        let err = format!(
-                            "doctor fix exhausted {DOCTOR_FIX_MAX_PASSES} passes for PR #{pr_number} \
-                             while additional repair operations remain (`{}`)",
-                            follow_up_plan.fingerprint()
-                        );
+                let post_repair = run_doctor_inner(repo, pr_number, Vec::new(), true);
+                match run_doctor_follow_up_repair(repo, pr_number, &post_repair) {
+                    Ok(Some(repair)) => repairs_applied.push(repair),
+                    Ok(None) => {},
+                    Err(err) => {
                         if let Err(emit_err) =
-                            jsonl::emit_json_error("fac_doctor_fix_incomplete", &err)
+                            jsonl::emit_json_error("fac_doctor_fix_follow_up_failed", &err)
                         {
                             eprintln!(
-                                "WARNING: failed to emit doctor fix max-pass error: {emit_err}"
+                                "WARNING: failed to emit doctor fix follow-up error: {emit_err}"
                             );
                         }
                         return exit_codes::GENERIC_ERROR;
-                    }
-                },
-                Err(err) => {
-                    if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_failed", &err) {
-                        eprintln!("WARNING: failed to emit doctor fix error: {emit_err}");
-                    }
-                    return exit_codes::GENERIC_ERROR;
-                },
+                    },
+                }
+            } else {
+                match run_doctor_follow_up_repair(repo, pr_number, &pre_repair) {
+                    Ok(Some(repair)) => repairs_applied.push(repair),
+                    Ok(None) => {},
+                    Err(err) => {
+                        if let Err(emit_err) =
+                            jsonl::emit_json_error("fac_doctor_fix_follow_up_failed", &err)
+                        {
+                            eprintln!(
+                                "WARNING: failed to emit doctor fix follow-up error: {emit_err}"
+                            );
+                        }
+                        return exit_codes::GENERIC_ERROR;
+                    },
+                }
+            }
+
+            let follow_up = run_doctor_inner(repo, pr_number, Vec::new(), true);
+            if follow_up.recommended_action.action != "fix" {
+                break;
+            }
+            let follow_up_plan = derive_doctor_repair_plan(&follow_up);
+            let follow_up_fix = doctor_recommended_action_requests_follow_up_fix(&follow_up);
+            if !follow_up_plan.has_operations() && !follow_up_fix {
+                break;
+            }
+            if pass == DOCTOR_FIX_MAX_PASSES {
+                let err = format!(
+                    "doctor fix exhausted {DOCTOR_FIX_MAX_PASSES} passes for PR #{pr_number} \
+                     while additional repair operations remain (`{}`) follow_up_fix={follow_up_fix}",
+                    follow_up_plan.fingerprint()
+                );
+                if let Err(emit_err) = jsonl::emit_json_error("fac_doctor_fix_incomplete", &err) {
+                    eprintln!("WARNING: failed to emit doctor fix max-pass error: {emit_err}");
+                }
+                return exit_codes::GENERIC_ERROR;
             }
         }
     }
@@ -1478,39 +1977,304 @@ pub fn run_doctor(
     };
     interrupted.store(false, Ordering::SeqCst);
 
-    let poll_interval = Duration::from_secs(poll_interval_seconds.max(1));
     let started = Instant::now();
     let mut tick = 0_u64;
     let mut summary = run_doctor_inner(repo, pr_number, repairs_applied, false);
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_mode".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "mode": DoctorWaitMode::PulsePrimary.as_str(),
+                "pr_number": pr_number,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait mode event: {err}");
+        }
+    }
+
+    let mut pulse_subscription =
+        match DoctorPulseSubscription::connect(operator_socket, repo, pr_number) {
+            Ok((subscription, accepted_count, rejected_count)) => {
+                emit_doctor_pulse_subscribed_event(
+                    json_output,
+                    pr_number,
+                    accepted_count,
+                    rejected_count,
+                    subscription.since_ledger_cursor,
+                    None,
+                );
+                Some(subscription)
+            },
+            Err(err) => {
+                emit_doctor_wait_degraded_mode_event(json_output, pr_number, &err);
+                None
+            },
+        };
+
+    if let Some(subscription) = pulse_subscription.as_mut() {
+        match run_doctor_wait_pulse_loop(
+            repo,
+            pr_number,
+            json_output,
+            &exit_actions,
+            interrupted.as_ref(),
+            wait_timeout_seconds,
+            started,
+            tick,
+            &mut summary,
+            subscription,
+        ) {
+            DoctorWaitLoopControl::Exit(code) => {
+                close_doctor_pulse_subscription(subscription);
+                return code;
+            },
+            DoctorWaitLoopControl::Fallback { next_tick, reason } => {
+                tick = next_tick;
+                close_doctor_pulse_subscription(subscription);
+                emit_doctor_wait_degraded_mode_event(json_output, pr_number, &reason);
+            },
+        }
+    }
+
+    run_doctor_wait_poll_loop(
+        repo,
+        pr_number,
+        json_output,
+        &exit_actions,
+        interrupted.as_ref(),
+        wait_timeout_seconds,
+        started,
+        tick,
+        summary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doctor_wait_maybe_exit(
+    repo: &str,
+    pr_number: u32,
+    summary: &mut DoctorPrSummary,
+    json_output: bool,
+    tick: u64,
+    started: Instant,
+    wait_timeout_seconds: u64,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+) -> Option<DoctorWaitLoopControl> {
+    let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
+    let facts = DoctorWaitFacts {
+        recommended_action: summary.recommended_action.action.as_str(),
+        exit_actions,
+        interrupted: interrupted.load(Ordering::SeqCst),
+        elapsed_seconds,
+        wait_timeout_seconds,
+    };
+    match derive_doctor_wait_next_state(DoctorWaitState::Evaluate, Some(&facts)) {
+        DoctorWaitState::ExitOnRecommendedAction => {
+            emit_doctor_wait_terminal_event(json_output, tick, summary, elapsed_seconds);
+            emit_doctor_wait_result(summary, json_output, tick, false, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(exit_codes::SUCCESS))
+        },
+        DoctorWaitState::ExitOnInterrupt => {
+            *summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
+            emit_doctor_wait_result(summary, json_output, tick, false, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(exit_codes::SUCCESS))
+        },
+        DoctorWaitState::ExitOnTimeout => {
+            emit_doctor_wait_timeout_event(json_output, tick, summary, elapsed_seconds);
+            emit_doctor_wait_result(summary, json_output, tick, true, elapsed_seconds);
+            Some(DoctorWaitLoopControl::Exit(DOCTOR_WAIT_TIMEOUT_EXIT_CODE))
+        },
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_doctor_wait_pulse_loop(
+    repo: &str,
+    pr_number: u32,
+    json_output: bool,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+    wait_timeout_seconds: u64,
+    started: Instant,
+    initial_tick: u64,
+    summary: &mut DoctorPrSummary,
+    pulse_subscription: &mut DoctorPulseSubscription,
+) -> DoctorWaitLoopControl {
+    let mut tick = initial_tick;
+    let mut pulse_deduper = DoctorPulseDeduper::new(DOCTOR_WAIT_PULSE_DEDUPE_CAPACITY);
+    let mut last_summary_collected_at = Instant::now();
+
+    loop {
+        if let Some(result) = doctor_wait_maybe_exit(
+            repo,
+            pr_number,
+            summary,
+            json_output,
+            tick,
+            started,
+            wait_timeout_seconds,
+            exit_actions,
+            interrupted,
+        ) {
+            return result;
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        let remaining_seconds = wait_timeout_seconds.saturating_sub(elapsed);
+        let wait_slice = Duration::from_millis(DOCTOR_WAIT_PULSE_CHECK_INTERVAL_MILLIS)
+            .min(Duration::from_secs(remaining_seconds.max(1)));
+
+        let pulse_metadata = match pulse_subscription.wait_for_pulse(wait_slice) {
+            Ok(pulse) => pulse,
+            Err(err) => {
+                if let Err(reconnect_err) =
+                    attempt_doctor_pulse_reconnect(pulse_subscription, json_output, pr_number, &err)
+                {
+                    return DoctorWaitLoopControl::Fallback {
+                        next_tick: tick,
+                        reason: reconnect_err,
+                    };
+                }
+                continue;
+            },
+        };
+        let wake_reason = if pulse_metadata.is_some() {
+            DoctorWaitWakeReason::Pulse
+        } else {
+            DoctorWaitWakeReason::Timer
+        };
+        let timer_backstop_due = matches!(wake_reason, DoctorWaitWakeReason::Timer)
+            && last_summary_collected_at.elapsed()
+                >= Duration::from_secs(DOCTOR_WAIT_PULSE_TIMER_BACKSTOP_SECONDS);
+
+        if !doctor_wait_should_collect_summary(
+            DoctorWaitMode::PulsePrimary,
+            wake_reason,
+            timer_backstop_due,
+        ) {
+            continue;
+        }
+
+        if matches!(wake_reason, DoctorWaitWakeReason::Timer) {
+            tick = tick.saturating_add(1);
+            emit_doctor_wait_timer_backstop_event(
+                json_output,
+                pr_number,
+                tick,
+                started.elapsed().as_secs(),
+            );
+            // Temporal recommendation guards (idle/dispatched age) need bounded
+            // wall-clock driven reevaluation when the pulse stream is quiet.
+            let use_lightweight = tick % 5 != 0;
+            *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+            last_summary_collected_at = Instant::now();
+            continue;
+        }
+
+        let Some(pulse) = pulse_metadata else {
+            continue;
+        };
+
+        if !doctor_wait_pulse_is_relevant(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "out_of_scope", &pulse);
+            continue;
+        }
+
+        if !pulse_deduper.insert_if_new(&pulse) {
+            emit_doctor_pulse_skipped_event(json_output, pr_number, "duplicate", &pulse);
+            continue;
+        }
+
+        tick = tick.saturating_add(1);
+        if json_output {
+            if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+                event: "doctor_pulse".to_string(),
+                ts: jsonl::ts_now(),
+                extra: serde_json::json!({
+                    "tick": tick,
+                    "pr_number": pr_number,
+                    "pulse_id": pulse.pulse_id,
+                    "topic": pulse.topic,
+                    "event_type": pulse.event_type,
+                    "ledger_cursor": pulse.ledger_cursor,
+                    "action": summary.recommended_action.action.as_str(),
+                }),
+            }) {
+                eprintln!("WARNING: failed to emit doctor pulse event: {err}");
+            }
+        } else {
+            let topic = pulse.topic.as_deref().unwrap_or("unknown");
+            let event_type = pulse.event_type.as_deref().unwrap_or("unknown");
+            eprintln!(
+                "doctor wait: pulse tick={tick} topic={topic} event_type={event_type} elapsed={}s",
+                started.elapsed().as_secs()
+            );
+        }
+
+        // Every 5th reevaluation uses full mode so merge state can still
+        // converge if only partial local projections updated.
+        let use_lightweight = tick % 5 != 0;
+        *summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+        last_summary_collected_at = Instant::now();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_doctor_wait_poll_loop(
+    repo: &str,
+    pr_number: u32,
+    json_output: bool,
+    exit_actions: &std::collections::BTreeSet<String>,
+    interrupted: &AtomicBool,
+    wait_timeout_seconds: u64,
+    started: Instant,
+    initial_tick: u64,
+    mut summary: DoctorPrSummary,
+) -> u8 {
+    let poll_interval = Duration::from_secs(DOCTOR_WAIT_POLL_INTERVAL_SECONDS);
+    let mut tick = initial_tick;
     let mut wait_state = DoctorWaitState::Evaluate;
+
+    if json_output {
+        if let Err(err) = jsonl::emit_jsonl(&jsonl::StageEvent {
+            event: "doctor_wait_mode".to_string(),
+            ts: jsonl::ts_now(),
+            extra: serde_json::json!({
+                "mode": DoctorWaitMode::PollingFallback.as_str(),
+                "pr_number": pr_number,
+            }),
+        }) {
+            eprintln!("WARNING: failed to emit doctor wait mode event: {err}");
+        }
+    }
 
     loop {
         let elapsed_seconds = started.elapsed().as_secs().min(wait_timeout_seconds);
         match wait_state {
             DoctorWaitState::Evaluate => {
-                let facts = DoctorWaitFacts {
-                    recommended_action: summary.recommended_action.action.as_str(),
-                    exit_actions: &exit_actions,
-                    interrupted: interrupted.load(Ordering::SeqCst),
-                    elapsed_seconds,
+                if let Some(DoctorWaitLoopControl::Exit(code)) = doctor_wait_maybe_exit(
+                    repo,
+                    pr_number,
+                    &mut summary,
+                    json_output,
+                    tick,
+                    started,
                     wait_timeout_seconds,
-                };
-                wait_state = derive_doctor_wait_next_state(wait_state, Some(&facts));
+                    exit_actions,
+                    interrupted,
+                ) {
+                    return code;
+                }
+                wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
-            DoctorWaitState::ExitOnRecommendedAction => {
-                emit_doctor_wait_terminal_event(json_output, tick, &summary, elapsed_seconds);
-                emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
-                return exit_codes::SUCCESS;
-            },
-            DoctorWaitState::ExitOnInterrupt => {
-                summary = run_doctor_inner(repo, pr_number, Vec::new(), true);
-                emit_doctor_wait_result(&summary, json_output, tick, false, elapsed_seconds);
-                return exit_codes::SUCCESS;
-            },
-            DoctorWaitState::ExitOnTimeout => {
-                emit_doctor_wait_timeout_event(json_output, tick, &summary, elapsed_seconds);
-                emit_doctor_wait_result(&summary, json_output, tick, true, elapsed_seconds);
-                return DOCTOR_WAIT_TIMEOUT_EXIT_CODE;
+            DoctorWaitState::ExitOnRecommendedAction
+            | DoctorWaitState::ExitOnInterrupt
+            | DoctorWaitState::ExitOnTimeout => {
+                // Exit states are handled centrally by `doctor_wait_maybe_exit`.
+                wait_state = DoctorWaitState::Evaluate;
             },
             DoctorWaitState::PollEmit => {
                 if json_output {
@@ -1525,8 +2289,7 @@ pub fn run_doctor(
                 } else {
                     eprintln!(
                         "doctor wait: tick={tick} action={} elapsed={}s",
-                        summary.recommended_action.action,
-                        started.elapsed().as_secs()
+                        summary.recommended_action.action, elapsed_seconds
                     );
                 }
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
@@ -1537,16 +2300,54 @@ pub fn run_doctor(
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
             DoctorWaitState::CollectSummary => {
-                // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
-                // mode to detect externally-merged PRs via GitHub API. This
-                // ensures the wait loop can terminate when a PR is merged
-                // outside the local lifecycle projection.
-                let use_lightweight = tick % 5 != 0;
-                summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+                if doctor_wait_should_collect_summary(
+                    DoctorWaitMode::PollingFallback,
+                    DoctorWaitWakeReason::Timer,
+                    false,
+                ) {
+                    // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
+                    // mode to detect externally-merged PRs via GitHub API.
+                    let use_lightweight = tick % 5 != 0;
+                    summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
+                }
                 wait_state = derive_doctor_wait_next_state(wait_state, None);
             },
         }
     }
+}
+
+fn run_doctor_follow_up_repair(
+    repo: &str,
+    pr_number: u32,
+    summary: &DoctorPrSummary,
+) -> Result<Option<DoctorRepairApplied>, String> {
+    if !doctor_recommended_action_requests_follow_up_fix(summary) {
+        return Ok(None);
+    }
+
+    let force_follow_up_fix = doctor_recommended_follow_up_fix_force(summary);
+    let repair_summary =
+        repair_cycle::run_repair_for_doctor_fix(repo, pr_number, force_follow_up_fix, true)?;
+    let dispatched_count = repair_summary
+        .reviews_dispatched
+        .as_ref()
+        .map_or(0, Vec::len);
+
+    Ok(Some(DoctorRepairApplied {
+        operation: "follow_up_pr_fix".to_string(),
+        before: Some(format!(
+            "force={force_follow_up_fix} reason={}",
+            summary.recommended_action.reason
+        )),
+        after: Some(format!(
+            "strategy={} evidence_passed={} dispatched_reviews={}",
+            repair_summary.strategy.label(),
+            repair_summary
+                .evidence_passed
+                .map_or_else(|| "none".to_string(), |passed| passed.to_string()),
+            dispatched_count
+        )),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -1727,7 +2528,7 @@ fn emit_doctor_wait_error(json_output: bool, error: &str, message: &str, exit_co
             }),
         });
     } else {
-        // JSON-only: emit the error as a structured JSON object.
+        // Compatibility fallback: still emit a structured JSON object.
         let payload = serde_json::json!({
             "error": error,
             "message": message,
@@ -1770,17 +2571,30 @@ pub fn collect_tracked_pr_summaries(
     fallback_owner_repo: Option<&str>,
     repo_filter: Option<&str>,
 ) -> Result<Vec<DoctorTrackedPrSummary>, String> {
-    let mut pr_numbers = list_review_pr_numbers()?;
-    // Sort descending so we keep the most recent PRs when truncating.
-    pr_numbers.sort_unstable_by(|a, b| b.cmp(a));
-    let mut candidates = Vec::with_capacity(pr_numbers.len());
-    for pr_number in pr_numbers {
-        let Some(owner_repo) = resolve_owner_repo_for_pr(pr_number, fallback_owner_repo) else {
-            continue;
-        };
-        candidates.push((pr_number, owner_repo));
+    let normalized_repo_filter = normalize_owner_repo_filter(repo_filter);
+    let normalized_fallback_repo = normalize_owner_repo_filter(fallback_owner_repo);
+
+    let mut candidates = if let Some(owner_repo) = normalized_repo_filter.as_deref() {
+        lifecycle::list_tracked_prs_for_repo(owner_repo)?
+    } else {
+        lifecycle::list_all_tracked_prs()?
+    };
+
+    if candidates.is_empty()
+        && normalized_repo_filter.is_none()
+        && let Some(owner_repo) = normalized_fallback_repo.as_deref()
+    {
+        candidates = lifecycle::list_tracked_prs_for_repo(owner_repo)?;
     }
-    let selected = filter_tracked_pr_candidates(candidates, repo_filter, MAX_TRACKED_PR_SUMMARIES);
+
+    // Sort descending so we keep the most recent PRs when truncating.
+    candidates.sort_unstable_by(|(a_pr, _), (b_pr, _)| b_pr.cmp(a_pr));
+
+    let selected = filter_tracked_pr_candidates(
+        candidates,
+        normalized_repo_filter.as_deref(),
+        MAX_TRACKED_PR_SUMMARIES,
+    );
 
     let mut summaries = Vec::with_capacity(selected.len());
     for (pr_number, owner_repo) in selected {
@@ -1806,6 +2620,7 @@ pub fn collect_tracked_pr_summaries(
             owner_repo,
             lifecycle_state,
             recommended_action: summary.recommended_action,
+            gate_failure_signal: summary.gate_failure_signal,
             active_agents,
             last_activity_seconds_ago,
         });
@@ -1814,35 +2629,30 @@ pub fn collect_tracked_pr_summaries(
     Ok(summaries)
 }
 
+fn normalize_owner_repo_filter(owner_repo: Option<&str>) -> Option<String> {
+    owner_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 fn filter_tracked_pr_candidates(
     candidates: Vec<(u32, String)>,
     repo_filter: Option<&str>,
     limit: usize,
 ) -> Vec<(u32, String)> {
+    let explicit_repo_filter = normalize_owner_repo_filter(repo_filter).is_some();
     candidates
         .into_iter()
         .filter(|(_, owner_repo)| tracked_pr_matches_repo_filter(owner_repo, repo_filter))
+        .filter(|(_, owner_repo)| {
+            explicit_repo_filter || {
+                let normalized = owner_repo.trim().to_ascii_lowercase();
+                !normalized.starts_with("example/") && !normalized.starts_with("test/")
+            }
+        })
         .take(limit)
         .collect()
-}
-
-fn resolve_owner_repo_for_pr(pr_number: u32, fallback_owner_repo: Option<&str>) -> Option<String> {
-    for review_type in ["security", "quality"] {
-        if let Ok(Some(state)) = load_review_run_state_strict(pr_number, review_type) {
-            let owner_repo = state.owner_repo.trim().to_ascii_lowercase();
-            if !owner_repo.is_empty() {
-                return Some(owner_repo);
-            }
-        }
-    }
-    fallback_owner_repo.and_then(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
-        }
-    })
 }
 
 fn tracked_pr_matches_repo_filter(owner_repo: &str, repo_filter: Option<&str>) -> bool {
@@ -1850,10 +2660,7 @@ fn tracked_pr_matches_repo_filter(owner_repo: &str, repo_filter: Option<&str>) -
     if normalized_owner_repo.is_empty() {
         return false;
     }
-    let normalized_filter = repo_filter
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
+    let normalized_filter = normalize_owner_repo_filter(repo_filter);
     normalized_filter.is_none_or(|filter| normalized_owner_repo == filter)
 }
 
@@ -2012,6 +2819,7 @@ fn run_doctor_inner(
                 retry_budget_remaining: snapshot.retry_budget_remaining,
                 updated_at: snapshot.updated_at.clone(),
                 last_event_seq: snapshot.last_event_seq,
+                lifecycle_sha: snapshot.current_sha.clone(),
             };
             if lifecycle_retry_budget_exhausted(&lifecycle_view) {
                 health.push(DoctorHealthItem {
@@ -2033,13 +2841,9 @@ fn run_doctor_inner(
             } else if snapshot.error_budget_used > 0 {
                 health.push(DoctorHealthItem {
                     severity: "medium",
-                    message: format!(
-                        "error budget used: {}/{}",
-                        snapshot.error_budget_used,
-                        10
-                    ),
-                    remediation:
-                        "run `apm2 fac doctor --pr <PR_NUMBER>` after `apm2 fac restart` to verify trend".to_string(),
+                    message: format!("error budget used: {}/{}", snapshot.error_budget_used, 10),
+                    remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix` and verify trend"
+                        .to_string(),
                 });
             }
             if snapshot.error_budget_used >= 8 {
@@ -2071,9 +2875,11 @@ fn run_doctor_inner(
         Ok(None) => {
             repair_signals.lifecycle_missing = true;
             health.push(DoctorHealthItem {
-                severity: "high",
-                message: "no lifecycle record found for this PR".to_string(),
-                remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix`".to_string(),
+                severity: "medium",
+                message: "no local lifecycle record found for this PR".to_string(),
+                remediation:
+                    "run `apm2 fac push` or `apm2 fac doctor --pr <PR_NUMBER> --fix` to rehydrate local lifecycle state"
+                        .to_string(),
             });
             None
         },
@@ -2239,6 +3045,18 @@ fn run_doctor_inner(
                                 .to_string(),
                     });
                 }
+                if !verdict_projection_snapshot_has_remote_comment_binding(&snapshot) {
+                    repair_signals.projection_comment_binding_missing = true;
+                    health.push(DoctorHealthItem {
+                        severity: "medium",
+                        message:
+                            "verdict projection is missing authoritative remote comment binding"
+                                .to_string(),
+                        remediation:
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to replay bounded projection repair"
+                                .to_string(),
+                    });
+                }
                 collect_review_dimension_snapshots(&snapshot)
             },
             Ok(None) => {
@@ -2246,7 +3064,7 @@ fn run_doctor_inner(
                     severity: "medium",
                     message: "no verdict projection for local SHA".to_string(),
                     remediation:
-                        "run both `fac review run --pr` and `fac review verdict show --pr --sha`"
+                        "run `apm2 fac doctor --pr <PR_NUMBER> --fix` then `apm2 fac review verdict show --pr <PR_NUMBER>`"
                             .to_string(),
                 });
                 collect_default_review_dimension_snapshots(sha)
@@ -2256,7 +3074,7 @@ fn run_doctor_inner(
                     severity: "high",
                     message: format!("failed to load verdict projection: {err}"),
                     remediation:
-                        "re-run review verdict flow (`fac review set`) after integrity check"
+                        "re-run verdict flow (`apm2 fac review verdict set ...`) after integrity check"
                             .to_string(),
                 });
                 collect_default_review_dimension_snapshots(sha)
@@ -2276,12 +3094,6 @@ fn run_doctor_inner(
     repair_signals.run_state_repair_required = run_state_diagnostics
         .iter()
         .any(|entry| entry.condition.requires_repair());
-    repair_signals.run_state_force_repair_required = run_state_diagnostics.iter().any(|entry| {
-        matches!(
-            entry.condition,
-            DoctorRunStateCondition::Corrupt | DoctorRunStateCondition::Ambiguous
-        )
-    });
 
     let agents = match lifecycle::load_agent_registry_snapshot_for_pr(owner_repo, pr_number) {
         Ok(snapshot) => {
@@ -2314,7 +3126,7 @@ fn run_doctor_inner(
                             entry.pid.unwrap_or(0)
                         ),
                         remediation:
-                            "run `apm2 fac restart --pr <PR_NUMBER>` to reclaim lane state"
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to reclaim lane state"
                                 .to_string(),
                     });
                 }
@@ -2328,7 +3140,7 @@ fn run_doctor_inner(
                             entry.agent_type, pr_number, entry.state
                         ),
                         remediation:
-                            "rerun `apm2 fac restart --pr <PR_NUMBER>` and watch for slot reapage"
+                            "rerun `apm2 fac doctor --pr <PR_NUMBER> --fix` and watch for slot reapage"
                                 .to_string(),
                     });
                 }
@@ -2341,7 +3153,7 @@ fn run_doctor_inner(
                     severity: "high",
                     message: "review_in_progress lifecycle state with zero active agents"
                         .to_string(),
-                    remediation: "run `apm2 fac restart --pr <PR_NUMBER>` to resume reviews"
+                    remediation: "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to resume reviews"
                         .to_string(),
                 });
             }
@@ -2421,9 +3233,6 @@ fn run_doctor_inner(
                     let mut latest = activity_by_run_id.get(&run_id_key).copied();
                     if latest.is_none() {
                         latest = activity_map.get(review_type).copied();
-                    }
-                    if let Some(ts) = log_activity.last_modified_at.get(&run_id_key).copied() {
-                        latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
                     }
                     if let Some(ts) = pulse_activity {
                         latest = Some(latest.map_or(ts, |current: DateTime<Utc>| current.max(ts)));
@@ -2526,8 +3335,9 @@ fn run_doctor_inner(
             },
         };
     let agent_activity = build_doctor_agent_activity_summary(agents.as_ref());
-    let recommended_action = build_recommended_action(&DoctorActionInputs {
+    let doctor_inputs = DoctorActionInputs {
         pr_number,
+        authoritative_sha: local_sha.as_deref().unwrap_or(""),
         repair_signals: &repair_signals,
         lifecycle: lifecycle.as_ref(),
         gates: &gates,
@@ -2537,7 +3347,9 @@ fn run_doctor_inner(
         findings_summary: &findings_summary,
         merge_readiness: &merge_readiness,
         latest_push_attempt: latest_push_attempt.as_ref(),
-    });
+    };
+    let gate_failure_signal = DoctorDecisionFacts::from_input(&doctor_inputs).gate_failure_signal;
+    let recommended_action = build_recommended_action(&doctor_inputs);
 
     DoctorPrSummary {
         schema: DOCTOR_SCHEMA.to_string(),
@@ -2561,6 +3373,7 @@ fn run_doctor_inner(
         worktree_status,
         github_projection,
         recommended_action,
+        gate_failure_signal,
         agents,
         run_state_diagnostics,
         repairs_applied,
@@ -2626,27 +3439,25 @@ fn derive_doctor_repair_plan(summary: &DoctorPrSummary) -> DoctorRepairPlan {
 
 const fn doctor_requires_force_repair(summary: &DoctorPrSummary) -> bool {
     let signals = &summary.repair_signals;
-    signals.lifecycle_load_failed
-        || signals.agent_registry_load_failed
-        || signals.run_state_force_repair_required
+    signals.lifecycle_load_failed || signals.agent_registry_load_failed
 }
 
-fn doctor_recommended_action_requests_restart(summary: &DoctorPrSummary) -> bool {
-    summary
+fn doctor_recommended_action_requests_follow_up_fix(summary: &DoctorPrSummary) -> bool {
+    if !summary
         .recommended_action
         .action
-        .eq_ignore_ascii_case("restart_reviews")
+        .eq_ignore_ascii_case("fix")
+    {
+        return false;
+    }
+    summary.recommended_action.follow_up_fix
 }
 
-fn doctor_recommended_restart_force(summary: &DoctorPrSummary) -> bool {
-    if summary.reviews.iter().any(review_requires_forced_restart) {
+fn doctor_recommended_follow_up_fix_force(summary: &DoctorPrSummary) -> bool {
+    if summary.reviews.iter().any(review_requires_forced_fix) {
         return true;
     }
-    summary
-        .recommended_action
-        .command
-        .as_deref()
-        .is_some_and(|command| command.split_whitespace().any(|token| token == "--force"))
+    summary.recommended_action.follow_up_force
 }
 
 fn build_doctor_agent_activity_summary(
@@ -3124,7 +3935,6 @@ fn load_run_state_nudge_counts_for_pr(pr_number: u32) -> std::collections::BTree
 #[derive(Default)]
 struct DoctorLogActivitySignals {
     line_counts: std::collections::BTreeMap<String, u64>,
-    last_modified_at: std::collections::BTreeMap<String, DateTime<Utc>>,
 }
 
 fn collect_log_activity_for_pr(
@@ -3142,16 +3952,6 @@ fn collect_log_activity_for_pr(
                 continue;
             }
             let run_id = run_id.to_string();
-            if let Ok(metadata) = fs::metadata(&entry.log_file)
-                && let Ok(modified) = metadata.modified()
-            {
-                let modified_at = DateTime::<Utc>::from(modified);
-                signals
-                    .last_modified_at
-                    .entry(run_id.clone())
-                    .and_modify(|existing| *existing = (*existing).max(modified_at))
-                    .or_insert(modified_at);
-            }
             if include_line_counts
                 && let Some(line_count) = count_log_lines_bounded(&entry.log_file)
             {
@@ -3250,6 +4050,57 @@ fn canonical_review_dimension(value: &str) -> String {
     }
 }
 
+fn diagnose_present_run_state(
+    review_type: &str,
+    state: &types::ReviewRunState,
+) -> (DoctorRunStateCondition, Option<String>) {
+    if state.status.is_terminal() {
+        return (DoctorRunStateCondition::Healthy, None);
+    }
+
+    if state.status == types::ReviewRunStatus::Alive && state.pid.is_none() {
+        return (
+            DoctorRunStateCondition::InconsistentRuntimeHandle,
+            Some(format!(
+                "{review_type} run-state is Alive but missing pid (run_id={})",
+                state.run_id
+            )),
+        );
+    }
+
+    if let Some(pid) = state.pid {
+        let Some(expected_start_time) = state.proc_start_time else {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state has pid={pid} but missing proc_start_time (run_id={})",
+                    state.run_id
+                )),
+            );
+        };
+        if !state::is_process_alive(pid) {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state references dead pid={pid} (run_id={})",
+                    state.run_id
+                )),
+            );
+        }
+        let observed_start_time = state::get_process_start_time(pid);
+        if observed_start_time != Some(expected_start_time) {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state process identity mismatch for pid={pid} expected_start={expected_start_time} observed_start={observed_start_time:?}",
+                )),
+            );
+        }
+    }
+
+    (DoctorRunStateCondition::Healthy, None)
+}
+
 fn collect_run_state_diagnostics(
     pr_number: u32,
     health: &mut Vec<DoctorHealthItem>,
@@ -3285,13 +4136,26 @@ fn collect_run_state_diagnostics(
         };
         match load_review_run_state(pr_number, review_type) {
             Ok(state::ReviewRunStateLoad::Present(state)) => {
+                let (condition, detail) = diagnose_present_run_state(review_type, &state);
                 diagnostics.push(DoctorRunStateDiagnostic {
                     review_type: review_type.to_string(),
-                    condition: DoctorRunStateCondition::Healthy,
+                    condition,
                     canonical_path,
-                    detail: None,
+                    detail: detail.clone(),
                     candidates: Vec::new(),
                 });
+                if condition.requires_repair() {
+                    health.push(DoctorHealthItem {
+                        severity: "high",
+                        message: format!(
+                            "{review_type} run-state has inconsistent runtime handle: {}",
+                            detail.unwrap_or_else(|| "unknown inconsistency".to_string())
+                        ),
+                        remediation:
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to rebuild stale/non-authoritative run-state"
+                                .to_string(),
+                    });
+                }
                 reasons.insert(dimension.to_string(), state.terminal_reason);
             },
             Ok(state::ReviewRunStateLoad::Missing { .. }) => {
@@ -3306,7 +4170,7 @@ fn collect_run_state_diagnostics(
                     severity: "low",
                     message: format!("missing {review_type} run-state file"),
                     remediation:
-                        "if review execution is expected for this dimension, run `apm2 fac restart --pr <PR_NUMBER>`"
+                        "if review execution is expected for this dimension, run `apm2 fac doctor --pr <PR_NUMBER> --fix`"
                             .to_string(),
                 });
                 reasons.insert(dimension.to_string(), None);
@@ -3631,6 +4495,15 @@ fn build_doctor_merge_readiness(
     }
 }
 
+fn verdict_projection_snapshot_has_remote_comment_binding(
+    snapshot: &verdict_projection::VerdictProjectionSnapshot,
+) -> bool {
+    verdict_projection::has_remote_comment_binding(
+        snapshot.source_comment_id,
+        snapshot.source_comment_url.as_deref(),
+    )
+}
+
 fn build_doctor_github_projection_status(
     owner_repo: &str,
     pr_number: u32,
@@ -3715,41 +4588,42 @@ fn lifecycle_retry_budget_exhausted(entry: &DoctorLifecycleSnapshot) -> bool {
         && matches!(entry.state.as_str(), "stuck" | "recovering" | "quarantined")
 }
 
-fn review_requires_forced_restart(review: &DoctorReviewSnapshot) -> bool {
+fn review_requires_forced_fix(review: &DoctorReviewSnapshot) -> bool {
     review
         .terminal_reason
         .as_deref()
         .is_some_and(|reason| reason.eq_ignore_ascii_case("max_restarts_exceeded"))
 }
 
-fn terminal_reason_requires_forced_restart(terminal_reason: Option<&String>) -> bool {
+fn terminal_reason_requires_forced_fix(terminal_reason: Option<&String>) -> bool {
     terminal_reason.is_some_and(|value| value.eq_ignore_ascii_case("max_restarts_exceeded"))
 }
 
-fn has_forced_restart_terminal_reason(
+fn has_forced_fix_terminal_reason(
     reviews: &[DoctorReviewSnapshot],
     review_terminal_reasons: &std::collections::BTreeMap<String, Option<String>>,
 ) -> bool {
-    reviews.iter().any(review_requires_forced_restart)
+    reviews.iter().any(review_requires_forced_fix)
         || review_terminal_reasons
             .values()
             .map(std::option::Option::as_ref)
-            .any(terminal_reason_requires_forced_restart)
+            .any(terminal_reason_requires_forced_fix)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorDecisionState {
     Fix,
     Done,
+    FixProjectionGap,
     Merge,
-    RestartStaleIdentity,
+    FixStaleIdentity,
     Approve,
     DispatchMergeConflicts,
     DispatchFailedGates,
     DispatchImplementor,
     WaitForGates,
-    RestartIdleReviewers,
-    RestartPendingNoActiveReviewers,
+    FixIdleReviewers,
+    FixPendingNoActiveReviewers,
     EscalateLifecycleBudget,
     Wait,
 }
@@ -3759,15 +4633,16 @@ impl DoctorDecisionState {
         match self {
             Self::Fix => "fix",
             Self::Done => "done",
+            Self::FixProjectionGap => "fix_projection_gap",
             Self::Merge => "merge",
-            Self::RestartStaleIdentity => "restart_stale_identity",
+            Self::FixStaleIdentity => "fix_stale_identity",
             Self::Approve => "approve",
             Self::DispatchMergeConflicts => "dispatch_merge_conflicts",
             Self::DispatchFailedGates => "dispatch_failed_gates",
             Self::DispatchImplementor => "dispatch_implementor",
             Self::WaitForGates => "wait_for_gates",
-            Self::RestartIdleReviewers => "restart_idle_reviewers",
-            Self::RestartPendingNoActiveReviewers => "restart_pending_no_active_reviewers",
+            Self::FixIdleReviewers => "fix_idle_reviewers",
+            Self::FixPendingNoActiveReviewers => "fix_pending_no_active_reviewers",
             Self::EscalateLifecycleBudget => "escalate_lifecycle_budget",
             Self::Wait => "wait",
         }
@@ -3775,12 +4650,13 @@ impl DoctorDecisionState {
 
     const fn recommended_action(self) -> &'static str {
         match self {
-            Self::Fix => "fix",
             Self::Done => "done",
             Self::Merge => "merge",
-            Self::RestartStaleIdentity
-            | Self::RestartIdleReviewers
-            | Self::RestartPendingNoActiveReviewers => "restart_reviews",
+            Self::Fix
+            | Self::FixProjectionGap
+            | Self::FixStaleIdentity
+            | Self::FixIdleReviewers
+            | Self::FixPendingNoActiveReviewers => "fix",
             Self::Approve => "approve",
             Self::DispatchMergeConflicts
             | Self::DispatchFailedGates
@@ -3816,6 +4692,7 @@ struct DoctorDecisionRule {
 enum DoctorDecisionGuard {
     HasIntegrityOrCorruption,
     LifecycleMerged,
+    ProjectionGapRequiresFix,
     MergeReady,
     ShaFreshnessStale,
     ApproveEligible,
@@ -3834,6 +4711,7 @@ impl DoctorDecisionGuard {
         match self {
             Self::HasIntegrityOrCorruption => "has_integrity_or_corruption",
             Self::LifecycleMerged => "lifecycle_merged",
+            Self::ProjectionGapRequiresFix => "projection_gap_requires_fix",
             Self::MergeReady => "merge_ready",
             Self::ShaFreshnessStale => "sha_freshness_stale",
             Self::ApproveEligible => "approve_eligible",
@@ -3854,7 +4732,7 @@ enum DoctorReasonKind {
     Template,
     PushFailureHintOrTemplate,
     FindingsRollupWithPushHint,
-    IdleRestartWithMaxIdle,
+    IdleFixWithMaxIdle,
     PendingNoActiveWithPushHint,
     WaitWithPendingHint,
 }
@@ -3865,7 +4743,7 @@ impl DoctorReasonKind {
             Self::Template => "template",
             Self::PushFailureHintOrTemplate => "push_failure_hint_or_template",
             Self::FindingsRollupWithPushHint => "findings_rollup_with_push_hint",
-            Self::IdleRestartWithMaxIdle => "idle_restart_with_max_idle",
+            Self::IdleFixWithMaxIdle => "idle_fix_with_max_idle",
             Self::PendingNoActiveWithPushHint => "pending_no_active_with_push_hint",
             Self::WaitWithPendingHint => "wait_with_pending_hint",
         }
@@ -3875,8 +4753,9 @@ impl DoctorReasonKind {
 #[derive(Debug, Clone, Copy)]
 enum DoctorCommandKind {
     RuleTemplate,
-    RestartForce,
-    RestartConditionalForce,
+    FixForce,
+    FixConditionalForce,
+    FixFollowUp,
     None,
 }
 
@@ -3884,8 +4763,9 @@ impl DoctorCommandKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::RuleTemplate => "rule_template",
-            Self::RestartForce => "restart_force",
-            Self::RestartConditionalForce => "restart_conditional_force",
+            Self::FixForce => "fix_force",
+            Self::FixConditionalForce => "fix_conditional_force",
+            Self::FixFollowUp => "fix_follow_up",
             Self::None => "none",
         }
     }
@@ -3960,6 +4840,14 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
     },
     DoctorDecisionRule {
         priority: 3,
+        state: DoctorDecisionState::FixProjectionGap,
+        guard: DoctorDecisionGuard::ProjectionGapRequiresFix,
+        guard_id: "DOC-G-003P",
+        guard_predicate: "facts.projection_gap_requires_fix",
+        requirement_refs: &[],
+    },
+    DoctorDecisionRule {
+        priority: 4,
         state: DoctorDecisionState::Merge,
         guard: DoctorDecisionGuard::MergeReady,
         guard_id: "DOC-G-003",
@@ -3967,23 +4855,23 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
     },
     DoctorDecisionRule {
-        priority: 4,
-        state: DoctorDecisionState::RestartStaleIdentity,
+        priority: 5,
+        state: DoctorDecisionState::FixStaleIdentity,
         guard: DoctorDecisionGuard::ShaFreshnessStale,
         guard_id: "DOC-G-004",
-        guard_predicate: "facts.sha_freshness_source == stale && !facts.has_gate_failure_signal",
+        guard_predicate: "facts.sha_freshness_source == stale && facts.gate_failure_signal != aligned_terminal_failure",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 5,
+        priority: 6,
         state: DoctorDecisionState::Approve,
         guard: DoctorDecisionGuard::ApproveEligible,
         guard_id: "DOC-G-005",
-        guard_predicate: "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && !facts.has_gate_failure_signal",
+        guard_predicate: "merge_readiness.all_verdicts_approve && !facts.has_actionable_findings && facts.sha_freshness_source == remote_match && facts.merge_conflict_status != has_conflicts && facts.gate_failure_signal != aligned_terminal_failure",
         requirement_refs: &["DR-003-TERMINAL_PASS_REQUIRED_FOR_MERGE_READY"],
     },
     DoctorDecisionRule {
-        priority: 6,
+        priority: 7,
         state: DoctorDecisionState::DispatchMergeConflicts,
         guard: DoctorDecisionGuard::MergeConflictsPresent,
         guard_id: "DOC-G-006",
@@ -3991,15 +4879,15 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 7,
+        priority: 8,
         state: DoctorDecisionState::DispatchFailedGates,
         guard: DoctorDecisionGuard::GateFailureSignal,
         guard_id: "DOC-G-007",
-        guard_predicate: "facts.has_gate_failure_signal",
+        guard_predicate: "facts.gate_failure_signal == aligned_terminal_failure",
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 8,
+        priority: 9,
         state: DoctorDecisionState::DispatchImplementor,
         guard: DoctorDecisionGuard::ImplementorRemediationResolved,
         guard_id: "DOC-G-008",
@@ -4007,31 +4895,31 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &["DR-001-GATE_FAILURE_REQUIRES_IMPLEMENTOR"],
     },
     DoctorDecisionRule {
-        priority: 9,
+        priority: 10,
         state: DoctorDecisionState::WaitForGates,
         guard: DoctorDecisionGuard::PendingVerdictWithGateInFlight,
         guard_id: "DOC-G-009",
         guard_predicate: "facts.has_pending_verdict && facts.gate_progress_state == in_flight",
-        requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_RESTART"],
+        requirement_refs: &["DR-002-RUNNING_GATE_SUPPRESSES_FIX"],
     },
     DoctorDecisionRule {
-        priority: 10,
-        state: DoctorDecisionState::RestartIdleReviewers,
+        priority: 11,
+        state: DoctorDecisionState::FixIdleReviewers,
         guard: DoctorDecisionGuard::AllActiveIdle,
         guard_id: "DOC-G-010",
         guard_predicate: "facts.all_active_idle",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 11,
-        state: DoctorDecisionState::RestartPendingNoActiveReviewers,
+        priority: 12,
+        state: DoctorDecisionState::FixPendingNoActiveReviewers,
         guard: DoctorDecisionGuard::PendingNoActive,
         guard_id: "DOC-G-011",
         guard_predicate: "facts.active_agents == 0 && facts.has_pending_verdict",
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 12,
+        priority: 13,
         state: DoctorDecisionState::EscalateLifecycleBudget,
         guard: DoctorDecisionGuard::LifecycleEscalation,
         guard_id: "DOC-G-012",
@@ -4039,7 +4927,7 @@ const DOCTOR_DECISION_RULES: &[DoctorDecisionRule] = &[
         requirement_refs: &[],
     },
     DoctorDecisionRule {
-        priority: 13,
+        priority: 14,
         state: DoctorDecisionState::Wait,
         guard: DoctorDecisionGuard::Default,
         guard_id: "DOC-G-013",
@@ -4070,6 +4958,16 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         command_notes: None,
     },
     DoctorRecommendationRule {
+        state: DoctorDecisionState::FixProjectionGap,
+        action: "fix",
+        priority: "high",
+        reason_kind: DoctorReasonKind::Template,
+        reason_template: "verdict projection is missing authoritative remote comment binding for a terminal-approved SHA",
+        command_kind: DoctorCommandKind::FixFollowUp,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
+        command_notes: Some("runtime follow-up PR repair cycle runs in bounded single-flight mode"),
+    },
+    DoctorRecommendationRule {
         state: DoctorDecisionState::Merge,
         action: "merge",
         priority: "medium",
@@ -4080,14 +4978,16 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         command_notes: None,
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartStaleIdentity,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixStaleIdentity,
+        action: "fix",
         priority: "high",
         reason_kind: DoctorReasonKind::Template,
         reason_template: "local verdict/findings snapshot is stale relative to remote PR head",
-        command_kind: DoctorCommandKind::RestartForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
-        command_notes: None,
+        command_kind: DoctorCommandKind::FixForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
+        command_notes: Some(
+            "follow-up PR repair cycle runs with forced strategy (bounded single-flight)",
+        ),
     },
     DoctorRecommendationRule {
         state: DoctorDecisionState::Approve,
@@ -4097,7 +4997,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_template: "all review dimensions approve; awaiting auto-merge",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
@@ -4108,7 +5008,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::Template,
         reason_template: "merge conflicts require implementor remediation and a fresh push",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: None,
     },
     DoctorRecommendationRule {
@@ -4118,7 +5018,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::PushFailureHintOrTemplate,
         reason_template: "evidence gate failure requires implementor remediation before review can continue",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: Some("reason may include latest push failure hint when available"),
     },
     DoctorRecommendationRule {
@@ -4128,7 +5028,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::FindingsRollupWithPushHint,
         reason_template: "review findings require implementor remediation",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac review findings --pr {pr_number} --json"),
+        command_template: Some("apm2 fac review findings --pr {pr_number}"),
         command_notes: Some("reason includes findings rollup when available"),
     },
     DoctorRecommendationRule {
@@ -4136,35 +5036,35 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         action: "wait",
         priority: "medium",
         reason_kind: DoctorReasonKind::Template,
-        reason_template: "FAC gates are still in progress; reviewer restart is deferred",
+        reason_template: "FAC gates are still in progress; follow-up fix is deferred",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartIdleReviewers,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixIdleReviewers,
+        action: "fix",
         priority: "high",
-        reason_kind: DoctorReasonKind::IdleRestartWithMaxIdle,
+        reason_kind: DoctorReasonKind::IdleFixWithMaxIdle,
         reason_template: "all active reviewer agents are idle",
-        command_kind: DoctorCommandKind::RestartForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --force --refresh-identity"),
+        command_kind: DoctorCommandKind::FixForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
         command_notes: Some(
-            "runtime reason appends max idle age from current agent activity telemetry",
+            "runtime follow-up PR repair cycle uses forced strategy (bounded single-flight); reason appends max idle age telemetry",
         ),
     },
     DoctorRecommendationRule {
-        state: DoctorDecisionState::RestartPendingNoActiveReviewers,
-        action: "restart_reviews",
+        state: DoctorDecisionState::FixPendingNoActiveReviewers,
+        action: "fix",
         priority: "high",
         reason_kind: DoctorReasonKind::PendingNoActiveWithPushHint,
         reason_template: "no active reviewer agents and verdict remains pending",
-        command_kind: DoctorCommandKind::RestartConditionalForce,
-        command_template: Some("apm2 fac restart --pr {pr_number} --refresh-identity"),
+        command_kind: DoctorCommandKind::FixConditionalForce,
+        command_template: Some("apm2 fac doctor --pr {pr_number} --fix"),
         command_notes: Some(
-            "runtime appends --force when terminal reason indicates max_restarts_exceeded",
+            "runtime follow-up PR repair cycle toggles forced strategy (bounded single-flight) when terminal reason indicates max_restarts_exceeded",
         ),
     },
     DoctorRecommendationRule {
@@ -4174,7 +5074,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_kind: DoctorReasonKind::Template,
         reason_template: "lifecycle retry/error budget exhausted",
         command_kind: DoctorCommandKind::RuleTemplate,
-        command_template: Some("apm2 fac doctor --pr {pr_number} --json"),
+        command_template: Some("apm2 fac doctor --pr {pr_number}"),
         command_notes: None,
     },
     DoctorRecommendationRule {
@@ -4185,7 +5085,7 @@ const DOCTOR_RECOMMENDATION_RULES: &[DoctorRecommendationRule] = &[
         reason_template: "reviews and findings are still in progress",
         command_kind: DoctorCommandKind::RuleTemplate,
         command_template: Some(
-            "apm2 fac doctor --pr {pr_number} --json --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
+            "apm2 fac doctor --pr {pr_number} --wait-for-recommended-action --wait-timeout-seconds {wait_timeout_seconds}",
         ),
         command_notes: None,
     },
@@ -4214,12 +5114,6 @@ const DOCTOR_ACTION_POLICIES: &[DoctorActionPolicy] = &[
         action: "dispatch_implementor",
         default_wait_exit: true,
         wait_terminal_reason: "dispatch_implementor",
-        allow_exit_on_flag: true,
-    },
-    DoctorActionPolicy {
-        action: "restart_reviews",
-        default_wait_exit: true,
-        wait_terminal_reason: "restart_reviews",
         allow_exit_on_flag: true,
     },
     DoctorActionPolicy {
@@ -4308,17 +5202,40 @@ const DOCTOR_WAIT_TRANSITION_RULES: &[DoctorWaitTransitionRule] = &[
     },
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DoctorGateFailureSignal {
+    None,
+    AlignedTerminalFailure {
+        sha: String,
+        source: DoctorFailureSource,
+    },
+    StaleFailure {
+        sha: String,
+        source: DoctorFailureSource,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFailureSource {
+    Lifecycle,
+    PushAttempt,
+    GateProjection,
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct DoctorDecisionFacts {
     has_integrity_or_corruption: bool,
     lifecycle_merged: bool,
+    projection_gap_requires_fix: bool,
     merge_ready: bool,
     all_verdicts_approve: bool,
     sha_freshness_source: DoctorShaFreshnessSource,
     has_actionable_findings: bool,
     merge_conflict_status: DoctorMergeConflictStatus,
-    has_gate_failure_signal: bool,
+    gate_failure_signal: DoctorGateFailureSignal,
     requires_implementor_remediation: bool,
     all_verdicts_resolved: bool,
     has_pending_verdict: bool,
@@ -4327,18 +5244,13 @@ struct DoctorDecisionFacts {
     all_active_idle: bool,
     max_idle_seconds: Option<i64>,
     max_dispatched_pending_seconds: Option<i64>,
-    has_forced_restart_terminal_reason: bool,
+    has_forced_fix_terminal_reason: bool,
     lifecycle_escalation: bool,
     push_failure_hint: Option<String>,
 }
 
 impl DoctorDecisionFacts {
     fn from_input(input: &DoctorActionInputs<'_>) -> Self {
-        let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
-            || input.repair_signals.lifecycle_missing
-            || input.repair_signals.agent_registry_load_failed
-            || input.repair_signals.run_state_repair_required;
-
         let has_actionable_findings = input
             .findings_summary
             .iter()
@@ -4358,17 +5270,68 @@ impl DoctorDecisionFacts {
             .any(|entry| entry.formal_verdict.eq_ignore_ascii_case("pending"));
 
         let gate_progress_state = derive_doctor_gate_progress_state(input.gates, input.lifecycle);
-        let lifecycle_gate_failure = input
-            .lifecycle
-            .is_some_and(|entry| entry.state.eq_ignore_ascii_case("gates_failed"));
-        let push_attempt_gate_failure = input
-            .latest_push_attempt
-            .and_then(|attempt| attempt.failed_stage.as_deref())
-            .is_some_and(push_attempt_stage_is_gate_failure);
-        let has_gate_failure_signal = gate_progress_state
-            == DoctorGateProgressState::TerminalFailed
-            || lifecycle_gate_failure
-            || push_attempt_gate_failure;
+
+        let mut gate_failure_signal = DoctorGateFailureSignal::None;
+
+        if let Some(attempt) = input.latest_push_attempt {
+            if push_attempt_stage_is_gate_failure(attempt.failed_stage.as_deref().unwrap_or("")) {
+                if attempt.sha == input.authoritative_sha {
+                    gate_failure_signal = DoctorGateFailureSignal::AlignedTerminalFailure {
+                        sha: attempt.sha.clone(),
+                        source: DoctorFailureSource::PushAttempt,
+                    };
+                } else {
+                    gate_failure_signal = DoctorGateFailureSignal::StaleFailure {
+                        sha: attempt.sha.clone(),
+                        source: DoctorFailureSource::PushAttempt,
+                    };
+                }
+            }
+        }
+
+        if gate_failure_signal == DoctorGateFailureSignal::None {
+            if let Some(entry) = input.lifecycle {
+                if entry.state.eq_ignore_ascii_case("gates_failed") {
+                    if entry.lifecycle_sha == input.authoritative_sha {
+                        gate_failure_signal = DoctorGateFailureSignal::AlignedTerminalFailure {
+                            sha: entry.lifecycle_sha.clone(),
+                            source: DoctorFailureSource::Lifecycle,
+                        };
+                    } else {
+                        gate_failure_signal = DoctorGateFailureSignal::StaleFailure {
+                            sha: entry.lifecycle_sha.clone(),
+                            source: DoctorFailureSource::Lifecycle,
+                        };
+                    }
+                }
+            }
+        }
+
+        if gate_failure_signal == DoctorGateFailureSignal::None
+            && gate_progress_state == DoctorGateProgressState::TerminalFailed
+        {
+            gate_failure_signal = DoctorGateFailureSignal::AlignedTerminalFailure {
+                sha: input.authoritative_sha.to_string(),
+                source: DoctorFailureSource::GateProjection,
+            };
+        }
+
+        let has_gate_failure_signal = matches!(
+            gate_failure_signal,
+            DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                | DoctorGateFailureSignal::StaleFailure { .. }
+        );
+
+        let projection_gap_requires_fix = input.repair_signals.projection_comment_binding_missing
+            && input.merge_readiness.all_verdicts_approve
+            && input.merge_readiness.gates_pass
+            && input.merge_readiness.sha_fresh
+            && input.merge_readiness.merge_conflict_status
+                != DoctorMergeConflictStatus::HasConflicts
+            && !has_gate_failure_signal;
+        let has_integrity_or_corruption = input.repair_signals.lifecycle_load_failed
+            || input.repair_signals.agent_registry_load_failed
+            || input.repair_signals.run_state_repair_required;
         let lifecycle_escalation = input.lifecycle.is_some_and(|entry| {
             entry.error_budget_used >= 8 || lifecycle_retry_budget_exhausted(entry)
         });
@@ -4378,12 +5341,13 @@ impl DoctorDecisionFacts {
             lifecycle_merged: input
                 .lifecycle
                 .is_some_and(|entry| entry.state.eq_ignore_ascii_case("merged")),
+            projection_gap_requires_fix,
             merge_ready: input.merge_readiness.merge_ready,
             all_verdicts_approve: input.merge_readiness.all_verdicts_approve,
             sha_freshness_source: input.merge_readiness.sha_freshness_source,
             has_actionable_findings,
             merge_conflict_status: input.merge_readiness.merge_conflict_status,
-            has_gate_failure_signal,
+            gate_failure_signal,
             requires_implementor_remediation,
             all_verdicts_resolved,
             has_pending_verdict,
@@ -4392,7 +5356,7 @@ impl DoctorDecisionFacts {
             all_active_idle: input.agent_activity.all_active_idle,
             max_idle_seconds: input.agent_activity.max_idle_seconds,
             max_dispatched_pending_seconds: input.agent_activity.max_dispatched_pending_seconds,
-            has_forced_restart_terminal_reason: has_forced_restart_terminal_reason(
+            has_forced_fix_terminal_reason: has_forced_fix_terminal_reason(
                 input.reviews,
                 input.review_terminal_reasons,
             ),
@@ -4408,22 +5372,32 @@ fn doctor_decision_guard_triggered(rule: &DoctorDecisionRule, facts: &DoctorDeci
     match rule.guard {
         DoctorDecisionGuard::HasIntegrityOrCorruption => facts.has_integrity_or_corruption,
         DoctorDecisionGuard::LifecycleMerged => facts.lifecycle_merged,
+        DoctorDecisionGuard::ProjectionGapRequiresFix => facts.projection_gap_requires_fix,
         DoctorDecisionGuard::MergeReady => facts.merge_ready,
         DoctorDecisionGuard::ShaFreshnessStale => {
             facts.sha_freshness_source == DoctorShaFreshnessSource::Stale
-                && !facts.has_gate_failure_signal
+                && !matches!(
+                    facts.gate_failure_signal,
+                    DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                )
         },
         DoctorDecisionGuard::ApproveEligible => {
             facts.all_verdicts_approve
                 && !facts.has_actionable_findings
                 && facts.sha_freshness_source == DoctorShaFreshnessSource::RemoteMatch
                 && facts.merge_conflict_status != DoctorMergeConflictStatus::HasConflicts
-                && !facts.has_gate_failure_signal
+                && !matches!(
+                    facts.gate_failure_signal,
+                    DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+                )
         },
         DoctorDecisionGuard::MergeConflictsPresent => {
             facts.merge_conflict_status == DoctorMergeConflictStatus::HasConflicts
         },
-        DoctorDecisionGuard::GateFailureSignal => facts.has_gate_failure_signal,
+        DoctorDecisionGuard::GateFailureSignal => matches!(
+            facts.gate_failure_signal,
+            DoctorGateFailureSignal::AlignedTerminalFailure { .. }
+        ),
         DoctorDecisionGuard::ImplementorRemediationResolved => {
             facts.requires_implementor_remediation && facts.all_verdicts_resolved
         },
@@ -4472,12 +5446,8 @@ fn render_doctor_command_template(template: &str, pr_number: u32) -> String {
         )
 }
 
-fn restart_reviews_command(pr_number: u32, force: bool) -> String {
-    if force {
-        format!("apm2 fac restart --pr {pr_number} --force --refresh-identity")
-    } else {
-        format!("apm2 fac restart --pr {pr_number} --refresh-identity")
-    }
+fn fix_command(pr_number: u32) -> String {
+    format!("apm2 fac doctor --pr {pr_number} --fix")
 }
 
 fn render_doctor_recommendation_reason(
@@ -4503,12 +5473,12 @@ fn render_doctor_recommendation_reason(
                 format!("{findings_rollup}; {push_hint}")
             }
         },
-        DoctorReasonKind::IdleRestartWithMaxIdle => {
+        DoctorReasonKind::IdleFixWithMaxIdle => {
             let max_idle = facts
                 .max_idle_seconds
                 .unwrap_or(DOCTOR_ACTIVE_AGENT_IDLE_TIMEOUT_SECONDS);
             format!(
-                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend restart"
+                "all active reviewer agents are idle (no activity for up to {max_idle}s); recommend repair"
             )
         },
         DoctorReasonKind::PendingNoActiveWithPushHint => facts
@@ -4537,18 +5507,29 @@ fn render_doctor_recommendation_reason(
 fn render_doctor_recommendation_command(
     rule: &DoctorRecommendationRule,
     input: &DoctorActionInputs<'_>,
-    facts: &DoctorDecisionFacts,
+    _facts: &DoctorDecisionFacts,
 ) -> Option<String> {
     match rule.command_kind {
         DoctorCommandKind::None => None,
         DoctorCommandKind::RuleTemplate => rule
             .command_template
             .map(|template| render_doctor_command_template(template, input.pr_number)),
-        DoctorCommandKind::RestartForce => Some(restart_reviews_command(input.pr_number, true)),
-        DoctorCommandKind::RestartConditionalForce => Some(restart_reviews_command(
-            input.pr_number,
-            facts.has_forced_restart_terminal_reason,
-        )),
+        DoctorCommandKind::FixFollowUp => Some(fix_command(input.pr_number)),
+        DoctorCommandKind::FixForce | DoctorCommandKind::FixConditionalForce => {
+            Some(fix_command(input.pr_number))
+        },
+    }
+}
+
+const fn render_doctor_follow_up_repair_flags(
+    rule: &DoctorRecommendationRule,
+    facts: &DoctorDecisionFacts,
+) -> (bool, bool) {
+    match rule.command_kind {
+        DoctorCommandKind::None | DoctorCommandKind::RuleTemplate => (false, false),
+        DoctorCommandKind::FixForce => (true, true),
+        DoctorCommandKind::FixConditionalForce => (true, facts.has_forced_fix_terminal_reason),
+        DoctorCommandKind::FixFollowUp => (true, false),
     }
 }
 
@@ -4556,11 +5537,14 @@ fn build_recommended_action(input: &DoctorActionInputs<'_>) -> DoctorRecommended
     let facts = DoctorDecisionFacts::from_input(input);
     let state = derive_doctor_decision_state(&facts);
     let rule = doctor_recommendation_rule_for_state(state);
+    let (follow_up_fix, follow_up_force) = render_doctor_follow_up_repair_flags(rule, &facts);
     DoctorRecommendedAction {
         action: rule.action.to_string(),
         reason: render_doctor_recommendation_reason(rule, input, &facts),
         priority: rule.priority.to_string(),
         command: render_doctor_recommendation_command(rule, input, &facts),
+        follow_up_fix,
+        follow_up_force,
     }
 }
 
@@ -4958,6 +5942,12 @@ impl DoctorGateProgressFacts {
         let mut has_in_flight_gate = false;
         let lifecycle_gates_failed =
             lifecycle.is_some_and(|entry| entry.state.eq_ignore_ascii_case("gates_failed"));
+        // NOTE: SHA alignment for the lifecycle gates_failed signal is enforced one
+        // level up in DoctorDecisionFacts::from_input (block 2), which sets
+        // StaleFailure before block 3 can branch on gate_progress_state ==
+        // TerminalFailed. This function is intentionally not SHA-aware; its
+        // output is consumed only by gate-progress rules that do not produce
+        // terminal actions directly. (DRA-001, DRA-002)
         let mut has_failed_gate = lifecycle_gates_failed;
         let mut has_passed_gate = false;
         for gate in gates {
@@ -5030,94 +6020,13 @@ fn format_freshness_age(seconds: Option<i64>) -> String {
 }
 // ── Public entry points ─────────────────────────────────────────────────────
 
-pub fn run_review(
-    repo: &str,
-    pr_number: Option<u32>,
-    review_type: ReviewRunType,
-    expected_head_sha: Option<&str>,
-    force: bool,
-    json_output: bool,
-) -> u8 {
-    let event_offset = review_events_path()
-        .ok()
-        .and_then(|path| fs::metadata(path).ok().map(|meta| meta.len()))
-        .unwrap_or(0);
-
-    let (owner_repo, resolved_pr) = match target::resolve_pr_target(repo, pr_number) {
-        Ok(value) => value,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_run_target_resolution_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            return exit_codes::GENERIC_ERROR;
-        },
-    };
-
-    match orchestrator::run_review_inner(
-        &owner_repo,
-        resolved_pr,
-        review_type,
-        expected_head_sha,
-        force,
-    ) {
-        Ok(summary) => {
-            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
-                && summary.quality.as_ref().is_none_or(|entry| entry.success);
-
-            let mut run_ids = Vec::new();
-            if let Some(entry) = &summary.security {
-                run_ids.push(entry.run_id.clone());
-            }
-            if let Some(entry) = &summary.quality {
-                run_ids.push(entry.run_id.clone());
-            }
-            if json_output {
-                let _ = emit_run_ndjson_since(event_offset, summary.pr_number, &run_ids, true);
-            }
-            let payload = serde_json::json!({
-                "schema": "apm2.fac.review.run.v1",
-                "summary": summary,
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
-            );
-
-            if success {
-                exit_codes::SUCCESS
-            } else {
-                exit_codes::GENERIC_ERROR
-            }
-        },
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_run_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
 pub fn run_findings(
     repo: &str,
     pr_number: Option<u32>,
     sha: Option<&str>,
-    refresh: bool,
     json_output: bool,
 ) -> u8 {
-    match findings::run_findings(repo, pr_number, sha, refresh, json_output) {
+    match findings::run_findings(repo, pr_number, sha, json_output) {
         Ok(code) => code,
         Err(err) => {
             let payload = serde_json::json!({
@@ -5173,40 +6082,6 @@ pub fn run_finding(
         Err(err) => {
             let payload = serde_json::json!({
                 "error": "fac_review_finding_failed",
-                "message": err,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| "{\"error\":\"serialization_failure\"}".to_string())
-            );
-            exit_codes::GENERIC_ERROR
-        },
-    }
-}
-
-pub fn run_comment_compat(
-    repo: &str,
-    pr_number: Option<u32>,
-    sha: Option<&str>,
-    review_type: ReviewFindingTypeArg,
-    severity: ReviewFindingSeverityArg,
-    body: Option<&str>,
-    json_output: bool,
-) -> u8 {
-    match finding::run_comment_compat(
-        repo,
-        pr_number,
-        sha,
-        review_type,
-        severity,
-        body,
-        json_output,
-    ) {
-        Ok(code) => code,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "error": "fac_review_comment_compat_failed",
                 "message": err,
             });
             println!(
@@ -5486,52 +6361,113 @@ fn run_terminate_inner_for_home(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-pub fn run_recover(
-    repo: &str,
-    pr_number: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    reap_stale_agents: bool,
-    reset_lifecycle: bool,
-    all: bool,
-    json_output: bool,
-) -> u8 {
-    recovery::run_recover(
-        repo,
-        pr_number,
-        force,
-        refresh_identity,
-        reap_stale_agents,
-        reset_lifecycle,
-        all,
-        json_output,
-    )
+pub struct PushRunConfig<'a> {
+    pub repo: &'a str,
+    pub remote: &'a str,
+    pub branch: Option<&'a str>,
+    pub ticket: Option<&'a Path>,
+    pub work_id: Option<&'a str>,
+    pub ticket_alias: Option<&'a str>,
+    pub lease_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub handoff_note: Option<&'a str>,
+    pub json_output: bool,
+    pub write_mode: QueueWriteMode,
+    pub operator_socket: &'a Path,
 }
 
-pub fn run_push(
-    repo: &str,
-    remote: &str,
-    branch: Option<&str>,
-    ticket: Option<&Path>,
-    json_output: bool,
-    write_mode: QueueWriteMode,
-) -> u8 {
-    push::run_push(repo, remote, branch, ticket, json_output, write_mode)
-}
-
-pub fn run_restart(
-    repo: &str,
-    pr: Option<u32>,
-    force: bool,
-    refresh_identity: bool,
-    json_output: bool,
-) -> u8 {
-    restart::run_restart(repo, pr, force, refresh_identity, json_output)
+pub fn run_push(config: &PushRunConfig<'_>) -> u8 {
+    push::run_push(&push::PushInvocation {
+        repo: config.repo,
+        remote: config.remote,
+        branch: config.branch,
+        ticket: config.ticket,
+        work_id_arg: config.work_id,
+        ticket_alias_arg: config.ticket_alias,
+        lease_id_arg: config.lease_id,
+        session_id_arg: config.session_id,
+        handoff_note_arg: config.handoff_note,
+        json_output: config.json_output,
+        write_mode: config.write_mode,
+        operator_socket: config.operator_socket,
+    })
 }
 
 pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {
     pipeline::run_pipeline(repo, pr_number, sha, json_output)
+}
+
+pub fn run_internal_reviewer(
+    repo: &str,
+    pr_number: u32,
+    review_type: &str,
+    expected_head_sha: &str,
+    force: bool,
+    _json_output: bool,
+) -> u8 {
+    let parsed_review_type = match review_type.trim().to_ascii_lowercase().as_str() {
+        "security" => ReviewRunType::Security,
+        "quality" => ReviewRunType::Quality,
+        other => {
+            let payload = serde_json::json!({
+                "error": "fac_review_internal_run_invalid_type",
+                "message": format!("invalid review type: {other} (expected security|quality)"),
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            return exit_codes::GENERIC_ERROR;
+        },
+    };
+    if let Err(err) = validate_expected_head_sha(expected_head_sha) {
+        let payload = serde_json::json!({
+            "error": "fac_review_internal_run_invalid_head_sha",
+            "message": err,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+        );
+        return exit_codes::GENERIC_ERROR;
+    }
+
+    match orchestrator::run_review_inner(
+        repo,
+        pr_number,
+        parsed_review_type,
+        Some(expected_head_sha),
+        force,
+    ) {
+        Ok(summary) => {
+            let success = summary.security.as_ref().is_none_or(|entry| entry.success)
+                && summary.quality.as_ref().is_none_or(|entry| entry.success);
+            let payload = serde_json::json!({
+                "schema": "apm2.fac.review.internal_run.v1",
+                "summary": summary,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            if success {
+                exit_codes::SUCCESS
+            } else {
+                exit_codes::GENERIC_ERROR
+            }
+        },
+        Err(err) => {
+            let payload = serde_json::json!({
+                "error": "fac_review_internal_run_failed",
+                "message": err,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            );
+            exit_codes::GENERIC_ERROR
+        },
+    }
 }
 
 pub fn run_logs(
@@ -5585,6 +6521,9 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<LocalGatesRunResult, String> {
     let result = gates::run_gates_local_worker(
         force,
@@ -5595,6 +6534,9 @@ pub(super) fn run_gates_local_worker(
         cpu_quota,
         gate_profile,
         workspace_root,
+        bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     )?;
     Ok(LocalGatesRunResult {
         exit_code: result.exit_code,
@@ -5642,7 +6584,15 @@ pub(super) fn apply_gate_result_lifecycle_for_repo_sha(
     lifecycle::apply_gate_result_events_for_repo_sha(owner_repo, head_sha, passed)
 }
 
-// ── Internal dispatch helper (shared with pipeline/restart) ─────────────────
+// ── Internal dispatch helper (shared with pipeline/follow-up repair) ────────
+
+fn dispatch_run_state_is_terminal(run_state: &str) -> bool {
+    let normalized = run_state.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "done" | "failed" | "crashed" | "completed" | "cancelled"
+    )
+}
 
 fn run_dispatch_inner(
     owner_repo: &str,
@@ -5701,7 +6651,21 @@ fn run_dispatch_inner(
             dispatch_epoch,
             force,
         )?;
-        if !result.mode.eq_ignore_ascii_case("joined") {
+        let is_joined = result.mode.eq_ignore_ascii_case("joined");
+        let joined_is_terminal = dispatch_run_state_is_terminal(&result.run_state);
+        let joined_has_run_id = result
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if is_joined && !joined_is_terminal && !joined_has_run_id {
+            return Err(format!(
+                "joined {} dispatch missing run_id in non-terminal state (run_state={})",
+                kind.as_str(),
+                result.run_state
+            ));
+        }
+        if !is_joined {
             let run_id = result
                 .run_id
                 .as_deref()
@@ -5831,8 +6795,7 @@ mod tests {
     use super::state::{read_last_lines, read_pulse_file_from_path, write_pulse_file_to_path};
     use super::types::{
         EVENT_ROTATE_BYTES, FacEventContext, ReviewBackend, ReviewKind, ReviewRunState,
-        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, default_review_type,
-        now_iso8601_millis,
+        ReviewRunStatus, ReviewStateEntry, ReviewStateFile, default_model, now_iso8601_millis,
     };
     static TEST_PR_COUNTER: AtomicU32 = AtomicU32::new(441_000);
 
@@ -5888,6 +6851,37 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn diagnose_present_run_state_marks_alive_missing_pid_inconsistent() {
+        let mut state = sample_run_state(next_test_pr(), 1234, "abcdef1234567890", Some(111));
+        state.pid = None;
+        let (condition, detail) = super::diagnose_present_run_state("security", &state);
+        assert_eq!(
+            condition,
+            super::DoctorRunStateCondition::InconsistentRuntimeHandle
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|value| value.contains("missing pid"))
+        );
+    }
+
+    #[test]
+    fn diagnose_present_run_state_marks_missing_proc_start_time_inconsistent() {
+        let state = sample_run_state(next_test_pr(), 1234, "abcdef1234567890", None);
+        let (condition, detail) = super::diagnose_present_run_state("security", &state);
+        assert_eq!(
+            condition,
+            super::DoctorRunStateCondition::InconsistentRuntimeHandle
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|value| value.contains("missing proc_start_time"))
+        );
     }
 
     fn seed_decision_projection_for_terminate(
@@ -6537,27 +7531,6 @@ mod tests {
             .expect("read pulse")
             .expect("pulse present");
         assert_eq!(pulse.head_sha, "0123456789abcdef");
-    }
-
-    #[test]
-    fn test_review_state_entry_backward_compat_defaults() {
-        let json = serde_json::json!({
-            "pid": 1234,
-            "started_at": Utc::now(),
-            "log_file": "/tmp/review.log",
-            "prompt_file": "/tmp/prompt.md",
-            "last_message_file": "/tmp/last.md",
-            "owner_repo": "owner/repo",
-            "head_sha": "0123456789abcdef0123456789abcdef01234567",
-            "restart_count": 0,
-            "temp_files": []
-        });
-        let entry: ReviewStateEntry =
-            serde_json::from_value(json).expect("deserialize review state entry");
-        assert_eq!(entry.review_type, default_review_type());
-        assert_eq!(entry.pr_number, 0);
-        assert_eq!(entry.model, default_model());
-        assert_eq!(entry.backend, ReviewBackend::Codex);
     }
 
     #[test]
@@ -7222,7 +8195,7 @@ mod tests {
         }
     }
 
-    fn doctor_pr_summary_for_restart_tests(
+    fn doctor_pr_summary_for_fix_tests(
         findings_summary: Vec<super::DoctorFindingsDimensionSummary>,
         agents: Option<super::DoctorAgentSection>,
     ) -> super::DoctorPrSummary {
@@ -7244,6 +8217,7 @@ mod tests {
             gates: Vec::new(),
             reviews: Vec::new(),
             findings_summary,
+            gate_failure_signal: super::DoctorGateFailureSignal::None,
             merge_readiness: doctor_merge_readiness_fixture(
                 super::DoctorMergeConflictStatus::Unknown,
             ),
@@ -7262,6 +8236,8 @@ mod tests {
                 reason: "fixture".to_string(),
                 priority: "low".to_string(),
                 command: None,
+                follow_up_fix: false,
+                follow_up_force: false,
             },
             agents,
             run_state_diagnostics: Vec::new(),
@@ -7285,6 +8261,7 @@ mod tests {
             retry_budget_remaining,
             updated_at: "2026-02-15T00:00:00Z".to_string(),
             last_event_seq,
+            lifecycle_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
         }
     }
 
@@ -7330,6 +8307,7 @@ mod tests {
             );
         }
         super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number,
             repair_signals: &repair_signals,
             lifecycle,
@@ -7344,7 +8322,7 @@ mod tests {
     }
 
     fn doctor_summary_for_repair_plan_tests() -> super::DoctorPrSummary {
-        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
+        let mut summary = doctor_pr_summary_for_fix_tests(pending_findings_summary(), None);
         summary.identity.local_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
         summary.identity.stale = false;
         summary.lifecycle = Some(doctor_lifecycle_fixture("pushed", 3, 0, 1));
@@ -7373,6 +8351,24 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_doctor_repair_plan_refreshes_identity_when_missing() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.identity_missing = true;
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.refresh_identity);
+    }
+
+    #[test]
+    fn test_derive_doctor_repair_plan_refreshes_identity_when_stale() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.identity_stale = true;
+
+        let plan = super::derive_doctor_repair_plan(&summary);
+        assert!(plan.refresh_identity);
+    }
+
+    #[test]
     fn test_doctor_requires_force_repair_for_registry_integrity_issue() {
         let mut summary = doctor_summary_for_repair_plan_tests();
         summary.repair_signals.agent_registry_load_failed = true;
@@ -7381,8 +8377,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_uses_force_restart_for_max_restarts_exceeded_before_escalation()
-     {
+    fn test_doctor_requires_force_repair_does_not_force_on_run_state_only() {
+        let mut summary = doctor_summary_for_repair_plan_tests();
+        summary.repair_signals.run_state_repair_required = true;
+
+        assert!(
+            !super::doctor_requires_force_repair(&summary),
+            "run-state-only repair should not imply forced lifecycle reset"
+        );
+    }
+
+    #[test]
+    fn test_build_recommended_action_uses_force_fix_for_max_restarts_exceeded_before_escalation() {
         let reviews = doctor_reviews_with_terminal_reason(Some("max_restarts_exceeded"));
         let findings = pending_findings_summary();
         let action = build_recommended_action_for_tests(
@@ -7398,20 +8404,22 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
-    fn test_build_recommended_action_uses_force_restart_when_terminal_reason_only_in_state_map() {
+    fn test_build_recommended_action_uses_force_fix_when_terminal_reason_only_in_state_map() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::from([(
             "security".to_string(),
             Some("max_restarts_exceeded".to_string()),
         )]);
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
@@ -7432,9 +8440,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7442,6 +8452,7 @@ mod tests {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("stuck", 0, 9, 100)),
@@ -7462,9 +8473,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(!command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7476,6 +8489,7 @@ mod tests {
             ..super::DoctorRepairSignals::default()
         };
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &repair_signals,
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
@@ -7500,10 +8514,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_missing_run_state_does_not_force_fix() {
+    fn test_build_recommended_action_missing_run_state_does_not_force_fix_command() {
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 10)),
@@ -7524,7 +8539,11 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_ne!(action.action, "fix");
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7544,9 +8563,11 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(!command.contains("--force"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
     }
 
     #[test]
@@ -7568,7 +8589,7 @@ mod tests {
         );
         assert_eq!(action.action, "dispatch_implementor");
         let command = action.command.expect("dispatch command");
-        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
+        assert!(command.contains("apm2 fac review findings --pr 42"));
     }
 
     #[test]
@@ -7616,7 +8637,7 @@ mod tests {
         );
         assert_eq!(action.action, "dispatch_implementor");
         let command = action.command.expect("dispatch command");
-        assert!(command.contains("apm2 fac review findings --pr 42 --json"));
+        assert!(command.contains("apm2 fac review findings --pr 42"));
     }
 
     #[test]
@@ -7751,6 +8772,126 @@ mod tests {
     }
 
     #[test]
+    fn test_build_recommended_action_lifecycle_missing_does_not_override_merge_ready() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            lifecycle_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: None,
+            gates: &[
+                doctor_gate_snapshot("fmt", "PASS"),
+                doctor_gate_snapshot("test", "PASS"),
+            ],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "merge");
+    }
+
+    #[test]
+    fn test_build_recommended_action_projection_gap_triggers_fix_and_follow_up_repair() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: true,
+            all_verdicts_approve: true,
+            gates_pass: true,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            projection_comment_binding_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 42)),
+            gates: &[
+                doctor_gate_snapshot("fmt", "PASS"),
+                doctor_gate_snapshot("test", "PASS"),
+            ],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "fix");
+        assert_eq!(
+            action.command.as_deref(),
+            Some("apm2 fac doctor --pr 42 --fix")
+        );
+        assert!(action.follow_up_fix);
+        assert!(!action.follow_up_force);
+    }
+
+    #[test]
+    fn test_build_recommended_action_projection_gap_waits_before_terminal_gate_pass() {
+        let findings = vec![
+            findings_summary_entry("security", "approve", 0, 0, 0, 0),
+            findings_summary_entry("code-quality", "approve", 0, 0, 0, 0),
+        ];
+        let readiness = super::DoctorMergeReadiness {
+            merge_ready: false,
+            all_verdicts_approve: true,
+            gates_pass: false,
+            sha_fresh: true,
+            sha_freshness_source: super::DoctorShaFreshnessSource::RemoteMatch,
+            no_merge_conflicts: true,
+            merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
+        };
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let repair_signals = super::DoctorRepairSignals {
+            projection_comment_binding_missing: true,
+            ..super::DoctorRepairSignals::default()
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &repair_signals,
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 2, 0, 42)),
+            gates: &[doctor_gate_snapshot("fmt", "RUNNING")],
+            agent_activity: super::DoctorAgentActivitySummary::default(),
+            reviews: &[],
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "approve");
+    }
+
+    #[test]
     fn test_build_recommended_action_does_not_approve_without_remote_sha_match() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = vec![
@@ -7810,10 +8951,11 @@ mod tests {
         };
         let action =
             build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7834,10 +8976,11 @@ mod tests {
         };
         let action =
             build_recommended_action_for_tests(42, None, None, &reviews, &findings, &readiness);
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -7925,6 +9068,7 @@ mod tests {
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = vec![doctor_gate_snapshot("test", "NOT_RUN")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("gates_running", 1, 0, 12)),
@@ -7952,12 +9096,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_gates_are_terminal_and_no_reviewers() {
+    fn test_build_recommended_action_fixes_when_gates_are_terminal_and_no_reviewers() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = vec![doctor_gate_snapshot("test", "PASS")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -7978,7 +9123,7 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
+        assert_eq!(action.action, "fix");
     }
 
     #[test]
@@ -7988,6 +9133,7 @@ mod tests {
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = vec![doctor_gate_snapshot("test", "RUNNING")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8028,6 +9174,7 @@ mod tests {
             )],
         };
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8046,12 +9193,69 @@ mod tests {
     }
 
     #[test]
+    fn test_build_recommended_action_waits_when_lifecycle_reports_gates_failed_but_sha_stale() {
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = Vec::new();
+
+        let mut lifecycle = doctor_lifecycle_fixture("gates_failed", 1, 0, 12);
+        // Make the lifecycle SHA mismatched
+        lifecycle.lifecycle_sha = "some_other_stale_sha".to_string();
+
+        let mut readiness =
+            doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown);
+        readiness.sha_freshness_source = super::DoctorShaFreshnessSource::Unknown;
+
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&lifecycle),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 1,
+                    total_agents: 1,
+                    entries: vec![super::DoctorAgentSnapshot {
+                        agent_type: "security".to_string(),
+                        state: "running".to_string(),
+                        run_id: "run-1".to_string(),
+                        sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                        pid: Some(1234),
+                        pid_alive: true,
+                        started_at: "2026-02-15T00:00:00Z".to_string(),
+                        completion_status: None,
+                        completion_summary: None,
+                        completion_token_hash: String::new(),
+                        completion_token_expires_at: String::new(),
+                        elapsed_seconds: Some(10),
+                        models_attempted: Vec::new(),
+                        tool_call_count: None,
+                        log_line_count: None,
+                        last_activity_seconds_ago: Some(0),
+                        nudge_count: None,
+                    }],
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &readiness,
+            latest_push_attempt: None,
+        });
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
     fn test_build_recommended_action_dispatches_implementor_when_lifecycle_reports_gates_failed() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = Vec::new();
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("gates_failed", 1, 0, 12)),
@@ -8083,6 +9287,7 @@ mod tests {
         let gates = vec![doctor_gate_snapshot("test", "RUNNING")];
         let push_attempt = doctor_push_attempt_summary(Some("gate_test"), Some("gate timeout"));
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8108,7 +9313,67 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_gate_failure_overrides_stale_identity_restart() {
+    fn test_build_recommended_action_waits_when_push_attempt_failed_stage_for_different_sha() {
+        // DRA-005: push attempt failed gate stage for different SHA -> does not trigger
+        // dispatch
+        let reviews = doctor_reviews_with_terminal_reason(None);
+        let findings = pending_findings_summary();
+        let terminal_reasons = std::collections::BTreeMap::new();
+        let gates = Vec::new();
+        let push_attempt = super::DoctorPushAttemptSummary {
+            ts: "fixture-ts".to_string(),
+            sha: "deadbeefdeadbeefdeadbeefdeadbeef00000000".to_string(),
+            failed_stage: Some("gate_test".to_string()),
+            exit_code: Some(1),
+            duration_s: Some(30),
+            error_hint: Some("gate timeout".to_string()),
+        };
+        let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
+            pr_number: 42,
+            repair_signals: &super::DoctorRepairSignals::default(),
+            lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
+            gates: &gates,
+            agent_activity: super::build_doctor_agent_activity_summary(Some(
+                &super::DoctorAgentSection {
+                    max_active_agents_per_pr: 2,
+                    active_agents: 1,
+                    total_agents: 1,
+                    entries: vec![super::DoctorAgentSnapshot {
+                        agent_type: "security".to_string(),
+                        state: "running".to_string(),
+                        run_id: "run-1".to_string(),
+                        sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                        pid: Some(1234),
+                        pid_alive: true,
+                        started_at: "2026-02-15T00:00:00Z".to_string(),
+                        completion_status: None,
+                        completion_summary: None,
+                        completion_token_hash: String::new(),
+                        completion_token_expires_at: String::new(),
+                        elapsed_seconds: Some(10),
+                        models_attempted: Vec::new(),
+                        tool_call_count: None,
+                        log_line_count: None,
+                        last_activity_seconds_ago: Some(0),
+                        nudge_count: None,
+                    }],
+                },
+            )),
+            reviews: &reviews,
+            review_terminal_reasons: &terminal_reasons,
+            findings_summary: &findings,
+            merge_readiness: &doctor_merge_readiness_fixture(
+                super::DoctorMergeConflictStatus::Unknown,
+            ),
+            latest_push_attempt: Some(&push_attempt),
+        });
+        assert_eq!(action.action, "wait");
+    }
+
+    #[test]
+    fn test_build_recommended_action_gate_projection_fail_triggers_dispatch_despite_stale_sha_freshness()
+     {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
@@ -8123,6 +9388,7 @@ mod tests {
             merge_conflict_status: super::DoctorMergeConflictStatus::NoConflicts,
         };
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8145,13 +9411,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_gate_progress_is_unknown_without_active_reviewers()
-     {
+    fn test_build_recommended_action_fixes_when_gate_progress_is_unknown_without_active_reviewers()
+    {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = Vec::new();
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: None,
@@ -8172,7 +9439,7 @@ mod tests {
             ),
             latest_push_attempt: None,
         });
-        assert_eq!(action.action, "restart_reviews");
+        assert_eq!(action.action, "fix");
     }
 
     #[test]
@@ -8201,6 +9468,7 @@ mod tests {
         let gates = gates_by_name.into_values().collect::<Vec<_>>();
 
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8232,6 +9500,7 @@ mod tests {
         let terminal_reasons = std::collections::BTreeMap::new();
         let gates = vec![doctor_gate_snapshot("test", "FAIL")];
         let action = super::build_recommended_action(&super::DoctorActionInputs {
+            authoritative_sha: "0123456789abcdef0123456789abcdef01234567",
             pr_number: 42,
             repair_signals: &super::DoctorRepairSignals::default(),
             lifecycle: Some(&doctor_lifecycle_fixture("review_in_progress", 1, 0, 12)),
@@ -8296,7 +9565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_recommended_action_restarts_when_active_reviewers_are_idle() {
+    fn test_build_recommended_action_fixes_when_active_reviewers_are_idle() {
         let reviews = doctor_reviews_with_terminal_reason(None);
         let findings = pending_findings_summary();
         let agents = super::DoctorAgentSection {
@@ -8313,10 +9582,11 @@ mod tests {
             &findings,
             &doctor_merge_readiness_fixture(super::DoctorMergeConflictStatus::Unknown),
         );
-        assert_eq!(action.action, "restart_reviews");
-        let command = action.command.expect("restart command");
-        assert!(command.contains("--force"));
-        assert!(command.contains("--refresh-identity"));
+        assert_eq!(action.action, "fix");
+        let command = action.command.expect("fix command");
+        assert_eq!(command, "apm2 fac doctor --pr 42 --fix");
+        assert!(action.follow_up_fix);
+        assert!(action.follow_up_force);
     }
 
     #[test]
@@ -8386,22 +9656,32 @@ mod tests {
         );
         assert_eq!(action.action, "escalate");
         let command = action.command.expect("escalate command");
-        assert!(command.contains("apm2 fac doctor --pr 42 --json"));
+        assert!(command.contains("apm2 fac doctor --pr 42"));
     }
 
     #[test]
-    fn test_doctor_recommended_restart_helpers_follow_recommended_action_contract() {
-        let mut summary = doctor_pr_summary_for_restart_tests(pending_findings_summary(), None);
-        assert!(!super::doctor_recommended_action_requests_restart(&summary));
-        assert!(!super::doctor_recommended_restart_force(&summary));
+    fn test_doctor_recommended_fix_helpers_follow_recommended_action_contract() {
+        let mut summary = doctor_pr_summary_for_fix_tests(pending_findings_summary(), None);
+        assert!(!super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
 
-        summary.recommended_action.action = "restart_reviews".to_string();
-        assert!(super::doctor_recommended_action_requests_restart(&summary));
-        assert!(!super::doctor_recommended_restart_force(&summary));
+        summary.recommended_action.action = "fix".to_string();
+        assert!(!super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
 
-        summary.recommended_action.command =
-            Some("apm2 fac restart --pr 42 --force --refresh-identity".to_string());
-        assert!(super::doctor_recommended_restart_force(&summary));
+        summary.recommended_action.follow_up_fix = true;
+        summary.recommended_action.follow_up_force = false;
+        assert!(super::doctor_recommended_action_requests_follow_up_fix(
+            &summary
+        ));
+        assert!(!super::doctor_recommended_follow_up_fix_force(&summary));
+
+        summary.recommended_action.follow_up_force = true;
+        assert!(super::doctor_recommended_follow_up_fix_force(&summary));
     }
 
     #[test]
@@ -8563,7 +9843,6 @@ mod tests {
         assert!(normalized.contains("escalate"));
         assert!(normalized.contains("fix"));
         assert!(normalized.contains("dispatch_implementor"));
-        assert!(normalized.contains("restart_reviews"));
         assert!(normalized.contains("merge"));
         assert!(normalized.contains("done"));
         assert!(normalized.contains("approve"));
@@ -8586,6 +9865,17 @@ mod tests {
             super::doctor_wait_terminal_reason("dispatch_implementor"),
             "dispatch_implementor"
         );
+    }
+
+    #[test]
+    fn test_dispatch_run_state_terminal_labels_include_done_and_crashed() {
+        assert!(super::dispatch_run_state_is_terminal("done"));
+        assert!(super::dispatch_run_state_is_terminal("failed"));
+        assert!(super::dispatch_run_state_is_terminal("crashed"));
+        assert!(super::dispatch_run_state_is_terminal("completed"));
+        assert!(super::dispatch_run_state_is_terminal("cancelled"));
+        assert!(!super::dispatch_run_state_is_terminal("pending"));
+        assert!(!super::dispatch_run_state_is_terminal("alive"));
     }
 
     #[test]
@@ -9135,6 +10425,114 @@ mod tests {
     }
 
     #[test]
+    fn doctor_wait_pulse_mode_rechecks_on_pulse_wakeups_without_timer_backstop() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Pulse,
+            false,
+        ));
+        assert!(!super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_mode_rechecks_on_timer_backstop() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PulsePrimary,
+            super::DoctorWaitWakeReason::Timer,
+            true,
+        ));
+    }
+
+    #[test]
+    fn doctor_wait_polling_mode_rechecks_on_timer_wakeups() {
+        assert!(super::doctor_wait_should_collect_summary(
+            super::DoctorWaitMode::PollingFallback,
+            super::DoctorWaitWakeReason::Timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn doctor_pulse_client_sub_id_is_bounded_and_ascii() {
+        let long_repo = "Guardian-Intelligence/APM2/With/Very/Long/Repository/Path/Components";
+        let sub_id = super::build_doctor_pulse_client_sub_id(long_repo, 42);
+        assert!(!sub_id.is_empty());
+        assert!(sub_id.is_ascii(), "client_sub_id must be ASCII");
+        assert!(
+            sub_id.len() <= super::DOCTOR_WAIT_PULSE_CLIENT_SUB_ID_MAX_LEN,
+            "client_sub_id exceeded max length: {}",
+            sub_id.len()
+        );
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_rejects_duplicate_fingerprint() {
+        let mut deduper = super::DoctorPulseDeduper::new(4);
+        let pulse = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+
+        assert!(deduper.insert_if_new(&pulse));
+        assert!(!deduper.insert_if_new(&pulse));
+    }
+
+    #[test]
+    fn doctor_pulse_deduper_evicts_oldest_entry_when_capacity_reached() {
+        let mut deduper = super::DoctorPulseDeduper::new(2);
+        let pulse_1 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-1".to_string()),
+            topic: Some("work.W-1.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(10),
+        };
+        let pulse_2 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-2".to_string()),
+            topic: Some("work.W-2.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(11),
+        };
+        let pulse_3 = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-3".to_string()),
+            topic: Some("work.W-3.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(12),
+        };
+
+        assert!(deduper.insert_if_new(&pulse_1));
+        assert!(deduper.insert_if_new(&pulse_2));
+        assert!(deduper.insert_if_new(&pulse_3));
+
+        // pulse_1 should have been evicted when pulse_3 was inserted.
+        assert!(deduper.insert_if_new(&pulse_1));
+    }
+
+    #[test]
+    fn doctor_wait_pulse_scope_filters_unrelated_events() {
+        let relevant = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-work".to_string()),
+            topic: Some("work.W-123.events".to_string()),
+            event_type: Some("work.transitioned".to_string()),
+            ledger_cursor: Some(42),
+        };
+        assert!(super::doctor_wait_pulse_is_relevant(&relevant));
+
+        let unrelated = super::DoctorPulseMetadata {
+            pulse_id: Some("pulse-session".to_string()),
+            topic: Some("session.S-1.lifecycle".to_string()),
+            event_type: Some("session.started".to_string()),
+            ledger_cursor: Some(43),
+        };
+        assert!(!super::doctor_wait_pulse_is_relevant(&unrelated));
+    }
+
+    #[test]
     fn upsert_doctor_gate_snapshot_prefers_inflight_over_pass() {
         let mut gates = std::collections::BTreeMap::new();
         super::upsert_doctor_gate_snapshot(
@@ -9261,5 +10659,25 @@ mod tests {
             selected,
             vec![(42, "guardian-intelligence/apm2".to_string())]
         );
+    }
+
+    #[test]
+    fn tracked_pr_candidate_filter_preserves_explicit_test_repo_filter() {
+        let selected = super::filter_tracked_pr_candidates(
+            vec![(42, "test/capacity-load".to_string())],
+            Some("test/capacity-load"),
+            super::MAX_TRACKED_PR_SUMMARIES,
+        );
+        assert_eq!(selected, vec![(42, "test/capacity-load".to_string())]);
+    }
+
+    #[test]
+    fn tracked_pr_candidate_filter_excludes_synthetic_repo_without_filter() {
+        let selected = super::filter_tracked_pr_candidates(
+            vec![(42, "test/capacity-load".to_string())],
+            None,
+            super::MAX_TRACKED_PR_SUMMARIES,
+        );
+        assert!(selected.is_empty());
     }
 }

@@ -145,6 +145,9 @@ pub mod harness_sandbox;
 /// Prune old time buckets, rebuild deterministically, and emit
 /// `IndexCompactionReceiptV1`.
 pub mod index_compaction;
+/// Queue lifecycle ledger event vocabulary and content-addressable job identity
+/// helpers (TCK-00669).
+pub mod job_lifecycle;
 pub mod job_spec;
 mod key_policy;
 pub mod lane;
@@ -210,6 +213,7 @@ pub mod serde_helpers;
 pub mod service_user_gate;
 pub mod signed_receipt;
 mod systemd_properties;
+pub mod systemd_unit;
 pub mod taint;
 mod terminal_verifier;
 pub mod token_ledger;
@@ -533,8 +537,10 @@ pub use receipt_pipeline::{
 // Re-export reconcile types (TCK-00534)
 pub use reconcile::{
     LaneRecoveryAction, MAX_CLAIMED_SCAN_ENTRIES, MAX_LANE_RECOVERY_ACTIONS,
-    MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueRecoveryAction, RECONCILE_RECEIPT_SCHEMA,
-    ReconcileError, ReconcileReceiptV1, reconcile_on_startup,
+    MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueReconcileLimits, QueueRecoveryAction,
+    RECONCILE_RECEIPT_SCHEMA, RUNTIME_QUEUE_RECONCILE_OUTCOME_SCHEMA, ReconcileError,
+    ReconcileReceiptV1, RuntimeQueueReconcileConfig, RuntimeQueueReconcileOutcome,
+    RuntimeQueueReconcileStatus, reconcile_claimed_runtime, reconcile_on_startup,
 };
 pub use repo_mirror::{
     CheckoutOutcome, DEFAULT_CLONE_TIMEOUT_SECS, DEFAULT_FETCH_TIMEOUT_SECS,
@@ -619,6 +625,13 @@ pub mod view_commitment;
 /// `WorkAuthorityBindingsV1` with bounded decoding, `deny_unknown_fields`,
 /// and per-artifact byte limits.
 pub mod work_cas_schemas;
+/// Publish and anchor `WorkLoopProfileV1` artifacts (RFC-0032 Phase 4,
+/// TCK-00645).
+///
+/// Validates, canonicalizes, stores in CAS, and computes deterministic
+/// evidence IDs for work loop profiles. Publication is idempotent on
+/// `(work_id, dedupe_key)`.
+pub mod work_loop_profile_publish;
 // Re-export view commitment types
 // Re-export summary receipt types (TCK-00327)
 // Re-export builtin role types (TCK-00331)
@@ -810,11 +823,17 @@ pub use node_identity::{
 pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)
 pub use safe_rmtree::{
-    MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt,
-    SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit,
+    DirModeNormalizationSummary, MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH,
+    RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
+    normalize_user_owned_dir_modes_for_safe_delete, safe_rmtree_v1,
+    safe_rmtree_v1_with_entry_limit,
 };
 pub use systemd_properties::{
     NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, resolve_network_policy,
+};
+pub use systemd_unit::{
+    FAC_UNIT_LIVENESS_UNAVAILABLE_REASON, FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    check_fac_lane_liveness, check_fac_unit_liveness, detect_systemd_unit_name,
 };
 pub use warm::{
     DEFAULT_WARM_PHASES, MAX_WARM_PHASES, MAX_WARM_RECEIPT_SIZE, MAX_WARM_STRING_LENGTH,
@@ -832,4 +851,9 @@ pub use work_cas_schemas::{
     WorkContextEntryV1, WorkContextKind, WorkLoopProfileV1, WorkSpecRepo, WorkSpecType, WorkSpecV1,
     WorkspaceConfig, bounded_decode_authority_bindings, bounded_decode_context_entry,
     bounded_decode_loop_profile, bounded_decode_work_spec, canonicalize_for_cas,
+};
+// Re-export work loop profile publish types (TCK-00645, RFC-0032 Phase 4)
+pub use work_loop_profile_publish::{
+    PublishWorkLoopProfileError, PublishWorkLoopProfileResult, compute_evidence_id,
+    publish_work_loop_profile,
 };

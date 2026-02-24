@@ -9,15 +9,15 @@ The `fac_review` module implements the `apm2 fac review *` command family, which
 ### Architecture
 
 ```
-apm2 fac review run --pr <N> --type all
+apm2 fac doctor --pr <N> --fix
        |
-       +-- orchestrator.rs   (main loop: spawn, monitor, restart, collect)
+       +-- orchestrator.rs   (reviewer missing-verdict decision machine artifact)
        |      |
        |      +-- dispatch.rs     (idempotent detached dispatch via systemd)
        |      +-- backend.rs      (model backend selection: Codex / Gemini / ClaudeCode)
        |      +-- model_pool.rs   (fallback model pool with priority)
        |      +-- liveness.rs     (stall detection via pulse files)
-       |      +-- restart.rs      (CI-state-aware pipeline restart)
+       |      +-- repair_cycle.rs (CI-state-aware PR fix follow-up cycle)
        |      +-- merge_conflicts.rs (merge conflict detection)
         |      +-- timeout_policy.rs (uniform bounded test timeout policy)
        |
@@ -26,7 +26,6 @@ apm2 fac review run --pr <N> --type all
        +-- events.rs         (NDJSON lifecycle telemetry)
        +-- barrier.rs        (GitHub helper primitives: auth/head/metadata rendering)
        +-- ci_status.rs      (CI check-suite status querying)
-       +-- decision.rs       (legacy verdict set/show compatibility helpers)
        +-- detection.rs      (review detection from PR comments)
        +-- evidence.rs       (evidence artifact collection)
        +-- findings.rs       (review findings aggregation)
@@ -47,9 +46,8 @@ apm2 fac review run --pr <N> --type all
 
 ### Key Behaviors
 
-- **Parallel orchestration**: Security and quality reviews run in parallel when `--type all`.
-- **Multi-model fallback**: If a model stalls, the orchestrator cycles through a model pool (`model_pool.rs`).
-- **Liveness monitoring**: Pulse files track reviewer health; stall threshold is 90 seconds.
+- **Detached dispatch**: Security and quality reviewers are dispatched idempotently and tracked via lifecycle + dispatch markers.
+- **Liveness monitoring**: Pulse files track reviewer health; stale/idle lanes surface through doctor diagnostics and repair recommendations.
 - **Idempotent dispatch**: `DispatchIdempotencyKey` prevents duplicate reviews for the same SHA.
 - **SHA freshness**: Reviews are invalidated if PR head moves during execution.
 - **Rust-native bounded tests**: FAC constructs `systemd-run` bounded test execution in Rust.
@@ -65,10 +63,9 @@ apm2 fac review run --pr <N> --type all
   unconditionally stripped both in `build_policy_setenv_pairs()` and via
   `env_remove_keys` on the spawned process (TCK-00548, INV-ENV-008).
 - **NDJSON telemetry**: All lifecycle events are appended to `~/.apm2/review_events.ndjson`.
-- **One-shot missing-verdict nudge**: On clean exit without a completion signal, orchestrator resumes the same session once (`SpawnMode::Resume`) with an explicit required `apm2 fac verdict set ...` command; crash/timeout paths still fall through to existing auto-verdict behavior.
-- **CI-aware restart**: `apm2 fac restart` analyzes CI check-suite state before restarting.
-- **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA (used by restart and dispatch paths; the pipeline path uses mirror-based lane checkout instead, see TCK-00544).
-- **Per-SHA finding comments**: `apm2 fac review comment` writes one finding per comment using an `apm2-finding:v1` marker and `apm2.finding.v1` metadata block.
+- **CI-aware repair strategy**: Doctor repair planning analyzes CI/check-suite state before applying repair actions.
+- **Worktree-aware dispatch**: Detached review dispatch resolves and uses the worktree whose `HEAD` matches target SHA (used by doctor-fix repair and dispatch paths; the pipeline path uses mirror-based lane checkout instead, see TCK-00544).
+- **Per-SHA findings**: `apm2 fac review finding` appends one structured finding bound to PR+SHA+dimension.
 - **PR body gate status sync**: `apm2 fac push` writes a marker-bounded gate-status section in the PR body with expanded latest SHA and collapsed previous SHA snapshots.
 - **Non-interactive GitHub CLI** (TCK-00597): All `gh` CLI calls use `apm2_core::fac::gh_command()` for token-based auth (via credential resolution chain) and lane-scoped `GH_CONFIG_DIR`, removing the dependency on `gh auth login` or `~/.config/gh` state.
 
@@ -261,18 +258,15 @@ pub use types::ReviewRunType;
 
 | Function | Description |
 |----------|-------------|
-| `run_review(repo, pr, type, sha, force, json)` | Run security/quality reviews synchronously |
-| `run_dispatch(repo, pr, type, sha, force, json)` | Dispatch reviews as detached processes |
-| `run_status(pr_number, type_filter, json)` | Show review run status (optionally one reviewer lane) |
-| `run_findings(repo, pr, sha, refresh, json)` | Aggregate review findings with optional cache refresh |
-| `run_comment(repo, pr, sha, severity, type, body, json)` | Compatibility shim to append a structured finding |
+| `run_doctor(repo, pr, fix, json, wait, timeout, exit_on)` | FAC doctor diagnostics and optional repair plan execution |
+| `run_findings(repo, pr, sha, json)` | Aggregate review findings for the selected PR/SHA |
+| `run_finding(repo, pr, sha, type, severity, summary, details, risk, impact, location, reviewer_id, model_id, backend_id, evidence_pointer, json)` | Append one structured finding |
 | `run_prepare(repo, pr, sha, json)` | Prepare review inputs |
 | `run_verdict_set(repo, pr, sha, dim, verdict, reason, keep, json)` | Set review verdict |
 | `run_verdict_show(repo, pr, sha, json)` | Show review verdicts |
-| `run_project(pr, sha, since, after_seq, errors, fail_term, format_json, json)` | Best-effort projection for debug/log surfaces; non-critical by default |
+| `run_terminate(repo, pr, type, json)` | Terminate one active reviewer lane with decision-bound authority checks |
 | `run_tail(lines, follow)` | Tail review event log |
-| `run_push(repo, remote, branch, ticket)` | Push review branch with commit signing |
-| `run_restart(repo, pr, force, json)` | CI-aware pipeline restart |
+| `run_push(repo, remote, branch, ticket)` | Push review branch and dispatch review pipeline |
 | `run_pipeline(repo, pr_number, sha)` | End-to-end: dispatch + project |
 | `run_logs(pr, repo, selector_type, selector, json)` | Retrieve review logs |
 | `run_gates(force, quick, timeout, mem, pids, cpu, gate_profile, json)` | Run pre-review gate checks |
@@ -287,7 +281,7 @@ pub use types::ReviewRunType;
 ## References
 
 - `~/.apm2/review_events.ndjson`: NDJSON lifecycle telemetry log
-- `~/.apm2/review_state.json`: Legacy reviewer state file
+- `~/.apm2/review_state.json`: Reviewer run-state index
 - `~/.apm2/reviews/<pr>/<type>/state.json`: Per-run deterministic state
 - `~/.apm2/review_pulses/`: Pulse files for liveness detection
 - `~/.apm2/review_locks/`: File-based dispatch locks
@@ -329,7 +323,7 @@ pub use types::ReviewRunType;
   - `evidence.rs`: `build_pipeline_test_command()` loads policy and builds policy-filtered environment for bounded pipeline test execution. Policy loading delegates to `policy_loader::load_or_create_fac_policy()`. `build_gate_policy_env()` added to construct policy-filtered env for non-test gates. `run_evidence_gates()` and `run_evidence_gates_with_status()` now pass the policy-filtered environment to ALL gates (fmt, clippy, doc, script gates, workspace integrity), not just the test gate. `run_gate_command_with_heartbeat()` now calls `env_clear()` before applying `extra_env` to enforce default-deny. `WRAPPER_STRIP_KEYS` and `WRAPPER_STRIP_PREFIXES` constants define `RUSTC_WRAPPER` and `SCCACHE_*` keys that are stripped from ALL gate phases (not just bounded test) via `env_remove_keys` on `Command`. `compute_gate_env_remove_keys()` computes the full removal set from both the ambient process env AND the policy-filtered environment (so policy-introduced SCCACHE_* variables are also discovered).
   - `bounded_test_runner.rs`: TCK-00549 replaced ad-hoc `SYSTEMD_SETENV_ALLOWLIST_EXACT`/`SYSTEMD_SETENV_ALLOWLIST_PREFIXES` with policy-driven environment. The bounded executor now accepts a pre-computed `FacPolicyV1` environment and forwards it via `--setenv` args. No ad-hoc allowlists remain; the single source of truth for env filtering is `build_job_environment()`.
 - TCK-00575: Per-lane HOME/TMPDIR/XDG env isolation + symlink safety + concurrency.
-  - `gates.rs`: `compute_nextest_test_environment()` calls `ensure_lane_env_dirs()` + `apply_lane_env_overrides()` for per-lane env isolation. `run_gates_inner()` acquires an exclusive lane lock on `lane-00` via `LaneManager::acquire_lock()` before any lane operations, preventing concurrent `apm2 fac gates` collisions. Also checks lane-00 for CORRUPT state before execution, refusing to run in a dirty environment (directs user to `apm2 fac lane reset lane-00`).
+  - `gates.rs`: `compute_nextest_test_environment()` calls `ensure_lane_env_dirs()` + `apply_lane_env_overrides()` for per-lane env isolation. `run_gates_inner()` acquires an exclusive lane lock on `lane-00` via `LaneManager::acquire_lock()` before any lane operations, preventing concurrent `apm2 fac gates` collisions. Also checks lane-00 for CORRUPT state before execution, refusing to run in a dirty environment (directs user to `apm2 fac doctor --fix`).
   - `evidence.rs`: `build_pipeline_test_command()` and `build_gate_policy_env()` accept a `lane_dir` parameter from the actually-locked lane (returned by `allocate_lane_job_logs_dir` / `allocate_evidence_lane_context`) and call `ensure_lane_env_dirs()` + `apply_lane_env_overrides()` using that lane directory, maintaining lock/env coupling. `EvidenceLaneContext` contains `logs_dir`, `lane_dir`, and `_lane_guard` so callers use the correct lane for env overrides. Every FAC gate phase (fmt, clippy, doc, test, script) runs with deterministic lane-local `HOME`/`TMPDIR`/`XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` values scoped to the locked lane.
   - `policy.rs`: `ensure_lane_env_dirs()` uses atomic creation (mkdir + handle `AlreadyExists`) instead of `exists()` check, eliminating TOCTOU. `verify_dir_permissions()` is the shared public helper for directory permission verification (symlink rejection, ownership check, mode 0o700 in operator mode/0o770 in system-mode), used by both `verify_lane_env_dir_permissions()` and `verify_cargo_home_permissions()`. UID comparison uses `subtle::ConstantTimeEq`.
   - `policy_loader.rs`: `ensure_managed_cargo_home()` uses atomic creation (mkdir + handle `AlreadyExists`) instead of `exists()` check. `verify_cargo_home_permissions()` delegates to the shared `verify_dir_permissions()` helper in `apm2-core`.

@@ -107,6 +107,8 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         // Core state-mutating operations with world effects.
         // =================================================================
         "hsi.work.claim"
+        | "hsi.work.claim_v2"
+        | "hsi.work.open"
         | "hsi.episode.spawn"
         | "hsi.capability.issue"
         | "hsi.process.start"
@@ -117,7 +119,10 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.event.emit"
         | "hsi.evidence.publish"
         | "hsi.projection.register_recovery_evidence"
-        | "hsi.projection.request_unfreeze" => Some(AUTH_IDEMPOTENT_RECEIPT),
+        | "hsi.projection.request_unfreeze"
+        | "hsi.work_context.publish"
+        | "hsi.work.record_pr_association"
+        | "hsi.work_loop_profile.publish" => Some(AUTH_IDEMPOTENT_RECEIPT),
 
         // =================================================================
         // Authoritative + best-effort idempotency + receipt-required
@@ -159,6 +164,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.consensus.metrics"
         | "hsi.work.status"
         | "hsi.work.list"
+        | "hsi.work.resolve_ticket_alias"
         | "hsi.ledger.verify_chain"
         | "hsi.launch.auditor_projection"
         | "hsi.launch.orchestrator_projection"
@@ -183,6 +189,8 @@ mod tests {
         // Verify a representative sample of routes have annotations
         let known_routes = [
             "hsi.work.claim",
+            "hsi.work.claim_v2",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.daemon.shutdown",
@@ -197,6 +205,10 @@ mod tests {
             "hsi.ledger.verify_chain",
             "hsi.projection.register_recovery_evidence",
             "hsi.projection.request_unfreeze",
+            "hsi.work_context.publish",
+            "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
+            "hsi.work.resolve_ticket_alias",
         ];
         for route in &known_routes {
             assert!(
@@ -219,6 +231,8 @@ mod tests {
         // require receipts.
         let all_routes = [
             "hsi.work.claim",
+            "hsi.work.claim_v2",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.process.start",
@@ -229,6 +243,9 @@ mod tests {
             "hsi.evidence.publish",
             "hsi.projection.register_recovery_evidence",
             "hsi.projection.request_unfreeze",
+            "hsi.work_context.publish",
+            "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
             "hsi.process.stop",
             "hsi.process.restart",
             "hsi.process.reload",
@@ -330,6 +347,8 @@ mod tests {
         let side_effectful_routes = [
             // Core state-mutating operations
             "hsi.work.claim",
+            "hsi.work.claim_v2",
+            "hsi.work.open",
             "hsi.episode.spawn",
             "hsi.capability.issue",
             "hsi.process.start",
@@ -340,6 +359,9 @@ mod tests {
             "hsi.evidence.publish",
             "hsi.projection.register_recovery_evidence",
             "hsi.projection.request_unfreeze",
+            "hsi.work_context.publish",
+            "hsi.work.record_pr_association",
+            "hsi.work_loop_profile.publish",
             // Lifecycle operations
             "hsi.process.stop",
             "hsi.process.restart",

@@ -175,6 +175,28 @@ pub enum evidence_event::Event {
 }
 ```
 
+### `WorkGraphEvent` (RFC-0032, TCK-00642)
+
+Dependency edge events between work items in the work graph.
+
+```rust
+pub enum work_graph_event::Event {
+    Added(WorkEdgeAdded),
+    Removed(WorkEdgeRemoved),
+    Waived(WorkEdgeWaived),
+}
+```
+
+| Event | Description |
+|-------|-------------|
+| `WorkEdgeAdded` | Directional dependency edge added (from -> to) |
+| `WorkEdgeRemoved` | Previously established edge removed |
+| `WorkEdgeWaived` | Edge intentionally overridden with audit justification |
+
+**Invariants:**
+- [INV-TOPIC-005] Event type strings use `work_graph.edge.*` prefix, NOT `work.*`, to avoid WorkReducer decoding collision
+- Topic derivation emits topics for BOTH `from_work_id` and `to_work_id` (multi-topic derivation)
+
 ### `KeyEvent`
 
 Key rotation events for actor signing keys.

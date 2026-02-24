@@ -453,6 +453,46 @@ pub struct WorkStatusRequest {
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
 }
+/// Structured dependency diagnostic attached to WorkStatus responses.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkDependencyDiagnostic {
+    /// Stable machine-readable reason code.
+    #[prost(string, tag = "1")]
+    pub reason_code: ::prost::alloc::string::String,
+    /// Severity classification.
+    #[prost(enumeration = "WorkDependencyDiagnosticSeverity", tag = "2")]
+    pub severity: i32,
+    /// Human-readable detail.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    /// Deterministic edge identifier.
+    #[prost(string, tag = "4")]
+    pub edge_id: ::prost::alloc::string::String,
+    /// Source work item ID.
+    #[prost(string, tag = "5")]
+    pub from_work_id: ::prost::alloc::string::String,
+    /// Target work item ID.
+    #[prost(string, tag = "6")]
+    pub to_work_id: ::prost::alloc::string::String,
+    /// Current source work state, when known.
+    #[prost(string, optional, tag = "7")]
+    pub from_work_state: ::core::option::Option<::prost::alloc::string::String>,
+    /// Whether a waiver is currently active.
+    #[prost(bool, tag = "8")]
+    pub waived: bool,
+    /// Waiver identifier, when present.
+    #[prost(string, optional, tag = "9")]
+    pub waiver_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Waiver expiry timestamp in ns, when present.
+    #[prost(uint64, optional, tag = "10")]
+    pub waiver_expires_at_ns: ::core::option::Option<u64>,
+    /// Remaining waiver lifetime in ns, when present.
+    #[prost(uint64, optional, tag = "11")]
+    pub waiver_remaining_ns: ::core::option::Option<u64>,
+    /// Whether this edge was added late (after dependent had already started).
+    #[prost(bool, tag = "12")]
+    pub late_edge: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkStatusResponse {
     /// Work identifier.
@@ -479,6 +519,13 @@ pub struct WorkStatusResponse {
     /// Work claimed timestamp (nanoseconds since epoch, if claimed).
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
+    /// Whether implementer claim is currently blocked by unsatisfied incoming
+    /// BLOCKS dependencies.
+    #[prost(bool, tag = "9")]
+    pub implementer_claim_blocked: bool,
+    /// Structured dependency diagnostics for doctor/work status consumers.
+    #[prost(message, repeated, tag = "10")]
+    pub dependency_diagnostics: ::prost::alloc::vec::Vec<WorkDependencyDiagnostic>,
 }
 /// IPC-PRIV-019: WorkList (TCK-00415)
 /// List all work items known to projection authority.
@@ -589,8 +636,11 @@ pub struct PublishChangeSetRequest {
     /// Work identifier this changeset belongs to.
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
+    /// Lease identifier proving authority for this work mutation.
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
     /// Serialized ChangeSetBundleV1 (canonical JSON bytes).
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", tag = "3")]
     pub bundle_bytes: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response confirming changeset publication.
@@ -1815,6 +1865,216 @@ pub struct RequestUnfreezeResponse {
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+/// Opens a new work item by persisting a validated WorkSpec to CAS
+/// and emitting a canonical work.opened event. Actor ID is derived
+/// from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenWorkRequest {
+    /// Canonical JSON-encoded WorkSpec (schema: apm2.work_spec.v1).
+    /// Must pass bounded decode + schema validation before acceptance.
+    #[prost(bytes = "vec", tag = "1")]
+    pub work_spec_json: ::prost::alloc::vec::Vec<u8>,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    /// Required when PCAC lifecycle gate is wired (fail-closed if empty).
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenWorkResponse {
+    /// Assigned canonical work identifier (W-{uuid} or from WorkSpec).
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub spec_snapshot_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Whether this was an idempotent no-op (work already existed with same hash).
+    #[prost(bool, tag = "3")]
+    pub already_existed: bool,
+}
+/// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+/// Publishes a work context entry to CAS and anchors it in the ledger via
+/// evidence.published with category WORK_CONTEXT_ENTRY.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkContextEntryRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Entry kind discriminant from closed WorkContextKind allowlist.
+    /// Accepted values: HandoffNote, ImplementerTerminal, Diagnosis,
+    /// ReviewFinding, ReviewVerdict, GateNote, Linkout.
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Deduplication key for idempotent publishing.
+    /// Must not be empty. Uniqueness is enforced on (work_id, kind, dedupe_key).
+    #[prost(string, tag = "3")]
+    pub dedupe_key: ::prost::alloc::string::String,
+    /// JSON-encoded WorkContextEntryV1 payload (max 256 KiB).
+    /// The daemon overwrites entry_id, actor_id, and created_at_ns with
+    /// daemon-authoritative values before CAS storage.
+    #[prost(bytes = "vec", tag = "4")]
+    pub entry_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement. Required.
+    #[prost(string, tag = "5")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkContextEntryResponse {
+    /// Deterministically derived entry_id (CTX- followed by blake3 hex).
+    #[prost(string, tag = "1")]
+    pub entry_id: ::prost::alloc::string::String,
+    /// Evidence ID (same as entry_id per ticket spec).
+    #[prost(string, tag = "2")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// CAS hash of the canonical entry bytes (hex-encoded BLAKE3).
+    #[prost(string, tag = "3")]
+    pub cas_hash: ::prost::alloc::string::String,
+    /// Work ID echoed back.
+    #[prost(string, tag = "4")]
+    pub work_id: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+/// Publishes a work loop profile to CAS and anchors it in the ledger via
+/// evidence.published with category WORK_LOOP_PROFILE.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkLoopProfileRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Deduplication key for idempotent publishing.
+    /// Must not be empty. Idempotency is enforced on (work_id, dedupe_key).
+    #[prost(string, tag = "2")]
+    pub dedupe_key: ::prost::alloc::string::String,
+    /// JSON-encoded WorkLoopProfileV1 payload (max 64 KiB).
+    /// The daemon validates bounded decode and deny_unknown_fields semantics.
+    #[prost(bytes = "vec", tag = "3")]
+    pub profile_json: ::prost::alloc::vec::Vec<u8>,
+    /// Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+    /// Required.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishWorkLoopProfileResponse {
+    /// Deterministic evidence ID (WLP- prefix).
+    #[prost(string, tag = "1")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// CAS hash of the canonical profile bytes (hex-encoded BLAKE3).
+    #[prost(string, tag = "2")]
+    pub cas_hash: ::prost::alloc::string::String,
+    /// Work ID echoed back.
+    #[prost(string, tag = "3")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Dedupe key echoed back.
+    #[prost(string, tag = "4")]
+    pub dedupe_key: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+/// Claims an EXISTING work item (opened via OpenWork). Does not create a new
+/// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
+/// ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
+/// WorkAuthorityBindings to CAS anchored via evidence.published.
+/// Actor ID is derived from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkV2Request {
+    /// Canonical work identifier from a prior OpenWork. Must already exist.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Role for this claim (IMPLEMENTER, REVIEWER, COORDINATOR).
+    #[prost(enumeration = "WorkRole", tag = "2")]
+    pub role: i32,
+    /// Governing lease ID for PCAC lifecycle enforcement.
+    /// Required when PCAC lifecycle gate is wired (fail-closed if empty).
+    #[prost(string, tag = "3")]
+    pub lease_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkV2Response {
+    /// Echoed canonical work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Newly issued lease identifier for this claim.
+    #[prost(string, tag = "2")]
+    pub issued_lease_id: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the WorkAuthorityBindings CAS document (hex-encoded).
+    #[prost(string, tag = "3")]
+    pub authority_bindings_hash: ::prost::alloc::string::String,
+    /// Evidence ID anchoring the authority bindings (WAB- prefix).
+    #[prost(string, tag = "4")]
+    pub evidence_id: ::prost::alloc::string::String,
+    /// Whether this was an idempotent re-claim by the same actor.
+    #[prost(bool, tag = "5")]
+    pub already_claimed: bool,
+}
+/// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+/// Records a PR association for an existing work item. Emits a canonical
+/// work.pr_associated event and optionally publishes a LINKOUT context entry
+/// with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
+/// Actor ID is derived from peer credentials (never from client input).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordWorkPrAssociationRequest {
+    /// Canonical work identifier. Must match an existing work claim.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Pull request number (must be > 0).
+    #[prost(uint64, tag = "2")]
+    pub pr_number: u64,
+    /// Commit SHA that triggered the PR (must be exactly 40 lowercase hex chars).
+    #[prost(string, tag = "3")]
+    pub commit_sha: ::prost::alloc::string::String,
+    /// Governing lease ID for PCAC lifecycle enforcement. Required.
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Optional PR URL for LINKOUT context entry publishing.
+    /// If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
+    /// with this URL as the target.
+    #[prost(string, tag = "5")]
+    pub pr_url: ::prost::alloc::string::String,
+    /// If true, validate association compatibility only and do not emit
+    /// `work.pr_associated` or LINKOUT side effects.
+    #[prost(bool, tag = "6")]
+    pub validate_only: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecordWorkPrAssociationResponse {
+    /// Echoed canonical work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Echoed PR number.
+    #[prost(uint64, tag = "2")]
+    pub pr_number: u64,
+    /// Echoed commit SHA.
+    #[prost(string, tag = "3")]
+    pub commit_sha: ::prost::alloc::string::String,
+    /// Whether this was an idempotent no-op (same association already exists).
+    #[prost(bool, tag = "4")]
+    pub already_existed: bool,
+}
+/// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+/// Resolves a ticket alias to a canonical work_id via projection state.
+/// Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
+/// WorkSpec lookup. Returns exactly one work_id on success, or an error
+/// on ambiguity/infrastructure failure (fail-closed).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveTicketAliasRequest {
+    /// Ticket alias to resolve (e.g. "TCK-00636").
+    /// Must not be empty; bounded to MAX_ID_LENGTH bytes.
+    #[prost(string, tag = "1")]
+    pub ticket_alias: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveTicketAliasResponse {
+    /// Canonical work_id resolved from the alias.
+    /// Empty when no match was found (found == false).
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// True when the alias resolved to exactly one work item.
+    #[prost(bool, tag = "2")]
+    pub found: bool,
+    /// Echoed ticket alias for response correlation.
+    #[prost(string, tag = "3")]
+    pub ticket_alias: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -2122,6 +2382,39 @@ impl WorkRole {
         }
     }
 }
+/// Severity for work dependency diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkDependencyDiagnosticSeverity {
+    Unspecified = 0,
+    Info = 1,
+    Warning = 2,
+    Error = 3,
+}
+impl WorkDependencyDiagnosticSeverity {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED",
+            Self::Info => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO",
+            Self::Warning => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING",
+            Self::Error => "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO" => Some(Self::Info),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING" => Some(Self::Warning),
+            "WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
 /// Projection uncertainty classification for fail-closed consumers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2343,6 +2636,10 @@ pub enum PrivilegedErrorCode {
     CredentialInvalidConfig = 18,
     /// Invalid argument in request (generic validation failure).
     InvalidArgument = 19,
+    /// Work item already exists with a different spec hash (TCK-00635).
+    WorkAlreadyExists = 20,
+    /// Precondition failed (e.g., work is in wrong state for the requested operation).
+    FailedPrecondition = 21,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2367,6 +2664,8 @@ impl PrivilegedErrorCode {
             Self::CredentialRefreshNotSupported => "CREDENTIAL_REFRESH_NOT_SUPPORTED",
             Self::CredentialInvalidConfig => "CREDENTIAL_INVALID_CONFIG",
             Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::WorkAlreadyExists => "WORK_ALREADY_EXISTS",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2390,6 +2689,8 @@ impl PrivilegedErrorCode {
             }
             "CREDENTIAL_INVALID_CONFIG" => Some(Self::CredentialInvalidConfig),
             "INVALID_ARGUMENT" => Some(Self::InvalidArgument),
+            "WORK_ALREADY_EXISTS" => Some(Self::WorkAlreadyExists),
+            "FAILED_PRECONDITION" => Some(Self::FailedPrecondition),
             _ => None,
         }
     }

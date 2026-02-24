@@ -120,7 +120,7 @@ impl SubstrateComponent {
                 "ensure $APM2_HOME is writable and rerun `apm2 fac gates`; if needed run `apm2 fac bootstrap`"
             },
             Self::LanePool => {
-                "repair lane substrate with `apm2 fac lane reconcile` or reinitialize with `apm2 fac lane init`"
+                "repair lane substrate with `apm2 fac doctor --fix` or reinitialize with `apm2 fac lane init`"
             },
             Self::Canonicalizer => {
                 "reset broker admission artifacts under $APM2_HOME/private/fac/broker and rerun readiness"
@@ -129,7 +129,7 @@ impl SubstrateComponent {
                 "adopt a valid economics profile hash with `apm2 fac economics adopt <b3-256:...>`"
             },
             Self::WorkerBroker => {
-                "start a FAC worker (`apm2 fac worker --poll-interval-secs 1`) and ensure broker state is healthy"
+                "ensure the FAC worker service is active (`apm2-worker.service`) and broker state is healthy"
             },
             Self::CargoDeps => {
                 "fix managed cargo home permissions under $APM2_HOME/private/fac/cargo_home"

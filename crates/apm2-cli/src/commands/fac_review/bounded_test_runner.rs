@@ -29,7 +29,9 @@ use std::process::Command;
 use apm2_core::fac::execution_backend::{
     ExecutionBackend, SystemModeConfig, build_systemd_run_command, probe_user_bus, select_backend,
 };
-use apm2_core::fac::{NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties};
+use apm2_core::fac::{
+    NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, detect_systemd_unit_name,
+};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 
 use super::timeout_policy::parse_memory_limit;
@@ -129,6 +131,7 @@ pub fn build_bounded_test_command(
     workspace_root: &Path,
     limits: BoundedTestLimits<'_>,
     nextest_command: &[String],
+    unit_name: Option<&str>,
     policy_env: &[(String, String)],
     sandbox_hardening: SandboxHardeningProfile,
     network_policy: NetworkPolicy,
@@ -181,6 +184,7 @@ pub fn build_bounded_test_command(
     } else {
         None
     };
+    let parent_unit = detect_systemd_unit_name();
 
     // Delegate to core command builder for deterministic, consistent
     // systemd-run argument construction. This ensures the CLI and
@@ -189,7 +193,8 @@ pub fn build_bounded_test_command(
         backend,
         &properties,
         workspace_root,
-        None,
+        unit_name,
+        parent_unit.as_deref(),
         system_config.as_ref(),
         nextest_command,
     )
@@ -265,6 +270,7 @@ pub fn build_bounded_gate_command(
     workspace_root: &Path,
     limits: BoundedTestLimits<'_>,
     gate_command: &[String],
+    unit_name: Option<&str>,
     policy_env: &[(String, String)],
     sandbox_hardening: SandboxHardeningProfile,
     network_policy: NetworkPolicy,
@@ -301,12 +307,14 @@ pub fn build_bounded_gate_command(
     } else {
         None
     };
+    let parent_unit = detect_systemd_unit_name();
 
     let core_cmd = build_systemd_run_command(
         backend,
         &properties,
         workspace_root,
-        None,
+        unit_name,
+        parent_unit.as_deref(),
         system_config.as_ref(),
         gate_command,
     )
@@ -460,6 +468,7 @@ mod tests {
                 cpu_quota: "100%",
             },
             &[],
+            None,
             &[],
             SandboxHardeningProfile::default(),
             NetworkPolicy::deny(),
@@ -627,6 +636,7 @@ mod tests {
                 cpu_quota: "200%",
             },
             &[],
+            None,
             &[],
             SandboxHardeningProfile::default(),
             NetworkPolicy::deny(),

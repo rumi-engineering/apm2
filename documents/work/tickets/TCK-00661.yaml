@@ -21,24 +21,26 @@ ticket_meta:
   dependencies:
     tickets:
       - 'TCK-00600' # worker service Type=notify + watchdog baseline
+      - 'TCK-00660' # event-driven runtime activation + claimed repair coordinator baseline
 
 context:
   observed_symptoms:
-    - 'Workers can remain "alive" under systemd while making no forward progress (deadlock/hang).'
-    - 'Queue stalls persist because systemd watchdog continues to be pinged even when the main loop is wedged.'
+    - 'Worker queue activation is now event-driven, but watchdog liveness remains decoupled from execution progress.'
+    - 'Workers can remain "alive" under systemd while making no queue/repair progress (deadlock/hang).'
+    - 'Queue stalls can persist because watchdog pings continue even when the main loop is wedged.'
   code_evidence:
     - |
       Worker spawns a dedicated watchdog thread that pings independently of main loop progress:
-        crates/apm2-cli/src/commands/fac_worker.rs:887-923
+        crates/apm2-cli/src/commands/fac_worker.rs:1385-1422
     - |
       WatchdogTicker itself only enforces periodicity; it has no notion of work progress:
         crates/apm2-core/src/fac/sd_notify.rs:309-377
 
 problem_statement: |
   The current watchdog design can mask deadlocks and indefinite hangs: the background thread will
-  continue pinging as long as the process is alive, even if the main loop cannot scan/claim/commit
-  jobs. This is a liveness failure. We need watchdog pings to be contingent on forward progress
-  signals from the main execution path.
+  continue pinging as long as the process is alive, even if the main loop cannot wake/process queue
+  work or runtime repair signals. This is a liveness failure. Watchdog pings must be contingent on
+  forward progress from the main execution path.
 
 root_cause_analysis:
   primary_cause: |
@@ -115,3 +117,18 @@ notes:
     - 'If progress bumps are missed in a legit long path, systemd may restart mid-job. Mitigate by ensuring all long waits are wrapped.'
   compatibility: |
     In non-systemd environments, watchdog ticker is disabled; this change should be a no-op.
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.

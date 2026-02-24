@@ -25,8 +25,8 @@ use apm2_core::fac::job_spec::{
 };
 use apm2_core::fac::service_user_gate::QueueWriteMode;
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, LaneState, apply_lane_env_overrides,
-    build_job_environment, compute_test_env_for_parallelism, ensure_lane_env_dirs,
+    FacPolicyV1, LaneLeaseV1, LaneLockGuard, LaneManager, LaneProfileV1, LaneState,
+    build_job_environment, compute_test_env_for_parallelism, current_time_iso8601,
     lookup_job_receipt, parse_b3_256_digest, parse_policy_hash, resolve_host_test_parallelism,
 };
 use chrono::{SecondsFormat, Utc};
@@ -66,7 +66,7 @@ const BALANCED_MAX_PARALLELISM: u32 = 16;
 const CONSERVATIVE_PARALLELISM: u32 = 2;
 const DEFAULT_GATES_WAIT_TIMEOUT_SECS: u64 = 1200;
 const GATES_WAIT_POLL_INTERVAL_SECS: u64 = 5;
-const INLINE_WORKER_POLL_INTERVAL_SECS: u64 = 1;
+const GATES_WAIT_INLINE_COOLDOWN_MILLIS: u64 = 750;
 const GATES_QUEUE_LANE: &str = "consume";
 const GATES_SINGLE_FLIGHT_DIR: &str = "queue/singleflight";
 const GATES_QUEUE_PENDING_DIR: &str = "pending";
@@ -115,9 +115,9 @@ enum WorkerExecutionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatesWaitState {
+    ProbeReceipt,
     EvaluateTimeout,
-    CheckReceipt,
-    EvaluateQueueMode,
+    DetectQueueMode,
     Sleep,
     RunInlineWorker,
     ExitWithReceipt,
@@ -127,9 +127,9 @@ enum GatesWaitState {
 impl GatesWaitState {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::ProbeReceipt => "probe_receipt",
             Self::EvaluateTimeout => "evaluate_timeout",
-            Self::CheckReceipt => "check_receipt",
-            Self::EvaluateQueueMode => "evaluate_queue_mode",
+            Self::DetectQueueMode => "detect_queue_mode",
             Self::Sleep => "sleep",
             Self::RunInlineWorker => "run_inline_worker",
             Self::ExitWithReceipt => "exit_with_receipt",
@@ -178,18 +178,18 @@ struct GatesWaitFacts {
 const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
     GatesWaitTransitionRule {
         priority: 1,
-        from: GatesWaitState::CheckReceipt,
+        from: GatesWaitState::ProbeReceipt,
         to: GatesWaitState::ExitWithReceipt,
         guard: GatesWaitGuard::ReceiptFound,
-        guard_id: "GW-WAIT-003",
+        guard_id: "GW-WAIT-001",
         guard_predicate: "facts.receipt_found",
     },
     GatesWaitTransitionRule {
         priority: 2,
-        from: GatesWaitState::CheckReceipt,
+        from: GatesWaitState::ProbeReceipt,
         to: GatesWaitState::EvaluateTimeout,
         guard: GatesWaitGuard::Always,
-        guard_id: "GW-WAIT-004",
+        guard_id: "GW-WAIT-002",
         guard_predicate: "default",
     },
     GatesWaitTransitionRule {
@@ -197,20 +197,20 @@ const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
         from: GatesWaitState::EvaluateTimeout,
         to: GatesWaitState::ExitTimeout,
         guard: GatesWaitGuard::TimedOut,
-        guard_id: "GW-WAIT-001",
+        guard_id: "GW-WAIT-003",
         guard_predicate: "facts.timed_out",
     },
     GatesWaitTransitionRule {
         priority: 4,
         from: GatesWaitState::EvaluateTimeout,
-        to: GatesWaitState::EvaluateQueueMode,
+        to: GatesWaitState::DetectQueueMode,
         guard: GatesWaitGuard::Always,
-        guard_id: "GW-WAIT-002",
+        guard_id: "GW-WAIT-004",
         guard_predicate: "default",
     },
     GatesWaitTransitionRule {
         priority: 5,
-        from: GatesWaitState::EvaluateQueueMode,
+        from: GatesWaitState::DetectQueueMode,
         to: GatesWaitState::RunInlineWorker,
         guard: GatesWaitGuard::InlineFallbackAllowed,
         guard_id: "GW-WAIT-005",
@@ -218,7 +218,7 @@ const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
     },
     GatesWaitTransitionRule {
         priority: 6,
-        from: GatesWaitState::EvaluateQueueMode,
+        from: GatesWaitState::DetectQueueMode,
         to: GatesWaitState::Sleep,
         guard: GatesWaitGuard::Always,
         guard_id: "GW-WAIT-006",
@@ -227,15 +227,15 @@ const GATES_WAIT_TRANSITION_RULES: &[GatesWaitTransitionRule] = &[
     GatesWaitTransitionRule {
         priority: 7,
         from: GatesWaitState::RunInlineWorker,
-        to: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::Sleep,
         guard: GatesWaitGuard::Always,
         guard_id: "GW-WAIT-007",
-        guard_predicate: "always",
+        guard_predicate: "inline worker cycle completed",
     },
     GatesWaitTransitionRule {
         priority: 8,
         from: GatesWaitState::Sleep,
-        to: GatesWaitState::CheckReceipt,
+        to: GatesWaitState::ProbeReceipt,
         guard: GatesWaitGuard::Always,
         guard_id: "GW-WAIT-008",
         guard_predicate: "always",
@@ -258,6 +258,8 @@ pub(super) struct QueuedGatesRequest {
     /// TCK-00577: Controls whether the service user ownership gate is
     /// enforced or bypassed for direct queue writes.
     pub(super) write_mode: QueueWriteMode,
+    /// Optional canonical work identifier to bind queue lifecycle identity.
+    pub(super) work_id_override: Option<String>,
 }
 
 /// Queue-backed FAC gates outcome with materialized per-gate rows.
@@ -764,10 +766,15 @@ fn prepare_queued_gates_job(
 
     let job_id = format!("gates-{}", generate_job_suffix());
     let lease_id = format!("gates-lease-{}", generate_job_suffix());
+    let effective_work_id = request
+        .work_id_override
+        .clone()
+        .unwrap_or_else(|| fallback_work_id_for_repo(&repo_source.repo_id));
     let spec = build_gates_job_spec(
         &job_id,
         &lease_id,
         &repo_source.repo_id,
+        &effective_work_id,
         &repo_source.head_sha,
         &policy_digest,
         memory_max_bytes,
@@ -786,6 +793,7 @@ fn prepare_queued_gates_job(
         &spec,
         &fac_policy.queue_bounds_policy,
         request.write_mode,
+        fac_policy.queue_lifecycle_dual_write_enabled,
     )
     .map_err(|err| QueuePreparationFailure::Runtime {
         message: format!("failed to enqueue gates job: {err}"),
@@ -1640,6 +1648,9 @@ pub(super) fn run_gates_local_worker(
     cpu_quota: &str,
     gate_profile: GateThroughputProfile,
     workspace_root: &Path,
+    bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<LocalGatesRunResult, String> {
     let (resolved_profile, effective_cpu_quota) =
         resolve_effective_execution_profile(cpu_quota, gate_profile)?;
@@ -1721,6 +1732,9 @@ pub(super) fn run_gates_local_worker(
         false,
         Some(prep_step_callback.as_ref()),
         Some(gate_progress_callback),
+        bounded_unit_base,
+        lease_job_id,
+        lease_toolchain_fingerprint,
     ) {
         Ok(summary) => summary,
         Err(failure) => {
@@ -1879,6 +1893,7 @@ fn run_gates_via_worker(
         wait_timeout_secs,
         require_external_worker: false,
         write_mode,
+        work_id_override: None,
     };
     let prepared = match prepare_queued_gates_job(&request, wait) {
         Ok(prepared) => prepared,
@@ -2085,6 +2100,7 @@ fn build_gates_job_spec(
     job_id: &str,
     lease_id: &str,
     repo_id: &str,
+    work_id: &str,
     head_sha: &str,
     policy_digest: &[u8; 32],
     memory_max_bytes: u64,
@@ -2117,6 +2133,7 @@ fn build_gates_job_spec(
         source: JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: repo_id.to_string(),
+            work_id: work_id.to_string(),
             head_sha: head_sha.to_string(),
             patch: Some(patch),
         },
@@ -2168,6 +2185,11 @@ fn build_gates_job_spec(
     Ok(spec)
 }
 
+fn fallback_work_id_for_repo(repo_id: &str) -> String {
+    let digest = blake3::hash(repo_id.as_bytes()).to_hex();
+    format!("W-LEGACY-{}", &digest[..24])
+}
+
 fn wait_for_gates_job_receipt(
     fac_root: &Path,
     job_id: &str,
@@ -2204,6 +2226,105 @@ fn derive_gates_wait_next_state(current: GatesWaitState, facts: GatesWaitFacts) 
     current
 }
 
+#[derive(Debug)]
+struct GatesReceiptWaitMachine<'a> {
+    fac_root: &'a Path,
+    job_id: &'a str,
+    timeout: Duration,
+    mode: WorkerExecutionMode,
+    receipts_dir: PathBuf,
+    start: Instant,
+    state: GatesWaitState,
+    last_receipt: Option<apm2_core::fac::FacJobReceiptV1>,
+    queue_mode: QueueProcessingMode,
+    sleep_duration: Duration,
+}
+
+impl<'a> GatesReceiptWaitMachine<'a> {
+    fn new(
+        fac_root: &'a Path,
+        job_id: &'a str,
+        timeout: Duration,
+        mode: WorkerExecutionMode,
+    ) -> Self {
+        Self {
+            fac_root,
+            job_id,
+            timeout,
+            mode,
+            receipts_dir: fac_root.join("receipts"),
+            start: Instant::now(),
+            state: GatesWaitState::ProbeReceipt,
+            last_receipt: None,
+            queue_mode: QueueProcessingMode::ExternalWorker,
+            sleep_duration: Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS),
+        }
+    }
+
+    fn facts(&self) -> GatesWaitFacts {
+        GatesWaitFacts {
+            timed_out: self.start.elapsed() >= self.timeout,
+            receipt_found: self.last_receipt.is_some(),
+            queue_mode: self.queue_mode,
+            allow_inline_fallback: self.mode == WorkerExecutionMode::AllowInlineFallback,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.state = derive_gates_wait_next_state(self.state, self.facts());
+    }
+
+    fn run(mut self) -> Result<apm2_core::fac::FacJobReceiptV1, String> {
+        loop {
+            match self.state {
+                GatesWaitState::ProbeReceipt => {
+                    self.last_receipt = lookup_job_receipt(&self.receipts_dir, self.job_id);
+                    self.advance();
+                },
+                GatesWaitState::EvaluateTimeout => {
+                    self.advance();
+                },
+                GatesWaitState::DetectQueueMode => {
+                    self.queue_mode = detect_queue_processing_mode(self.fac_root);
+                    let next_state = derive_gates_wait_next_state(self.state, self.facts());
+                    if next_state == GatesWaitState::Sleep {
+                        self.sleep_duration = Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS);
+                    }
+                    self.state = next_state;
+                },
+                GatesWaitState::RunInlineWorker => {
+                    run_inline_worker_cycle()?;
+                    self.sleep_duration = Duration::from_millis(GATES_WAIT_INLINE_COOLDOWN_MILLIS);
+                    self.advance();
+                },
+                GatesWaitState::Sleep => {
+                    std::thread::sleep(self.sleep_duration);
+                    self.advance();
+                },
+                GatesWaitState::ExitWithReceipt => {
+                    if let Some(receipt) = self.last_receipt {
+                        return Ok(receipt);
+                    }
+                    return Err(format!(
+                        "gates job {} wait machine reached receipt terminal state without a receipt",
+                        self.job_id
+                    ));
+                },
+                GatesWaitState::ExitTimeout => {
+                    if let Some(receipt) = lookup_job_receipt(&self.receipts_dir, self.job_id) {
+                        return Ok(receipt);
+                    }
+                    return Err(format!(
+                        "gates job {} did not reach terminal receipt within {}s",
+                        self.job_id,
+                        self.timeout.as_secs()
+                    ));
+                },
+            }
+        }
+    }
+}
+
 pub(super) fn gates_wait_machine_spec_json() -> serde_json::Value {
     let transitions = GATES_WAIT_TRANSITION_RULES
         .iter()
@@ -2222,9 +2343,9 @@ pub(super) fn gates_wait_machine_spec_json() -> serde_json::Value {
         "schema": "apm2.fac.review.gates_wait_machine.v1",
         "evaluation": "first_matching_guard_applies",
         "states": [
+            GatesWaitState::ProbeReceipt.as_str(),
             GatesWaitState::EvaluateTimeout.as_str(),
-            GatesWaitState::CheckReceipt.as_str(),
-            GatesWaitState::EvaluateQueueMode.as_str(),
+            GatesWaitState::DetectQueueMode.as_str(),
             GatesWaitState::Sleep.as_str(),
             GatesWaitState::RunInlineWorker.as_str(),
             GatesWaitState::ExitWithReceipt.as_str(),
@@ -2271,66 +2392,7 @@ fn wait_for_gates_job_terminal_receipt_with_mode(
     timeout: Duration,
     mode: WorkerExecutionMode,
 ) -> Result<apm2_core::fac::FacJobReceiptV1, String> {
-    let receipts_dir = fac_root.join("receipts");
-    let start = Instant::now();
-    let mut state = GatesWaitState::CheckReceipt;
-    let mut last_receipt: Option<apm2_core::fac::FacJobReceiptV1> = None;
-    let mut queue_mode = QueueProcessingMode::ExternalWorker;
-
-    loop {
-        let facts = GatesWaitFacts {
-            timed_out: start.elapsed() >= timeout,
-            receipt_found: last_receipt.is_some(),
-            queue_mode,
-            allow_inline_fallback: mode == WorkerExecutionMode::AllowInlineFallback,
-        };
-        match state {
-            GatesWaitState::CheckReceipt => {
-                last_receipt = lookup_job_receipt(&receipts_dir, job_id);
-                let facts = GatesWaitFacts {
-                    receipt_found: last_receipt.is_some(),
-                    ..facts
-                };
-                state = derive_gates_wait_next_state(state, facts);
-            },
-            GatesWaitState::EvaluateTimeout => {
-                state = derive_gates_wait_next_state(state, facts);
-            },
-            GatesWaitState::EvaluateQueueMode => {
-                queue_mode = detect_queue_processing_mode(fac_root);
-                let facts = GatesWaitFacts {
-                    queue_mode,
-                    ..facts
-                };
-                state = derive_gates_wait_next_state(state, facts);
-            },
-            GatesWaitState::Sleep => {
-                std::thread::sleep(Duration::from_secs(GATES_WAIT_POLL_INTERVAL_SECS));
-                state = derive_gates_wait_next_state(state, facts);
-            },
-            GatesWaitState::RunInlineWorker => {
-                run_inline_worker_cycle()?;
-                state = derive_gates_wait_next_state(state, facts);
-            },
-            GatesWaitState::ExitWithReceipt => {
-                if let Some(receipt) = last_receipt {
-                    return Ok(receipt);
-                }
-                return Err(format!(
-                    "gates job {job_id} wait machine reached receipt terminal state without a receipt",
-                ));
-            },
-            GatesWaitState::ExitTimeout => {
-                if let Some(receipt) = lookup_job_receipt(&receipts_dir, job_id) {
-                    return Ok(receipt);
-                }
-                return Err(format!(
-                    "gates job {job_id} did not reach terminal receipt within {}s",
-                    timeout.as_secs()
-                ));
-            },
-        }
-    }
+    GatesReceiptWaitMachine::new(fac_root, job_id, timeout, mode).run()
 }
 
 fn detect_queue_processing_mode(fac_root: &Path) -> QueueProcessingMode {
@@ -2395,7 +2457,7 @@ where
         return Ok(true);
     }
     Err(
-        "no live FAC worker heartbeat found after auto-start attempts; run `apm2 fac worker --poll-interval-secs 1`".to_string(),
+        "no live FAC worker heartbeat found after auto-start attempts; ensure `apm2-worker.service` is active".to_string(),
     )
 }
 
@@ -2404,7 +2466,7 @@ fn spawn_detached_worker_for_queue() -> Result<(), String> {
         std::env::current_exe().map_err(|err| format!("resolve current executable: {err}"))?;
     let mut command = Command::new(current_exe);
     command
-        .args(["fac", "worker", "--poll-interval-secs", "1"])
+        .args(["fac", "worker"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2472,13 +2534,7 @@ fn is_pid_running(pid: u32) -> bool {
 }
 
 fn run_inline_worker_cycle() -> Result<(), String> {
-    let code = crate::commands::fac_worker::run_fac_worker(
-        true,
-        INLINE_WORKER_POLL_INTERVAL_SECS,
-        1,
-        false,
-        false,
-    );
+    let code = crate::commands::fac_worker::run_fac_worker(true, 1, false, false);
     if code == exit_codes::SUCCESS {
         Ok(())
     } else {
@@ -3553,6 +3609,9 @@ fn run_gates_inner(
         emit_human_logs,
         None,
         on_gate_progress,
+        None,
+        None,
+        None,
     )
     .map_err(GatesRunFailure::render)
 }
@@ -3572,6 +3631,9 @@ fn run_gates_inner_detailed(
     emit_human_logs: bool,
     on_prep_step: Option<PrepStepCallback<'_>>,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+    bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<GatesSummary, GatesRunFailure> {
     validate_timeout_seconds(timeout_seconds).map_err(|message| {
         let structured = StructuredFailure::prep_not_ready(
@@ -3630,6 +3692,9 @@ fn run_gates_inner_detailed(
                 test_parallelism,
                 emit_human_logs,
                 on_gate_progress,
+                bounded_unit_base,
+                lease_job_id,
+                lease_toolchain_fingerprint,
             )
             .map_err(|message| {
                 let structured = StructuredFailure::gate_execution_failed(
@@ -3678,6 +3743,9 @@ fn run_execute_phase(
     test_parallelism: u32,
     emit_human_logs: bool,
     on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
+    bounded_unit_base: Option<&str>,
+    lease_job_id: Option<&str>,
+    lease_toolchain_fingerprint: Option<&str>,
 ) -> Result<GatesSummary, String> {
     let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
@@ -3708,6 +3776,16 @@ fn run_execute_phase(
     // If lane-00 is corrupt (from a previous failed run), refuse to
     // run gates in a dirty environment. The user must reset first.
     check_lane_not_corrupt(&lane_manager)?;
+    let _gates_running_lease_guard = lease_job_id
+        .map(|job_id| {
+            persist_gates_running_lease(
+                &lane_manager,
+                "lane-00",
+                job_id,
+                lease_toolchain_fingerprint,
+            )
+        })
+        .transpose()?;
 
     // 1. Require clean working tree for full gates only. `--force` allows
     // rerunning gates for the same SHA while local edits are in progress.
@@ -3803,6 +3881,7 @@ fn run_execute_phase(
                 cpu_quota,
             },
             &default_nextest_command,
+            bounded_unit_base,
             &test_command_environment,
             policy.sandbox_hardening,
             gate_network_policy,
@@ -3857,6 +3936,7 @@ fn run_execute_phase(
         test_command,
         test_command_environment,
         env_remove_keys,
+        bounded_gate_unit_base: bounded_unit_base.map(std::string::ToString::to_string),
         skip_test_gate: quick,
         skip_merge_conflict_gate: true,
         emit_human_logs,
@@ -4225,8 +4305,7 @@ fn compute_nextest_test_environment(
     // under $APM2_HOME/private/fac/lanes/lane-00.
     let fac_root = apm2_home.join("private/fac");
     let lane_dir = fac_root.join("lanes/lane-00");
-    ensure_lane_env_dirs(&lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, &lane_dir);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, &lane_dir, &ambient)?;
 
     // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy
@@ -4345,11 +4424,70 @@ fn acquire_gates_lane_lock(lane_manager: &LaneManager) -> Result<LaneLockGuard, 
     })
 }
 
+/// Best-effort RAII cleanup guard for lane-00 RUNNING lease records used by
+/// worker-executed queued gates jobs.
+struct GatesRunningLeaseGuard {
+    lane_dir: PathBuf,
+    lane_id: &'static str,
+    job_id: String,
+}
+
+impl Drop for GatesRunningLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = LaneLeaseV1::remove(&self.lane_dir) {
+            eprintln!(
+                "fac gates: WARNING: failed to remove running lease for lane {} job {}: {err}",
+                self.lane_id, self.job_id
+            );
+        }
+    }
+}
+
+fn persist_gates_running_lease(
+    lane_manager: &LaneManager,
+    lane_id: &'static str,
+    job_id: &str,
+    toolchain_fingerprint: Option<&str>,
+) -> Result<GatesRunningLeaseGuard, String> {
+    let lane_dir = lane_manager.lane_dir(lane_id);
+    let lane_profile_hash = match LaneProfileV1::load(&lane_dir) {
+        Ok(lane_profile) => lane_profile
+            .compute_hash()
+            .unwrap_or_else(|_| "b3-256:unknown".to_string()),
+        Err(err) => {
+            eprintln!(
+                "fac gates: WARNING: lane profile unavailable for {lane_id} lease; \
+                 using unknown profile hash: {err}"
+            );
+            "b3-256:unknown".to_string()
+        },
+    };
+    let lease = LaneLeaseV1::new(
+        lane_id,
+        job_id,
+        std::process::id(),
+        LaneState::Running,
+        &current_time_iso8601(),
+        &lane_profile_hash,
+        toolchain_fingerprint.unwrap_or("b3-256:unknown"),
+    )
+    .map_err(|err| format!("failed to build running lane lease for {lane_id}: {err}"))?;
+    lease
+        .persist(&lane_dir)
+        .map_err(|err| format!("failed to persist running lane lease for {lane_id}: {err}"))?;
+
+    Ok(GatesRunningLeaseGuard {
+        lane_dir,
+        lane_id,
+        job_id: job_id.to_string(),
+    })
+}
+
 /// Check that `lane-00` is not in a CORRUPT state.
 ///
 /// If a previous gate run (or worker) marked the lane as corrupt, running
 /// gates in that environment risks non-deterministic results. The user must
-/// run `apm2 fac lane reset lane-00` to clear the corrupt marker first.
+/// run `apm2 fac doctor --fix` to clear the corrupt marker first.
 fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
     let status = lane_manager
         .lane_status("lane-00")
@@ -4359,7 +4497,7 @@ fn check_lane_not_corrupt(lane_manager: &LaneManager) -> Result<(), String> {
         return Err(format!(
             "lane-00 is in CORRUPT state (reason: {reason}). \
              Cannot run gates in a dirty environment. \
-             Run `apm2 fac lane reset lane-00` to clear the corrupt marker first."
+             Run `apm2 fac doctor --fix` to clear the corrupt marker first."
         ));
     }
     Ok(())
@@ -4422,6 +4560,7 @@ mod tests {
             wait_timeout_secs: 60,
             require_external_worker,
             write_mode: QueueWriteMode::UnsafeLocalWrite,
+            work_id_override: None,
         }
     }
 
@@ -4463,6 +4602,7 @@ mod tests {
             source: JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: repo_id.to_string(),
+                work_id: fallback_work_id_for_repo(repo_id),
                 head_sha: head_sha.to_string(),
                 patch: Some(serde_json::to_value(options).expect("serialize options")),
             },
@@ -4600,6 +4740,58 @@ mod tests {
             .expect("receipt should win even at timeout boundary");
             assert_eq!(resolved.receipt_id, "receipt-timeout-boundary");
         });
+    }
+
+    #[test]
+    fn gates_wait_machine_transitions_inline_cycle_through_sleep() {
+        let facts = GatesWaitFacts {
+            timed_out: false,
+            receipt_found: false,
+            queue_mode: QueueProcessingMode::InlineSingleJob,
+            allow_inline_fallback: true,
+        };
+        assert_eq!(
+            derive_gates_wait_next_state(GatesWaitState::DetectQueueMode, facts),
+            GatesWaitState::RunInlineWorker
+        );
+        assert_eq!(
+            derive_gates_wait_next_state(GatesWaitState::RunInlineWorker, facts),
+            GatesWaitState::Sleep
+        );
+        assert_eq!(
+            derive_gates_wait_next_state(GatesWaitState::Sleep, facts),
+            GatesWaitState::ProbeReceipt
+        );
+    }
+
+    #[test]
+    fn gates_wait_machine_spec_declares_inline_worker_sleep_transition() {
+        let spec = gates_wait_machine_spec_json();
+        let transitions = spec
+            .get("transitions")
+            .and_then(serde_json::Value::as_array)
+            .expect("transitions array");
+        let inline_transition = transitions
+            .iter()
+            .find(|transition| {
+                transition
+                    .get("guard_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("GW-WAIT-007")
+            })
+            .expect("inline transition");
+        assert_eq!(
+            inline_transition
+                .get("from")
+                .and_then(serde_json::Value::as_str),
+            Some("run_inline_worker")
+        );
+        assert_eq!(
+            inline_transition
+                .get("to")
+                .and_then(serde_json::Value::as_str),
+            Some("sleep")
+        );
     }
 
     #[test]
@@ -5541,6 +5733,7 @@ mod tests {
                 "gates-intent-test",
                 "gates-lease-intent-test",
                 "guardian-intelligence/apm2",
+                "W-GATES-INTENT-TEST",
                 &"d".repeat(40),
                 &policy_digest,
                 256 * 1024 * 1024,
@@ -5857,7 +6050,7 @@ mod tests {
         let err = ensure_external_worker_bootstrap_with(temp.path(), |_| false, || Ok(()), || {})
             .expect_err("missing worker heartbeat must fail closed after auto-start");
         assert!(err.contains("after auto-start attempts"));
-        assert!(err.contains("apm2 fac worker"));
+        assert!(err.contains("apm2-worker.service"));
     }
 
     #[test]
@@ -6905,6 +7098,7 @@ time.sleep(20)\n",
             test_command: None,
             test_command_environment: Vec::new(),
             env_remove_keys: Vec::new(),
+            bounded_gate_unit_base: None,
             skip_test_gate: true,
             skip_merge_conflict_gate: true,
             emit_human_logs: false,
@@ -7003,6 +7197,38 @@ time.sleep(20)\n",
         drop(guard);
     }
 
+    #[test]
+    fn persist_gates_running_lease_tracks_active_job_and_cleans_up() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let _lane_guard = acquire_gates_lane_lock(&manager).expect("acquire lane lock");
+        let lease_guard = persist_gates_running_lease(
+            &manager,
+            "lane-00",
+            "job-gates-active",
+            Some("b3-256:test-toolchain"),
+        )
+        .expect("persist gates running lease");
+        let lane_dir = manager.lane_dir("lane-00");
+        let lease = LaneLeaseV1::load(&lane_dir)
+            .expect("load lease")
+            .expect("lease present");
+        assert_eq!(lease.job_id, "job-gates-active");
+        assert_eq!(lease.state, LaneState::Running);
+
+        drop(lease_guard);
+        assert!(
+            LaneLeaseV1::load(&lane_dir)
+                .expect("reload lease")
+                .is_none(),
+            "drop cleanup must remove lease"
+        );
+    }
+
     /// Regression (BLOCKER 1/2): `run_gates_inner` with `lane_count = 1`
     /// should run all command-style phases in the same lane-local env context.
     ///
@@ -7082,22 +7308,30 @@ time.sleep(20)\n",
             b"# empty\n",
         )
         .expect("write allowlist");
+        let machine_spec_snapshot =
+            crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+                .expect("render machine spec snapshot");
+        fs::write(
+            review_gate_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec_snapshot.as_bytes(),
+        )
+        .expect("write machine spec snapshot");
 
         let prompt = concat!(
             "{\n",
             "  \"payload\": {\n",
             "    \"commands\": {\n",
-            "      \"binary_prefix\": \"cargo run -p apm2-cli --\",\n",
-            "      \"prepare\": \"cargo run -p apm2-cli -- fac review prepare --json\",\n",
-            "      \"finding\": \"cargo run -p apm2-cli -- fac review finding --json\",\n",
-            "      \"verdict\": \"cargo run -p apm2-cli -- fac review verdict set --json\"\n",
+            "      \"binary_prefix\": \"apm2\",\n",
+            "      \"prepare\": \"apm2 fac review prepare --pr $PR_NUMBER --sha $HEAD_SHA\",\n",
+            "      \"finding\": \"apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA\",\n",
+            "      \"verdict\": \"apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA\"\n",
             "    },\n",
             "    \"constraints\": {\n",
             "      \"forbidden_operations\": [\n",
-            "        \"Do not pass --sha manually; CLI auto-derives the SHA and SHA is managed by the CLI.\"\n",
+            "        \"Always pass --pr $PR_NUMBER --sha $HEAD_SHA when running prepare/finding/verdict.\"\n",
             "      ],\n",
             "      \"invariants\": [\n",
-            "        \"SHA is managed by the CLI\"\n",
+            "        \"Bind commands using $PR_NUMBER and $HEAD_SHA.\"\n",
             "      ]\n",
             "    }\n",
             "  }\n",

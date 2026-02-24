@@ -39,11 +39,7 @@ pub enum BrokerSubcommand {
 
 /// Arguments for `apm2 fac broker status`.
 #[derive(Debug, Args)]
-pub struct BrokerStatusArgs {
-    /// Emit structured JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct BrokerStatusArgs {}
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +64,7 @@ pub fn run_broker(args: &BrokerArgs, json_output: bool) -> u8 {
 }
 
 fn run_status(status_args: &BrokerStatusArgs, parent_json_output: bool) -> u8 {
-    let _ = parent_json_output || status_args.json;
+    let _ = (status_args, parent_json_output);
     match build_status() {
         Ok(response) => {
             match serde_json::to_string_pretty(&response) {

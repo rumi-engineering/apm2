@@ -172,6 +172,8 @@ pub struct WorkReducer {
 }
 
 impl WorkReducer {
+    const PR_REBIND_RATIONALE_CODE: &str = "pr_rebound_ticket_work_id";
+
     /// Creates a new work reducer.
     #[must_use]
     pub fn new() -> Self {
@@ -344,7 +346,46 @@ impl WorkReducer {
             });
         }
 
-        // Apply completion
+        // --- Domain separation: gate_receipt_id vs merge_receipt_id ---
+        //
+        // INV-0113 (fail-closed): gate_receipt_id MUST NOT contain a merge
+        // receipt identifier.  Any value whose ASCII-lowercase form starts
+        // with "merge-receipt-" is rejected.  Case-insensitive comparison
+        // prevents bypass via case-variant prefixes (e.g. "MERGE-RECEIPT-",
+        // "Merge-Receipt-").
+        //
+        // INV-0114 (positive allowlist): merge_receipt_id, when non-empty,
+        // MUST start with "merge-receipt-" (case-insensitive).  This
+        // prevents gate receipt identifiers from being injected into the
+        // merge field.
+        //
+        // Together these two checks enforce bidirectional domain separation
+        // at the reducer boundary.
+
+        if event
+            .gate_receipt_id
+            .to_ascii_lowercase()
+            .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::MergeReceiptInGateReceiptField {
+                work_id: work_id.clone(),
+                value: event.gate_receipt_id,
+            });
+        }
+
+        if !event.merge_receipt_id.is_empty()
+            && !event
+                .merge_receipt_id
+                .to_ascii_lowercase()
+                .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::InvalidMergeReceiptId {
+                work_id: work_id.clone(),
+                value: event.merge_receipt_id,
+            });
+        }
+
+        // Apply completion (all deny gates passed — safe to mutate)
         work.state = WorkState::Completed;
         work.last_transition_at = timestamp;
         work.transition_count += 1;
@@ -354,6 +395,11 @@ impl WorkReducer {
             None
         } else {
             Some(event.gate_receipt_id)
+        };
+        work.merge_receipt_id = if event.merge_receipt_id.is_empty() {
+            None
+        } else {
+            Some(event.merge_receipt_id)
         };
 
         Ok(())
@@ -403,9 +449,10 @@ impl WorkReducer {
     /// # Security Constraints
     ///
     /// - **State Restriction**: PR association is only allowed when the work
-    ///   item is in `InProgress` state. This prevents agents from bypassing CI
-    ///   gating by associating a work item with a PR that has already passed CI
-    ///   while in `CiPending` or `Blocked` state.
+    ///   item is in `Claimed` or `InProgress` state. This permits manual
+    ///   operator-supervised push flows before explicit `InProgress`
+    ///   transition, while still preventing CI-gating bypass from
+    ///   `CiPending`/`Blocked` and terminal states.
     ///
     /// - **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be
     ///   associated with a work item if it is already associated with another
@@ -413,6 +460,7 @@ impl WorkReducer {
     fn handle_pr_associated(
         &mut self,
         event: &crate::events::WorkPrAssociated,
+        timestamp: u64,
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
         let pr_number = event.pr_number;
@@ -420,16 +468,25 @@ impl WorkReducer {
 
         // Security check: Verify PR number is not already associated with another
         // active work item (CTR-CIQ002 uniqueness constraint)
-        if let Some(existing_work) = self
+        if let Some(existing_work_id) = self
             .state
             .work_items
             .values()
             .find(|w| w.pr_number == Some(pr_number) && w.is_active() && w.work_id != *work_id)
+            .map(|w| w.work_id.clone())
         {
-            return Err(WorkError::PrNumberAlreadyAssociated {
-                pr_number,
-                existing_work_id: existing_work.work_id.clone(),
-            });
+            // Migration recovery: during ledger replay, permit rebinding from a
+            // legacy non-ticket work ID (e.g. UUID-based) to a canonical
+            // ticket work ID (`W-TCK-*`). This prevents historical mixed-ID
+            // ledgers from bricking projection rebuild after canonicalization.
+            if Self::allow_ticket_work_rebind(work_id, &existing_work_id) {
+                self.abort_superseded_work_for_pr_rebind(&existing_work_id, work_id, timestamp)?;
+            } else {
+                return Err(WorkError::PrNumberAlreadyAssociated {
+                    pr_number,
+                    existing_work_id,
+                });
+            }
         }
 
         let work =
@@ -440,10 +497,9 @@ impl WorkReducer {
                     work_id: work_id.clone(),
                 })?;
 
-        // Security check: PR association only allowed from InProgress state.
-        // This prevents bypassing CI gating by associating with a PR that has
-        // already passed CI while in CiPending or Blocked state.
-        if work.state != WorkState::InProgress {
+        // Security check: PR association only allowed from Claimed or
+        // InProgress state.
+        if !matches!(work.state, WorkState::Claimed | WorkState::InProgress) {
             return Err(WorkError::PrAssociationNotAllowed {
                 work_id: work_id.clone(),
                 current_state: work.state,
@@ -453,6 +509,49 @@ impl WorkReducer {
         // Set the PR number and commit SHA for CI event matching
         work.pr_number = Some(pr_number);
         work.commit_sha = Some(commit_sha.clone());
+
+        Ok(())
+    }
+
+    #[inline]
+    fn is_canonical_ticket_work_id(work_id: &str) -> bool {
+        let Some(ticket_suffix) = work_id.strip_prefix("W-TCK-") else {
+            return false;
+        };
+        !ticket_suffix.is_empty() && ticket_suffix.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    #[inline]
+    fn allow_ticket_work_rebind(incoming_work_id: &str, existing_work_id: &str) -> bool {
+        Self::is_canonical_ticket_work_id(incoming_work_id)
+            && !Self::is_canonical_ticket_work_id(existing_work_id)
+    }
+
+    fn abort_superseded_work_for_pr_rebind(
+        &mut self,
+        existing_work_id: &str,
+        incoming_work_id: &str,
+        timestamp: u64,
+    ) -> Result<(), WorkError> {
+        let existing_work = self
+            .state
+            .work_items
+            .get_mut(existing_work_id)
+            .ok_or_else(|| WorkError::WorkNotFound {
+                work_id: existing_work_id.to_string(),
+            })?;
+
+        if existing_work.is_terminal() {
+            return Ok(());
+        }
+
+        existing_work.state = WorkState::Aborted;
+        existing_work.last_transition_at = timestamp;
+        existing_work.transition_count = existing_work.transition_count.saturating_add(1);
+        existing_work.last_rationale_code = Self::PR_REBIND_RATIONALE_CODE.to_string();
+        existing_work.abort_reason = Some(format!(
+            "superseded by canonical ticket work_id '{incoming_work_id}' during PR rebind replay"
+        ));
 
         Ok(())
     }
@@ -483,7 +582,7 @@ impl Reducer for WorkReducer {
             },
             Some(work_event::Event::Completed(e)) => self.handle_completed(e, timestamp),
             Some(work_event::Event::Aborted(e)) => self.handle_aborted(e, timestamp),
-            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e),
+            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e, timestamp),
             None => Ok(()),
         }
     }
@@ -581,18 +680,31 @@ pub mod helpers {
     }
 
     /// Creates a `WorkCompleted` event payload.
+    ///
+    /// # Parameters
+    ///
+    /// * `gate_receipt_id` - ID of the gate receipt that authorized this
+    ///   completion.  Must NOT contain a merge receipt identifier (values
+    ///   starting with `merge-receipt-` are rejected at the reducer level per
+    ///   INV-0113).
+    /// * `merge_receipt_id` - Dedicated merge receipt identifier populated when
+    ///   work completes via the merge executor.  When non-empty, MUST start
+    ///   with `merge-receipt-` (positive allowlist per INV-0114).  Pass `""`
+    ///   when no merge receipt is involved.
     #[must_use]
     pub fn work_completed_payload(
         work_id: &str,
         evidence_bundle_hash: Vec<u8>,
         evidence_ids: Vec<String>,
         gate_receipt_id: &str,
+        merge_receipt_id: &str,
     ) -> Vec<u8> {
         let completed = WorkCompleted {
             work_id: work_id.to_string(),
             evidence_bundle_hash,
             evidence_ids,
             gate_receipt_id: gate_receipt_id.to_string(),
+            merge_receipt_id: merge_receipt_id.to_string(),
         };
         let event = WorkEvent {
             event: Some(work_event::Event::Completed(completed)),

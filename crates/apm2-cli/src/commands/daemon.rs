@@ -12,6 +12,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use apm2_core::config::{default_data_dir, normalize_pid_file_path, normalize_state_file_path};
 use apm2_core::fac::execution_backend::{probe_user_bus, select_backend};
+use apm2_core::fac::{
+    FacUnitLiveness, LaneLeaseV1, LaneManager, LaneState, ORPHANED_SYSTEMD_UNIT_REASON_CODE,
+    ProcessIdentity, check_fac_unit_liveness, verify_pid_identity,
+};
 use apm2_core::github::{GitHubAppTokenProvider, resolve_apm2_home};
 use apm2_daemon::telemetry::is_cgroup_v2_available;
 use tracing::info;
@@ -85,6 +89,8 @@ WantedBy=default.target\n\
 /// the worker started. The worker calls `sd_notify::notify_ready()` after
 /// broker connection. `WatchdogSec=300` restarts the worker if it fails to
 /// send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
+/// Worker activation is wake-driven; degraded safety nudges use an internal
+/// bounded interval.
 const WORKER_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker\n\
@@ -96,7 +102,7 @@ PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
-ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
+ExecStart=%exe_path% fac worker\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -126,7 +132,7 @@ PartOf=apm2-daemon.service\n\
 \n\
 [Service]\n\
 Type=notify\n\
-ExecStart=%exe_path% fac worker --poll-interval-secs 10\n\
+ExecStart=%exe_path% fac worker\n\
 Restart=always\n\
 RestartSec=5\n\
 WatchdogSec=300\n\
@@ -160,16 +166,105 @@ RuntimeDirectory=apm2\n\
 WantedBy=sockets.target\n\
 ";
 
+fn current_cli_contract_hash() -> Result<String> {
+    let cli_version = apm2_daemon::hsi_contract::CliVersion {
+        semver: env!("CARGO_PKG_VERSION").to_string(),
+        build_hash: String::new(),
+    };
+    let manifest = apm2_daemon::hsi_contract::build_manifest(cli_version)
+        .map_err(|e| anyhow!("failed to build CLI HSI contract manifest: {e}"))?;
+    let hash = manifest
+        .content_hash()
+        .map_err(|e| anyhow!("failed to compute CLI HSI contract hash: {e}"))?;
+    if hash.is_empty() {
+        bail!("CLI HSI contract hash is empty");
+    }
+    Ok(hash)
+}
+
+fn daemon_runtime_binary_path() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| anyhow!("failed to resolve current executable path: {e}"))?;
+    let current_exe = current_exe
+        .canonicalize()
+        .map_err(|e| anyhow!("failed to canonicalize {}: {e}", current_exe.display()))?;
+
+    if let Some(parent) = current_exe.parent() {
+        let sibling = parent.join("apm2-daemon");
+        if sibling.exists() {
+            return sibling
+                .canonicalize()
+                .map_err(|e| anyhow!("failed to canonicalize {}: {e}", sibling.display()));
+        }
+    }
+
+    resolve_which_binary("apm2-daemon")
+        .map_err(|e| anyhow!("failed to resolve daemon runtime binary: {e}"))
+}
+
+fn read_daemon_runtime_contract_hash(daemon_binary: &Path) -> Result<String> {
+    let output = Command::new(daemon_binary)
+        .arg("--print-hsi-contract-hash")
+        .output()
+        .map_err(|e| {
+            anyhow!(
+                "failed to execute {} --print-hsi-contract-hash: {e}",
+                daemon_binary.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit code {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr
+        };
+        bail!(
+            "{} --print-hsi-contract-hash failed: {detail}",
+            daemon_binary.display()
+        );
+    }
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if hash.is_empty() {
+        bail!(
+            "{} --print-hsi-contract-hash returned empty output",
+            daemon_binary.display()
+        );
+    }
+    Ok(hash)
+}
+
+fn ensure_daemon_contract_compatibility(daemon_binary: &Path) -> Result<()> {
+    let cli_hash = current_cli_contract_hash()?;
+    let daemon_hash = read_daemon_runtime_contract_hash(daemon_binary)?;
+    if daemon_hash != cli_hash {
+        bail!(
+            "daemon runtime contract hash mismatch: client='{cli_hash}' daemon='{}' \
+             daemon_binary={}. Remediation: run `apm2 fac install` to install aligned \
+             apm2/apm2-daemon binaries.",
+            daemon_hash,
+            daemon_binary.display()
+        );
+    }
+    Ok(())
+}
+
 /// Start the daemon.
 pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
-    let mut cmd = Command::new("apm2-daemon");
+    let daemon_binary = daemon_runtime_binary_path()?;
+    ensure_daemon_contract_compatibility(&daemon_binary)?;
+
+    let mut cmd = Command::new(&daemon_binary);
     cmd.arg("--config").arg(config);
 
     if no_daemon {
         cmd.arg("--no-daemon");
     }
 
-    info!("Starting apm2 daemon...");
+    info!(
+        daemon_binary = %daemon_binary.display(),
+        "Starting apm2 daemon..."
+    );
 
     if no_daemon {
         // Run in foreground
@@ -406,6 +501,106 @@ pub struct DaemonDoctorCheck {
 /// the vector can grow beyond this if more checks are added.
 const MAX_DOCTOR_CHECKS: usize = 64;
 
+fn check_orphaned_systemd_units() -> DaemonDoctorCheck {
+    let Some(home) = resolve_apm2_home() else {
+        return DaemonDoctorCheck {
+            name: "orphaned_systemd_units".to_string(),
+            status: "WARN",
+            message: "cannot resolve APM2_HOME; orphaned systemd unit check skipped".to_string(),
+        };
+    };
+    let fac_root = home.join("private").join("fac");
+    let lane_mgr = match LaneManager::new(fac_root) {
+        Ok(manager) => manager,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "orphaned_systemd_units".to_string(),
+                status: "WARN",
+                message: format!(
+                    "cannot initialize lane manager for orphaned systemd unit check: {err}"
+                ),
+            };
+        },
+    };
+
+    let mut findings: Vec<String> = Vec::new();
+    for lane_id in LaneManager::default_lane_ids() {
+        let lane_dir = lane_mgr.lane_dir(&lane_id);
+        let lease = match LaneLeaseV1::load(&lane_dir) {
+            Ok(value) => value,
+            Err(err) => {
+                return DaemonDoctorCheck {
+                    name: "orphaned_systemd_units".to_string(),
+                    status: "WARN",
+                    message: format!("failed to load lease for {lane_id}: {err}"),
+                };
+            },
+        };
+        let Some(lease) = lease else {
+            continue;
+        };
+        if !matches!(
+            lease.state,
+            LaneState::Running | LaneState::Leased | LaneState::Cleanup
+        ) {
+            continue;
+        }
+        if !matches!(
+            verify_pid_identity(lease.pid, lease.proc_start_time_ticks),
+            ProcessIdentity::Dead | ProcessIdentity::AliveMismatch
+        ) {
+            continue;
+        }
+
+        let liveness = check_fac_unit_liveness(&lane_id, &lease.job_id);
+        match liveness {
+            FacUnitLiveness::Inactive => {},
+            FacUnitLiveness::Active { active_units } => {
+                let preview = active_units
+                    .iter()
+                    .take(3)
+                    .map(std::string::String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(format!(
+                    "lane={lane_id} job_id={} pid={} active_units={}{}",
+                    lease.job_id,
+                    lease.pid,
+                    active_units.len(),
+                    if preview.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{preview}]")
+                    }
+                ));
+            },
+            FacUnitLiveness::Unknown { reason } => {
+                findings.push(format!(
+                    "lane={lane_id} job_id={} pid={} liveness=unknown ({reason})",
+                    lease.job_id, lease.pid
+                ));
+            },
+        }
+    }
+
+    if findings.is_empty() {
+        return DaemonDoctorCheck {
+            name: "orphaned_systemd_units".to_string(),
+            status: "OK",
+            message: "no orphaned systemd unit blockers detected".to_string(),
+        };
+    }
+
+    DaemonDoctorCheck {
+        name: "orphaned_systemd_units".to_string(),
+        status: "ERROR",
+        message: format!(
+            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE} detected: {}. Remediation: stop_revoke target job(s) to terminate active units, then run `apm2 fac doctor --fix`.",
+            findings.join("; ")
+        ),
+    }
+}
+
 pub fn collect_doctor_checks(
     operator_socket: &Path,
     config_path: &Path,
@@ -521,6 +716,12 @@ pub fn collect_doctor_checks(
         status: projection_check.status,
         message: projection_check.message,
     });
+
+    let orphaned_units_check = check_orphaned_systemd_units();
+    if orphaned_units_check.status == "ERROR" {
+        has_error = true;
+    }
+    checks.push(orphaned_units_check);
 
     // Disk space
     let data_dir = default_data_dir();
@@ -850,6 +1051,14 @@ pub fn collect_doctor_checks(
     }
     checks.push(alignment_check);
 
+    // Verify that the daemon child binary selected by `apm2 daemon`
+    // advertises the same HSI contract hash as the CLI wrapper.
+    let daemon_contract_check = check_daemon_runtime_contract_alignment();
+    if daemon_contract_check.status == "ERROR" {
+        has_error = true;
+    }
+    checks.push(daemon_contract_check);
+
     Ok((checks, has_error))
 }
 
@@ -1178,21 +1387,26 @@ fn sha256_file_digest(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Resolve the binary path from `which apm2`.
-fn resolve_which_apm2() -> Result<PathBuf, String> {
+/// Resolve the binary path from `which <binary_name>`.
+fn resolve_which_binary(binary_name: &str) -> Result<PathBuf, String> {
     let output = Command::new("which")
-        .arg("apm2")
+        .arg(binary_name)
         .output()
-        .map_err(|e| format!("failed to run `which apm2`: {e}"))?;
+        .map_err(|e| format!("failed to run `which {binary_name}`: {e}"))?;
     if !output.status.success() {
-        return Err("apm2 not found on PATH".to_string());
+        return Err(format!("{binary_name} not found on PATH"));
     }
     let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path_str.is_empty() {
-        return Err("which apm2 returned empty output".to_string());
+        return Err(format!("which {binary_name} returned empty output"));
     }
     // Resolve symlinks to get the canonical path
     std::fs::canonicalize(&path_str).map_err(|e| format!("cannot canonicalize {path_str}: {e}"))
+}
+
+/// Resolve the binary path from `which apm2`.
+fn resolve_which_apm2() -> Result<PathBuf, String> {
+    resolve_which_binary("apm2")
 }
 
 /// Parse the binary path from a systemd `ExecStart` property value.
@@ -1319,6 +1533,76 @@ fn check_binary_alignment() -> DaemonDoctorCheck {
         &borrowed,
         BINARY_ALIGNMENT_UNIT_NAMES.len(),
     )
+}
+
+/// Verify wrapper/daemon contract compatibility for daemon runtime startup.
+///
+/// This check resolves the daemon binary that `apm2 daemon` will execute,
+/// reads its `--print-hsi-contract-hash` output, and compares it with the
+/// wrapper's current HSI contract hash.
+fn check_daemon_runtime_contract_alignment() -> DaemonDoctorCheck {
+    let daemon_binary = match daemon_runtime_binary_path() {
+        Ok(path) => path,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "daemon_runtime_contract".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "cannot resolve daemon runtime binary: {err}. \
+                     Remediation: install `apm2-daemon` alongside `apm2` \
+                     (run `apm2 fac install`)"
+                ),
+            };
+        },
+    };
+
+    let cli_hash = match current_cli_contract_hash() {
+        Ok(hash) => hash,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "daemon_runtime_contract".to_string(),
+                status: "ERROR",
+                message: format!("failed to compute CLI HSI contract hash: {err}"),
+            };
+        },
+    };
+
+    let daemon_hash = match read_daemon_runtime_contract_hash(&daemon_binary) {
+        Ok(hash) => hash,
+        Err(err) => {
+            return DaemonDoctorCheck {
+                name: "daemon_runtime_contract".to_string(),
+                status: "ERROR",
+                message: format!(
+                    "failed to read daemon runtime contract hash from {}: {err}. \
+                     Remediation: reinstall aligned binaries with `apm2 fac install`",
+                    daemon_binary.display()
+                ),
+            };
+        },
+    };
+
+    if daemon_hash != cli_hash {
+        return DaemonDoctorCheck {
+            name: "daemon_runtime_contract".to_string(),
+            status: "ERROR",
+            message: format!(
+                "daemon runtime contract hash mismatch: client='{cli_hash}' daemon='{daemon_hash}' \
+                 daemon_binary={}. Remediation: run `apm2 fac install` to align binaries",
+                daemon_binary.display()
+            ),
+        };
+    }
+
+    DaemonDoctorCheck {
+        name: "daemon_runtime_contract".to_string(),
+        status: "OK",
+        message: format!(
+            "daemon runtime binary {} matches CLI HSI contract hash ({})",
+            daemon_binary.display(),
+            &cli_hash[..cli_hash.len().min(20)]
+        ),
+    }
 }
 
 /// Testable inner logic for binary alignment checking.
@@ -1913,12 +2197,12 @@ mod tests {
     #[test]
     fn daemon_service_templates_use_expected_worker_flag_and_rw_paths() {
         assert!(
-            WORKER_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
-            "worker service template must use --poll-interval-secs"
+            WORKER_SERVICE_TEMPLATE.contains("ExecStart=%exe_path% fac worker"),
+            "worker service template must invoke fac worker without poll interval flags"
         );
         assert!(
-            WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("fac worker --poll-interval-secs 10"),
-            "worker@ template must use --poll-interval-secs"
+            WORKER_TEMPLATE_SERVICE_TEMPLATE.contains("ExecStart=%exe_path% fac worker"),
+            "worker@ template must invoke fac worker without poll interval flags"
         );
         for worker_template in [WORKER_SERVICE_TEMPLATE, WORKER_TEMPLATE_SERVICE_TEMPLATE] {
             assert!(

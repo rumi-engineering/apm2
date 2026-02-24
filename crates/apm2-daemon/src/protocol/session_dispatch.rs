@@ -13312,6 +13312,26 @@ mod tests {
                 .emit_session_event(session_id, event_type, payload, actor_id, timestamp_ns)
         }
 
+        fn emit_evidence_published_event(
+            &self,
+            session_id: &str,
+            payload: &[u8],
+            actor_id: &str,
+            timestamp_ns: u64,
+            evidence_id: &str,
+        ) -> Result<
+            crate::protocol::dispatch::SignedLedgerEvent,
+            crate::protocol::dispatch::LedgerEventError,
+        > {
+            self.inner.emit_evidence_published_event(
+                session_id,
+                payload,
+                actor_id,
+                timestamp_ns,
+                evidence_id,
+            )
+        }
+
         fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
             self.verifying_key_override
                 .unwrap_or_else(|| self.inner.verifying_key())
@@ -13361,6 +13381,16 @@ mod tests {
                     .cloned(),
             );
             events
+        }
+
+        fn has_work_pr_association_tuple(
+            &self,
+            work_id: &str,
+            pr_number: u64,
+            commit_sha: &str,
+        ) -> bool {
+            self.inner
+                .has_work_pr_association_tuple(work_id, pr_number, commit_sha)
         }
 
         fn get_all_events(&self) -> Vec<crate::protocol::dispatch::SignedLedgerEvent> {
@@ -17527,6 +17557,23 @@ mod tests {
                 )
             }
 
+            fn emit_evidence_published_event(
+                &self,
+                session_id: &str,
+                payload: &[u8],
+                actor_id: &str,
+                timestamp_ns: u64,
+                evidence_id: &str,
+            ) -> Result<SignedLedgerEvent, LedgerEventError> {
+                self.inner.emit_evidence_published_event(
+                    session_id,
+                    payload,
+                    actor_id,
+                    timestamp_ns,
+                    evidence_id,
+                )
+            }
+
             fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
                 self.inner.verifying_key()
             }
@@ -17558,6 +17605,16 @@ mod tests {
 
             fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
                 self.inner.get_events_by_work_id(work_id)
+            }
+
+            fn has_work_pr_association_tuple(
+                &self,
+                work_id: &str,
+                pr_number: u64,
+                commit_sha: &str,
+            ) -> bool {
+                self.inner
+                    .has_work_pr_association_tuple(work_id, pr_number, commit_sha)
             }
 
             fn get_all_events(&self) -> Vec<SignedLedgerEvent> {

@@ -342,7 +342,6 @@ impl_bounded_decode_simple!(
     AuditorLaunchProjectionRequest,
     OrchestratorLaunchProjectionRequest,
     WorkStatusRequest,
-    WorkStatusResponse,
     WorkListRequest,
     SessionStatusRequest,
     SessionStatusResponse,
@@ -419,6 +418,24 @@ impl_bounded_decode_simple!(
     RegisterRecoveryEvidenceResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
+    // TCK-00638: Work context entry publishing
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
+    // TCK-00645: Work loop profile publishing
+    PublishWorkLoopProfileRequest,
+    PublishWorkLoopProfileResponse,
+    // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
+    ClaimWorkV2Request,
+    ClaimWorkV2Response,
+    // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
+    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -439,6 +456,7 @@ impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
 // TCK-00415: Projection-backed work list
 impl_bounded_decode_with_repeated!(WorkListResponse, work_items);
+impl_bounded_decode_with_repeated!(WorkStatusResponse, dependency_diagnostics);
 // TCK-00452: Auditor/orchestrator projections with uncertainty flags.
 impl_bounded_decode_with_repeated!(AuditorLaunchProjectionResponse, uncertainty_flags);
 impl_bounded_decode_with_repeated!(OrchestratorLaunchProjectionResponse, uncertainty_flags);

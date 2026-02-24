@@ -8,7 +8,7 @@ The `projection` module implements write-only projection adapters that synchroni
 
 ### Components
 
-- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Enforces economics-gated admission plus projection lifecycle gate (`join -> revalidate -> consume`) before effects (TCK-00505). ALL events must pass through the economics gate; events without economics selectors are DENIED (fail-closed: no bypass path).
+- **`ProjectionWorker`**: Long-running worker that tails the ledger for `ReviewReceiptRecorded` events and projects review results to GitHub. Also tails `evidence.published` events for `work_context` projection (TCK-00638) and `work_active_loop_profile` projection (TCK-00645). The `handle_evidence_published` method decodes the production JSON-envelope wire format (`emit_session_event` stores events as `{"payload": "<hex-encoded-protobuf>", ...}`): it first parses the JSON, extracts the hex-encoded inner payload, hex-decodes it, then protobuf-decodes the `EvidenceEvent`, and routes by category (`WORK_CONTEXT_ENTRY` or `WORK_LOOP_PROFILE`). Economics + lifecycle gates are enforced for authoritative external projection effects (`ReviewReceiptRecorded` -> GitHub); `evidence.published` indexing is deterministic replay of already-admitted ledger facts.
 - **`AdmissionTelemetry`**: Thread-safe atomic counters for economics admit/deny decisions per subcategory (TCK-00505)
 - **`lifecycle_deny`**: Constants for denial subcategories (consumed, revoked, stale, missing_gate, missing_economics_selectors, missing_lifecycle_selectors) used in replay prevention and gate failure scenarios (TCK-00505)
 - **`GitHubProjectionAdapter`**: Write-only GitHub commit status projection with signed receipts
@@ -21,6 +21,7 @@ The `projection` module implements write-only projection adapters that synchroni
 - **`ConfigBackedResolver`**: Config-backed continuity profile resolver for economics gate input assembly (TCK-00507)
 - **`ContinuityProfileResolver`**: Trait for resolving continuity profiles, sink snapshots, and continuity windows
 - **`DeferredReplayWorker`**: Worker that drains the deferred replay backlog after sink recovery, re-evaluating economics gate AND PCAC lifecycle enforcement for each replayed intent (TCK-00508)
+- **`JobLifecycleRehydrationReconciler`**: RFC-0032 queue projection reconciler that rebuilds filesystem witness state from `fac.job.*` ledger events with bounded event/fs-op budgets (TCK-00669)
 
 ### Security Model
 
@@ -31,11 +32,19 @@ The `projection` module implements write-only projection adapters that synchroni
 - **Idempotent**: Safe for retries with `(work_id, changeset_digest, ledger_head)` key
 - **Persistent cache**: Idempotency cache survives restarts
 - **Bounded deserialization**: String fields (`boundary_id`, `receipt_id`, `work_id`) reject oversized values before allocation
-- **Economics admission gate**: ALL events pass through the economics gate before any side effect. Events without economics selectors are DENIED (fail-closed: no bypass path). Events with selectors pass through `evaluate_projection_continuity()` (TCK-00505)
+- **Economics admission gate**: `ReviewReceiptRecorded` events pass through the economics gate before external side effects. Events without economics selectors are DENIED (fail-closed: no bypass path). Events with selectors pass through `evaluate_projection_continuity()` (TCK-00505)
 - **Lifecycle gate before effect**: Economics ALLOW is necessary but not sufficient; projection side effects require lifecycle `join -> revalidate -> consume` success first (TCK-00505).
 - **Idempotent-insert replay prevention**: Duplicate `(work_id, changeset_digest)` intents are denied, preventing double-projection (TCK-00505).
 - **Fail-closed gate defaults**: Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, never default ALLOW. Gate init failure also denies events with economics selectors (TCK-00505)
 - **Post-projection admission**: Intent is inserted as PENDING before projection, then admitted only AFTER successful projection side effects, ensuring at-least-once semantics (TCK-00505)
+- **Bounded lifecycle replay**: Job lifecycle reconciliation must use cursor-bounded event reads (`get_events_since`) with fixed `max_events_per_tick`; full-ledger materialization per tick is forbidden (TCK-00669).
+- **Terminal witness preservation**: Unknown-file cleanup for job lifecycle repair is restricted to `pending/` ONLY; `claimed/` files are never cleaned up because the move-first claim implementation may leave in-flight jobs that exist on disk but not in the projection (claim emission failure). `completed/` and `denied/` witness files remain durable evidence even after in-memory projection eviction (TCK-00669).
+- **Quarantine lifecycle termination**: When `scan_pending_from_projection` quarantines a malformed pending file, it emits `fac.job.failed` to move the projection record to a terminal state. Without this emission, the reconciler would recreate the witness stub, the scanner would re-quarantine it, and the loop would repeat indefinitely (TCK-00669).
+- **Terminal projection eviction**: Job lifecycle projection keeps a bounded terminal insertion-order queue and evicts oldest terminal jobs first when `MAX_PROJECTED_JOBS` is reached; active non-terminal saturation returns `CapacityExhausted` (TCK-00669).
+- **Lifecycle-scoped cursor probe**: The reconciler determines caught-up status by probing for remaining lifecycle events (`get_events_since` with lifecycle type filters and limit=1) instead of comparing against the global ledger head. Non-lifecycle events do not prevent cleanup from running (TCK-00669).
+- **Capacity exhaustion backpressure**: When `apply_event` returns `CapacityExhausted`, the reconciler halts the current tick WITHOUT advancing the cursor. The event is retried on a future tick once terminal jobs complete and free capacity. This prevents permanent data loss from skipping valid enqueue events (TCK-00669).
+- **Worker-integrated reconciler tick**: The reconciler `tick()` is called at worker startup and before each scan cycle in the worker runtime loop. This ensures `scan_pending_from_projection` reads a fresh checkpoint reflecting recently emitted dual-write events. Tick errors are non-fatal; the worker falls back to filesystem scan (TCK-00669).
+- **Projection scan queue_job_id validation**: `scan_pending_from_projection` validates each `queue_job_id` from the checkpoint before using it for filesystem path construction. IDs containing path traversal sequences (`/`, `..`, `\`), non-alphanumeric characters (outside `a-zA-Z0-9_-`), or exceeding length bounds are skipped with a warning (TCK-00669).
 
 ## Key Types
 
@@ -51,11 +60,12 @@ Long-running worker that tails ledger and projects review results to GitHub.
 
 - [INV-PJ01] Watermark is NOT advanced for events that fail due to missing dependencies (NACK/Retry).
 - [INV-PJ02] Worker is idempotent: restarts do not duplicate comments.
-- [INV-PJ10] No projection occurs without passing the economics admission gate. When the gate is NOT wired, ALL events are DENIED (fail-closed) (TCK-00505).
+- [INV-PJ10] No `ReviewReceiptRecorded` projection occurs without passing the economics admission gate. When the gate is NOT wired, those events are DENIED (fail-closed) (TCK-00505).
 - [INV-PJ11] Missing gate inputs (temporal authority, profile, snapshot, window) result in DENY, not default ALLOW (TCK-00505).
 - [INV-PJ12] Events without economics selectors are DENIED with `missing_economics_selectors` subcategory — no bypass path exists (TCK-00505).
 - [INV-PJ13] Already-projected intents (same `work_id + changeset_digest`) result in DENY via IntentBuffer uniqueness -- idempotent-insert replay prevention (TCK-00505).
-- [INV-PJ14] No projection side effect executes unless lifecycle gate `join -> revalidate -> consume` succeeds (TCK-00505).
+- [INV-PJ14] No external projection side effect executes unless lifecycle gate `join -> revalidate -> consume` succeeds (TCK-00505).
+- [INV-PJ15] Permanently malformed `evidence.published` events (InvalidPayload) are acknowledged and skipped to prevent head-of-line blocking; transient errors retry on next poll cycle (TCK-00638 R4 fix).
 
 **Contracts:**
 
@@ -187,11 +197,26 @@ Tracks active intervention freezes. Freezes require adjudication-based `Interven
 
 ### `WorkIndex`
 
-Maps `changeset_digest` to `work_id` to PR metadata for projection routing.
+Maps `changeset_digest` to `work_id` to PR metadata for projection routing. Also manages the `work_context` projection table (TCK-00638) with `register_work_context_entry()` for idempotent INSERT OR IGNORE, the `work_active_loop_profile` projection table (TCK-00645) with `register_work_active_loop_profile()` for latest-wins upsert, and the `work_spec_snapshot` projection table (TCK-00636) with `register_work_spec_snapshot()` for idempotent INSERT OR IGNORE.
+
+**Tables:**
+
+- `changeset_map`, `pr_metadata` -- projection routing tables
+- `work_context` -- work context entries projected from `evidence.published` events (TCK-00638). Primary key `(work_id, entry_id)`, unique constraint on `(work_id, kind, dedupe_key)`, indexed by `work_id` and `created_at_ns`. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds) with seconds-to-nanoseconds conversion (BLOCKER fix: unbounded state growth).
+- `work_active_loop_profile` -- active work loop profile per `work_id` projected from `evidence.published` events with category `WORK_LOOP_PROFILE` (TCK-00645). Primary key `work_id`, indexed by `work_id` and `anchored_at_ns`. Stores `dedupe_key` plus canonical ledger `seq_id`; latest-wins semantics are `(anchored_at_ns DESC, seq_id DESC)` so same-timestamp events resolve deterministically to the higher sequence. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `anchored_at_ns` (nanoseconds).
+- `work_spec_snapshot` -- maps `work_id` to `spec_snapshot_hash` (32-byte BLAKE3 hash) derived from `work.opened` events (TCK-00636, RFC-0032 Phase 1). Primary key `work_id`, indexed by `created_at_ns`. Uses `INSERT OR IGNORE` for idempotent replay and is consumed by the work-authority alias reconciliation gate for CAS-backed ticket alias resolution. Included in `evict_expired` / `evict_expired_async` TTL-based eviction using `created_at_ns` (nanoseconds).
 
 ### `LedgerTailer`
 
-Ledger event tailer that drives projection decisions.
+Ledger event tailer that drives projection decisions. Uses a composite cursor `(timestamp_ns, event_id)` for deterministic ordering and at-least-once delivery semantics.
+
+**Freeze-aware canonical reads (TCK-00638):** When the canonical `events` table exists (freeze mode active), `poll_events` and `poll_events_async` merge results from both `ledger_events` (legacy) and `events` (canonical) tables, sorted by `(timestamp_ns, event_id)` and truncated to the batch limit. Canonical events use synthesised `event_id` = `"canonical-{seq_id:020}"` (20-digit zero-padded) and map `session_id` to `work_id`. Canonical mode is lazily detected via `sqlite_master` probe and cached in an `AtomicU8` (0=unknown, 1=legacy-only, 2=canonical-active). The zero-padded format ensures lexicographic ordering matches numeric `seq_id` ordering, preventing cursor skip when >9 canonical events share the same timestamp (MAJOR fix: timestamp collision cursor skip).
+
+**Invariants:**
+
+- [INV-LT01] Canonical mode detection is cached after first probe -- no repeated `sqlite_master` queries per poll cycle.
+- [INV-LT02] Merged results are always sorted by `(timestamp_ns, event_id)` for deterministic cursor advancement.
+- [INV-LT03] When no canonical `events` table exists, the tailer operates in legacy-only mode with no error.
 
 ### `IntentBuffer` (TCK-00504)
 
@@ -350,3 +375,6 @@ Worker that drains the deferred replay backlog after sink recovery. For each rep
 - TCK-00505: Wire economics admission gate into projection worker pre-projection path
 - TCK-00507: Continuity profile and sink snapshot resolution for economics gate input assembly
 - TCK-00508: Deferred replay worker for projection intent buffer drain after outage recovery
+- TCK-00638: RFC-0032 Phase 2 `work_context` projection table and `evidence.published` tailer for work context entries
+- TCK-00636: RFC-0032 Phase 1 `work_spec_snapshot` projection table mapping `work_id` to `spec_snapshot_hash` for work-authority alias reconciliation, `work.opened` event tailer
+- TCK-00645: RFC-0032 Phase 4 `work_active_loop_profile` projection table for active loop profile selection, `PublishWorkLoopProfile` CAS + evidence anchor

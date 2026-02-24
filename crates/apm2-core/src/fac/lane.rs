@@ -52,7 +52,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::execution_backend::{ExecutionBackend, select_backend};
-use super::safe_rmtree::{MAX_LOG_DIR_ENTRIES, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit};
+use super::safe_rmtree::{
+    MAX_LOG_DIR_ENTRIES, normalize_user_owned_dir_modes_for_safe_delete,
+    safe_rmtree_v1_with_entry_limit,
+};
+use super::systemd_unit::{
+    FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -111,6 +117,19 @@ pub const MAX_LANE_ID_LENGTH: usize = 64;
 
 /// Maximum string field length in lane records.
 pub const MAX_STRING_LENGTH: usize = 512;
+
+fn truncate_to_max_string(raw: &str) -> String {
+    let char_count = raw.chars().count();
+    if char_count <= MAX_STRING_LENGTH {
+        return raw.to_string();
+    }
+    if MAX_STRING_LENGTH <= 3 {
+        return raw.chars().take(MAX_STRING_LENGTH).collect();
+    }
+    let mut out = raw.chars().take(MAX_STRING_LENGTH - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
 
 /// Maximum lease file size to read (1 MiB, CTR-1603).
 pub const MAX_LEASE_FILE_SIZE: u64 = 1024 * 1024;
@@ -1219,7 +1238,7 @@ pub struct LaneInitProfileEntry {
     pub created: bool,
 }
 
-/// Receipt for `apm2 fac lane reconcile` (TCK-00539).
+/// Receipt for lane reconciliation used by `apm2 fac doctor --fix` (TCK-00539).
 ///
 /// Records all reconciliation actions taken, lanes inspected, and outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1532,8 +1551,8 @@ impl LaneManager {
     /// Reconcile lane state: repair missing directories and profiles, mark
     /// lanes CORRUPT if unrecoverable.
     ///
-    /// This is the operator recovery command for `apm2 fac lane reconcile`.
-    /// It inspects each configured lane and repairs what it can:
+    /// This powers operator recovery via `apm2 fac doctor --fix`. It inspects
+    /// each configured lane and repairs what it can:
     ///
     /// - Missing lane directories are recreated with `0o700` permissions.
     /// - Missing profiles are regenerated with defaults.
@@ -1634,6 +1653,64 @@ impl LaneManager {
                             "lease state=LEASED with unverifiable identity".to_string()
                         },
                     };
+                    let liveness = check_fac_unit_liveness(lane_id, &lease.job_id);
+                    if !matches!(liveness, FacUnitLiveness::Inactive) {
+                        let liveness_detail = match &liveness {
+                            FacUnitLiveness::Active { active_units } => {
+                                let preview = active_units
+                                    .iter()
+                                    .take(4)
+                                    .map(std::string::String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                if preview.is_empty() {
+                                    format!(
+                                        "associated systemd units still active (count={})",
+                                        active_units.len()
+                                    )
+                                } else {
+                                    let suffix = if active_units.len() > 4 { " +more" } else { "" };
+                                    format!(
+                                        "associated systemd units still active (count={}, units=[{preview}]{suffix})",
+                                        active_units.len()
+                                    )
+                                }
+                            },
+                            FacUnitLiveness::Unknown { reason } => {
+                                format!(
+                                    "systemd liveness probe inconclusive ({reason}); fail-closed"
+                                )
+                            },
+                            FacUnitLiveness::Inactive => {
+                                "no active associated systemd units".to_string()
+                            },
+                        };
+                        let reason = truncate_to_max_string(&format!(
+                            "{ORPHANED_SYSTEMD_UNIT_REASON_CODE}: lane={lane_id} job_id={} pid={} stale lease reap blocked: {liveness_detail}",
+                            lease.job_id, lease.pid
+                        ));
+                        match self.mark_corrupt(lane_id, &reason, None) {
+                            Ok(_) => {
+                                actions.push(LaneReconcileAction {
+                                    lane_id: lane_id.to_string(),
+                                    action: "reap_orphan_lease".to_string(),
+                                    outcome: LaneReconcileOutcome::MarkedCorrupt,
+                                    detail: Some(reason),
+                                });
+                            },
+                            Err(err) => {
+                                actions.push(LaneReconcileAction {
+                                    lane_id: lane_id.to_string(),
+                                    action: "reap_orphan_lease".to_string(),
+                                    outcome: LaneReconcileOutcome::Failed,
+                                    detail: Some(format!(
+                                        "failed to persist corrupt marker for blocked orphan-lease reap: {err}"
+                                    )),
+                                });
+                            },
+                        }
+                        return;
+                    }
                     Some(detail)
                 } else {
                     return;
@@ -1726,7 +1803,7 @@ impl LaneManager {
     ///
     /// Corrupt-marked lanes are skipped immediately — no repair attempts are
     /// made. This preserves the quarantine contract: operators must explicitly
-    /// clear the corrupt marker via `apm2 fac lane reset` before the lane is
+    /// clear the corrupt marker via `apm2 fac doctor --fix` before the lane is
     /// eligible for repair.
     fn reconcile_single_lane(
         fac_root: &Path,
@@ -1745,7 +1822,7 @@ impl LaneManager {
                 action: "existing_corrupt_marker".to_string(),
                 outcome: LaneReconcileOutcome::Skipped,
                 detail: Some(
-                    "corrupt marker present; use `apm2 fac lane reset` to clear".to_string(),
+                    "corrupt marker present; use `apm2 fac doctor --fix` to clear".to_string(),
                 ),
             });
             return;
@@ -2434,7 +2511,20 @@ impl LaneManager {
         // Step 3: Prune temp directory.
         let tmp_dir = lanes_dir.join("tmp");
         if tmp_dir.exists() {
-            if let Err(err) = safe_rmtree_v1(&tmp_dir, &lanes_dir) {
+            if let Err(err) =
+                normalize_user_owned_dir_modes_for_safe_delete(&tmp_dir, MAX_LOG_DIR_ENTRIES)
+            {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::TempPruneFailed {
+                    step: CLEANUP_STEP_TEMP_PRUNE,
+                    reason: format!("tmp permission repair failed: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_TEMP_PRUNE.to_string()),
+                });
+            }
+            if let Err(err) =
+                safe_rmtree_v1_with_entry_limit(&tmp_dir, &lanes_dir, MAX_LOG_DIR_ENTRIES)
+            {
                 persist_lease_state(&mut lease, LaneState::Corrupt)?;
                 return Err(LaneCleanupError::TempPruneFailed {
                     step: CLEANUP_STEP_TEMP_PRUNE,
@@ -2456,7 +2546,23 @@ impl LaneManager {
 
             let env_dir = lanes_dir.join(env_subdir);
             if env_dir.exists() {
-                if let Err(err) = safe_rmtree_v1(&env_dir, &lanes_dir) {
+                if let Err(err) =
+                    normalize_user_owned_dir_modes_for_safe_delete(&env_dir, MAX_LOG_DIR_ENTRIES)
+                {
+                    persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                    return Err(LaneCleanupError::EnvDirPruneFailed {
+                        step: CLEANUP_STEP_ENV_DIR_PRUNE,
+                        reason: format!(
+                            "failed to repair env dir permissions {}: {err}",
+                            env_dir.display()
+                        ),
+                        steps_completed: steps_completed.clone(),
+                        failure_step: Some(CLEANUP_STEP_ENV_DIR_PRUNE.to_string()),
+                    });
+                }
+                if let Err(err) =
+                    safe_rmtree_v1_with_entry_limit(&env_dir, &lanes_dir, MAX_LOG_DIR_ENTRIES)
+                {
                     persist_lease_state(&mut lease, LaneState::Corrupt)?;
                     return Err(LaneCleanupError::EnvDirPruneFailed {
                         step: CLEANUP_STEP_ENV_DIR_PRUNE,
@@ -5437,6 +5543,55 @@ mod tests {
                 "{env_subdir} should be deleted during cleanup"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lane_cleanup_recovers_write_only_broker_requests_tmp_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let nested_dir = lane_dir
+            .join("tmp")
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        fs::create_dir_all(&nested_dir).expect("create nested broker_requests tree");
+        fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+        fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let steps_completed = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("cleanup should recover write-only tmp trees");
+        assert!(
+            steps_completed.contains(&CLEANUP_STEP_TEMP_PRUNE.to_string()),
+            "tmp prune step should complete successfully"
+        );
+        assert!(
+            !lane_dir.join("tmp").exists(),
+            "tmp tree should be removed by lane cleanup"
+        );
+
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Idle);
     }
 
     #[test]

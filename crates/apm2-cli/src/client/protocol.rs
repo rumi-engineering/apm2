@@ -28,9 +28,10 @@
 //! - [DD-009] Protocol selection is strict and fail-closed
 //! - [CTR-PROTO-001] Mandatory Hello/HelloAck handshake before any requests
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apm2_daemon::protocol::{
     // Credential management types (CTR-PROTO-011, TCK-00343)
@@ -43,6 +44,8 @@ use apm2_daemon::protocol::{
     // Privileged endpoint messages
     ClaimWorkRequest,
     ClaimWorkResponse,
+    ClaimWorkV2Request,
+    ClaimWorkV2Response,
     // Handshake
     ClientHandshake,
     // TCK-00345: Consensus query messages
@@ -74,6 +77,9 @@ use apm2_daemon::protocol::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    OpenWorkRequest,
+    OpenWorkResponse,
     PrivilegedError,
     PrivilegedErrorCode,
     PrivilegedMessageType,
@@ -87,6 +93,11 @@ use apm2_daemon::protocol::{
     // Evidence publishing
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    PublishWorkContextEntryRequest,
+    PublishWorkContextEntryResponse,
+    PulseEvent,
+    RecordWorkPrAssociationRequest,
+    RecordWorkPrAssociationResponse,
     RefreshCredentialRequest,
     RefreshCredentialResponse,
     ReloadProcessRequest,
@@ -96,6 +107,9 @@ use apm2_daemon::protocol::{
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
+    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    ResolveTicketAliasRequest,
+    ResolveTicketAliasResponse,
     RestartProcessRequest,
     RestartProcessResponse,
     SessionError,
@@ -115,8 +129,12 @@ use apm2_daemon::protocol::{
     // TCK-00342: Log streaming types
     StreamLogsRequest,
     StreamLogsResponse,
+    SubscribePulseRequest,
+    SubscribePulseResponse,
     SwitchCredentialRequest,
     SwitchCredentialResponse,
+    UnsubscribePulseRequest,
+    UnsubscribePulseResponse,
     WorkListRequest,
     WorkListResponse,
     // Work types
@@ -127,6 +145,7 @@ use apm2_daemon::protocol::{
     // Encoding helpers
     encode_add_credential_request,
     encode_claim_work_request,
+    encode_claim_work_v2_request,
     // TCK-00345: Consensus query encoding
     encode_consensus_byzantine_evidence_request,
     encode_consensus_metrics_request,
@@ -140,13 +159,18 @@ use apm2_daemon::protocol::{
     // TCK-00342: Process management encoding
     encode_list_processes_request,
     encode_login_credential_request,
+    // TCK-00635: OpenWork encoding
+    encode_open_work_request,
     encode_process_status_request,
     encode_publish_changeset_request,
     encode_publish_evidence_request,
+    encode_publish_work_context_entry_request,
+    encode_record_work_pr_association_request,
     encode_refresh_credential_request,
     encode_reload_process_request,
     encode_remove_credential_request,
     encode_request_tool_request,
+    encode_resolve_ticket_alias_request,
     encode_restart_process_request,
     // TCK-00344: Status query encoding
     encode_session_status_request,
@@ -164,6 +188,7 @@ use apm2_daemon::protocol::{
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use prost::Message;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
@@ -180,11 +205,21 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 #[allow(dead_code)]
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const DAEMON_SIGNING_PUBLIC_KEY_LEN: usize = 32;
+const SUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 65;
+const UNSUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 67;
+const MAX_PENDING_PULSE_EVENTS: usize = 256;
 
 #[derive(Debug, Clone)]
 struct HandshakeInfo {
     server_info: String,
     daemon_signing_public_key: Option<[u8; DAEMON_SIGNING_PUBLIC_KEY_LEN]>,
+}
+
+#[derive(Debug)]
+enum OperatorPulseFrame {
+    Pulse(PulseEvent),
+    Subscribe(SubscribePulseResponse),
+    Unsubscribe(UnsubscribePulseResponse),
 }
 
 // ============================================================================
@@ -298,6 +333,7 @@ impl From<ProtocolError> for ProtocolClientError {
 /// - Mandatory Hello/HelloAck handshake per CTR-PROTO-001
 pub struct OperatorClient {
     framed: Framed<UnixStream, FrameCodec>,
+    pending_pulses: VecDeque<PulseEvent>,
     /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
@@ -346,6 +382,7 @@ impl OperatorClient {
 
         Ok(Self {
             framed,
+            pending_pulses: VecDeque::new(),
             server_info: handshake.server_info,
             daemon_signing_public_key: handshake.daemon_signing_public_key,
             timeout,
@@ -1203,6 +1240,393 @@ impl OperatorClient {
     }
 
     // =========================================================================
+    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Resolves a ticket alias to a canonical `work_id` via daemon projection
+    /// state (TCK-00636).
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket_alias` - Ticket alias to resolve (e.g. "TCK-00636")
+    ///
+    /// # Returns
+    ///
+    /// Resolution result containing the canonical `work_id` if found, or
+    /// `found: false` when no match exists. Infrastructure/ambiguity errors
+    /// are returned as `DaemonError`.
+    pub async fn resolve_ticket_alias(
+        &mut self,
+        ticket_alias: &str,
+    ) -> Result<ResolveTicketAliasResponse, ProtocolClientError> {
+        let request = ResolveTicketAliasRequest {
+            ticket_alias: ticket_alias.to_string(),
+        };
+        let request_bytes = encode_resolve_ticket_alias_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_resolve_ticket_alias_response(&response_frame)
+    }
+
+    // =========================================================================
+    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // =========================================================================
+
+    /// Opens a new work item by sending a validated `WorkSpec` to the daemon
+    /// (TCK-00635).
+    ///
+    /// The daemon validates the `WorkSpec`, canonicalizes it, stores to CAS,
+    /// and emits a `work.opened` event. Idempotent: same `work_id` + same
+    /// spec hash returns success with `already_existed=true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_spec_json` - Canonical JSON-encoded `WorkSpec` bytes
+    ///
+    /// # Returns
+    ///
+    /// [`OpenWorkResponse`] with `work_id`, spec hash, and idempotency flag.
+    pub async fn open_work(
+        &mut self,
+        work_spec_json: &[u8],
+        lease_id: &str,
+    ) -> Result<OpenWorkResponse, ProtocolClientError> {
+        let request = OpenWorkRequest {
+            work_spec_json: work_spec_json.to_vec(),
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_open_work_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_open_work_response(&response_frame)
+    }
+
+    /// Claims an existing work item via RFC-0032 `ClaimWorkV2` (TCK-00637).
+    ///
+    /// `ClaimWorkV2` claims an already opened work item and returns a
+    /// role-scoped issued claim lease.
+    pub async fn claim_work_v2(
+        &mut self,
+        work_id: &str,
+        role: WorkRole,
+        lease_id: &str,
+    ) -> Result<ClaimWorkV2Response, ProtocolClientError> {
+        let request = ClaimWorkV2Request {
+            work_id: work_id.to_string(),
+            role: role.into(),
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_claim_work_v2_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_claim_work_v2_response(&response_frame)
+    }
+
+    // =========================================================================
+    // TCK-00654: HEF Pulse Wait Integration (RFC-0032 section 12.5)
+    // =========================================================================
+
+    fn enqueue_pending_pulse(pending_pulses: &mut VecDeque<PulseEvent>, event: PulseEvent) {
+        if pending_pulses.len() >= MAX_PENDING_PULSE_EVENTS {
+            pending_pulses.pop_front();
+        }
+        pending_pulses.push_back(event);
+    }
+
+    /// Subscribes the operator connection to HEF pulse topics.
+    ///
+    /// Operator subscriptions use socket-authenticated privileges and therefore
+    /// omit `session_token`.
+    pub async fn subscribe_pulse(
+        &mut self,
+        client_sub_id: &str,
+        topic_patterns: &[String],
+        since_ledger_cursor: u64,
+        max_pulses_per_sec: u32,
+    ) -> Result<SubscribePulseResponse, ProtocolClientError> {
+        let request = SubscribePulseRequest {
+            session_token: String::new(),
+            client_sub_id: client_sub_id.to_string(),
+            topic_patterns: topic_patterns.to_vec(),
+            since_ledger_cursor,
+            max_pulses_per_sec,
+        };
+
+        let mut buf = vec![PrivilegedMessageType::SubscribePulse.tag()];
+        request.encode(&mut buf).expect("encode cannot fail");
+
+        tokio::time::timeout(self.timeout, self.framed.send(Bytes::from(buf)))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ProtocolClientError::Timeout);
+            };
+            let frame = tokio::time::timeout(remaining, self.framed.next())
+                .await
+                .map_err(|_| ProtocolClientError::Timeout)?
+                .ok_or_else(|| {
+                    ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+                })?
+                .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+            match Self::decode_operator_pulse_frame(&frame)? {
+                OperatorPulseFrame::Pulse(event) => {
+                    Self::enqueue_pending_pulse(&mut self.pending_pulses, event);
+                },
+                OperatorPulseFrame::Subscribe(response) => return Ok(response),
+                OperatorPulseFrame::Unsubscribe(_) => {
+                    return Err(ProtocolClientError::UnexpectedResponse(
+                        "received UnsubscribePulse response while waiting for SubscribePulse response"
+                            .to_string(),
+                    ));
+                },
+            }
+        }
+    }
+
+    /// Waits for the next pulse event on an active subscription.
+    ///
+    /// Returns `Ok(None)` when `timeout` elapses without a pulse.
+    pub async fn wait_for_pulse(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<PulseEvent>, ProtocolClientError> {
+        if let Some(pending) = self.pending_pulses.pop_front() {
+            return Ok(Some(pending));
+        }
+
+        let Ok(frame) = tokio::time::timeout(timeout, self.framed.next()).await else {
+            return Ok(None);
+        };
+
+        let frame = frame
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        match Self::decode_operator_pulse_frame(&frame)? {
+            OperatorPulseFrame::Pulse(event) => Ok(Some(event)),
+            OperatorPulseFrame::Subscribe(response) => {
+                Err(ProtocolClientError::UnexpectedResponse(format!(
+                    "received unexpected SubscribePulse response while waiting for pulse event (subscription_id={})",
+                    response.subscription_id
+                )))
+            },
+            OperatorPulseFrame::Unsubscribe(response) => {
+                Err(ProtocolClientError::UnexpectedResponse(format!(
+                    "received unexpected UnsubscribePulse response while waiting for pulse event (removed={})",
+                    response.removed
+                )))
+            },
+        }
+    }
+
+    /// Unsubscribes a previously-created pulse subscription.
+    pub async fn unsubscribe_pulse(
+        &mut self,
+        subscription_id: &str,
+    ) -> Result<UnsubscribePulseResponse, ProtocolClientError> {
+        let request = UnsubscribePulseRequest {
+            session_token: String::new(),
+            subscription_id: subscription_id.to_string(),
+        };
+
+        let mut buf = vec![PrivilegedMessageType::UnsubscribePulse.tag()];
+        request.encode(&mut buf).expect("encode cannot fail");
+
+        tokio::time::timeout(self.timeout, self.framed.send(Bytes::from(buf)))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(ProtocolClientError::Timeout);
+            };
+            let frame = tokio::time::timeout(remaining, self.framed.next())
+                .await
+                .map_err(|_| ProtocolClientError::Timeout)?
+                .ok_or_else(|| {
+                    ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+                })?
+                .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+            match Self::decode_operator_pulse_frame(&frame)? {
+                OperatorPulseFrame::Pulse(event) => {
+                    Self::enqueue_pending_pulse(&mut self.pending_pulses, event);
+                },
+                OperatorPulseFrame::Unsubscribe(response) => return Ok(response),
+                OperatorPulseFrame::Subscribe(_) => {
+                    return Err(ProtocolClientError::UnexpectedResponse(
+                        "received SubscribePulse response while waiting for UnsubscribePulse response"
+                            .to_string(),
+                    ));
+                },
+            }
+        }
+    }
+
+    /// Decodes a pulse-control frame on the operator socket.
+    fn decode_operator_pulse_frame(
+        frame: &Bytes,
+    ) -> Result<OperatorPulseFrame, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag == PrivilegedMessageType::PulseEvent.tag() {
+            let event = PulseEvent::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            return Ok(OperatorPulseFrame::Pulse(event));
+        }
+
+        if tag == SUBSCRIBE_PULSE_RESPONSE_TAG {
+            let response =
+                SubscribePulseResponse::decode_bounded(payload, &DecodeConfig::default())
+                    .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            return Ok(OperatorPulseFrame::Subscribe(response));
+        }
+
+        if tag == UNSUBSCRIBE_PULSE_RESPONSE_TAG {
+            let response =
+                UnsubscribePulseResponse::decode_bounded(payload, &DecodeConfig::default())
+                    .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            return Ok(OperatorPulseFrame::Unsubscribe(response));
+        }
+
+        Err(ProtocolClientError::UnexpectedResponse(format!(
+            "unexpected operator pulse frame tag {tag}"
+        )))
+    }
+
+    /// Decodes an `OpenWork` response (TCK-00635).
+    fn decode_open_work_response(frame: &Bytes) -> Result<OpenWorkResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::OpenWork.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected OpenWork response (tag {}), got tag {tag}",
+                PrivilegedMessageType::OpenWork.tag()
+            )));
+        }
+
+        OpenWorkResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `ClaimWorkV2` response (TCK-00637).
+    fn decode_claim_work_v2_response(
+        frame: &Bytes,
+    ) -> Result<ClaimWorkV2Response, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ClaimWorkV2.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ClaimWorkV2 response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ClaimWorkV2.tag()
+            )));
+        }
+
+        ClaimWorkV2Response::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    // =========================================================================
     // TCK-00389: IngestReviewReceipt
     // =========================================================================
 
@@ -1733,6 +2157,39 @@ impl OperatorClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
+    /// Decodes a `ResolveTicketAlias` response (TCK-00636).
+    fn decode_resolve_ticket_alias_response(
+        frame: &Bytes,
+    ) -> Result<ResolveTicketAliasResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ResolveTicketAlias.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ResolveTicketAlias response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ResolveTicketAlias.tag()
+            )));
+        }
+
+        ResolveTicketAliasResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
     // =========================================================================
     // TCK-00394: ChangeSet Publishing
     // =========================================================================
@@ -1746,6 +2203,7 @@ impl OperatorClient {
     /// # Arguments
     ///
     /// * `work_id` - Work identifier this changeset belongs to
+    /// * `lease_id` - Governing lease for this work mutation
     /// * `bundle_bytes` - Serialized `ChangeSetBundleV1` (canonical JSON)
     ///
     /// # Errors
@@ -1757,10 +2215,12 @@ impl OperatorClient {
     pub async fn publish_changeset(
         &mut self,
         work_id: &str,
+        lease_id: &str,
         bundle_bytes: Vec<u8>,
     ) -> Result<PublishChangeSetResponse, ProtocolClientError> {
         let request = PublishChangeSetRequest {
             work_id: work_id.to_string(),
+            lease_id: lease_id.to_string(),
             bundle_bytes,
         };
         let request_bytes = encode_publish_changeset_request(&request);
@@ -1815,6 +2275,141 @@ impl OperatorClient {
         }
 
         PublishChangeSetResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Records a canonical PR association for an existing `work_id`.
+    pub async fn record_work_pr_association(
+        &mut self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+        lease_id: &str,
+        pr_url: Option<&str>,
+        validate_only: bool,
+    ) -> Result<RecordWorkPrAssociationResponse, ProtocolClientError> {
+        let request = RecordWorkPrAssociationRequest {
+            work_id: work_id.to_string(),
+            pr_number,
+            commit_sha: commit_sha.to_string(),
+            lease_id: lease_id.to_string(),
+            pr_url: pr_url.unwrap_or_default().to_string(),
+            validate_only,
+        };
+        let request_bytes = encode_record_work_pr_association_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_record_work_pr_association_response(&response_frame)
+    }
+
+    fn decode_record_work_pr_association_response(
+        frame: &Bytes,
+    ) -> Result<RecordWorkPrAssociationResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::RecordWorkPrAssociation.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected RecordWorkPrAssociation response (tag {}), got tag {tag}",
+                PrivilegedMessageType::RecordWorkPrAssociation.tag()
+            )));
+        }
+
+        RecordWorkPrAssociationResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Publishes a work context entry anchored by `(work_id, kind,
+    /// dedupe_key)`.
+    pub async fn publish_work_context_entry(
+        &mut self,
+        work_id: &str,
+        kind: &str,
+        dedupe_key: &str,
+        entry_json: Vec<u8>,
+        lease_id: &str,
+    ) -> Result<PublishWorkContextEntryResponse, ProtocolClientError> {
+        let request = PublishWorkContextEntryRequest {
+            work_id: work_id.to_string(),
+            kind: kind.to_string(),
+            dedupe_key: dedupe_key.to_string(),
+            entry_json,
+            lease_id: lease_id.to_string(),
+        };
+        let request_bytes = encode_publish_work_context_entry_request(&request);
+
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        Self::decode_publish_work_context_entry_response(&response_frame)
+    }
+
+    fn decode_publish_work_context_entry_response(
+        frame: &Bytes,
+    ) -> Result<PublishWorkContextEntryResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::PublishWorkContextEntry.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected PublishWorkContextEntry response (tag {}), got tag {tag}",
+                PrivilegedMessageType::PublishWorkContextEntry.tag()
+            )));
+        }
+
+        PublishWorkContextEntryResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
@@ -2811,6 +3406,65 @@ mod tests {
         );
     }
 
+    /// Tests that `ClaimWorkV2` requests use tag-based encoding.
+    #[test]
+    fn test_operator_claim_work_v2_routing() {
+        let request = ClaimWorkV2Request {
+            work_id: "W-TCK-00640".to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: "L-governing-001".to_string(),
+        };
+        let encoded = encode_claim_work_v2_request(&request);
+
+        assert!(!encoded.is_empty());
+        let tag = encoded[0];
+        assert_eq!(
+            tag,
+            PrivilegedMessageType::ClaimWorkV2.tag(),
+            "ClaimWorkV2 request should use correct tag"
+        );
+    }
+
+    #[test]
+    fn test_decode_claim_work_v2_response_success() {
+        let response = ClaimWorkV2Response {
+            work_id: "W-TCK-00640".to_string(),
+            issued_lease_id: "L-issued-001".to_string(),
+            authority_bindings_hash: "b3-256:abcd".to_string(),
+            evidence_id: "WAB-001".to_string(),
+            already_claimed: false,
+        };
+        let mut frame = vec![PrivilegedMessageType::ClaimWorkV2.tag()];
+        response
+            .encode(&mut frame)
+            .expect("encode ClaimWorkV2Response");
+        let decoded = OperatorClient::decode_claim_work_v2_response(&Bytes::from(frame))
+            .expect("decode ClaimWorkV2 response");
+        assert_eq!(decoded.work_id, "W-TCK-00640");
+        assert_eq!(decoded.issued_lease_id, "L-issued-001");
+    }
+
+    #[test]
+    fn test_decode_claim_work_v2_response_wrong_tag() {
+        let response = ClaimWorkV2Response {
+            work_id: "W-TCK-00640".to_string(),
+            issued_lease_id: "L-issued-001".to_string(),
+            authority_bindings_hash: "b3-256:abcd".to_string(),
+            evidence_id: "WAB-001".to_string(),
+            already_claimed: false,
+        };
+        let mut frame = vec![PrivilegedMessageType::OpenWork.tag()];
+        response
+            .encode(&mut frame)
+            .expect("encode ClaimWorkV2Response");
+        let err = OperatorClient::decode_claim_work_v2_response(&Bytes::from(frame))
+            .expect_err("wrong tag must fail");
+        assert!(
+            matches!(err, ProtocolClientError::UnexpectedResponse(_)),
+            "expected UnexpectedResponse, got {err:?}"
+        );
+    }
+
     /// Tests that `SpawnEpisode` requests use tag-based encoding.
     #[test]
     fn test_operator_spawn_episode_routing() {
@@ -2833,6 +3487,150 @@ mod tests {
             PrivilegedMessageType::SpawnEpisode.tag(),
             "SpawnEpisode request should use correct tag"
         );
+    }
+
+    #[test]
+    fn test_operator_pulse_request_tags() {
+        let subscribe_request = SubscribePulseRequest {
+            session_token: String::new(),
+            client_sub_id: "client-sub-1".to_string(),
+            topic_patterns: vec!["work.W-123.events".to_string()],
+            since_ledger_cursor: 42,
+            max_pulses_per_sec: 16,
+        };
+        let mut subscribe_encoded = vec![PrivilegedMessageType::SubscribePulse.tag()];
+        subscribe_request
+            .encode(&mut subscribe_encoded)
+            .expect("encode subscribe request");
+        assert_eq!(
+            subscribe_encoded[0],
+            PrivilegedMessageType::SubscribePulse.tag()
+        );
+
+        let unsubscribe_request = UnsubscribePulseRequest {
+            session_token: String::new(),
+            subscription_id: "SUB-123".to_string(),
+        };
+        let mut unsubscribe_encoded = vec![PrivilegedMessageType::UnsubscribePulse.tag()];
+        unsubscribe_request
+            .encode(&mut unsubscribe_encoded)
+            .expect("encode unsubscribe request");
+        assert_eq!(
+            unsubscribe_encoded[0],
+            PrivilegedMessageType::UnsubscribePulse.tag()
+        );
+    }
+
+    #[test]
+    fn test_decode_operator_pulse_frame_subscribe_response() {
+        let response = SubscribePulseResponse {
+            subscription_id: "SUB-123".to_string(),
+            effective_since_cursor: 9,
+            accepted_patterns: vec!["work.>".to_string()],
+            rejected_patterns: Vec::new(),
+        };
+        let mut frame = vec![SUBSCRIBE_PULSE_RESPONSE_TAG];
+        response
+            .encode(&mut frame)
+            .expect("encode subscribe response");
+
+        let decoded = OperatorClient::decode_operator_pulse_frame(&Bytes::from(frame))
+            .expect("decode subscribe response");
+        match decoded {
+            OperatorPulseFrame::Subscribe(resp) => {
+                assert_eq!(resp.subscription_id, "SUB-123");
+                assert_eq!(resp.accepted_patterns, vec!["work.>".to_string()]);
+            },
+            other => panic!("expected subscribe response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_operator_pulse_frame_pulse_event() {
+        let pulse = PulseEvent {
+            envelope: Some(apm2_daemon::protocol::PulseEnvelopeV1 {
+                schema_version: 1,
+                pulse_id: "pulse-1".to_string(),
+                topic: "work.W-123.events".to_string(),
+                ledger_cursor: 11,
+                ledger_head: 11,
+                event_hash: Some(vec![0xAB; 32]),
+                event_type: "work.transitioned".to_string(),
+                entities: Vec::new(),
+                cas_refs: Vec::new(),
+                time_envelope_hash: None,
+                hlc: None,
+                wall: None,
+            }),
+        };
+        let mut frame = vec![PrivilegedMessageType::PulseEvent.tag()];
+        pulse.encode(&mut frame).expect("encode pulse event");
+
+        let decoded =
+            OperatorClient::decode_operator_pulse_frame(&Bytes::from(frame)).expect("decode pulse");
+        match decoded {
+            OperatorPulseFrame::Pulse(event) => {
+                assert_eq!(
+                    event.envelope.as_ref().map(|entry| entry.topic.as_str()),
+                    Some("work.W-123.events")
+                );
+            },
+            other => panic!("expected pulse event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_operator_pulse_frame_daemon_error() {
+        let err_payload = PrivilegedError {
+            code: PrivilegedErrorCode::PermissionDenied as i32,
+            message: "denied".to_string(),
+        };
+        let mut frame = vec![0];
+        err_payload
+            .encode(&mut frame)
+            .expect("encode privileged error");
+
+        let err = OperatorClient::decode_operator_pulse_frame(&Bytes::from(frame))
+            .expect_err("decode should return daemon error");
+        match err {
+            ProtocolClientError::DaemonError { code, message } => {
+                assert!(code.contains("PermissionDenied"));
+                assert_eq!(message, "denied");
+            },
+            other => panic!("expected daemon error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_operator_pending_pulse_queue_is_bounded() {
+        let mut pending = VecDeque::new();
+
+        for idx in 0..(MAX_PENDING_PULSE_EVENTS + 10) {
+            let pulse = PulseEvent {
+                envelope: Some(apm2_daemon::protocol::PulseEnvelopeV1 {
+                    schema_version: 1,
+                    pulse_id: format!("pulse-{idx}"),
+                    topic: "work.W-123.events".to_string(),
+                    ledger_cursor: idx as u64,
+                    ledger_head: idx as u64,
+                    event_hash: None,
+                    event_type: "work.transitioned".to_string(),
+                    entities: Vec::new(),
+                    cas_refs: Vec::new(),
+                    time_envelope_hash: None,
+                    hlc: None,
+                    wall: None,
+                }),
+            };
+            OperatorClient::enqueue_pending_pulse(&mut pending, pulse);
+        }
+
+        assert_eq!(pending.len(), MAX_PENDING_PULSE_EVENTS);
+        let oldest = pending
+            .front()
+            .and_then(|event| event.envelope.as_ref())
+            .map(|envelope| envelope.pulse_id.as_str());
+        assert_eq!(oldest, Some("pulse-10"));
     }
 
     // =========================================================================

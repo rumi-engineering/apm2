@@ -401,6 +401,42 @@ message WorkStatusRequest {
   string work_id = 1;
 }
 
+// Severity for work dependency diagnostics.
+enum WorkDependencyDiagnosticSeverity {
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_INFO = 1;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_WARNING = 2;
+  WORK_DEPENDENCY_DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+// Structured dependency diagnostic attached to WorkStatus responses.
+message WorkDependencyDiagnostic {
+  // Stable machine-readable reason code.
+  string reason_code = 1;
+  // Severity classification.
+  WorkDependencyDiagnosticSeverity severity = 2;
+  // Human-readable detail.
+  string message = 3;
+  // Deterministic edge identifier.
+  string edge_id = 4;
+  // Source work item ID.
+  string from_work_id = 5;
+  // Target work item ID.
+  string to_work_id = 6;
+  // Current source work state, when known.
+  optional string from_work_state = 7;
+  // Whether a waiver is currently active.
+  bool waived = 8;
+  // Waiver identifier, when present.
+  optional string waiver_id = 9;
+  // Waiver expiry timestamp in ns, when present.
+  optional uint64 waiver_expires_at_ns = 10;
+  // Remaining waiver lifetime in ns, when present.
+  optional uint64 waiver_remaining_ns = 11;
+  // Whether this edge was added late (after dependent had already started).
+  bool late_edge = 12;
+}
+
 message WorkStatusResponse {
   // Work identifier.
   string work_id = 1;
@@ -418,6 +454,11 @@ message WorkStatusResponse {
   uint64 created_at_ns = 7;
   // Work claimed timestamp (nanoseconds since epoch, if claimed).
   optional uint64 claimed_at_ns = 8;
+  // Whether implementer claim is currently blocked by unsatisfied incoming
+  // BLOCKS dependencies.
+  bool implementer_claim_blocked = 9;
+  // Structured dependency diagnostics for doctor/work status consumers.
+  repeated WorkDependencyDiagnostic dependency_diagnostics = 10;
 }
 
 // IPC-PRIV-019: WorkList (TCK-00415)
@@ -525,8 +566,10 @@ message OrchestratorLaunchProjectionResponse {
 message PublishChangeSetRequest {
   // Work identifier this changeset belongs to.
   string work_id = 1;
+  // Lease identifier proving authority for this work mutation.
+  string lease_id = 2;
   // Serialized ChangeSetBundleV1 (canonical JSON bytes).
-  bytes bundle_bytes = 2;
+  bytes bundle_bytes = 3;
 }
 
 // Response confirming changeset publication.
@@ -766,6 +809,10 @@ enum PrivilegedErrorCode {
   CREDENTIAL_INVALID_CONFIG = 18;
   // Invalid argument in request (generic validation failure).
   INVALID_ARGUMENT = 19;
+  // Work item already exists with a different spec hash (TCK-00635).
+  WORK_ALREADY_EXISTS = 20;
+  // Precondition failed (e.g., work is in wrong state for the requested operation).
+  FAILED_PRECONDITION = 21;
 }
 
 // Generic error response for privileged endpoints.
@@ -1850,4 +1897,170 @@ message RequestUnfreezeResponse {
   string freeze_id = 2;
   // Human-readable message.
   string message = 3;
+}
+
+// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+// Opens a new work item by persisting a validated WorkSpec to CAS
+// and emitting a canonical work.opened event. Actor ID is derived
+// from peer credentials (never from client input).
+message OpenWorkRequest {
+  // Canonical JSON-encoded WorkSpec (schema: apm2.work_spec.v1).
+  // Must pass bounded decode + schema validation before acceptance.
+  bytes work_spec_json = 1;
+  // Governing lease ID for PCAC lifecycle enforcement.
+  // Required when PCAC lifecycle gate is wired (fail-closed if empty).
+  string lease_id = 2;
+}
+
+message OpenWorkResponse {
+  // Assigned canonical work identifier (W-{uuid} or from WorkSpec).
+  string work_id = 1;
+  // BLAKE3 hash of the canonical WorkSpec stored in CAS (32 bytes).
+  bytes spec_snapshot_hash = 2;
+  // Whether this was an idempotent no-op (work already existed with same hash).
+  bool already_existed = 3;
+}
+
+// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+// Publishes a work context entry to CAS and anchors it in the ledger via
+// evidence.published with category WORK_CONTEXT_ENTRY.
+message PublishWorkContextEntryRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Entry kind discriminant from closed WorkContextKind allowlist.
+  // Accepted values: HandoffNote, ImplementerTerminal, Diagnosis,
+  // ReviewFinding, ReviewVerdict, GateNote, Linkout.
+  string kind = 2;
+  // Deduplication key for idempotent publishing.
+  // Must not be empty. Uniqueness is enforced on (work_id, kind, dedupe_key).
+  string dedupe_key = 3;
+  // JSON-encoded WorkContextEntryV1 payload (max 256 KiB).
+  // The daemon overwrites entry_id, actor_id, and created_at_ns with
+  // daemon-authoritative values before CAS storage.
+  bytes entry_json = 4;
+  // Lease ID for PCAC lifecycle enforcement. Required.
+  string lease_id = 5;
+}
+
+message PublishWorkContextEntryResponse {
+  // Deterministically derived entry_id (CTX- followed by blake3 hex).
+  string entry_id = 1;
+  // Evidence ID (same as entry_id per ticket spec).
+  string evidence_id = 2;
+  // CAS hash of the canonical entry bytes (hex-encoded BLAKE3).
+  string cas_hash = 3;
+  // Work ID echoed back.
+  string work_id = 4;
+}
+
+// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+// Publishes a work loop profile to CAS and anchors it in the ledger via
+// evidence.published with category WORK_LOOP_PROFILE.
+message PublishWorkLoopProfileRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Deduplication key for idempotent publishing.
+  // Must not be empty. Idempotency is enforced on (work_id, dedupe_key).
+  string dedupe_key = 2;
+  // JSON-encoded WorkLoopProfileV1 payload (max 64 KiB).
+  // The daemon validates bounded decode and deny_unknown_fields semantics.
+  bytes profile_json = 3;
+  // Lease ID for PCAC lifecycle enforcement and role-scoped claim resolution.
+  // Required.
+  string lease_id = 4;
+}
+
+message PublishWorkLoopProfileResponse {
+  // Deterministic evidence ID (WLP- prefix).
+  string evidence_id = 1;
+  // CAS hash of the canonical profile bytes (hex-encoded BLAKE3).
+  string cas_hash = 2;
+  // Work ID echoed back.
+  string work_id = 3;
+  // Dedupe key echoed back.
+  string dedupe_key = 4;
+}
+
+// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+// Claims an EXISTING work item (opened via OpenWork). Does not create a new
+// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
+// ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
+// WorkAuthorityBindings to CAS anchored via evidence.published.
+// Actor ID is derived from peer credentials (never from client input).
+message ClaimWorkV2Request {
+  // Canonical work identifier from a prior OpenWork. Must already exist.
+  string work_id = 1;
+  // Role for this claim (IMPLEMENTER, REVIEWER, COORDINATOR).
+  WorkRole role = 2;
+  // Governing lease ID for PCAC lifecycle enforcement.
+  // Required when PCAC lifecycle gate is wired (fail-closed if empty).
+  string lease_id = 3;
+}
+
+message ClaimWorkV2Response {
+  // Echoed canonical work identifier.
+  string work_id = 1;
+  // Newly issued lease identifier for this claim.
+  string issued_lease_id = 2;
+  // BLAKE3 hash of the WorkAuthorityBindings CAS document (hex-encoded).
+  string authority_bindings_hash = 3;
+  // Evidence ID anchoring the authority bindings (WAB- prefix).
+  string evidence_id = 4;
+  // Whether this was an idempotent re-claim by the same actor.
+  bool already_claimed = 5;
+}
+
+// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+// Records a PR association for an existing work item. Emits a canonical
+// work.pr_associated event and optionally publishes a LINKOUT context entry
+// with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
+// Actor ID is derived from peer credentials (never from client input).
+message RecordWorkPrAssociationRequest {
+  // Canonical work identifier. Must match an existing work claim.
+  string work_id = 1;
+  // Pull request number (must be > 0).
+  uint64 pr_number = 2;
+  // Commit SHA that triggered the PR (must be exactly 40 lowercase hex chars).
+  string commit_sha = 3;
+  // Governing lease ID for PCAC lifecycle enforcement. Required.
+  string lease_id = 4;
+  // Optional PR URL for LINKOUT context entry publishing.
+  // If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
+  // with this URL as the target.
+  string pr_url = 5;
+  // If true, validate association compatibility only and do not emit
+  // `work.pr_associated` or LINKOUT side effects.
+  bool validate_only = 6;
+}
+
+message RecordWorkPrAssociationResponse {
+  // Echoed canonical work identifier.
+  string work_id = 1;
+  // Echoed PR number.
+  uint64 pr_number = 2;
+  // Echoed commit SHA.
+  string commit_sha = 3;
+  // Whether this was an idempotent no-op (same association already exists).
+  bool already_existed = 4;
+}
+
+// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+// Resolves a ticket alias to a canonical work_id via projection state.
+// Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
+// WorkSpec lookup. Returns exactly one work_id on success, or an error
+// on ambiguity/infrastructure failure (fail-closed).
+message ResolveTicketAliasRequest {
+  // Ticket alias to resolve (e.g. "TCK-00636").
+  // Must not be empty; bounded to MAX_ID_LENGTH bytes.
+  string ticket_alias = 1;
+}
+
+message ResolveTicketAliasResponse {
+  // Canonical work_id resolved from the alias.
+  // Empty when no match was found (found == false).
+  string work_id = 1;
+  // True when the alias resolved to exactly one work item.
+  bool found = 2;
+  // Echoed ticket alias for response correlation.
+  string ticket_alias = 3;
 }

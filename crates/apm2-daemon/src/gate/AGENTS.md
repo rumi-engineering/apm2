@@ -75,6 +75,7 @@ Watches for all required gate receipts reaching PASS verdict and autonomously ex
 - [INV-GT08] Gate receipt IDs are sorted before inclusion in `MergeReceipt` for determinism.
 - [INV-GT09] Merge conflicts produce `ReviewBlockedRecorded` events, not silent failure.
 - [INV-GT10] Pending merges bounded to `MAX_PENDING_MERGES` (1,000).
+- [INV-GT11] `MergeExecutorEvent::WorkCompleted` emits `merge_receipt_id` (derived from result SHA) separately from `evidence_gate_receipt_ids` (TCK-00650). The merge receipt is NOT placed in `gate_receipt_id`.
 
 **Contracts:**
 

@@ -289,6 +289,14 @@ impl WorkSpecV1 {
         if self.work_id.is_empty() {
             return Err(WorkCasSchemaError::MissingField("work_id"));
         }
+        // Enforce canonical work_id prefix for consistency with the work
+        // lifecycle namespace convention (W-<identifier>).
+        if !self.work_id.starts_with("W-") {
+            return Err(WorkCasSchemaError::InvalidValue {
+                field: "work_id",
+                value: self.work_id.clone(),
+            });
+        }
         validate_field_length("work_id", &self.work_id, MAX_WORK_ID_LENGTH)?;
         validate_field_length("title", &self.title, MAX_MEDIUM_STRING_LENGTH)?;
         // work_type is validated at decode time via WorkSpecType enum — no
@@ -503,6 +511,12 @@ pub struct WorkLoopProfileV1 {
     /// Canonical work identifier.
     pub work_id: String,
 
+    /// Deduplication key for idempotent publishing.
+    ///
+    /// Must be non-empty. Idempotency on `(work_id, dedupe_key)` prevents
+    /// duplicate profile anchors in the ledger.
+    pub dedupe_key: String,
+
     /// Workspace configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceConfig>,
@@ -581,6 +595,11 @@ impl WorkLoopProfileV1 {
             return Err(WorkCasSchemaError::MissingField("work_id"));
         }
         validate_field_length("work_id", &self.work_id, MAX_WORK_ID_LENGTH)?;
+
+        if self.dedupe_key.is_empty() {
+            return Err(WorkCasSchemaError::MissingField("dedupe_key"));
+        }
+        validate_field_length("dedupe_key", &self.dedupe_key, MAX_SHORT_STRING_LENGTH)?;
 
         if let Some(ref ws) = self.workspace {
             if let Some(ref strategy) = ws.strategy {
@@ -1006,6 +1025,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tck_00635_work_spec_rejects_work_id_without_w_prefix() {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "schema": WORK_SPEC_V1_SCHEMA,
+            "work_id": "bad-work-id-001",
+            "title": "Test",
+            "work_type": "TICKET"
+        }))
+        .expect("valid json");
+        let result = bounded_decode_work_spec(&data);
+        assert!(
+            matches!(
+                result,
+                Err(WorkCasSchemaError::InvalidValue {
+                    field: "work_id",
+                    ..
+                })
+            ),
+            "work_id without 'W-' prefix should be rejected, got: {result:?}"
+        );
+    }
+
     // ===================================================================
     // WorkContextEntryV1 tests
     // ===================================================================
@@ -1092,6 +1133,7 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "workspace": {
                 "strategy": "git_worktree",
                 "root": "~/.apm2/worktrees",
@@ -1143,6 +1185,7 @@ mod tests {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "extra_knob": 42
         }))
         .expect("valid json");
@@ -1352,6 +1395,7 @@ mod tests {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
             "work_id": "W-001",
+            "dedupe_key": "rev:1",
             "retry": {
                 "backoff_seconds": intervals
             }
@@ -1487,11 +1531,13 @@ mod tests {
     fn tck_00633_loop_profile_minimal_valid() {
         let data = serde_json::to_vec(&serde_json::json!({
             "schema": WORK_LOOP_PROFILE_V1_SCHEMA,
-            "work_id": "W-001"
+            "work_id": "W-001",
+            "dedupe_key": "rev:1"
         }))
         .expect("valid json");
         let profile = bounded_decode_loop_profile(&data).expect("minimal profile should decode");
         assert_eq!(profile.work_id, "W-001");
+        assert_eq!(profile.dedupe_key, "rev:1");
         assert!(profile.workspace.is_none());
         assert!(profile.retry.is_none());
         assert!(profile.nudge_policy.is_none());

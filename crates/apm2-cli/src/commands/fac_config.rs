@@ -3,7 +3,7 @@
 //!
 //! Aggregates resolved policy, boundary identity, execution backend, lane
 //! configuration, admitted digests, and queue bounds from broker and filesystem
-//! state. Prints either human-readable text or structured JSON (`--json`).
+//! state. Output is structured JSON by default.
 //!
 //! # Security
 //!
@@ -59,11 +59,7 @@ pub enum ConfigSubcommand {
 
 /// Arguments for `apm2 fac config show`.
 #[derive(Debug, Args)]
-pub struct ConfigShowArgs {
-    /// Emit JSON output.
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+pub struct ConfigShowArgs {}
 
 // =============================================================================
 // Response types
@@ -164,7 +160,8 @@ pub fn run_config_command(args: &ConfigArgs, json_global: bool) -> u8 {
 // =============================================================================
 
 fn run_show(args: &ConfigShowArgs, json_global: bool) -> u8 {
-    let json = args.json || json_global;
+    let _ = args;
+    let json = json_global;
 
     let response = build_config_show_response();
 

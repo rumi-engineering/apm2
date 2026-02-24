@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: 'TCK-00664'
     title: 'FAC: Refactor worker orchestration into explicit state machine modules (reduce brittleness, improve crash recovery)'
-    status: 'OPEN'
+    status: 'IN_PROGRESS'
   binds:
     prd_id: 'PRD-0001'
     rfc_id: 'RFC-0019'
@@ -22,8 +22,7 @@ ticket_meta:
       - 'fac/lane'
   dependencies:
     tickets:
-      - 'TCK-00660' # reconcile-on-tick baseline
-      - 'TCK-00663' # regression harness (protect refactor)
+      - 'TCK-00660' # runtime repair state machine + event-driven activation baseline
 
 context:
   motivation: |
@@ -33,7 +32,7 @@ context:
     to reason about crash recovery and invariants.
   code_evidence:
     - 'crates/apm2-cli/src/commands/fac_worker.rs is >8k LOC and mixes queue I/O, lane logic, execution, and recovery.'
-    - 'Several failure paths intentionally leave partially transitioned state (claimed without receipt) and rely on startup reconcile.'
+    - 'Several failure paths intentionally leave partially transitioned state (claimed without receipt) and rely on runtime claimed reconcile + startup/doctor convergence.'
 
 problem_statement: |
   Reliability work keeps accumulating as local patches inside fac_worker.rs. Without a clearer
@@ -67,31 +66,41 @@ scope:
   in_scope:
     - id: 'S1'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Extract modules (behavior-preserving):
-          - worker_loop.rs: poll cadence, scan lock, watchdog + heartbeat, periodic reconcile trigger
+          - worker_loop.rs: wake-driven loop, scan lock, watchdog + heartbeat, runtime repair signal handling
           - queue_ops.rs: claim/requeue/move-to-terminal, open_no_follow, flock handling
           - lane_ops.rs: acquire lane, persist/remove lease, lane cleanup, liveness checks
           - execution_ops.rs: warm + gates + stop_revoke execution
           - commit_ops.rs: receipt pipeline + failure handling
     - id: 'S2'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Implement an explicit orchestration struct:
           - struct WorkerOrchestrator { ... }
           - fn step(&mut self) -> StepOutcome
           - transitions expressed as enums; all filesystem writes go through queue_ops/lane_ops.
     - id: 'S3'
       description: |
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
         Introduce a single error taxonomy:
           - enum OrchestrationError { Recoverable, NeedsReconcile, CorruptLane, ... }
           - ensures every error path either:
               * requeues job safely
-              * leaves for reconcile (and schedules reconcile-on-tick)
+              * leaves for runtime claimed reconcile via explicit repair signal
               * quarantines lane/job with explicit reason
     - id: 'S4'
       description: |
-        Use the fault-injection harness (TCK-00663) to lock in behavior:
-          - All crash-point tests must still pass after refactor.
+        Delivered in PR #796 (merged to `main` on 2026-02-22); retained for historical traceability.
+        Use existing deterministic reconcile/worker suites to lock in behavior:
+          - Existing runtime reconcile and state-machine tests must still pass after refactor.
           - Add at least 3 new unit tests for state transitions.
+    - id: 'S5'
+      description: |
+        Post-merge hardening follow-up for PR #796:
+          - make `consume_authority` durable write path atomic and fail-closed under concurrent races
+          - eliminate path re-resolution chmod fallback by using fd-based chmod on Unix
+          - add regressions for consume idempotency/race behavior and queue dir hardening edges
   out_of_scope:
     - 'Changing queue on-disk format or adding new directories.'
     - 'Rewriting execution backend (systemd/cgroup) — separate efforts.'
@@ -105,21 +114,42 @@ plan:
     - id: 'P3'
       description: 'Unify error taxonomy and remove ad-hoc string matching (e.g., "no lane available").'
     - id: 'P4'
-      description: 'Run regression harness; add new transition unit tests.'
+      description: 'Run deterministic reconcile/worker suites; add new transition unit tests.'
+    - id: 'P5'
+      description: 'Apply post-merge hardening patches surfaced by FAC review loops and re-run full gates.'
 
 
 definition_of_done:
   criteria:
-    - 'fac_worker.rs is reduced materially (target: <3k LOC) with logic moved into focused modules.'
-    - 'All existing worker integration tests + new fault-injection tests pass.'
+    - 'S1-S4 outcomes are present in `main` via merged PR #796 (material LOC reduction + modularized worker).'
+    - 'Post-merge hardening deltas (S5) are implemented with deterministic regressions.'
+    - 'All existing deterministic worker/reconcile tests + new transition tests pass.'
     - 'All state transitions are explicit and auditable (no hidden partial transitions).'
   evidence_ids:
     - 'EVID-TCK-00664-01: diff shows modularization + LOC reduction'
-    - 'EVID-TCK-00664-02: regression harness passes'
+    - 'EVID-TCK-00664-02: deterministic worker/reconcile transition suites pass'
+    - 'EVID-TCK-00664-03: consume_authority atomic create+sync hardening with race regression'
+    - 'EVID-TCK-00664-04: fd-based chmod hardening avoids path re-resolution on Unix'
 
 notes:
   risk:
-    - 'Large refactor can destabilize; must be protected by deterministic tests (TCK-00663) and done incrementally.'
+    - 'Large refactor can destabilize; must be protected by deterministic tests and done incrementally.'
   guiding_principle: |
     Prefer making illegal states unrepresentable in code. Where the filesystem can contain illegal
-    states (crash), isolate recovery logic in reconcile_tick and keep it testable.
+    states (crash), isolate recovery logic in runtime claimed reconcile and startup/doctor repair
+    boundaries, and keep it testable.
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.

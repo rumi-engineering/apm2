@@ -86,8 +86,6 @@ pub struct PrAuthSetupCliArgs {
     pub keep_private_key_file: bool,
     #[arg(long, default_value_t = false)]
     pub for_systemd: bool,
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 ```
 

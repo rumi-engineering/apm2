@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: TCK-00632
     title: 'RFC-0032 AT-0: ledger unification acceptance test (legacy DB -> canonical append)'
-    status: OPEN
+    status: MERGED
   binds:
     prd_id: PRD-PLACEHOLDER
     rfc_id: RFC-0032

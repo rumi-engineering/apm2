@@ -106,6 +106,55 @@ pub(super) fn findings_bundle_path(
         .join("bundle.json"))
 }
 
+pub(super) fn load_all_findings_bundles(
+    owner_repo: &str,
+    pr_number: u32,
+) -> Result<Vec<FindingsBundle>, String> {
+    let pr_dir = apm2_home_dir()?
+        .join("private")
+        .join("fac")
+        .join("findings")
+        .join("repos")
+        .join(sanitize_for_path(owner_repo))
+        .join(format!("pr-{pr_number}"));
+
+    if !pr_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut bundles = Vec::new();
+    let entries = fs::read_dir(&pr_dir).map_err(|err| {
+        format!(
+            "failed to read findings directory {}: {err}",
+            pr_dir.display()
+        )
+    })?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let bundle_path = path.join("bundle.json");
+            if bundle_path.exists() {
+                if let Some(sha_dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(head_sha) = sha_dir_name.strip_prefix("sha-") {
+                        if let Ok(Some(bundle)) =
+                            load_findings_bundle(owner_repo, pr_number, head_sha)
+                        {
+                            bundles.push(bundle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by created_at or updated_at, but updated_at is a string, which we can
+    // sort.
+    bundles.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+
+    Ok(bundles)
+}
+
 fn findings_secrets_dir() -> Result<PathBuf, String> {
     Ok(apm2_home_dir()?
         .join("private")
