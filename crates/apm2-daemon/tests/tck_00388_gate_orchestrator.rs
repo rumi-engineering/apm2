@@ -2,15 +2,15 @@
 //! TCK-00388: Gate execution orchestrator integration tests.
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by
-//! exercising the real `GateOrchestrator` through its daemon entry point
-//! (`on_session_terminated`), including:
+//! exercising the real `GateOrchestrator` entrypoints, including:
 //!
-//! - Full lifecycle: session termination -> policy resolution -> lease issuance
-//!   -> receipt collection -> all-gates-completed
+//! - Full lifecycle: changeset publication -> policy resolution -> lease
+//!   issuance -> receipt collection -> all-gates-completed
 //! - Per-invocation event return (no global buffer)
 //! - Event ordering invariant (`PolicyResolved` before `GateLeaseIssued`)
 //! - Receipt signature verification (BLOCKER 4)
 //! - Admission check before events (BLOCKER 2)
+//! - Lifecycle-only timeout progression via `poll_session_lifecycle`
 //! - Fail-closed timeout semantics
 //!
 //! # Verification Commands
@@ -33,26 +33,27 @@
 //! - Receipt signatures verified against executor verifying key
 //! - Fail-closed: timeouts produce FAIL verdicts, never silent expiry
 //! - Policy resolution always precedes lease issuance
+//! - Session termination does not bootstrap gate start
 
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
-use apm2_core::fac::GateReceiptBuilder;
+use apm2_core::fac::{ChangesetPublication, GateReceiptBuilder};
 use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent,
-    GateType, SessionTerminatedInfo,
+    GateType,
 };
 use apm2_daemon::state::DispatcherState;
 
-/// Helper: creates a test `SessionTerminatedInfo`.
-///
-/// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
-fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
-    SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
+/// Helper: creates a test `ChangesetPublication`.
+fn test_publication(work_id: &str, digest: [u8; 32]) -> ChangesetPublication {
+    ChangesetPublication {
         work_id: work_id.to_string(),
-        changeset_digest: [0x42; 32],
-        terminated_at_ms: 0,
+        changeset_digest: digest,
+        bundle_cas_hash: [0xA5; 32],
+        published_at_ms: 1_706_000_000,
+        publisher_actor_id: "actor:publisher".to_string(),
+        changeset_published_event_id: format!("evt-{work_id}"),
     }
 }
 
@@ -66,9 +67,9 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
     let config = GateOrchestratorConfig::default();
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
-    // Step 1: Session terminates via daemon entry point
+    // Step 1: Authoritative changeset publication starts orchestration.
     let (gate_types, executor_signers, setup_events) = orch
-        .on_session_terminated(test_session_info("work-integ-01"))
+        .start_for_changeset(test_publication("work-integ-01", [0x42; 32]))
         .await
         .unwrap();
 
@@ -150,7 +151,7 @@ async fn tck_00388_event_ordering_invariant() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-02"))
+        .start_for_changeset(test_publication("work-integ-02", [0x42; 32]))
         .await
         .unwrap();
 
@@ -180,7 +181,7 @@ async fn tck_00388_receipt_signature_verified() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, executor_signers, _events) = orch
-        .on_session_terminated(test_session_info("work-integ-03"))
+        .start_for_changeset(test_publication("work-integ-03", [0x42; 32]))
         .await
         .unwrap();
 
@@ -246,14 +247,14 @@ async fn tck_00388_admission_check_before_events() {
 
     // First orchestration succeeds
     let (_gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-04a"))
+        .start_for_changeset(test_publication("work-integ-04a", [0x44; 32]))
         .await
         .unwrap();
     assert!(!events.is_empty(), "First orchestration should emit events");
 
     // Second orchestration fails due to capacity - no events should leak
     let result = orch
-        .on_session_terminated(test_session_info("work-integ-04b"))
+        .start_for_changeset(test_publication("work-integ-04b", [0x45; 32]))
         .await;
     assert!(result.is_err(), "Expected capacity error");
     let err = result.err().unwrap();
@@ -271,18 +272,34 @@ async fn tck_00388_admission_check_before_events() {
     let orch2 = GateOrchestrator::new(config2, Arc::clone(&signer));
 
     orch2
-        .on_session_terminated(test_session_info("work-integ-04c"))
+        .start_for_changeset(test_publication("work-integ-04c", [0x46; 32]))
         .await
         .unwrap();
 
-    let result = orch2
-        .on_session_terminated(test_session_info("work-integ-04c"))
+    // Same (work_id, digest) is idempotent no-op.
+    let no_op_result = orch2
+        .start_for_changeset(test_publication("work-integ-04c", [0x46; 32]))
         .await;
-    assert!(result.is_err(), "Expected replay/duplicate error");
-    let err = result.err().unwrap();
     assert!(
-        matches!(err, GateOrchestratorError::ReplayDetected { .. }),
-        "Expected ReplayDetected error, got: {err:?}"
+        no_op_result.is_ok(),
+        "duplicate publication should be idempotent no-op"
+    );
+    let (gate_types, signers, events) = no_op_result.expect("duplicate should be no-op");
+    assert!(gate_types.is_empty(), "no-op should not issue gates");
+    assert!(
+        signers.is_empty(),
+        "no-op should not return executor signers"
+    );
+    assert!(events.is_empty(), "no-op should not emit events");
+
+    // CSID-003: Same work_id with a different digest while active is ALLOWED
+    // (different changeset orchestrations can run concurrently for the same work).
+    let different_digest_result = orch2
+        .start_for_changeset(test_publication("work-integ-04c", [0x47; 32]))
+        .await;
+    assert!(
+        different_digest_result.is_ok(),
+        "same work_id with different digest should be allowed (CSID-003)"
     );
 }
 
@@ -299,12 +316,15 @@ async fn tck_00388_fail_closed_timeout_semantics() {
     };
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
-    let (gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-05"))
+    let (gate_types, _signers, _events) = orch
+        .start_for_changeset(test_publication("work-integ-05", [0x42; 32]))
         .await
         .unwrap();
 
     assert_eq!(gate_types.len(), 3);
+
+    // Lifecycle polling advances timeout progression but never bootstraps gates.
+    let events = orch.poll_session_lifecycle().await;
 
     // All 3 gates should have timed out (instant timeout)
     let timeout_count = events
@@ -351,26 +371,27 @@ async fn tck_00388_dispatcher_state_wiring() {
         "gate_orchestrator should be present after with_gate_orchestrator"
     );
 
-    // Call notify_session_terminated through the dispatcher
-    let info = test_session_info("work-wiring");
-    let result = dispatcher.notify_session_terminated(info).await;
+    // Poll lifecycle through the dispatcher.
+    let events = dispatcher
+        .poll_gate_lifecycle()
+        .await
+        .expect("should return Some when orchestrator is wired");
 
-    // Should return Some(Ok(events))
-    let events = result
-        .expect("should return Some when orchestrator is wired")
-        .expect("should succeed for valid session info");
-
-    // Should have PolicyResolved + 3 GateLeaseIssued = 4 events
-    assert_eq!(events.len(), 4, "1 PolicyResolved + 3 GateLeaseIssued");
-    assert!(matches!(
-        events[0],
-        GateOrchestratorEvent::PolicyResolved { .. }
-    ));
+    // Session termination is lifecycle-only and MUST NOT start gates.
+    assert!(
+        events.is_empty(),
+        "no gate bootstrap from session termination"
+    );
+    assert_eq!(
+        orch.active_count().await,
+        0,
+        "session lifecycle hook must not create orchestration"
+    );
 }
 
 #[tokio::test]
 async fn tck_00388_dispatcher_state_without_orchestrator() {
-    // Without gate orchestrator, notify_session_terminated returns None
+    // Without gate orchestrator, lifecycle polling returns None.
     let dispatcher = DispatcherState::new(None);
 
     assert!(
@@ -378,8 +399,7 @@ async fn tck_00388_dispatcher_state_without_orchestrator() {
         "gate_orchestrator should be None by default"
     );
 
-    let info = test_session_info("work-no-orch");
-    let result = dispatcher.notify_session_terminated(info).await;
+    let result = dispatcher.poll_gate_lifecycle().await;
     assert!(
         result.is_none(),
         "should return None when no orchestrator is wired"

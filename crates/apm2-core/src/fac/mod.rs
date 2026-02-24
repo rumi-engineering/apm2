@@ -104,6 +104,7 @@ pub mod cas_reader;
 /// calibration (TCK-00572).
 pub mod cgroup_stats;
 mod changeset_bundle;
+mod changeset_publication;
 mod ci_attestation;
 mod ci_import;
 /// Containment verification: cgroup membership checks for child processes
@@ -305,6 +306,9 @@ pub use changeset_bundle::{
     ChangeSetPublished, ChangeSetPublishedProto, FileChange, GitObjectRef, HashAlgo,
     MAX_CHANGESET_ID_LENGTH, MAX_FILE_MANIFEST_SIZE, MAX_PATH_LENGTH, SCHEMA_IDENTIFIER,
     SCHEMA_VERSION,
+};
+pub use changeset_publication::{
+    ChangeSetPublishedKernelEventPayload, ChangesetPublication, ChangesetPublicationError,
 };
 // Re-export CI attestation types
 pub use ci_attestation::{

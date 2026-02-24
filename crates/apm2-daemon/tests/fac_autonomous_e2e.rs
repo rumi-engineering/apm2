@@ -35,7 +35,9 @@
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
-use apm2_core::fac::{GateReceiptBuilder, PolicyResolvedForChangeSetBuilder, ReasonCode};
+use apm2_core::fac::{
+    ChangesetPublication, GateReceiptBuilder, PolicyResolvedForChangeSetBuilder, ReasonCode,
+};
 use apm2_core::ledger::{EventRecord, Ledger};
 use apm2_core::reducer::{Reducer, ReducerContext};
 use apm2_core::work::helpers::{
@@ -49,7 +51,7 @@ const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorEvent, GateOutcome, GateType,
     GitHubMergeAdapter, MergeExecutor, MergeExecutorError, MergeExecutorEvent, MergeInput,
-    MergeResult, SessionTerminatedInfo,
+    MergeResult,
 };
 
 // =============================================================================
@@ -197,6 +199,78 @@ impl FacAutonomousHarness {
             .apply(&record, &ctx)
             .expect("apply work.opened");
         self.transition_count = 0;
+    }
+
+    /// Emits a `changeset_published` event to the reducer, populating
+    /// `latest_changeset_by_work` for the given `work_id`. Required before
+    /// CI stage boundary transitions (fail-closed CSID-004).
+    fn emit_changeset_published(&mut self, work_id: &str, changeset_digest: [u8; 32]) {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "event_type": "changeset_published",
+            "work_id": work_id,
+            "changeset_digest": hex::encode(changeset_digest),
+        }))
+        .expect("serialize changeset_published payload");
+
+        let record = EventRecord::with_timestamp(
+            "changeset_published",
+            work_id,
+            self.actor_id(),
+            payload,
+            self.current_timestamp_ns,
+        );
+
+        let ctx = Self::reducer_context();
+        self.work_reducer
+            .apply(&record, &ctx)
+            .expect("apply changeset_published");
+    }
+
+    /// Emits a `gate.receipt_collected` event to the reducer, populating
+    /// `ci_receipt_digest_by_work` for the given `work_id`. Required before
+    /// CI transitions to `ReadyForReview` or Blocked.
+    fn emit_gate_receipt_collected(&mut self, work_id: &str, changeset_digest: [u8; 32]) {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "work_id": work_id,
+            "changeset_digest": hex::encode(changeset_digest),
+        }))
+        .expect("serialize gate receipt payload");
+
+        let record = EventRecord::with_timestamp(
+            "gate.receipt_collected",
+            work_id,
+            self.actor_id(),
+            payload,
+            self.current_timestamp_ns,
+        );
+
+        let ctx = Self::reducer_context();
+        self.work_reducer
+            .apply(&record, &ctx)
+            .expect("apply gate.receipt_collected");
+    }
+
+    /// Emits a `merge_receipt_recorded` event to the reducer, populating
+    /// `merge_receipt_digest_by_work` for the given `work_id`.
+    fn emit_merge_receipt_recorded(&mut self, work_id: &str, changeset_digest: [u8; 32]) {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "work_id": work_id,
+            "changeset_digest": hex::encode(changeset_digest),
+        }))
+        .expect("serialize merge receipt payload");
+
+        let record = EventRecord::with_timestamp(
+            "merge_receipt_recorded",
+            work_id,
+            self.actor_id(),
+            payload,
+            self.current_timestamp_ns,
+        );
+
+        let ctx = Self::reducer_context();
+        self.work_reducer
+            .apply(&record, &ctx)
+            .expect("apply merge_receipt_recorded");
     }
 
     /// Emits a `WorkTransitioned` event and applies it to the reducer.
@@ -382,6 +456,13 @@ async fn test_fac_autonomous_full_lifecycle() {
     // Phase 4: CiPending -> ReadyForReview (CI passed)
     // =========================================================================
 
+    // Publish changeset and emit gate receipt BEFORE CI transition (fail-closed
+    // CSID-004 requires changeset + receipt context for CI stage boundaries).
+    harness.advance_time_ms(10_000);
+    harness.emit_changeset_published(work_id, changeset_digest);
+    harness.advance_time_ms(1_000);
+    harness.emit_gate_receipt_collected(work_id, changeset_digest);
+
     harness.advance_time_ms(120_000); // CI takes ~2 minutes
     harness.emit_work_transitioned(
         work_id,
@@ -418,17 +499,19 @@ async fn test_fac_autonomous_full_lifecycle() {
 
     harness.advance_time_ms(30_000); // Session runs for 30s
 
-    // Trigger gate orchestration via session termination
-    let session_info = SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
+    // Trigger gate orchestration via ChangeSetPublished (CSID-003)
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0, // bypass freshness for tests
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: format!("session-{work_id}"),
+        changeset_published_event_id: format!("evt-publish-{work_id}"),
     };
 
     let (gate_types, executor_signers, setup_events) = harness
         .gate_orchestrator
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("gate orchestration should succeed");
 
@@ -639,6 +722,10 @@ async fn test_fac_autonomous_full_lifecycle() {
     // =========================================================================
 
     harness.advance_time_ms(100);
+
+    // Emit merge receipt bound to latest changeset before completion
+    // (fail-closed CSID-004 requires digest-bound receipt for completion).
+    harness.emit_merge_receipt_recorded(work_id, changeset_digest);
 
     let evidence_bundle_hash = vec![0xDD; 32];
     let evidence_ids = vec!["EVID-FAC-001".to_string(), "EVID-FAC-002".to_string()];
@@ -880,16 +967,18 @@ async fn test_gate_failure_halts_lifecycle() {
     let work_id = "work-gate-fail-001";
     let changeset_digest = [0x42; 32];
 
-    // Step 1: Session terminates
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-gate-fail".to_string(),
+    // Step 1: Start gates from ChangeSetPublished (CSID-003)
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: "session-gate-fail".to_string(),
+        changeset_published_event_id: "evt-publish-gate-fail".to_string(),
     };
 
     let (gate_types, executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("orchestration setup");
 
@@ -1085,6 +1174,7 @@ async fn test_review_rejection_halts_lifecycle() {
 
     let mut harness = FacAutonomousHarness::new();
     let work_id = "work-review-reject-001";
+    let changeset_digest = [0x42; 32];
 
     // Drive work to Review state
     harness.emit_work_opened(work_id);
@@ -1112,6 +1202,12 @@ async fn test_review_rejection_halts_lifecycle() {
         "pr_created",
         &harness.actor_id(),
     );
+    // Publish changeset and gate receipt before CI transition (CSID-004
+    // fail-closed).
+    harness.advance_time_ms(10);
+    harness.emit_changeset_published(work_id, changeset_digest);
+    harness.advance_time_ms(10);
+    harness.emit_gate_receipt_collected(work_id, changeset_digest);
     harness.advance_time_ms(100);
     harness.emit_work_transitioned(
         work_id,
@@ -1180,6 +1276,7 @@ async fn test_ci_failure_blocks_lifecycle() {
 
     let mut harness = FacAutonomousHarness::new();
     let work_id = "work-ci-fail-001";
+    let changeset_digest = [0x42; 32];
 
     // Drive work to CiPending
     harness.emit_work_opened(work_id);
@@ -1208,6 +1305,13 @@ async fn test_ci_failure_blocks_lifecycle() {
         &harness.actor_id(),
     );
     harness.assert_work_state(work_id, WorkState::CiPending);
+
+    // Publish changeset and gate receipt before CI transition (CSID-004
+    // fail-closed).
+    harness.advance_time_ms(10);
+    harness.emit_changeset_published(work_id, changeset_digest);
+    harness.advance_time_ms(10);
+    harness.emit_gate_receipt_collected(work_id, changeset_digest);
 
     // CI fails -> Blocked
     harness.advance_time_ms(60_000);
@@ -1244,6 +1348,10 @@ async fn test_ci_failure_blocks_lifecycle() {
     );
     harness.assert_work_state(work_id, WorkState::CiPending);
 
+    // Gate receipt already exists from first cycle; re-emit for new CI cycle.
+    harness.advance_time_ms(10);
+    harness.emit_gate_receipt_collected(work_id, changeset_digest);
+
     // CI passes this time
     harness.advance_time_ms(90_000);
     harness.emit_work_transitioned(
@@ -1275,15 +1383,17 @@ async fn test_gate_receipt_signature_verification() {
     let work_id = "work-sig-verify-001";
     let changeset_digest = [0x42; 32];
 
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-sig-verify".to_string(),
+    let publication = ChangesetPublication {
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        bundle_cas_hash: [0u8; 32],
+        published_at_ms: 0,
+        publisher_actor_id: "session-sig-verify".to_string(),
+        changeset_published_event_id: "evt-publish-sig-verify".to_string(),
     };
 
     let (_gate_types, _executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .start_for_changeset(publication)
         .await
         .expect("orchestration setup");
 

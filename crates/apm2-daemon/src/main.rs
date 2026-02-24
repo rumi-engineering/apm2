@@ -60,7 +60,8 @@ use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
 use apm2_daemon::gate::{
-    GateOrchestrator, GateOrchestratorConfig, GateTimeoutKernel, GateTimeoutKernelConfig,
+    GateOrchestrator, GateOrchestratorConfig, GateStartKernel, GateStartKernelConfig,
+    GateTimeoutKernel, GateTimeoutKernelConfig,
 };
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
@@ -1380,9 +1381,9 @@ async fn async_main(args: Args) -> Result<()> {
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
-    // and wired into the DispatcherState. When a session terminates, the dispatcher
-    // calls `notify_session_terminated` which delegates to the orchestrator. A
-    // background task polls for gate timeouts periodically.
+    // and wired into the DispatcherState for lifecycle timeout polling.
+    // Gate start is publication-driven (`changeset_published` -> GateStartKernel
+    // -> `start_for_changeset`), and a background task polls gate timeouts.
     let gate_signer = Arc::new(
         Signer::from_bytes(&lifecycle_signing_key_bytes)
             .map_err(|e| anyhow::anyhow!("failed to derive gate signer from lifecycle key: {e}"))?,
@@ -1399,8 +1400,9 @@ async fn async_main(args: Args) -> Result<()> {
         GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer).with_cas(gate_cas),
     );
 
-    // Wire orchestrator into dispatcher state so session termination events
-    // trigger autonomous gate lifecycle (Quality BLOCKER 1).
+    // Wire orchestrator into dispatcher state for lifecycle timeout polling.
+    // Gate start is publication-driven via GateStartKernel
+    // (`changeset_published` -> `start_for_changeset`).
     let dispatcher_state = {
         // Unwrap the Arc, attach the orchestrator, and re-wrap.
         // Safety: we just created this Arc and hold the only reference.
@@ -1428,6 +1430,18 @@ async fn async_main(args: Args) -> Result<()> {
     {
         let orch = Arc::clone(&gate_orchestrator);
         let timeout_signing_key_bytes = lifecycle_signing_key_bytes;
+        // Create a dedicated ledger emitter for the gate-start poller if a
+        // ledger database is configured. Uses the same sqlite_conn (shared via
+        // Arc<Mutex>) and daemon lifecycle signing key.
+        let gate_start_ledger_emitter: Option<SqliteLedgerEventEmitter> =
+            sqlite_conn.as_ref().map(|conn| {
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&timeout_signing_key_bytes);
+                let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key);
+                if let Err(e) = emitter.freeze_legacy_writes_self() {
+                    warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
+                }
+                emitter
+            });
         // Create a dedicated ledger emitter for the timeout poller if a
         // ledger database is configured. Uses the same sqlite_conn (shared
         // via Arc<Mutex>) and the daemon lifecycle signing key.
@@ -1442,6 +1456,14 @@ async fn async_main(args: Args) -> Result<()> {
                 }
                 emitter
             });
+        let gate_start_kernel = GateStartKernel::new(
+            Arc::clone(&orch),
+            sqlite_conn.as_ref(),
+            gate_start_ledger_emitter,
+            &fac_root,
+            GateStartKernelConfig::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to initialize gate start kernel: {e}"))?;
         let timeout_kernel = GateTimeoutKernel::new(
             Arc::clone(&orch),
             sqlite_conn.as_ref(),
@@ -1482,6 +1504,7 @@ async fn async_main(args: Args) -> Result<()> {
         let daemon_start = std::time::Instant::now();
 
         tokio::spawn(async move {
+            let mut gate_start_kernel = gate_start_kernel;
             let mut timeout_kernel = timeout_kernel;
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             // TCK-00600: Watchdog ticker sends WATCHDOG=1 to systemd at half
@@ -1492,6 +1515,25 @@ async fn async_main(args: Args) -> Result<()> {
                 interval.tick().await;
                 // TCK-00600: Ping systemd watchdog if due.
                 watchdog.ping_if_due();
+                match gate_start_kernel.tick().await {
+                    Ok(report) => {
+                        if report.executed_intents > 0 || report.persisted_receipts > 0 {
+                            info!(
+                                executed_intents = report.executed_intents,
+                                completed_intents = report.completed_intents,
+                                blocked_intents = report.blocked_intents,
+                                persisted_receipts = report.persisted_receipts,
+                                "Gate start kernel tick completed"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "Gate start kernel tick failed (fail-closed)"
+                        );
+                    },
+                }
                 match timeout_kernel.tick().await {
                     Ok(report) => {
                         if report.executed_intents > 0 || report.persisted_receipts > 0 {

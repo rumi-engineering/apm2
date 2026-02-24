@@ -17748,6 +17748,15 @@ impl PrivilegedDispatcher {
                 .iter()
                 .map(Self::dependency_diagnostic_to_proto)
                 .collect(),
+            // STEP_10: FAC identity chain surface fields.
+            // Populated from WorkAuthorityStatus when available.
+            latest_changeset_digest: authority_status.latest_changeset_digest.map(hex::encode),
+            changeset_published_event_id: authority_status.changeset_published_event_id.clone(),
+            bundle_cas_hash: authority_status.bundle_cas_hash.map(hex::encode),
+            gate_status: authority_status.gate_status.clone(),
+            review_status: authority_status.review_status.clone(),
+            merge_status: authority_status.merge_status.clone(),
+            identity_chain_defect_count: authority_status.identity_chain_defect_count,
         };
 
         let mut derived_adhoc_session_id: Option<String> = None;
@@ -28687,6 +28696,18 @@ mod tests {
                     timestamp_ns: 1_000_000_100,
                 })
                 .expect("transition Claimed->InProgress should persist");
+            // CSID-004: A published changeset must exist before the projection
+            // admits an InProgress -> Review transition (fail-closed guard).
+            dispatcher
+                .event_emitter
+                .emit_changeset_published(
+                    "W-REVIEW-STATE-001",
+                    &[0x42; 32],
+                    &[0xCA; 32],
+                    "actor:implementer",
+                    1_000_000_150,
+                )
+                .expect("changeset_published should persist");
             dispatcher
                 .event_emitter
                 .emit_work_transitioned(&WorkTransition {
