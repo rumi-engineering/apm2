@@ -8,7 +8,7 @@ orientation: "You are an autonomous senior engineer tasked with writing code to 
 title: Implementor Default Protocol
 protocol:
   id: IMPLEMENTOR-DEFAULT
-  version: 1.0.0
+  version: 1.2.0
   type: executable_specification
   inputs[1]:
     - IMPLEMENTATION_SCOPE_OPTIONAL
@@ -16,40 +16,9 @@ protocol:
 variables:
   IMPLEMENTATION_SCOPE_OPTIONAL: "$1"
 
-references[17]:
+references[4]:
   - path: "@documents/security/SECURITY_POLICY.cac.json"
     purpose: "Security posture and fail-closed defaults for ambiguous trust state."
-  - path: "@documents/rfcs/RFC-0019/20_fac_execution_substrate_build_farm_revision.md"
-    purpose: "FESv1 execution substrate design: lanes, broker/worker queue, warm lifecycle, GC, and failure mode handling. Read for future operational context (PLANNED — not yet implemented; gates are run internally by `apm2 fac push`)."
-
-  # Core standards
-  - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
-    purpose: "RS-15: explicit error channels and no silent fallback. CRITICAL DoS: RSK-0701 (panic-as-DoS)."
-  - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
-    purpose: "RS-20: tests and evidence requirements for merge readiness."
-  - path: "@documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md"
-    purpose: "RS-21: atomic protocols, happens-before graphs, and RMW ordering. CRITICAL TOCTOU: CAS patterns, memory ordering."
-  - path: "@documents/skills/rust-standards/references/31_io_protocol_boundaries.md"
-    purpose: "RS-31: protocol boundary contracts and trust handling. CRITICAL DoS: RSK-1601 (parsing DoS), CTR-1603 (bounded reads)."
-  - path: "@documents/skills/rust-standards/references/34_security_adjacent_rust.md"
-    purpose: "RS-34: crypto and security-adjacent correctness."
-  - path: "@documents/skills/rust-standards/references/39_hazard_catalog_checklists.md"
-    purpose: "RS-39: hazard scan checklist for regressions. CRITICAL: RSK-2408/2409 (concurrency), RSK-2406 (panic surface)."
-  - path: "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md"
-    purpose: "RS-40: monotonic clocks, ordering hazards, staleness detection. CRITICAL DoS: INV-2501 (Instant not SystemTime), RSK-2504 (zero-interval guards). CRITICAL TOCTOU: tick/epoch staleness."
-  - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
-    purpose: "RS-41: fail-closed, validated construction, state machines. CRITICAL: CTR-2605 (state machines), CTR-2608 (retry backoff), RSK-2625 (unbounded channels)."
-
-  - path: "@documents/skills/rust-standards/references/44_deterministic_simulated_testing.md"
-    purpose: "RS-44: deterministic simulated testing, test isolation, and reproducibility. CRITICAL: CTR-3001 (hermetic isolation), RSK-3001 (env var mutation), RSK-3003 (sleep-based sync), CTR-3007 (simulation harnesses)."
-
-  # Domain patterns and reference findings
-  - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"
-    purpose: "RS-27: bounded collections and DoS prevention. CRITICAL: CTR-1303 (bounded stores), RSK-1302 (size math), CTR-1302 (query limits)."
-  - path: "@documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md"
-    purpose: "RS-32: verification tools for DoS-prone patterns (fuzzing, property tests). CRITICAL: RSK-1703 (parser fuzzing), CTR-1701 (verification plan)."
-  - path: "@documents/skills/rust-standards/references/42_pcac_ajc_integration.md"
-    purpose: "RS-42: PCAC/AJC authority lifecycle (join→revalidate→consume→effect). MANDATORY for privileged handlers. CRITICAL: 7 semantic laws, reviewer checklist."
   - path: "@documents/skills/implementor-default/references/daemon-implementation-patterns.md"
     purpose: "Daemon wiring and runtime invariants that commonly regress. CRITICAL: SQL patterns (no O(N) scans), atomicity protocols."
   - path: "@documents/skills/implementor-default/references/common-review-findings.md"
@@ -79,13 +48,38 @@ decision_tree:
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
-            Resolve scope/identity with a three-path contract:
-            (1) If a ticket YAML exists at `documents/work/tickets/$1.yaml`, read it for context and requirement bindings.
-            (2) If no YAML exists, resolve scope from daemon-backed work projection (`apm2 fac work current` and/or operator-provided canonical work_id `W-...`).
-            (3) If neither YAML nor daemon work object exists, stop with BLOCKED and escalate to operator before implementation.
-            If a PR number was provided instead of `$1`, derive scope from PR context (branch alias/work_id), then apply the same three-path rule.
-            For YAML-backed context, read the reason field to understand blocking relationships and note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
-            For YAML-backed context, binds links your work to requirements and evidence artifacts via file paths; scope.in_scope is your delivery contract and scope.out_of_scope is a hard boundary; definition_of_done.criteria plus linked requirement acceptance_criteria form your completion checklist.
+            Resolve scope using the following priority order. Do not guess; fail closed if
+            no path resolves.
+
+            (a) JSON-backed ticket ($1 is a TCK alias or a ticket file exists at
+                `documents/work/tickets/$1.json`):
+                Read the full YAML file. The ticket structure is authoritative for:
+                binds (requirements + evidence artifacts), scope.in_scope (delivery
+                contract), scope.out_of_scope (hard boundary), and
+                definition_of_done.criteria (completion checklist).
+                Also run `apm2 fac work current` to confirm the daemon has a live
+                work object for this alias.
+
+            (b) Daemon-only work object ($1 is a canonical work_id starting with `W-`,
+                or a TCK alias that resolves via daemon but has no YAML file):
+                Run `apm2 fac work current` (or `apm2 work status <work_id>`) to
+                retrieve the daemon-projected WorkSpecV1. Derive scope from
+                WorkSpecV1.title, .summary, .requirement_ids, and .rfc_id fields.
+                Read referenced requirement files directly from the repo using the
+                requirement_ids list. There is no YAML file to read.
+
+            (c) PR number provided ($1 looks like a PR number):
+                Extract the work_id or ticket alias from the branch name or PR
+                description, then resolve via (a) or (b) above.
+
+            (d) Nothing resolves: STOP with BLOCKED. State which resolution paths
+                were attempted and what each returned. Do not infer scope from the
+                branch name alone. Remediation: operator must create a canonical
+                work object first via `apm2 fac work open --from-ticket <yaml>`.
+
+            In all cases: note custody.responsibility_domains —
+            DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed
+            review patterns.
         - id: FETCH_REVIEW_FINDINGS
           action: |
             If a PR already exists for this branch, fetch current review findings:
@@ -104,15 +98,28 @@ decision_tree:
           action: "Read any orchestrator-provided warm handoff files before edits."
         - id: LOAD_REQUIREMENT_BINDINGS
           action: |
-            For each entry in binds.requirements: read the file at requirement_ref (strip the #anchor suffix). Extract the requirement's statement, acceptance_criteria, and priority. Merge these acceptance_criteria with definition_of_done.criteria to form your complete implementation checklist.
+            If operating from a YAML-backed ticket:
+              For each entry in binds.requirements: read the file at requirement_ref
+              (strip the #anchor suffix). Extract statement, acceptance_criteria, and
+              priority. Merge these acceptance_criteria with definition_of_done.criteria
+              to form your complete implementation checklist.
+              For each entry in binds.evidence_artifacts: read the file at artifact_ref
+              (strip the #anchor suffix). Note expected_contents — this tells you exactly
+              what proof your PR must include (e.g., denial proofs, lifecycle receipts).
 
-            For each entry in binds.evidence_artifacts: read the file at artifact_ref (strip the #anchor suffix). Note expected_contents — this tells you exactly what proof your PR must include (e.g., denial proofs, lifecycle receipts, test output).
+            If operating from a daemon-only work object (no YAML):
+              Use WorkSpecV1.requirement_ids as the checklist source. Read each
+              referenced requirement file directly. If a requirement file does not exist
+              on disk, STOP with BLOCKED and report the missing path — do not fabricate
+              acceptance criteria.
 
-            Read the parent RFC at documents/rfcs/<rfc_id>/ for design context if the requirement statements reference concepts you do not yet understand.
+            In all cases: read the parent RFC at documents/rfcs/<rfc_id>/ for design
+            context when requirement statements reference concepts you do not yet
+            understand.
         - id: LIST_MODULE_AGENTS_DOCS
-          action: "List module-level AGENTS docs with `rg --files -g 'AGENTS.md' crates` and record candidates for touched areas."
+          action: "List module-level AGENTS docs with `rg --files -g 'AGENTS.json' crates` and record candidates for touched areas."
         - id: READ_RELEVANT_MODULE_AGENTS
-          action: "Read AGENTS.md files adjacent to modules/crates that look relevant to the assigned scope."
+          action: "Read AGENTS.json files adjacent to modules/crates that look relevant to the assigned scope."
       next: WORKTREE_PREP
 
     - id: WORKTREE_PREP
@@ -154,25 +161,21 @@ decision_tree:
             For any code pattern matching "check → decision → act on checked state", verify that checked state cannot become stale between check and act.
             REJECT IF: permission checked then used without re-verification; quota checked then reserved non-atomically; state read outside lock then used as if valid; policy/capability read from store then applied without binding to read epoch.
             REQUIRE: atomic operations (CAS loops, atomic types, database constraints, or explicit two-phase with idempotency).
-            Reference: RS-21 (atomics), RS-40 (staleness), RS-41 (state machines).
         - id: GATE_SHARED_STATE_PROTOCOLS
           action: |
             Every shared mutable state (Mutex, RwLock, Atomic*, Cell, RefCell) MUST have explicit documented synchronization protocol.
             Protocol must state: (1) what data is protected, (2) who can mutate and under what conditions, (3) lock/atomic ordering required, (4) happens-before edges, (5) async suspension invariants.
             REJECT IF: interior mutability with no synchronization comment; lock/atomic use without clear ownership; panic-in-Drop of locked guard.
-            Reference: RS-21, RS-39.
         - id: GATE_ASYNC_STATE_FRESHNESS
           action: |
             Async code depending on state machine transitions or monotonic values (tick/epoch/version) MUST NOT assume stale state is valid across `.await`.
             REJECT IF: tick/epoch captured before `.await`, used after without re-validation; state machine state observed pre-await, decision made on stale assumption; leadership inferred pre-await, enforced post-await.
             REQUIRE: critical gates re-fetch fresh state immediately before enforcement; staleness checks via HLC or explicit version binding; re-validation after suspension.
-            Reference: RS-40 (monotonicity), RS-21 (happens-before).
         - id: GATE_DISTRIBUTED_STATE_CONSISTENCY
           action: |
             Multi-process or multi-thread code reading from persistent storage (ledger, files, DB) MUST ensure consistency between read epoch and enforcement epoch.
             REJECT IF: ledger event read then enforced without provenance verification; file read then used without atomic/immutability proof; DB row read ignoring concurrent writers; policy cached without binding to resolver epoch; order assumptions without explicit causality.
             REQUIRE: explicit consistency mechanism (immutability, atomic DB constraint, CAS loop); proof of who can write this state; reader holds lock/version for full decision scope.
-            Reference: RS-31, RS-40, RS-41.
         - id: GATE_NO_SYNTHETIC_CONSTANTS
           action: "Reject hardcoded runtime placeholders (ticks, attempts, verdicts, token counts) on production paths."
         - id: GATE_OPTIONAL_BYPASS
@@ -184,25 +187,22 @@ decision_tree:
             Every in-memory collection (Vec, HashMap, HashSet, VecDeque, BTreeMap) tracking external events or input MUST have hard MAX_* constant and eviction strategy.
             For EACH collection: (1) verify MAX_* constant exists at crate root, (2) verify overflow returns Err not truncation, (3) verify load/batch-insert enforce same cap, (4) verify concurrent writers cannot TOCTOU past cap.
             AUTOMATIC REJECT IF UNCAPPED: query result collections, persisted state reload, cache stores, event ledgers, resource pools.
-            Reference: RS-27, common-review-findings.md § 3.
+            Reference: common-review-findings.md § 3.
         - id: GATE_PANIC_SURFACE_DOS
           action: |
             Verify no untrusted input can trigger panic via unwrap(), expect(), panic!(), indexing, or division.
             For EACH unsafe/boundary path: (1) scan for panic sites, (2) confirm unreachable from untrusted input (proof required), (3) replace with fallible API (get(), checked math, Result).
             AUTOMATIC REJECT: parse().unwrap() on external input; v[index] on untrusted index; str slicing by byte offset without UTF-8 check.
-            Reference: RS-15 (panic safety), RS-39 (hazards).
         - id: GATE_UNBOUNDED_LOOPS_AND_TIMEOUTS
           action: |
             Verify loops, retries, and async operations have explicit termination guarantees.
             For EACH loop/retry/spawn: (1) confirm max iteration count or break condition, (2) confirm timeout guards (Instant::elapsed < max_duration), (3) confirm exponential backoff with cap (e.g., max_delay=30s), (4) confirm circuit breaker if high failure rate.
             AUTOMATIC REJECT: loops without MAX_ITERATIONS; retry loops without backoff; spawn loops without max concurrency; requests without timeout; recursive algorithms without depth limit.
-            Reference: RS-27, RS-40, RS-41.
         - id: GATE_IO_BOUNDS_AND_PARSING
           action: |
             Verify I/O reads, allocations, and parsing cannot be exploited for memory exhaustion (memory DoS).
             For EACH boundary read/parse: (1) never use .read_to_end(); use bounded loop, (2) confirm allocation size from length prefix WITH explicit cap checked BEFORE allocation, (3) confirm recursive parsing/JSON depth capped, (4) confirm string/bytes length validated before allocation.
             AUTOMATIC REJECT: r.read_to_end() without size cap; vec.reserve(len) without len < MAX check; serde_json on untrusted bytes without size validation.
-            Reference: RS-31, RS-27.
         - id: GATE_E2E_COVERAGE
           action: "Require at least one test through production dispatch/runtime path for each high-risk change."
       next: IMPLEMENT
@@ -272,11 +272,11 @@ decision_tree:
       purpose: "Refresh module-level AGENTS docs before push."
       steps[3]:
         - id: IDENTIFY_TOUCHED_MODULE_DOCS
-          action: "Map changed code paths to nearby AGENTS.md files."
+          action: "Map changed code paths to nearby AGENTS.json files."
         - id: EDIT_MODULE_AGENTS_DOCS
-          action: "Update relevant AGENTS.md files with new/changed module responsibilities, invariants, workflows, or guardrails introduced by the change."
+          action: "Update relevant AGENTS.json files with new/changed module responsibilities, invariants, workflows, or guardrails introduced by the change."
         - id: NOTE_AGENTS_DOC_UPDATES
-          action: "Ensure AGENTS.md edits are included in the final committed diff."
+          action: "Ensure AGENTS.json edits are included in the final committed diff."
       next: COMMIT
 
     - id: COMMIT
@@ -287,7 +287,7 @@ decision_tree:
         There is NO workaround. Commit everything first.
       steps[2]:
         - id: STAGE_ALL_CHANGES
-          action: "Run `git add -A` to stage ALL changes — implementation code, test additions, AGENTS.md updates, and any other modified files. Do NOT leave files unstaged."
+          action: "Run `git add -A` to stage ALL changes — implementation code, test additions, AGENTS.json updates, and any other modified files. Do NOT leave files unstaged."
         - id: CREATE_COMMIT
           action: "Run `git commit` with a concise message summarizing what changed and why. Verify with `git status` that the tree is clean (no modified, staged, or untracked files remain)."
       next: PUSH
@@ -296,7 +296,17 @@ decision_tree:
       purpose: "Push through FAC-only surface and handle interstitial branch/worktree failures. Requires a clean committed tree."
       steps[4]:
         - id: RUN_FAC_PUSH
-          action: "`apm2 fac push` REQUIRES a clean working tree with all changes committed. It will not stage or commit for you. First run `apm2 fac work current` to verify work binding. Then run `apm2 fac push` (add `--ticket <TICKET_YAML>` for metadata consistency checks, and add `--handoff-note <NOTE>` only when needed). Expect it to take about 5-10 minutes on a fresh worktree"
+          action: |
+            `apm2 fac push` REQUIRES a clean working tree with all changes committed.
+            It will not stage or commit for you.
+            First run `apm2 fac work current` to verify work binding.
+            Then run `apm2 fac push`:
+              - Add `--ticket <TICKET_YAML>` only when a YAML file exists for this
+                work item (provides PR title/body from YAML metadata).
+              - Omit `--ticket` when operating from a daemon-only work object; push
+                will use WorkSpecV1.title and .summary from CAS projection instead.
+              - Add `--handoff-note <NOTE>` only when needed.
+            Expect about 5-10 minutes on a fresh worktree.
         - id: CAPTURE_PR_CONTEXT
           action: "Capture PR number/URL from `apm2 fac push` output for monitoring and restart."
         - id: HANDLE_PUSH_FAILURE
@@ -343,7 +353,7 @@ invariants[17]:
   - "Timeout logic uses monotonic Instant not wall-clock SystemTime; duration_since() uses checked_* variant; intervals guarded for zero before division."
 
   # Deterministic Test Invariant
-  - "Tests MUST be deterministic and hermetically isolated: inject all external dependencies (time, I/O, randomness, environment) via traits or parameters; never share mutable process-global state between tests; never use sleep-based synchronization; never depend on HashMap iteration order, filesystem state, or network availability. Reference: RS-44 (deterministic simulated testing)."
+  - "Tests MUST be deterministic and hermetically isolated: inject all external dependencies (time, I/O, randomness, environment) via traits or parameters; never share mutable process-global state between tests; never use sleep-based synchronization; never depend on HashMap iteration order, filesystem state, or network availability."
 
   # TOCTOU Prevention Invariants
   - "If state machine state (tick, epoch, version, cursor) is read outside a lock, re-validate before enforcement; do not assume stale reads are truthful across await."

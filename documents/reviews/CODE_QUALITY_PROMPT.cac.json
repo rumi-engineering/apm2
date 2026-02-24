@@ -1,6 +1,6 @@
 {
   "schema": "apm2.review.prompt.v1",
-  "schema_version": "2.0.0",
+  "schema_version": "2.1.0",
   "kind": "review.executable_prompt",
   "meta": {
     "stable_id": "dcp://apm2.review/prompt/code-quality-review@2",
@@ -120,11 +120,11 @@
             },
             {
               "action": "read_module_agents",
-              "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] that the diff must preserve."
+              "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.json (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] that the diff must preserve."
             },
             {
               "action": "read_ticket",
-              "rule": "Identify the ticket ID from commit messages in $commit_history_path (convention: 'TCK-XXXXX: ...'). Read the ticket YAML at documents/work/tickets/TCK-XXXXX.yaml in full. Extract scope.in_scope (the delivery contract), scope.out_of_scope (hard boundaries), and definition_of_done.criteria (completion checklist). For each entry in binds.requirements, read the file at requirement_ref and extract acceptance_criteria. These form the requirements baseline for completeness checking in STEP_3."
+              "rule": "Identify the ticket ID from commit messages in $commit_history_path (convention: 'TCK-XXXXX: ...'). Read the ticket file at documents/work/tickets/TCK-XXXXX.json in full. Extract scope.in_scope (the delivery contract), scope.out_of_scope (hard boundaries), and definition_of_done.criteria (completion checklist). For each entry in binds.requirements, read the file at requirement_ref and extract acceptance_criteria. These form the requirements baseline for completeness checking in STEP_3."
             },
             {
               "action": "selective_read",
@@ -141,7 +141,7 @@
             "modes": [
               {
                 "mode": "documents/skills/modes-of-reasoning/assets/06-constraint-satisfiability.json",
-                "apply": "For each changed function/module: enumerate the invariants and contracts (from AGENTS.md [INV-*], [CTR-*], type constraints, documented preconditions). Verify the change satisfies ALL constraints. If any constraint is violated or unverifiable, it is a finding."
+                "apply": "For each changed function/module: enumerate the invariants and contracts (from AGENTS.json [INV-*], [CTR-*], type constraints, documented preconditions). Verify the change satisfies ALL constraints. If any constraint is violated or unverifiable, it is a finding."
               },
               {
                 "mode": "documents/skills/modes-of-reasoning/assets/07-type-theoretic.json",
