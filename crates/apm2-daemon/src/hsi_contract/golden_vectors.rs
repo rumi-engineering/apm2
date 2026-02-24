@@ -239,8 +239,7 @@ mod tests {
     /// `MANIFEST_FULL_VECTOR.expected_hash`.
     #[test]
     fn evid_0001_hash_matches_golden_vector() {
-        let evid_contents =
-            include_str!("../../../../documents/rfcs/RFC-0020.evid-0001.json");
+        let evid_contents = include_str!("../../../../documents/rfcs/RFC-0020.evid-0001.json");
         assert!(
             evid_contents.contains(MANIFEST_FULL_VECTOR.expected_hash),
             "EVID-0001.yaml does not contain the current full manifest golden hash \
