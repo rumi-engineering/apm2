@@ -694,13 +694,60 @@ fn bounded_reap(
 mod tests {
     use super::*;
 
+    fn infer_toolchain_home_from_path(path: &str) -> Option<std::path::PathBuf> {
+        std::env::split_paths(path).find_map(|entry| {
+            if entry.file_name()? != "bin" {
+                return None;
+            }
+            let cargo_home = entry.parent()?;
+            if cargo_home.file_name()? != ".cargo" {
+                return None;
+            }
+            cargo_home.parent().map(std::path::Path::to_path_buf)
+        })
+    }
+
     fn test_hardened_env() -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
-        if let Ok(path) = std::env::var("PATH") {
-            env.insert("PATH".to_string(), path);
+        let path = std::env::var("PATH").ok();
+        if let Some(path_value) = path.as_deref() {
+            env.insert("PATH".to_string(), path_value.to_string());
         }
         if let Ok(home) = std::env::var("HOME") {
             env.insert("HOME".to_string(), home);
+        }
+        if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+            env.insert("CARGO_HOME".to_string(), cargo_home);
+        }
+        if let Ok(rustup_home) = std::env::var("RUSTUP_HOME") {
+            env.insert("RUSTUP_HOME".to_string(), rustup_home);
+        }
+        // In lane-contained gates, HOME is redirected to a per-lane directory.
+        // If RUSTUP_HOME/CARGO_HOME are absent, rustup shims in PATH may try
+        // network bootstrap and fail. Infer host toolchain homes from PATH.
+        if let Some(inferred_home) = path
+            .as_deref()
+            .and_then(infer_toolchain_home_from_path)
+            .filter(|_| !env.contains_key("CARGO_HOME") || !env.contains_key("RUSTUP_HOME"))
+        {
+            if !env.contains_key("CARGO_HOME") {
+                let candidate = inferred_home.join(".cargo");
+                if candidate.is_dir() {
+                    env.insert(
+                        "CARGO_HOME".to_string(),
+                        candidate.to_string_lossy().to_string(),
+                    );
+                }
+            }
+            if !env.contains_key("RUSTUP_HOME") {
+                let candidate = inferred_home.join(".rustup");
+                if candidate.is_dir() {
+                    env.insert(
+                        "RUSTUP_HOME".to_string(),
+                        candidate.to_string_lossy().to_string(),
+                    );
+                }
+            }
         }
         env
     }
