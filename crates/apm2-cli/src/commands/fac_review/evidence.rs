@@ -1653,14 +1653,22 @@ fn build_rustfmt_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
 }
 
 fn build_doc_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
-    let mut command = vec!["cargo".to_string(), "doc".to_string()];
+    let mut command = vec![
+        "cargo".to_string(),
+        "doc".to_string(),
+        "--offline".to_string(),
+    ];
     append_scope_package_args(&mut command, scope);
     command.push("--no-deps".to_string());
     command
 }
 
 fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
-    let mut command = vec!["cargo".to_string(), "clippy".to_string()];
+    let mut command = vec![
+        "cargo".to_string(),
+        "clippy".to_string(),
+        "--offline".to_string(),
+    ];
     append_scope_package_args(&mut command, scope);
     command.extend([
         "--all-targets".to_string(),
@@ -1703,6 +1711,7 @@ fn build_scoped_nextest_command(scope: &CargoGateExecutionScope) -> Vec<String> 
         "cargo".to_string(),
         "nextest".to_string(),
         "run".to_string(),
+        "--offline".to_string(),
     ];
     append_scope_package_args(&mut command, scope);
     command.extend([
@@ -4010,7 +4019,9 @@ mod tests {
         let command =
             resolve_evidence_test_command_with_scope(None, &CargoGateExecutionScope::FullWorkspace);
         let joined = command.join(" ");
-        assert!(joined.contains("cargo nextest run --workspace"));
+        assert!(joined.contains("cargo nextest run"));
+        assert!(joined.contains("--offline"));
+        assert!(joined.contains("--workspace"));
         assert!(!joined.contains("cargo test --workspace"));
     }
 
@@ -4075,11 +4086,18 @@ mod tests {
 
         assert!(rustfmt.contains("cargo fmt -p apm2-cli -- --check"));
         assert!(!rustfmt.contains("--all"));
-        assert!(nextest.contains("cargo nextest run -p apm2-cli"));
+        assert!(nextest.contains("cargo nextest run"));
+        assert!(nextest.contains("--offline"));
+        assert!(nextest.contains("-p apm2-cli"));
         assert!(!nextest.contains("--workspace"));
-        assert!(doc.contains("cargo doc -p apm2-cli --no-deps"));
+        assert!(doc.contains("cargo doc"));
+        assert!(doc.contains("-p apm2-cli"));
+        assert!(doc.contains("--no-deps"));
+        assert!(doc.contains("--offline"));
         assert!(!doc.contains("--workspace"));
-        assert!(clippy.contains("cargo clippy -p apm2-cli"));
+        assert!(clippy.contains("cargo clippy"));
+        assert!(clippy.contains("-p apm2-cli"));
+        assert!(clippy.contains("--offline"));
         assert!(!clippy.contains("--workspace"));
     }
 
@@ -4116,7 +4134,9 @@ mod tests {
             Ok(command) => {
                 let joined = command.command.join(" ");
                 assert!(joined.contains("systemd-run"));
-                assert!(joined.contains("cargo nextest run --workspace"));
+                assert!(joined.contains("cargo nextest run"));
+                assert!(joined.contains("--offline"));
+                assert!(joined.contains("--workspace"));
                 assert!(!joined.contains(".sh"));
                 assert_eq!(
                     command.gate_profile,
