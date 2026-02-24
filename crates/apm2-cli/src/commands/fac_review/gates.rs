@@ -7357,6 +7357,26 @@ time.sleep(20)\n",
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
+        run_git(
+            &repo,
+            &[
+                "add",
+                "documents/reviews/test-safety-allowlist.txt",
+                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+            ],
+        );
+        run_git(&repo, &["commit", "-m", "add review fixtures"]);
+        run_git(
+            &repo,
+            &[
+                "add",
+                "documents/reviews/test-safety-allowlist.txt",
+                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+            ],
+        );
+        run_git(&repo, &["commit", "-m", "add review fixtures"]);
         let cargo_path = bin_dir.join("cargo");
         fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
             .expect("set fake cargo mode");
@@ -7904,7 +7924,8 @@ time.sleep(20)\n",
         run_git(&repo, &["config", "user.email", "test@example.com"]);
         run_git(&repo, &["config", "user.name", "Test User"]);
         fs::write(repo.join("README.md"), "fac gates benchmark test\n").expect("write repo file");
-        run_git(&repo, &["add", "README.md"]);
+        fs::write(repo.join(".gitignore"), "target/\n").expect("write gitignore");
+        run_git(&repo, &["add", "README.md", ".gitignore"]);
         run_git(&repo, &["commit", "-m", "initial"]);
         run_git(&repo, &["branch", "-M", "main"]);
 
@@ -7943,6 +7964,17 @@ time.sleep(20)\n",
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
 
+        run_git(
+            &repo,
+            &[
+                "add",
+                "documents/reviews/test-safety-allowlist.txt",
+                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+            ],
+        );
+        run_git(&repo, &["commit", "-m", "add review fixtures"]);
+
         // --- Configure hermetic environment ---
         let original_path = env::var_os("PATH");
         let original_apm2_home = env::var_os("APM2_HOME");
@@ -7971,11 +8003,28 @@ time.sleep(20)\n",
 
         env::set_current_dir(&repo).expect("set test repository as cwd");
 
+        let preflight_status = Command::new("git")
+            .args(["status", "--short", "--untracked-files=all"])
+            .current_dir(&repo)
+            .output()
+            .expect("collect preflight git status");
+        assert!(
+            preflight_status.status.success(),
+            "git status preflight should succeed: {}",
+            String::from_utf8_lossy(&preflight_status.stderr)
+        );
+        let preflight_status_text = String::from_utf8_lossy(&preflight_status.stdout);
+        assert!(
+            preflight_status_text.trim().is_empty(),
+            "benchmark fixture repo must start clean, found:\n{}",
+            preflight_status_text
+        );
+
         // ---- Run 1 (cold): exercises the full gate pipeline ----
         let run1 = run_gates_inner(
             &repo,
             false, // force
-            true,  // quick — fast cold-path baseline
+            false, // quick=false so cold-path baseline reflects full FAC gate profile
             30,
             "128M",
             128,
