@@ -705,6 +705,38 @@
             },
             {
               "type": "requirement",
+              "id": "RFC-0032::REQ-0041",
+              "title": "FAC worker queue intake is fail-closed before claim",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC worker queue consumers MUST treat pending queue entries as untrusted input, validate RFC-0028 authorization and RFC-0029 admission before claim, and deny or quarantine on any validation failure.",
+                "acceptance": [
+                  "Queue file reads are bounded and deterministic.",
+                  "Malformed specs or `job_spec_digest` mismatches are quarantined with receipts.",
+                  "Missing/invalid RFC-0028 token or non-Allow RFC-0029 admission yields denial receipts prior to claim.",
+                  "Pending-to-claimed transition is atomic and prevents double execution under concurrent workers."
+                ],
+                "domain": [
+                  "security",
+                  "correctness",
+                  "reliability"
+                ],
+                "depends_on": [
+                  "RFC-0032::REQ-0004",
+                  "RFC-0032::REQ-0011",
+                  "RFC-0032::REQ-0024"
+                ],
+                "theory_refs": [
+                  "INV-F-02",
+                  "INV-F-05",
+                  "LAW-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
               "id": "RFC-0032::REQ-0038",
               "title": "FAC enforces bounded economics for retries and anti-entropy",
               "children": [],

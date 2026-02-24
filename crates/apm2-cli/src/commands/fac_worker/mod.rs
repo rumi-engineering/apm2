@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00511)
+// AGENT-AUTHORED (RFC-0032::REQ-0041)
 //! FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission
 //! gating.
 //!
