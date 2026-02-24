@@ -19861,7 +19861,6 @@ impl PrivilegedDispatcher {
                 computed_changeset_digest,
                 &replay_event_id,
                 replay_timestamp_ns,
-                true,
             ) {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -19934,7 +19933,6 @@ impl PrivilegedDispatcher {
                         computed_changeset_digest,
                         &replay_event_id,
                         replay_timestamp_ns,
-                        true,
                     ) {
                         return Ok(PrivilegedResponse::error(
                             PrivilegedErrorCode::CapabilityRequestRejected,
@@ -19971,7 +19969,6 @@ impl PrivilegedDispatcher {
             computed_changeset_digest,
             &signed_event.event_id,
             timestamp_ns,
-            false,
         ) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -20021,7 +20018,6 @@ impl PrivilegedDispatcher {
         changeset_digest: [u8; 32],
         source_event_id: &str,
         source_timestamp_ns: u64,
-        replay_candidate: bool,
     ) -> Result<(), String> {
         let Some(orchestrator) = &self.gate_orchestrator else {
             debug!(
@@ -20031,15 +20027,11 @@ impl PrivilegedDispatcher {
             return Ok(());
         };
 
-        // Replay candidates are idempotency-first admissions. We intentionally
-        // bypass freshness timestamp enforcement here so retries for an
-        // already-published changeset cannot fail as stale before replay
-        // resolution.
-        let gate_start_timestamp_ms = if replay_candidate {
-            0
-        } else {
-            source_timestamp_ns / 1_000_000
-        };
+        // Preserve authoritative source timestamp for both fresh publications
+        // and replay candidates. Replay classification must happen before
+        // freshness inside the orchestrator, but stale replays must still be
+        // rejected when replay identity cache is no longer present.
+        let gate_start_timestamp_ms = source_timestamp_ns / 1_000_000;
         let gate_start = crate::gate::GateStartInfo {
             source_event_id: source_event_id.to_string(),
             work_id: work_id.to_string(),
@@ -33572,6 +33564,31 @@ mod tests {
             (dispatcher.with_gate_orchestrator(orchestrator), cas)
         }
 
+        #[derive(Debug)]
+        struct FixedGateClock {
+            now_ms: u64,
+            monotonic: std::time::Instant,
+        }
+
+        impl FixedGateClock {
+            fn new(now_ms: u64) -> Self {
+                Self {
+                    now_ms,
+                    monotonic: std::time::Instant::now(),
+                }
+            }
+        }
+
+        impl crate::gate::Clock for FixedGateClock {
+            fn now_ms(&self) -> u64 {
+                self.now_ms
+            }
+
+            fn monotonic_now(&self) -> std::time::Instant {
+                self.monotonic
+            }
+        }
+
         fn privileged_ctx() -> ConnectionContext {
             ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
@@ -33999,6 +34016,97 @@ mod tests {
             assert_eq!(
                 changeset_count, 1,
                 "legacy replay payload must not produce duplicate changeset events"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_replay_rejects_stale_identity_when_replay_cache_missing() {
+            let fixed_now_ms = 2_000_000_000_000_u64;
+            let stale_source_ms = fixed_now_ms
+                .saturating_sub(crate::gate::MAX_SOURCE_EVENT_AGE_MS)
+                .saturating_sub(10_000);
+
+            let (dispatcher, cas) = make_dispatcher_with_cas();
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::with_clock(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::new(Signer::generate()),
+                Arc::new(FixedGateClock::new(fixed_now_ms)),
+            ));
+            let dispatcher = dispatcher.with_gate_orchestrator(orchestrator);
+
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-replay-stale-reject");
+            let bundle: ChangeSetBundleV1 =
+                serde_json::from_slice(&bundle_bytes).expect("bundle fixture should decode");
+            let changeset_digest_hex = hex::encode(bundle.changeset_digest);
+            let persisted_cas_hash_hex = hex::encode(
+                cas.store(&bundle_bytes)
+                    .expect("bundle should store in CAS")
+                    .hash,
+            );
+
+            let replay_payload = serde_json::json!({
+                "event_type": "changeset_published",
+                "work_id": work_id,
+                "changeset_digest": changeset_digest_hex,
+                "cas_hash": persisted_cas_hash_hex,
+                "actor_id": "actor:test-stale",
+                "timestamp_ns": stale_source_ms.saturating_mul(1_000_000),
+            });
+            dispatcher
+                .event_emitter
+                .inject_raw_event(SignedLedgerEvent {
+                    event_id: "EVT-test-stale-replay-seed".to_string(),
+                    event_type: "changeset_published".to_string(),
+                    work_id: work_id.clone(),
+                    actor_id: "actor:test-stale".to_string(),
+                    payload: serde_json::to_vec(&replay_payload).expect("payload should serialize"),
+                    signature: vec![0u8; 64],
+                    timestamp_ns: stale_source_ms.saturating_mul(1_000_000),
+                });
+
+            let response = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        lease_id,
+                        bundle_bytes,
+                    }),
+                    &ctx,
+                )
+                .expect("request should complete with deterministic error response");
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message
+                            .contains("gate lifecycle start failed for replayed changeset"),
+                        "unexpected stale replay error message: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("stale gate-start event"),
+                        "stale replay rejection must preserve freshness violation semantics: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected stale replay rejection, got: {other:?}"),
+            }
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_count = events
+                .iter()
+                .filter(|event| event.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_count, 1,
+                "stale replay rejection must not append duplicate changeset_published events"
             );
         }
 
