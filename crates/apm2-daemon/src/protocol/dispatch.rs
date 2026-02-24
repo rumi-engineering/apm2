@@ -8989,6 +8989,11 @@ fn budget_error_to_protocol_error(
 }
 
 impl PrivilegedDispatcher {
+    #[inline]
+    fn constant_time_str_eq(lhs: &str, rhs: &str) -> bool {
+        lhs.len() == rhs.len() && bool::from(lhs.as_bytes().ct_eq(rhs.as_bytes()))
+    }
+
     /// Builds a channel-boundary check from daemon-classified tool context.
     ///
     /// Tool requests accepted by the daemon session plane are treated as
@@ -20598,7 +20603,7 @@ impl PrivilegedDispatcher {
         // TCK-00638: Actor ownership check — the authenticated caller must be
         // the actor that owns the work claim. Prevents unauthorized actors
         // from publishing context entries against work they don't own.
-        if claim.actor_id != actor_id {
+        if !Self::constant_time_str_eq(claim.actor_id.as_str(), actor_id.as_str()) {
             warn!(
                 work_id = %request.work_id,
                 claim_actor = %claim.actor_id,
@@ -21460,7 +21465,7 @@ impl PrivilegedDispatcher {
         };
 
         // 5. Actor ownership check — the authenticated caller must own the claim.
-        if claim.actor_id != actor_id {
+        if !Self::constant_time_str_eq(claim.actor_id.as_str(), actor_id.as_str()) {
             warn!(
                 work_id = %request.work_id,
                 claim_actor = %claim.actor_id,
@@ -22121,9 +22126,15 @@ impl PrivilegedDispatcher {
         // caller_actor_id into the effect_intent_digest for integrity, but
         // cannot enforce caller-to-lease ownership semantics. Authorization
         // MUST be checked before the PCAC lifecycle is invoked.
-        if parent_lease.executor_actor_id != caller_actor_id
-            && parent_lease.issuer_actor_id != caller_actor_id
-        {
+        let caller_is_executor = Self::constant_time_str_eq(
+            parent_lease.executor_actor_id.as_str(),
+            caller_actor_id.as_str(),
+        );
+        let caller_is_issuer = Self::constant_time_str_eq(
+            parent_lease.issuer_actor_id.as_str(),
+            caller_actor_id.as_str(),
+        );
+        if !(caller_is_executor || caller_is_issuer) {
             warn!(
                 parent_lease_id = %request.parent_lease_id,
                 caller = %caller_actor_id,

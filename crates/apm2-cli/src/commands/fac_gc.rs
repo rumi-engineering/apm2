@@ -428,6 +428,8 @@ mod tests {
     #[allow(unsafe_code)] // Env mutation is required for scoped test setup.
     fn set_apm2_home(path: &Path) {
         unsafe {
+            // SAFETY: test-only helper guarded by `env_var_test_lock()` in callers,
+            // so no concurrent env mutation occurs while setting APM2_HOME.
             std::env::set_var("APM2_HOME", path);
         }
     }
@@ -435,6 +437,8 @@ mod tests {
     #[allow(unsafe_code)] // Env mutation is required for scoped test teardown.
     fn restore_apm2_home(previous: Option<&std::ffi::OsString>) {
         unsafe {
+            // SAFETY: test-only helper guarded by `env_var_test_lock()` in callers,
+            // so no concurrent env mutation occurs while restoring APM2_HOME.
             match previous {
                 Some(value) => std::env::set_var("APM2_HOME", value),
                 None => std::env::remove_var("APM2_HOME"),
