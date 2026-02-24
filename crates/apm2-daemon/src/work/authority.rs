@@ -211,10 +211,14 @@ impl ProjectionWorkAuthority {
                     // payload with `session_id` field) so structural
                     // validation rejects them.
                     "work_claimed" => Self::has_work_domain_payload_structure(
+                        &event.event_type,
+                        &event.work_id,
                         &event.payload,
                         WORK_CLAIMED_DOMAIN_PREFIX,
                     ),
                     "work_transitioned" => Self::has_work_domain_payload_structure(
+                        &event.event_type,
+                        &event.work_id,
                         &event.payload,
                         WORK_TRANSITIONED_DOMAIN_PREFIX,
                     ),
@@ -266,7 +270,8 @@ impl ProjectionWorkAuthority {
             return true;
         };
 
-        let has_session_id = value.get("session_id").and_then(|v| v.as_str()).is_some();
+        let session_id_field = value.get("session_id").and_then(|v| v.as_str());
+        let has_session_id = session_id_field.is_some();
         let has_wrapped_payload = value.get("payload").and_then(|v| v.as_str()).is_some();
 
         !(has_session_id && has_wrapped_payload)
@@ -275,22 +280,40 @@ impl ProjectionWorkAuthority {
     /// Checks whether a JSON payload has the structural shape of a
     /// work-domain event rather than a session-wrapped event.
     ///
-    /// Work-domain events contain a top-level `work_id` field and do NOT
-    /// contain a `session_id` field. Session events (via `EmitEvent`)
-    /// always contain `session_id` and wrap the user payload as
-    /// hex-encoded bytes, so they structurally differ.
-    fn has_work_domain_payload_structure(payload: &[u8], _domain_prefix: &[u8]) -> bool {
+    /// Work-domain events contain a top-level `work_id` field. Most do not
+    /// include `session_id`; the only accepted exception is the transitional
+    /// canonical envelope used for legacy `work_transitioned`.
+    fn has_work_domain_payload_structure(
+        event_type: &str,
+        work_id: &str,
+        payload: &[u8],
+        _domain_prefix: &[u8],
+    ) -> bool {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
             return false;
         };
 
-        // Work-domain events have a `work_id` field; session-wrapped
-        // events have a `session_id` field instead. Reject events that
-        // look like session wrappers.
-        let has_work_id = value.get("work_id").and_then(|v| v.as_str()).is_some();
-        let has_session_id = value.get("session_id").and_then(|v| v.as_str()).is_some();
+        let work_id_field = value.get("work_id").and_then(|v| v.as_str());
+        let session_id_field = value.get("session_id").and_then(|v| v.as_str());
+        let has_session_id = session_id_field.is_some();
+        let has_wrapped_payload = value.get("payload").and_then(|v| v.as_str()).is_some();
+        let envelope_event_type = value.get("event_type").and_then(|v| v.as_str());
 
-        has_work_id && !has_session_id
+        if work_id_field != Some(work_id) {
+            return false;
+        }
+
+        if !has_session_id {
+            return true;
+        }
+
+        // Transitional canonical envelope for legacy `work_transitioned` event
+        // type: allow only the exact envelope shape emitted by work-domain
+        // handlers.
+        event_type == "work_transitioned"
+            && has_wrapped_payload
+            && envelope_event_type == Some("work_transitioned")
+            && session_id_field == Some(work_id)
     }
 
     fn status_from_work(

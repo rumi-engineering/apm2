@@ -1192,18 +1192,14 @@ pub struct PushArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
-    /// Optional ticket YAML path for consistency checking against derived TCK
-    /// id.
-    #[arg(long)]
-    pub ticket: Option<PathBuf>,
-
     /// Canonical work identifier to bind projection and daemon publication.
     /// If omitted, `fac push` derives work binding via ticket alias and
     /// fail-closed TCK alias resolution.
     /// Projection fallback is only used when explicitly requested with
     /// `--lease-id`/`--session-id`.
     /// Use `apm2 fac work current` to inspect.
-    /// If no work exists yet, create/claim one via `apm2 fac work open` and
+    /// If no work exists yet, create/claim one via
+    /// `apm2 fac work open --from-ticket ... --lease-id ...` and
     /// `apm2 fac work claim`.
     #[arg(long = "work-id")]
     pub work_id: Option<String>,
@@ -3757,7 +3753,6 @@ pub fn run_fac(
                 repo: &repo,
                 remote: &args.remote,
                 branch: args.branch.as_deref(),
-                ticket: args.ticket.as_deref(),
                 work_id: args.work_id.as_deref(),
                 ticket_alias: args.ticket_alias.as_deref(),
                 lease_id: args.lease_id.as_deref(),

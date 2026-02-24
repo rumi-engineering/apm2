@@ -205,47 +205,20 @@ fn collect_commit_history(remote: &str, branch: &str) -> Result<Vec<CommitSummar
     Ok(fallback)
 }
 
-fn ticket_path_for_tck(repo_root: &Path, tck: &str) -> PathBuf {
-    repo_root
-        .join("documents")
-        .join("work")
-        .join("tickets")
-        .join(format!("{tck}.yaml"))
-}
-
-fn load_ticket_body(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read ticket body at {}: {err}", path.display()))
-}
-
-fn load_ticket_title(path: &Path, body: &str) -> Result<String, String> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|err| format!("failed to parse ticket YAML at {}: {err}", path.display()))?;
-
-    let Some(title) = parsed
-        .get("ticket_meta")
-        .and_then(|value| value.get("ticket"))
-        .and_then(|value| value.get("title"))
-        .and_then(serde_yaml::Value::as_str)
-        .map(str::trim)
+fn title_subject_from_commit_history(commit_history: &[CommitSummary]) -> String {
+    commit_history
+        .last()
+        .map(|entry| entry.message.trim().replace('\n', " "))
         .filter(|value| !value.is_empty())
-    else {
-        return Err(format!(
-            "missing `ticket_meta.ticket.title` in {}",
-            path.display()
-        ));
-    };
-
-    Ok(title.to_string())
+        .unwrap_or_else(|| "FAC push update".to_string())
 }
 
-fn render_ticket_body_markdown(
-    body: &str,
+fn render_push_body_markdown(
+    work_id: &str,
+    ticket_alias: Option<&str>,
+    branch: &str,
     commit_history: &[CommitSummary],
 ) -> Result<String, String> {
-    let mut parsed: serde_yaml::Value = serde_yaml::from_str(body)
-        .map_err(|err| format!("failed to parse ticket YAML for PR body rendering: {err}"))?;
-
     let history_entries = commit_history
         .iter()
         .map(|entry| {
@@ -262,21 +235,37 @@ fn render_ticket_body_markdown(
         })
         .collect::<Vec<_>>();
 
-    let root = parsed
-        .as_mapping_mut()
-        .ok_or_else(|| "ticket YAML root must be a mapping".to_string())?;
-    let metadata_key = serde_yaml::Value::String("fac_push_metadata".to_string());
-    let mut metadata_mapping = match root.remove(&metadata_key) {
-        Some(serde_yaml::Value::Mapping(value)) => value,
-        Some(_) | None => serde_yaml::Mapping::new(),
-    };
+    let mut root = serde_yaml::Mapping::new();
+    root.insert(
+        serde_yaml::Value::String("schema".to_string()),
+        serde_yaml::Value::String("apm2.fac_push_metadata.v1".to_string()),
+    );
+    root.insert(
+        serde_yaml::Value::String("work_id".to_string()),
+        serde_yaml::Value::String(work_id.to_string()),
+    );
+    if let Some(alias) = ticket_alias {
+        root.insert(
+            serde_yaml::Value::String("ticket_alias".to_string()),
+            serde_yaml::Value::String(alias.to_string()),
+        );
+    }
+    root.insert(
+        serde_yaml::Value::String("branch".to_string()),
+        serde_yaml::Value::String(branch.to_string()),
+    );
+
+    let mut metadata_mapping = serde_yaml::Mapping::new();
     metadata_mapping.insert(
         serde_yaml::Value::String("commit_history".to_string()),
         serde_yaml::Value::Sequence(history_entries),
     );
-    root.insert(metadata_key, serde_yaml::Value::Mapping(metadata_mapping));
+    root.insert(
+        serde_yaml::Value::String("fac_push_metadata".to_string()),
+        serde_yaml::Value::Mapping(metadata_mapping),
+    );
 
-    let mut rendered = serde_yaml::to_string(&parsed)
+    let mut rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
         .map_err(|err| format!("failed to render PR description YAML: {err}"))?;
     if let Some(stripped) = rendered.strip_prefix("---\n") {
         rendered = stripped.to_string();
@@ -285,51 +274,39 @@ fn render_ticket_body_markdown(
     Ok(format!("```yaml\n{normalized}\n```"))
 }
 
-fn validate_ticket_path_matches_tck(ticket_path: &Path, tck: &str) -> Result<(), String> {
-    let Some(stem) = ticket_path.file_stem().and_then(|value| value.to_str()) else {
-        return Err(format!(
-            "invalid --ticket path `{}`; expected filename `{tck}.yaml`",
-            ticket_path.display()
-        ));
-    };
-
-    if stem != tck {
-        return Err(format!(
-            "--ticket path `{}` does not match derived TCK `{tck}`; expected filename `{tck}.yaml`",
-            ticket_path.display()
-        ));
-    }
-
-    Ok(())
-}
-
 #[derive(Debug)]
 struct PrMetadata {
     title: String,
     body: String,
-    ticket_path: PathBuf,
 }
 
 fn resolve_pr_metadata(
     branch: &str,
     worktree_dir: &Path,
-    repo_root: &Path,
     commit_history: &[CommitSummary],
-    ticket: Option<&Path>,
+    work_id: &str,
+    resolved_ticket_alias: Option<&str>,
 ) -> Result<PrMetadata, String> {
-    let tck_id = resolve_tck_id(branch, worktree_dir)?;
-    if let Some(ticket_path) = ticket {
-        validate_ticket_path_matches_tck(ticket_path, &tck_id)?;
-    }
-
-    let canonical_ticket_path = ticket_path_for_tck(repo_root, &tck_id);
-    let raw_body = load_ticket_body(&canonical_ticket_path)?;
-    let ticket_title = load_ticket_title(&canonical_ticket_path, &raw_body)?;
-    let body = render_ticket_body_markdown(&raw_body, commit_history)?;
+    validate_push_work_id(work_id)?;
+    let inferred_ticket_alias = resolved_ticket_alias
+        .map(ToString::to_string)
+        .or_else(|| resolve_tck_id(branch, worktree_dir).ok());
+    let title_prefix = inferred_ticket_alias
+        .as_deref()
+        .unwrap_or(work_id)
+        .to_string();
+    let body = render_push_body_markdown(
+        work_id,
+        inferred_ticket_alias.as_deref(),
+        branch,
+        commit_history,
+    )?;
     Ok(PrMetadata {
-        title: format!("{tck_id}: {ticket_title}"),
+        title: format!(
+            "{title_prefix}: {}",
+            title_subject_from_commit_history(commit_history)
+        ),
         body,
-        ticket_path: canonical_ticket_path,
     })
 }
 
@@ -2452,7 +2429,6 @@ pub(super) struct PushInvocation<'a> {
     pub repo: &'a str,
     pub remote: &'a str,
     pub branch: Option<&'a str>,
-    pub ticket: Option<&'a Path>,
     pub work_id_arg: Option<&'a str>,
     pub ticket_alias_arg: Option<&'a str>,
     pub lease_id_arg: Option<&'a str>,
@@ -2467,7 +2443,6 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let repo = invocation.repo;
     let remote = invocation.remote;
     let branch = invocation.branch;
-    let ticket = invocation.ticket;
     let work_id_arg = invocation.work_id_arg;
     let ticket_alias_arg = invocation.ticket_alias_arg;
     let lease_id_arg = invocation.lease_id_arg;
@@ -2661,7 +2636,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         "fast_checks_started",
         serde_json::json!({
             "checks": [
-                "ticket_metadata_resolution",
+                "push_metadata_resolution",
                 "fac_review_machine_spec_snapshot_guard",
                 "work_binding_resolution",
                 "clean_worktree",
@@ -2721,24 +2696,6 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         },
     };
 
-    let metadata =
-        match resolve_pr_metadata(&branch, &worktree_dir, &repo_root, &commit_history, ticket) {
-            Ok(value) => value,
-            Err(err) => {
-                fail_with_attempt!(
-                    "fac_push_ticket_resolution_failed",
-                    format!(
-                        "{err}; expected ticket file under documents/work/tickets/TCK-xxxxx.yaml"
-                    )
-                );
-            },
-        };
-    human_log!(
-        "fac push: metadata title={} body={}",
-        metadata.title,
-        metadata.ticket_path.display()
-    );
-
     let handoff_note = match parse_handoff_note(handoff_note_arg) {
         Ok(note) => note,
         Err(err) => {
@@ -2794,6 +2751,20 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             .as_deref()
             .map_or_else(String::new, |alias| format!(" ticket_alias={alias}"),)
     );
+
+    let metadata = match resolve_pr_metadata(
+        &branch,
+        &worktree_dir,
+        &commit_history,
+        &work_id,
+        resolved_ticket_alias.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_metadata_resolution_failed", err);
+        },
+    };
+    human_log!("fac push: metadata title={}", metadata.title);
 
     if let Err(err) = ensure_clean_worktree_for_push() {
         fail_with_attempt!("fac_push_dirty_worktree", err);
@@ -4885,85 +4856,38 @@ mod tests {
     }
 
     #[test]
-    fn ticket_path_for_tck_uses_canonical_location() {
-        let path = ticket_path_for_tck(Path::new("/repo"), "TCK-00412");
-        assert_eq!(
-            path,
-            PathBuf::from("/repo/documents/work/tickets/TCK-00412.yaml")
-        );
-    }
-
-    #[test]
-    fn validate_ticket_path_matches_tck_accepts_matching_filename() {
-        let result = validate_ticket_path_matches_tck(
-            Path::new("documents/work/tickets/TCK-00412.yaml"),
-            "TCK-00412",
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_ticket_path_matches_tck_rejects_mismatch() {
-        let err = validate_ticket_path_matches_tck(
-            Path::new("documents/work/tickets/TCK-00411.yaml"),
-            "TCK-00412",
-        )
-        .expect_err("mismatch should fail");
-        assert!(err.contains("does not match derived TCK"));
-    }
-
-    #[test]
-    fn load_ticket_body_reads_raw_contents() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let ticket_path = temp_dir.path().join("TCK-00412.yaml");
-        std::fs::write(
-            &ticket_path,
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n",
-        )
-        .expect("write ticket");
-
-        let content = load_ticket_body(&ticket_path).expect("load ticket body");
-        assert_eq!(content, "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n");
-    }
-
-    #[test]
-    fn load_ticket_title_reads_plain_title() {
-        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
-        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Title Value\"\n";
-        let title = load_ticket_title(ticket_path, body).expect("title should parse");
-        assert_eq!(title, "Title Value");
-    }
-
-    #[test]
-    fn load_ticket_title_fails_when_missing() {
-        let ticket_path = Path::new("/repo/documents/work/tickets/TCK-00412.yaml");
-        let body = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n";
-        let err = load_ticket_title(ticket_path, body).expect_err("missing title should fail");
-        assert!(err.contains("ticket_meta.ticket.title"));
-    }
-
-    #[test]
     fn parse_commit_history_parses_short_sha_and_message() {
         let parsed = parse_commit_history("abc12345\tfirst change\ndef67890\tsecond change\n");
         assert_eq!(parsed, sample_commit_history());
     }
 
     #[test]
-    fn render_ticket_body_markdown_includes_commit_history_metadata() {
-        let rendered = render_ticket_body_markdown(
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n",
+    fn title_subject_from_commit_history_uses_last_commit_message() {
+        let subject = title_subject_from_commit_history(&sample_commit_history());
+        assert_eq!(subject, "second change");
+    }
+
+    #[test]
+    fn render_push_body_markdown_includes_work_identity_and_commit_history() {
+        let rendered = render_push_body_markdown(
+            "W-TCK-00412",
+            Some("TCK-00412"),
+            "ticket/RFC-0018/TCK-00412",
             &sample_commit_history(),
         )
-        .expect("render ticket body");
+        .expect("render push body");
         let yaml = parse_yaml_from_markdown_fence(&rendered);
 
-        let ticket_id = yaml
-            .get("ticket_meta")
-            .and_then(|value| value.get("ticket"))
-            .and_then(|value| value.get("id"))
+        let work_id = yaml
+            .get("work_id")
             .and_then(serde_yaml::Value::as_str)
-            .expect("ticket id");
-        assert_eq!(ticket_id, "TCK-00412");
+            .expect("work id");
+        assert_eq!(work_id, "W-TCK-00412");
+        let ticket_alias = yaml
+            .get("ticket_alias")
+            .and_then(serde_yaml::Value::as_str)
+            .expect("ticket alias");
+        assert_eq!(ticket_alias, "TCK-00412");
 
         let history = yaml
             .get("fac_push_metadata")
@@ -4986,24 +4910,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pr_metadata_branch_tck_yields_title_and_markdown_body() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        let ticket_path = tickets_dir.join("TCK-00412.yaml");
-        let ticket_content = "ticket_meta:\n  ticket:\n    id: \"TCK-00412\"\n    title: \"Any\"\n";
-        fs::write(&ticket_path, ticket_content).expect("write ticket");
-
+    fn resolve_pr_metadata_prefers_resolved_ticket_alias_prefix() {
         let metadata = resolve_pr_metadata(
             "ticket/RFC-0018/TCK-00412",
             Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
             &sample_commit_history(),
-            None,
+            "W-TCK-00412",
+            Some("TCK-00412"),
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00412: Any");
+        assert_eq!(metadata.title, "TCK-00412: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         let history = yaml
             .get("fac_push_metadata")
@@ -5011,72 +4927,44 @@ mod tests {
             .and_then(serde_yaml::Value::as_sequence)
             .expect("commit history");
         assert_eq!(history.len(), 2);
-        assert_eq!(metadata.ticket_path, ticket_path);
     }
 
     #[test]
-    fn resolve_pr_metadata_uses_worktree_fallback() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        let ticket_path = tickets_dir.join("TCK-00444.yaml");
-        let ticket_content =
-            "ticket_meta:\n  ticket:\n    id: \"TCK-00444\"\n    title: \"Fallback Title\"\n";
-        fs::write(&ticket_path, ticket_content).expect("write ticket");
-
+    fn resolve_pr_metadata_uses_branch_derived_alias_when_not_explicitly_supplied() {
         let metadata = resolve_pr_metadata(
             "feat/no-ticket",
             Path::new("/tmp/apm2-TCK-00444"),
-            repo_root,
             &sample_commit_history(),
+            "W-TCK-00444",
             None,
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00444: Fallback Title");
+        assert_eq!(metadata.title, "TCK-00444: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
-        let history = yaml
-            .get("fac_push_metadata")
-            .and_then(|value| value.get("commit_history"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .expect("commit history");
-        assert_eq!(history.len(), 2);
-        assert_eq!(metadata.ticket_path, ticket_path);
+        assert_eq!(
+            yaml.get("ticket_alias")
+                .and_then(serde_yaml::Value::as_str)
+                .expect("ticket alias"),
+            "TCK-00444"
+        );
     }
 
     #[test]
-    fn resolve_pr_metadata_rejects_ticket_mismatch() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let tickets_dir = repo_root.join("documents/work/tickets");
-        fs::create_dir_all(&tickets_dir).expect("create tickets dir");
-        fs::write(tickets_dir.join("TCK-00412.yaml"), "ticket_meta:\n").expect("write ticket");
-
-        let err = resolve_pr_metadata(
-            "ticket/RFC-0018/TCK-00412",
+    fn resolve_pr_metadata_falls_back_to_work_id_when_no_ticket_context_exists() {
+        let metadata = resolve_pr_metadata(
+            "feat/no-ticket",
             Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
             &sample_commit_history(),
-            Some(Path::new("documents/work/tickets/TCK-00411.yaml")),
-        )
-        .expect_err("mismatch should fail");
-        assert!(err.contains("does not match derived TCK"));
-    }
-
-    #[test]
-    fn resolve_pr_metadata_fails_when_canonical_ticket_missing() {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let repo_root = temp_dir.path();
-        let err = resolve_pr_metadata(
-            "ticket/RFC-0018/TCK-00412",
-            Path::new("/tmp/apm2-no-ticket"),
-            repo_root,
-            &sample_commit_history(),
+            "W-12345678",
             None,
         )
-        .expect_err("missing ticket should fail");
-        assert!(err.contains("failed to read ticket body"));
-        assert!(err.contains("TCK-00412.yaml"));
+        .expect("metadata should resolve using work_id fallback");
+        assert_eq!(metadata.title, "W-12345678: second change");
+        let yaml = parse_yaml_from_markdown_fence(&metadata.body);
+        assert!(
+            yaml.get("ticket_alias").is_none(),
+            "ticket_alias should be absent without alias context"
+        );
     }
 
     #[test]

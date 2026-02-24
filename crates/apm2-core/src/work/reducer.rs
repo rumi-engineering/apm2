@@ -609,6 +609,35 @@ pub mod helpers {
         work_event,
     };
 
+    /// Normalizes legacy/canonical work-state labels into reducer state names.
+    ///
+    /// Accepted spellings are ASCII-alphanumeric-insensitive, so values like
+    /// `InProgress`, `IN_PROGRESS`, and `in-progress` normalize to
+    /// `IN_PROGRESS`.
+    #[must_use]
+    pub fn normalize_work_state_label(raw_state: &str) -> Option<&'static str> {
+        let compact = raw_state
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_uppercase();
+
+        match compact.as_str() {
+            "OPEN" => Some("OPEN"),
+            "CLAIMED" => Some("CLAIMED"),
+            "INPROGRESS" => Some("IN_PROGRESS"),
+            "REVIEW" => Some("REVIEW"),
+            "NEEDSINPUT" => Some("NEEDS_INPUT"),
+            "NEEDSADJUDICATION" => Some("NEEDS_ADJUDICATION"),
+            "COMPLETED" => Some("COMPLETED"),
+            "ABORTED" => Some("ABORTED"),
+            "CIPENDING" => Some("CI_PENDING"),
+            "READYFORREVIEW" => Some("READY_FOR_REVIEW"),
+            "BLOCKED" => Some("BLOCKED"),
+            _ => None,
+        }
+    }
+
     /// Creates a `WorkOpened` event payload.
     #[must_use]
     pub fn work_opened_payload(

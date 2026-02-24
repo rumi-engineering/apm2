@@ -4776,14 +4776,44 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON with work transition data
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
-        // malleability per LAW-09 (Temporal Pinning & Freshness)
+        let canonical_from_state =
+            apm2_core::work::helpers::normalize_work_state_label(transition.from_state)
+                .ok_or_else(|| LedgerEventError::ValidationFailed {
+                    message: format!(
+                        "invalid from_state '{}' for work_transitioned payload",
+                        transition.from_state
+                    ),
+                })?;
+        let canonical_to_state = apm2_core::work::helpers::normalize_work_state_label(
+            transition.to_state,
+        )
+        .ok_or_else(|| LedgerEventError::ValidationFailed {
+            message: format!(
+                "invalid to_state '{}' for work_transitioned payload",
+                transition.to_state
+            ),
+        })?;
+
+        let reducer_payload = apm2_core::work::helpers::work_transitioned_payload_with_sequence(
+            transition.work_id,
+            canonical_from_state,
+            canonical_to_state,
+            transition.rationale_code,
+            transition.previous_transition_count,
+        );
+
+        // Transitional event envelope for `work_transitioned`.
+        // The projection layer now requires reducer protobuf payload wrapped in
+        // session-envelope JSON; legacy raw transition JSON is no longer valid.
+        // SECURITY: timestamp_ns remains in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness).
         let payload_json = serde_json::json!({
             "event_type": "work_transitioned",
+            "session_id": transition.work_id,
+            "payload": hex::encode(&reducer_payload),
             "work_id": transition.work_id,
-            "from_state": transition.from_state,
-            "to_state": transition.to_state,
+            "from_state": canonical_from_state,
+            "to_state": canonical_to_state,
             "rationale_code": transition.rationale_code,
             "previous_transition_count": transition.previous_transition_count,
             "actor_id": transition.actor_id,
@@ -19831,6 +19861,7 @@ impl PrivilegedDispatcher {
                 computed_changeset_digest,
                 &replay_event_id,
                 replay_timestamp_ns,
+                true,
             ) {
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -19903,6 +19934,7 @@ impl PrivilegedDispatcher {
                         computed_changeset_digest,
                         &replay_event_id,
                         replay_timestamp_ns,
+                        true,
                     ) {
                         return Ok(PrivilegedResponse::error(
                             PrivilegedErrorCode::CapabilityRequestRejected,
@@ -19939,6 +19971,7 @@ impl PrivilegedDispatcher {
             computed_changeset_digest,
             &signed_event.event_id,
             timestamp_ns,
+            false,
         ) {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -19981,6 +20014,7 @@ impl PrivilegedDispatcher {
         changeset_digest: [u8; 32],
         source_event_id: &str,
         source_timestamp_ns: u64,
+        replay_candidate: bool,
     ) -> Result<(), String> {
         let Some(orchestrator) = &self.gate_orchestrator else {
             debug!(
@@ -19990,7 +20024,15 @@ impl PrivilegedDispatcher {
             return Ok(());
         };
 
-        let gate_start_timestamp_ms = source_timestamp_ns / 1_000_000;
+        // Replay candidates are idempotency-first admissions. We intentionally
+        // bypass freshness timestamp enforcement here so retries for an
+        // already-published changeset cannot fail as stale before replay
+        // resolution.
+        let gate_start_timestamp_ms = if replay_candidate {
+            0
+        } else {
+            source_timestamp_ns / 1_000_000
+        };
         let gate_start = crate::gate::GateStartInfo {
             source_event_id: source_event_id.to_string(),
             work_id: work_id.to_string(),
@@ -31263,8 +31305,8 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_slice(&event.payload).expect("valid JSON payload");
             assert_eq!(payload["event_type"], "work_transitioned");
-            assert_eq!(payload["from_state"], "Open");
-            assert_eq!(payload["to_state"], "Claimed");
+            assert_eq!(payload["from_state"], "OPEN");
+            assert_eq!(payload["to_state"], "CLAIMED");
             assert_eq!(payload["rationale_code"], "work_claimed_via_ipc");
             assert_eq!(payload["previous_transition_count"], 0);
             assert!(event.timestamp_ns > 0, "timestamp must be non-zero");
@@ -31331,16 +31373,16 @@ mod tests {
             // First transition: Open -> Claimed
             let first_payload: serde_json::Value =
                 serde_json::from_slice(&transition_events[0].payload).expect("valid JSON");
-            assert_eq!(first_payload["from_state"], "Open");
-            assert_eq!(first_payload["to_state"], "Claimed");
+            assert_eq!(first_payload["from_state"], "OPEN");
+            assert_eq!(first_payload["to_state"], "CLAIMED");
             assert_eq!(first_payload["rationale_code"], "work_claimed_via_ipc");
             assert_eq!(first_payload["previous_transition_count"], 0);
 
             // Second transition: Claimed -> InProgress
             let second_payload: serde_json::Value =
                 serde_json::from_slice(&transition_events[1].payload).expect("valid JSON");
-            assert_eq!(second_payload["from_state"], "Claimed");
-            assert_eq!(second_payload["to_state"], "InProgress");
+            assert_eq!(second_payload["from_state"], "CLAIMED");
+            assert_eq!(second_payload["to_state"], "IN_PROGRESS");
             assert_eq!(second_payload["rationale_code"], "episode_spawned_via_ipc");
             assert_eq!(second_payload["previous_transition_count"], 1);
 
@@ -32088,8 +32130,8 @@ mod tests {
 
             // Verify the transition has correct previous_transition_count
             let payload: serde_json::Value = serde_json::from_slice(&events[1].payload).unwrap();
-            assert_eq!(payload["from_state"], "Open");
-            assert_eq!(payload["to_state"], "Claimed");
+            assert_eq!(payload["from_state"], "OPEN");
+            assert_eq!(payload["to_state"], "CLAIMED");
             assert_eq!(payload["previous_transition_count"], 0);
         }
 
@@ -32151,8 +32193,8 @@ mod tests {
             assert_eq!(events[3].event_type, "work_transitioned");
 
             let payload: serde_json::Value = serde_json::from_slice(&events[3].payload).unwrap();
-            assert_eq!(payload["from_state"], "Claimed");
-            assert_eq!(payload["to_state"], "InProgress");
+            assert_eq!(payload["from_state"], "CLAIMED");
+            assert_eq!(payload["to_state"], "IN_PROGRESS");
             // previous_transition_count should be 1 (derived from ledger)
             assert_eq!(payload["previous_transition_count"], 1);
         }
