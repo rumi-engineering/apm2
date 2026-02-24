@@ -658,11 +658,13 @@ fn maybe_repair_directory_mode_for_current_uid(
     }
 
     // Handle-relative chmod via "." keeps the operation bound to this inode.
+    // Use `NoFollowSymlink` to fail closed if the final component ever
+    // resolves to a symlink.
     stat::fchmodat(
         dir_fd,
         Path::new("."),
         Mode::from_bits_truncate(repaired_mode),
-        stat::FchmodatFlags::FollowSymlink,
+        stat::FchmodatFlags::NoFollowSymlink,
     )
     .map_err(|err| {
         SafeRmtreeError::io(
