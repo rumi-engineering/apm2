@@ -1960,13 +1960,9 @@ impl DispatcherState {
     /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
     #[must_use]
     pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
-        // Wire orchestrator into session dispatcher so termination triggers
-        // gate lifecycle directly from the session dispatch path (Security
-        // BLOCKER 1 fix).
-        self.session_dispatcher
-            .set_gate_orchestrator(Arc::clone(&orchestrator));
-        // Wire orchestrator into privileged dispatcher so DelegateSublease
-        // can access the orchestrator for sublease issuance (Quality BLOCKER 4 fix).
+        // Wire orchestrator into privileged dispatcher so PublishChangeSet can
+        // start gate lifecycle from authoritative changeset identity and
+        // DelegateSublease can issue strict-subset subleases.
         self.privileged_dispatcher = self
             .privileged_dispatcher
             .with_gate_orchestrator(Arc::clone(&orchestrator));

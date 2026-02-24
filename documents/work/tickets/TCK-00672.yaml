@@ -106,7 +106,7 @@ plan:
            `handle_session_terminated` section.
          - Delete the block that does:
              - `blake3::Hasher::new(); hasher.update(session_id); hasher.update(work_id); ...`
-             - `GateOrchestrator::handle_session_terminated(SessionTerminatedInfo{ changeset_digest: <synthetic> ... })`
+             - legacy gate start invocation from session termination path (pre-cutover).
              - emits `gate.*` as session-scoped events.
 
       2. Replace with one of the following (choose A as default):
@@ -163,9 +163,9 @@ plan:
       Gate orchestration must be keyed by the published changeset identity.
 
       1. Replace the SessionTerminated-specific API:
-         - Deprecate/remove `SessionTerminatedInfo` and the remaining session-termination gate start API
-           (`GateOrchestrator::handle_session_terminated(...)`).
-         - Introduce `GateStartInfo` or reuse `ChangesetPublication` as the input.
+         - Remove `SessionTerminated`-driven gate start APIs/call-sites.
+         - Use `GateStartInfo` (authoritative changeset identity) as the only gate start input.
+         - Use `GateOrchestrator::start_for_changeset(...)` as the only gate start entrypoint.
 
       2. Idempotency semantics:
          - The idempotency key MUST be stable across restarts and MUST be a pure function of authoritative input.
@@ -368,6 +368,15 @@ plan:
         - an extension of existing `apm2 daemon doctor` / `apm2 work inspect`.
 
       Must be safe-by-default: do not dump full diffs; only identifiers + bounded summaries.
+implementation_status:
+  completed_in_this_pr:
+    - Synthetic `changeset_digest = blake3(session_id || work_id)` derivation was removed from `SessionDispatcher`.
+    - Session termination no longer starts gates; `SessionTerminated` is lifecycle/accounting only.
+    - `PublishChangeSet` now starts gate lifecycle via `GateOrchestrator::start_for_changeset(GateStartInfo)`.
+    - Gate startup events from publish path are persisted as canonical ledger events (`gate.policy_resolved`, `gate.lease_issued`).
+    - Gate start idempotency remains keyed to authoritative identity `(work_id, changeset_digest)`.
+  remaining_focus:
+    - Complete cursor-driven orchestrator-kernel cutover for all downstream stages (gates/review/merge) and latest-digest enforcement.
 definition_of_done:
   evidence_ids:
   - EXEC-TCK00672-NO-SYNTHETIC-DIGEST
