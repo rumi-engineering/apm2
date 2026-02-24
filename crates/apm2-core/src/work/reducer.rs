@@ -172,6 +172,8 @@ pub struct WorkReducer {
 }
 
 impl WorkReducer {
+    const PR_REBIND_RATIONALE_CODE: &str = "pr_rebound_ticket_work_id";
+
     /// Creates a new work reducer.
     #[must_use]
     pub fn new() -> Self {
@@ -458,6 +460,7 @@ impl WorkReducer {
     fn handle_pr_associated(
         &mut self,
         event: &crate::events::WorkPrAssociated,
+        timestamp: u64,
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
         let pr_number = event.pr_number;
@@ -465,16 +468,25 @@ impl WorkReducer {
 
         // Security check: Verify PR number is not already associated with another
         // active work item (CTR-CIQ002 uniqueness constraint)
-        if let Some(existing_work) = self
+        if let Some(existing_work_id) = self
             .state
             .work_items
             .values()
             .find(|w| w.pr_number == Some(pr_number) && w.is_active() && w.work_id != *work_id)
+            .map(|w| w.work_id.clone())
         {
-            return Err(WorkError::PrNumberAlreadyAssociated {
-                pr_number,
-                existing_work_id: existing_work.work_id.clone(),
-            });
+            // Migration recovery: during ledger replay, permit rebinding from a
+            // legacy non-ticket work ID (e.g. UUID-based) to a canonical
+            // ticket work ID (`W-TCK-*`). This prevents historical mixed-ID
+            // ledgers from bricking projection rebuild after canonicalization.
+            if Self::allow_ticket_work_rebind(work_id, &existing_work_id) {
+                self.abort_superseded_work_for_pr_rebind(&existing_work_id, work_id, timestamp)?;
+            } else {
+                return Err(WorkError::PrNumberAlreadyAssociated {
+                    pr_number,
+                    existing_work_id,
+                });
+            }
         }
 
         let work =
@@ -497,6 +509,49 @@ impl WorkReducer {
         // Set the PR number and commit SHA for CI event matching
         work.pr_number = Some(pr_number);
         work.commit_sha = Some(commit_sha.clone());
+
+        Ok(())
+    }
+
+    #[inline]
+    fn is_canonical_ticket_work_id(work_id: &str) -> bool {
+        let Some(ticket_suffix) = work_id.strip_prefix("W-TCK-") else {
+            return false;
+        };
+        !ticket_suffix.is_empty() && ticket_suffix.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    #[inline]
+    fn allow_ticket_work_rebind(incoming_work_id: &str, existing_work_id: &str) -> bool {
+        Self::is_canonical_ticket_work_id(incoming_work_id)
+            && !Self::is_canonical_ticket_work_id(existing_work_id)
+    }
+
+    fn abort_superseded_work_for_pr_rebind(
+        &mut self,
+        existing_work_id: &str,
+        incoming_work_id: &str,
+        timestamp: u64,
+    ) -> Result<(), WorkError> {
+        let existing_work = self
+            .state
+            .work_items
+            .get_mut(existing_work_id)
+            .ok_or_else(|| WorkError::WorkNotFound {
+                work_id: existing_work_id.to_string(),
+            })?;
+
+        if existing_work.is_terminal() {
+            return Ok(());
+        }
+
+        existing_work.state = WorkState::Aborted;
+        existing_work.last_transition_at = timestamp;
+        existing_work.transition_count = existing_work.transition_count.saturating_add(1);
+        existing_work.last_rationale_code = Self::PR_REBIND_RATIONALE_CODE.to_string();
+        existing_work.abort_reason = Some(format!(
+            "superseded by canonical ticket work_id '{incoming_work_id}' during PR rebind replay"
+        ));
 
         Ok(())
     }
@@ -527,7 +582,7 @@ impl Reducer for WorkReducer {
             },
             Some(work_event::Event::Completed(e)) => self.handle_completed(e, timestamp),
             Some(work_event::Event::Aborted(e)) => self.handle_aborted(e, timestamp),
-            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e),
+            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e, timestamp),
             None => Ok(()),
         }
     }
