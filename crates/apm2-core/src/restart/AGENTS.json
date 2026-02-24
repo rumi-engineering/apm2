@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/restart",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-RESTART-001",
+      "kind": "invariant",
+      "title": "max_restarts bounds restart attempts within restart_window",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-002",
+      "kind": "invariant",
+      "title": "min_uptime defines threshold for considering a run successful (resets backoff)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-003",
+      "kind": "invariant",
+      "title": "restart_on_success=false prevents restarting processes that exit cleanly (code 0)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-004",
+      "kind": "invariant",
+      "title": "delay_for_attempt(n) is monotonically non-decreasing for n>=1",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-005",
+      "kind": "invariant",
+      "title": "All backoff strategies cap at max_delay to prevent unbounded waits",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-006",
+      "kind": "invariant",
+      "title": "History contains only entries within config.restart_window (auto-pruned)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-007",
+      "kind": "invariant",
+      "title": "circuit_open=true when history.len() >= config.max_restarts",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-008",
+      "kind": "invariant",
+      "title": "backoff_attempt resets to 0 on record_success() call",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-009",
+      "kind": "safety",
+      "title": "should_restart returns false if circuit is open",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-RESTART-010",
+      "kind": "invariant",
+      "title": "RestartEntry timestamp records the moment of restart, not exit or delay completion",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/shutdown",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SHUTDOWN-001",
+      "kind": "invariant",
+      "title": "timeout defaults to 30 seconds; must be non-zero for meaningful graceful shutdown",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-002",
+      "kind": "invariant",
+      "title": "signal defaults to SIGTERM; must be a valid Unix signal name",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-003",
+      "kind": "invariant",
+      "title": "State transitions are unidirectional: Running->PreShutdown->Graceful->ForceKill->Completed",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-004",
+      "kind": "invariant",
+      "title": "PreShutdown is skipped if pre_shutdown_commands is empty",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-005",
+      "kind": "invariant",
+      "title": "ForceKillPending is only reachable if force_kill is enabled and timeout elapsed",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-006",
+      "kind": "invariant",
+      "title": "shutdown_started_at is Some only when state != Running",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-007",
+      "kind": "invariant",
+      "title": "graceful_signal_sent_at is Some only after transitioning to GracefulShutdown",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SHUTDOWN-008",
+      "kind": "requirement",
+      "title": "has_timed_out() returns true only in GracefulShutdown when elapsed exceeds timeout",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

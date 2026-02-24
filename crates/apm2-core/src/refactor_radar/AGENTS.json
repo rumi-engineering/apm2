@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/refactor_radar",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-RADAR-001",
+      "kind": "invariant",
+      "title": "recommendations.len() never exceeds config.max_recommendations",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-002",
+      "kind": "invariant",
+      "title": "Recommendations are sorted by priority (1 = highest severity)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-003",
+      "kind": "invariant",
+      "title": "When circuit_breaker.is_blocking() is true, recommendations is empty",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-004",
+      "kind": "invariant",
+      "title": "Circuit breaker trips when current_backlog > threshold",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-005",
+      "kind": "invariant",
+      "title": "is_blocking() returns true only when status is Tripped AND ignored is false",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-006",
+      "kind": "invariant",
+      "title": "Priority starts at 1 and is strictly sequential",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-007",
+      "kind": "invariant",
+      "title": "signal_type is one of hotspot, duplication, or complexity",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-008",
+      "kind": "invariant",
+      "title": "Hotspot severity thresholds: churn>=30 Critical, >=20 High, >=10 Medium, else Low",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-009",
+      "kind": "invariant",
+      "title": "Duplication severity: similarity>=90||count>=4 Critical, >=80||count>=3 High",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RADAR-010",
+      "kind": "invariant",
+      "title": "Complexity severity thresholds: ratio>=3.0 Critical, >=2.0 High, >=1.5 Medium",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}
