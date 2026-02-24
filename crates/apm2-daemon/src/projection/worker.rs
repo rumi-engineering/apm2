@@ -3007,14 +3007,14 @@ impl ProjectionWorker {
                         .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
-                Err(ProjectionWorkerError::InvalidPayload(reason)) => {
-                    // Poison payloads are not recoverable via retry; keep the
-                    // tailer making forward progress by acking this event and
-                    // preserving diagnostics in logs.
+                Err(ProjectionWorkerError::InvalidPayload(ref msg)) => {
+                    // InvalidPayload is permanently unrecoverable for this
+                    // event and retry would head-of-line block all subsequent
+                    // work.pr_associated events. Acknowledge and continue.
                     warn!(
                         event_id = %event.event_id,
-                        error = %reason,
-                        "Skipping malformed WorkPrAssociated event (acknowledged)"
+                        error = %msg,
+                        "Defect: permanently malformed work.pr_associated event - acknowledging to prevent head-of-line blocking"
                     );
                     self.work_pr_tailer
                         .acknowledge_async(event.timestamp_ns, &event.event_id)

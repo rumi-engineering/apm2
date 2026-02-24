@@ -1717,20 +1717,30 @@ mod tests {
         (cas, spec_hash)
     }
 
+    fn make_work_opened_session_envelope_payload(work_id: &str, spec_hash: Vec<u8>) -> Vec<u8> {
+        use apm2_core::work::helpers::work_opened_payload;
+
+        let opened_payload = work_opened_payload(work_id, "TICKET", spec_hash, vec![], vec![]);
+        serde_json::to_vec(&serde_json::json!({
+            "event_type": "work.opened",
+            "session_id": work_id,
+            "actor_id": "actor:test",
+            "payload": hex::encode(opened_payload),
+        }))
+        .expect("work.opened session envelope should encode")
+    }
+
     /// Builds a minimal `LedgerEventEmitter` that emits `work.opened` events
     /// via the `StubLedgerEventEmitter` with `inject_raw_event`.
     fn make_emitter_with_work(work_ids: &[(&str, Vec<u8>)]) -> Arc<dyn LedgerEventEmitter> {
-        use apm2_core::work::helpers::work_opened_payload;
-
         let emitter = crate::protocol::dispatch::StubLedgerEventEmitter::new();
         for (idx, (work_id, spec_hash)) in work_ids.iter().enumerate() {
-            let payload = work_opened_payload(work_id, "TICKET", spec_hash.clone(), vec![], vec![]);
             let event = SignedLedgerEvent {
                 event_id: format!("EVT-opened-{idx}"),
                 event_type: "work.opened".to_string(),
                 work_id: work_id.to_string(),
                 actor_id: "actor:test".to_string(),
-                payload,
+                payload: make_work_opened_session_envelope_payload(work_id, spec_hash.clone()),
                 signature: vec![0u8; 64],
                 timestamp_ns: (idx as u64 + 1) * 1_000_000_000,
             };
@@ -1980,8 +1990,6 @@ mod tests {
 
     #[test]
     fn resolve_ticket_alias_retries_after_transient_cas_failure() {
-        use apm2_core::work::helpers::work_opened_payload;
-
         let cas = Arc::new(FlakyCas::new(1));
         let spec_hash = store_work_spec_in_cas(
             cas.as_ref(),
@@ -1996,12 +2004,9 @@ mod tests {
             event_type: "work.opened".to_string(),
             work_id: "W-636-RETRY-001".to_string(),
             actor_id: "actor:test".to_string(),
-            payload: work_opened_payload(
+            payload: make_work_opened_session_envelope_payload(
                 "W-636-RETRY-001",
-                "TICKET",
                 spec_hash.to_vec(),
-                vec![],
-                vec![],
             ),
             signature: vec![0u8; 64],
             timestamp_ns: 1_000_000_000,
@@ -2043,8 +2048,6 @@ mod tests {
 
     #[test]
     fn refresh_projection_reuses_spec_hash_cache_for_evicted_items() {
-        use apm2_core::work::helpers::work_opened_payload;
-
         let cas = Arc::new(CountingCas::new());
         let emitter = Arc::new(crate::protocol::dispatch::StubLedgerEventEmitter::new());
 
@@ -2063,13 +2066,7 @@ mod tests {
                 event_type: "work.opened".to_string(),
                 work_id: work_id.clone(),
                 actor_id: "actor:test".to_string(),
-                payload: work_opened_payload(
-                    &work_id,
-                    "TICKET",
-                    spec_hash.to_vec(),
-                    vec![],
-                    vec![],
-                ),
+                payload: make_work_opened_session_envelope_payload(&work_id, spec_hash.to_vec()),
                 signature: vec![0u8; 64],
                 timestamp_ns: (idx as u64 + 1) * 1_000_000_000,
             });
@@ -2114,8 +2111,6 @@ mod tests {
 
     #[test]
     fn resolve_ticket_alias_scans_full_projection_beyond_max_work_list_rows() {
-        use apm2_core::work::helpers::work_opened_payload;
-
         let target_work_id = "W-636-CAP-9999";
         let target_alias = "TCK-636-BEYOND-CAP";
         let (cas, target_hash) = setup_cas_with_work_spec(target_work_id, Some(target_alias));
@@ -2126,31 +2121,29 @@ mod tests {
         // then place the real alias mapping after that boundary.
         for idx in 0..MAX_WORK_LIST_ROWS {
             let work_id = format!("W-636-CAP-{idx:04}");
-            let payload = work_opened_payload(&work_id, "TICKET", vec![0xAA; 32], vec![], vec![]);
             emitter.inject_raw_event(SignedLedgerEvent {
                 event_id: format!("EVT-opened-cap-{idx}"),
                 event_type: "work.opened".to_string(),
                 work_id,
                 actor_id: "actor:test".to_string(),
-                payload,
+                payload: make_work_opened_session_envelope_payload(
+                    &format!("W-636-CAP-{idx:04}"),
+                    vec![0xAA; 32],
+                ),
                 signature: vec![0u8; 64],
                 timestamp_ns: (idx as u64 + 1) * 1_000_000_000,
             });
         }
 
-        let target_payload = work_opened_payload(
-            target_work_id,
-            "TICKET",
-            target_hash.to_vec(),
-            vec![],
-            vec![],
-        );
         emitter.inject_raw_event(SignedLedgerEvent {
             event_id: "EVT-opened-cap-target".to_string(),
             event_type: "work.opened".to_string(),
             work_id: target_work_id.to_string(),
             actor_id: "actor:test".to_string(),
-            payload: target_payload,
+            payload: make_work_opened_session_envelope_payload(
+                target_work_id,
+                target_hash.to_vec(),
+            ),
             signature: vec![0u8; 64],
             timestamp_ns: (MAX_WORK_LIST_ROWS as u64 + 1) * 1_000_000_000,
         });

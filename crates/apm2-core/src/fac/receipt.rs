@@ -82,6 +82,9 @@ pub const FAC_JOB_RECEIPT_SCHEMA: &str = "apm2.fac.job_receipt.v1";
 /// Maximum human-reason length for `FacJobReceiptV1`.
 const MAX_FAC_JOB_REASON_LENGTH: usize = 512;
 
+const CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT: &str = "post_terminal_commit";
+const CLAIMED_LOCK_RELEASE_PHASE_POST_FAIL_CLOSED_RETURN: &str = "post_fail_closed_return";
+
 /// Maximum serialized size of a `FacJobReceiptV1` (bytes).
 /// Protects against memory-exhaustion attacks during bounded deserialization.
 pub const MAX_JOB_RECEIPT_SIZE: usize = 65_536;
@@ -804,6 +807,23 @@ pub struct FacJobReceiptV1 {
     /// corresponding stat could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
+    /// CLCK continuity attestation bit for terminal commit paths (TCK-00640).
+    ///
+    /// When present, this must be `true` and indicates that terminal commit
+    /// executed under a continuous claimed-file lock (no release/reacquire
+    /// gap between claim and terminal transition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_lock_continuity_v1: Option<bool>,
+    /// Epoch timestamp when claimed-file lock was first acquired (TCK-00640).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_lock_acquired_at_epoch_ms: Option<u64>,
+    /// Phase where the claimed lock is released (TCK-00640).
+    ///
+    /// Allowed values:
+    /// - `post_terminal_commit`
+    /// - `post_fail_closed_return`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_lock_release_phase: Option<String>,
     /// Epoch timestamp.
     pub timestamp_secs: u64,
     /// BLAKE3 body hash for content-addressed storage.
@@ -1067,6 +1087,21 @@ impl FacJobReceiptV1 {
             // payload is bounded: 5 option fields max 9 bytes each = max 45 bytes
             bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             bytes.extend_from_slice(&payload);
+        }
+
+        // TCK-00640: Claimed lock continuity attestation fields.
+        if let Some(flag) = self.claimed_lock_continuity_v1 {
+            bytes.push(12u8);
+            bytes.push(u8::from(flag));
+        }
+        if let Some(epoch_ms) = self.claimed_lock_acquired_at_epoch_ms {
+            bytes.push(13u8);
+            bytes.extend_from_slice(&epoch_ms.to_be_bytes());
+        }
+        if let Some(phase) = &self.claimed_lock_release_phase {
+            bytes.push(14u8);
+            bytes.extend_from_slice(&(phase.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(phase.as_bytes());
         }
 
         bytes
@@ -1396,6 +1431,21 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&payload);
         }
 
+        // TCK-00640: Claimed lock continuity attestation fields.
+        if let Some(flag) = self.claimed_lock_continuity_v1 {
+            bytes.push(12u8);
+            bytes.push(u8::from(flag));
+        }
+        if let Some(epoch_ms) = self.claimed_lock_acquired_at_epoch_ms {
+            bytes.push(13u8);
+            bytes.extend_from_slice(&epoch_ms.to_be_bytes());
+        }
+        if let Some(phase) = &self.claimed_lock_release_phase {
+            bytes.push(14u8);
+            bytes.extend_from_slice(&(phase.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(phase.as_bytes());
+        }
+
         bytes
     }
 
@@ -1721,6 +1771,49 @@ impl FacJobReceiptV1 {
             }
         }
 
+        // TCK-00640: Validate claimed-lock continuity attestation fields.
+        if let Some(flag) = self.claimed_lock_continuity_v1 {
+            if !flag {
+                return Err(FacJobReceiptError::InvalidData(
+                    "claimed_lock_continuity_v1 must be true when present".to_string(),
+                ));
+            }
+            if self.claimed_lock_acquired_at_epoch_ms.is_none() {
+                return Err(FacJobReceiptError::MissingField(
+                    "claimed_lock_acquired_at_epoch_ms",
+                ));
+            }
+            if self.claimed_lock_release_phase.is_none() {
+                return Err(FacJobReceiptError::MissingField(
+                    "claimed_lock_release_phase",
+                ));
+            }
+        }
+        if self.claimed_lock_continuity_v1.is_none()
+            && (self.claimed_lock_acquired_at_epoch_ms.is_some()
+                || self.claimed_lock_release_phase.is_some())
+        {
+            return Err(FacJobReceiptError::InvalidData(
+                "claimed lock metadata requires claimed_lock_continuity_v1".to_string(),
+            ));
+        }
+        if let Some(phase) = &self.claimed_lock_release_phase {
+            if phase.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "claimed_lock_release_phase",
+                    actual: phase.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if phase != CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT
+                && phase != CLAIMED_LOCK_RELEASE_PHASE_POST_FAIL_CLOSED_RETURN
+            {
+                return Err(FacJobReceiptError::InvalidData(format!(
+                    "claimed_lock_release_phase must be '{CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT}' or '{CLAIMED_LOCK_RELEASE_PHASE_POST_FAIL_CLOSED_RETURN}'",
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1752,6 +1845,9 @@ pub struct FacJobReceiptV1Builder {
     node_fingerprint: Option<String>,
     toolchain_fingerprint: Option<String>,
     observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
+    claimed_lock_continuity_v1: Option<bool>,
+    claimed_lock_acquired_at_epoch_ms: Option<u64>,
+    claimed_lock_release_phase: Option<String>,
     timestamp_secs: Option<u64>,
 }
 
@@ -1921,6 +2017,27 @@ impl FacJobReceiptV1Builder {
     #[must_use]
     pub const fn observed_usage(mut self, usage: super::cgroup_stats::ObservedCgroupUsage) -> Self {
         self.observed_usage = Some(usage);
+        self
+    }
+
+    /// Sets claimed-lock continuity attestation flag (TCK-00640).
+    #[must_use]
+    pub const fn claimed_lock_continuity_v1(mut self, continuity: bool) -> Self {
+        self.claimed_lock_continuity_v1 = Some(continuity);
+        self
+    }
+
+    /// Sets claim-lock acquisition timestamp in epoch milliseconds (TCK-00640).
+    #[must_use]
+    pub const fn claimed_lock_acquired_at_epoch_ms(mut self, epoch_ms: u64) -> Self {
+        self.claimed_lock_acquired_at_epoch_ms = Some(epoch_ms);
+        self
+    }
+
+    /// Sets claim-lock release phase marker (TCK-00640).
+    #[must_use]
+    pub fn claimed_lock_release_phase(mut self, phase: impl Into<String>) -> Self {
+        self.claimed_lock_release_phase = Some(phase.into());
         self
     }
 
@@ -2170,6 +2287,49 @@ impl FacJobReceiptV1Builder {
             }
         }
 
+        // TCK-00640: Validate claimed-lock continuity attestation fields.
+        if let Some(flag) = self.claimed_lock_continuity_v1 {
+            if !flag {
+                return Err(FacJobReceiptError::InvalidData(
+                    "claimed_lock_continuity_v1 must be true when present".to_string(),
+                ));
+            }
+            if self.claimed_lock_acquired_at_epoch_ms.is_none() {
+                return Err(FacJobReceiptError::MissingField(
+                    "claimed_lock_acquired_at_epoch_ms",
+                ));
+            }
+            if self.claimed_lock_release_phase.is_none() {
+                return Err(FacJobReceiptError::MissingField(
+                    "claimed_lock_release_phase",
+                ));
+            }
+        }
+        if self.claimed_lock_continuity_v1.is_none()
+            && (self.claimed_lock_acquired_at_epoch_ms.is_some()
+                || self.claimed_lock_release_phase.is_some())
+        {
+            return Err(FacJobReceiptError::InvalidData(
+                "claimed lock metadata requires claimed_lock_continuity_v1".to_string(),
+            ));
+        }
+        if let Some(phase) = &self.claimed_lock_release_phase {
+            if phase.len() > MAX_STRING_LENGTH {
+                return Err(FacJobReceiptError::StringTooLong {
+                    field: "claimed_lock_release_phase",
+                    actual: phase.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if phase != CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT
+                && phase != CLAIMED_LOCK_RELEASE_PHASE_POST_FAIL_CLOSED_RETURN
+            {
+                return Err(FacJobReceiptError::InvalidData(format!(
+                    "claimed_lock_release_phase must be '{CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT}' or '{CLAIMED_LOCK_RELEASE_PHASE_POST_FAIL_CLOSED_RETURN}'",
+                )));
+            }
+        }
+
         let candidate = FacJobReceiptV1 {
             schema: FAC_JOB_RECEIPT_SCHEMA.to_string(),
             receipt_id,
@@ -2195,6 +2355,9 @@ impl FacJobReceiptV1Builder {
             node_fingerprint: self.node_fingerprint,
             toolchain_fingerprint: self.toolchain_fingerprint,
             observed_usage: self.observed_usage,
+            claimed_lock_continuity_v1: self.claimed_lock_continuity_v1,
+            claimed_lock_acquired_at_epoch_ms: self.claimed_lock_acquired_at_epoch_ms,
+            claimed_lock_release_phase: self.claimed_lock_release_phase,
             moved_job_path,
             timestamp_secs,
             content_hash: String::new(),

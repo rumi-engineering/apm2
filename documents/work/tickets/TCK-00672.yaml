@@ -304,7 +304,7 @@ plan:
             - correct diff_hash
             - file_manifest matching diff
             - base_ref and other required metadata
-        - Call PublishChangeSet(work_id=W, bundle_bytes=<canonical JSON>).
+        - Call PublishChangeSet(work_id=W, lease_id=L, bundle_bytes=<canonical JSON>).
         - Capture response changeset_digest D and cas_hash H.
 
       Assertions (authoritative ledger events):
@@ -396,7 +396,7 @@ notes:
       2) Implementer runs `apm2 fac push --work-id W` which:
            - stores diff bytes in CAS -> diff_hash
            - builds ChangeSetBundleV1 referencing diff_hash -> computes changeset_digest D
-           - calls PublishChangeSet(work_id=W, bundle_bytes=...)
+           - calls PublishChangeSet(work_id=W, lease_id=L, bundle_bytes=...)
       3) Daemon appends `ChangeSetPublished{work_id=W, changeset_digest=D, cas_hash=H, ...}`.
       4) GateStartOrchestrator consumes ChangeSetPublished and starts gates for (W,D):
            - PolicyResolvedForChangeSet{W,D,...}
@@ -418,3 +418,17 @@ notes:
   risk: |-
     Main risk is accidentally retaining a hidden fallback to session termination that reintroduces synthetic digest behavior.
     Mitigation: dedicated e2e regression that asserts every referenced digest has a corresponding ChangeSetPublished mapping.
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.

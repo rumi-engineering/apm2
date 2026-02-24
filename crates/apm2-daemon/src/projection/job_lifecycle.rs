@@ -45,6 +45,7 @@ pub const MAX_PENDING_RECONCILES: usize = 16_384;
 const CHECKPOINT_FILE_NAME: &str = ".job_lifecycle_checkpoint.v1.json";
 const MAX_CURSOR_EVENT_ID_LENGTH: usize = 256;
 const MAX_QUEUE_JOB_ID_LENGTH: usize = 256;
+const MAX_WORK_ID_LENGTH: usize = 256;
 // At MAX_PROJECTED_JOBS capacity (16,384), checkpoint state can exceed 10 MiB.
 // Keep read bound aligned with configured projection/pending limits.
 const MAX_CHECKPOINT_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
@@ -199,6 +200,45 @@ impl JobLifecycleProjectionV1 {
                 self.terminal_job_eviction_order.len()
             )));
         }
+
+        for (job_id, projected) in &self.jobs {
+            if projected.job_id.trim().is_empty() {
+                return Err(JobLifecycleProjectionError::Validation(
+                    "projected record has empty job_id".to_string(),
+                ));
+            }
+            if job_id != &projected.job_id {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "projection key mismatch: map key `{job_id}` != record.job_id `{}`",
+                    projected.job_id
+                )));
+            }
+            if projected.last_event_id.len() > MAX_CURSOR_EVENT_ID_LENGTH {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "last_event_id exceeds bound for `{job_id}`: {} > {MAX_CURSOR_EVENT_ID_LENGTH}",
+                    projected.last_event_id.len()
+                )));
+            }
+            validate_queue_job_id(&projected.queue_job_id).map_err(|err| {
+                JobLifecycleProjectionError::Validation(format!(
+                    "invalid projected queue_job_id for `{job_id}`: {err}"
+                ))
+            })?;
+            validate_work_id(&projected.work_id).map_err(|err| {
+                JobLifecycleProjectionError::Validation(format!(
+                    "invalid projected work_id for `{job_id}`: {err}"
+                ))
+            })?;
+        }
+
+        for entry in &self.terminal_job_eviction_order {
+            if !self.jobs.contains_key(&entry.job_id) {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "terminal eviction queue references unknown job_id `{}`",
+                    entry.job_id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -335,8 +375,29 @@ impl JobLifecycleProjectionV1 {
                 "event {ledger_event_id}: invalid queue_job_id: {err}"
             )));
         }
+        if let Err(err) = validate_work_id(&work_id) {
+            return Err(JobLifecycleProjectionError::Validation(format!(
+                "event {ledger_event_id}: invalid work_id: {err}"
+            )));
+        }
 
-        let existing_status = self.jobs.get(&job_id).map(|record| record.status);
+        let existing = self.jobs.get(&job_id);
+        if let Some(existing) = existing {
+            if existing.queue_job_id != queue_job_id {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "event {ledger_event_id}: identity mismatch for `{job_id}`: queue_job_id changed from `{}` to `{queue_job_id}`",
+                    existing.queue_job_id
+                )));
+            }
+            if existing.work_id != work_id {
+                return Err(JobLifecycleProjectionError::Validation(format!(
+                    "event {ledger_event_id}: identity mismatch for `{job_id}`: work_id changed from `{}` to `{work_id}`",
+                    existing.work_id
+                )));
+            }
+        }
+
+        let existing_status = existing.map(|record| record.status);
         let mut lease_id: Option<String> = None;
         let mut reason_code: Option<String> = None;
 
@@ -530,6 +591,12 @@ impl JobLifecycleRehydrationReconciler {
     /// Individually undecodable lifecycle events are warned-and-skipped while
     /// still advancing the cursor to prevent poison-pill replay loops.
     pub fn tick(&self) -> Result<JobLifecycleReconcileTickV1, JobLifecycleProjectionError> {
+        if self.config.max_events_per_tick == 0 {
+            return Err(JobLifecycleProjectionError::Validation(
+                "max_events_per_tick must be greater than zero".to_string(),
+            ));
+        }
+
         self.ensure_queue_dirs()?;
         let mut checkpoint = self.load_checkpoint()?;
 
@@ -1016,6 +1083,28 @@ fn validate_queue_job_id(queue_job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_work_id(work_id: &str) -> Result<(), String> {
+    if work_id.is_empty() {
+        return Err("work_id is empty".to_string());
+    }
+    if work_id.len() > MAX_WORK_ID_LENGTH {
+        return Err(format!(
+            "work_id exceeds bound: {} > {MAX_WORK_ID_LENGTH}",
+            work_id.len()
+        ));
+    }
+    if !work_id.starts_with("W-") {
+        return Err(format!("work_id must start with `W-`: {work_id:?}"));
+    }
+    if !work_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!("unsafe work_id: {work_id:?}"));
+    }
+    Ok(())
+}
+
 /// Sets directory permissions via an fd opened with `O_NOFOLLOW`, preventing
 /// TOCTOU symlink traversal between `create_dir_all` and permission
 /// application.
@@ -1111,8 +1200,8 @@ fn safe_job_file_name(queue_job_id: &str) -> Result<String, JobLifecycleProjecti
 #[cfg(test)]
 mod tests {
     use apm2_core::fac::job_lifecycle::{
-        FacJobEnqueuedV1, FacJobFailedV1, FacJobIdentityV1, FacJobLifecycleEventData,
-        FacJobLifecycleEventV1, FacJobStartedV1,
+        FacJobClaimedV1, FacJobEnqueuedV1, FacJobFailedV1, FacJobIdentityV1,
+        FacJobLifecycleEventData, FacJobLifecycleEventV1, FacJobStartedV1,
     };
     use tempfile::TempDir;
 
@@ -1724,6 +1813,71 @@ mod tests {
     }
 
     #[test]
+    fn apply_event_rejects_identity_mutation_for_existing_job() {
+        let mut projection = JobLifecycleProjectionV1::default();
+        let ts = now_timestamp_ns();
+
+        let enqueued = FacJobLifecycleEventV1::new(
+            "intent:enqueue:identity",
+            None,
+            FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                identity: identity("identity-stable"),
+                enqueue_epoch_ns: ts,
+            }),
+        );
+        projection
+            .apply_event(&enqueued, "evt-1", ts)
+            .expect("initial enqueue should succeed");
+
+        let mut mutated_identity = identity("different-queue-id");
+        mutated_identity.job_id = "fj1-identity-stable".to_string();
+        let claimed = FacJobLifecycleEventV1::new(
+            "intent:claim:identity",
+            None,
+            FacJobLifecycleEventData::Claimed(FacJobClaimedV1 {
+                identity: mutated_identity,
+                lease_id: "L-identity".to_string(),
+                actor_id: "actor:test".to_string(),
+                claim_epoch_ns: ts + 1,
+            }),
+        );
+
+        let err = projection
+            .apply_event(&claimed, "evt-2", ts + 1)
+            .expect_err("identity mutation must fail closed");
+        assert!(
+            err.to_string().contains("identity mismatch"),
+            "expected identity mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn projection_validate_rejects_invalid_projected_work_id() {
+        let mut projection = JobLifecycleProjectionV1::default();
+        projection.jobs.insert(
+            "fj1-bad-work-id".to_string(),
+            ProjectedJobLifecycleV1 {
+                job_id: "fj1-bad-work-id".to_string(),
+                queue_job_id: "bad-work-id".to_string(),
+                work_id: "repo/evil".to_string(),
+                status: ProjectedJobStatus::Pending,
+                last_event_id: "event-1".to_string(),
+                last_event_timestamp_ns: now_timestamp_ns(),
+                lease_id: None,
+                reason_code: None,
+            },
+        );
+
+        let err = projection
+            .validate()
+            .expect_err("invalid work_id in projection must fail");
+        assert!(
+            err.to_string().contains("invalid projected work_id"),
+            "expected projected work_id validation error, got: {err}"
+        );
+    }
+
+    #[test]
     fn tick_backpressures_on_capacity_exhaustion_then_recovers() {
         // f-798-code_quality-1771815588937622-0: Verify that when projection
         // is at MAX_PROJECTED_JOBS with no terminal jobs, capacity exhaustion
@@ -1922,6 +2076,82 @@ mod tests {
         assert_eq!(
             second.processed_events, 0,
             "unsafe queue_job_id event must not be replayed"
+        );
+    }
+
+    #[test]
+    fn tick_skips_invalid_work_id_and_advances_cursor() {
+        // Reject malformed/non-canonical work_id values at projection apply
+        // boundary and keep processing later valid events.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let stub = Arc::new(StubLedgerEventEmitter::new());
+        let emitter: Arc<dyn LedgerEventEmitter> = stub;
+        let ts = now_timestamp_ns();
+
+        let unsafe_identity = FacJobIdentityV1 {
+            job_id: "fj1-unsafe-work-id".to_string(),
+            queue_job_id: "unsafe-work-id".to_string(),
+            work_id: "repo/evil".to_string(),
+            changeset_digest: "b3-256:".to_string() + &"a".repeat(64),
+            spec_digest: "b3-256:".to_string() + &"b".repeat(64),
+            gate_profile: "gates:balanced".to_string(),
+            revision: "1".to_string(),
+        };
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:unsafe-work-id",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: unsafe_identity,
+                    enqueue_epoch_ns: ts,
+                }),
+            ),
+            ts,
+        );
+
+        emit_lifecycle(
+            &emitter,
+            &FacJobLifecycleEventV1::new(
+                "intent:enqueue:valid-after-unsafe-work-id",
+                None,
+                FacJobLifecycleEventData::Enqueued(FacJobEnqueuedV1 {
+                    identity: identity("valid-after-unsafe-work-id"),
+                    enqueue_epoch_ns: ts + 1,
+                }),
+            ),
+            ts + 1,
+        );
+
+        let reconciler = make_reconciler(
+            &queue_root,
+            Arc::clone(&emitter),
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 8,
+                max_fs_ops_per_tick: 8,
+            },
+        );
+
+        let tick = reconciler
+            .tick()
+            .expect("tick must succeed (invalid work_id treated as poison pill)");
+        assert_eq!(
+            tick.processed_events, 1,
+            "valid event after invalid work_id poison pill must be processed"
+        );
+        assert!(
+            queue_root
+                .join(PENDING_DIR)
+                .join("valid-after-unsafe-work-id.json")
+                .exists(),
+            "valid event must be reconciled to pending/"
+        );
+
+        let second = reconciler.tick().expect("second tick");
+        assert_eq!(
+            second.processed_events, 0,
+            "invalid work_id event must be cursor-advanced and not replayed"
         );
     }
 
@@ -2164,5 +2394,26 @@ mod tests {
             "orphan file must be cleaned up when cursor is caught up to \
              lifecycle stream, regardless of non-lifecycle events ahead"
         );
+    }
+
+    #[test]
+    fn tick_rejects_zero_event_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_root = make_queue_root(&tmp);
+        let emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
+        let reconciler = make_reconciler(
+            &queue_root,
+            emitter,
+            JobLifecycleReconcilerConfig {
+                max_events_per_tick: 0,
+                max_fs_ops_per_tick: 16,
+            },
+        );
+
+        let err = reconciler
+            .tick()
+            .expect_err("zero event budget must fail closed");
+        assert!(matches!(err, JobLifecycleProjectionError::Validation(_)));
+        assert!(err.to_string().contains("max_events_per_tick"));
     }
 }

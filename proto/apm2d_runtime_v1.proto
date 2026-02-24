@@ -566,8 +566,10 @@ message OrchestratorLaunchProjectionResponse {
 message PublishChangeSetRequest {
   // Work identifier this changeset belongs to.
   string work_id = 1;
+  // Lease identifier proving authority for this work mutation.
+  string lease_id = 2;
   // Serialized ChangeSetBundleV1 (canonical JSON bytes).
-  bytes bundle_bytes = 2;
+  bytes bundle_bytes = 3;
 }
 
 // Response confirming changeset publication.
@@ -2026,6 +2028,9 @@ message RecordWorkPrAssociationRequest {
   // If non-empty, a WORK_CONTEXT_ENTRY of kind Linkout is published
   // with this URL as the target.
   string pr_url = 5;
+  // If true, validate association compatibility only and do not emit
+  // `work.pr_associated` or LINKOUT side effects.
+  bool validate_only = 6;
 }
 
 message RecordWorkPrAssociationResponse {

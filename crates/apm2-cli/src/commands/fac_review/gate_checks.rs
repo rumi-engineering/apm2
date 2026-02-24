@@ -20,6 +20,8 @@ use crate::commands::fac_secure_io;
 
 pub const TEST_SAFETY_ALLOWLIST_REL_PATH: &str = "documents/reviews/test-safety-allowlist.txt";
 pub const REVIEW_ARTIFACTS_REL_PATH: &str = "documents/reviews";
+pub const FAC_REVIEW_MACHINE_SPEC_REL_PATH: &str =
+    "documents/reviews/fac_review_state_machine.cac.json";
 pub const WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH: &str =
     "target/ci/workspace_integrity.snapshot.tsv";
 
@@ -28,6 +30,7 @@ const MAX_TEST_SAFETY_TARGET_FILES: usize = 20_000;
 const MAX_TEST_SAFETY_TOTAL_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TEST_SAFETY_ALLOWLIST_FILE_SIZE: usize = 512 * 1024;
 const MAX_REVIEW_ARTIFACT_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_FAC_REVIEW_MACHINE_SPEC_FILE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_PROMPT_FILE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_WORKSPACE_SNAPSHOT_FILE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -935,6 +938,59 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
     }
 }
 
+pub fn run_fac_review_machine_spec_guard(workspace_root: &Path) -> Result<CheckExecution, String> {
+    let expected_path = workspace_root.join(FAC_REVIEW_MACHINE_SPEC_REL_PATH);
+    let expected =
+        fac_secure_io::read_bounded_text(&expected_path, MAX_FAC_REVIEW_MACHINE_SPEC_FILE_SIZE)
+            .map_err(|err| {
+                format!(
+                    "failed to read FAC review machine spec snapshot {}: {err}",
+                    expected_path.display()
+                )
+            })?;
+    let actual = super::fac_review_machine_spec_json_string(true)
+        .map_err(|err| format!("failed to render FAC review machine spec from code: {err}"))?;
+
+    let mut output = String::new();
+    writeln!(
+        output,
+        "INFO: === FAC Review Machine Spec Snapshot Guard (TCK-00640) ==="
+    )
+    .ok();
+    writeln!(output, "INFO: snapshot_path={}", expected_path.display()).ok();
+    if expected.trim() == actual.trim() {
+        writeln!(
+            output,
+            "INFO: PASS: documents/reviews/fac_review_state_machine.cac.json matches code-generated FAC review machine spec"
+        )
+        .ok();
+        return Ok(CheckExecution {
+            passed: true,
+            output,
+        });
+    }
+
+    writeln!(
+        output,
+        "ERROR: FAIL: FAC review machine spec snapshot is stale relative to code-generated spec"
+    )
+    .ok();
+    writeln!(
+        output,
+        "ERROR: Remediation: regenerate and commit documents/reviews/fac_review_state_machine.cac.json"
+    )
+    .ok();
+    writeln!(
+        output,
+        "ERROR: Validation command: cargo test -p apm2-cli fac_review_machine_spec_snapshot_is_current -- --exact"
+    )
+    .ok();
+    Ok(CheckExecution {
+        passed: false,
+        output,
+    })
+}
+
 fn hash_file_contents_into(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
     let mut file = fs::File::open(path)
         .map_err(|err| format!("failed to open {} for hashing: {err}", path.display()))?;
@@ -1590,6 +1646,37 @@ mod tests {
         let check = verify_workspace_integrity(repo, &snapshot, Some(&allow))
             .expect("verify with allowlist");
         assert!(check.passed, "allowlisted mutation should pass");
+    }
+
+    #[test]
+    fn fac_review_machine_spec_guard_passes_when_snapshot_is_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let spec_path = repo.join(FAC_REVIEW_MACHINE_SPEC_REL_PATH);
+        fs::create_dir_all(spec_path.parent().expect("parent")).expect("create docs/reviews");
+        let expected = crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+            .expect("render fac review machine spec");
+        fs::write(&spec_path, expected.as_bytes()).expect("write snapshot");
+
+        let check = run_fac_review_machine_spec_guard(repo).expect("run guard");
+        assert!(check.passed, "unexpected output:\n{}", check.output);
+    }
+
+    #[test]
+    fn fac_review_machine_spec_guard_fails_when_snapshot_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let spec_path = repo.join(FAC_REVIEW_MACHINE_SPEC_REL_PATH);
+        fs::create_dir_all(spec_path.parent().expect("parent")).expect("create docs/reviews");
+        fs::write(&spec_path, b"{\"schema\":\"stale\"}\n").expect("write stale snapshot");
+
+        let check = run_fac_review_machine_spec_guard(repo).expect("run guard");
+        assert!(!check.passed, "expected stale snapshot to fail");
+        assert!(
+            check.output.contains("snapshot is stale"),
+            "expected stale snapshot message, got:\n{}",
+            check.output
+        );
     }
 
     #[cfg(unix)]

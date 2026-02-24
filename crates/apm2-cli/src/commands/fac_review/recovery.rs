@@ -28,6 +28,7 @@ enum RunStateRepairCondition {
     Missing,
     Corrupt,
     Ambiguous,
+    InconsistentRuntimeHandle,
 }
 
 impl RunStateRepairCondition {
@@ -36,6 +37,7 @@ impl RunStateRepairCondition {
             Self::Missing => "missing",
             Self::Corrupt => "corrupt",
             Self::Ambiguous => "ambiguous",
+            Self::InconsistentRuntimeHandle => "inconsistent_runtime_handle",
         }
     }
 }
@@ -46,6 +48,7 @@ enum RunStateRepairAction {
     BaselineCreated,
     Canonicalized,
     RebuiltFromCandidate,
+    RebuiltFromPresent,
 }
 
 impl RunStateRepairAction {
@@ -54,6 +57,7 @@ impl RunStateRepairAction {
             Self::BaselineCreated => "baseline_created",
             Self::Canonicalized => "canonicalized",
             Self::RebuiltFromCandidate => "rebuilt_from_candidate",
+            Self::RebuiltFromPresent => "rebuilt_from_present",
         }
     }
 }
@@ -517,7 +521,29 @@ fn repair_run_state_for_review_type(
 ) -> Result<Option<RunStateRepairOutcome>, String> {
     let canonical = state::review_run_state_path_for_home(home, pr_number, review_type);
     match state::load_review_run_state_for_home(home, pr_number, review_type)? {
-        ReviewRunStateLoad::Present(_) => Ok(None),
+        ReviewRunStateLoad::Present(state) => {
+            let Some(_detail) = present_run_state_repair_detail(review_type, &state) else {
+                return Ok(None);
+            };
+            let repaired = write_baseline_run_state_for_repair(
+                home,
+                owner_repo,
+                pr_number,
+                review_type,
+                head_sha,
+                Some(&state),
+            )?;
+            Ok(Some(RunStateRepairOutcome {
+                review_type: review_type.to_string(),
+                condition: RunStateRepairCondition::InconsistentRuntimeHandle,
+                action: RunStateRepairAction::RebuiltFromPresent,
+                canonical_path: canonical.display().to_string(),
+                source_candidate: None,
+                quarantined_paths: Vec::new(),
+                before: Some(run_state_snapshot(&state)),
+                after: run_state_snapshot(&repaired),
+            }))
+        },
         ReviewRunStateLoad::Missing { .. } => {
             let repaired = write_baseline_run_state_for_repair(
                 home,
@@ -573,6 +599,38 @@ fn repair_run_state_for_review_type(
             )?))
         },
     }
+}
+
+fn present_run_state_repair_detail(review_type: &str, state: &ReviewRunState) -> Option<String> {
+    if state.status.is_terminal() {
+        return None;
+    }
+    if state.status == ReviewRunStatus::Alive && state.pid.is_none() {
+        return Some(format!(
+            "{review_type} run-state is Alive but missing pid (run_id={})",
+            state.run_id
+        ));
+    }
+    if let Some(pid) = state.pid {
+        let Some(expected_start_time) = state.proc_start_time else {
+            return Some(format!(
+                "{review_type} run-state has pid={pid} but missing proc_start_time (run_id={})",
+                state.run_id
+            ));
+        };
+        if !state::is_process_alive(pid) {
+            return Some(format!(
+                "{review_type} run-state references dead pid={pid} (run_id={})",
+                state.run_id
+            ));
+        }
+        if state::get_process_start_time(pid) != Some(expected_start_time) {
+            return Some(format!(
+                "{review_type} run-state process identity mismatch pid={pid} expected_start={expected_start_time}",
+            ));
+        }
+    }
+    None
 }
 
 fn repair_run_states_for_pr(
@@ -975,6 +1033,36 @@ mod tests {
         assert_eq!(state.status, ReviewRunStatus::Failed);
         assert_eq!(
             state.terminal_reason.as_deref(),
+            Some(TERMINAL_REPAIR_STATE_REBUILT)
+        );
+    }
+
+    #[test]
+    fn repair_run_state_present_with_inconsistent_runtime_handle_rebuilds_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path();
+        let pr_number = 441;
+        let review_type = "security";
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut state = sample_state(pr_number, review_type, head_sha);
+        state.proc_start_time = None;
+        write_review_run_state_for_home(home, &state).expect("write inconsistent run-state");
+
+        let outcome =
+            repair_run_state_for_review_type(home, "example/repo", pr_number, review_type, None)
+                .expect("repair run-state")
+                .expect("inconsistent run-state should be repaired");
+
+        assert_eq!(outcome.review_type, review_type);
+        assert_eq!(
+            outcome.condition.as_str(),
+            "inconsistent_runtime_handle",
+            "repair outcome must classify inconsistent runtime handle"
+        );
+        assert!(outcome.before.is_some());
+        assert_eq!(outcome.after.status, "failed");
+        assert_eq!(
+            outcome.after.terminal_reason.as_deref(),
             Some(TERMINAL_REPAIR_STATE_REBUILT)
         );
     }
