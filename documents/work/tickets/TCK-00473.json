@@ -1,0 +1,87 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00473",
+      "title": "RFC-0029 REQ-0004 HTF-bound queue admission and anti-entropy anti-starvation enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0029",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0004.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0004",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0004.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_RELIABILITY",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00470",
+          "reason": "Queue economics admission requires canonical budget profile baseline."
+        },
+        {
+          "ticket_id": "TCK-00471",
+          "reason": "Queue admission depends on deterministic selector/context admissibility checks."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement lane reservations and tick-floor invariants for stop/revoke and control lanes.",
+        "Enforce TP-EIO29-001/002/003 checks in queue and anti-entropy admission paths.",
+        "Run adversarial queue drills: replay flood, mixed control/replay bursts, low-rate exhaustion.",
+        "Emit structured deny defects for stale, unsigned, missing, or invalid temporal authority envelopes."
+      ],
+      "out_of_scope": [
+        "Replay/recovery convergence receipt generation and idempotency closure.",
+        "Projection sink outage continuity scenarios."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement queue scheduler invariants and bounded anti-entropy admission checks.",
+        "Bind queue verdicts to signed time_authority_ref and window_ref fields.",
+        "Add adversarial stress suites and fail-closed assertion checks.",
+        "Capture queue resilience and predicate-verdict evidence artifacts."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0004"
+      ],
+      "criteria": [
+        "Stop/revoke and control lanes preserve declared tick floors under adversarial load.",
+        "Anti-entropy remains pull-only and budget-bound.",
+        "Unknown or invalid temporal authority state denies admission."
+      ]
+    },
+    "notes": {
+      "security": "Emergency-time carve-outs must never authorize authority expansion.\n",
+      "verification": "Include deterministic anti-starvation and budget-exhaustion deny fixtures.\n",
+      "general": "This ticket implements queue and anti-entropy obligations for REQ-0004.\n"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/ccp",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CCP-001",
+      "kind": "invariant",
+      "title": "Component IDs are deterministic from crate name",
+      "description": "Same crate name always produces same component ID (COMP-{UPPER_SNAKE_CASE}).",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-002",
+      "kind": "invariant",
+      "title": "Component and crate lists sorted for deterministic output",
+      "description": "Component list is sorted by ID, AGENTS.md discovery sorted alphabetically, crate nodes sorted by ID, and edges sorted by (from, to, dep_type).",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-003",
+      "kind": "invariant",
+      "title": "Graph output is deterministic for identical workspaces",
+      "description": "Same workspace always produces identical crate graph. Only workspace crates are included as nodes.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-004",
+      "kind": "requirement",
+      "title": "CCP index hash is deterministic via BLAKE3",
+      "description": "Index hash is deterministic: same inputs produce identical BLAKE3 hash. File inventory sorted by path for reproducible output.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-005",
+      "kind": "safety",
+      "title": "Cargo subprocess environment is sanitized",
+      "description": "Only PATH, HOME, CARGO_HOME, RUSTUP_HOME passed through to cargo metadata subprocess.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-006",
+      "kind": "safety",
+      "title": "Cargo subprocess has 30-second timeout",
+      "description": "Cargo subprocess is bounded by a 30-second timeout to prevent hangs.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-007",
+      "kind": "safety",
+      "title": "Bounded file reads for AGENTS.md and Cargo.toml",
+      "description": "Strict bounded file reads: 10 MB for AGENTS.md, 1 MB for Cargo.toml.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CCP-008",
+      "kind": "safety",
+      "title": "Only files within repo root are processed",
+      "description": "Path traversal prevention: only files within repo root are processed.",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

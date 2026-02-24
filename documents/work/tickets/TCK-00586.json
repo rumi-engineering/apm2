@@ -1,0 +1,58 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00586",
+      "title": "Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker exists."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Reduce overhead of multiple workers scanning large pending dirs:",
+        "  - optional short-lived `queue/scan.lock` lease for scan ownership",
+        "  - others wait/jitter and rely on atomic claim",
+        "Maintain determinism of claim selection order.",
+        "Emit a receipt if scan lock is held too long (stuck worker detection)."
+      ],
+      "out_of_scope": [
+        "Distributed queue sharding."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement optional scan lock with TTL and jitter.",
+        "Integrate with worker loop."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Multiple workers do not cause excessive CPU/IO overhead scanning pending jobs."
+      ]
+    }
+  }
+}

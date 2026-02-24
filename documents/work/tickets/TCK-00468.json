@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00468",
+      "title": "RFC-0028 REQ-0008 projection isolation and direct-GitHub authority elimination",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0028",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0008",
+          "requirement_ref": "documents/rfcs/RFC-0028/requirements/REQ-0008.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0008",
+          "artifact_ref": "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_INFRA"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00462",
+          "reason": "Projection admission traces must link to lifecycle intent receipts."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Enforce production `agent_runtime` exclusion of direct GitHub capability classes (`github_api`, `gh_cli`, `forge_org_admin`, `forge_repo_admin`).",
+        "Require projection_worker-only write paths with receipt linkage from authoritative internal state.",
+        "Implement GH-DIRECT stage policy behavior (Stage 0/1/2) with fail-closed default to Stage 2 on ambiguity.",
+        "Emit structured deny defects for direct runtime GitHub actuation attempts."
+      ],
+      "out_of_scope": [
+        "Migration of non-GitHub sink families into production profile.",
+        "Organization-level GitHub governance outside runtime capability surface."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add runtime capability-surface checks to projection isolation gate path.",
+        "Bind projection writes to projection_worker receipt chains.",
+        "Implement stage-state evaluator and fail-closed default behavior.",
+        "Add negative tests for direct GitHub API/CLI attempts from agent_runtime context."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0008"
+      ],
+      "criteria": [
+        "Production agent_runtime cannot directly actuate GitHub sinks.",
+        "All admissible GitHub projections are projection_worker-mediated and receipt-linked.",
+        "Unknown or stale stage state fails closed to hard deny."
+      ]
+    },
+    "notes": {
+      "security": "Projection isolation constrains blast radius by separating authority and projection principals.\n",
+      "verification": "Include capability-surface reports and direct-attempt deny traces.\n",
+      "general": "This ticket delivers the production isolation baseline required before compromise containment rollout.\n"
+    }
+  }
+}

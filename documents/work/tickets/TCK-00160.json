@@ -1,0 +1,122 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00160",
+      "title": "Implement EpisodeRuntime with state machine",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-EPISODE-001"
+        },
+        {
+          "requirement_id": "REQ-DAEMON-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00159"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "EpisodeRuntime with create/start/stop/signal methods",
+      "verification": "Unit tests verify all methods"
+    },
+    {
+      "criterion": "State machine CREATED -> RUNNING -> (TERMINATED | QUARANTINED)",
+      "verification": "State transition tests cover all paths"
+    },
+    {
+      "criterion": "Event emission for all state transitions",
+      "verification": "Integration test verifies event emission"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "EpisodeRuntime structure",
+        "code": "pub struct EpisodeRuntime {\n    ledger: Arc<Ledger>,\n    cas: Arc<ContentAddressedStore>,\n    policy: Arc<PolicyEngine>,\n    adapters: AdapterRegistry,\n    episodes: DashMap<EpisodeId, EpisodeState>,\n}\n\nimpl EpisodeRuntime {\n    pub async fn create(&self, envelope: EpisodeEnvelope) -> Result<EpisodeId>;\n    pub async fn start(&self, id: EpisodeId) -> Result<SessionHandle>;\n    pub async fn stop(&self, id: EpisodeId, reason: StopReason) -> Result<()>;\n    pub async fn signal(&self, id: EpisodeId, sig: Signal) -> Result<()>;\n    pub async fn observe(&self, id: EpisodeId) -> Result<EpisodeState>;\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/src/episode/runtime.rs",
+        "purpose": "EpisodeRuntime implementation"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/state.rs",
+        "purpose": "Episode state machine"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/handle.rs",
+        "purpose": "SessionHandle for running episodes"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/error.rs",
+        "purpose": "Episode error types"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Export runtime, state, handle modules",
+        "path": "crates/apm2-daemon/src/episode/mod.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Define EpisodeState enum",
+        "details": "Create state machine per AD-EPISODE-002:\n- CREATED: Envelope accepted, resources not allocated\n- RUNNING: Harness spawned, I/O streaming\n- TERMINATED: Normal completion, evidence finalized\n- QUARANTINED: Abnormal termination, evidence pinned\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement state transitions",
+        "details": "Create transition methods with invariants:\n- create(): -> CREATED\n- start(): CREATED -> RUNNING (requires valid lease)\n- stop(): RUNNING -> TERMINATED\n- quarantine(): RUNNING -> QUARANTINED\n- No transitions from terminal states\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement EpisodeRuntime",
+        "details": "Create runtime struct with:\n- DashMap for concurrent episode tracking\n- Ledger/CAS/Policy references\n- AdapterRegistry for harness lookup\n- Methods: create, start, stop, signal, observe\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement event emission",
+        "details": "Emit events for all transitions:\n- episode.created (envelope_hash)\n- episode.started (session_pid, io_stream_id)\n- episode.stopped (termination_class)\n- episode.quarantined (reason, evidence_refs)\n"
+      },
+      {
+        "step": 5,
+        "action": "Create SessionHandle",
+        "details": "Create handle for running episode:\n- episode_id, session_id\n- I/O stream handles\n- Stop condition checker\n- Budget tracker reference\n"
+      }
+    ],
+    "summary": "Implement EpisodeRuntime with state machine per AD-EPISODE-002.\nManages episode lifecycle (create/start/stop/signal) with event emission\nfor all state transitions. States: CREATED -> RUNNING -> TERMINATED | QUARANTINED.\n"
+  },
+  "notes": "Phase: PHASE-1B (Episode Envelope and Lifecycle)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-004.\n",
+  "test_requirements": [
+    {
+      "description": "State transition coverage",
+      "test_id": "UT-00160-01",
+      "verification_command": "cargo test -p apm2-daemon episode_state"
+    },
+    {
+      "description": "Event emission",
+      "test_id": "IT-00160-01",
+      "verification_command": "cargo test -p apm2-daemon --test integration episode_events"
+    },
+    {
+      "description": "Invalid transition rejection",
+      "test_id": "UT-00160-02",
+      "verification_command": "cargo test -p apm2-daemon invalid_transition"
+    }
+  ]
+}

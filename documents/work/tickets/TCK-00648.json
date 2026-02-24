@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00648",
+      "title": "RFC-0032 Phase 4: WorkLoopManager reaper/nudge loop (enforce implementer terminal contract after session termination)",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_ORCHESTRATION"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00638",
+          "reason": "Needs work_context markers"
+        },
+        {
+          "ticket_id": "TCK-00645",
+          "reason": "Needs WorkLoopProfile budgets"
+        },
+        {
+          "ticket_id": "TCK-00647",
+          "reason": "Needs session lifecycle events"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement daemon WorkLoopManager that reacts to `session.terminated` events for implementer sessions",
+        "If work state remains InProgress and required terminal marker is missing (IMPLEMENTER_TERMINAL), schedule nudges/re-dispatch per WorkLoopProfile budgets; HANDOFF_NOTE is optional",
+        "Nudge content must include: doctor status, missing markers, exact command to run (`apm2 fac push --work-id ...`)",
+        "No hard-coded retry caps; use WorkLoopProfile nudge_policy/backoff_seconds"
+      ],
+      "out_of_scope": [
+        "Changing reducer work state machine rules (this is a daemon control-plane loop)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add WorkLoopManager module under `crates/apm2-daemon/src/work/`",
+        "Subscribe to session termination notifications and query projections for terminal markers keyed by session_id",
+        "Schedule nudges using tokio timers and deterministic workspace reuse (via WorktreeManager)",
+        "Add metrics for nudges scheduled/sent and terminal contract compliance rates",
+        "Add tests: missing markers triggers nudge; markers present suppress nudge; budgets enforced"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Terminal contract compliance is enforced by daemon loop (nudges/reaping) and is replayable from ledger+CAS (no local-only truth).",
+        "Missing HANDOFF_NOTE alone does not trigger nudge/re-dispatch; missing IMPLEMENTER_TERMINAL does.",
+        "Nudge behavior is configurable via WorkLoopProfile; no hard-coded caps remain in new path."
+      ]
+    }
+  },
+  "fac_security_contract": {
+    "source": "documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml",
+    "profile": "FAC-RFC0032-BASELINE",
+    "required_invariants": [
+      "INV-FAC-TRUTH-001",
+      "INV-FAC-WORK-BIND-001",
+      "INV-FAC-CLAIM-BIND-001",
+      "INV-FAC-ACTOR-BIND-001",
+      "INV-FAC-IDEMP-001",
+      "INV-FAC-EVID-001"
+    ],
+    "enforcement_requirements": [
+      "Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.",
+      "Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.",
+      "Reviewer denial is expected for invariant-unmapped behavior changes."
+    ]
+  }
+}

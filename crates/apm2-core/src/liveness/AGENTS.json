@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/liveness",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-LIVE-001",
+      "kind": "safety",
+      "title": "Ambiguous health verdict is fail-closed: treated as unhealthy",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-002",
+      "kind": "invariant",
+      "title": "Only Healthy verdict permits authoritative progression",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-003",
+      "kind": "safety",
+      "title": "Heartbeat run_id bounded to MAX_RUN_ID_LENGTH (256 bytes)",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-004",
+      "kind": "safety",
+      "title": "Heartbeat detail bounded to MAX_HEARTBEAT_DETAIL_LENGTH (512 bytes)",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-005",
+      "kind": "invariant",
+      "title": "Serialization round-trip is lossless for valid receipts",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-006",
+      "kind": "invariant",
+      "title": "Once terminal reason recorded, all subsequent restarts denied",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-007",
+      "kind": "invariant",
+      "title": "Circuit breaker is monotone: once opened, it never closes",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-008",
+      "kind": "invariant",
+      "title": "Restart window pruning uses saturating_sub to prevent underflow",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-LIVE-009",
+      "kind": "safety",
+      "title": "Liveness gate denial detail truncated to 512 bytes at char boundary",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

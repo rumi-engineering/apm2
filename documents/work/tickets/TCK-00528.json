@@ -1,0 +1,75 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00528",
+      "title": "Systemd units + runbook: daemon/broker + worker as managed services (user+system modes)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Broker must exist before unit packaging."
+        },
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker must exist before unit packaging."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Provide systemd unit templates for: apm2-daemon (FAC Broker surface) and FAC Worker.",
+        "Support both user-mode units (with linger guidance) and system-mode units (preferred hardening).",
+        "Define dedicated runtime directories under `$APM2_HOME/private/fac/**` with strict permissions.",
+        "Support socket activation for broker IPC via `.socket` units (preferred) or an equivalent non-flaky auto-start approach.",
+        "Support systemd credentials (`LoadCredential=`) for secrets provisioning (e.g., `GH_TOKEN`, GitHub App private key), without relying on interactive dotfiles.",
+        "Provide a minimal runbook: start/stop/status, logs, credential provisioning notes, failure modes.",
+        "Add/extend `apm2 fac services status` (optional) to report unit health."
+      ],
+      "out_of_scope": [
+        "Cluster orchestration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Author unit files with explicit WorkingDirectory, Restart policies, and hardening knobs.",
+        "Use `EnvironmentFile=` only for non-secret configuration; forbid secrets in `EnvironmentFile=`.",
+        "Use `LoadCredential=` (systemd credentials) for any secret material required by broker/worker.",
+        "Add `.socket` unit(s) for broker IPC to support socket activation (preferred).",
+        "For system units: run as dedicated service user; define slices if needed.",
+        "Add docs: how to enable linger for user-mode; how to run system-mode safely."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "On a clean Ubuntu VPS, daemon/broker and worker can be enabled, started, and remain running after reboot.",
+        "Broker IPC is reachable without manual startup (Restart=always or socket activation).",
+        "Worker can execute at least one queued job end-to-end under unit management.",
+        "Secret provisioning uses systemd credentials (LoadCredential) rather than shell environment/dotfiles."
+      ]
+    },
+    "notes": {
+      "security": "Ensure units do not run with excessive privileges by default.\nPrefer systemd credentials over environment variables to avoid accidental exposure.\nDefault should avoid reliance on a user-bus for correctness.\n"
+    }
+  }
+}

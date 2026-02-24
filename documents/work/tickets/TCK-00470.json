@@ -1,0 +1,82 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00470",
+      "title": "RFC-0029 REQ-0001 canonical economics profile and deterministic budget admission",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0029",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0001",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0001.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0001.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_OBSERVABILITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00439",
+          "reason": "RFC-0019 CAC registry hardening must exist before economics profile gate bindings are admitted."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement economics-constraint admission checks for boundary interaction classes.",
+        "Emit deterministic budget allow/deny traces with stable deny reasons.",
+        "Deny unprofiled authoritative paths by default.",
+        "Add deny-path coverage for missing, stale, or unresolved economics profile inputs."
+      ],
+      "out_of_scope": [
+        "Digest-first selector closure and replay zoom-in behavior.",
+        "Verifier cache amortization policy tuning."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Bind economics.constraint.profile digests to active epoch policy roots.",
+        "Implement deterministic serialization for budget decision traces.",
+        "Add fail-closed defects for unknown economics profile state.",
+        "Add integration tests and evidence extraction for budget-admission decisions."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001"
+      ],
+      "criteria": [
+        "Budget admission traces are deterministic and replay-verifiable.",
+        "Unprofiled authoritative requests are fail-closed deny.",
+        "Decision traces expose stable input/output and deny_reason fields."
+      ]
+    },
+    "notes": {
+      "security": "Missing or ambiguous economics profile inputs are non-admissible for authority-bearing decisions.\n",
+      "verification": "Include deterministic replay checks over serialized budget-admission traces.\n",
+      "general": "This ticket is the baseline RFC-0029 implementation ticket and prerequisite for selector, queue, and optimization tickets.\n"
+    }
+  }
+}

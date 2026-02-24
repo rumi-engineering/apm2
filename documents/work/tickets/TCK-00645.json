@@ -1,0 +1,70 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00645",
+      "title": "RFC-0032 Phase 4: implement PublishWorkLoopProfile (CAS + evidence anchor) + active-profile selection projection",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_PROTOCOL",
+        "DOMAIN_PROJECTION",
+        "DOMAIN_EVIDENCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00633",
+          "reason": "LoopProfile schema"
+        },
+        {
+          "ticket_id": "TCK-00634",
+          "reason": "EvidenceCategory extensions"
+        },
+        {
+          "ticket_id": "TCK-00631",
+          "reason": "Canonical ledger append"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add PublishWorkLoopProfile request to runtime proto and implement handler",
+        "Enforce bounded decode (<= 64KiB), deny_unknown_fields, and reject empty dedupe_key",
+        "Store canonical JSON to CAS and anchor via `evidence.published` category WORK_LOOP_PROFILE with deterministic evidence_id (WLP- prefix)",
+        "Add projection that selects the latest anchored profile per work_id as active (by ledger seq_id/timestamp)"
+      ],
+      "out_of_scope": [
+        "Workspace allocation logic (WorktreeManager ticket)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Extend runtime proto and implement handler: validate, CAS store, ledger append, idempotency on (work_id,dedupe_key)",
+        "Extend projection worker to maintain work_active_loop_profile(work_id -> profile_hash, evidence_id, updated_at_ns)",
+        "Add tests: idempotent publish; latest profile wins; empty dedupe_key rejected"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Loop profile publication is idempotent and replayable from ledger+CAS.",
+        "Active profile selection is deterministic and projection-derived (no hidden state)."
+      ]
+    }
+  }
+}

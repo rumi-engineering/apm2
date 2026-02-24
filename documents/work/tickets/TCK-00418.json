@@ -1,0 +1,98 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00418",
+      "title": "HTF authority hardening for FAC lifecycle transitions",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0015",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0015.yaml#rfc_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0016",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0016.yaml#rfc_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00239",
+          "reason": "Critical events must expose time_envelope_ref surfaces."
+        },
+        {
+          "ticket_id": "TCK-00240",
+          "reason": "HolonicClock and envelope stamping runtime prerequisites."
+        },
+        {
+          "ticket_id": "TCK-00241",
+          "reason": "Lease tick-based semantics are required before FAC transition enforcement."
+        },
+        {
+          "ticket_id": "TCK-00246",
+          "reason": "Wall-authority lint enforcement baseline in privileged paths."
+        },
+        {
+          "ticket_id": "TCK-00415",
+          "reason": "WorkObject projection authority cutover must be in place."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Require resolvable time_envelope_ref on authoritative lifecycle transitions and terminal receipts.",
+        "Validate clock_profile_hash pinning and profile allowlist policy by risk tier.",
+        "Enforce tick/envelope-based lease and gate decisions in FAC transition paths.",
+        "Add deny tests for wall-time authority regressions in admission/gate/reducer decisions."
+      ],
+      "out_of_scope": [
+        "Cross-node HLC federation expansion beyond current FAC cutover boundaries.",
+        "Time source attestation implementation beyond existing optional hooks."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Integrate envelope/profile validation into FAC transition validators.",
+        "Wire policy checks for allowed clock profiles at transition admission points.",
+        "Add negative tests for missing envelope, invalid hash, and disallowed profile.",
+        "Add perturbation tests proving wall-time changes do not alter authority outcomes.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0016"
+      ],
+      "criteria": [
+        "Missing/unresolvable/disallowed envelope/profile bindings fail closed.",
+        "FAC lease/gate authority checks are tick/envelope-based.",
+        "No wall-time authority regressions remain in privileged FAC paths."
+      ]
+    },
+    "notes": {
+      "security": "Time authority is a gate primitive; any ambiguity must deny promotion.\n",
+      "verification": "Include failure-injection and deterministic replay checks for temporal decisions.\n"
+    }
+  }
+}

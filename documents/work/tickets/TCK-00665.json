@@ -1,0 +1,125 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00665",
+      "title": "FAC review: emit canonical review receipts (ReviewReceiptRecorded/ReviewBlockedRecorded) with CAS artifact bundles and lease-bound identity",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CLI",
+        "DOMAIN_DAEMON",
+        "DOMAIN_EVIDENCE",
+        "DOMAIN_PROTOCOL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00637",
+          "reason": "Reviewer claim/lease issuance must exist (ClaimWorkV2) so receipts bind to an authoritative lease_id."
+        },
+        {
+          "ticket_id": "TCK-00647",
+          "reason": "DispatchReviewer must provide daemon-owned workspaces and a reviewer execution boundary to attach receipts to."
+        },
+        {
+          "ticket_id": "TCK-00649",
+          "reason": "Reviewer bridge defines reviewer role integration and ledger indexing for review artifacts."
+        },
+        {
+          "ticket_id": "TCK-00638",
+          "reason": "Publishing review artifacts as evidence/context entries depends on CAS-backed evidence publishing."
+        }
+      ]
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "FAC review currently persists completion/termination via bespoke local receipts\n(HMAC-bound JSON files) and uses NDJSON telemetry + local state files as a source\nof truth. This diverges from the kernel-native model already present in apm2-core\nand apm2-daemon:\n\n  - apm2-core provides ReviewArtifactBundleV1 + ReviewReceiptRecorded / ReviewBlockedRecorded\n    events with domain separation and CAS binding.\n  - apm2-daemon exposes IngestReviewReceiptRequest to persist those events, validating:\n      * lease existence and HTF time-authority binding,\n      * reviewer identity derived from peer credentials,\n      * idempotency on receipt_id.\n\nThe system is currently failing to leverage these primitives, so review outcomes are\nnot uniformly replayable, auditable, or distributable (BFT-ready). This is also a\nblocker for automated implementer orchestration: reviewer outputs must become durable\nkernel evidence, not scattered local files.\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "RR-001",
+        "title": "Define the review artifact bundle emission contract for reviewer executions",
+        "detail": "Standardize how a reviewer execution produces durable artifacts:\n\n  Inputs (authoritative):\n    - lease_id (issued by daemon for reviewer role)\n    - work_id + changeset_digest (bound via lease/work authority bindings)\n    - reviewer_actor_id MUST be derived from the executing process identity (peer creds)\n\n  Outputs:\n    - ReviewArtifactBundleV1 stored in CAS (bundle includes review text hash + tool logs hashes + metadata)\n    - IngestReviewReceiptRequest sent to daemon with:\n        * lease_id\n        * receipt_id (idempotency key; stable per (work_id, changeset_digest, review_kind, attempt))\n        * changeset_digest\n        * artifact_bundle_hash (CAS hash of bundle)\n        * verdict (PASS/FAIL/BLOCKED)\n        * blocked_reason_code + blocked_log_hash when BLOCKED\n        * identity_proof_hash binding reviewer identity\n\nThe contract MUST be written in-code as:\n  - typed env var names (for episode processes), OR\n  - a structured \"review receipt emission spec\" struct passed into the reviewer wrapper.\n"
+      },
+      {
+        "id": "RR-002",
+        "title": "Implement receipt emission path for reviewer runs using daemon protocol IngestReviewReceiptRequest",
+        "detail": "In the reviewer execution boundary (the process that has the lease and runs the model backend),\nimplement:\n\n  1) Store artifacts into CAS (review text, tool logs, bundle JSON) using the existing daemon CAS/evidence APIs.\n  2) Call protocol client ingest_review_receipt() with the computed hashes and verdict.\n  3) Treat a successful response as the only canonical completion signal.\n\nRequirements:\n  - Fail closed if CAS writes fail or hashes mismatch.\n  - Do not emit duplicate receipts: receipt_id must be stable and ingestion must be idempotent.\n  - If daemon rejects (lease missing, identity mismatch, HTF invalid), surface a single actionable error\n    and do NOT fall back to local receipts.\n"
+      },
+      {
+        "id": "RR-003",
+        "title": "Wire receipt ingestion into RFC-0032 reviewer dispatch path",
+        "detail": "Ensure the daemon-owned reviewer dispatch path (DispatchReviewer) either:\n  - directly runs a wrapper that emits receipts via IngestReviewReceiptRequest, or\n  - provides sufficient environment/context for an existing wrapper to emit receipts.\n\nThis ensures review completion is ledger+CAS durable even when the orchestrating CLI exits mid-run.\n"
+      },
+      {
+        "id": "RR-004",
+        "title": "Add verification: crash-point safety and replay stability for receipt emission",
+        "detail": "Add tests (unit/integration) that simulate:\n  - crash between CAS store and receipt ingestion (receipt not present; restart reuses same receipt_id)\n  - crash after successful receipt ingestion (restart does not emit duplicate receipts)\n  - duplicate ingestion attempts return idempotent success\n\nTests should validate that the resulting ledger contains:\n  - ReviewReceiptRecorded OR ReviewBlockedRecorded (exactly once)\n  - artifact_bundle_hash references a CAS blob that verifies\n"
+      }
+    ],
+    "out_of_scope": [
+      "Migrating the full fac_review CLI UX off local state (handled by follow-on tickets).",
+      "Adding new evidence categories beyond what RFC-0032 already introduces unless strictly required."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "Identify the correct execution boundary to own receipt emission post-RFC-0032 (expected": "reviewer episode wrapper)."
+      },
+      "Implement CAS artifact storage for bundle + referenced blobs with bounded reads/writes.",
+      "Implement receipt_id derivation (stable digest; bounded) and call IngestReviewReceiptRequest.",
+      "Add crash-point + idempotency tests."
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "A reviewer run produces ReviewReceiptRecorded/ReviewBlockedRecorded in the core ledger (via daemon) and no longer relies on local receipt JSON as canonical truth.",
+      "All receipt artifacts are stored in CAS and hash-verified on read.",
+      "Duplicate ingestion is idempotent; crash between phases is recoverable without ambiguity.",
+      "Tests cover crash-point and duplicate-ingest behavior."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-RR-01",
+      "title": "Identity binding prevents orchestrator process from ingesting receipts",
+      "mitigation": "Ensure ingestion is performed by the leased reviewer execution process (episode wrapper),\nnot by a separate operator/orchestrator process. If necessary, restructure dispatch so that\nthe unit owning the lease also owns the protocol client.\n"
+    }
+  ],
+  "notes": [
+    "This ticket is the substrate pivot for FAC review: without durable receipts, the rest of kernel-native review orchestration cannot be trusted."
+  ],
+  "fac_security_contract": {
+    "source": "documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml",
+    "profile": "FAC-RFC0032-BASELINE",
+    "required_invariants": [
+      "INV-FAC-TRUTH-001",
+      "INV-FAC-WORK-BIND-001",
+      "INV-FAC-CLAIM-BIND-001",
+      "INV-FAC-ACTOR-BIND-001",
+      "INV-FAC-IDEMP-001",
+      "INV-FAC-EVID-001"
+    ],
+    "enforcement_requirements": [
+      "Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.",
+      "Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.",
+      "Reviewer denial is expected for invariant-unmapped behavior changes."
+    ]
+  }
+}

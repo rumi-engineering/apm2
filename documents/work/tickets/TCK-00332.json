@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00332",
+      "title": "Orchestrator revision loop (1..100 cycles) with deterministic stop conditions",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0011",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0011.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0011",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0011.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_KERNEL",
+        "DOMAIN_ADMISSION"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00331",
+          "reason": "Prerequisite per RFC-0019 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement FAC orchestration state machine in ledger events (iteration counter, budgets, termination reason)",
+        "Drive implementer + reviewer episodes iteratively until PASS/BLOCKED/BUDGET_EXHAUSTED/OPERATOR_STOP",
+        "Crash-only resumability: restart from ledger head/checkpoint without duplicating projections",
+        "Bind each iteration to ChangeSetBundleV1 + reviewer receipts + ledger anchor"
+      ],
+      "out_of_scope": [
+        "Automatic bug creation/triage loop (defer)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Implement FAC orchestration state machine in ledger events (iteration counter, budgets, termination reason)",
+        "Implement: Drive implementer + reviewer episodes iteratively until PASS/BLOCKED/BUDGET_EXHAUSTED/OPERATOR_STOP",
+        "Implement: Crash-only resumability: restart from ledger head/checkpoint without duplicating projections",
+        "Implement: Bind each iteration to ChangeSetBundleV1 + reviewer receipts + ledger anchor",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0019/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0011"
+      ],
+      "criteria": [
+        "A work_id can run >= 20 revision iterations in integration test without human interaction",
+        "Restart resumes orchestration deterministically from ledger state",
+        "Termination reasons are recorded as authoritative facts"
+      ]
+    },
+    "notes": {
+      "security": "Productivity-first; keep fail-closed invariants intact where already mandated by RFC-0019.",
+      "verification": "Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process memory.",
+      "general": "Keep changes minimal, explicit, and reversible; make dependencies and attribution fields queryable."
+    }
+  }
+}

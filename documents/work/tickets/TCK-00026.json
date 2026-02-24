@@ -1,0 +1,31 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-23",
+    "template_version": "2026-01-23",
+    "ticket": {
+      "id": "TCK-00026",
+      "title": "Create xtask crate structure"
+    },
+    "binds": {
+      "prd_id": "",
+      "rfc_id": "RFC-0002",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_TOOLING"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "definition_of_done": {
+      "evidence_ids": []
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00300",
+      "title": "HEF: Extend ProtocolServer proto with PulseEnvelope + Subscribe/Unsubscribe",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0002",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0002.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-HEF-0008",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0008.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0003",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0003.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PROTOCOL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00287",
+          "reason": "Depends on base ProtocolServer infrastructure"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define PulseEnvelopeV1 message in proto/apm2d_runtime_v1.proto",
+        "Define PulseSubscribeRequest and PulseSubscribeResponse messages",
+        "Define PulseUnsubscribeRequest and PulseUnsubscribeResponse messages",
+        "Define PulseEvent message (server->client only)",
+        "Assign new message tags for session and operator sockets",
+        "Reserve HEF tag range in proto file",
+        "Ensure bounded fields and reject unknown fields"
+      ],
+      "out_of_scope": [
+        "Subscription handling logic (covered by TCK-00302)",
+        "Topic grammar and matching (covered by TCK-00301)",
+        "Pulse publishing logic (covered by TCK-00304)",
+        "ACL enforcement (covered by TCK-00302)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Review existing apm2d_runtime_v1.proto structure and tag assignments",
+        "Define PulseEnvelopeV1 message with bounded fields",
+        "Define PulseSubscribeRequest with topic pattern field",
+        "Define PulseSubscribeResponse with success/error status",
+        "Define PulseUnsubscribeRequest with subscription ID",
+        "Define PulseUnsubscribeResponse with confirmation",
+        "Define PulseEvent message for server-to-client pulse delivery",
+        "Reserve tag range for HEF messages (document range in proto comments)",
+        "Add validation for unknown field rejection",
+        "Run protoc to verify proto compilation succeeds",
+        "Verify tag map has no collisions with existing messages"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0003"
+      ],
+      "criteria": [
+        "PulseEnvelopeV1 fields are bounded and unknown fields are rejected.",
+        "Subscribe/Unsubscribe tags reserved for both session and operator sockets.",
+        "Verified tag map has no collisions; apm2d_runtime_v1.proto reserves a HEF tag range."
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed",
+      "verification": "Proto compilation test, tag collision check via grep/script"
+    }
+  }
+}

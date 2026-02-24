@@ -1,0 +1,81 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00229",
+      "title": "FAC: Evidence hygiene enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0014",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0016",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00221"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement validate_evidence_hygiene_for_admission()",
+        "Require retention_window for Confidential/Restricted",
+        "Require redaction_profile_hash for redacted non-public"
+      ],
+      "out_of_scope": [
+        "Retention enforcement",
+        "Redaction implementation"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Modify crates/apm2-core/src/fac/artifact_manifest.rs",
+        "Implement validate_evidence_hygiene_for_admission(manifest)",
+        "Check Confidential/Restricted have retention_window",
+        "Check redacted non-public have redaction_profile_hash",
+        "Define HygieneError variants",
+        "Write unit tests for retention requirement",
+        "Write unit tests for redaction profile requirement",
+        "Write unit tests for admission blocking"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0016"
+      ],
+      "criteria": [
+        "Confidential artifacts require retention_window",
+        "Redacted artifacts require redaction_profile_hash",
+        "Evidence hygiene violations block admission",
+        "cargo test -p apm2-core fac::artifact_manifest::tests::hygiene passes"
+      ]
+    },
+    "notes": {
+      "security": "Evidence hygiene ensures proper data classification and\nretention metadata for all artifacts. This supports\ncompliance and audit requirements.\n",
+      "implementation_details": "validate_evidence_hygiene_for_admission checks:\n1. All artifacts have data_classification (struct enforced)\n2. Confidential/Restricted require retention_window_ref\n3. Redacted non-public require redaction_profile_hash\n\nHygieneError variants:\n- MissingRetentionWindow(digest)\n- MissingRedactionProfile(digest)\n",
+      "affected_files": "Modified: crates/apm2-core/src/fac/artifact_manifest.rs\n"
+    }
+  }
+}

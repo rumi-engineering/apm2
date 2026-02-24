@@ -1,0 +1,130 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00403",
+      "title": "End-to-end FAC lifecycle integration test: claim -> spawn -> tool execute -> evidence -> terminate",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0010",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#rfc_requirement"
+        },
+        {
+          "requirement_id": "REQ-HEF-0011",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0011.yaml#rfc_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0012",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml#rfc_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_ORCHESTRATION",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00396",
+          "reason": "HarnessHandle must work for process lifecycle management."
+        },
+        {
+          "ticket_id": "TCK-00397",
+          "reason": "Adapter profile binding must exist in SpawnEpisodeRequest."
+        },
+        {
+          "ticket_id": "TCK-00398",
+          "reason": "Ledger read compatibility must be in place so FAC queries find daemon-written events."
+        },
+        {
+          "ticket_id": "TCK-00399",
+          "reason": "Adapter must be wired into SpawnEpisode to actually spawn agent processes."
+        },
+        {
+          "ticket_id": "TCK-00401",
+          "reason": "ToolBroker must be initialized for tool requests to succeed."
+        },
+        {
+          "ticket_id": "TCK-00402",
+          "reason": "At least one tool request must originate from the spawned agent via the adapter bridge to validate true agent-runtime mediation."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "An integration test (cargo test) that exercises the full FAC lifecycle via an in-process daemon and real protocol clients (OperatorClient/SessionClient).",
+        "Test stages: daemon start, work claim, episode spawn (agent process starts), tool request (read file), event emit, evidence publish, work status, FAC ledger query, episode stop, daemon kill.",
+        "Verify each stage produces the expected IPC response AND the expected ledger event.",
+        "Verify CAS artifacts are written and readable.",
+        "Verify FAC ledger queries (apm2 fac work status) find all events for the work_id.",
+        "Use a trivial test agent script (not a real LLM) that responds to tool bridge protocol.",
+        "Verify at least one allowlisted tool request is emitted by the spawned agent process over the adapter bridge and receives a mediated result.",
+        "Produce a structured test report with PASS/FAIL per hypothesis."
+      ],
+      "out_of_scope": [
+        "Testing with real LLM models (Claude, Codex) — use a mock agent script.",
+        "Multi-episode or multi-work-item scenarios.",
+        "Consensus or multi-node scenarios.",
+        "Performance or load testing."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create a test fixture: a minimal shell script (test_agent.sh) that acts as an agent. It reads stdin for tool bridge messages, emits JSONL events on stdout, and exits cleanly on SIGTERM.",
+        "Create a test adapter profile for the fixture agent (or use RawAdapter with custom command).",
+        "Write an integration test in crates/apm2-daemon/tests/fac_lifecycle.rs (or tests/ directory).",
+        "Test Step 1: Start daemon in-process (not as subprocess) using DaemonState::with_persistence_and_cas_and_key() with temp directories.",
+        "Test Step 2: Connect OperatorClient, perform Hello handshake, send ClaimWork request. Assert: response has work_id, lease_id, capability_manifest_hash.",
+        "Test Step 3: Send SpawnEpisode with work_id, lease_id, workspace_root pointing to temp dir, adapter_profile_hash for the test agent. Assert: response has session_id, session_token.",
+        "Test Step 4: Validate tool execution via both paths: (a) fixture agent emits one bridge-framed allowlisted tool request from process output and receives mediated result input; (b) SessionClient sends RequestTool for an allowlisted class and receives tool result (not NotInitialized, not PolicyDeny).",
+        "Test Step 5: Attempt session request with a forged/invalid session token. Assert: authentication failure.",
+        "Test Step 6: Send RequestTool for a disallowed tool class. Assert: PolicyDeny.",
+        "Test Step 7: Send EmitEvent with event_type 'test.completed'. Assert: response has event_id, sequence number.",
+        "Test Step 8: Send PublishEvidence with a small test artifact. Assert: response has artifact_hash, storage_path.",
+        "Test Step 9: Verify CAS file exists on disk at the expected path.",
+        "Test Step 10: Open ledger DB directly and query for work_id events. Assert: at least WorkClaimed, SessionStarted, SessionEvent events are found.",
+        "Test Step 11: Send EpisodeStop or wait for agent process exit. Verify episode transitions to Terminated.",
+        "Test Step 12: Send Shutdown via operator socket. Verify daemon exits cleanly.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test -p apm2-daemon --test fac_lifecycle."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0012"
+      ],
+      "criteria": [
+        "Integration test exercises all 12 stages of the FAC lifecycle.",
+        "Each stage asserts both the IPC response AND the ledger/CAS side effects.",
+        "Test uses a mock agent script, not a real LLM — test is hermetic and fast.",
+        "Test creates temp directories for CAS, ledger, workspace — no filesystem pollution.",
+        "Test cleans up all resources (sockets, temp dirs, child processes) even on failure.",
+        "The test includes explicit assertion mapping against the AAT hypotheses and demonstrates closure of the previously failing areas (H5 broker initialization, H9 FAC ledger visibility).",
+        "At least one allowlisted tool request is proven to originate from the spawned agent via adapter bridge framing (not only from direct SessionClient calls).",
+        "The test verifies session authentication by rejecting forged/invalid session tokens.",
+        "The test verifies deny-by-default policy by asserting PolicyDeny for a disallowed tool class.",
+        "All CI checks pass: cargo fmt, clippy (zero warnings), doc, tests."
+      ]
+    },
+    "notes": {
+      "context": "The AAT evidence report (documents/aat/FINDINGS.md) tested the FAC\nlifecycle manually and found 8/10 PASS, 1 FAIL (ToolBroker), 1 NEEDS_ADJUDICATION (ledger\nschema). This ticket creates an automated integration test that will turn green once all\nblocker tickets (TCK-00396 through TCK-00402) are resolved.\n\nThis test serves as the gate for DD-HEF-0013 (FAC v0 autonomy gated by end-to-end evidence)\nfrom RFC-0018. It also corresponds to TCK-00313 (end-to-end autonomous run harness) from\nthe RFC-0018 ticket decomposition.\n\nThis ticket complements (not replaces) fac_autonomous_e2e coverage by focusing specifically\non the claim -> spawn -> tool -> evidence -> FAC-query path that failed in manual AAT.\n\nThe test should be structured to produce evidence artifacts that can be referenced by the\nAAT evidence report, making the test both a regression guard and a conformance demonstration.\n",
+      "files": "- documents/aat/FINDINGS.md (the manual AAT evidence this test automates)\n- crates/apm2-daemon/tests/fac_autonomous_e2e.rs (existing lifecycle coverage to reuse/extend)\n- crates/apm2-daemon/src/state.rs (DaemonState for in-process daemon)\n- crates/apm2-cli/src/client/protocol.rs (OperatorClient, SessionClient for IPC)\n- crates/apm2-daemon/src/protocol/dispatch.rs (all IPC handlers under test)\n- crates/apm2-daemon/src/protocol/session_dispatch.rs (session-scoped handlers under test)\n- crates/apm2-daemon/src/ledger.rs (ledger write path under test)\n- crates/apm2-core/src/ledger/mod.rs (ledger read path for verification)\n",
+      "security": "- Test must not leave orphan processes on failure (use Drop guards for child process cleanup).\n- Test temp directories must use restrictive permissions (0700) to match production CAS requirements.\n- Test must verify that session token authentication works (reject forged tokens).\n- Test must verify that tool class deny-by-default works (request a disallowed tool, expect PolicyDeny).\n"
+    }
+  }
+}

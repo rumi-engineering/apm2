@@ -1,0 +1,130 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00612",
+      "title": "FAC gate throughput pivot: host-aware profiles + queue-managed contention + bounded-spec alignment",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_DOCUMENTATION"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00410",
+          "reason": "Original bounded-runner contract and guardrail semantics; requires amendment to avoid throughput ambiguity."
+        },
+        {
+          "ticket_id": "TCK-00436",
+          "reason": "Original fac gates unification and bounded-execution assumptions; requires throughput-profile clarification."
+        },
+        {
+          "ticket_id": "TCK-00519",
+          "reason": "Lane-derived test parallelism introduced; this ticket decouples throughput defaults from lane cpu_quota."
+        },
+        {
+          "ticket_id": "TCK-00549",
+          "reason": "Bounded executor rewrite semantics retained for containment while throughput defaults are redefined."
+        },
+        {
+          "ticket_id": "TCK-00602",
+          "reason": "Uniform timeout/memory policy retained; CPU throughput defaults pivot to profile resolution."
+        },
+        {
+          "ticket_id": "TCK-00605",
+          "reason": "Rust-native bounded test path retained; throughput defaults need explicit profile-based policy."
+        },
+        {
+          "ticket_id": "TCK-00607",
+          "reason": "Timeout unification retained; throughput assumptions require amendment."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "Full FAC gate regressions (>10 minutes) are dominated by bounded test-path\nthrottling and cold compile amplification.\n\nConfirmed contributors:\n1. Default CPU quota of 200% (effectively ~2 cores) on high-core hosts.\n2. Test/build parallelism derived from quota (NEXTEST_TEST_THREADS and\n   CARGO_BUILD_JOBS both collapsing to 2 under default policy).\n3. Cold build behavior and cache-warmth variance amplify low parallelism.\n4. Security hardening (wrapper stripping and strict env policy) is\n   correct but removed prior acceleration paths, increasing compile cost.\n\nBaseline evidence:\n- quick gates remain ~120s class.\n- full gates stall in test phase with wide compile fan-in.\n- controlled benchmark showed ~2.1x compile-time delta between jobs=2 and\n  jobs=16 for the same filtered workload.\n"
+    },
+    "scope": {
+      "in_scope": [
+        "Introduce gate throughput profiles (`throughput`, `balanced`, `conservative`) and wire profile selection into `apm2 fac gates`.",
+        "Default `apm2 fac gates` to `throughput` profile on high-capacity hosts.",
+        "Decouple test/build parallelism defaults from lane cpu_quota; use host-aware profile-derived parallelism.",
+        "Retain fail-closed bounded containment controls (timeout, memory, pids, env filtering, systemd isolation).",
+        "Apply profile-derived defaults to pipeline bounded test command construction to prevent cross-path drift.",
+        "Emit effective resolved resource settings in gate JSON events and summaries for observability.",
+        "Amend all impacted TCKs with explicit throughput-pivot notes to remove conflicting bounded-throughput assumptions."
+      ],
+      "out_of_scope": [
+        "Removing bounded execution or containment controls.",
+        "Reintroducing wrapper/sccache pass-through in bounded mode without new containment guarantees.",
+        "Global distributed scheduler redesign."
+      ]
+    },
+    "plan": {
+      "steps": [
+        {
+          "id": "STEP_01",
+          "title": "Profile model implementation",
+          "detail": "Add a gate throughput profile enum and resolver for:\n- effective test parallelism\n- effective CPU quota percent\nInclude deterministic host-aware bounds.\n"
+        },
+        {
+          "id": "STEP_02",
+          "title": "CLI and gates wiring",
+          "detail": "Add `--gate-profile` to `apm2 fac gates`.\nChange default `--cpu-quota` handling to `auto` resolution from profile.\nSurface requested/effective settings in JSON telemetry.\n"
+        },
+        {
+          "id": "STEP_03",
+          "title": "Decouple test env defaults",
+          "detail": "Refactor FAC throughput resolution to host-aware behavior and use\nexplicit helper(s) for profile-driven parallelism injection.\n"
+        },
+        {
+          "id": "STEP_04",
+          "title": "Pipeline alignment",
+          "detail": "Apply the same profile-driven throughput defaults in pipeline bounded\ntest command construction to keep gates and pipeline behavior aligned.\n"
+        },
+        {
+          "id": "STEP_05",
+          "title": "Ticket amendment sweep",
+          "detail": "Add amendment entries to all impacted tickets:\nTCK-00410, TCK-00436, TCK-00519, TCK-00549, TCK-00602,\nTCK-00605, TCK-00607.\n\nAmendment rule:\n- bounded constraints remain security/containment requirements.\n- default throughput is profile-driven and queue-managed on\n  high-capacity hosts.\n"
+        },
+        {
+          "id": "STEP_06",
+          "title": "Validation",
+          "detail": "Run compile and targeted tests for:\n- profile resolution and auto quota behavior\n- host-aware test env behavior\n- gate module integration paths\n"
+        }
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "`apm2 fac gates --help` exposes `--gate-profile` with throughput/balanced/conservative options.",
+        "`apm2 fac gates` defaults to profile-driven host-aware parallelism and no longer defaults to fixed two-thread behavior.",
+        "`NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` default resolution is decoupled from lane cpu_quota.",
+        "Pipeline bounded test command path uses the same throughput-profile defaulting model as local gates.",
+        "Bounded containment semantics remain fail-closed and unchanged in security posture.",
+        "Impacted historical tickets include explicit amendment notes documenting the policy pivot.",
+        "`cargo check -p apm2-core -p apm2-cli` passes.",
+        "Targeted profile/test-env unit tests pass."
+      ]
+    },
+    "notes": {
+      "context": "This ticket formalizes a policy pivot:\n- Keep bounded controls as mandatory safety containment.\n- Move throughput control to host-aware profiles + queue admission.\n\nThis prevents future ambiguity where “bounded” was interpreted as\n“always low throughput,” which caused avoidable gate latency on\nhigh-capacity hosts.\n",
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

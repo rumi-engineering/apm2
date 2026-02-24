@@ -1,0 +1,134 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00619",
+      "title": "Fix: PR closed instead of merged in GitHub projection; remove post-merge worktree deletion; remove --allow-legacy-cache flag",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_CI",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00618",
+          "reason": "Lifecycle gate-retry and verdict-comment fixes; related projection infrastructure."
+        }
+      ]
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "Three issues addressed in this ticket:\n\nBUG 1 (Regression, introduced in TCK-00617): PRs are marked \"closed\" rather than \"merged\" on GitHub\n  after a successful local fast-forward merge.\n  Location: crates/apm2-cli/src/commands/fac_review/github_projection.rs:385-415\n    (close_pr_if_open), called from lifecycle.rs:3018 via\n    project_merge_to_github_with().\n  Observed: After local merge + push to origin/main, the GitHub projection\n    calls close_pr_if_open(), which issues:\n      PATCH /repos/{owner/repo}/pulls/{pr_number}  {\"state\": \"closed\"}\n    This sets PR state to \"closed\", not \"merged\". GitHub distinguishes\n    the two: a merged PR shows the purple \"Merged\" badge and is recorded\n    in the commit's associated-PRs list; a closed PR shows the red \"Closed\"\n    badge and is not associated with the merge commit. This corrupts the\n    audit trail and breaks any downstream tooling that filters by merged PRs.\n  Cause: TCK-00617 added explicit close_pr_if_open() as a best-effort\n    projection after local merge, on the theory that GitHub might not\n    auto-close the PR when the branch is deleted. The correct mechanism\n    to record a PR as merged is the GitHub PR merge endpoint:\n      PUT /repos/{owner/repo}/pulls/{pr_number}/merge\n    with sha= set to the merge commit SHA. Because the fast-forward merge\n    does not create a merge commit (it advances main to the feature branch\n    tip), the sha parameter should be the current HEAD of main post-merge.\n    Alternatively, GitHub auto-detects a PR as merged when its head branch\n    is deleted and the commits are reachable from the base branch — which\n    means the delete_remote_branch_projection() step alone may be\n    sufficient to trigger the \"merged\" state without any explicit API call.\n  Fix: Replace close_pr_if_open() with a merge_pr_on_github() call that\n    uses PUT /repos/{owner/repo}/pulls/{pr_number}/merge. If the PR is\n    already closed or merged (idempotent guard), skip the call. If the\n    merge API call fails, the projection must fail-closed (propagate error)\n    rather than silently succeeding — a PR left in \"open\" or \"closed\" state\n    is an unacceptable outcome for the audit trail.\n\nISSUE 2 (Correctness, introduced in TCK-00617): Post-merge worktree deletion is undesirable.\n  Location: lifecycle.rs:2403-2467 (cleanup_merged_branch_local_state_inner),\n    called from lifecycle.rs:3394 after project_merge_to_all_sinks_with_retry().\n  Detail: cleanup_merged_branch_local_state_inner() runs:\n    1. maybe_cleanup_worktree_target() — removes the worktree's /target dir.\n    2. git worktree remove --force {worktree_path} — deletes the worktree.\n    3. git branch -D {branch} — deletes the local branch ref.\n    The worktree deletion (step 2) is problematic: agent processes, editors,\n    or the orchestrator itself may hold references to the worktree path.\n    Silently deleting a live worktree mid-session causes path-not-found\n    errors in consumers and leaves dangling worktree metadata in git.\n  Fix: Remove the git worktree remove --force call from\n    cleanup_merged_branch_local_state_inner(). Retain the /target removal\n    (disk space hygiene) and local branch ref deletion (keeps local branch\n    list clean). The worktree lifecycle is managed externally by the\n    orchestrator; the merge path must not touch it.\n\nISSUE 3 (Cleanup, from TCK-00540): The --allow-legacy-cache migration flag\n  is no longer needed and must be removed.\n  Location: fac.rs (CLI arg), fac_gates_job.rs, fac_worker.rs,\n    fac_review/{mod,gates,gate_cache,evidence,push}.rs\n  Background: TCK-00540 added --allow-legacy-cache as a temporary unsafe\n    override allowing reuse of gate cache entries that lack RFC-0028/0029\n    receipt bindings, to support migration of pre-binding cache entries.\n    The migration period is now complete; all live cache entries carry\n    proper receipt bindings. Retaining the flag leaves an unsafe override\n    path in the security-sensitive gate evaluation stack with no legitimate\n    use case. The flag threads through multiple layers of the codebase\n    (CLI → job struct → worker opts → review pipeline → gate cache\n    check_reuse()), adding complexity and dead-weight to every callsite.\n  Fix: Delete the flag and all its infrastructure. The fail-closed default\n    behavior (reject entries without both rfc0028_receipt_bound and\n    rfc0029_receipt_bound) is retained; only the unsafe override branch\n    (legacy_cache_override_unsafe) is removed. This is safe because the\n    flag is an opt-in unsafe escape hatch — removing it hardens the default\n    and eliminates the migration bypass entirely.\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1_REPLACE_CLOSE_WITH_MERGE_API",
+        "title": "Replace close_pr_if_open() with merge_pr_on_github()",
+        "detail": "In github_projection.rs, replace close_pr_if_open() with a new\nfunction merge_pr_on_github(repo, pr_number, sha) that calls:\n  PUT /repos/{repo}/pulls/{pr_number}/merge\n  body: { \"sha\": \"{sha}\", \"merge_method\": \"merge\" }\nThe sha must be the current HEAD of local main after fast-forward\n(the feature branch tip, since no merge commit is created).\nIdempotency: if the PR is already in state \"merged\" or \"closed\",\nreturn Ok(()) without re-calling the API.\nRemove the close_pr_if_open function entirely.\n"
+      },
+      {
+        "id": "S2_FAIL_CLOSED_ON_MERGE_PROJECTION",
+        "title": "Fail closed if GitHub merge projection fails",
+        "detail": "Currently project_merge_to_github_with() aggregates errors and\nreturns them but the caller (project_merge_to_all_sinks_with_retry)\nretries up to 3 times with 2 s delay. This is acceptable for the\nmerge projection step, but if merge_pr_on_github() fails after all\nretries, the error must propagate to the caller of\nmaybe_auto_merge_if_ready_inner() and surface in the merge receipt\nas a projection failure — not silently swallowed.\nThe local Merged lifecycle event is already committed at this point,\nso the merge is authoritative locally; however, an unresolved GitHub\nprojection failure must be flagged for operator attention (not just\nWARNING-logged).\n"
+      },
+      {
+        "id": "S3_REMOVE_WORKTREE_DELETION",
+        "title": "Remove git worktree remove --force from post-merge cleanup",
+        "detail": "In cleanup_merged_branch_local_state_inner() (lifecycle.rs:2403-2467),\nremove the block that calls:\n  git worktree remove --force {worktree_path}\n(currently around line 2441).\nRetain:\n- maybe_cleanup_worktree_target() — /target dir removal for disk hygiene.\n- git branch -D {branch} — local branch ref cleanup.\nDo not retain: any call to git worktree remove, git worktree prune,\nor std::fs::remove_dir_all on the worktree root.\n"
+      },
+      {
+        "id": "S4_REGRESSION_TESTS",
+        "title": "Regression tests",
+        "detail": "- Test: after successful local merge, the GitHub projection calls\n  PUT .../pulls/{pr}/merge (not PATCH .../pulls/{pr} with state=closed).\n- Test: if merge_pr_on_github() fails, the error propagates (not swallowed).\n- Test: if PR is already merged/closed, merge_pr_on_github() is a no-op.\n- Test: post-merge cleanup does NOT call git worktree remove.\n- Test: post-merge cleanup DOES remove the /target directory.\n- Test: post-merge cleanup DOES delete the local branch ref.\n- Test: --allow-legacy-cache is not present in the CLI surface (arg rejected).\n- Test: check_reuse() always rejects entries missing receipt bindings\n  (legacy_cache_override_unsafe branch is gone; fail-closed is unconditional).\n"
+      },
+      {
+        "id": "S5_REMOVE_ALLOW_LEGACY_CACHE",
+        "title": "Remove --allow-legacy-cache flag and all related infrastructure",
+        "detail": "The --allow-legacy-cache flag was introduced in TCK-00540 as a\ntemporary migration override. The migration is complete; remove the\nflag and every layer it touches:\n  - fac.rs: delete allow_legacy_cache CLI arg definition and its\n    pass-through to run_fac_worker().\n  - fac_gates_job.rs: remove allow_legacy_cache field from the job\n    struct and its propagation into the worker.\n  - fac_worker.rs: remove from FacWorkerOpts, the test stub, and all\n    call sites that thread the value into the review pipeline.\n  - fac_review/mod.rs: remove from function signatures and any struct\n    fields that carry the flag through the review pipeline.\n  - fac_review/gates.rs: remove from GateOpts / GateContext structs\n    and all gate evaluation call sites.\n  - fac_review/gate_cache.rs: remove allow_legacy_cache parameter from\n    check_reuse(); delete the legacy_cache_override_unsafe branch and\n    the two tests that exercise it\n    (legacy_entry_accepted_with_allow_legacy_cache_override and\n    allow_legacy_cache_flag_changes_runtime_behaviour).\n  - fac_review/evidence.rs: remove extraction of the flag from options\n    and the passing of it into the reuse policy calculation.\n  - fac_review/push.rs: remove allow_legacy_cache: false initializer\n    from the options struct construction.\nThe fail-closed default (reject entries lacking rfc0028_receipt_bound\nor rfc0029_receipt_bound) is fully retained — only the unsafe override\nbranch is deleted.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Redesigning the overall post-merge projection retry strategy.",
+      "Removing the /target directory cleanup or local branch ref deletion.",
+      "Unifying the CLI merge path with the daemon MergeExecutor.",
+      "Any changes to the local fast-forward merge or signed receipt logic."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "STEP_01",
+        "title": "Replace close_pr_if_open with merge_pr_on_github in github_projection.rs",
+        "detail": "Write merge_pr_on_github(repo: &str, pr_number: u32, sha: &str) -> Result<(), String>:\n  1. GET PR state; if already \"merged\" or \"closed\", return Ok(()).\n  2. PUT /repos/{repo}/pulls/{pr_number}/merge with sha and merge_method=merge.\n  3. Return Ok(()) on 200; return Err on any other status.\nDelete close_pr_if_open() entirely.\n"
+      },
+      {
+        "id": "STEP_02",
+        "title": "Thread merge SHA into project_merge_to_github",
+        "detail": "merge_pr_on_github requires the merge SHA (post-fast-forward HEAD of main).\nMergeProjectionContext already carries merge_sha (lifecycle.rs:2523).\nUpdate project_merge_to_github_with() signature and the close_pr_if_open\nfn-pointer slot to accept sha, passing context.merge_sha through.\n"
+      },
+      {
+        "id": "STEP_03",
+        "title": "Remove worktree deletion from cleanup_merged_branch_local_state_inner",
+        "detail": "Delete the git worktree remove --force block (and surrounding\nis_missing_worktree_error guard) from the function. Leave\nmaybe_cleanup_worktree_target and git branch -D untouched.\n"
+      },
+      {
+        "id": "STEP_04",
+        "title": "Add regression tests",
+        "detail": "Cover: merge API called (not close), idempotency guard, error propagation,\nno worktree remove call, /target removal preserved, branch -D preserved,\n--allow-legacy-cache absent from CLI, check_reuse() unconditionally\nfail-closed on entries missing receipt bindings.\n"
+      },
+      {
+        "id": "STEP_05",
+        "title": "Remove --allow-legacy-cache flag and all infrastructure",
+        "detail": "Delete allow_legacy_cache from: fac.rs (CLI arg + pass-through),\nfac_gates_job.rs (job struct field), fac_worker.rs (FacWorkerOpts,\ntest stub, call sites), fac_review/mod.rs (signatures + struct fields),\nfac_review/gates.rs (GateOpts, GateContext, eval call sites),\nfac_review/gate_cache.rs (check_reuse() parameter + legacy override\nbranch + two associated tests), fac_review/evidence.rs (option\nextraction + reuse policy passing), fac_review/push.rs (struct init).\nRetain the fail-closed default in check_reuse() unchanged.\n"
+      },
+      {
+        "id": "STEP_06",
+        "title": "Run full workspace validation",
+        "detail": "cargo fmt --all\ncargo clippy --workspace --all-targets --all-features -- -D warnings\ncargo doc --workspace --no-deps\ncargo test --workspace\n"
+      }
+    ]
+  },
+  "definition_of_done": {
+    "evidence_ids": [
+      "EXEC-TCK00619-MERGE-API-PROJECTION",
+      "EXEC-TCK00619-NO-WORKTREE-DELETION",
+      "EXEC-TCK00619-REMOVE-ALLOW-LEGACY-CACHE",
+      "EXEC-TCK00619-WORKSPACE-VALIDATION"
+    ],
+    "criteria": [
+      "After a successful local fast-forward merge, the GitHub PR is in 'merged' state (purple badge), not 'closed' state.",
+      "The GitHub projection calls PUT /repos/{owner/repo}/pulls/{pr}/merge, not PATCH with state=closed.",
+      "close_pr_if_open() is removed from the codebase entirely.",
+      "If merge_pr_on_github() fails after retries, the failure is surfaced to the operator (not silently WARNING-logged).",
+      "Post-merge cleanup does not issue git worktree remove for the feature branch worktree.",
+      "Post-merge cleanup still removes the worktree /target directory.",
+      "Post-merge cleanup still deletes the local feature branch ref.",
+      "The --allow-legacy-cache CLI flag is absent from the fac/fac-gates CLI surface.",
+      "allow_legacy_cache is removed from every struct, function signature, and call site across the eight affected source files.",
+      "The legacy_cache_override_unsafe branch in gate_cache::check_reuse() is deleted; check_reuse() is unconditionally fail-closed for entries lacking receipt bindings.",
+      "Regression tests pass for all the above invariants.",
+      "Workspace validation (fmt, clippy, doc, test) completes successfully."
+    ]
+  },
+  "notes": {
+    "context": "The PR-closed regression was introduced in TCK-00617 (S2_PROJECT_MERGE_TO_GITHUB),\nwhich added close_pr_if_open() as a post-merge GitHub projection step.\nThe intent was to ensure the PR is not left open if GitHub does not\nauto-detect the merge; the implementation incorrectly used the close\nendpoint instead of the merge endpoint. GitHub's PR state machine\ndistinguishes \"closed\" from \"merged\": only a merge via the merge\nendpoint (or a push that makes the PR commits reachable from the base\nand triggers auto-detection) sets state to \"merged\".\nThe worktree deletion removal is a correctness fix: the orchestrator\nowns the worktree lifecycle and must not have it deleted underneath it\nby the merge path. The /target cleanup and branch ref deletion remain\nsafe and desirable.\nThe allow_legacy_cache removal closes out the TCK-00540 migration: that\nticket added --allow-legacy-cache as an explicit escape hatch so operators\ncould continue using cache entries produced before RFC-0028/0029 receipt\nbinding was enforced. Those entries are now either expired or re-populated\nwith bound receipts. Removing the flag eliminates a permanent unsafe bypass\nin the gate evaluation stack and reduces the codebase surface that must be\naudited for security correctness.\n",
+    "security": "default-deny, fail-closed on GitHub projection failure; removal of legacy_cache_override_unsafe hardens gate cache to unconditional fail-closed"
+  }
+}

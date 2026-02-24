@@ -1,0 +1,81 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00221",
+      "title": "FAC: Artifact manifest and evidence binding",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0007",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00218"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add ArtifactManifest proto message",
+        "Define ArtifactManifest Rust types",
+        "Define ArtifactDigest with data classification",
+        "Implement basic hygiene validation"
+      ],
+      "out_of_scope": [
+        "Full evidence hygiene enforcement (TCK-00229)",
+        "Retention policy enforcement"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add ArtifactManifest message to proto/kernel_events.proto",
+        "Create crates/apm2-core/src/fac/artifact_manifest.rs",
+        "Define ArtifactManifest struct with artifacts",
+        "Define ArtifactDigest struct",
+        "Define ArtifactType enum (Log, Junit, Coverage, Snapshot, Binary)",
+        "Define DataClassification enum (Public, Internal, Confidential, Restricted)",
+        "Implement validate_hygiene() method",
+        "Write unit tests for hygiene validation"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0007"
+      ],
+      "criteria": [
+        "ArtifactManifest includes data_classification for all artifacts",
+        "ArtifactDigest has required metadata fields",
+        "Basic hygiene validation works",
+        "cargo test -p apm2-core fac::artifact_manifest::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "Artifact manifest ensures evidence artifacts have proper\ndata classification and retention metadata. This supports\nevidence hygiene requirements.\n",
+      "implementation_details": "ArtifactManifest fields:\n- artifacts: Vec<ArtifactDigest>\n\nArtifactDigest fields:\n- artifact_type, digest, data_classification\n- redaction_applied, redaction_profile_hash\n- retention_window_ref\n",
+      "affected_files": "Modified: proto/kernel_events.proto\nCreated: crates/apm2-core/src/fac/artifact_manifest.rs\n"
+    }
+  }
+}

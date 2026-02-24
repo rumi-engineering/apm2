@@ -1,0 +1,84 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/schema_registry",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SCHEMA-001",
+      "kind": "invariant",
+      "title": "Digests are exactly 32 bytes (BLAKE3 output)",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-002",
+      "kind": "invariant",
+      "title": "Digests are deterministic: same content produces same digest",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-003",
+      "kind": "invariant",
+      "title": "stable_id is unique within a registry",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-004",
+      "kind": "invariant",
+      "title": "Schema entries are immutable once registered",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-005",
+      "kind": "safety",
+      "title": "Fail-closed: unknown schemas return None, never silent acceptance",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-006",
+      "kind": "invariant",
+      "title": "Registration is idempotent for same stable_id and content",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-007",
+      "kind": "safety",
+      "title": "Conflict error if stable_id exists with different content",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-008",
+      "kind": "invariant",
+      "title": "Schema count cannot exceed max_schemas",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-009",
+      "kind": "invariant",
+      "title": "One stable_id per digest prevents ghost entries",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-010",
+      "kind": "invariant",
+      "title": "Lock ordering prevents deadlocks: insertion_order -> by_digest -> by_stable_id",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-011",
+      "kind": "invariant",
+      "title": "Protected kernel schemas are never evicted",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-012",
+      "kind": "safety",
+      "title": "Register validates digest matches content before storage",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-SCHEMA-013",
+      "kind": "safety",
+      "title": "Staging pattern validates and hashes before acquiring write locks",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

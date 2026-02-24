@@ -1,0 +1,92 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00065",
+      "title": "Improve Check Workflow Error Messages"
+    },
+    "binds": {
+      "prd_id": "NONE",
+      "rfc_id": "RFC-0006",
+      "requirements": [
+        {
+          "requirement_id": "MAINT-011",
+          "requirement_ref": "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[5]"
+        }
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_BUILD_RELEASE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00061"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add remediation mapping for each check failure type in check.rs",
+        "Display failure-specific fix commands when checks fail",
+        "Clippy failure shows: cargo clippy --fix --allow-dirty",
+        "Fmt failure shows: cargo fmt",
+        "Test failure shows: cargo test --workspace",
+        "SecurityReview failure shows: cargo xtask push --force-review",
+        "QualityReview failure shows: cargo xtask push --force-review",
+        "SemverCheck failure shows: cargo semver-checks",
+        "Format output as: [X] <Check> failed / Fix: <command>"
+      ],
+      "out_of_scope": [
+        "Changes to other xtask commands",
+        "Automatic execution of remediation commands",
+        "Changes to check pass/fail logic",
+        "New check types"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read xtask/src/tasks/check.rs to understand current failure display logic",
+        "Define remediation command mapping (check type -> fix command string)",
+        "Create helper function get_remediation_command(check_type) -> Option<String>",
+        "Modify failure output to include fix hint on line below failure marker",
+        "Update Clippy failure output: [X] Clippy checks failed / Fix: cargo clippy --fix --allow-dirty",
+        "Update Fmt failure output: [X] Format check failed / Fix: cargo fmt",
+        "Update Test failure output: [X] Tests failed / Fix: cargo test --workspace",
+        "Update SecurityReview failure output: [X] Security review failed / Fix: cargo xtask push --force-review",
+        "Update QualityReview failure output: [X] Quality review failed / Fix: cargo xtask push --force-review",
+        "Update SemverCheck failure output: [X] Semver check failed / Fix: cargo semver-checks",
+        "Run cargo build to verify compilation",
+        "Run cargo test --workspace to verify tests pass",
+        "Run cargo clippy to verify no warnings",
+        "Manually test with intentional failures to verify remediation hints display correctly"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Clippy failures display: Fix: cargo clippy --fix --allow-dirty",
+        "Fmt failures display: Fix: cargo fmt",
+        "Test failures display: Fix: cargo test --workspace",
+        "SecurityReview failures display: Fix: cargo xtask push --force-review",
+        "QualityReview failures display: Fix: cargo xtask push --force-review",
+        "SemverCheck failures display: Fix: cargo semver-checks",
+        "Fix hint appears indented on line below the [X] failure marker",
+        "cargo build succeeds",
+        "cargo test passes",
+        "cargo clippy passes with no warnings"
+      ]
+    },
+    "notes": {
+      "security": "No security impact - display-only enhancement to error messages",
+      "display_format": "[X] Clippy checks failed\n    Fix: cargo clippy --fix --allow-dirty\n",
+      "affected_file": "xtask/src/tasks/check.rs"
+    }
+  }
+}

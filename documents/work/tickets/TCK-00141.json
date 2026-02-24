@@ -1,0 +1,149 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00141",
+      "title": "Implement deterministic export pipeline",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0007",
+      "rfc_id": "RFC-0011",
+      "requirements": [
+        {
+          "requirement_id": "CAC-REQ-0005",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0005.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "CAC-REQ-0013",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0013.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-0006",
+        "EVID-0009"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL",
+        "DOMAIN_COMPILER"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00137",
+        "TCK-00140"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement ExportPipeline struct that transforms ContextPack to vendor layout",
+        "Implement profile-constrained rendering based on TargetProfile",
+        "Embed provenance metadata in all exported outputs",
+        "Generate ExportManifest with content hashes for all outputs",
+        "Ensure byte-identical determinism (re-export produces identical output)",
+        "Use atomic file writes for crash safety",
+        "Support Markdown output format with YAML frontmatter provenance"
+      ],
+      "out_of_scope": [
+        "CLI command implementation (TCK-00143)",
+        "Conformance test framework (TCK-00142)",
+        "Additional vendor formats beyond Markdown"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create crates/apm2-core/src/cac/export.rs module",
+        "Define ExportPipeline struct with TargetProfile and output directory",
+        "Define ExportManifest struct with outputs list and content hashes",
+        "Define ExportOutput struct with path, content_hash, provenance",
+        "Implement render_context_pack() applying RenderingPolicy constraints",
+        "Implement embed_provenance() adding YAML frontmatter to Markdown",
+        "Implement write_outputs() using atomic_write for crash safety",
+        "Implement generate_manifest() computing content hashes",
+        "Write determinism property tests (export twice, compare byte-for-byte)",
+        "Write unit tests for rendering policy application"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0006",
+        "EVID-0009"
+      ],
+      "criteria": [
+        "ExportPipeline::export() returns Result<ExportManifest, ExportError>",
+        "Re-exporting same pack with same profile produces byte-identical output",
+        "All exported Markdown files have provenance frontmatter",
+        "ExportManifest includes content_hash for each output file",
+        "BudgetPolicy violations return descriptive errors",
+        "All tests pass: cargo test export"
+      ]
+    },
+    "notes": {
+      "security": "Deterministic output is critical for audit and verification.\nProvenance embedding enables downstream verification of export source.\n",
+      "architecture": "DD-0005: CAC-JSON is always source of truth; vendor layouts are derived outputs.\nExport determinism is verifiable via conformance tests (TCK-00142).\n\nUse existing determinism patterns from canonicalize.rs:\n- Lexicographic key ordering for any serialized output\n- Consistent formatting (indentation, newlines)\n- Idempotent output (export(export(pack)) == export(pack))\n\nProvenance frontmatter format (Markdown):\n```yaml\n---\nprovenance:\n  source_pack_hash: \"sha256:...\"\n  export_profile: \"claude-code-v1\"\n  export_timestamp: \"2026-01-27T12:00:00Z\"\n  exporter_version: \"0.1.0\"\n---\n```\n",
+      "rust_textbook_refs": [
+        {
+          "file": ".claude/skills/rust-textbook/25_time_monotonicity_determinism.md",
+          "rules": [
+            "CTR-2501: Time Is an External Input (inject timestamps, don't read SystemTime)",
+            "CTR-2503: Deterministic Tests Require a Controllable Clock"
+          ]
+        },
+        {
+          "file": ".claude/skills/rust-textbook/16_io_protocol_boundaries.md",
+          "rules": [
+            "CTR-1602: Serialization Formats Must Be Versioned",
+            "INV-1601: Partial Progress Is the Default at I/O Boundaries"
+          ]
+        },
+        {
+          "file": ".claude/skills/rust-textbook/17_testing_fuzz_miri_evidence.md",
+          "rules": [
+            "INV-1701: Tests Encode Invariants, Not Only Examples"
+          ]
+        },
+        {
+          "file": ".claude/skills/rust-textbook/12_api_design_stdlib_quality.md",
+          "rules": [
+            "CTR-1206: Authoritative Apply Pattern (single function for config application)"
+          ]
+        }
+      ],
+      "codebase_context": {
+        "files_to_reference": [
+          {
+            "path": "crates/apm2-core/src/determinism/canonicalize.rs",
+            "purpose": "Pattern for deterministic output (key sorting, TypedKey, idempotence tests)"
+          },
+          {
+            "path": "crates/apm2-core/src/determinism/atomic_write.rs",
+            "purpose": "Atomic file writing for crash safety"
+          },
+          {
+            "path": "crates/apm2-core/src/determinism/mod.rs",
+            "purpose": "Determinism module integration patterns"
+          }
+        ],
+        "files_to_create": [
+          {
+            "path": "crates/apm2-core/src/cac/export.rs",
+            "purpose": "Export pipeline implementation"
+          }
+        ],
+        "files_to_modify": [
+          {
+            "path": "crates/apm2-core/src/cac/mod.rs",
+            "purpose": "Export export module"
+          }
+        ]
+      }
+    }
+  }
+}

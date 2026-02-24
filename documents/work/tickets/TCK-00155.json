@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00155",
+      "title": "Implement coordination end-to-end integration tests",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0012"
+    }
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "All integration tests pass",
+      "verification": "cargo test coordination_integration"
+    },
+    {
+      "criterion": "Happy path produces valid receipt with deterministic JCS hash",
+      "verification": "Receipt validation in test"
+    },
+    {
+      "criterion": "Atomic binding via CAS-at-commit (SessionBound committed BEFORE spawn)",
+      "verification": "Test logs and ledger event ordering verification (MANDATORY ORDERING)"
+    },
+    {
+      "criterion": "Coordination uses SessionSpawner trait for decoupling",
+      "verification": "Documentation and trait usage review"
+    },
+    {
+      "criterion": "Golden test vectors verify versioned canonicalization (JCS 1.0)",
+      "verification": "cargo test --package apm2-core --lib coordination::canonicalization::tests"
+    },
+    {
+      "criterion": "transition_count uses u64 width to match underlying state",
+      "verification": "Code review of event and state structures"
+    },
+    {
+      "criterion": "AGENTS.md follows module pattern",
+      "verification": "Documentation review"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-core/tests/coordination_integration.rs",
+        "purpose": "Integration test suite"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Add SessionSpawner trait and AGENTS.md documentation",
+        "path": "crates/apm2-core/src/coordination/mod.rs"
+      }
+    ],
+    "implementation_steps": [
+      "Define SessionSpawner trait in coordination/mod.rs",
+      "Update CoordinationEvent to include expected_transition_count (u64)",
+      "Implement versioned canonicalizer (JCS 1.0) and canonical_bytes() method",
+      "Add golden test vectors for coordination events and receipts in kernel-testkit",
+      "Implement MockSessionSpawner for integration tests",
+      "Implement coordination execution loop with NORMATIVE CAS-at-commit ordering (commit before side-effect)",
+      "Write integration tests for happy path and TOCTOU races (verify commit-before-spawn)"
+    ],
+    "summary": "Implement coordination end-to-end integration tests with CAS-at-commit atomicity and versioned canonicalization."
+  },
+  "notes": "Phase: PHASE-1\nGenerated from RFC RFC-0012 ticket decomposition on 2026-01-27.",
+  "test_requirements": [
+    {
+      "description": "Unit tests pass",
+      "test_id": "UT-00155-01",
+      "verification_command": "cargo test -p apm2-core tck_00155"
+    },
+    {
+      "description": "Integration test",
+      "test_id": "IT-00155-01",
+      "verification_command": "cargo run --bin apm2 -- factory tickets emit --rfc RFC-0012"
+    }
+  ]
+}

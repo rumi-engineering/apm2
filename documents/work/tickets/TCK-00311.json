@@ -1,0 +1,133 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00311",
+      "title": "FAC v0 NEW WORK REQUIRED: Workspace snapshot/apply + ReviewBlocked",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0010",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-HEF-0011",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0011.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0010",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0010.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL",
+        "DOMAIN_EVIDENCE",
+        "DOMAIN_DAEMON"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00286",
+          "reason": "Foundational daemon infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00287",
+          "reason": "Protocol server infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00288",
+          "reason": "Episode runtime infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00290",
+          "reason": "Tool broker infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00293",
+          "reason": "CAS storage infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00310",
+          "reason": "ChangeSetBundleV1 schema and ChangeSetPublished event required for workspace apply"
+        },
+        {
+          "ticket_id": "TCK-00314",
+          "reason": "Capability allowlists required for CAS access"
+        },
+        {
+          "ticket_id": "TCK-00254",
+          "reason": "RFC-0017: Session capability manifest infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00256",
+          "reason": "RFC-0017: Episode lifecycle management required"
+        },
+        {
+          "ticket_id": "TCK-00260",
+          "reason": "RFC-0017: Tool execution context required"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement reviewer workspace snapshot semantics from ChangeSetBundleV1",
+        "Implement workspace apply semantics with failure handling",
+        "Add ReviewBlockedRecorded ledger event type to kernel_events.proto",
+        "Define reason_code enumeration for workspace apply failures",
+        "Emit ReviewBlockedRecorded with CAS log references on apply/tool failure",
+        "Create review_blocked_v1.yaml schema with reason codes and CAS log bundle",
+        "Bound retries by HTF windows",
+        "Ensure blocked outcome is durable in ledger"
+      ],
+      "out_of_scope": [
+        "Review execution logic beyond workspace setup",
+        "ReviewReceipt generation (covered by TCK-00312)",
+        "End-to-end FAC harness (covered by TCK-00313)",
+        "GitHub integration for workspace state",
+        "Non-HTF retry policies"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read existing kernel_events.proto to understand event structure",
+        "Design ReviewBlockedRecorded event type with required fields (changeset_digest, reason_code, cas_log_refs)",
+        "Create schemas/apm2/review_blocked_v1.yaml with reason code enumeration (APPLY_FAILED, TOOL_TIMEOUT, RESOURCE_EXHAUSTED, etc.)",
+        "Add ReviewBlockedRecorded event type to proto/kernel_events.proto",
+        "Implement workspace snapshot extraction from ChangeSetBundleV1 in episode runtime",
+        "Implement workspace apply with failure detection and error categorization",
+        "Wire failure paths to emit ReviewBlockedRecorded with CAS log references",
+        "Implement HTF window retry bounds",
+        "Add tests for workspace apply success and failure paths",
+        "Verify blocked outcome persists across daemon restart"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0010"
+      ],
+      "criteria": [
+        "Workspace apply failure emits ReviewBlockedRecorded with CAS logs.",
+        "Retries bounded by HTF windows; blocked outcome is durable."
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed",
+      "verification": "Verify workspace apply failures are logged to CAS before emitting ReviewBlockedRecorded",
+      "general": "Part of FAC v0 Preconditions group; workspace semantics must be deterministic for replay"
+    }
+  }
+}

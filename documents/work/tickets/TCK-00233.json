@@ -1,0 +1,79 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00233",
+      "title": "FAC: Bounded retry manager",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0021",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0020",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Define MAX_GATE_ATTEMPTS and MAX_GLOBAL_EPISODES constants",
+        "Implement RetryManager struct",
+        "Implement can_retry() check",
+        "Implement record_attempt() with limit enforcement"
+      ],
+      "out_of_scope": [
+        "Echo-trap detection (TCK-00234)",
+        "Escalation handling"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create crates/apm2-core/src/fac/retry_manager.rs",
+        "Define MAX_GATE_ATTEMPTS = 3",
+        "Define MAX_GLOBAL_EPISODES = 50",
+        "Define RetryManager struct with gate_attempts and global_episodes",
+        "Implement can_retry(gate_id) method",
+        "Implement record_attempt(gate_id) method",
+        "Define RetryError enum",
+        "Write unit tests for limit enforcement"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0020"
+      ],
+      "criteria": [
+        "Per-gate max attempts is 3",
+        "Global max episodes is 50",
+        "Exceeding limits returns error",
+        "cargo test -p apm2-core fac::retry_manager::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "Bounded retries prevent infinite loops and resource exhaustion.\nBoth per-gate and global limits are enforced.\n",
+      "implementation_details": "RetryManager fields:\n- gate_attempts: HashMap<GateId, u32>\n- global_episodes: u32\n\ncan_retry(gate_id):\n- attempts < MAX_GATE_ATTEMPTS && global_episodes < MAX_GLOBAL_EPISODES\n\nrecord_attempt(gate_id):\n- Increment gate_attempts[gate_id]\n- Increment global_episodes\n- Return Err if limits exceeded\n",
+      "affected_files": "Created: crates/apm2-core/src/fac/retry_manager.rs\n"
+    }
+  }
+}

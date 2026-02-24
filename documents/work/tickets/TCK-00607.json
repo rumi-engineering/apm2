@@ -1,0 +1,130 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00607",
+      "title": "Fix doctor false positive, unify timeouts, add agent activity diagnostics, and auto-nudge incomplete reviewers",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00605",
+          "reason": "TCK-00605 introduced the doctor --pr checks including worker_liveness."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "Four operational issues surfaced during field verification of the FAC\nexecution substrate:\n\n1. DOCTOR worker_liveness CHECK IS A FALSE POSITIVE\n\n   The `check_projection_worker_health()` function in\n   `crates/apm2-cli/src/commands/daemon.rs:882` constructs the expected\n   cache path as:\n\n       let cache_path = state_dir.join(\"projection_cache.db\");\n\n   This always looks for `{state_dir}/projection_cache.db`.\n\n   However, the daemon projection worker in\n   `crates/apm2-daemon/src/main.rs:1508-1515` determines the cache path\n   differently when `ledger_db_path` is configured:\n\n       let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(\n           || { ... p.join(\"projection_cache.db\") },\n           |p| p.with_extension(\"projection_cache.db\"),\n       );\n\n   When `ledger_db_path` is set (e.g., to `ledger.db`), Rust's\n   `Path::with_extension()` replaces the existing extension, producing\n   `ledger.projection_cache.db` — NOT `projection_cache.db`.\n\n   Result: doctor reports 13/14 checks green with one ERROR on\n   worker_liveness, even though the projection worker is running\n   correctly and the cache file exists (just under the wrong name from\n   the doctor's perspective).\n\n   The fix must unify the cache-path derivation so that the doctor\n   check and the daemon use the same logic.\n\n2. TEST TIMEOUTS ARE INCONSISTENT (240s vs 600s)\n\n   The bounded FAC test timeout policy in\n   `crates/apm2-cli/src/commands/fac_review/timeout_policy.rs:10-11`\n   standardised on 600s:\n\n       pub const DEFAULT_BOUNDED_TEST_TIMEOUT_SECONDS: u64 = 600;\n       pub const MAX_MANUAL_TIMEOUT_SECONDS: u64 = 600;\n\n   However, the `LaneTimeouts` default in\n   `crates/apm2-core/src/fac/lane.rs:283` still uses 240s:\n\n       test_timeout_seconds: 240,\n\n   This means any code path that constructs a `LaneTimeouts::default()`\n   (e.g., lane profile deserialization fallback, systemd unit\n   generation) will silently use a 4-minute timeout while the rest of\n   the system expects 10 minutes. Tests relying on the lane profile\n   default can be killed 6 minutes early, producing flaky failures that\n   only reproduce under load.\n\n   The fix must unify all timeout defaults to 600s (or, if a cold/warm\n   distinction is desired, 600s cold / 240s warm with an explicit\n   field).\n\n3. DOCTOR --PR LACKS AGENT ACTIVITY METRICS\n\n   Orchestrator-monitor agents diagnosing PR state rely on\n   `apm2 fac doctor --pr <N>` to determine whether a \"pending\" review\n   is actively working or stuck. The current `DoctorAgentSnapshot`\n   (fac_review/mod.rs:136-159) includes `elapsed_seconds`,\n   `models_attempted`, and `last_activity_seconds_ago`, but does NOT\n   include the two most useful activity proxies:\n\n     a) Tool call count — how many tool invocations the agent has made\n        (a monotonically increasing count that distinguishes \"active\n        but slow\" from \"stuck doing nothing\").\n     b) Log line count — total lines written to the agent's log/output\n        file, which increases with any agent activity.\n\n   The event log scanner (`scan_event_signals_for_pr()` at\n   fac_review/mod.rs:1399-1498) already reads review_events.ndjson but\n   only extracts model attempts and activity timestamps. Extending it\n   to count tool-call events (and reading log file sizes) is\n   straightforward.\n\n   Without these metrics, orchestrator monitors must guess whether\n   \"pending\" means the agent is working or dead-but-not-yet-reaped,\n   leading to premature restarts or unnecessary waiting.\n\n4. REVIEWERS EXIT WITHOUT EXECUTING TERMINAL COMMAND (verdict set)\n\n   Review agents (especially codex) consistently collect context,\n   produce findings, but then exit cleanly without calling\n   `apm2 fac verdict set`. The auto-verdict reaper (TCK-00605) handles\n   this after the fact, but auto-derived verdicts are lower quality\n   than agent-issued ones because they lack the agent's synthesized\n   reasoning.\n\n   The existing `SpawnMode::Resume { message }` mechanism\n   (fac_review/orchestrator.rs:767-792, types.rs:549-552) already\n   supports resuming an agent session with a message — but it is only\n   triggered by SHA drift. There is no logic to detect \"agent exited\n   without verdict\" and resume with a nudge.\n\n   All three backends support session resume:\n     - Codex: `codex exec resume --last ... \"message\"`\n     - Gemini: `gemini --resume latest -p \"message\"`\n     - Claude: `claude --resume -p \"message\"`\n\n   The fix should detect clean-exit-without-verdict and, before\n   falling through to auto-verdict, attempt ONE resume with a message\n   that echoes the agent's original assigned prompt and instructs it\n   to execute the terminal command. If the nudge also fails to produce\n   a verdict, fall through to auto-verdict as today.\n"
+    },
+    "scope": {
+      "in_scope": [
+        {
+          "id": "S1_DOCTOR_CACHE_PATH",
+          "title": "Fix doctor worker_liveness cache-path derivation",
+          "detail": "The doctor check in `check_projection_worker_health()` must use the\nsame cache-path derivation logic as the daemon projection worker.\n\nCurrent doctor logic (daemon.rs:876-882):\n  let state_dir = config.daemon.state_file.parent()...;\n  let cache_path = state_dir.join(\"projection_cache.db\");\n\nCorrect logic must mirror daemon (main.rs:1508-1515):\n  - If `ledger_db_path` is set: `ledger_db_path.with_extension(\"projection_cache.db\")`\n  - Otherwise: `state_dir.join(\"projection_cache.db\")`\n\nThe doctor check needs access to `config.daemon.ledger_db_path` (or\nthe resolved `DaemonConfig`) to replicate this branching.\n\nAcceptance:\n  - `apm2 daemon doctor` reports worker_liveness as OK when the\n    projection worker is running and the cache file exists at the\n    ledger-adjacent path.\n  - `apm2 daemon doctor` still reports ERROR when projection is\n    enabled but the cache file genuinely does not exist.\n"
+        },
+        {
+          "id": "S2_UNIFY_TIMEOUTS",
+          "title": "Unify test timeout defaults to 600s",
+          "detail": "Change `LaneTimeouts::default()` in\n`crates/apm2-core/src/fac/lane.rs:283` from 240 to 600:\n\n    test_timeout_seconds: 600,\n\nUpdate all test fixtures and assertions that hard-code 240:\n  - `crates/apm2-core/src/fac/lane.rs:1572` (JSON fixture)\n  - `crates/apm2-core/src/fac/systemd_properties.rs:132` (test)\n\nVerify consistency with:\n  - `timeout_policy.rs` (already 600)\n  - `.config/nextest.toml` (60s × 10 cycles = 600s, already correct)\n  - RFC-0019 amendment A1 (mandates 600s uniform policy)\n\nIf a cold/warm split is desired instead:\n  - Add `test_timeout_cold_seconds: 600` and\n    `test_timeout_warm_seconds: 240` to `LaneTimeouts`\n  - Update the serialization format and lane profile schema\n  - Gate selection on workspace-cache presence\n  This is a larger change; the simple path is to unify to 600s.\n"
+        },
+        {
+          "id": "S3_DOCTOR_AGENT_ACTIVITY",
+          "title": "Add tool-call count and log-line count to doctor --pr agent snapshots",
+          "detail": "Extend `DoctorAgentSnapshot` (fac_review/mod.rs:136-159) with two\nnew fields:\n\n    tool_call_count: Option<u64>,\n    log_line_count: Option<u64>,\n\n**Tool call count:**\nExtend `scan_event_signals_for_pr()` (fac_review/mod.rs:1399-1498)\nto count events that represent tool invocations. The review event\nlog (review_events.ndjson) already contains structured events; any\nevent with a `\"tool\"` or `\"tool_call\"` field (or event type\nindicating tool use) should increment a per-agent counter. The\nexact event shape depends on the backend, so the scanner should\ncount liberally (any event that is not a pure lifecycle event\nlike `run_start`, `model_fallback`, `run_complete` is likely a\ntool call or output event).\n\nIf the event log does not contain tool-granularity events for a\nbackend, fall back to counting total event lines for that\nagent's run_id as a proxy.\n\n**Log line count:**\nThe `ReviewStateEntry` stores `log_file: PathBuf` — the temp file\nwhere agent stdout/stderr is captured. Read the file's line count\n(or byte size as a cheaper proxy) and surface it in the snapshot.\nFor agents whose log file has been cleaned up, emit `None`.\n\nWire both fields into the `DoctorAgentSnapshot` serialization so\nthey appear in `apm2 fac doctor --pr <N> --json` output.\n\nAcceptance:\n  - `apm2 fac doctor --pr <N> --json | jq '.agents.entries[].tool_call_count'`\n    returns a non-null integer for active/completed agents.\n  - `apm2 fac doctor --pr <N> --json | jq '.agents.entries[].log_line_count'`\n    returns a non-null integer when the log file exists.\n  - Orchestrator-monitor agents can distinguish \"pending, 0 tool\n    calls\" (stuck) from \"pending, 847 tool calls\" (working).\n"
+        },
+        {
+          "id": "S4_AUTO_NUDGE",
+          "title": "Auto-nudge agents that exit without executing their terminal command",
+          "detail": "Add a nudge-before-auto-verdict mechanism to the review\norchestrator. When a review agent process exits (clean exit, not\ncrash/timeout) without having called `apm2 fac verdict set`, the\nsystem should attempt ONE session resume before falling through\nto auto-verdict.\n\n**Detection site:**\nIn `run_single_review()` (orchestrator.rs:595), after the spawned\nprocess exits, the orchestrator already checks whether a verdict\nwas set. If the process exited with code 0 but no verdict exists\nfor this (pr, dimension, sha), this is the nudge trigger.\n\n**Nudge mechanism:**\n1. Read the agent's original prompt from `ReviewStateEntry.prompt_file`\n   (or reconstruct it via `build_prompt_content()`).\n2. Construct a resume message:\n\n       \"RESUME TASK — REQUIRED TERMINAL COMMAND NOT EXECUTED.\n        You exited without running your required terminal command.\n        You MUST execute this command before exiting:\n\n            apm2 fac verdict set --pr {pr} --sha {sha} \\\n                --dimension {dimension} --verdict <approve|deny> \\\n                --reason '<your synthesized reasoning>'\n\n        Your original assignment was:\n        ---\n        {original_prompt_content}\n        ---\n\n        Review your findings and execute the verdict command now.\"\n\n3. Spawn with `SpawnMode::Resume { message }` using the\n   appropriate backend resume command (codex exec resume --last,\n   gemini --resume latest, claude --resume).\n4. Track this as `nudge_attempt_count` on the `ReviewStateEntry`\n   (or `TrackedAgent`). Max nudge attempts: 1.\n5. If the nudge attempt also exits without verdict, fall through\n   to auto-verdict (existing reaper logic).\n\n**State tracking:**\nAdd a field to `ReviewStateEntry` or `ReviewRunState`:\n\n    nudge_count: u32,  // default 0, max 1\n\nThe nudge should only fire once per review run to avoid infinite\nresume loops.\n\n**Scope boundaries:**\n  - Nudge ONLY on clean exit (exit code 0) without verdict.\n  - Do NOT nudge on crash, timeout, or SIGKILL — these go straight\n    to auto-verdict as today.\n  - Do NOT nudge if the agent already exceeded MAX_RESTART_ATTEMPTS.\n  - The nudge uses the same model and backend as the original run.\n\nAcceptance:\n  - Codex agent exits without verdict → system resumes session\n    with nudge message → agent executes verdict set.\n  - If nudge also fails → auto-verdict fires (no regression).\n  - `nudge_count` is visible in doctor --pr agent snapshot.\n  - Review event log contains a `nudge_resume` event for\n    traceability.\n"
+        }
+      ],
+      "out_of_scope": [
+        "Refactoring the projection worker cache path logic itself (only the doctor check needs to match it).",
+        "Changing nextest.toml or CI-level timeouts (already correct at 600s).",
+        "Multi-nudge retry loops (nudge is capped at 1 attempt).",
+        "Changing the auto-verdict reaper logic itself (it remains the fallback).",
+        "Adding resume support to backends that don't have it (all three already do)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        {
+          "id": "STEP_01",
+          "title": "Fix doctor cache-path to mirror daemon logic",
+          "detail": "In `crates/apm2-cli/src/commands/daemon.rs`, update\n`check_projection_worker_health()`:\n\n1. Read `config.daemon.ledger_db_path` from the ecosystem config.\n2. If `ledger_db_path` is set, compute cache_path as\n   `ledger_db_path.with_extension(\"projection_cache.db\")`.\n3. Otherwise, fall back to `state_dir.join(\"projection_cache.db\")`.\n4. Update the comment at line 875 to reflect the new logic.\n"
+        },
+        {
+          "id": "STEP_02",
+          "title": "Unify LaneTimeouts::default() to 600s",
+          "detail": "1. Change `crates/apm2-core/src/fac/lane.rs:283` from 240 to 600.\n2. Update the JSON fixture in lane.rs:1572 to use 600.\n3. Update the systemd_properties.rs test at line 132 to use 600.\n4. Grep for any remaining 240-second test timeout references\n   and update them.\n"
+        },
+        {
+          "id": "STEP_03",
+          "title": "Add tool_call_count and log_line_count to DoctorAgentSnapshot",
+          "detail": "1. Add `tool_call_count: Option<u64>` and `log_line_count: Option<u64>`\n   fields to `DoctorAgentSnapshot` in fac_review/mod.rs.\n2. Extend `DoctorEventSignals` with a `tool_call_counts: BTreeMap<String, u64>`\n   keyed by agent run_id.\n3. In `scan_event_signals_from_reader()`, count events per run_id that\n   are not pure lifecycle events (run_start, run_complete, model_fallback).\n   These are tool calls or output events — count them all.\n4. In the doctor snapshot builder, read log file line count from\n   `ReviewStateEntry.log_file` (use `BufReader::lines().count()` or\n   metadata byte size as a cheaper proxy).\n5. Wire both into the JSON serialization.\n"
+        },
+        {
+          "id": "STEP_04",
+          "title": "Implement auto-nudge for clean-exit-without-verdict",
+          "detail": "1. Add `nudge_count: u32` field to `ReviewRunState` (types.rs) and\n   `TrackedAgent` (lifecycle.rs). Default 0.\n2. In `run_single_review()` (orchestrator.rs), after the child process\n   exits, add a check:\n     - Exit code 0 AND no verdict set for (pr, dimension, sha)\n     - AND nudge_count == 0\n     - AND restart_count < MAX_RESTART_ATTEMPTS\n   If all true, enter nudge path.\n3. Nudge path:\n   a. Read original prompt from prompt_file or reconstruct via\n      `build_prompt_content()`.\n   b. Construct the nudge message (see S4 detail).\n   c. Increment nudge_count in run state and persist.\n   d. Emit a `nudge_resume` event to review_events.ndjson.\n   e. Spawn with `SpawnMode::Resume { message: nudge_message }`.\n   f. Wait for the resumed process to exit.\n   g. If verdict still not set, fall through to auto-verdict.\n4. Surface `nudge_count` in `DoctorAgentSnapshot`.\n"
+        },
+        {
+          "id": "STEP_05",
+          "title": "Test and verify",
+          "detail": "1. Run `cargo test -p apm2-cli` — doctor and review tests pass.\n2. Run `cargo test -p apm2-core fac::lane` — lane profile tests pass.\n3. Run `cargo test -p apm2-core fac::systemd` — systemd tests pass.\n4. Run `apm2 daemon doctor` on a running daemon with\n   ledger_db_path configured — worker_liveness reports OK.\n5. Verify `apm2 fac doctor --pr <N> --json` output includes\n   tool_call_count and log_line_count for agent entries.\n6. Verify nudge logic: mock a clean-exit-without-verdict scenario\n   and confirm resume is attempted once before auto-verdict.\n"
+        }
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "`apm2 daemon doctor` reports worker_liveness=OK when projection worker is running (no false positive).",
+        "Doctor still detects genuinely missing projection cache (no false negative).",
+        "`LaneTimeouts::default().test_timeout_seconds` is 600.",
+        "No remaining hard-coded 240s test timeout defaults in the codebase (grep-verified).",
+        "`apm2 fac doctor --pr <N> --json` agent entries include `tool_call_count` and `log_line_count`.",
+        "Orchestrator-monitor agents can distinguish stuck (0 tool calls) from active (N tool calls) pending reviews.",
+        "Clean-exit-without-verdict triggers exactly one nudge resume before falling through to auto-verdict.",
+        "Nudge message echoes the agent's original prompt and specifies the required terminal command.",
+        "`nudge_count` is tracked in run state and visible in doctor --pr output.",
+        "Nudge does NOT fire on crash, timeout, or SIGKILL exits.",
+        "`cargo test -p apm2-cli -p apm2-core` passes."
+      ]
+    },
+    "notes": {
+      "context": "Discovered during field verification of multi-PR orchestration runs:\n\n(1) `apm2 daemon doctor` reported 13/14 checks green with one ERROR\non worker_liveness. The projection cache file existed as\n`ledger.projection_cache.db` but the doctor check was looking for\n`projection_cache.db`. Path-derivation mismatch from TCK-00322.\n\n(2) Timeout inconsistency (240s vs 600s) noticed during the same\nreview. The bounded timeout policy and nextest config are already at\n600s, but LaneTimeouts::default() still uses the pre-RFC-0019 value\nof 240s.\n\n(3) Orchestrator-monitor agents diagnosing pending reviews have no\nquantitative activity signal. They see \"pending\" and\n\"last_activity_seconds_ago\" but cannot tell if the agent has made\n847 tool calls (healthy, just slow) or 0 tool calls (stuck). Adding\ntool_call_count and log_line_count to doctor --pr agent snapshots\ngives monitors a monotonically increasing proxy for agent progress.\n\n(4) Codex (and occasionally other backends) consistently exits after\ncollecting context and producing findings but BEFORE calling\n`apm2 fac verdict set`. The auto-verdict reaper catches this\neventually, but auto-derived verdicts lack the agent's synthesized\nreasoning. Since all three backends support session resume, we can\nnudge the agent once: resume the session with a message echoing the\noriginal prompt and explicitly instructing it to execute the verdict\ncommand. This is cheaper and higher quality than restarting from\nscratch or falling through to auto-verdict.\n",
+      "amendments": [
+        {
+          "amendment_id": "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT",
+          "summary": "Retain uniform timeout policy while allowing host-aware throughput profile defaults.",
+          "supersedes": [
+            "Interpretation that uniform timeout policy implies conservative fixed CPU throughput defaults."
+          ],
+          "replacement": [
+            "Timeout policy remains uniform and fail-closed.",
+            "CPU quota and lane test/build parallelism defaults are profile-driven (`throughput` by default on high-capacity hosts)."
+          ]
+        }
+      ],
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

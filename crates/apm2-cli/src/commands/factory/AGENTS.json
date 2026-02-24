@@ -1,0 +1,50 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli/src/commands/factory",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-FACTORY-001",
+      "kind": "invariant",
+      "title": "Pipeline stages execute in strict order with no skipping",
+      "description": "Compile pipeline stages (CCP Build, Impact Map, RFC Frame, Ticket Emit) execute in strict order; no stage is skipped.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-002",
+      "kind": "invariant",
+      "title": "Each pipeline stage receives output from previous stage",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-003",
+      "kind": "safety",
+      "title": "Pipeline errors halt immediately with context",
+      "description": "Errors in any pipeline stage halt the pipeline immediately with diagnostic context.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-004",
+      "kind": "safety",
+      "title": "Dry-run produces no filesystem modifications",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-005",
+      "kind": "requirement",
+      "title": "PRD ID must match ^PRD-\\d{4,}$ format",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-006",
+      "kind": "requirement",
+      "title": "RFC ID auto-generated if not provided",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-FACTORY-007",
+      "kind": "requirement",
+      "title": "Routing profile must exist if specified",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

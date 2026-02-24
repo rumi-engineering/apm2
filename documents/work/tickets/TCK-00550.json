@@ -1,0 +1,67 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00550",
+      "title": "CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 730,
+          "merge_commit": "793c38716ebb7c2e3695b5979ee632e4d8288810",
+          "merged_at": "2026-02-17T20:29:35Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00513",
+          "reason": "Receipt fields must exist."
+        },
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Verifier integration must be real."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add compile-time/CI checks that `NoOpVerifier` is not used in default mode.",
+        "Add integration tests asserting: execution receipts include RFC-0028 boundary + RFC-0029 admission traces.",
+        "Add tests asserting: jobs without broker token are denied/quarantined."
+      ],
+      "out_of_scope": [
+        "Full formal verification."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add feature flags if needed: `--features unsafe_no_verify` only for dev/testing.",
+        "Add CI checks and minimal end-to-end harness."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "A PR that reintroduces NoOpVerifier or omits RFC-0028/0029 receipt fields fails CI."
+      ]
+    }
+  }
+}

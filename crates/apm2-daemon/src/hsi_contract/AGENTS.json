@@ -1,0 +1,57 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/hsi_contract",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-HSI-001",
+      "kind": "invariant",
+      "title": "Routes are sorted lexicographically by route field",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#REQ-0001"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-002",
+      "kind": "invariant",
+      "title": "Route count bounded to MAX_ROUTES (1,024)",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-003",
+      "kind": "invariant",
+      "title": "All string fields bounded by MAX_ROUTE_LEN / MAX_SCHEMA_ID_LEN",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-004",
+      "kind": "invariant",
+      "title": "canonical_bytes() produces deterministic output",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#REQ-0001"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-005",
+      "kind": "requirement",
+      "title": "content_hash() uses domain-separated BLAKE3",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-006",
+      "kind": "safety",
+      "title": "build_manifest() returns error if any route lacks semantics annotations",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-007",
+      "kind": "requirement",
+      "title": "Tier0/Tier1 warn and waive on mismatch; Tier2+ deny (fail-closed)",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#REQ-0002"]
+    },
+    {
+      "id": "BEH-DAEMON-HSI-008",
+      "kind": "safety",
+      "title": "Unknown or error states during mismatch evaluation result in DENY",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

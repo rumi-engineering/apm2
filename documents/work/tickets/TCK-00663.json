@@ -1,0 +1,102 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00663",
+      "title": "SUPERSEDED: FAC queue/lane fault-injection harness (coverage integrated into runtime reconcile suites)",
+      "status": "CANCELLED"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        "REQ-0020",
+        "REQ-0037"
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "Implementer",
+        "Reviewer"
+      ],
+      "responsibility_domains": [
+        "fac/tests",
+        "fac/reconcile",
+        "fac/worker"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00658",
+        "TCK-00659",
+        "TCK-00660"
+      ]
+    }
+  },
+  "supersession": {
+    "superseded_by_tickets": [
+      "TCK-00658",
+      "TCK-00659",
+      "TCK-00660"
+    ],
+    "rationale": "The original harness intent has been absorbed by deterministic simulated tests added\ndirectly to fac worker and reconcile modules. The specific stuck-claimed, flock-held,\ncommit-failure, and recovery idempotency scenarios now have direct regression coverage\nwithout introducing a separate shared harness layer.\n"
+  },
+  "context": {
+    "why_now": "The current failures are intermittent and environment-dependent (PID reuse timing, worker crash\npoints, systemd behavior). Without deterministic tests, regressions will recur.\n"
+  },
+  "problem_statement": "We need a repeatable, deterministic test suite that exercises the queue/lane orchestration failure\nmodes reported in the field:\n  - jobs stuck in claimed with no worker pickup\n  - dead/stale PIDs in lane leases\n  - corrupt lanes due to ambiguous liveness\n  - worker crash between claim/lease/commit\nThese should be tested without relying on real systemd in CI.\n",
+  "proposed_change": {
+    "intent": "Add a fault-injection harness that can simulate crash points and liveness conditions using:\n  - temp dirs for FAC root/queue root\n  - controllable process identity fixtures (spawn child process, record start ticks)\n  - dependency-injected command runners for systemctl queries\n  - explicit \"crash\" by dropping state mid-transition\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1",
+        "description": "Create a shared test harness module (apm2-core and/or apm2-cli) to build minimal FAC roots:\n  - create_fac_root_fixture(lanes=N)\n  - write_lease(lane, lease_fields)\n  - write_job(queue/pending, spec)\n  - move_job_to_claimed(...) helper\n  - write_receipt(job_id, outcome)\n  - lock_claimed_file(job_id) helper (flock)\n"
+      },
+      {
+        "id": "S2",
+        "description": "Add deterministic regression tests for the specific failure modes:\n  - T1: Claimed orphan job (no active lane) => reconcile_tick moves to pending.\n  - T2: Torn state (receipt exists, job still claimed) => reconcile_tick moves to done/denied.\n  - T3: PID reuse false positive simulation:\n      * Spawn child process P, get pid + start ticks.\n      * Create lease with pid=P but WRONG start ticks.\n      * Verify lane_status identity mismatch => lease is reclaimable; job is not treated active.\n  - T4: Orphaned systemd unit guard (mocked):\n      * Create lease with pid dead.\n      * Mock systemctl says associated unit active.\n      * Verify reconcile/acquire_worker_lane fail-closed (do not reclaim lane).\n  - T5: Commit pipeline failure recovery:\n      * Leave job in claimed with no receipt.\n      * Verify periodic reconcile path requeues (or quarantines) based on policy.\n"
+      },
+      {
+        "id": "S3",
+        "description": "Add \"crash point\" tests for the worker write-path (model-based):\n  - Simulate crash after rename pending→claimed.\n  - Simulate crash after lane lease persisted but before receipt.\n  - Simulate crash after receipt persisted but before move claimed→done.\nEach crash point must have a deterministic recovery assertion.\n"
+      }
+    ],
+    "out_of_scope": [
+      "End-to-end systemd integration tests requiring privileged CI."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "P1",
+        "description": "Implement reusable fixture builders + helpers (temp dirs, job/lease writers)."
+      },
+      {
+        "id": "P2",
+        "description": "Add regression tests T1-T5."
+      },
+      {
+        "id": "P3",
+        "description": "Add crash point model tests; ensure each recovery path is asserted."
+      }
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "At least 5 deterministic tests reproduce and then prevent the reported stuck-claimed/dead-PID scenarios.",
+      "Tests do not require a running systemd instance; systemctl queries are dependency-injected/mocked.",
+      "Tests run in CI and fail on regression."
+    ],
+    "evidence_ids": [
+      "EVID-TCK-00663-01 (tests): queue/lane fault-injection regression suite"
+    ]
+  },
+  "notes": {
+    "design_note": "Prefer a \"thin\" harness that constructs on-disk state and calls reconcile/lane APIs directly.\nAvoid spinning full worker threads unless necessary; model crash points by stopping mid-step.\n"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00581",
+      "title": "Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 731,
+          "merge_commit": "fc43e1feda7dcf5dedbe288f311840bf6cd38f7f",
+          "merged_at": "2026-02-17T21:00:43Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00517",
+          "reason": "Patch injection flow exists."
+        },
+        {
+          "ticket_id": "TCK-00545",
+          "reason": "Patch bytes store exists."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Validate patch content before apply:",
+        "  - reject paths containing `..`, absolute paths, or weird prefixes",
+        "  - restrict patch format to git_diff_v1 rules",
+        "Apply patch in safe mode and verify resulting tree matches expected patch digest binding.",
+        "Emit PatchApplyReceiptV1 including patch digest, applied files count, and any refusals."
+      ],
+      "out_of_scope": [
+        "Binary patch formats."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement patch parser/validator.",
+        "Implement safe apply and post-apply verification."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "A patch attempting to write outside the workspace is denied/quarantined with receipts."
+      ]
+    }
+  }
+}

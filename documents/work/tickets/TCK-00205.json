@@ -1,0 +1,84 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00205",
+      "title": "FAC: GateRunCompleted event with signature verification",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0017",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0001",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements[0]"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00202",
+        "TCK-00203"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add GateRunCompleted proto message",
+        "Create GateRunCompleted Rust type",
+        "Implement verify_for_admission() with full validation",
+        "Verify signature, lease binding, revocation, expiry"
+      ],
+      "out_of_scope": [
+        "GateReceipt envelope (TCK-00207)",
+        "AAT receipt payload (TCK-00218)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add GateRunCompleted message to proto/kernel_events.proto",
+        "Add to EvidenceEvent oneof",
+        "Create crates/apm2-core/src/fac/gate_run.rs",
+        "Define GateRunCompleted struct with all 10 fields",
+        "Implement verify_for_admission() with 6 validation steps",
+        "Write unit tests for happy path admission",
+        "Write unit tests for invalid signature rejection",
+        "Write unit tests for lease expiry/revocation rejection"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0001"
+      ],
+      "criteria": [
+        "GateRunCompleted signature verification uses GATE_RUN_COMPLETED_PREFIX",
+        "Invalid signatures rejected with INVALID_SIGNATURE",
+        "Expired leases rejected with LeaseExpired",
+        "Revoked leases rejected with LeaseRevoked",
+        "cargo test -p apm2-core fac::gate_run::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "GateRunCompleted is the critical event for admission decisions.\nAll 6 validation steps must pass for admission to proceed.\n",
+      "implementation_details": "verify_for_admission validation steps:\n1. Verify signature with domain separator\n2. Check lease_id matches\n3. Check changeset_digest matches lease\n4. Check executor matches lease\n5. Check lease not revoked\n6. Check completion within lease expiry (HTF-based)\n",
+      "affected_files": "Modified: proto/kernel_events.proto\nCreated: crates/apm2-core/src/fac/gate_run.rs\n"
+    }
+  }
+}

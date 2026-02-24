@@ -1,0 +1,87 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00429",
+      "title": "PCAC verifier economics instrumentation and bounded enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0027",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0011",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0011.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0005",
+          "artifact_ref": "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0005.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PERFORMANCE",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_OBSERVABILITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00423",
+          "reason": "Lifecycle operations must be wired before meaningful p95 and proof-check metrics can be measured."
+        },
+        {
+          "ticket_id": "TCK-00425",
+          "reason": "Receipt-auth verification path must be present before verifier economics can be bounded and enforced."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Instrument join/revalidate/consume and anti-entropy verification paths for p95 and proof-check-count metrics.",
+        "Implement policy checks for declared verifier-economics bounds by risk tier.",
+        "Fail closed Tier2+ admissions when bounds are exceeded and no degraded-mode path is admissible.",
+        "Capture benchmark outputs for gate evidence."
+      ],
+      "out_of_scope": [
+        "Generic runtime performance optimization outside PCAC verifier paths.",
+        "Degraded-mode policy redesign beyond enforcement hooks."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add metrics and timers around PCAC verification operations and proof-check routines.",
+        "Implement bound-evaluation checks and deny paths for Tier2+ admissions.",
+        "Add stress/load tests to validate bound behavior and deny semantics.",
+        "Produce benchmark artifacts mapped to EVID-0005 expected contents.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0005"
+      ],
+      "criteria": [
+        "p95 bounds are measured and enforceable for join/revalidate/consume/anti-entropy operations.",
+        "Tier2+ admissions deny when declared economics bounds are exceeded without admissible degraded mode.",
+        "Benchmark evidence is reproducible and linked to defined profile thresholds."
+      ]
+    },
+    "notes": {
+      "security": "Economics enforcement is part of containment; overload cannot silently relax authority checks.\n",
+      "verification": "Include bound-exceedance tests with explicit deny assertions by risk tier.\n",
+      "general": "Draft mapped from RFC-0027 06_ticket_decomposition.yaml (TCK-PCAC-0008).\n"
+    }
+  }
+}

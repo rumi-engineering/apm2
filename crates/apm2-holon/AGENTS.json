@@ -1,0 +1,133 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-holon",
+  "behaviors": [
+    {
+      "id": "BEH-HOLON-001",
+      "kind": "invariant",
+      "title": "All Holon associated types must implement Send + Sync",
+      "description": "Input, Output, and State associated types on the Holon trait must be Send + Sync for concurrent contexts.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-002",
+      "kind": "invariant",
+      "title": "Holon defines a clear Markov Blanket boundary via trait contract",
+      "description": "Each holon defines a clear boundary through its trait contract, implementing Axiom I (Markov Blanket) from the Principia Holonica.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-003",
+      "kind": "requirement",
+      "title": "intake() must validate lease before preparing internal state",
+      "rfc": ["RFC-0003", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-004",
+      "kind": "requirement",
+      "title": "execute_episode() must respect budget constraints in context",
+      "rfc": ["RFC-0003", "RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-005",
+      "kind": "invariant",
+      "title": "should_stop() must be deterministic given the same context",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-006",
+      "kind": "invariant",
+      "title": "EpisodeContext requires work_id and lease_id (builder panics if missing)",
+      "rfc": ["RFC-0003", "RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-007",
+      "kind": "invariant",
+      "title": "Budget decrement uses saturating_sub; None values remain None",
+      "description": "EpisodeContext.next_episode() uses saturating_sub for token and time deduction. None values remain None (no budget tracking for that dimension).",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-008",
+      "kind": "invariant",
+      "title": "Terminal EpisodeOutcomes are Completed, Failed, and Escalated",
+      "description": "EpisodeOutcome::Completed, Failed, and Escalated are terminal; NeedsContinuation and Interrupted are non-terminal.",
+      "rfc": ["RFC-0003", "RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-009",
+      "kind": "invariant",
+      "title": "Artifact requires kind and work_id (builder panics if missing)",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-010",
+      "kind": "requirement",
+      "title": "HolonError classifies recoverability for escalation decisions",
+      "description": "is_recoverable() returns true only for recoverable EpisodeExecutionFailed and ArtifactEmissionFailed. should_escalate() returns true for non-recoverable errors.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-011",
+      "kind": "invariant",
+      "title": "WorkLifecycle enforces valid state machine transitions",
+      "description": "Terminal states (Completed, Failed, Cancelled) allow no further transitions. Invalid transitions return HolonError::InvalidState.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-012",
+      "kind": "invariant",
+      "title": "WorkObject version increments on every state transition or mutation",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-013",
+      "kind": "safety",
+      "title": "WorkObject enforces DoS limits on attempts and metadata",
+      "description": "MAX_ATTEMPTS (100) and MAX_METADATA_ENTRIES (50) prevent unbounded growth.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-014",
+      "kind": "safety",
+      "title": "HolonConfig uses deny_unknown_fields to prevent fail-open parsing",
+      "description": "StopConditionsConfig, HolonContract, and HolonConfig all use serde deny_unknown_fields to prevent typos from silently bypassing constraints.",
+      "rfc": ["RFC-0003", "RFC-0020"]
+    },
+    {
+      "id": "BEH-HOLON-015",
+      "kind": "invariant",
+      "title": "Tool access is fail-closed: None means no tools permitted",
+      "description": "HolonConfig.tools: None (omitted) means no tools permitted (maximum restriction), not unlimited.",
+      "rfc": ["RFC-0003", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-016",
+      "kind": "requirement",
+      "title": "StopCondition at least one must be configured with values > 0",
+      "description": "StopConditionsConfig requires at least one stop condition. All values must be > 0 if specified. Empty budget resource names are rejected.",
+      "rfc": ["RFC-0003", "RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-017",
+      "kind": "requirement",
+      "title": "spawn_holon orchestrates full lifecycle with ledger event emission",
+      "description": "spawn_holon creates WorkObject, issues Lease, calls intake, runs episode loop, emits ledger events, handles escalation, and returns SpawnResult.",
+      "rfc": ["RFC-0003", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-018",
+      "kind": "invariant",
+      "title": "Crate has no runtime dependency on apm2-core",
+      "description": "apm2-holon establishes a clean contract boundary permitting alternative runtime implementations.",
+      "rfc": ["RFC-0003"]
+    },
+    {
+      "id": "BEH-HOLON-019",
+      "kind": "invariant",
+      "title": "StopCondition exit codes follow Unix conventions",
+      "description": "Exit code 0 for Continue/GoalSatisfied/Escalated, 1 for ErrorCondition/Stalled, 2 for resource limits, 3 for ExternalSignal, 4 for PolicyViolation.",
+      "rfc": ["RFC-0003"]
+    }
+  ]
+}

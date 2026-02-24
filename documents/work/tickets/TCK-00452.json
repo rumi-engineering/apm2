@@ -1,0 +1,88 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00452",
+      "title": "Auditor/orchestrator projections for launch lineage, liveness, and uncertainty",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0040",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0040.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0040",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0040.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_OBSERVABILITY",
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00450",
+          "reason": "Boundary enforcement semantics are prerequisite for trustworthy projection reporting."
+        },
+        {
+          "ticket_id": "TCK-00451",
+          "reason": "Projection surfaces depend on liveness and terminal taxonomy contracts."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Expose auditor projection showing launch lineage completeness and boundary-conformance indicators.",
+        "Expose orchestrator projection showing active runs, last authoritative receipt tick, restart count, and uncertainty flags.",
+        "Make projection responses digest-first and replay-consistent for independent verification.",
+        "Fail closed when required lineage/liveness evidence is missing or unresolved."
+      ],
+      "out_of_scope": [
+        "Core launch admission and Markov-blanket enforcement logic changes.",
+        "Workflow-level authorization policy changes."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define projection contracts and required fields for auditor/orchestrator consumers.",
+        "Implement projection endpoints/commands over receipt-backed state.",
+        "Integrate uncertainty classification for missing lineage/liveness evidence.",
+        "Add tests ensuring projection determinism and fail-closed uncertainty behavior.",
+        "Run required checks."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0040"
+      ],
+      "criteria": [
+        "Auditor projection reports lineage completeness and boundary-conformance from receipt-backed data.",
+        "Orchestrator projection reports liveness/uncertainty state for dispatch control decisions.",
+        "Missing lineage/liveness evidence is surfaced as non-admissible uncertainty."
+      ]
+    },
+    "notes": {
+      "security": "Projection ambiguity must not be silently accepted for authority-bearing operations.\n",
+      "verification": "Include deterministic replay checks on projection outputs across repeated queries.\n",
+      "general": "This ticket closes operator-facing visibility gaps for launch-path governance and control.\n"
+    }
+  }
+}

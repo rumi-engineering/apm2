@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00467",
+      "title": "RFC-0028 REQ-0007 disclosure-control interlock and trade-secret policy enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0028",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0007",
+          "requirement_ref": "documents/rfcs/RFC-0028/requirements/REQ-0007.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0007",
+          "artifact_ref": "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0007.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_GOVERNANCE",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00465",
+          "reason": "Disclosure policy interlock depends on boundary-flow and declassification receipt enforcement."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Bind authoritative effects to signed disclosure-control policy snapshots and active policy epochs.",
+        "Enforce phase-qualified policy mode matching (`phase_disclosure_profile(phase_id)`).",
+        "Deny patent/provisional and unapproved disclosure channels in `TRADE_SECRET_ONLY` mode with structured defects.",
+        "Fail closed on unknown, stale, missing, or ambiguous disclosure-control state."
+      ],
+      "out_of_scope": [
+        "Design of future patent-allowing governance policy modes.",
+        "Non-promotion informational telemetry channels."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Wire trade-secret policy profile checks into gate evaluation path.",
+        "Add policy-epoch signature/freshness verification and phase-mode matching checks.",
+        "Implement structured deny traces for prohibited disclosure channels.",
+        "Add policy transition negative tests for unsigned or stale transitions."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0007"
+      ],
+      "criteria": [
+        "Policy mode hash and epoch are digest-bound to promotion-critical decisions.",
+        "Trade-secret mode rejects patent/provisional workflows by default.",
+        "Disclosure-policy ambiguity is non-admissible."
+      ]
+    },
+    "notes": {
+      "security": "Disclosure-control posture changes never relax containment guarantees.\n",
+      "verification": "Include phase-mode mismatch, stale policy, and unsigned transition deny fixtures.\n",
+      "general": "This ticket operationalizes RFC-0028 disclosure controls as hard admission constraints.\n"
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00390",
+      "title": "Daemon-side merge executor: autonomous merge after gate approval",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018"
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_ORCHESTRATION",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00388",
+          "reason": "Gate orchestrator must produce gate receipts that the merge executor observes for approval."
+        },
+        {
+          "ticket_id": "TCK-00389",
+          "reason": "Review receipt ingestion must produce ReviewReceiptRecorded events that confirm gate passage."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement MergeExecutor module in daemon that watches for all required gate receipts reaching PASS verdict.",
+        "Verify all policy requirements are met (policy_hash matches PolicyResolvedForChangeSet).",
+        "Execute merge via GitHub API (squash merge of associated PR) through GitHubProjectionAdapter.",
+        "Observe merge result (commit SHA on target branch) from GitHub API response.",
+        "Create and sign MergeReceipt via create_after_observation binding inputs to observed result.",
+        "Emit merge_receipt ledger event.",
+        "Transition work state to Completed via WorkCompleted event.",
+        "Handle merge conflicts by emitting ReviewBlockedRecorded with appropriate reason code."
+      ],
+      "out_of_scope": [
+        "GitHub token management (use existing credential profiles from daemon configuration).",
+        "Divergence watchdog changes (already monitors MergeReceipt vs trunk HEAD independently).",
+        "Manual merge approval workflow (this is autonomous merge for FAC-managed changesets).",
+        "Gate orchestration and lease issuance (TCK-00388).",
+        "Review receipt ingestion (TCK-00389)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create MergeExecutor struct in crates/apm2-daemon/src/merge/ with ledger tailer for gate_receipt events.",
+        "On each gate_receipt event: check if all required gates for the work_id have PASS verdict.",
+        "Required gates are determined from the PolicyResolvedForChangeSet for the work_id (aat, quality, security).",
+        "When all gates pass: look up associated PR metadata from work index.",
+        "Verify policy_hash on each gate receipt matches the PolicyResolvedForChangeSet resolved_policy_hash.",
+        "Execute squash merge via GitHubProjectionAdapter (replaces xtask's `gh pr merge --auto --squash`).",
+        "Observe the merge result: extract the new commit SHA (result_selector) from GitHub API response.",
+        "Build MergeReceipt via create_after_observation with base_selector, changeset_digest, sorted gate_receipt_ids, policy_hash, result_selector.",
+        "Sign the MergeReceipt with daemon signer using MERGE_RECEIPT: domain separator.",
+        "Emit merge_receipt event to ledger.",
+        "Emit WorkCompleted event to transition work state from Review to Completed.",
+        "On merge conflict: emit ReviewBlockedRecorded with ReasonCode::ApplyFailed and log details.",
+        "Add integration test: emit gate receipts with PASS verdicts, verify MergeExecutor produces MergeReceipt and WorkCompleted."
+      ]
+    },
+    "definition_of_done": {
+      "criteria": [
+        "All required gate receipts with PASS verdict trigger autonomous merge execution.",
+        "Policy hash is verified against PolicyResolvedForChangeSet before merge (anti-downgrade).",
+        "Merge is executed via GitHub API as squash merge through GitHubProjectionAdapter.",
+        "MergeReceipt atomically binds inputs (base_selector, changeset_digest, gate_receipt_ids, policy_hash) to observed result (result_selector).",
+        "MergeReceipt is signed with MERGE_RECEIPT: domain separator.",
+        "merge_receipt event is emitted to ledger.",
+        "Work state transitions to Completed via WorkCompleted event.",
+        "Merge conflicts produce ReviewBlockedRecorded event, not silent failure.",
+        "gate_receipt_ids in MergeReceipt are sorted canonically (deterministic serialization).",
+        "Divergence watchdog can observe the MergeReceipt HEAD and compare against external trunk (existing behavior, verified)."
+      ]
+    },
+    "notes": {
+      "context": "This is the final step in the FAC state machine:\nreview_receipt -> MERGE -> merge_receipt -> WORK_COMPLETE\n\nThe MergeReceipt type (crates/apm2-core/src/fac/merge_receipt.rs) already exists with full\ncryptographic binding. The create_after_observation method (line 144) validates inputs,\nconstructs the receipt, computes canonical encoding, and signs with MERGE_RECEIPT: domain\nseparator. Fields include: base_selector, changeset_digest, gate_receipt_ids (sorted\ncanonical, max 64 via MAX_GATE_RECEIPTS), policy_hash, result_selector, merged_at,\ngate_actor_id.\n\nCurrently, xtask/src/tasks/push.rs line 148 uses `gh pr merge --auto --squash` to trigger\nmerge outside the FAC pipeline. This means merges are not recorded in the ledger, not\ncryptographically bound to gate receipts, and not observable by the divergence watchdog.\n\nThe divergence watchdog (crates/apm2-daemon/src/projection/divergence_watchdog.rs) already\ncompares MergeReceipt HEAD against external trunk HEAD and emits InterventionFreeze on\ndivergence. Once the MergeExecutor produces MergeReceipt events, the watchdog can detect\nunauthorized external merges (merge happened on GitHub but no MergeReceipt exists in ledger).\n\nThe work state machine (crates/apm2-core/src/work/reducer.rs line 166) supports the\nReview -> Completed transition via WorkCompleted event. The WorkCompleted event payload\n(line 578) binds the completion to the work_id.\n\nThe GitHubProjectionAdapter (crates/apm2-daemon/src/projection/github_sync.rs line 1242)\nprovides GitHub API access through the projection layer. The merge operation should go\nthrough this adapter rather than shelling out to `gh` CLI, ensuring all GitHub interactions\nare managed through the daemon's authenticated adapter with proper error handling.\n\nAfter this ticket, the complete FAC pipeline operates autonomously:\nsession_terminated -> gate_lease -> gate_receipt -> review_receipt -> merge_receipt -> work_completed\n",
+      "files": "- crates/apm2-core/src/fac/merge_receipt.rs (MergeReceipt, create_after_observation at line 144, MERGE_RECEIPT: domain separator)\n- crates/apm2-core/src/work/reducer.rs (WorkCompleted event, Review -> Completed transition at line 166)\n- crates/apm2-core/src/fac/policy_resolution.rs (PolicyResolvedForChangeSet for policy hash verification)\n- crates/apm2-daemon/src/projection/github_sync.rs (GitHubProjectionAdapter at line 1242 for GitHub API merge)\n- crates/apm2-daemon/src/projection/divergence_watchdog.rs (monitors MergeReceipt HEAD vs external trunk)\n- crates/apm2-core/src/fac/review_blocked.rs (ReviewBlockedRecorded for merge conflict handling)\n- crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter for event emission)\n- xtask/src/tasks/push.rs (current `gh pr merge --auto --squash` at line 148, to be superseded)\n",
+      "security": "The MergeReceipt's atomic binding (FAC-REQ-0020) is the critical security property: it\nprevents equivocation where a merge is claimed but the result points to a different commit.\nThe create_after_observation pattern enforces this by requiring the merge to be OBSERVED\nbefore the receipt is created - the result_selector comes from the actual GitHub API response,\nnot from a prediction. Policy hash verification before merge prevents policy downgrade attacks\nwhere gates passed under one policy but merge happens under a weaker one. The gate_receipt_ids\nmust be sorted canonically to ensure deterministic serialization and prevent receipt\nsubstitution. Merge conflicts must be handled explicitly (emit ReviewBlockedRecorded) rather\nthan silently retrying, which could mask concurrent modification attacks. The divergence\nwatchdog provides defense-in-depth: even if the MergeExecutor is compromised, unauthorized\nmerges will be detected by comparing ledger state against external trunk.\n"
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00545",
+      "title": "Patch bytes backend: implement `fac_blobs_v1` store under `$APM2_HOME/private/fac/blobs` + GC policy",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00517",
+          "reason": "Patch injection needs a bytes store."
+        },
+        {
+          "ticket_id": "TCK-00524",
+          "reason": "GC must know how to prune blobs."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement content-addressed blob store for patch bytes: `$APM2_HOME/private/fac/blobs/<hex>`.",
+        "Write/read APIs with bounded sizes and safe permissions.",
+        "Define blob retention policy and integrate with GC.",
+        "Bind patch digest in job spec and attestation."
+      ],
+      "out_of_scope": [
+        "Dedup across nodes."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement blob writer/reader and hashing.",
+        "Wire into patch injection flow.",
+        "Add GC pruning based on reachability from recent receipts/jobs."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Patch injection can execute without relying on ambient caller worktree.",
+        "Blobs are safely prunable without breaking active jobs."
+      ]
+    }
+  }
+}

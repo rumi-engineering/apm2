@@ -1,0 +1,68 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00392",
+      "title": "Wire IPC shutdown handler to daemon graceful shutdown signal",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018"
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Wire `handle_shutdown` in PrivilegedDispatcher to call `request_shutdown()` on the daemon's SharedState.",
+        "Ensure the graceful shutdown sequence runs: stop all processes, cleanup sockets, remove PID file.",
+        "Return success response to the CLI caller before initiating the shutdown sequence.",
+        "Add timeout for graceful shutdown (30 seconds before forced exit).",
+        "Add integration test: start daemon, send Shutdown via OperatorClient, verify clean exit."
+      ],
+      "out_of_scope": [
+        "Forceful shutdown (SIGKILL equivalent via IPC).",
+        "Process-specific shutdown (already works via StopProcess command).",
+        "Changes to the SIGTERM/SIGINT signal handling path (already works correctly)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "In `handle_shutdown`, retrieve `daemon_state` from `self.daemon_state` (already an `Option<SharedState>` field on PrivilegedDispatcher).",
+        "If `daemon_state` is `Some`, call `state.request_shutdown()` which sets the atomic shutdown flag.",
+        "If `daemon_state` is `None` (test mode), log a warning and return the existing stub response.",
+        "Return the ShutdownResponse with a success message before the shutdown flag takes effect.",
+        "In main.rs, add a 30-second timeout to the graceful shutdown sequence after `shutdown_all_processes`.",
+        "Verify the existing main event loop correctly detects `is_shutdown_requested()` and exits (it already does at line 1105).",
+        "Add integration test in `crates/apm2-daemon/tests/`: start daemon in-process, connect OperatorClient, send Shutdown, assert daemon exits cleanly within timeout.",
+        "Verify `apm2 kill` CLI command works end-to-end against a running daemon."
+      ]
+    },
+    "definition_of_done": {
+      "criteria": [
+        "`apm2 kill` successfully stops a running daemon via IPC (no more `kill <PID>` workaround).",
+        "Daemon performs graceful shutdown: stops processes, cleans sockets, removes PID file.",
+        "CLI receives success response before daemon begins shutdown.",
+        "Graceful shutdown completes within 30-second timeout.",
+        "If `daemon_state` is None (test/stub mode), handler returns stub response with warning log.",
+        "Integration test verifies clean shutdown via IPC."
+      ]
+    },
+    "notes": {
+      "context": "The IPC shutdown handler at dispatch.rs line 4123 is a stub that returns\n\"Shutdown acknowledged (stub)\" without actually stopping the daemon:\n\n  // STUB: Return acknowledgment\n  // Full implementation requires daemon state integration\n  Ok(PrivilegedResponse::Shutdown(ShutdownResponse {\n      message: \"Shutdown acknowledged (stub)\".to_string(),\n  }))\n\nThe `apm2 kill` CLI command (in `crates/apm2-cli/src/commands/daemon.rs`, line 49)\nconnects via the operator socket and sends a Shutdown request, but the daemon ignores\nit because the handler is stubbed.\n\nThe PrivilegedDispatcher already has a `daemon_state: Option<SharedState>` field\n(set via `with_daemon_state()` at dispatch.rs line 623). The SharedState provides\n`request_shutdown()` (state.rs line 820) which sets an atomic boolean flag, and\n`is_shutdown_requested()` (state.rs line 815) which the main event loop already\npolls at main.rs line 1105.\n\nThe signal-based shutdown path works correctly: SIGTERM/SIGINT -> signal handler\ncalls `signal_state.request_shutdown()` (main.rs line 937) -> main event loop\ndetects shutdown -> `shutdown_all_processes()` (main.rs line 979) -> socket cleanup\n(main.rs line 983) -> PID file removal (main.rs line 986).\n\nThe fix is straightforward: call `request_shutdown()` from the IPC handler, which\nwill trigger the same graceful shutdown path that signals already use.\n\nCurrent workaround: users must `kill <PID>` or send SIGTERM manually instead of\nusing `apm2 kill`. This breaks autonomous operation where the coordinator needs\nto programmatically stop a daemon.\n",
+      "files": "- crates/apm2-daemon/src/protocol/dispatch.rs (line 4123: handle_shutdown stub, line 623: with_daemon_state)\n- crates/apm2-daemon/src/state.rs (line 815: is_shutdown_requested, line 820: request_shutdown)\n- crates/apm2-daemon/src/main.rs (line 937: signal handler calls request_shutdown, line 979: shutdown_all_processes, line 1105: shutdown check in event loop)\n- crates/apm2-cli/src/commands/daemon.rs (line 49: kill function sends Shutdown via OperatorClient)\n- crates/apm2-cli/src/client/protocol.rs (OperatorClient::shutdown method)\n",
+      "security": "The Shutdown command is only available on the operator socket, which requires\nprivileged access (peer credential verification). The handler must validate\nthat the connection context has operator-level permissions before triggering\nshutdown. The response must be sent before shutdown begins to avoid socket\nerrors on the client side. Graceful shutdown must clean up all sockets and\nPID files to prevent stale state that could be exploited by a subsequent\ndaemon instance.\n"
+    }
+  }
+}

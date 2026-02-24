@@ -1,0 +1,80 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00222",
+      "title": "FAC: Risk tier classification model",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0009",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0009",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Define RiskTier enum (High, Med, Low)",
+        "Define primary signals for HIGH tier",
+        "Define secondary signals for MED tier",
+        "Implement classify_risk() function"
+      ],
+      "out_of_scope": [
+        "AAT selection policy (TCK-00223)",
+        "Risk tier configuration"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create crates/apm2-core/src/fac/risk_tier.rs",
+        "Define RiskTier enum with High, Med, Low",
+        "Define CRITICAL_MODULES list",
+        "Define SENSITIVE_PATTERNS list",
+        "Implement classify_risk(changeset) function",
+        "Check primary signals (critical modules, sensitive patterns)",
+        "Check secondary signals (lines changed, files changed, dependency fanout)",
+        "Write unit tests for classification",
+        "Write unit tests for critical module detection"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0009"
+      ],
+      "criteria": [
+        "RiskTier enum has High, Med, Low variants",
+        "Classification model uses primary and secondary signals",
+        "Critical modules are classified as HIGH",
+        "cargo test -p apm2-core fac::risk_tier::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "Risk tier classification determines the level of scrutiny\nfor AAT. High-risk changes always require full AAT.\n",
+      "implementation_details": "PRIMARY SIGNALS (-> HIGH):\n- touches_critical_module (auth, crypto, ledger, tool, kernel)\n- matches_sensitive_pattern (secret, credentials, policy)\n\nSECONDARY SIGNALS (-> MED):\n- lines_changed > 500\n- files_changed > 10\n- dependency_fanout > 20\n\nDEFAULT: LOW\n",
+      "affected_files": "Created: crates/apm2-core/src/fac/risk_tier.rs\n"
+    }
+  }
+}

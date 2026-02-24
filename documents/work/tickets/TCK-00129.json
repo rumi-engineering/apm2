@@ -1,0 +1,88 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00129",
+      "title": "Embed bootstrap schema bundle in binary",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0007",
+      "rfc_id": "RFC-0011",
+      "requirements": [
+        {
+          "requirement_id": "CAC-REQ-0010",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0010.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "CAC-REQ-0009",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0009.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-0008"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00128"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Create bootstrap schema bundle at crates/apm2-core/bootstrap/schemas/",
+        "Generate bundle with hash-pinned manifests via build.rs",
+        "Embed bundle in binary via include_bytes!",
+        "Runtime startup verification of bootstrap hash",
+        "Reject patches targeting bootstrap stable IDs",
+        "Expose read-only bootstrap schemas to validator"
+      ],
+      "out_of_scope": [
+        "Bootstrap upgrade ceremony",
+        "Emergency override mechanism (future ticket)",
+        "Multi-bootstrap version support"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create crates/apm2-core/bootstrap/schemas/ directory structure",
+        "Define minimal bootstrap schema set (envelope, patch, receipt)",
+        "Extend build.rs to generate bootstrap manifest with content hashes",
+        "Add println!('cargo:rerun-if-changed=bootstrap/') for rebuild tracking",
+        "Create BOOTSTRAP_MANIFEST constant with embedded bytes and hash",
+        "Implement verify_bootstrap_hash() called at startup",
+        "Add is_bootstrap_id(stable_id) check for admission rejection",
+        "Write tests for startup failure on hash mismatch",
+        "Write tests for patch rejection targeting bootstrap IDs"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0008"
+      ],
+      "criteria": [
+        "Binary includes bootstrap manifest with content hashes",
+        "Startup fails with BootstrapVerificationFailed if hash mismatch",
+        "Patch targeting bootstrap:* stable_id rejected with BootstrapProtected error",
+        "Validator can access bootstrap schemas for validation",
+        "Build changes to bootstrap/ trigger recompilation",
+        "All tests pass: cargo test bootstrap_integrity"
+      ]
+    },
+    "notes": {
+      "security": "Bootstrap trust root is critical security boundary (TB-0002).\nBinary embedding prevents filesystem tampering.\nNo runtime modification of bootstrap schemas.\n",
+      "architecture": "Follow prost_build pattern from existing build.rs (lines 12-35).\nUse EvidenceCategory::BootstrapSchema for evidence module integration.\nBootstrap IDs use reserved prefix \"bootstrap:*\".\n"
+    }
+  }
+}

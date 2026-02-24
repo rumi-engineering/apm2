@@ -1,0 +1,80 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00008",
+      "title": "Implement quarantine mechanism"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0001",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0018",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0018.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "REQ-0027",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0027.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "REQ-0033",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0033.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0006",
+          "artifact_ref": "documents/prds/PRD-0001/evidence_artifacts/EVID-0006.yaml#prd_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00007",
+          "reason": "Requires crash detection from 'Implement crash detection and restart logic'"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define quarantine triggers (entropy exceeded, violations)",
+        "Emit SessionQuarantined event",
+        "Prevent session restart while quarantined",
+        "Implement quarantine duration and release"
+      ],
+      "out_of_scope": [
+        "Manual quarantine management CLI (TCK-00023)"
+      ]
+    },
+    "plan": {
+      "steps": []
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0006"
+      ],
+      "criteria": [
+        "Quarantine triggered on threshold",
+        "SessionQuarantined event emitted",
+        "Quarantined sessions cannot restart",
+        "Quarantine expires after configured duration",
+        "Quarantine visible in projection"
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

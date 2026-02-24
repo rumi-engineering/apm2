@@ -1,0 +1,49 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00190",
+      "title": "Quorum Certificate Generation and Verification",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0014"
+    }
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "QC generated after 2f+1 votes",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "QC verification validates signer membership and signatures",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Authority events include QC in ledger record",
+      "verification": "Manual verification required"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [],
+    "files_to_modify": [],
+    "implementation_steps": [],
+    "summary": "Aggregate 2f+1 validator signatures into a QuorumCertificate and attach\nit to finalized authority events. Provide offline verification utilities.\n"
+  },
+  "notes": "Phase: P2\nGenerated from RFC RFC-0014 ticket decomposition on 2026-01-28.",
+  "test_requirements": [
+    {
+      "description": "Unit tests pass",
+      "test_id": "UT-00190-01",
+      "verification_command": "cargo test -p apm2-core tck_00190"
+    },
+    {
+      "description": "Integration test",
+      "test_id": "IT-00190-01",
+      "verification_command": "cargo run --bin apm2 -- factory tickets emit --rfc RFC-0014"
+    }
+  ]
+}

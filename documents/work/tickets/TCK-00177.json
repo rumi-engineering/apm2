@@ -1,0 +1,113 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00177",
+      "title": "Implement E2E evidence and receipt verification tests",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-EVID-001"
+        },
+        {
+          "requirement_id": "REQ-RECEIPT-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00174"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "Verification of evidence integrity",
+      "verification": "Stored evidence matches content hash"
+    },
+    {
+      "criterion": "Receipt authenticity verification",
+      "verification": "Signed receipts verify against public key"
+    },
+    {
+      "criterion": "Compaction and TTL enforcement scenarios",
+      "verification": "Expired artifacts evicted, compaction produces valid receipts"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "E2E evidence verification test",
+        "code": "#[tokio::test]\nasync fn test_evidence_integrity() {\n    let daemon = TestDaemon::start().await;\n    let episode_id = daemon.create_and_start().await;\n\n    // Execute tool to generate evidence\n    daemon.run_tool(&episode_id, \"write\", &[\"test.txt\", \"content\"]).await;\n\n    // Stop episode to finalize evidence\n    daemon.stop(&episode_id, StopReason::Normal).await;\n\n    // Verify evidence integrity\n    let receipt = daemon.get_episode_receipt(&episode_id).await.unwrap();\n    for evidence_ref in &receipt.evidence_refs {\n        let content = daemon.cas_get(evidence_ref).await.unwrap();\n        assert_eq!(blake3::hash(&content).as_bytes(), evidence_ref);\n    }\n\n    // Verify receipt signature\n    assert!(receipt.verify(&daemon.public_key()).is_ok());\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/tests/e2e_evidence.rs",
+        "purpose": "E2E evidence integrity tests"
+      },
+      {
+        "path": "crates/apm2-daemon/tests/e2e_receipt.rs",
+        "purpose": "E2E receipt verification tests"
+      },
+      {
+        "path": "crates/apm2-daemon/tests/e2e_compaction.rs",
+        "purpose": "E2E compaction and TTL tests"
+      }
+    ],
+    "files_to_modify": [],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Implement evidence integrity tests",
+        "details": "Test scenarios:\n- Content hash matches stored content\n- CAS retrieval returns correct data\n- Missing evidence detected\n- Corrupted evidence detected\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement receipt verification tests",
+        "details": "Test scenarios:\n- Valid receipt verifies\n- Tampered receipt fails\n- Wrong key fails\n- All evidence refs exist\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement TTL enforcement tests",
+        "details": "Test scenarios:\n- Expired artifacts evicted\n- Pinned artifacts survive TTL\n- Unpin allows eviction\n- Evidence class TTLs correct\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement compaction tests",
+        "details": "Test scenarios:\n- Compaction produces summary\n- Tombstones reference originals\n- Compaction receipt valid\n- Audit trail preserved\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement verification predicate tests",
+        "details": "Full doctrine predicate:\n- VerifyReceipt(receipt)\n- EvidenceSatisfies(contract, evidence)\n- DigestBindingsHold(output, evidence)\n"
+      }
+    ],
+    "summary": "Implement E2E tests for evidence integrity and receipt verification.\nVerifies evidence hash binding, receipt signature verification,\nand compaction/TTL enforcement scenarios.\n"
+  },
+  "notes": "Phase: PHASE-4 (Integration and CLI)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-018c.\n",
+  "test_requirements": [
+    {
+      "description": "Evidence integrity E2E",
+      "test_id": "E2E-00177-01",
+      "verification_command": "cargo test -p apm2-daemon --test e2e_evidence"
+    },
+    {
+      "description": "Receipt verification E2E",
+      "test_id": "E2E-00177-02",
+      "verification_command": "cargo test -p apm2-daemon --test e2e_receipt"
+    },
+    {
+      "description": "Compaction E2E",
+      "test_id": "E2E-00177-03",
+      "verification_command": "cargo test -p apm2-daemon --test e2e_compaction"
+    }
+  ]
+}

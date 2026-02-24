@@ -1,0 +1,69 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00588",
+      "title": "End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Broker exists."
+        },
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker exists."
+        },
+        {
+          "ticket_id": "TCK-00518",
+          "reason": "gates defaults to enqueue+wait."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement an e2e test harness runnable in CI or local dev that:",
+        "  - starts broker and worker (in-process or subprocess)",
+        "  - enqueues a minimal job",
+        "  - asserts receipt contains: RFC-0028 boundary, RFC-0029 queue admission, budget admission",
+        "  - asserts missing token job is denied/quarantined",
+        "  - asserts expired token job is denied",
+        "  - asserts NoOpVerifier is not used (signature verified)"
+      ],
+      "out_of_scope": [
+        "Benchmarking (separate)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add harness as integration test crate or script.",
+        "Use lightweight job kind for CI if full gates too heavy."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "CI proves RFC-0028/0029 are exercised and enforced end-to-end."
+      ]
+    }
+  }
+}

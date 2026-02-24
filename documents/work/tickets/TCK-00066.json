@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00066",
+      "title": "Switch Code Quality Reviewer to Gemini CLI"
+    },
+    "binds": {
+      "prd_id": "NONE",
+      "rfc_id": "RFC-0006",
+      "requirements": [
+        {
+          "requirement_id": "MAINT-013",
+          "requirement_ref": "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements"
+        }
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_BUILD_RELEASE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00064"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Update ReviewType::Quality.ai_tool() to return 'gemini' in xtask/src/tasks/review.rs",
+        "Replace Codex invocation with Gemini CLI pattern using temp file + script approach",
+        "Verify CODE_QUALITY_PROMPT.md exists at documents/reviews/",
+        "Update doc comments to reference Gemini instead of Codex",
+        "Update push.rs trigger_ai_reviews() to use Gemini pattern for quality reviews",
+        "Ensure temp file cleanup after Gemini invocation",
+        "Handle Gemini CLI error cases gracefully"
+      ],
+      "out_of_scope": [
+        "Changes to other review types (security, architecture)",
+        "Modifying the CODE_QUALITY_PROMPT.md content",
+        "Adding new review types",
+        "Changes to CI/CD pipeline configuration"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read xtask/src/tasks/review.rs to understand current ReviewType::Quality implementation",
+        "Read xtask/src/tasks/push.rs to understand trigger_ai_reviews() implementation",
+        "Verify CODE_QUALITY_PROMPT.md exists at documents/reviews/",
+        "Update ReviewType::Quality.ai_tool() method to return 'gemini' instead of 'codex'",
+        "Implement Gemini CLI invocation pattern: write prompt to temp file, invoke gemini with script approach",
+        "Update doc comments in review.rs to reference Gemini instead of Codex",
+        "Update push.rs trigger_ai_reviews() to use Gemini CLI pattern for quality reviews",
+        "Add error handling for Gemini CLI failures",
+        "Ensure temp files are cleaned up after invocation",
+        "Run cargo build to verify compilation",
+        "Run cargo test to ensure existing tests pass",
+        "Run cargo clippy to check for warnings",
+        "Test end-to-end by running xtask review with quality type"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "ReviewType::Quality.ai_tool() returns 'gemini'",
+        "Quality reviews invoke Gemini CLI using temp file + script pattern",
+        "CODE_QUALITY_PROMPT.md exists at documents/reviews/",
+        "Doc comments reference Gemini instead of Codex",
+        "push.rs trigger_ai_reviews() uses Gemini pattern for quality",
+        "Temp files are properly cleaned up after invocation",
+        "Error cases are handled gracefully with informative messages",
+        "cargo build succeeds",
+        "cargo test passes",
+        "cargo clippy passes with no warnings"
+      ]
+    },
+    "notes": {
+      "security": "No security impact - replacing one AI CLI tool with another for code review",
+      "affected_files": "xtask/src/tasks/push.rs, xtask/src/tasks/review.rs",
+      "migration": "This ticket switches from Codex to Gemini CLI for code quality reviews as part of RFC-0006 multi-model review architecture"
+    }
+  }
+}

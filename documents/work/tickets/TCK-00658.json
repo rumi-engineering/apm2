@@ -1,0 +1,204 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00658",
+      "title": "FAC: PID-reuse safe lane liveness (bind LaneLease to /proc start time)",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        "REQ-0008",
+        "REQ-0037"
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "Implementer",
+        "Reviewer"
+      ],
+      "responsibility_domains": [
+        "fac/lane-lease",
+        "fac/reconcile",
+        "fac/systemd-unit"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00657",
+        "TCK-00622"
+      ]
+    }
+  },
+  "context": {
+    "observed_symptoms": [
+      "Lanes marked Corrupt and jobs remain stuck in claimed because the lease PID appears alive even though the original worker is gone.",
+      "Operators report dead-PID situations; recovery often requires manual lane reset and/or queue surgery.",
+      "Orphaned claimed jobs with consumed channel_context_token are requeued by startup reconcile, then denied at replay by nonce check — job is permanently stuck rather than cleanly failed.",
+      "Bounded gates and warm builders fail intermittently with \"Unit session-*.scope not found\" when the detected cgroup session scope is already gone/closing; systemd-run --user refuses to start the transient unit because PartOf=/BindsTo= references a non-existent parent."
+    ],
+    "code_evidence": [
+      "Lane liveness uses kill(pid, 0) only (PID existence), which is vulnerable to PID reuse:\n  crates/apm2-core/src/fac/lane.rs:3030-3078 (derive_lane_state + is_pid_alive)\n",
+      "Reconcile treats \"lock free + pid alive\" as Corrupt and then considers the job active,\npreventing claimed→pending recovery:\n  crates/apm2-core/src/fac/reconcile.rs:769-817\n",
+      "Lane reset kill path only checks /proc/<pid>/comm exists before SIGTERM/SIGKILL,\nwhich can kill the wrong process under PID reuse:\n  crates/apm2-cli/src/commands/fac.rs:5124-5171\n",
+      "Token nonce is consumed before job completes; reconcile requeues orphaned claimed\njobs unconditionally (OrphanedJobPolicy::Requeue), violating single-use semantics:\n  crates/apm2-core/src/fac/token_ledger.rs:567 (nonce marked consumed)\n  crates/apm2-cli/src/commands/fac_worker.rs:772 (OrphanedJobPolicy::Requeue at startup)\n  crates/apm2-core/src/fac/reconcile.rs:1418 (requeue without token-awareness)\n  crates/apm2-core/src/fac/token_ledger.rs:657 (replay denial on second execution)\n",
+      "Parent unit auto-detected from cgroup path treats ephemeral session-*.scope as valid parent\nwithout existence/stability check:\n  crates/apm2-core/src/fac/systemd_unit.rs:64 (detect_systemd_unit_name)\n  crates/apm2-core/src/fac/systemd_unit.rs:266 (returns session-*.scope from /proc/self/cgroup)\n",
+      "Bounded gate and warm builders pass detected parent_unit to command builder unconditionally:\n  crates/apm2-cli/src/commands/fac_review/bounded_test_runner.rs:187 (bounded gate)\n  crates/apm2-core/src/fac/warm.rs:639 (warm builder)\n",
+      "Command builder always adds PartOf= and BindsTo= for parent_unit; if the session scope is\ngone/closing, systemd-run --user fails with \"Unit session-*.scope not found\":\n  crates/apm2-core/src/fac/execution_backend.rs:448 (PartOf/BindsTo unconditionally added)\n"
+    ]
+  },
+  "problem_statement": "PID existence is an insufficient identity for lane ownership. Linux PID reuse can cause the system\nto believe a dead lease is still alive, producing Corrupt lanes and preventing requeue of claimed\njobs. This is both a liveness failure (jobs stuck) and a safety risk (potentially killing unrelated\nprocesses via operator tools).\n",
+  "root_cause_analysis": {
+    "primary_cause": "LaneLeaseV1 stores only a PID and the system uses kill(0) to test liveness. PID reuse yields\nfalse positives; the reconcile logic then fail-closes by marking Corrupt and treating the job as\nactive, which can strand work indefinitely.\n",
+    "secondary_cause": "There is no durable process-identity binding (e.g., /proc/<pid>/stat starttime) in LaneLeaseV1.\n",
+    "tertiary_cause": "Transient systemd units bind unconditionally to an auto-detected parent unit (session-*.scope from\n/proc/self/cgroup). These session scopes are ephemeral and may be gone/closing by the time\nsystemd-run executes. No existence or stability check is performed on the parent, and there is no\nfallback path when PartOf=/BindsTo= targets a non-existent unit. The failure is intermittent because\nit depends on process cgroup/session lifecycle, not repo code content.\n"
+  },
+  "proposed_change": {
+    "intent": "Bind lane leases to process identity by recording the process start time (in kernel ticks since\nboot) at lease creation and verifying it during liveness checks. This makes PID reuse detectable\nand allows safe, automatic recovery from stale leases without killing unrelated processes.\n"
+  },
+  "invariants": [
+    {
+      "id": "INV-PROC-ID-001",
+      "statement": "If a LaneLeaseV1 contains pid + proc_start_time_ticks, the lane is considered owned by that process IFF (kill(pid,0) == alive) AND (/proc/<pid>/stat starttime == proc_start_time_ticks)."
+    },
+    {
+      "id": "INV-PROC-ID-002",
+      "statement": "If PID is alive but starttime mismatches, it MUST be treated as NOT the lease owner (PID reuse or identity loss)."
+    },
+    {
+      "id": "INV-PROC-ID-003",
+      "statement": "Reconcile MUST NOT strand claimed jobs solely due to PID existence; it must use identity checks or additional evidence."
+    },
+    {
+      "id": "INV-TOKEN-REQUEUE-001",
+      "statement": "Reconcile MUST NOT requeue an orphaned claimed job that has a consumed channel_context_token; such jobs MUST be marked MarkFailed to preserve single-use token semantics."
+    },
+    {
+      "id": "INV-TOKEN-REQUEUE-002",
+      "statement": "OrphanedJobPolicy::Requeue is only valid for explicitly idempotent or token-free jobs; token-bound jobs MUST use OrphanedJobPolicy::Fail."
+    },
+    {
+      "id": "INV-SYSTEMD-PARENT-001",
+      "statement": "Transient unit command builders MUST NOT bind (PartOf=/BindsTo=) to a parent unit that is not-found or inactive; if parent validation fails, the binding MUST be omitted and execution MUST proceed without it."
+    },
+    {
+      "id": "INV-SYSTEMD-PARENT-002",
+      "statement": "Ephemeral session-*.scope units MUST NOT be treated as stable parents without an existence+active check (systemctl --user show <unit> LoadState/ActiveState)."
+    }
+  ],
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1",
+        "description": "Extend LaneLeaseV1 with process identity:\n  - Add field: proc_start_time_ticks: optional u64\n  - Record this value at lease creation (worker + any other lease writers)\n  - Update serialization versioning carefully (keep schema_version = 1; field optional)\n"
+      },
+      {
+        "id": "S2",
+        "description": "Add process identity helpers (prefer apm2-core, reusable across CLI + daemon):\n  - read_proc_start_time_ticks(pid: u32) -> io::Result<u64>\n    * parse /proc/<pid>/stat field 22 (starttime)\n  - verify_pid_identity(pid, expected_start_ticks) -> ProcessIdentity\n    * AliveMatch | AliveMismatch | Dead | Unknown\n  - Must be pure/testable where possible; OS errors should be surfaced as Unknown.\n"
+      },
+      {
+        "id": "S3",
+        "description": "Update lane status + reconcile to use identity:\n  - crates/apm2-core/src/fac/lane.rs:\n      * replace is_pid_alive checks with verify_pid_identity when start ticks available\n      * derive_lane_state uses identity result (AliveMatch behaves like Alive; AliveMismatch behaves like Dead)\n  - crates/apm2-core/src/fac/reconcile.rs:\n      * when lock free + lease present:\n          - if identity == AliveMismatch => treat as stale lease (recover), DO NOT mark Corrupt\n          - if identity == Unknown => keep fail-closed behavior (Corrupt) but annotate reason\n      * only insert job_id into active_job_ids when identity == AliveMatch (not mere PID existence)\n"
+      },
+      {
+        "id": "S4",
+        "description": "Update acquire_worker_lane (fac_worker) to avoid taking a lane based on PID-only:\n  - If lease exists and identity == AliveMismatch => remove lease (stale) and proceed\n  - If identity == Unknown => skip lane and emit actionable log\n"
+      },
+      {
+        "id": "S5",
+        "description": "Add tests (no PID reuse required):\n  - Spawn a child process (sleep) and read its start ticks; assert identity matches.\n  - Write a lease with the same pid but wrong start ticks; assert identity mismatch path is taken.\n  - Reconcile test: a lane with lock free + lease (pid alive, start ticks mismatch) is recovered and its job is eligible for claimed→pending.\n"
+      },
+      {
+        "id": "S6",
+        "description": "Fix reconcile token-awareness (immediate fix for the requeue/replay-denial bug):\n  - Before requeuing an orphaned claimed job, check whether the job has a channel_context_token\n    with a consumed nonce in the token ledger.\n  - If nonce is consumed: call MarkFailed instead of requeue.\n  - If nonce is not consumed (or job has no token): existing requeue path is safe.\n  - Applies at startup reconcile (OrphanedJobPolicy) and periodic reconcile-on-tick paths.\n"
+      },
+      {
+        "id": "S7",
+        "description": "Add regression test for the specific failure sequence observed 2026-02-21:\n  - Consume a token nonce (simulate via token_ledger WAL write).\n  - Create an orphaned claimed job referencing that nonce.\n  - Run reconcile with OrphanedJobPolicy::Requeue.\n  - Assert job is NOT moved back to pending; assert it is marked failed.\n  - Assert no subsequent replay-denial error is possible for this job.\nLonger-term note: bind reconcile token checks to authoritative token ledger state\nvia daemon-mediated query rather than direct WAL reads, to support distributed reconcile.\n"
+      },
+      {
+        "id": "S8",
+        "description": "Harden transient systemd unit parent binding against stale session scopes:\n  - Before adding PartOf=/BindsTo= in the command builder, validate that the detected\n    parent unit exists and is active (systemctl --user show <unit> LoadState+ActiveState).\n  - If parent is not-found or inactive, omit PartOf=/BindsTo= and continue execution\n    without parent binding (log a warning).\n  - Do not bind to ephemeral session-*.scope parents unless they pass the existence check.\n  - Add one retry-once path: if systemd-run fails with \"Unit ... not found\", retry\n    without parent binding.\n  - Sites: crates/apm2-core/src/fac/systemd_unit.rs (detection + validation),\n    crates/apm2-core/src/fac/execution_backend.rs:448 (conditional binding),\n    crates/apm2-cli/src/commands/fac_review/bounded_test_runner.rs:187 (bounded gate),\n    crates/apm2-core/src/fac/warm.rs:639 (warm builder).\n"
+      },
+      {
+        "id": "S9",
+        "description": "Add regression tests for stale session scope parent detection:\n  - Test that detect_systemd_unit_name returning a non-existent session scope results\n    in parent binding being omitted (not a hard failure).\n  - Test the retry-once path: simulate \"Unit ... not found\" failure and assert fallback\n    without parent binding succeeds.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Full lease/receipt schema version bump (optional later).",
+      "Broader daemon-mediated token ledger authority (follow-on; note captured in S7)."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "P1",
+        "description": "Introduce proc start time helper + unit tests (apm2-core)."
+      },
+      {
+        "id": "P2",
+        "description": "Extend LaneLeaseV1 with proc_start_time_ticks (optional) and write it from all producers."
+      },
+      {
+        "id": "P3",
+        "description": "Update lane_status + reconcile + acquire_worker_lane to use identity verification."
+      },
+      {
+        "id": "P4",
+        "description": "Add focused regression tests for the previously-stuck scenario (Corrupt lane due to PID reuse false positive)."
+      },
+      {
+        "id": "P5",
+        "description": "Add token-awareness check in reconcile orphan path: consumed-nonce jobs take MarkFailed, not Requeue."
+      },
+      {
+        "id": "P6",
+        "description": "Add regression test for the 2026-02-21 nonce-requeue-replay-denial sequence (S7)."
+      },
+      {
+        "id": "P7",
+        "description": "Harden transient systemd unit parent binding: validate parent exists+active before PartOf/BindsTo, omit binding on stale session scope, add retry-once fallback (S8)."
+      },
+      {
+        "id": "P8",
+        "description": "Add regression tests for stale session scope parent detection (S9)."
+      }
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "Lane reconciliation no longer treats PID existence as sufficient evidence of ownership when proc_start_time_ticks is present.",
+      "The \"lock free + pid alive\" ambiguous path is significantly reduced: PID reuse becomes a recoverable stale lease, not a permanent Corrupt lane.",
+      "Newly written leases include proc_start_time_ticks.",
+      "Transient systemd units no longer fail when the auto-detected session scope parent is gone/closing; parent binding is omitted gracefully."
+    ],
+    "evidence_ids": [
+      "EVID-TCK-00658-01 (unit): process identity helper tests",
+      "EVID-TCK-00658-02 (unit): lane reconcile recovers on identity mismatch",
+      "EVID-TCK-00658-03 (regression): consumed-nonce orphaned job is marked failed, not requeued",
+      "EVID-TCK-00658-04 (regression): stale session scope parent is detected and binding omitted without hard failure"
+    ]
+  },
+  "test_plan": {
+    "unit_tests": [
+      "apm2-core: parse /proc/<pid>/stat starttime; identity mismatch/match behavior",
+      "apm2-core reconcile: orphaned claimed job with consumed nonce → MarkFailed (not Requeue)"
+    ],
+    "integration_tests": [
+      "apm2-cli fac_worker lane acquisition: stale lease with mismatched starttime is removed and lane becomes available",
+      "End-to-end regression (2026-02-21): nonce consumed → orphan → reconcile → job marked failed, no replay-denial reachable",
+      "apm2-core systemd_unit: stale session-*.scope detected → parent binding omitted, transient unit starts successfully",
+      "apm2-core execution_backend: retry-once path on \"Unit ... not found\" succeeds without parent binding"
+    ]
+  },
+  "notes": {
+    "safety_and_fail_closed": "- Identity mismatch MUST be treated as non-ownership; this is safer than killing or blocking.\n- Identity unknown MUST remain fail-closed (do not reclaim automatically) to avoid double execution.\n",
+    "migration": "Existing leases will not have proc_start_time_ticks. The system should:\n  - log a one-time warning when identity cannot be verified due to missing field\n  - rely on other evidence (lock held + receipt presence + unit liveness) for safe recovery\n  - naturally converge as new leases are written.\n"
+  }
+}

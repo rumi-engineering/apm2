@@ -1,0 +1,115 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00168",
+      "title": "Implement cgroups v2 reader for resource metrics",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-TEL-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00160"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "CgroupReader for cpu, memory, io stats",
+      "verification": "Reader returns valid metrics for process"
+    },
+    {
+      "criterion": "Per-episode cgroup placement",
+      "verification": "Episode process runs in isolated cgroup"
+    },
+    {
+      "criterion": "Fallback to /proc for non-cgroup metrics",
+      "verification": "Degraded mode returns /proc values"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "CgroupReader structure",
+        "code": "pub struct CgroupReader {\n    cgroup_path: PathBuf,\n    fallback_pid: Option<Pid>,\n}\n\nimpl CgroupReader {\n    pub fn for_episode(episode_id: &EpisodeId) -> Result<Self>;\n\n    pub fn read_cpu(&self) -> Result<CpuStats> {\n        // cpu.stat: usage_usec, user_usec, system_usec\n    }\n\n    pub fn read_memory(&self) -> Result<MemoryStats> {\n        // memory.current, memory.peak, memory.stat\n    }\n\n    pub fn read_io(&self) -> Result<IoStats> {\n        // io.stat: rbytes, wbytes, rios, wios\n    }\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/src/telemetry/cgroup.rs",
+        "purpose": "CgroupReader and cgroup v2 integration"
+      },
+      {
+        "path": "crates/apm2-daemon/src/telemetry/stats.rs",
+        "purpose": "CpuStats, MemoryStats, IoStats types"
+      },
+      {
+        "path": "crates/apm2-daemon/src/telemetry/proc_fallback.rs",
+        "purpose": "/proc fallback for degraded mode"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Export cgroup, stats, proc_fallback modules",
+        "path": "crates/apm2-daemon/src/telemetry/mod.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Define stats types",
+        "details": "Create metric types per AD-TEL-001:\n- CpuStats: usage_ns, user_ns, system_ns\n- MemoryStats: rss_bytes, peak_bytes, page_faults\n- IoStats: read_bytes, write_bytes, read_ops, write_ops\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement cgroup path resolution",
+        "details": "Per AD-CGROUP-001, episodes run in:\n/sys/fs/cgroup/apm2.slice/episode-{uuid}.scope/\n\nResolve path from episode_id:\n- Check cgroup v2 unified hierarchy\n- Verify controllers available\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement stat readers",
+        "details": "Read cgroup v2 files:\n- cpu.stat for CPU metrics\n- memory.current, memory.peak for memory\n- io.stat for I/O metrics\nParse key=value format\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement /proc fallback",
+        "details": "For degraded mode (no cgroup):\n- /proc/{pid}/stat for CPU\n- /proc/{pid}/statm for memory\n- /proc/{pid}/io for I/O\nMark metrics with degraded flag\n"
+      },
+      {
+        "step": 5,
+        "action": "Create episode cgroup scope",
+        "details": "Per AD-CGROUP-001:\n- Primary: systemd transient API via zbus\n- Fallback: direct cgroup v2 writes\n- Freeze trick: create frozen, assign PID, unfreeze\n"
+      }
+    ],
+    "summary": "Implement cgroups v2 reader for resource metrics per AD-TEL-001 and AD-CGROUP-001.\nReads cpu, memory, io stats from per-episode cgroup scopes.\nIncludes /proc fallback for degraded mode.\n"
+  },
+  "notes": "Phase: PHASE-2C (Telemetry Collection)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-011.\n",
+  "test_requirements": [
+    {
+      "description": "Cgroup stat reading",
+      "test_id": "UT-00168-01",
+      "verification_command": "cargo test -p apm2-daemon cgroup_read"
+    },
+    {
+      "description": "Proc fallback",
+      "test_id": "UT-00168-02",
+      "verification_command": "cargo test -p apm2-daemon proc_fallback"
+    },
+    {
+      "description": "Episode cgroup creation",
+      "test_id": "IT-00168-01",
+      "verification_command": "cargo test -p apm2-daemon --test integration cgroup_create"
+    }
+  ]
+}

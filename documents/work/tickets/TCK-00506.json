@@ -1,0 +1,97 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00506",
+      "title": "Projection receipt format bridge for economics gate compatibility",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0029",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0009",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0009.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0005",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0005.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0009",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RELIABILITY",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00478",
+          "reason": "Economics module defines DeferredReplayReceiptV1 shape that daemon receipts must bridge to."
+        },
+        {
+          "ticket_id": "TCK-00474",
+          "reason": "Replay/recovery receipt closure (REQ-0005) defines temporal field requirements."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Extend ProjectionReceipt in crates/apm2-daemon/src/projection/projection_receipt.rs with temporal fields: boundary_id, time_authority_ref (Hash), window_ref (Hash), eval_tick (u64).",
+        "Create ProjectionAdmissionReceipt type that bridges daemon receipt fields to economics DeferredReplayReceiptV1 inputs.",
+        "Update Ed25519 signing domain to include temporal fields in the signed payload.",
+        "Implement From<ProjectionAdmissionReceipt> for DeferredReplayReceiptV1 input assembly.",
+        "Add bounded serde deserialization for new string/vec fields on receipt types.",
+        "Preserve backwards compatibility: existing ProjectionReceipt deserialization must not break on old receipts missing temporal fields (use Option<> with fail-closed semantics at validation time)."
+      ],
+      "out_of_scope": [
+        "Generating these receipts in the projection worker (see TCK-00505).",
+        "Deferred replay receipt generation (see TCK-00508)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add temporal fields to ProjectionReceipt as Option types for backwards compat.",
+        "Create ProjectionAdmissionReceipt with all temporal fields required (non-Option).",
+        "Update signing logic: domain prefix PROJECTION_ADMISSION_RECEIPT: covers all fields including temporal.",
+        "Implement conversion trait from admission receipt to DeferredReplayReceiptV1 input shape.",
+        "Add bounded serde visitors for boundary_id string field.",
+        "Write round-trip serde tests and signature verification tests for both receipt types.",
+        "Verify old receipts (without temporal fields) still deserialize correctly."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0009"
+      ],
+      "criteria": [
+        "ProjectionAdmissionReceipt signs over all fields including temporal references.",
+        "Conversion to DeferredReplayReceiptV1 input is lossless for all required fields.",
+        "Old ProjectionReceipt payloads deserialize without error (backwards compat).",
+        "New receipts with temporal fields round-trip through serde correctly.",
+        "Bounded deserialization rejects oversized boundary_id before allocation."
+      ]
+    },
+    "notes": {
+      "security": "The signing domain MUST change for the new receipt type to prevent cross-type\nsignature confusion. Old PROJECTION_RECEIPT: domain stays for legacy receipts;\nnew PROJECTION_ADMISSION_RECEIPT: domain covers temporal fields. Never accept\na legacy-domain signature as proof of temporal binding.\n",
+      "verification": "Include cross-domain rejection test: sign with old domain, verify with new domain\nmust fail. Include tampered temporal field detection test.\n",
+      "general": "This is a format bridge — it does not change when or how receipts are created,\nonly what they contain and how they map to economics module types.\n"
+    }
+  }
+}

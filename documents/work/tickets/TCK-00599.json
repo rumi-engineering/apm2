@@ -1,0 +1,75 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00599",
+      "title": "`apm2 fac bootstrap`: compute-host provisioning (dirs, perms, policy stub, services)",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 723,
+          "merge_commit": "e59df5c09ddd8979f7ebd39e69f205233593479d",
+          "merged_at": "2026-02-17T17:28:19Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00594",
+          "reason": "`services ensure` should be invoked or referenced."
+        },
+        {
+          "ticket_id": "TCK-00528",
+          "reason": "Needs unit conventions and $APM2_HOME layout."
+        },
+        {
+          "ticket_id": "TCK-00547",
+          "reason": "Bootstrap should run doctor."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement `apm2 fac bootstrap` as described in §5.2.9.",
+        "Create directory tree with correct ownership/mode.",
+        "Write minimal default policy and stub lanes configuration (or pointers).",
+        "Optionally install/enable services (system vs user)."
+      ],
+      "out_of_scope": [
+        "Automated cloud provisioning."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement idempotent bootstrap (safe re-run).",
+        "Add `--dry-run` to show planned filesystem/systemd actions.",
+        "Integrate doctor and services ensure."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "On a clean host, `apm2 fac bootstrap` results in a host that can execute `apm2 fac gates` in default mode.",
+        "Bootstrap does not leak secrets and does not destroy existing lanes unless explicitly requested."
+      ]
+    }
+  }
+}

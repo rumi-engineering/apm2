@@ -1,0 +1,122 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00315",
+      "title": "FAC v0 NEW WORK REQUIRED: Reviewer navigation tool surface (ListFiles/Search)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0010",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0011",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0011.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00286",
+          "reason": "Foundational daemon infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00290",
+          "reason": "Tool broker infrastructure required for RequestTool handling"
+        },
+        {
+          "ticket_id": "TCK-00291",
+          "reason": "Tool protocol infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00292",
+          "reason": "Capability manifest infrastructure required for allowlists"
+        },
+        {
+          "ticket_id": "TCK-00293",
+          "reason": "CAS storage required for logging navigation outputs"
+        },
+        {
+          "ticket_id": "TCK-00252",
+          "reason": "RFC-0017: Session management infrastructure required"
+        },
+        {
+          "ticket_id": "TCK-00260",
+          "reason": "RFC-0017: Tool execution context required"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define ListFiles message in proto/tool_protocol.proto",
+        "Define Search message in proto/tool_protocol.proto",
+        "Wire ListFiles through RequestTool to tool broker",
+        "Wire Search through RequestTool to tool broker",
+        "Enforce capability allowlist for ListFiles tool",
+        "Enforce capability allowlist for Search tool",
+        "Enforce context firewall rules (read-only access)",
+        "Enforce bounded output limits (max_bytes=65536, max_lines=2000)",
+        "Log navigation outputs to CAS",
+        "Handle tool broker routing for navigation tools"
+      ],
+      "out_of_scope": [
+        "File modification tools (read-only navigation only)",
+        "Advanced search features (regex, semantic search)",
+        "Directory creation or deletion",
+        "File content reading beyond search results",
+        "Network or external resource access",
+        "Unbounded output (strict limits enforced)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read existing proto/tool_protocol.proto to understand message patterns",
+        "Design ListFiles message with path, pattern, and output bound fields",
+        "Design Search message with query, scope, and output bound fields",
+        "Add ListFiles and Search messages to proto/tool_protocol.proto",
+        "Implement ListFiles handler in tool broker with allowlist check",
+        "Implement Search handler in tool broker with allowlist check",
+        "Add context firewall enforcement for read-only access",
+        "Implement output truncation at max_bytes=65536 and max_lines=2000",
+        "Wire navigation outputs to CAS logging",
+        "Update consume.rs to enforce allowlist for navigation tools",
+        "Add tests for ListFiles with allowlisted and non-allowlisted paths",
+        "Add tests for Search with bounded output verification",
+        "Add tests for context firewall enforcement"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0011"
+      ],
+      "criteria": [
+        "ListFiles/Search requests are denied unless allowlisted.",
+        "Navigation outputs are bounded (max_bytes=65536, max_lines=2000) and logged to CAS."
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed",
+      "verification": "Verify non-allowlisted paths return PERMISSION_DENIED; verify output truncation",
+      "general": "Part of FAC v0 Preconditions group; provides minimal file navigation for reviewers"
+    }
+  }
+}

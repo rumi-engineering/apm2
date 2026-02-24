@@ -1,0 +1,63 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00201",
+      "title": "Clarify CI vs Internal Gate Architecture in Security Documentation",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": null,
+      "requirements": [
+        {
+          "requirement_id": "CTR-1912"
+        },
+        {
+          "requirement_id": "CTR-1913"
+        }
+      ]
+    }
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "CI_SECURITY_GATES.md clearly distinguishes CI gates from internal gates",
+      "verification": "Documentation review"
+    },
+    {
+      "criterion": "Agent Complexity gate documented as internal (GateRunner) not CI",
+      "verification": "Documentation review"
+    },
+    {
+      "criterion": "Formal Proofs (kani/prusti) gate documented as internal not CI",
+      "verification": "Documentation review"
+    },
+    {
+      "criterion": "safety-proof-coverage scope expanded to all crates or exclusions documented",
+      "verification": "CI workflow inspection"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [],
+    "files_to_modify": [
+      "documents/security/CI_SECURITY_GATES.md",
+      ".github/workflows/ci.yml"
+    ],
+    "implementation_steps": [
+      "Update CI_SECURITY_GATES.md to clarify which gates run in GitHub Actions vs internal GateRunner",
+      "Add \"Internal Gates (per PRD-0004)\" section explaining Agent Complexity and Formal Proofs belong in internal gate system",
+      "Either expand safety-proof-coverage to scan all crates/ or document why xtask is excluded"
+    ],
+    "summary": "Address code quality review findings from PR #212. Per PRD-0004 (Work Substrate),\nGitHub Actions is a projection adapter - cognitive complexity and formal verification\n(kani/prusti) gates belong in the internal GateRunner system, not CI. Documentation\nmust clearly distinguish between CI-enforced gates and internal gates.\n"
+  },
+  "notes": "Follow-up from PR #212 code quality review.\nPRD-0004 establishes that GitHub is a projection adapter and internal gates are authoritative.\nThis ticket resolves documentation discrepancy flagged as MAJOR finding.\n",
+  "test_requirements": [
+    {
+      "description": "Documentation accurately reflects gate architecture",
+      "test_id": "DOC-00201-01",
+      "verification_command": "grep -q \"Internal Gates\" documents/security/CI_SECURITY_GATES.md"
+    }
+  ]
+}

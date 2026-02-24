@@ -1,0 +1,77 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00183",
+      "title": "Peer Discovery and Mutual TLS",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0014"
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00180"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "Nodes connect to bootstrap nodes on startup",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "TLS 1.3 mutual authentication",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Certificate validation against network CA",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Peer list maintained and refreshed",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Connection pooling for reuse",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Control plane frames padded to fixed-size envelope",
+      "verification": "Manual verification required"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-core/src/consensus/network.rs",
+        "purpose": "Network transport and TLS"
+      },
+      {
+        "path": "crates/apm2-core/src/consensus/discovery.rs",
+        "purpose": "Peer discovery protocol"
+      }
+    ],
+    "files_to_modify": [],
+    "implementation_steps": [],
+    "summary": "Implement peer discovery via bootstrap nodes and optional gossip.\nEstablish mutual TLS connections between nodes using rustls.\nCreate network CA and node certificate infrastructure.\n"
+  },
+  "notes": "Phase: P1\nGenerated from RFC RFC-0014 ticket decomposition on 2026-01-28.",
+  "test_requirements": [
+    {
+      "description": "Unit tests pass",
+      "test_id": "UT-00183-01",
+      "verification_command": "cargo test -p apm2-core tck_00183"
+    },
+    {
+      "description": "Integration test",
+      "test_id": "IT-00183-01",
+      "verification_command": "cargo run --bin apm2 -- factory tickets emit --rfc RFC-0014"
+    }
+  ]
+}

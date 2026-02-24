@@ -1,0 +1,59 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00548",
+      "title": "Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00529",
+          "reason": "Containment checks depend on the execution backend."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement a containment check routine: verify child processes (rustc/nextest) share the same cgroup as the job unit.",
+        "Expose `apm2 fac verify containment --job <job_id>` (or similar).",
+        "When sccache is enabled, require this check to pass (else auto-disable sccache and emit receipt).",
+        "Record containment verdict in receipts."
+      ],
+      "out_of_scope": [
+        "Kernel-level sandboxing."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement process discovery during job execution and sample cgroup paths.",
+        "Implement verdict logic and receipt recording."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Containment mismatches are detected reliably.",
+        "System refuses to run with unsafe sccache containment in default mode."
+      ]
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/determinism",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-DET-001",
+      "kind": "invariant",
+      "title": "YAML mapping keys sorted lexicographically",
+      "description": "All mapping keys are sorted in byte order to ensure deterministic output.",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-002",
+      "kind": "invariant",
+      "title": "Consistent 2-space indentation",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-003",
+      "kind": "invariant",
+      "title": "No trailing whitespace on any line",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-004",
+      "kind": "invariant",
+      "title": "YAML canonicalization is idempotent",
+      "description": "canonicalize_yaml(parse(canonicalize_yaml(v))) == canonicalize_yaml(v).",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-005",
+      "kind": "invariant",
+      "title": "Atomic write crash safety",
+      "description": "Target file is either fully written or unchanged after write_atomic.",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-006",
+      "kind": "invariant",
+      "title": "fsync before rename on Unix for durability",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-007",
+      "kind": "invariant",
+      "title": "Temp files created in same directory as target",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-008",
+      "kind": "invariant",
+      "title": "Diff classification is symmetric",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-009",
+      "kind": "invariant",
+      "title": "Identical inputs always return Identical classification",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-DET-010",
+      "kind": "invariant",
+      "title": "JSON object keys sorted lexicographically (CAC-JSON)",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-011",
+      "kind": "invariant",
+      "title": "No whitespace between JSON tokens (CAC-JSON)",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-012",
+      "kind": "invariant",
+      "title": "JSON canonicalization is idempotent",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-013",
+      "kind": "invariant",
+      "title": "JSON canonical output is deterministic across platforms",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-014",
+      "kind": "safety",
+      "title": "Reject floating-point numbers in CAC-JSON",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-015",
+      "kind": "safety",
+      "title": "Reject numbers outside i64 range in CAC-JSON",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-016",
+      "kind": "safety",
+      "title": "Reject duplicate object keys in CAC-JSON",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-017",
+      "kind": "safety",
+      "title": "Reject non-NFC normalized strings in CAC-JSON",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-018",
+      "kind": "safety",
+      "title": "Reject nesting deeper than 128 levels in CAC-JSON",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-DET-019",
+      "kind": "safety",
+      "title": "Reject complex YAML keys explicitly",
+      "description": "Sequence or mapping keys cause UnsupportedComplexKey error, never silent data loss.",
+      "rfc": ["RFC-0016"]
+    }
+  ]
+}

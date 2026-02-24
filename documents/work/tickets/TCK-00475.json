@@ -1,0 +1,91 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00475",
+      "title": "RFC-0029 REQ-0006 security-interlocked optimization gates and quantitative evidence quality enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0029",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0006.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0006",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_OBSERVABILITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00439",
+          "reason": "Schema-qualified CAC registry coverage is required for RFC-0029 interlock gate contracts."
+        },
+        {
+          "ticket_id": "TCK-00470",
+          "reason": "Optimization interlock checks depend on canonical economics profile baseline."
+        },
+        {
+          "ticket_id": "TCK-00471",
+          "reason": "Optimization and run-receipt checks depend on deterministic selector/context closure."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Require KPI/countermetric completeness for all optimization decisions.",
+        "Enforce canonical TemporalPredicateEvaluatorV1 and arbitration bindings for TP-EIO29 predicates.",
+        "Enforce evidence-quality thresholds (power >= 0.90, alpha <= 0.01, sample-size proof) and reproducibility matrix (>=3 runtime classes).",
+        "Enforce freshness BLOCKED transitions and throughput-dominance behavior for promotion-critical evidence classes."
+      ],
+      "out_of_scope": [
+        "Disclosure policy mode design changes.",
+        "Projection sink continuity scenario orchestration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Bind countermetric.profile and receipt.run checks into optimization gate path.",
+        "Implement fail-closed defects for missing KPI/countermetric and unresolved arbitration states.",
+        "Implement quality/freshness/throughput gate checks in promotion-critical policy path.",
+        "Add deterministic tests for threshold failures, stale evidence, and throughput-dominance violations."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0006"
+      ],
+      "criteria": [
+        "Optimization gates reject incomplete KPI/countermetric mappings.",
+        "Evidence-quality gate enforces statistical thresholds and reproducibility matrix contracts.",
+        "Stale or throughput-dominance-violating evidence classes block optimization promotions."
+      ]
+    },
+    "notes": {
+      "security": "Countermetric incompleteness and low-confidence evidence are non-admissible for promotion-critical optimization.\n",
+      "verification": "Include evaluator disagreement/arbitration fixtures and quality-threshold deny suites.\n",
+      "general": "This ticket implements REQ-0006 interlock and quantitative evidence-governance enforcement.\n"
+    }
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00594",
+      "title": "`apm2 fac services`: status/ensure + socket-activation glue for non-flaky startup",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00528",
+          "reason": "Needs unit naming conventions and runbook semantics."
+        },
+        {
+          "ticket_id": "TCK-00547",
+          "reason": "Doctor/readiness output should integrate."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement `apm2 fac services status` (broker reachability, worker liveness, and (if applicable) systemd unit status).",
+        "Implement `apm2 fac services ensure` with best-effort start semantics:",
+        "  * system-mode: attempt to start/enable system units (when permitted).",
+        "  * user-mode: attempt to start/enable user units and print linger guidance.",
+        "Provide deterministic remediation output when auto-start is not possible.",
+        "Ensure commands are non-destructive (no GC, no lane reset)."
+      ],
+      "out_of_scope": [
+        "Full fleet orchestration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define a minimal broker status endpoint (or reuse existing) returning broker version and queue depth.",
+        "Wire `services status` to broker liveness + worker liveness.",
+        "Add optional systemd integration (D-Bus or `systemctl` invocation), gated by environment/privilege checks.",
+        "Add docs linking to TCK-00528 runbook."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "`apm2 fac services status` clearly distinguishes: broker unreachable vs worker absent vs healthy.",
+        "`apm2 fac services ensure` starts services where possible, otherwise prints deterministic remediation.",
+        "No secret values appear in output."
+      ]
+    }
+  }
+}

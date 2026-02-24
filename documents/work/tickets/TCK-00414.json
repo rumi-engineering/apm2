@@ -1,0 +1,137 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00414",
+      "title": "Re-architect identity abstraction with spec-driven wire/tag/derivation/resolution contracts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0007",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0007.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0008",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0008.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0007",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0007.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0008",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0303",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0303.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_API",
+        "DOMAIN_THEORY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00413",
+          "reason": "Provides the first abstraction cut (`CanonicalDigestIdKit`) and baseline behavior to preserve."
+        },
+        {
+          "ticket_id": "TCK-00353",
+          "reason": "Canonical key identifier rules and conformance vectors are the invariants this redesign must retain."
+        },
+        {
+          "ticket_id": "TCK-00354",
+          "reason": "Cell/Holon identity derivation contracts must remain stable while abstraction boundaries evolve."
+        },
+        {
+          "ticket_id": "TCK-00355",
+          "reason": "Certificate and delegation flows consume identity types and must not regress under new abstractions."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Introduce a second-generation identity abstraction layer centered on explicit semantic contracts, not only codec deduplication.",
+        "Define `IdentitySpec` (or equivalent) with four required semantic axes: `wire_form`, `tag_semantics`, `derivation_semantics`, and `resolution_semantics`.",
+        "Implement a shared `IdentityWireKernel` for bounded, fail-closed canonical text/binary parsing and rendering, while keeping derivation and meaning policies type-defined.",
+        "Model supported wire variants explicitly (at minimum: `Tagged33` and `Hash32`) with per-type admissibility rules.",
+        "Model tag semantics explicitly (fixed version tag, algorithm registry, set-mode optional/unknown, etc.) rather than assuming one tag meaning across all IDs.",
+        "Add explicit parse provenance (`from_text`, `from_tagged_binary`, `from_hash_only_binary`) and semantic completeness state (`resolved`, `unresolved`) to identity objects or wrappers.",
+        "Replace hidden sentinel-overloaded semantics for `KeySetIdV1` with explicit unresolved/resolved state while preserving existing external wire/text compatibility.",
+        "Define a digest-first resolver contract for IDs whose text form omits semantics (for example, KeySet mode resolution via descriptor lookup).",
+        "Encode per-type specs for existing identities (`PublicKeyIdV1`, `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) as the initial migration set.",
+        "Preserve RFC-0020 canonical grammar, fail-closed parser behavior, bounded decoding, and existing derivation domain separators.",
+        "Add conformance and differential tests that assert no externally observable drift for existing IDs, plus explicit tests for provenance/completeness state transitions.",
+        "Add fuzz/property tests for mixed wire-form parsing and resolver-required paths (unknown/missing descriptor, stale descriptor, malformed descriptor).",
+        "Document a 'new identity type admission checklist' so future ID families can be added without ad-hoc parser/semantic drift.",
+        "Add a Rust-standards invariant requiring eligible identity codepaths to adopt the shared spec-driven abstraction (or carry an explicit, documented waiver)."
+      ],
+      "out_of_scope": [
+        "Changing canonical text prefixes or binary encodings for currently shipped identity types.",
+        "Changing existing derivation hashes/domain separators for `PublicKeyIdV1`, `KeySetIdV1`, `CellIdV1`, or `HolonIdV1`.",
+        "Introducing new cryptographic algorithms or PQC migration work.",
+        "Reworking non-identity protocol dispatch, session routing, or unrelated daemon subsystems.",
+        "RFC governance rewrites beyond implementation notes and traceability updates needed for this ticket."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Codify the new abstraction contract in `identity/mod.rs` documentation: define the four axes and fail-closed invariants.",
+        "Implement shared wire-kernel primitives for canonical parse/encode with explicit wire-variant typing and bounded decode contracts.",
+        "Introduce `IdentitySpec` (trait/type-level config) and express the four current ID types through this specification layer.",
+        "Implement explicit provenance/completeness modeling and migrate `KeySetIdV1` away from implicit sentinel semantics.",
+        "Add resolver interface(s) and integrate descriptor-based resolution path for unresolved `KeySetIdV1` semantics.",
+        "Refactor `from_binary`/`parse_text` entry points to route through the new kernel+spec model while preserving current public API behavior.",
+        "Add compatibility tests proving canonical text/binary round-trip parity with pre-refactor vectors for all existing IDs.",
+        "Expand conformance suite with wire-variant and unresolved-state vectors (including fail-closed missing-resolution scenarios).",
+        "Add focused fuzz/property tests for parser/resolver interaction boundaries and ambiguous-tag rejection behavior.",
+        "Document extensibility checklist and acceptance gate for future identity types (spec declaration, invariants, vectors, fuzz, resolver policy).",
+        "Add a new invariant to `documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md` that mandates use of the shared identity abstraction for eligible canonical ID parse/encode paths, and map it for review-time enforcement.",
+        "Run `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo doc --workspace --no-deps`, and `cargo test --workspace`."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0007",
+        "EVID-0008",
+        "EVID-0303"
+      ],
+      "criteria": [
+        "All four current ID types are represented through explicit spec contracts covering wire/tag/derivation/resolution semantics.",
+        "`PublicKeyIdV1` and `KeySetIdV1` no longer rely on one-size-fits-all tag assumptions in shared abstractions.",
+        "`KeySetIdV1` unknown-tag semantics are represented explicitly (resolved/unresolved), not only by implicit sentinel overloading.",
+        "Existing RFC-0020 canonical grammar and current externally visible text/binary forms remain unchanged.",
+        "All pre-existing conformance vectors continue to pass without verdict regression.",
+        "New vectors/tests cover provenance state, completeness state, and resolver-required fail-closed behavior.",
+        "Identity abstraction documentation includes a repeatable admission checklist for future ID types and links to corresponding tests.",
+        "A new Rust-standards invariant is added under `documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md` requiring eligible canonical identity parse/encode paths to use the shared spec-driven abstraction (or an explicit waiver with rationale/evidence).",
+        "The invariant is actionable for reviews: adoption violations are treated as defects (not style nits) unless waived, so future identity surfaces cannot bypass the abstraction silently.",
+        "No identity boundary path widens acceptance of non-canonical or ambiguous inputs."
+      ]
+    },
+    "notes": {
+      "context": "Follow-up to TCK-00413 / PRs #461 and #466.\n\nLimitation observed in first abstraction generation:\n- `PublicKeyIdV1` uses AlgorithmTag semantics and a distinct binary validation path.\n- `KeySetIdV1` has sentinel-tag semantics and accepts both 32-byte and 33-byte binary encodings.\n\nThe new design target is to avoid overfitting to a single digest-id shape by\nseparating codec mechanics from semantic contracts and resolution obligations.\n\nTheory and governance alignment for this ticket:\n- LAW-13 / INV-F-03: typed, canonical boundary fields.\n- LAW-16: closure under composition and boundary-contract stability.\n- LAW-05 + RFC-0020 §1.7: fail-closed identity semantics at authority boundaries.\n- PRIN-107 / MSC-11: reduce semantic drift and preserve recursive semantic stability.\n",
+      "files": "- crates/apm2-daemon/src/identity/mod.rs\n- crates/apm2-daemon/src/identity/canonical_digest_id_kit.rs\n- crates/apm2-daemon/src/identity/public_key_id.rs\n- crates/apm2-daemon/src/identity/keyset_id.rs\n- crates/apm2-daemon/src/identity/cell_id.rs\n- crates/apm2-daemon/src/identity/holon_id.rs\n- crates/apm2-daemon/src/identity/conformance.rs\n- fuzz/fuzz_targets/public_key_id_parse.rs\n- fuzz/fuzz_targets/keyset_id_parse.rs\n- crates/apm2-daemon/tests/\n",
+      "security": "- Preserve default-deny, fail-closed parsing and resolution semantics at every identity boundary.\n- Never silently coerce unresolved semantic states into authoritative resolved states.\n- Keep canonicalization and semantic interpretation explicitly separated to prevent confused-deputy parsing paths.\n"
+    }
+  }
+}

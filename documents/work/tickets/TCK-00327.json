@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00327",
+      "title": "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt integration",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0010",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0010.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0010",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0010.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00320",
+          "reason": "Prerequisite per RFC-0019 ticket decomposition ordering"
+        },
+        {
+          "ticket_id": "TCK-00321",
+          "reason": "Prerequisite per RFC-0019 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Emit signed ToolExecutionReceipt per tool actuation (proof-carrying tool use)",
+        "ToolExecutionReceipt binds episode/policy/request/capability, args_hash/result_hash, and time envelope/duration",
+        "ToolLogIndexV1 indexes ToolExecutionReceipt hashes with canonical ordering and chunking support",
+        "Generate SummaryReceipt (loss profile + selectors) for review outcomes",
+        "Review artifacts reference tool_log_index_hash and summary_receipt_hash (single-pointer scaling)"
+      ],
+      "out_of_scope": [
+        "Exabyte-scale compaction pipelines (future RFC)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Emit signed ToolExecutionReceipt per tool actuation (proof-carrying tool use)",
+        "Implement: ToolExecutionReceipt binds episode/policy/request/capability, args_hash/result_hash, and time envelope/duration",
+        "Implement: ToolLogIndexV1 indexes ToolExecutionReceipt hashes with canonical ordering and chunking support",
+        "Implement: Generate SummaryReceipt (loss profile + selectors) for review outcomes",
+        "Implement: Review artifacts reference tool_log_index_hash and summary_receipt_hash (single-pointer scaling)",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0019/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0010"
+      ],
+      "criteria": [
+        "ToolExecutionReceipts stored in CAS for every tool actuation",
+        "ToolLogIndexV1 stored in CAS referencing only resolvable ToolExecutionReceipt hashes",
+        "Review artifacts include tool_log_index_hash and summary_receipt_hash",
+        "Verifier can resolve ToolExecutionReceipt -> args_hash/result_hash -> CAS artifacts"
+      ]
+    },
+    "notes": {
+      "security": "Productivity-first; keep fail-closed invariants intact where already mandated by RFC-0019.",
+      "verification": "Prefer deterministic tests and CAS/ledger replay checks; avoid relying on process memory.",
+      "general": "Keep changes minimal, explicit, and reversible; make dependencies and attribution fields queryable."
+    }
+  }
+}

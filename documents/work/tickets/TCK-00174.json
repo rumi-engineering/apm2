@@ -1,0 +1,117 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00174",
+      "title": "Implement apm2 episode CLI commands",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013"
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00173"
+      },
+      {
+        "ticket_id": "TCK-00172"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "apm2 episode create/start/stop/status commands",
+      "verification": "All commands execute successfully"
+    },
+    {
+      "criterion": "JSON output for machine readability",
+      "verification": "--json flag produces valid JSON"
+    },
+    {
+      "criterion": "Integration with daemon via UDS",
+      "verification": "CLI connects to daemon socket"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "CLI commands",
+        "code": "// apm2 episode create --envelope envelope.yaml\n// apm2 episode start <episode_id>\n// apm2 episode stop <episode_id> [--reason <reason>]\n// apm2 episode status <episode_id>\n// apm2 episode list [--state <state>]\n\npub fn episode_create(envelope_path: &Path) -> Result<EpisodeId>;\npub fn episode_start(episode_id: &EpisodeId) -> Result<SessionHandle>;\npub fn episode_stop(episode_id: &EpisodeId, reason: StopReason) -> Result<()>;\npub fn episode_status(episode_id: &EpisodeId) -> Result<EpisodeState>;\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-cli/src/commands/episode.rs",
+        "purpose": "Episode CLI commands"
+      },
+      {
+        "path": "crates/apm2-cli/src/client/daemon.rs",
+        "purpose": "Daemon client for UDS communication"
+      },
+      {
+        "path": "crates/apm2-cli/src/output/json.rs",
+        "purpose": "JSON output formatting"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Add episode subcommand",
+        "path": "crates/apm2-cli/src/main.rs"
+      },
+      {
+        "changes": "Export episode, client modules",
+        "path": "crates/apm2-cli/src/lib.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Implement daemon client",
+        "details": "Create client for daemon communication:\n- Connect to ${XDG_RUNTIME_DIR}/apm2/apm2d.sock\n- Frame messages with length prefix\n- Handle version negotiation\n- Async request/response\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement episode create",
+        "details": "Command: apm2 episode create --envelope <path>\n- Load envelope from YAML file\n- Send CreateEpisode to daemon\n- Print episode_id on success\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement episode start/stop",
+        "details": "Commands:\n- apm2 episode start <id>: Start episode, print session info\n- apm2 episode stop <id> [--reason]: Stop episode\n- Handle errors gracefully\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement episode status",
+        "details": "Command: apm2 episode status <id>\n- Query daemon for episode state\n- Print state, budget remaining, telemetry summary\n- --json for machine-readable output\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement JSON output",
+        "details": "--json flag on all commands:\n- Serialize response to JSON\n- Include all relevant fields\n- Exit codes: 0=success, 1=error\n"
+      }
+    ],
+    "summary": "Implement apm2 episode CLI commands for episode management.\nCommands: create, start, stop, status, list.\nIncludes JSON output mode and daemon UDS integration.\n"
+  },
+  "notes": "Phase: PHASE-4 (Integration and CLI)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-017.\n",
+  "test_requirements": [
+    {
+      "description": "CLI create command",
+      "test_id": "IT-00174-01",
+      "verification_command": "cargo test -p apm2-cli --test integration episode_create"
+    },
+    {
+      "description": "CLI start/stop",
+      "test_id": "IT-00174-02",
+      "verification_command": "cargo test -p apm2-cli --test integration episode_lifecycle"
+    },
+    {
+      "description": "JSON output",
+      "test_id": "UT-00174-01",
+      "verification_command": "cargo test -p apm2-cli json_output"
+    }
+  ]
+}

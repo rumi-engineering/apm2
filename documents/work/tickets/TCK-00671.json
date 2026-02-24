@@ -1,0 +1,150 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00671",
+      "title": "apm2-core: introduce OrchestratorKernel runtime harness (cursor-driven reducer + idempotent effects) and refactor one daemon orchestrator to use it",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        "REQ-0035",
+        "REQ-0039"
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL",
+        "DOMAIN_DAEMON",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00660",
+        "TCK-00636"
+      ]
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "APM2 already has multiple orchestration loops (gate orchestrator, work loop manager,\nFAC worker, FAC review) that all re-implement the same hard problems:\n\n  - reading canonical events incrementally (cursor handling),\n  - deterministic state folding + checkpointing,\n  - effect execution with intent->receipt idempotency,\n  - crash-point recovery and bounded work per tick,\n  - liveness nudges / retry policies.\n\nWithout a shared runtime harness, orchestration logic drifts, subtle bugs reappear,\nand new systems (FAC review, holon) tend to build bespoke frameworks.\n\nThis ticket creates a shared OrchestratorKernel harness in apm2-core so all\norchestrators converge on one tested controller loop suitable for scaling to\n100B agents.\n"
+  },
+  "requirements_alignment": [
+    {
+      "id": "REQ-0035",
+      "statement": "The orchestration runtime must be budget-bound and deterministic under load:\nbounded observe/execute work, bounded intent drain, and fail-closed handling\nwhen bounded durability steps fail.\n",
+      "implementation_refs": [
+        "crates/apm2-core/src/orchestrator_kernel/controller_loop.rs (`run_tick` bounded observe/execute + durable ordering)",
+        "crates/apm2-core/src/orchestrator_kernel/types.rs (`TickConfig` explicit per-tick bounds)",
+        "crates/apm2-core/src/orchestrator_kernel/intent_store.rs (durable dequeue batch contract)",
+        "crates/apm2-daemon/src/gate/timeout_kernel.rs (bounded timeout poll integration on kernel tick)"
+      ],
+      "verification_refs": [
+        "`run_tick_enforces_execute_limit`",
+        "`run_tick_replay_determinism_matches_full_replay_and_checkpoint_delta`",
+        "`run_tick_does_not_mark_done_when_receipt_persistence_fails`"
+      ]
+    },
+    {
+      "id": "REQ-0039",
+      "statement": "Ambiguous runtime/effect states must deny progression until explicit\nresolution; restart recovery must avoid duplicate authority effects.\n",
+      "implementation_refs": [
+        "crates/apm2-core/src/orchestrator_kernel/effect_journal.rs (`Unknown` + explicit `resolve_in_doubt` contract)",
+        "crates/apm2-core/src/orchestrator_kernel/controller_loop.rs (Started/Unknown fail-closed routing)",
+        "crates/apm2-daemon/src/gate/timeout_kernel.rs (terminal-receipt observation + fallback terminal checker before emitting timeout)"
+      ],
+      "verification_refs": [
+        "`run_tick_blocks_unknown_without_resolution`",
+        "`run_tick_crash_replay_fail_closed_prevents_duplicate_effects`",
+        "`execute_fallback_skips_when_ledger_already_contains_terminal_receipt`"
+      ]
+    }
+  ],
+  "scope": {
+    "in_scope": [
+      {
+        "id": "OK-001",
+        "title": "Create apm2_core::orchestrator_kernel module via extraction, not invention",
+        "detail": "Implement a thin, mechanical controller loop by extracting existing primitives rather than building a generic framework.\nMUST extract and reuse:\n  - `LedgerTailer` (from `crates/apm2-daemon/src/projection/worker.rs`) for durable cursoring and crash-safe resume.\n  - `EffectJournal` (from `crates/apm2-daemon/src/admission_kernel/effect_journal.rs`) for crash-window classification and idempotent effect execution.\n\nThe module (`controller_loop.rs` or similar) should provide a minimal API:\n  - Observe -> Plan -> Execute -> Receipt\n  - A simple `OrchestratorDomain` trait with `apply_events`, `plan` (returning durable intents), and `execute`.\n  - Explicit backpressure (intent store / buffering) and timeout semantics.\n\nThe harness must support:\n  - bounded per-iteration work limits\n  - crash-point safe execution ordering (intent -> op -> receipt)\n  - deterministic replay tests\n"
+      },
+      {
+        "id": "OK-002",
+        "title": "Implement smallest orchestrator on the loop (e.g. timeout receipt generator) as reference",
+        "detail": "To de-risk the extraction without cementing a \"framework,\" build the simplest possible orchestrator on the loop:\n  - E.g., a \"timeout receipt generator\" that watches for expired leases and emits deterministic timeout receipts.\n\nThis establishes the pattern:\n  - observe ledger\n  - plan timeout intent\n  - execute via EffectJournal\n  - emit ledger receipt\n\nThe implementation should demonstrate:\n  - restart-safe behavior\n  - consolidation of cursor tracking and effect idempotency\n"
+      },
+      {
+        "id": "OK-003",
+        "title": "Verification suite for OrchestratorKernel",
+        "detail": "Add tests that:\n  - prove replay determinism (genesis vs checkpoint+delta)\n  - simulate crashes between intent/op/receipt and ensure safe replay\n  - enforce bounded work per tick\n  - optionally: simulate duplicate inputs and ensure idempotency\n"
+      }
+    ],
+    "out_of_scope": [
+      "Building a generic workflow engine or complex trait hierarchies.",
+      "Inventing a new event model or a new persistence store (must reuse existing SQLite/File stores).",
+      "Porting FAC Review immediately (this is the *target* for a follow-on ticket, not the test subject for the initial harness).",
+      "Refactoring all existing orchestrators in one shot.",
+      "Cementing the split between `apm2_core::ledger` and daemon ledger (the loop should abstract over a thin trait to allow future migration)."
+    ]
+  },
+  "implementation_notes": {
+    "critical_structural_boundaries": [
+      {
+        "id": "IMPL-01",
+        "title": "Crate Dependency Trap (apm2-core vs apm2-daemon)",
+        "detail": "LedgerTailer and EffectJournal implementations currently live in apm2-daemon. The loop must live in apm2-core.\nDo NOT create a circular dependency. Move the *traits* to apm2-core and inject the daemon *implementations*\ninto the loop at runtime (e.g. via `&dyn EffectJournal`).\n"
+      },
+      {
+        "id": "IMPL-02",
+        "title": "The 'Two Ledgers' Schism",
+        "detail": "apm2_core uses the new BFT-ready ledger schema. The daemon uses a legacy SQLite schema.\nThe loop MUST be written against an abstract `LedgerRead` trait. The implementor should create a\n`DaemonLedgerAdapter` in the daemon to wrap the legacy DB. Do not rewrite the database layer here.\n"
+      },
+      {
+        "id": "IMPL-03",
+        "title": "EffectJournal 'InDoubt' Resolution",
+        "detail": "When an effect is left in an 'Unknown' crash-window state, the loop must explicitly handle it.\nIt must NOT blindly retry (which breaks idempotency for external APIs). It must either query the external\nstate or emit a 'Blocked/NeedsIntervention' ledger receipt and fail-closed for that intent.\n"
+      },
+      {
+        "id": "IMPL-04",
+        "title": "Intent Buffering (Plan vs Execute Seam)",
+        "detail": "The loop's `Plan` phase may generate 10,000 intents. `Execute` cannot process them in one tick.\nIntents MUST be durably buffered (e.g., a simple SQLite `intent_store` table) before execution. The loop then\npulls bounded batches (e.g., LIMIT 50) from this buffer for the `Execute` phase.\n"
+      }
+    ]
+  },
+  "plan": {
+    "steps": [
+      "Extract `LedgerTailer` into a shared module (currently in projection worker).",
+      "Reuse `EffectJournal` (currently in admission kernel).",
+      "Implement a thin controller loop `run_loop(domain, deps, cfg)`.",
+      "Implement the smallest orchestrator (e.g. timeout receipt generator) as the reference driver.",
+      "Add determinism/crash/idempotency tests for the new loop."
+    ]
+  },
+  "definition_of_done": {
+    "evidence_ids": [
+      "EVID-TCK-00671-01: controller loop boundedness + unknown fail-closed and retry recovery coverage (`run_tick_enforces_execute_limit`, `run_tick_blocks_unknown_without_resolution`, `run_tick_requeues_retry_outcomes`)",
+      "EVID-TCK-00671-02: deterministic replay parity coverage (`run_tick_replay_determinism_matches_full_replay_and_checkpoint_delta`)",
+      "EVID-TCK-00671-03: crash-point replay idempotency coverage (`run_tick_crash_replay_fail_closed_prevents_duplicate_effects`)"
+    ],
+    "criteria": [
+      "apm2_core::orchestrator_kernel exists with cursor/reducer/driver/checkpoint/tick interfaces.",
+      "At least one daemon orchestrator runs on the harness and passes existing tests.",
+      "New tests cover determinism + crash-point recovery + boundedness.",
+      "Extracts LedgerTailer and EffectJournal rather than creating net-new equivalents."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-OK-01",
+      "title": "Over-generalizing the harness creates friction and slows refactors",
+      "mitigation": "Keep the kernel minimal and opinionated: event-sourced reducers + intent/receipt idempotency.\nAvoid modeling every possible orchestrator; expand only when a second consumer needs it.\n"
+    }
+  ]
+}

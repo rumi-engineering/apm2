@@ -1,0 +1,74 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00511",
+      "title": "FAC Worker: queue consumer with RFC-0028 authorization + RFC-0029 admission gating (default-mode executor)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Worker requires broker-issued RFC-0028 tokens and RFC-0029 envelopes/horizons."
+        },
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "Worker must acquire lane leases and execute within lanes."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add `apm2 fac worker` command (`--once` and continuous modes).",
+        "Scan pending queue; treat queue files as untrusted external input.",
+        "Validate job spec bounded-deserialization + `job_spec_digest` correctness.",
+        "RFC-0028: decode+validate ChannelContextToken before claim; deny/quarantine on failure.",
+        "RFC-0029: compute QueueAdmissionDecision before claim using broker-issued TP001/002/003 state; deny on non-Allow.",
+        "Atomic claim via rename pending→claimed.",
+        "Acquire lane lease, execute job under containment, write authoritative receipts.",
+        "Write denial/quarantine receipts for failed validations (with reason codes)."
+      ],
+      "out_of_scope": [
+        "Distributed routing."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement queue scanning + deterministic ordering.",
+        "Implement RFC-0028 pre-claim validation using broker token decode.",
+        "Implement RFC-0029 admission path: build request/state, call `evaluate_queue_admission`, persist trace.",
+        "Implement claimed execution path + receipt emission.",
+        "Implement systemd unit recommendation / sample unit for long-running worker."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Worker denies jobs without valid RFC-0028 token (moves to quarantine/denied) and emits denial receipts.",
+        "Worker produces RFC-0029 admission traces for every attempted job and denies non-Allow.",
+        "Worker never double-executes a job under concurrent workers."
+      ]
+    },
+    "notes": {
+      "security": "Worker must not accept raw ChannelBoundaryCheck JSON. Authorization must come from token decode.\nQueue is attacker-writable; all reads must be bounded and fail-closed.\n"
+    }
+  }
+}

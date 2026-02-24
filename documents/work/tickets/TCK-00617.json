@@ -1,0 +1,211 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00617",
+      "title": "Forge admission merge decoupling: local-authoritative merge with clean worktree, PR projection, and signed receipts",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_CI"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00616",
+          "reason": "Gates-before-push ordering and projection demotion must land first."
+        },
+        {
+          "ticket_id": "TCK-00614",
+          "reason": "Queued-gates fail-closed hardening is prerequisite for merge-after-gates."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "Three compounding bugs in the post-admission merge path:\n\nBUG 1: Main branch gets dirty after merge.\n  Location: lifecycle.rs:2058-2085 (sync_main_worktree_if_present)\n  Cause: After try_fast_forward_main() updates refs/heads/main via\n  git update-ref, the worktree sync only runs `git reset --hard HEAD`\n  which handles tracked files but leaves untracked files from the\n  feature branch work. git_worktree_has_tracked_changes() uses\n  --untracked-files=no so untracked artifacts accumulate. Additionally,\n  no cleanup of the feature branch ref or its worktree happens post-merge.\n\nBUG 2: PR/Admission Request status not updated post-merge.\n  Location: lifecycle.rs:2289-2321 (maybe_auto_merge_if_ready_inner success path)\n  Cause: After successful local fast-forward + push to origin, the code\n  only records a local Merged lifecycle event. No GitHub API call closes\n  the PR, deletes the remote branch, or updates the PR body. The system\n  relies on GitHub detecting the fast-forward push to auto-close the PR,\n  which is GitHub-dependent and not guaranteed.\n\nBUG 3: GitHub still used as source of truth for merge state.\n  Location: lifecycle.rs:2087-2132 (sync_local_main_with_origin),\n            push.rs:1909 (enable_auto_merge),\n            CLAUDE.md (\"GitHub is temporarily authoritative for merges\")\n  Cause: Two competing merge paths exist:\n  (a) Local fast-forward merge triggered by maybe_auto_merge_if_ready()\n      when both security + code-quality verdicts are approve.\n  (b) GitHub auto-merge enabled during fac push via enable_auto_merge()\n      which lets GitHub merge independently when status checks pass.\n  Either can fire first, creating race conditions. The CLI merge path\n  produces no signed MergeReceipt (the daemon MergeExecutor does, but\n  is not wired into the CLI path). sync_local_main_with_origin() treats\n  origin/main as authoritative, not local state.\n"
+    }
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1_CLEAN_WORKTREE_POST_MERGE",
+        "title": "Clean worktree after merge (tracked + untracked)",
+        "detail": "After successful fast-forward merge of a feature branch:\n- Run `git clean -fd` (or equivalent) on the main worktree to remove\n  untracked files left by the feature branch work.\n- Delete the local feature branch ref.\n- Remove or detach the feature branch worktree if it exists.\n- Clean up any stale worktree target/ directories.\nEnsures main is always clean after admission without manual intervention.\n"
+      },
+      {
+        "id": "S2_PROJECT_MERGE_TO_GITHUB",
+        "title": "Project merge state to GitHub post-merge",
+        "detail": "After successful local merge + push to origin:\n- Close the PR via GitHub API if not auto-closed by fast-forward detection.\n- Delete the remote feature branch.\n- Update PR body with merge evidence (merge commit SHA, timestamp, receipt).\n- Post a final commit status update reflecting merged state.\nAll of these are projections (best-effort, non-authoritative). Local\nlifecycle Merged event remains the source of truth.\n"
+      },
+      {
+        "id": "S3_REMOVE_GITHUB_AUTO_MERGE",
+        "title": "Stop enabling GitHub auto-merge during fac push",
+        "detail": "Remove the call to enable_auto_merge() in the push flow. The local\nmaybe_auto_merge_if_ready() path is the authoritative merge trigger.\nGitHub auto-merge creates a competing merge path and race condition.\nWith strict_required_status_checks_policy=true (TCK-00616), the PR\ncannot merge via GitHub until FAC status is posted anyway, so GitHub\nauto-merge adds no value and adds risk.\n"
+      },
+      {
+        "id": "S4_SIGNED_MERGE_RECEIPT",
+        "title": "Emit signed MergeReceipt on CLI merge path",
+        "detail": "The daemon MergeExecutor already produces signed MergeReceipts.\nThe CLI maybe_auto_merge_if_ready_inner() path does not.\nAdd MergeReceipt emission to the CLI path:\n- Bind receipt to gate evidence hashes, verdict hashes, and merge commit SHA.\n- Sign with broker/operator key.\n- Persist to receipts store.\nThis makes the merge cryptographically attested, not just a raw git operation.\n"
+      },
+      {
+        "id": "S5_LOCAL_AUTHORITATIVE_MERGE_STATE",
+        "title": "Make local lifecycle state authoritative for merge (remove origin dependency)",
+        "detail": "sync_local_main_with_origin() currently treats origin/main as\nauthoritative. Invert this:\n- Local lifecycle Merged event + signed receipt = authoritative merge.\n- Origin is a projection target, not a source of truth.\n- If origin/main has diverged unexpectedly, fail-closed and surface\n  the conflict rather than silently accepting origin state.\n- Remove \"GitHub is temporarily authoritative for merges\" from CLAUDE.md\n  once this lands.\n"
+      },
+      {
+        "id": "S6_DOCTOR_WAIT_TIMEOUT_EVENT",
+        "title": "Emit terminal event on `fac doctor --wait-for-recommended-action` timeout",
+        "detail": "When --wait-for-recommended-action reaches its timeout, the command\nexits silently — no final JSON line, no error, just EOF. This makes\nit impossible for orchestrators to distinguish \"timed out\" from\n\"process died\".\nFix: emit a terminal event line before exit, e.g.\n{\"event\":\"wait_timeout\",\"elapsed_seconds\":1200}\nso the caller can unambiguously branch on timeout vs crash vs success.\n"
+      },
+      {
+        "id": "S7_DOCTOR_REPO_FILTER",
+        "title": "Add --repo filter to `fac doctor --json`",
+        "detail": "The global `apm2 fac doctor --json` (no --pr) mixes test/capacity PRs\nwith real ones. With 100+ entries from example/capacity-* repos, it is\nhard to spot actual guardian-intelligence/apm2 PRs.\nAdd a --repo flag (e.g. --repo guardian-intelligence/apm2) so\norchestrators can scope output to a specific repo without\npost-processing jq filters.\n"
+      },
+      {
+        "id": "S8_REGRESSION_TESTS",
+        "title": "Regression tests for merge flow and doctor UX",
+        "detail": "- Test: worktree is clean (no untracked files) after merge.\n- Test: feature branch ref deleted after merge.\n- Test: GitHub auto-merge is NOT enabled during push.\n- Test: MergeReceipt is emitted and verifiable after CLI merge.\n- Test: origin divergence triggers fail-closed, not silent acceptance.\n- Test: PR is closed/updated via projection after merge.\n- Test: doctor --wait-for-recommended-action emits terminal event on timeout.\n- Test: doctor --json --repo filters output to specified repo only.\n- Test: fac push auto-starts worker when heartbeat is stale/absent.\n- Test: push-attempt log parser handles truncated/malformed lines without panic.\n- Test: fac push --pr output contains no unreachable remediation strings.\n- Test: apm2 fac doctor --wait and --wait-timeout-secs are accepted.\n"
+      },
+      {
+        "id": "S9_FAC_PUSH_AUTO_START_WORKER",
+        "title": "Auto-start worker for fac push when heartbeat is missing",
+        "detail": "When `apm2 fac push` is invoked and the daemon worker heartbeat is stale\nor absent, the command currently fails with an opaque error requiring the\nuser to manually restart the worker. Instead:\n- Detect the missing/stale heartbeat condition before attempting push.\n- Automatically issue a worker start command (equivalent to\n  `apm2 work start` or equivalent daemon operator call).\n- Wait briefly (configurable, default ~10 s) for the heartbeat to become\n  live before proceeding.\n- Surface a clear INFO line (\"worker was not running — auto-started\") so\n  the operator knows what happened.\n- If auto-start fails or heartbeat does not appear within the wait window,\n  fail with a clear, actionable error.\n"
+      },
+      {
+        "id": "S10_RESILIENT_PUSH_ATTEMPT_LOG_PARSING",
+        "title": "Resilient push-attempt log parsing",
+        "detail": "The push-attempt log parser currently panics or returns a hard error on\nlines that are truncated, malformed, or written by an older binary version.\nFix the parser to:\n- Skip unrecognised/malformed lines with a WARN log instead of propagating\n  an error to the caller.\n- Treat a completely absent log file as an empty attempt history (not an\n  error), so a first-ever push attempt is handled cleanly.\n- Preserve all valid entries seen before the first malformed line.\nThis makes the push flow resilient to log corruption and format evolution.\n"
+      },
+      {
+        "id": "S11_REMOVE_INVALID_FAC_PUSH_PR_REMEDIATION",
+        "title": "Remove invalid fac push --pr remediation strings",
+        "detail": "`apm2 fac push --pr <N>` currently surfaces one or more remediation hint\nstrings that reference flags, sub-commands, or config keys that do not\nexist in the current CLI surface (e.g. references to removed flags or\ncommands that were renamed). These mislead operators.\nAudit all remediation/hint strings emitted by the push --pr code path,\nremove any that reference non-existent CLI surface, and replace with\naccurate guidance where a replacement hint is useful.\n"
+      },
+      {
+        "id": "S12_DOCTOR_FLAG_ALIASES",
+        "title": "Add --wait and --wait-timeout-secs aliases to fac doctor",
+        "detail": "`apm2 fac doctor` currently requires the full flag names. Add\nshorter aliases:\n- `--wait` as an alias for `--wait-for-recommended-action`\n- `--wait-timeout-secs <N>` as an alias for the existing timeout flag\n  (whatever its current canonical name is).\nBoth aliases should appear in --help output. No behaviour change —\naliases are purely ergonomic.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Redesigning the daemon MergeExecutor or wiring it into the CLI path (future unification).",
+      "Multi-repo or distributed merge coordination.",
+      "Changing the verdict state machine (security + code-quality approve = MergeReady)."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "STEP_01",
+        "title": "Fix worktree cleanup post-merge",
+        "detail": "In sync_main_worktree_if_present(): add git clean -fd after\ngit reset --hard HEAD. Add feature branch ref deletion and\nworktree removal/detach logic.\n"
+      },
+      {
+        "id": "STEP_02",
+        "title": "Add post-merge GitHub projection",
+        "detail": "After Merged lifecycle event: close PR, delete remote branch,\nupdate PR body, post final status. All best-effort projection.\n"
+      },
+      {
+        "id": "STEP_03",
+        "title": "Remove enable_auto_merge() from fac push",
+        "detail": "Delete the call in push.rs:1909. Local merge path is authoritative.\n"
+      },
+      {
+        "id": "STEP_04",
+        "title": "Add signed MergeReceipt to CLI merge path",
+        "detail": "Emit MergeReceipt binding gate evidence, verdicts, and merge commit.\nSign with broker/operator key. Persist to receipts store.\n"
+      },
+      {
+        "id": "STEP_05",
+        "title": "Invert origin/main authority",
+        "detail": "Make sync_local_main_with_origin() fail-closed on unexpected divergence\ninstead of accepting origin state. Local Merged event is authoritative.\n"
+      },
+      {
+        "id": "STEP_06",
+        "title": "Doctor: emit terminal event on wait timeout",
+        "detail": "In fac doctor --wait-for-recommended-action, emit a JSON terminal\nevent line (wait_timeout + elapsed_seconds) before exiting on timeout.\n"
+      },
+      {
+        "id": "STEP_07",
+        "title": "Doctor: add --repo filter flag",
+        "detail": "Add --repo flag to fac doctor --json to scope PR list output\nto a specific repo. Filter applied before serialization.\n"
+      },
+      {
+        "id": "STEP_08",
+        "title": "Add regression tests",
+        "detail": "Clean worktree, branch cleanup, no auto-merge, receipt emission,\norigin divergence fail-closed, PR projection, doctor timeout event,\ndoctor repo filter, worker auto-start on stale heartbeat, resilient\nlog parsing, no invalid remediation strings, doctor flag aliases.\n"
+      },
+      {
+        "id": "STEP_09",
+        "title": "Auto-start worker on stale/absent heartbeat in fac push",
+        "detail": "Detect missing/stale worker heartbeat before push. Issue worker start,\nwait up to ~10 s for heartbeat to go live, emit INFO line, fail with\nactionable error if auto-start times out.\n"
+      },
+      {
+        "id": "STEP_10",
+        "title": "Harden push-attempt log parser",
+        "detail": "Skip malformed/unrecognised log lines with WARN instead of hard error.\nTreat absent log file as empty history. Preserve valid entries before\nfirst bad line.\n"
+      },
+      {
+        "id": "STEP_11",
+        "title": "Remove invalid fac push --pr remediation strings",
+        "detail": "Audit and remove all remediation/hint strings in the push --pr code\npath that reference non-existent CLI flags or commands. Replace with\naccurate guidance where applicable.\n"
+      },
+      {
+        "id": "STEP_12",
+        "title": "Add --wait and --wait-timeout-secs aliases to fac doctor",
+        "detail": "Wire --wait as alias for --wait-for-recommended-action and\n--wait-timeout-secs <N> as alias for the existing timeout flag.\nBoth appear in --help. No behaviour change.\n"
+      },
+      {
+        "id": "STEP_13",
+        "title": "Run full workspace validation",
+        "detail": "- cargo fmt --all\n- cargo clippy --workspace --all-targets --all-features -- -D warnings\n- cargo doc --workspace --no-deps\n- cargo test --workspace\n"
+      }
+    ]
+  },
+  "definition_of_done": {
+    "evidence_ids": [
+      "EXEC-TCK00617-CLEAN-WORKTREE",
+      "EXEC-TCK00617-MERGE-RECEIPT",
+      "EXEC-TCK00617-PR-PROJECTION",
+      "EXEC-TCK00617-FAC-PUSH-UX",
+      "EXEC-TCK00617-WORKSPACE-VALIDATION"
+    ],
+    "criteria": [
+      "After forge admission merge, main worktree has zero untracked files from the feature branch.",
+      "Feature branch ref and worktree are cleaned up after merge.",
+      "GitHub auto-merge is not enabled during fac push.",
+      "Signed MergeReceipt is emitted on CLI merge path, binding gate evidence + verdicts + merge SHA.",
+      "PR is closed, remote branch deleted, and PR body updated via projection after merge.",
+      "Origin/main divergence triggers fail-closed error, not silent acceptance.",
+      "CLAUDE.md no longer says GitHub is temporarily authoritative for merges.",
+      "`fac doctor --wait-for-recommended-action` emits terminal JSON event on timeout (not silent exit).",
+      "`fac doctor --json --repo <owner/repo>` filters output to the specified repo.",
+      "`apm2 fac push` auto-starts the worker when the heartbeat is stale/absent, with a clear INFO line.",
+      "Push-attempt log parser skips malformed lines (WARN) and treats absent log as empty history.",
+      "`apm2 fac push --pr` output contains no remediation strings referencing non-existent CLI surface.",
+      "`apm2 fac doctor --wait` and `--wait-timeout-secs` are accepted and appear in --help.",
+      "Regression tests pass for all merge flow and doctor UX invariants.",
+      "Workspace validation commands complete successfully."
+    ]
+  },
+  "notes": {
+    "context": "The merge path in the CLI (lifecycle.rs maybe_auto_merge_if_ready_inner)\ncurrently does a local git fast-forward + push to origin, but:\n- Leaves untracked files in the main worktree\n- Does not close or update the PR on GitHub\n- Does not delete the remote feature branch\n- Does not emit a signed MergeReceipt\n- Races with GitHub auto-merge (enabled during fac push)\n- Treats origin/main as authoritative via sync_local_main_with_origin()\n\nThe daemon-side MergeExecutor (gate/merge_executor.rs) has the right\ndesign (signed receipts, event emission, policy validation) but is not\nwired into the CLI lifecycle path. This ticket fixes the CLI path\ndirectly; unifying with the daemon executor is future work.\nAdditional hardening completed:\n- Doctor reviewer-idle restart no longer treats elapsed runtime as idle\n  when activity is unknown.\n- Idle age derivation now uses log-write activity and liveness idle-age\n  semantics to avoid false restart recommendations during long reviews.\n- Reviewer idle-age heartbeat now advances only when tool-call count or\n  token count increases, so 301s idle windows only trigger restart when\n  both counters are flat.\n- Regression tests added for unknown-activity running reviewers and\n  liveness idle-age timestamp derivation.\n- Repo-scoped doctor filtering now applies before global tracked-PR\n  truncation, with regression coverage for mixed-repo (>100 PR) state.\n",
+    "security": "default-deny, fail-closed on origin divergence, signed merge receipts"
+  }
+}

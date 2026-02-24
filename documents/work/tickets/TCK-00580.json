@@ -1,0 +1,65 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00580",
+      "title": "Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 728,
+          "merge_commit": "0e843dd126613a2c94c5678877960f285b10f36c",
+          "merged_at": "2026-02-17T21:31:52Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00517",
+          "reason": "Lane workspaces are created from mirror."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Ensure lane workspace git config is hardened:",
+        "  - disable hooks (`core.hooksPath` to empty dir controlled by FAC)",
+        "  - enforce `safe.directory` for lane workspace path",
+        "  - refuse repo configs that attempt to run external commands via filters/smudge if policy forbids",
+        "Record git hardening status in receipts."
+      ],
+      "out_of_scope": [
+        "Git sandboxing beyond configuration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement post-checkout git config setup for lanes.",
+        "Add tests ensuring hooks do not run."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Malicious repo hooks do not execute during lane operations in default mode."
+      ]
+    }
+  }
+}

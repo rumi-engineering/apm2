@@ -1,0 +1,77 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00022",
+      "title": "Implement Claude Code instrumented adapter"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0001",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0010",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0010.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/prds/PRD-0001/evidence_artifacts/EVID-0001.yaml#prd_evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0002",
+          "artifact_ref": "documents/prds/PRD-0001/evidence_artifacts/EVID-0002.yaml#prd_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00021",
+          "reason": "Requires black-box adapter from 'Implement black-box adapter (observation-based)'"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Integrate with Claude Code hook system",
+        "Receive native tool requests",
+        "Send tool responses",
+        "Rich progress signals"
+      ],
+      "out_of_scope": [
+        "Other vendor adapters"
+      ]
+    },
+    "plan": {
+      "steps": []
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001",
+        "EVID-0002"
+      ],
+      "criteria": [
+        "Claude Code hooks integrated",
+        "Tool requests received natively",
+        "Tool responses delivered",
+        "Rich progress signals captured",
+        "Session lifecycle managed"
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

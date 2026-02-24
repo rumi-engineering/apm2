@@ -1,0 +1,56 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00556",
+      "title": "Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "LaneProfileV1 contains node_fingerprint."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement node_fingerprint derivation and persistence (stable across restarts; changes only on explicit reset).",
+        "Define and persist boundary_id (default `apm2.fac.local`).",
+        "Ensure broker and worker consistently use same boundary_id."
+      ],
+      "out_of_scope": [
+        "Multi-node identity distribution."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define fingerprint inputs and persistence path.",
+        "Update LaneProfileV1 writer and broker config."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Receipts and lane profiles include stable node_fingerprint and boundary_id; RFC-0029 evaluation uses it consistently."
+      ]
+    }
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00493",
+      "title": "Admission evidence closure: seal AdmissionBundleV1 (CAS) before receipt/event emission; bind all authoritative outcomes to bundle digest (no digest cycles)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0024",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0024.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0019",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0019.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_DATA"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00488",
+          "reason": "Kernel must exist to define and populate the bundle deterministically."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define AdmissionBundleV1 as a deterministic, bounded, deny-unknown-fields CAS object.",
+        "Bundle MUST include: HSI envelope bindings, authoritative policy-root reference/provenance, AJC id + selectors, intent digest(s), witness SEED hashes + post-effect witness evidence hashes/refs, effect digest, quarantine actions, and HT/HE anchors required for audit.",
+        "Bundle MUST be sealed BEFORE emission of authoritative receipts/events that reference it.",
+        "Bundle digest IS the v1.1 AdmissionBindingHash (semantic equality) and MUST be included in all authoritative receipts/events.",
+        "Bundle MUST NOT include hashes/ids of receipts/events that are created after bundle sealing (avoid digest cycles).",
+        "If forward indexing is required, define a separate AdmissionOutcomeIndexV1 object/event emitted AFTER receipts/events.",
+        "If CAC overlay objects would create digest cycles (because they need receipt ids emitted after bundle sealing), they MUST be emitted post-bundle as separate objects/events that reference AdmissionBundleDigest."
+      ],
+      "out_of_scope": [
+        "Full CAC digest-set enforcement across all promotion-critical claims (TCK-00495)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define serde schema with explicit bounds (max arrays/strings).",
+        "Seal bundle after effect + post-effect boundary checks but BEFORE receipt/event emission.",
+        "Store bundle in CAS and pass its digest into receipt/event emission helpers.",
+        "Add deterministic digest test vectors.",
+        "Update receipt/event emission helpers to include bundle digest reference.",
+        "Add regression test preventing bundle/receipt digest cycles and CAC overlay cycles."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0019"
+      ],
+      "criteria": [
+        "AdmissionBundleV1 exists, is stored in CAS, and is referenced from authoritative receipts/events.",
+        "Digest stability is tested (canonical ordering).",
+        "Bundle includes witness SEED commitments and post-effect witness evidence refs where applicable.",
+        "Regression tests prevent introducing bundle/receipt digest cycles and CAC overlay digest cycles."
+      ]
+    },
+    "notes": {
+      "security": "Bundle eliminates a recurring class of regressions: \"one missing binding hash in one receipt type\".\n"
+    }
+  }
+}

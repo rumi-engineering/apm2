@@ -1,0 +1,92 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00595",
+      "title": "Daemon turnkey setup: systemd user service, CLI auto-start, env-based auto-config, and health check",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Broker service must be implemented (merged)."
+        },
+        {
+          "ticket_id": "TCK-00322",
+          "reason": "Projection worker must be wired into daemon (merged)."
+        },
+        {
+          "ticket_id": "TCK-00383",
+          "reason": "CAS, broker, ledger, and clock must be wired via with_persistence_and_cas (merged)."
+        },
+        {
+          "ticket_id": "TCK-00387",
+          "reason": "Crash recovery must be wired for restart-safe operation (merged)."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Systemd user service unit file (`apm2-daemon.service`) with Restart=always, journal logging, and WatchdogSec.",
+        "`apm2 daemon install` command: installs unit file to `~/.config/systemd/user/`, enables linger, starts service.",
+        "CLI `ensure_daemon_running()` guard: all `apm2 fac` subcommands auto-start the daemon if not running (check operator socket, start via systemctl or direct spawn fallback).",
+        "Environment-based auto-config: daemon auto-detects GITHUB_TOKEN from env, GitHub owner/repo from `git remote get-url origin` parse, without requiring ecosystem.toml edits.",
+        "XDG-standard default paths: ledger at `~/.local/share/apm2/ledger.db`, CAS at `~/.local/share/apm2/cas/`, sockets at `$XDG_RUNTIME_DIR/apm2/`, keys at `~/.local/share/apm2/keys/`.",
+        "Config-less startup: daemon starts with zero config if GITHUB_TOKEN is set and cwd is a git repo. ecosystem.toml overrides only when present.",
+        "Minimal `apm2 fac doctor` command: checks daemon running, socket reachable, projection worker active, GITHUB_TOKEN set, disk space, actionable remediation output."
+      ],
+      "out_of_scope": [
+        "FAC Worker process management (TCK-00511, deferred).",
+        "System-mode service units (covered by TCK-00528/TCK-00529).",
+        "Multi-node orchestration.",
+        "Automated remediation from doctor output."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Author systemd user unit file at `contrib/systemd/apm2-daemon.service` with ExecStart, Restart=always, Environment passthrough.",
+        "Implement `apm2 daemon install` CLI command: copy unit to `~/.config/systemd/user/`, run daemon-reload, enable, start.",
+        "Add `ensure_daemon_running()` helper to CLI: check operator socket liveness, auto-start if missing.",
+        "Wire `ensure_daemon_running()` into `apm2 fac push`, `apm2 fac review`, and other fac subcommands.",
+        "Extend daemon config resolution: if no ecosystem.toml, construct defaults from env vars and git remote.",
+        "Update default paths in `crates/apm2-core/src/config/mod.rs` to use XDG conventions.",
+        "Implement `apm2 fac doctor` with structured checks (ERROR/WARN/OK) and `--json` output.",
+        "Test: fresh VPS, clone repo, set GITHUB_TOKEN, run `apm2 daemon install`, verify `apm2 fac doctor` reports all green."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "On a clean Ubuntu VPS with only GITHUB_TOKEN set, `apm2 daemon install` sets up the daemon as a persistent systemd user service.",
+        "Daemon auto-starts when any `apm2 fac` command runs, without manual intervention.",
+        "Daemon survives reboot (systemd restart + linger).",
+        "Daemon self-configures GitHub owner/repo from git remote without ecosystem.toml edits.",
+        "`apm2 fac doctor` reports daemon health with actionable output.",
+        "Projection worker is active and economics gate is initialized after startup."
+      ]
+    },
+    "notes": {
+      "security": "- GITHUB_TOKEN must not be persisted in unit files; use EnvironmentFile or inherit from user session.\n- Socket permissions: operator socket 0600, session socket 0660 (existing invariants preserved).\n- Key material stored in ~/.local/share/apm2/keys/ with 0600 permissions.\n",
+      "rationale": "This ticket is the prerequisite for activating RFC-0028/0029 value in production.\nThe daemon internals are fully wired (projection worker, economics gate, MergeExecutor,\nreview receipt ingestion, crash recovery) but have never run because there is no\nturnkey process management. This ticket closes that gap so that subsequent tickets\n(TCK-00389 CLI wiring, TCK-00390 merge authority activation) can route real traffic\nthrough the daemon.\n",
+      "execution_order": "This ticket is Step 1 of 4 in the daemon activation critical path:\n  1. TCK-00595 (this) — Daemon turnkey setup\n  2. TCK-00389 — CLI review pipeline calls daemon IPC (ingest_review_receipt)\n  3. TCK-00390 — MergeExecutor activation, remove GitHub auto-merge from CLI\n  4. TCK-00588 — E2E verification on real PRs\n"
+    }
+  }
+}

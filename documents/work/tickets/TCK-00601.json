@@ -1,0 +1,77 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00601",
+      "title": "E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 729,
+          "merge_commit": "9cb9cede6a4d28fd9c8f91b71f0e0cea1a75cf81",
+          "merged_at": "2026-02-17T21:51:55Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00595",
+          "reason": "Need liveness signals to avoid hangs deterministically."
+        },
+        {
+          "ticket_id": "TCK-00596",
+          "reason": "Need credential posture rules."
+        },
+        {
+          "ticket_id": "TCK-00594",
+          "reason": "Services status output should be asserted."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add E2E tests for `apm2 fac gates` default-mode failure modes:",
+        "  * broker absent => fail fast with actionable error",
+        "  * broker present, worker absent => bounded wait then fail with worker-absent error",
+        "Add E2E tests for secrets posture:",
+        "  * missing GitHub creds does not prevent `gates`",
+        "  * GitHub-facing command fails fast with explicit credential remediation",
+        "Assert no secrets appear in receipts/logs under test."
+      ],
+      "out_of_scope": [
+        "Multi-node CI."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Build a hermetic test harness using temp APM2_HOME + fake broker/worker where needed.",
+        "Add snapshot tests for error messages (redacted)."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Tests catch hangs and secret leakage regressions.",
+        "Tests run on CI deterministically."
+      ]
+    }
+  }
+}

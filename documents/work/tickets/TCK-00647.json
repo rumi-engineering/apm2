@@ -1,0 +1,88 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00647",
+      "title": "RFC-0032 Phase 4: implement DispatchImplementer/DispatchReviewer (daemon-owned workspace + SpawnEpisode) and record session boundary pins",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_PROTOCOL",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00646",
+          "reason": "WorktreeManager required"
+        },
+        {
+          "ticket_id": "TCK-00637",
+          "reason": "ClaimWorkV2 required"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add DispatchImplementer/DispatchReviewer requests to runtime proto",
+        "Daemon allocates workspace via WorktreeManager, ensures directory exists, then spawns episode with correct parameters",
+        "Ensure `session.started` (SessionStarted) records complete boundary pin set required by RFC-0018 §6.3 (extend proto if needed)",
+        "Keep SpawnEpisode lease requirements and validations fail-closed (do not weaken existing checks in `handle_spawn_episode`)"
+      ],
+      "out_of_scope": [
+        "Mediated tool execution bridge (explicitly non-goal of RFC-0032)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Extend runtime proto with Dispatch* messages; implement dispatch handlers that call internal SpawnEpisode",
+        "Plumb active WorkLoopProfile selection to choose workspace + nudge budgets",
+        "Extend `proto/kernel_events.proto` SessionStarted message to include boundary pin hashes if not already present; update reducers accordingly",
+        "Add tests: dispatch creates session and emits session.started with expected pin fields; missing pins fail-closed and produce defects"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "DispatchImplementer/Reviewer removes caller-managed workspace_root from the critical path.",
+        "SessionStarted events are replay-self-contained with boundary pins for spawned episodes.",
+        "Existing SpawnEpisode authorization and gate behavior remains fail-closed."
+      ]
+    },
+    "notes": {
+      "security": "Session boundary pin completeness is promotion-blocking per RFC-0018 §6.3; missing pins must be recorded as defects."
+    }
+  },
+  "fac_security_contract": {
+    "source": "documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml",
+    "profile": "FAC-RFC0032-BASELINE",
+    "required_invariants": [
+      "INV-FAC-TRUTH-001",
+      "INV-FAC-WORK-BIND-001",
+      "INV-FAC-CLAIM-BIND-001",
+      "INV-FAC-ACTOR-BIND-001",
+      "INV-FAC-IDEMP-001",
+      "INV-FAC-EVID-001"
+    ],
+    "enforcement_requirements": [
+      "Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.",
+      "Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.",
+      "Reviewer denial is expected for invariant-unmapped behavior changes."
+    ]
+  }
+}

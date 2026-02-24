@@ -1,0 +1,62 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/events",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-EVENTS-001",
+      "kind": "invariant",
+      "title": "KernelEvent sequence monotonically increasing within a ledger",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-002",
+      "kind": "invariant",
+      "title": "previous_hash equals hash of prior event or 32 zero bytes for genesis",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-003",
+      "kind": "invariant",
+      "title": "Signature is valid Ed25519 over canonical encoding",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-004",
+      "kind": "invariant",
+      "title": "WorkTransitioned previous_transition_count matches current count",
+      "description": "Replay protection via transition count matching.",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-005",
+      "kind": "invariant",
+      "title": "WorkGraphEvent uses work_graph.edge.* prefix to avoid WorkReducer collision",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-006",
+      "kind": "requirement",
+      "title": "Events must be canonicalized before signing",
+      "description": "Canonicalize::canonicalize() must be called to sort repeated fields before signing.",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-007",
+      "kind": "requirement",
+      "title": "Genesis events must use 32 zero bytes for previous_hash",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-008",
+      "kind": "safety",
+      "title": "No maps in protobuf message types for deterministic serialization",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-CORE-EVENTS-009",
+      "kind": "requirement",
+      "title": "WorkGraphEvent emits topics for both from_work_id and to_work_id",
+      "rfc": ["RFC-0032"]
+    }
+  ]
+}

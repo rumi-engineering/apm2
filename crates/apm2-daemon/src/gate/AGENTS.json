@@ -1,0 +1,102 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/gate",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-GATE-001",
+      "kind": "invariant",
+      "title": "PolicyResolvedForChangeSet emitted before any GateLeaseIssued for same work_id",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-002",
+      "kind": "invariant",
+      "title": "Maximum concurrent orchestrations bounded to MAX_CONCURRENT_ORCHESTRATIONS",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-003",
+      "kind": "invariant",
+      "title": "Maximum gate types per orchestration bounded to MAX_GATE_TYPES (8)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-004",
+      "kind": "safety",
+      "title": "Expired gate leases produce FAIL verdict (fail-closed timeouts)",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-005",
+      "kind": "invariant",
+      "title": "Changeset digest in each lease matches authoritative ChangeSetPublished digest",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-006",
+      "kind": "invariant",
+      "title": "Gate start entrypoint is start_for_changeset, not session-termination",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-007",
+      "kind": "invariant",
+      "title": "Idempotency key is (work_id, changeset_digest) -- pure function of inputs",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-008",
+      "kind": "invariant",
+      "title": "One-active-per-work_id: latest changeset supersedes old orchestration",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-009",
+      "kind": "safety",
+      "title": "Event payloads enforce MAX_PAYLOAD_BYTES (1 MiB) before deserialization",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-010",
+      "kind": "safety",
+      "title": "publisher_actor_id derived from verified actor_id column, not payload content",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-011",
+      "kind": "invariant",
+      "title": "Policy hash from gate receipts verified against PolicyResolvedForChangeSet anchor",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-012",
+      "kind": "invariant",
+      "title": "MergeReceipt atomically binds inputs to observed result (new commit SHA)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-013",
+      "kind": "invariant",
+      "title": "Gate receipt IDs sorted before inclusion in MergeReceipt for determinism",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-014",
+      "kind": "safety",
+      "title": "Merge conflicts produce ReviewBlockedRecorded events, not silent failure",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-015",
+      "kind": "invariant",
+      "title": "Pending merges bounded to MAX_PENDING_MERGES (1,000)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-016",
+      "kind": "safety",
+      "title": "Malformed-row resilience: parse errors advance cursor, not deadlock",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

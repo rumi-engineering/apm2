@@ -1,0 +1,85 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00017",
+      "title": "Implement work contract data model"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0001",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0001",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0001.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "REQ-0003",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0003.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "REQ-0014",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0014.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/prds/PRD-0001/evidence_artifacts/EVID-0001.yaml#prd_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00002",
+          "reason": "Requires proto event schemas from 'Define kernel event schemas with prost'"
+        },
+        {
+          "ticket_id": "TCK-00004",
+          "reason": "Requires reducer framework from 'Implement reducer framework with checkpointing'"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define Work struct with states",
+        "Implement WorkOpened, WorkTransitioned events",
+        "Spec snapshot handling",
+        "Requirement binding"
+      ],
+      "out_of_scope": [
+        "Lease integration (TCK-00018)",
+        "Evidence publication (TCK-00019)"
+      ]
+    },
+    "plan": {
+      "steps": []
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001"
+      ],
+      "criteria": [
+        "Work states defined (OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, COMPLETED, ABORTED)",
+        "WorkOpened includes spec_snapshot_hash",
+        "State transitions validated",
+        "Work projection tracks all active work",
+        "Requirement IDs linked to work"
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

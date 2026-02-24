@@ -1,0 +1,284 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli/src/commands",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-CMD-001",
+      "kind": "safety",
+      "title": "Session tokens passed via env var to mitigate CWE-214",
+      "description": "Session-scoped commands accept session tokens via `APM2_SESSION_TOKEN` environment variable (preferred) to mitigate visible sensitive information in process listings (CWE-214).",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-002",
+      "kind": "requirement",
+      "title": "All command functions return exit codes from crate::exit_codes",
+      "description": "All command functions return a `u8` exit code or `anyhow::Result<()>`, using values from `crate::exit_codes`.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-CMD-003",
+      "kind": "safety",
+      "title": "FAC root preflight validates ownership and 0700 mode",
+      "description": "FAC command entry (`run_fac`) enforces strict ownership and 0700-mode validation on `$APM2_HOME` critical subdirectories.",
+      "rfc": ["RFC-0017", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-004",
+      "kind": "safety",
+      "title": "Work file opened with O_NOFOLLOW to refuse symlinks",
+      "description": "Ticket file opened with `O_NOFOLLOW` to refuse symlinks at kernel level (TOCTOU prevention).",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-005",
+      "kind": "safety",
+      "title": "Work file handle verified as regular file before read",
+      "description": "After open, `fstat` verifies the handle is a regular file; FIFOs, sockets, block/char devices are rejected fail-closed before any read.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-006",
+      "kind": "safety",
+      "title": "Work file read bounded to prevent memory exhaustion",
+      "description": "Bounded read via `take(MAX_TICKET_FILE_SIZE + 1)` prevents memory exhaustion from oversized or special files.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-007",
+      "kind": "safety",
+      "title": "Bounded I/O for job spec reads prevents DoS via special files",
+      "description": "`read_job_spec` uses `File::open().take(MAX_SIZE+1)` to prevent denial-of-service via special files (procfs, FIFOs, `/dev/zero`).",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-008",
+      "kind": "invariant",
+      "title": "Receipt emitted before job moved to terminal directory",
+      "description": "Cancellation receipt is emitted BEFORE moving the job to `cancelled/`. A job is never in a terminal directory without a terminal receipt.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-009",
+      "kind": "safety",
+      "title": "Claimed job cancel is fail-closed on read failure",
+      "description": "`cancel_claimed_job` returns a hard error if the claimed job spec cannot be read. No success without a `CancellationRequested` receipt.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-010",
+      "kind": "safety",
+      "title": "Lane sanitization rejects non-alphanumeric characters",
+      "description": "`stop_target_unit_exact` rejects `queue_lane` values containing characters outside `[A-Za-z0-9_-]` to prevent command injection via unit names.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-011",
+      "kind": "safety",
+      "title": "Control-lane denial paths emit explicit refusal receipts",
+      "description": "All deny paths in the control-lane `stop_revoke` flow emit explicit refusal receipts before moving jobs to `denied/`.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-012",
+      "kind": "safety",
+      "title": "Stop-revoke requires RFC-0028 channel context token",
+      "description": "Cancel command issues a self-signed RFC-0028 channel context token. Worker validates this token on the control-lane admission path. Missing or invalid tokens deny the job fail-closed.",
+      "rfc": ["RFC-0027", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-013",
+      "kind": "invariant",
+      "title": "RUNNING lease persisted before execution, removed on early return",
+      "description": "A RUNNING LaneLeaseV1 is persisted after lane acquisition and before any execution. Every early-return path removes the lease.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-014",
+      "kind": "invariant",
+      "title": "Lane cleanup runs after job completion receipt emission",
+      "description": "Lane cleanup runs AFTER job completion receipt emission and move to `completed/`. Cleanup failures do not negate completed job outcome.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-015",
+      "kind": "safety",
+      "title": "Process identity binding uses verify_pid_identity",
+      "description": "Lease liveness decisions use `verify_pid_identity(pid, proc_start_time_ticks)` to detect PID reuse and prevent kill-on-reused-PID hazards.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-016",
+      "kind": "safety",
+      "title": "JSON-only stderr for recommendation channel",
+      "description": "The `emit_lane_reset_recommendation` function emits exactly one JSON line per recommendation to stderr. No plain-text mixed into the stream.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-017",
+      "kind": "safety",
+      "title": "Warm job lane encoding validated against worker character set",
+      "description": "The `--lane` flag value is validated using `[A-Za-z0-9_-]` and length-checked against `MAX_QUEUE_LANE_LENGTH`.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-018",
+      "kind": "invariant",
+      "title": "Warm job denials use atomic pipeline commit",
+      "description": "All warm job denial paths use `commit_claimed_job_via_pipeline` for crash-safe receipt-before-move ordering.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-019",
+      "kind": "invariant",
+      "title": "Warm phase subprocesses wrapped in systemd-run containment",
+      "description": "Warm phase subprocesses that compile untrusted code are wrapped in `systemd-run` transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec constraints.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-CMD-020",
+      "kind": "safety",
+      "title": "Worker heartbeat refreshed during warm phase execution",
+      "description": "Worker heartbeat refreshed every 5 seconds during warm phase to prevent broker from considering the worker dead during long compilations.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-021",
+      "kind": "safety",
+      "title": "Policy-aware warm spec validation before enqueue",
+      "description": "Warm enqueue path derives `JobSpecValidationPolicy` from FAC policy and validates via `validate_job_spec_with_policy()` before enqueue, failing closed on validation error.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-022",
+      "kind": "safety",
+      "title": "Queue scan entries bounded by MAX_SCAN_ENTRIES",
+      "description": "Queue status scans use bounded `read_dir` (MAX_SCAN_ENTRIES=4096). Reason codes capped at MAX_REASON_CODES=64.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-023",
+      "kind": "safety",
+      "title": "Job spec reads use open-once O_NOFOLLOW pattern",
+      "description": "`read_job_spec_bounded` uses `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` to atomically refuse symlinks and prevent FIFO blocking.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-024",
+      "kind": "invariant",
+      "title": "Config show is pure read-only introspection",
+      "description": "`apm2 fac config show` MUST NOT create files, directories, or persist state. All lookups use non-mutating read paths.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-025",
+      "kind": "safety",
+      "title": "Policy and economics file reads use bounded open-once pattern",
+      "description": "File reads use `O_NOFOLLOW | O_CLOEXEC` at `open(2)` + `fstat` + `take()` to eliminate TOCTOU gap between symlink validation and read.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-026",
+      "kind": "safety",
+      "title": "Operator identity sanitized against control character injection",
+      "description": "Username resolved from `$USER`/`$LOGNAME` is sanitized to `[a-zA-Z0-9._@-]` to prevent control character injection.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-027",
+      "kind": "safety",
+      "title": "Bootstrap directories created with restricted permissions at create-time",
+      "description": "Directories created via `create_dir_restricted` with restricted permissions at create-time (no TOCTOU chmod window). Uses 0o700 in user-mode, 0o770 in system-mode.",
+      "rfc": ["RFC-0017", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-028",
+      "kind": "invariant",
+      "title": "Bootstrap is additive-only; existing state never destroyed",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-029",
+      "kind": "safety",
+      "title": "Bootstrap doctor checks gate exit code (fail-closed)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-030",
+      "kind": "safety",
+      "title": "System bootstrap is root-only and fails closed on ownership errors",
+      "description": "`--system` provisioning is root-only and fails closed when service-user identity or ownership updates cannot be verified.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-031",
+      "kind": "safety",
+      "title": "System account management uses trusted absolute binary paths",
+      "description": "`useradd`/`usermod` execute only from trusted absolute root-owned non-symlink binaries with group/other-writable modes rejected.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-032",
+      "kind": "safety",
+      "title": "Caches nuke never deletes receipts or broker keys",
+      "description": "`apm2 fac caches nuke` NEVER deletes `receipts/` or broker keys. All deletion paths validated against explicit allow-list.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-033",
+      "kind": "safety",
+      "title": "Nuke receipt persistence is hard success condition",
+      "description": "If `persist_nuke_receipt` fails, command returns non-zero exit. Destructive work without durable audit trail is never reported as success.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-034",
+      "kind": "safety",
+      "title": "Broker promotion rewrites files to prevent attacker-owned inodes",
+      "description": "`promote_broker_requests` creates NEW temp files in `pending/` owned by service user instead of renaming attacker-owned files, preventing post-promotion mutation.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-035",
+      "kind": "safety",
+      "title": "ServiceUserNotResolved is hard denial in system mode",
+      "description": "When service user identity cannot be confirmed, no write path (including broker fallback) is permitted. Fail-closed.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-036",
+      "kind": "safety",
+      "title": "FIFO poisoning defense with pre-open file type check",
+      "description": "`promote_broker_requests` calls `symlink_metadata()` before `read_bounded` to quarantine non-regular files without opening them.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-037",
+      "kind": "safety",
+      "title": "Sticky bit required for non-owner-writable broker_requests",
+      "description": "Pre-existing `broker_requests/` with group-write or other-write bit must also have sticky bit set to prevent peer file tampering.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-038",
+      "kind": "safety",
+      "title": "Patch injection uses hardened apply_patch_hardened",
+      "description": "Worker patch injection path uses `apply_patch_hardened` enforcing path traversal rejection, absolute path rejection, NUL byte rejection, size bounds, and format validation.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-CMD-039",
+      "kind": "safety",
+      "title": "Economics admission is fail-closed on load errors",
+      "description": "Economics admission denies jobs on any load error (I/O, corruption, schema mismatch, oversized file). NoAdmittedRoot denies if policy requires economics.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-CMD-040",
+      "kind": "safety",
+      "title": "Broker request files use mode 0640 with fchown (fail-closed)",
+      "description": "Broker request temp files created with mode 0640 and `fchown(fd, -1, gid)`. Fail-closed if service user not resolvable or fchown fails.",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

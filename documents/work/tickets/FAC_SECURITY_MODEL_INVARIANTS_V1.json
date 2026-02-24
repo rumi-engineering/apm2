@@ -1,0 +1,134 @@
+{
+  "schema": "apm2.fac_security_invariants.v1",
+  "fac_security_model": {
+    "schema_version": "2026-02-24",
+    "stable_id": "FAC-SECURITY-MODEL-V1",
+    "purpose": "Canonical cross-ticket security and correctness contract for Forge Admission Cycle (FAC) and RFC-0032 vNext work.",
+    "source_of_truth": [
+      "documents/rfcs/RFC-0032/KERNEL_NATIVE_FAC_VNEXT.md",
+      "documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md",
+      "documents/rfcs/RFC-0027/PROOF_CARRYING_AUTHORITY_CONTINUITY.md",
+      "documents/theory/unified-theory-v2.json"
+    ],
+    "threat_model": [
+      "TOCTOU lock-gap requeue/double-processing during terminal transitions",
+      "Work identity confusion across lease/work/claim mappings",
+      "Unauthorized mutation by actor/lease mismatch reuse",
+      "PR projection flapping from conflicting bindings",
+      "Replay/duplication from non-idempotent external side effects",
+      "Ambiguous authority when local caches diverge from ledger+CAS"
+    ],
+    "mandatory_invariants": [
+      {
+        "id": "INV-FAC-TRUTH-001",
+        "statement": "Ledger + CAS is authoritative; filesystem/state files are witnessed caches only.",
+        "fail_closed_behavior": "Reject or quarantine when projection and cache disagree.",
+        "code_references": [
+          "crates/apm2-daemon/src/work/projection.rs",
+          "crates/apm2-core/src/fac/reconcile.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-WORK-BIND-001",
+        "statement": "Privileged mutations must derive work identity from authoritative lease->work mapping.",
+        "fail_closed_behavior": "Deny when lease mapping missing, empty, or inconsistent with provided work_id.",
+        "code_references": [
+          "crates/apm2-daemon/src/protocol/dispatch.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-CLAIM-BIND-001",
+        "statement": "Claim resolution must be lease-scoped (`get_claim_by_lease_id`), not role-agnostic.",
+        "fail_closed_behavior": "Deny when lease-bound claim cannot be resolved exactly.",
+        "code_references": [
+          "crates/apm2-daemon/src/protocol/dispatch.rs",
+          "crates/apm2-daemon/src/work/registry.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-ACTOR-BIND-001",
+        "statement": "Authenticated actor must equal claim owner using constant-time comparison before mutation.",
+        "fail_closed_behavior": "Deny permission before any CAS or ledger side effect.",
+        "code_references": [
+          "crates/apm2-daemon/src/protocol/dispatch.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-IDEMP-001",
+        "statement": "Side effects are idempotent on stable semantic identity tuples.",
+        "fail_closed_behavior": "Replay returns canonical prior result; conflicts deny.",
+        "code_references": [
+          "crates/apm2-daemon/src/protocol/dispatch.rs",
+          "crates/apm2-daemon/src/ledger.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-PR-BIND-001",
+        "statement": "Once a work_id is bound to pr_number, conflicting pr_number writes are rejected.",
+        "fail_closed_behavior": "Emit WORK_PR_BINDING_CONFLICT and preserve existing association.",
+        "code_references": [
+          "crates/apm2-daemon/src/ledger.rs",
+          "crates/apm2-daemon/src/protocol/dispatch.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-PR-BIND-002",
+        "statement": "(work_id, pr_number, commit_sha) uniqueness is case-insensitive on commit_sha.",
+        "fail_closed_behavior": "Reject duplicates/conflicts at storage layer under concurrency.",
+        "code_references": [
+          "crates/apm2-daemon/src/ledger.rs"
+        ]
+      },
+      {
+        "id": "INV-CLCK-001",
+        "statement": "Claimed lock continuity is maintained from claim -> execute -> terminal_commit -> release.",
+        "fail_closed_behavior": "No unlock/reacquire gap in worker terminal path.",
+        "code_references": [
+          "crates/apm2-cli/src/commands/fac_worker/orchestrator.rs",
+          "crates/apm2-core/src/fac/receipt_pipeline.rs"
+        ]
+      },
+      {
+        "id": "INV-CLCK-002",
+        "statement": "Terminal commit path must not perform secondary claim lock acquisition when guard is present.",
+        "fail_closed_behavior": "Guarded commit APIs only; deny on mismatched lock ownership.",
+        "code_references": [
+          "crates/apm2-core/src/fac/receipt_pipeline.rs",
+          "crates/apm2-cli/src/commands/fac_worker/commit_ops.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-BOUNDED-001",
+        "statement": "Reconcile/cleanup traversal and scans are globally bounded to prevent DoS.",
+        "fail_closed_behavior": "Stop traversal and emit deterministic bounded error outcomes.",
+        "code_references": [
+          "crates/apm2-core/src/fac/safe_rmtree.rs",
+          "crates/apm2-core/src/fac/reconcile.rs"
+        ]
+      },
+      {
+        "id": "INV-FAC-EVID-001",
+        "statement": "Every authority-relevant transition must be receipt/evidence anchored and replay-reconstructible.",
+        "fail_closed_behavior": "Never advance terminal/merge/review state on unanchored artifacts.",
+        "code_references": [
+          "crates/apm2-daemon/src/protocol/dispatch.rs",
+          "crates/apm2-daemon/src/work/projection.rs"
+        ]
+      }
+    ],
+    "reviewer_checklist": [
+      "Verify no privileged handler mutates state before lease/work/claim/actor validation.",
+      "Verify no role-agnostic claim fallback remains in privileged flows.",
+      "Verify stale or conflicting PR/work bindings return deterministic fail-closed errors.",
+      "Verify queue/worker terminal flows preserve claimed lock continuity.",
+      "Verify projections are rebuildable from ledger+CAS without local state files.",
+      "Verify all large scans/decodes are bounded."
+    ],
+    "required_tests": [
+      "cargo test -p apm2-daemon --test tck_00412_publish_changeset_fail_closed",
+      "cargo test -p apm2-daemon tck_00639_frozen_work_pr_binding_conflict_rejects_different_pr_numbers -- --nocapture",
+      "cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture",
+      "cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture"
+    ]
+  }
+}

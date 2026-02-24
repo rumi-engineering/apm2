@@ -1,0 +1,125 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00439",
+      "title": "RFC-0019 ch17 CAC snapshot contract registry hardening",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0020",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0020.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0010",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0010.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0013",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0013.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0014",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0014.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0028/requirements/REQ-0006.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0006.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0010",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0010.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0013",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0013.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0014",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0006",
+          "artifact_ref": "documents/rfcs/RFC-0028/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0006",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_OBSERVABILITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Define schema-qualified `contract_object_registry[]` rows for RFC-0019 chapter 17 snapshot objects.",
+        "Bind each required object to `schema_id`, `schema_major`, `schema_stable_id`, digest, and canonicalizer tuple fields.",
+        "Treat CAC as deterministic RoleSpec context injection substrate by adding RoleSpec/context-pack/selector/budget/run-receipt contract rows.",
+        "Specify deterministic CAC validation order for schema resolution, canonicalizer compatibility, signature freshness, digest completeness, and predicate execution.",
+        "Define explicit CAC defect classes and compatibility-state refinements (`COMPATIBLE`/`SUSPECT`/`BLOCKED`).",
+        "Define Tier2+ freeze/halt escalation behavior for unresolved CAC defects before adjudication deadline."
+      ],
+      "out_of_scope": [
+        "Runtime implementation of schema validators or new kernel admission handlers.",
+        "Changes to RFC-0027 lifecycle semantics.",
+        "Changes to post-RFC-0020 subsystem ownership boundaries."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Map existing chapter 17 snapshot object list to schema-qualified CAC object registry entries.",
+        "Add missing object kinds required by RFC-0028/RFC-0029 CAC gate contracts.",
+        "Add RoleSpec context-injection object kinds and verify hash linkage to run receipts.",
+        "Add explicit CAC defect taxonomy and fail-closed compatibility transitions.",
+        "Cross-check schema IDs used in RFC-0028/RFC-0029 against chapter 17 registry coverage.",
+        "Validate final ticket references and section anchors."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0010",
+        "EVID-0013",
+        "EVID-0014",
+        "EVID-0006"
+      ],
+      "criteria": [
+        "REQ-0020 schema-qualified CAC registry requirements are represented in chapter 17.",
+        "RFC-0019 chapter 17 snapshot contract surface is schema-qualified rather than object-name-only.",
+        "CAC defect classes include schema, canonicalizer, digest, signature, stale-input, and validation-order failures.",
+        "Tier2+ behavior explicitly freezes promotion paths and escalates to halt if unresolved by deadline.",
+        "RFC-0028 and RFC-0029 CAC gate/predicate schema IDs are represented in chapter 17 registry.",
+        "RoleSpec context injection is hash-deterministic and selector-closed for promotion-critical runs."
+      ]
+    },
+    "notes": {
+      "security": "Missing, stale, ambiguous, or unverifiable CAC inputs are fail-closed for all promotion-critical\npaths. Tier2+ ambiguity is not eligible for permissive continuation.\n",
+      "verification": "Verify coverage by diffing schema IDs referenced in RFC-0028/0029 CAC sections against chapter 17\n`contract_object_registry[]`.\n",
+      "general": "Governance backfill ticket created because RFC-0019 (pre-RFC-0020) documents were patched to add\nCAC hardening semantics.\n"
+    }
+  }
+}

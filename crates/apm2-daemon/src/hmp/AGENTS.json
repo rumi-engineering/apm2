@@ -1,0 +1,73 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/hmp",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-HMP-001",
+      "kind": "safety",
+      "title": "Unknown channel classes are rejected (fail-closed)",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-002",
+      "kind": "invariant",
+      "title": "message_class prefix must be consistent with channel_class",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-003",
+      "kind": "invariant",
+      "title": "Only Work and Governance channels can carry authority-bearing messages",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-004",
+      "kind": "invariant",
+      "title": "Envelope size bounded to MAX_ENVELOPE_BYTES (16 KiB)",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-005",
+      "kind": "invariant",
+      "title": "Causal parent references bounded to MAX_PARENTS (64)",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-006",
+      "kind": "invariant",
+      "title": "All string fields reject control characters (canonicalization safety)",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-007",
+      "kind": "invariant",
+      "title": "deny_unknown_fields on all boundary structs",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-008",
+      "kind": "requirement",
+      "title": "Body content is never inlined in the envelope wire shape (digest-first)",
+      "rfc": ["RFC-0018"],
+      "req": ["RFC-0018#REQ-0034"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-009",
+      "kind": "invariant",
+      "title": "Every successful cross-cell import emits an AdmissionReceiptV1",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-010",
+      "kind": "safety",
+      "title": "Replicated bytes without receipts are untrusted cache, not truth-plane facts",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-HMP-011",
+      "kind": "invariant",
+      "title": "Admitted hashes bounded to MAX_ADMITTED_HASHES (100,000)",
+      "rfc": ["RFC-0018"]
+    }
+  ]
+}

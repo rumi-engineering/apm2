@@ -1,0 +1,100 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00341",
+      "title": "AgentAdapterProfileV1 hardening: validation gaps and API completeness"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0009",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0009.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0009",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0009.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00328",
+          "reason": "Follow-up hardening for AgentAdapterProfileV1 implementation"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add FromStr implementations for InputMode and OutputMode enums (symmetry with AdapterMode)",
+        "Validate VersionProbe regex compiles during profile validation (prevent ReDoS)",
+        "Add validation for ToolBridgeConfig fields (non-zero timeouts, reasonable size limits)",
+        "Add path validation for command/cwd fields (absolute paths, no traversal sequences)",
+        "Replace panic path in compute_cas_hash with proper error handling",
+        "Add serde deny_unknown_fields to prevent silent field drops",
+        "Validate environment variable key syntax (alphanumeric + underscore)",
+        "Add serde round-trip tests for all enum variants",
+        "Remove or differentiate dead code in AdapterRegistry::with_profile (all adapter modes currently identical)",
+        "Remove unused UnsupportedAdapterMode error variant or implement its usage"
+      ],
+      "out_of_scope": [
+        "Changes to AdapterRegistry behavior beyond what TCK-00328 established",
+        "New adapter modes or profile fields"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read TCK-00328 implementation and review findings from PR",
+        "Implement: Add FromStr for InputMode and OutputMode with tests",
+        "Implement: Add regex compilation check in VersionProbe::validate()",
+        "Implement: Add ToolBridgeConfig::validate() with bounds checks",
+        "Implement: Add path validation for command/cwd (require absolute, reject traversal)",
+        "Implement: Replace .expect() in compute_cas_hash with Result return",
+        "Implement: Add #[serde(deny_unknown_fields)] to all deserializable structs",
+        "Implement: Add env var key syntax validation",
+        "Implement: Differentiate AdapterRegistry::with_profile behavior per adapter mode or consolidate",
+        "Implement: Remove unused UnsupportedAdapterMode error variant or add usage",
+        "Add comprehensive serde round-trip tests for all enums",
+        "Run cargo check, cargo clippy, cargo test to verify"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0009"
+      ],
+      "criteria": [
+        "All enum types have symmetric Display/FromStr implementations",
+        "Invalid regex in VersionProbe fails validation before CAS storage",
+        "ToolBridgeConfig with zero timeout or extreme sizes fails validation",
+        "command/cwd with path traversal sequences are rejected",
+        "compute_cas_hash returns Result instead of panicking",
+        "Unknown fields in JSON cause deserialization errors",
+        "No dead code in AdapterRegistry (modes either differentiated or consolidated)",
+        "No unused error variants in AdapterRegistryError",
+        "All tests pass including new serde round-trip tests"
+      ]
+    },
+    "notes": {
+      "security": "These fixes address validation gaps identified in deep code review of PR #411. Strengthens fail-fast behavior to catch misconfigurations at profile creation rather than runtime.",
+      "verification": "Add property-based tests where appropriate (regex fuzzing, path validation edge cases).",
+      "general": "Follow-up to TCK-00328 based on Opus code review findings. Keep changes focused on validation hardening without changing core schema or behavior.",
+      "review_source": "Issues identified by Claude Opus 4.5 deep review of PR #411 on 2026-02-05: Critical (3): Missing FromStr, unvalidated regex, unchecked ToolBridgeConfig. High (2): Panic path, dead code in adapter modes. Medium (4): Dead error variant, missing env validation, no hash mismatch test, missing serde tests."
+    }
+  }
+}

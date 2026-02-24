@@ -1,0 +1,203 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00610",
+      "title": "Fix stale-verdict approve bypass, clear verdicts on restart, and repair worktree-less auto-merge",
+      "status": "MERGED",
+      "note": "Stale-verdict bypass and worktree-less auto-merge fixes completed as part of RFC-0019 FAC hardening work."
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00609",
+          "reason": "TCK-00609 introduced the `approve` action in build_recommended_action() that trusts all_verdicts_approve without cross-checking finding counts. The approve action is the immediate vector for the stale-verdict bypass."
+        },
+        {
+          "ticket_id": "TCK-00605",
+          "reason": "TCK-00605 introduced build_recommended_action, auto-merge via maybe_auto_merge_if_ready, and try_fast_forward_main — all involved in this incident."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "INCIDENT: PR #692 merged to main with 2 MAJOR security findings\n(worker heartbeat starvation, containment bypass) because stale\nverdicts from a previous review round persisted across a review\nrestart, causing the TCK-00609 `approve` action to fire before\nthe `dispatch_implementor` check could catch the findings.\n\nThree defects compound to create the bypass:\n\nDEFECT 1: APPROVE ACTION TRUSTS STALE VERDICTS (TCK-00609 regression)\n\n`build_recommended_action()` at\n`crates/apm2-cli/src/commands/fac_review/mod.rs:2527-2534`:\n\n    if input.merge_readiness.all_verdicts_approve {\n        return DoctorRecommendedAction {\n            action: \"approve\".to_string(), ...\n        };\n    }\n\nThe `approve` action fires when `all_verdicts_approve=true`,\nwhich is checked BEFORE the `dispatch_implementor` branch at\nline 2554. The dispatch_implementor branch cross-checks\n`counts.blocker > 0 || counts.major > 0`, but `approve`\nshort-circuits before reaching it.\n\nBefore TCK-00609, there was no `approve` action. The only\naction that consumed `all_verdicts_approve` was `merge`, which\nrequired the full `merge_ready` conjunction (gates_pass +\nsha_fresh + no_merge_conflicts) — a much higher bar that\nrarely triggered on stale data.\n\nThe `approve` action fires on `all_verdicts_approve` alone.\nIt does not check:\n  - Whether finding counts have blocker/major (inconsistency guard)\n  - Whether active reviewer agents are running (freshness guard)\n\nDEFECT 2: STALE VERDICTS PERSIST ACROSS REVIEW RESTARTS (pre-existing)\n\nTwo data stores retain old verdicts when reviews restart:\n\n(a) Lifecycle record.verdicts BTreeMap:\n    `lifecycle.rs:1476-1489` — the reduce_event handler for\n    VerdictSet inserts into record.verdicts at line 1483.\n    But ReviewsDispatched (the restart event) hits the\n    `_ => {}` catch-all at line 1488, which does NOT clear\n    record.verdicts. Old verdicts from previous rounds survive.\n\n    Impact: When the first dimension of a new round sets its\n    verdict, `next_state_for_event()` at lines 2347-2366\n    checks BOTH dimensions. If the other dimension still has\n    \"approve\" from the previous round (because its new verdict\n    hasn't been set yet), the state machine transitions to\n    MergeReady prematurely.\n\n(b) Verdict projection record.dimensions BTreeMap:\n    `verdict_projection.rs:437-465` —\n    `persist_verdict_projection_impl()` does a read-modify-write:\n    loads existing record (which has ALL previous dimension\n    entries), inserts the new dimension verdict, saves. Old\n    dimension entries are NOT cleared on restart.\n\n    Impact: Between the first and second dimension of a new\n    round, the projection shows one fresh verdict + one stale\n    verdict. `build_doctor_merge_readiness()` at mod.rs:2339-2344\n    computes `all_verdicts_approve` from the projection, seeing\n    stale approve for the dimension that hasn't been re-reviewed\n    yet.\n\nThe stale-verdict window:\n    T0: Round 1 completes — security=approve, code-quality=approve\n    T1: Reviews restart for same SHA (apm2 fac restart)\n        Projection still has: {security: approve, code-quality: approve}\n        Lifecycle verdicts still have: {security: approve, code-quality: approve}\n    T2: Code-quality round 2 sets approve\n        Projection: {security: approve (STALE!), code-quality: approve}\n        Lifecycle: both approve → MergeReady → auto-merge fires\n        Doctor: all_verdicts_approve=true → action=\"approve\"\n    T3: Security round 2 sets deny (e.g., \"prepare failed\")\n        Too late — orchestrator already saw \"approve\" at T2\n\nDEFECT 3: AUTO-MERGE BROKEN WHEN NO WORKTREE HAS MAIN (pre-existing)\n\n`try_fast_forward_main()` at lifecycle.rs:1908-1971 calls\n`resolve_main_worktree()` which parses `git worktree list\n--porcelain` looking for a worktree with\n`branch refs/heads/main`. If no worktree has main checked out,\nit returns Err and auto-merge fails with a MergeFailed\nlifecycle event.\n\nThe primary worktree `/home/ubuntu/Projects/apm2` currently\nhas `ticket/RFC-0019/TCK-00542` checked out (confirmed via\n`git -C /home/ubuntu/Projects/apm2 symbolic-ref HEAD`). No\nworktree has main. Auto-merge is dead.\n\nThe function uses `git merge --ff-only` which REQUIRES main to\nbe checked out. But with 11+ worktrees, the primary worktree\nis routinely repurposed for ticket work. The function should\nuse `git update-ref refs/heads/main <sha>` instead, which\nupdates the branch ref without requiring main to be checked out.\n\nThis defect also causes \"local main keeps getting stale\" — no\nmechanism syncs local main with origin/main when auto-merge\ncan't fire.\n\nINCIDENT TIMELINE FOR PR #692:\n\n1. Round 1 reviews ran for SHA 693adf4a — security likely\n   approved (findings were NITs only in earlier rounds)\n2. Reviews restarted (new round with updated review inputs)\n3. Code-quality round 2 approved at 02:26:39Z\n   - Projection: security=approve (stale from round 1),\n     code-quality=approve (fresh)\n   - Lifecycle: MergeReady (both verdicts \"approve\")\n   - Auto-merge attempted but FAILED (no main worktree)\n   - Doctor returned action=\"approve\"\n   - GitHub CI check updated to green (projection shows approve)\n4. PR #692 merged on GitHub (merge commit 71c05c93)\n5. Security round 2 finished at 02:29:23Z with deny\n   (\"prepare failed: no review inputs available\")\n   — 2 MAJOR findings (heartbeat starvation, containment bypass)\n6. But PR already merged to main with unresolved MAJOR findings\n"
+    }
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1_GUARD_APPROVE_AGAINST_FINDINGS",
+        "title": "Guard approve action against inconsistent finding counts and active reviewers",
+        "detail": "In `build_recommended_action()` at\n`crates/apm2-cli/src/commands/fac_review/mod.rs:2527-2534`:\n\nThe `approve` action currently fires on `all_verdicts_approve`\nalone. Add two guards:\n\n1. FINDINGS GUARD: Compute `has_actionable_findings` (any\n   dimension with blocker > 0 or major > 0) BEFORE the approve\n   check. Only emit approve if `!has_actionable_findings`.\n\n2. ACTIVE AGENTS GUARD: Only emit approve if no active reviewer\n   agents are running (`active_agents == 0`). If reviewers are\n   still active, verdicts may not be final.\n\nMove the `requires_implementor_remediation` and\n`all_verdicts_resolved` computations above the approve check:\n\n    let has_actionable_findings = input.findings_summary.iter().any(|entry| {\n        entry.counts.blocker > 0 || entry.counts.major > 0\n    });\n    if input.merge_readiness.all_verdicts_approve\n        && !has_actionable_findings\n        && input.agent_activity.active_agents == 0\n    {\n        return DoctorRecommendedAction {\n            action: \"approve\".to_string(), ...\n        };\n    }\n\nThis ensures:\n  - Stale approve + current MAJOR findings → dispatch_implementor\n  - Active reviewers (verdict not final) → wait\n  - Genuine all-approve with no actionable findings → approve\n\nAcceptance:\n  - Projection shows all approve BUT findings have 2 MAJOR →\n    doctor returns \"dispatch_implementor\", NOT \"approve\".\n  - All approve, zero MAJOR/BLOCKER, zero active agents →\n    doctor returns \"approve\".\n  - All approve, zero findings, but 1 active reviewer agent →\n    doctor returns \"wait\".\n"
+      },
+      {
+        "id": "S2_CLEAR_VERDICTS_ON_RESTART_LIFECYCLE",
+        "title": "Clear lifecycle verdicts BTreeMap when ReviewsDispatched event fires",
+        "detail": "In `lifecycle.rs:1476-1489`, the reduce_event handler for\nReviewsDispatched currently falls through to `_ => {}`:\n\n    match event {\n        LifecycleEventKind::VerdictSet { ... } => {\n            record.verdicts.insert(dim, dec);\n        },\n        _ => {},\n    }\n\nChange to explicitly clear verdicts on ReviewsDispatched:\n\n    LifecycleEventKind::ReviewsDispatched => {\n        record.verdicts.clear();\n    },\n    _ => {},\n\nThis prevents stale verdicts from a previous round from\npersisting into the next round. When the first dimension of\nthe new round sets its verdict, the other dimension will have\nno entry (not stale \"approve\"), so `next_state_for_event()`\nwill correctly return VerdictPending instead of MergeReady.\n\nThe `verdicts.clear()` is safe because:\n  - ReviewsDispatched means NEW reviews are starting\n  - Old verdicts are from a PREVIOUS round (possibly stale)\n  - The new round will set fresh verdicts as reviewers complete\n  - The \"deny is sticky\" safety check in\n    persist_verdict_projection (line 473-481) already prevents\n    approve from overwriting deny within a single round\n\nAcceptance:\n  - After `apm2 fac restart --pr <N>`, lifecycle record.verdicts\n    is empty.\n  - Security approve (round 1) does NOT carry into round 2.\n  - First dimension of round 2 setting approve → lifecycle state\n    is VerdictPending (not MergeReady), because the other\n    dimension has no verdict yet.\n"
+      },
+      {
+        "id": "S3_CLEAR_VERDICTS_ON_RESTART_PROJECTION",
+        "title": "Clear verdict projection dimensions when reviews restart for same SHA",
+        "detail": "In `verdict_projection.rs`, add a function to clear dimension\nentries from the projection record for a given SHA:\n\n    pub fn clear_dimension_verdicts_for_sha(\n        owner_repo: &str,\n        pr_number: u32,\n        head_sha: &str,\n    ) -> Result<(), String>\n\nThis function:\n  1. Acquires the projection lock\n  2. Loads the projection record for the SHA\n  3. Clears record.dimensions (BTreeMap::clear())\n  4. Saves the record\n\nCall this from the restart flow — wherever `apm2 fac restart\n--pr <N>` dispatches new reviews, BEFORE the ReviewsDispatched\nlifecycle event. This ensures the projection is clean before\nnew verdicts arrive.\n\nThe clear must happen under the projection lock to prevent\na concurrent verdict-set from racing with the clear.\n\nAcceptance:\n  - After `apm2 fac restart --pr <N>`, projection for the SHA\n    shows both dimensions as \"pending\" (no stale entries).\n  - Doctor polled between restart and first new verdict shows\n    all_verdicts_approve=false.\n  - No stale-verdict window exists between restart and new\n    verdicts.\n"
+      },
+      {
+        "id": "S4_WORKTREE_LESS_AUTO_MERGE",
+        "title": "Replace git merge --ff-only with git update-ref for auto-merge",
+        "detail": "`try_fast_forward_main()` at lifecycle.rs:1908-1971 currently:\n  1. Finds a worktree with main checked out (resolve_main_worktree)\n  2. Runs git merge --ff-only in that worktree\n\nThis fails when no worktree has main checked out. Replace with\n`git update-ref`:\n\n    fn try_fast_forward_main(\n        current_dir: &Path,\n        branch: &str,\n        expected_sha: &str,\n    ) -> Result<(), String> {\n        // 1. Verify main ref exists\n        let main_sha = git_stdout_checked(\n            current_dir,\n            &[\"rev-parse\", \"--verify\", \"refs/heads/main\"],\n        )?;\n\n        // 2. Verify branch head matches expected\n        let branch_sha = git_stdout_checked(\n            current_dir,\n            &[\"rev-parse\", \"--verify\", &format!(\"refs/heads/{branch}\")],\n        )?;\n        if !branch_sha.eq_ignore_ascii_case(expected_sha) {\n            return Err(...);\n        }\n\n        // 3. Verify fast-forward (main is ancestor of branch)\n        git_run_checked(current_dir, &[\n            \"merge-base\", \"--is-ancestor\",\n            \"refs/heads/main\", &format!(\"refs/heads/{branch}\")\n        ])?;\n\n        // 4. Update main ref atomically (no checkout needed)\n        git_run_checked(current_dir, &[\n            \"update-ref\", \"refs/heads/main\", &branch_sha, &main_sha\n        ])?;\n\n        Ok(())\n    }\n\n`git update-ref` is atomic and does NOT require the branch\nto be checked out. The old-value argument (main_sha) ensures\nno concurrent update races.\n\nRemove `resolve_main_worktree()` entirely (dead code after\nthis change).\n\nIf a worktree DOES have main checked out, the working tree\nwill be stale (HEAD updated but working tree not). Add a\nbest-effort `git -C <main_worktree> reset --hard HEAD`\nif a main worktree exists, to sync its working tree.\n\nAcceptance:\n  - Auto-merge succeeds even when no worktree has main\n    checked out.\n  - `git log main` shows the merged commit after auto-merge.\n  - Concurrent update-ref calls are safe (old-value guard).\n  - If a main worktree exists, its working tree is synced.\n"
+      },
+      {
+        "id": "S5_SYNC_LOCAL_MAIN_WITH_REMOTE",
+        "title": "Add remote main sync to doctor and post-merge flow",
+        "detail": "Local main falls behind origin/main when merges happen on\nGitHub (PR merge button) rather than via local auto-merge.\nTwo sync points:\n\n1. POST-MERGE: After successful auto-merge (in\n   maybe_auto_merge_if_ready_inner, after the update-ref),\n   push local main to origin:\n\n       git push origin refs/heads/main:refs/heads/main\n\n   This keeps origin/main in sync with local auto-merges.\n\n2. PRE-MERGE CHECK: Before attempting auto-merge, fetch\n   remote main and verify local main is not behind:\n\n       git fetch origin refs/heads/main:refs/heads/main\n\n   If main is already checked out in a worktree, use:\n\n       git fetch origin main\n       git update-ref refs/heads/main origin/main\n\n   This ensures local main is current before the ff-only\n   check, preventing \"non-fast-forward\" failures when\n   origin/main has diverged.\n\n3. DOCTOR SYNC: In run_doctor_inner(), if local main is\n   behind origin/main (detectable by comparing refs),\n   emit a health item:\n\n       severity: \"medium\"\n       message: \"local main is N commits behind origin/main\"\n       remediation: \"run `git fetch origin main:main`\"\n\nAcceptance:\n  - After local auto-merge, origin/main is updated.\n  - If origin/main has commits local main doesn't, fetch\n    syncs them before auto-merge attempt.\n  - Doctor warns when local main is stale.\n"
+      },
+      {
+        "id": "S6_UPDATE_EXISTING_TESTS",
+        "title": "Update existing approve and merge-readiness tests",
+        "detail": "1. Update any test that asserts approve action fires on\n   all_verdicts_approve alone — must now also verify zero\n   actionable findings and zero active agents.\n\n2. Add lifecycle reducer test: ReviewsDispatched after\n   VerdictSet clears record.verdicts.\n\n3. Add merge-readiness test: stale security=approve in\n   projection + fresh code-quality=approve → after restart →\n   all_verdicts_approve is false.\n\nAcceptance:\n  - All existing tests updated and passing.\n  - No test asserts approve fires with MAJOR findings present.\n"
+      },
+      {
+        "id": "S7_ADD_NEW_TESTS",
+        "title": "Add tests for stale-verdict prevention and worktree-less merge",
+        "detail": "New tests for approve guard:\n1. test_approve_blocked_when_findings_have_major:\n   all_verdicts_approve=true, counts.major=2 → action != \"approve\"\n2. test_approve_blocked_when_active_agents_running:\n   all_verdicts_approve=true, active_agents=1 → action != \"approve\"\n3. test_approve_fires_when_clean:\n   all_verdicts_approve=true, no findings, no agents → action=\"approve\"\n\nNew tests for lifecycle verdict clearing:\n4. test_reviews_dispatched_clears_verdicts:\n   VerdictSet(security=approve) → ReviewsDispatched →\n   record.verdicts is empty\n5. test_no_premature_merge_ready_after_restart:\n   security=approve + code-quality=approve → ReviewsDispatched →\n   VerdictSet(code-quality=approve) → state is VerdictPending\n   (not MergeReady)\n\nNew tests for projection verdict clearing:\n6. test_clear_dimension_verdicts_for_sha:\n   Projection with both dimensions → clear → load → both pending\n7. test_restart_clears_projection_verdicts:\n   Full round → restart → projection shows pending for both\n\nNew tests for worktree-less merge:\n8. test_try_fast_forward_main_without_main_worktree:\n   update-ref path works when main is not checked out\n9. test_try_fast_forward_main_rejects_non_ff:\n   Non-ancestor → Err\n\nAcceptance:\n  - All 9 new tests pass.\n  - Coverage of stale-verdict window prevention.\n  - Coverage of worktree-less auto-merge path.\n"
+      },
+      {
+        "id": "S8_WAIT_TIMEOUT_AND_EXIT_CODE",
+        "title": "Raise --wait-timeout-seconds default to 1200s, distinguish timeout from matched exit",
+        "detail": "The `--wait-for-recommended-action` poll loop at\n`crates/apm2-cli/src/commands/fac_review/mod.rs:606-649` has\nthree problems:\n\n1. DEFAULT TOO LOW: `--wait-timeout-seconds` defaults to 60s\n   with a clap range of 5..=180 (fac.rs:374). Real orchestration\n   cycles (review dispatch → reviewer runs → verdict set) take\n   5-20 minutes. The 60s default causes premature exit on nearly\n   every poll.\n\n2. RANGE TOO NARROW: The clap max of 180s (3 minutes) prevents\n   orchestrators from setting a reasonable timeout. Orchestrators\n   need 20+ minutes for multi-dimension review cycles.\n\n3. TIMEOUT EXITS WITH SUCCESS: At line 624-627, timeout returns\n   `exit_codes::SUCCESS` with the last poll result. The caller\n   cannot distinguish \"exited because action matched --exit-on\"\n   from \"exited because timeout expired.\" This is a liveness\n   hazard: the orchestrator treats a stale \"wait\" result as if\n   it were a matched action.\n\nFixes:\n\n(a) Change default to 1200 seconds (20 minutes) and cap range\n    at 5..=1200 (20 minutes max):\n\n        #[arg(long, default_value_t = 1200,\n              value_parser = clap::value_parser!(u64).range(5..=1200))]\n        pub wait_timeout_seconds: u64,\n\n    The 20-minute cap is deliberate: if nothing has happened for\n    20 minutes, the system is in an abnormal state and the\n    orchestrator must diagnose the problem — not wait longer.\n    Allowing longer waits masks glitches in the overall system.\n\n    When a monitor attempts to set a value above 1200, clap\n    should emit an informative error message. Use a custom\n    value_parser that wraps the range check and returns a\n    descriptive error:\n\n        fn parse_wait_timeout(s: &str) -> Result<u64, String> {\n            let val: u64 = s.parse().map_err(|e| format!(\"{e}\"))?;\n            if val < 5 || val > 1200 {\n                return Err(format!(\n                    \"wait timeout must be between 5 and 1200 seconds \\\n                     (20 minutes max). If nothing has happened for 20 \\\n                     minutes, the orchestrator should diagnose the \\\n                     problem rather than wait longer.\"\n                ));\n            }\n            Ok(val)\n        }\n\n        #[arg(long, default_value_t = 1200,\n              value_parser = parse_wait_timeout)]\n        pub wait_timeout_seconds: u64,\n\n(b) On timeout, return a DISTINCT exit code (e.g.,\n    exit_codes::TIMEOUT or a new constant like 2) instead of\n    SUCCESS. This lets the orchestrator detect timeout and\n    decide whether to re-poll or escalate.\n\n(c) In JSON output, include a `timed_out` field in the final\n    result so the orchestrator can programmatically detect\n    timeout:\n\n        {\n          \"recommended_action\": { ... },\n          \"timed_out\": true,\n          \"elapsed_seconds\": 1200,\n          \"ticks\": 240\n        }\n\n(d) In the recommended_action.command emitted by \"wait\",\n    include the timeout flag so the orchestrator's next poll\n    inherits a reasonable timeout:\n\n        \"apm2 fac doctor --pr {pr} --json \\\n            --wait-for-recommended-action \\\n            --wait-timeout-seconds 1200\"\n\nAcceptance:\n  - Default wait timeout is 1200 seconds (20 minutes).\n  - `--wait-timeout-seconds 1201` is rejected with an\n    informative error explaining the 20-minute cap and that\n    the orchestrator should diagnose the problem.\n  - `--wait-timeout-seconds 1200` is accepted (max value).\n  - Timeout exit code differs from success (exit_on match).\n  - JSON output includes `timed_out: true` when timeout expires.\n  - wait action command includes `--wait-timeout-seconds`.\n"
+      },
+      {
+        "id": "S9_CONSOLIDATE_CI_STATUS_IN_PR_BODY",
+        "title": "Move all CI/gate status into the PR body, YAML-only format, brief previous-SHA collapsible",
+        "detail": "GitHub rate limits are exhausted by the current dual-update\npattern: CI status is posted as a separate PR comment\n(`ci_status.rs` → `create_issue_comment` / `update_issue_comment`)\nAND gate status is synced into the PR body (`projection.rs` →\n`edit_pr_body`). Every gate transition fires TWO GitHub API\ncalls (one PATCH to the comment, one PATCH to the PR body).\nConsolidating into a single PR body update halves API traffic.\n\nFive changes:\n\n(a) MOVE CI STATUS INTO PR BODY:\n\n    Retire `ci_status.rs` comment CRUD (`create_status_comment`,\n    `update_status_comment`, `ThrottledUpdater`). Merge the\n    `CiStatus` gate data into the existing gate status section\n    of the PR body. All status updates go through a single\n    `edit_pr_body()` call.\n\n    The `CiStatus` struct and its RUNNING/PASS/FAIL semantics\n    remain — only the transport changes (PR comment → PR body\n    section).\n\n    In `evidence.rs`, replace `ThrottledUpdater::new()` /\n    `.update()` / `.force_update()` with a call to the\n    unified PR body updater.\n\n(b) YAML EVERYTHING (NO JSON):\n\n    Replace `render_status_metadata_block()` which emits\n    ````json` blocks (projection.rs:939-953) with YAML blocks.\n\n    Replace `render_gate_table()` markdown table\n    (projection.rs:918-937) with a fenced YAML block.\n\n    The current SHA section becomes:\n\n        ```yaml\n        # apm2-gate-status:v2\n        sha: <full_sha>\n        short_sha: <8char>\n        timestamp: <ISO-8601>\n        all_passed: true|false\n        gates:\n          - name: <gate_name>\n            status: RUNNING|PASS|FAIL\n            duration_secs: <optional>\n            tokens_used: <optional>\n            model: <optional>\n        ```\n\n    One fenced YAML block per SHA — no separate table + metadata.\n\n(c) CURRENT SHA: FULL BREAKDOWN AFTER TICKET YAML + COMMIT HISTORY:\n\n    Position the current SHA's gate status section immediately\n    after the ticket YAML + `fac_push_metadata.commit_history`\n    block (rendered by `render_ticket_body_markdown()` in\n    push.rs:239-283), and before any previous-SHA collapsible.\n\n    PR body layout:\n\n        ```yaml\n        ticket_meta: ...\n        fac_push_metadata:\n          commit_history: ...\n        ```\n\n        <!-- apm2-gate-status:start -->\n        ## FAC Gate Status\n\n        ```yaml\n        # apm2-gate-status:v2\n        sha: <current_sha>\n        ...full breakdown...\n        ```\n\n        <details>\n        <summary>Previous SHAs</summary>\n        ...brief pass/fail...\n        </details>\n        <!-- apm2-gate-status:end -->\n\n(d) PREVIOUS SHAs: BRIEF PASS/FAIL IN A SINGLE COLLAPSIBLE:\n\n    Currently each previous SHA gets its own `<details>` with\n    a full markdown table + JSON metadata block\n    (`render_previous_status()` at projection.rs:955-968).\n\n    Replace with a SINGLE `<details>` at the bottom containing\n    ALL previous SHAs as a brief pass/fail summary:\n\n        <details>\n        <summary>Previous SHAs (3)</summary>\n\n        ```yaml\n        previous_shas:\n          - sha: abc12345\n            timestamp: \"2026-02-15T...\"\n            all_passed: false\n            gates: [lint: PASS, security: FAIL, code-quality: PASS]\n          - sha: def67890\n            timestamp: \"2026-02-14T...\"\n            all_passed: true\n            gates: [lint: PASS, security: PASS, code-quality: PASS]\n        ```\n\n        </details>\n\n    One-line-per-gate format (inline YAML flow sequence) keeps\n    it brief. The count in the summary shows how many previous\n    SHAs are present.\n\n(e) REMOVE MARKDOWN TABLE:\n\n    Delete `render_gate_table()` (projection.rs:918-937) and\n    all call sites. The YAML block is the sole rendering format.\n\nMigration: The `parse_pr_body()` function must handle BOTH old\nformat (table + JSON metadata) and new format (YAML-only) during\nthe transition. Old-format sections are parsed and re-rendered\nin the new format on the next update.\n\nAcceptance:\n  - CI status updates use `edit_pr_body()` only — no PR comment\n    CRUD for status.\n  - Gate status section contains fenced YAML blocks, not JSON.\n  - No markdown table in the gate status section.\n  - Current SHA has full gate breakdown (with duration, model,\n    tokens) immediately after ticket YAML + commit history.\n  - All previous SHAs are in a single `<details>` collapsible\n    with a brief one-line-per-gate YAML summary.\n  - PR body update count per gate transition is 1 (not 2).\n  - Old-format PRs are migrated on next status sync.\n"
+      },
+      {
+        "id": "S10_FULL_MACHINE_THROUGHPUT_POLICY",
+        "title": "Use full host compute for FAC pipeline tests; rely on queue admission for contention",
+        "detail": "The throughput pivot requires gates and pipeline to use the same\nhost-aware default compute policy:\n\n1. In `crates/apm2-cli/src/commands/fac_review/evidence.rs`\n   (`build_pipeline_test_command`), remove the per-lane cap:\n\n       lane_parallelism_cap = host_parallelism / lane_count\n       execution_profile = cap_execution_parallelism(...)\n\n   and resolve throughput directly from host parallelism:\n\n       execution_profile = resolve_gate_execution_profile(Throughput)\n\n2. Keep containment bounds (`RuntimeMaxSec`, `MemoryMax`,\n   `TasksMax`) unchanged. This change is about throughput policy,\n   not removing containment.\n\n3. Keep contention control at queue admission / lane scheduling,\n   not at per-job CPU throttling defaults.\n\nAcceptance:\n  - Pipeline throughput defaults resolve to host parallelism\n    (no `host/lane_count` split).\n  - `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` in pipeline\n    env equal host parallelism under throughput defaults.\n  - Default pipeline CPU quota equals `host_parallelism * 100%`.\n  - Memory, PID, and timeout containment limits remain enforced.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Revoking the merge of PR #692. The PR is already on main; reverting requires a separate coordinated rollback.",
+      "Adding a pre-merge verification hook on GitHub (GitHub-side protection rules are outside the CLI's control plane).",
+      "Clearing findings on restart (findings are tied to SHA, not review round — they remain valid across restarts).",
+      "Handling non-fast-forward merges (the current ff-only policy is correct; non-ff merges indicate branch divergence that requires rebase)."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "STEP_01",
+        "title": "Guard approve action against findings and active agents",
+        "detail": "In build_recommended_action() at mod.rs:2527-2534:\n1. Compute has_actionable_findings BEFORE the approve check.\n2. Add active_agents == 0 guard.\n3. Only emit approve if all three conditions hold.\n"
+      },
+      {
+        "id": "STEP_02",
+        "title": "Clear lifecycle verdicts on ReviewsDispatched",
+        "detail": "In lifecycle.rs reduce_event handler:\n1. Add explicit arm for ReviewsDispatched that calls\n   record.verdicts.clear().\n2. Move from _ => {} catch-all to named match arm.\n"
+      },
+      {
+        "id": "STEP_03",
+        "title": "Add clear_dimension_verdicts_for_sha to verdict_projection",
+        "detail": "1. Add pub fn clear_dimension_verdicts_for_sha().\n2. Acquires lock, loads record, clears dimensions, saves.\n3. Call from the restart flow before ReviewsDispatched event.\n"
+      },
+      {
+        "id": "STEP_04",
+        "title": "Replace git merge --ff-only with git update-ref",
+        "detail": "In lifecycle.rs try_fast_forward_main():\n1. Remove resolve_main_worktree() dependency.\n2. Use git update-ref with old-value guard.\n3. Best-effort sync main worktree if one exists.\n"
+      },
+      {
+        "id": "STEP_05",
+        "title": "Add remote main sync to auto-merge flow",
+        "detail": "1. Fetch origin main before merge attempt.\n2. Push local main to origin after successful merge.\n3. Add doctor health item when local main is behind.\n"
+      },
+      {
+        "id": "STEP_06",
+        "title": "Update existing tests",
+        "detail": "Update approve tests to include findings/agents guards.\nAdd lifecycle reducer test for ReviewsDispatched clearing.\n"
+      },
+      {
+        "id": "STEP_07",
+        "title": "Add new tests",
+        "detail": "Add the 9 tests described in S7. Cover: approve guards (3),\nlifecycle clearing (2), projection clearing (2),\nworktree-less merge (2).\n"
+      },
+      {
+        "id": "STEP_08",
+        "title": "Fix wait timeout default, range, and exit code",
+        "detail": "1. In fac.rs: change wait_timeout_seconds default to 1200,\n   range to 5..=1200 with custom value_parser that emits an\n   informative error when monitors exceed the 20-minute cap.\n2. In mod.rs poll loop: return distinct exit code on timeout.\n3. Add timed_out field to JSON output on timeout.\n4. Include --wait-timeout-seconds in wait action command.\n"
+      },
+      {
+        "id": "STEP_09",
+        "title": "Consolidate CI status into PR body, YAML-only format",
+        "detail": "1. In projection.rs: replace render_gate_table() and\n   render_status_metadata_block() with YAML rendering.\n2. Replace per-SHA <details> with a single collapsible\n   containing brief pass/fail YAML for all previous SHAs.\n3. In ci_status.rs: retire comment CRUD. Merge CiStatus\n   data into the PR body gate section.\n4. In evidence.rs: replace ThrottledUpdater calls with\n   unified PR body updater.\n5. In push.rs: ensure gate status section is positioned\n   after ticket YAML + commit history.\n6. In projection.rs parse_pr_body(): handle old format\n   (table + JSON) for migration.\n"
+      },
+      {
+        "id": "STEP_10",
+        "title": "Verify all changes",
+        "detail": "1. cargo test -p apm2-cli — all tests pass.\n2. Verify approve action never fires with MAJOR findings.\n3. Verify restart clears both lifecycle verdicts and projection.\n4. Verify auto-merge works without main worktree.\n5. Verify timeout returns distinct exit code.\n6. Verify PR body contains YAML-only gate status (no JSON,\n   no markdown table).\n7. Verify CI status updates produce 1 API call (not 2).\n8. Verify old-format PR bodies are migrated correctly.\n9. Manual: restart reviews for a PR, verify stale-verdict\n   window is eliminated.\n"
+      },
+      {
+        "id": "STEP_11",
+        "title": "Align pipeline throughput defaults with full-machine policy",
+        "detail": "1. Remove per-lane CPU/test-thread cap from\n   `build_pipeline_test_command`.\n2. Ensure throughput profile uses host parallelism directly\n   in both `fac gates` and pipeline paths.\n3. Add/update tests to assert pipeline env (`NEXTEST_TEST_THREADS`,\n   `CARGO_BUILD_JOBS`) and effective CPU quota match host\n   parallelism defaults.\n4. Verify containment knobs (memory/pids/timeout) are unchanged.\n"
+      }
+    ]
+  },
+  "definition_of_done": {
+    "evidence_ids": [],
+    "criteria": [
+      "approve action is blocked when any dimension has blocker or major findings — stale formal verdicts cannot hide actionable findings.",
+      "approve action is blocked when active reviewer agents are running — verdicts-in-flight cannot trigger premature approve.",
+      "ReviewsDispatched lifecycle event clears record.verdicts — no stale verdicts persist across review restarts.",
+      "apm2 fac restart clears verdict projection dimensions for the SHA — projection shows pending for both dimensions after restart.",
+      "try_fast_forward_main uses git update-ref (no worktree with main checkout required).",
+      "Auto-merge succeeds when primary worktree is on a ticket branch (not main).",
+      "Local main is synced with origin/main via fetch before merge and push after merge.",
+      "Doctor emits health warning when local main is behind origin/main.",
+      "Existing approve tests updated with findings and active-agents guards.",
+      "9 new tests cover stale-verdict prevention, verdict clearing, and worktree-less merge.",
+      "`--wait-timeout-seconds` defaults to 1200 (20 min), range capped at 1200 (20 min max). Values above 1200 are rejected with an informative error explaining the orchestrator should diagnose the problem.",
+      "Timeout exit code differs from exit-on-match success code — orchestrators can distinguish timeout from matched action.",
+      "JSON output includes `timed_out: true` when wait times out.",
+      "CI status updates use a single `edit_pr_body()` call — no PR comment CRUD (`create_issue_comment` / `update_issue_comment`) for status.",
+      "Gate status section uses fenced YAML blocks — no JSON metadata blocks, no markdown tables.",
+      "Current SHA full breakdown appears immediately after ticket YAML + commit history in the PR body.",
+      "All previous SHAs are in a single `<details>` collapsible with brief one-line-per-gate YAML summary.",
+      "Old-format PR bodies (table + JSON) are migrated to new format on next status sync.",
+      "Pipeline throughput defaults use host parallelism directly (no per-lane CPU split).",
+      "Pipeline default `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` and effective CPU quota match host parallelism.",
+      "Containment remains bounded (memory, pids, timeout) despite throughput pivot.",
+      "`cargo test -p apm2-cli` passes."
+    ]
+  },
+  "notes": {
+    "context": "INCIDENT REPORT\n\nPR #692 (TCK-00525: warm phase containment hardening) was merged\nto main with 2 unresolved MAJOR security findings:\n\n1. Worker heartbeat starvation (MAJOR): execute_warm_job runs on\n   the main thread, blocking the heartbeat loop. Long-running\n   phases cause the worker to be marked dead → restart loops.\n\n2. Containment bypass (MAJOR): Warm jobs use Command::spawn\n   directly, bypassing systemd resource limits (MemoryMax,\n   CPUQuota). Unbounded resource usage → DoS vector.\n\nThe merge happened because:\n- Stale security=approve from a previous review round persisted\n  in the verdict projection and lifecycle after reviews restarted\n- The TCK-00609 `approve` action trusted all_verdicts_approve\n  without checking finding counts\n- The orchestrator saw action=\"approve\" and the PR was merged on\n  GitHub (auto-merge was broken — no main worktree)\n\nThe root cause pattern is a TOCTOU: the verdict projection has\na stale-verdict window between review restart and the second\ndimension's new verdict. Any consumer reading\nall_verdicts_approve during this window sees stale data.\n\nThe fix addresses three layers:\n1. IMMEDIATE: Guard approve against inconsistent findings\n2. ROOT CAUSE: Clear stale verdicts on restart\n3. INFRASTRUCTURE: Fix auto-merge to work without main worktree\n\nThis is safety-critical: the merge gate exists specifically to\nprevent code with unresolved MAJOR/BLOCKER findings from reaching\nmain. The stale-verdict bypass undermines this guarantee.\n",
+    "amendments": [
+      {
+        "amendment_id": "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT",
+        "summary": "Clarify that references to bounded CPUQuota in this incident are containment concerns, not normative low-throughput defaults.",
+        "replacement": [
+          "Bounded execution remains mandatory for containment and fail-closed behavior.",
+          "Default gate throughput policy is profile-driven and host-aware, with queue admission controlling contention.",
+          "Pipeline throughput defaults are aligned with gates: full host parallelism by default, no per-lane CPU split."
+        ]
+      }
+    ],
+    "security": "default-deny, least privilege, fail-closed"
+  }
+}

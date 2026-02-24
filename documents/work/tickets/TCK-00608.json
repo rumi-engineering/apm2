@@ -1,0 +1,118 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00608",
+      "title": "Fix daemon ledger_db config/XDG fallback, worker unit template flag, and systemd ReadWritePaths",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00595",
+          "reason": "TCK-00595 introduced the daemon turnkey path including unit template generation and config-less startup."
+        },
+        {
+          "ticket_id": "TCK-00607",
+          "reason": "TCK-00607 S1 fixes doctor worker_liveness cache-path derivation which depends on ledger_db_path being resolved."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "Four defects in the TCK-00595 daemon turnkey path share the same root\ncause: the unit-file template generation and DaemonConfig struct do not\nmatch the actual CLI argument names, required paths, or systemd\nconfinement constraints.\n\n1. LEDGER_DB_PATH HAS NO CONFIG/DEFAULT FALLBACK\n\n   `crates/apm2-daemon/src/main.rs:186-187` reads ledger_db_path\n   exclusively from CLI `--ledger-db` args, never falling back to\n   ecosystem.toml or XDG defaults:\n\n       // Ledger DB path from args (config fallback not yet standard)\n       let ledger_db_path = args.ledger_db.clone();\n\n   Every other path field in `DaemonConfig::new()` follows the pattern\n   `args.X.unwrap_or_else(|| config.daemon.X.clone())`:\n     - operator_socket_path (lines 169-172) -- fallback exists\n     - session_socket_path (lines 173-176) -- fallback exists\n     - pid_path (lines 177-180) -- fallback exists\n     - state_file_path (lines 181-184) -- fallback exists\n     - cas_path (lines 190-193, added by TCK-00383) -- fallback exists\n     - ledger_db_path (line 187) -- NO fallback\n\n   Impact: When the daemon starts via the systemd unit\n   (`ExecStart=apm2 daemon --no-daemon`), no `--ledger-db` is passed.\n   The CLI wrapper (daemon.rs:162-167) only forwards `--config` and\n   `--no-daemon`. So `ledger_db_path` is always `None`, `sqlite_conn` is\n   `None` at line 1021, and the dispatcher falls through to\n   `with_persistence_and_adapter_rotation()` at line 1128 -- no CAS, no\n   ledger, no broker, no event emission. The daemon is running but\n   functionally hollow.\n\n2. DAEMONCONFIG HAS NO LEDGER_DB FIELD\n\n   `crates/apm2-core/src/config/mod.rs:155-203` -- the `DaemonConfig`\n   struct defines fields for every daemon path except `ledger_db`. The\n   `Default` impl also omits it. This means even if ecosystem.toml\n   contains `ledger_db = \"...\"`, the TOML parser silently ignores it\n   (serde default behavior for missing struct fields).\n\n3. WORKER UNIT TEMPLATE USES --poll-interval (NONEXISTENT FLAG)\n\n   `crates/apm2-cli/src/commands/daemon.rs:98` and `:127`:\n\n       ExecStart=%exe_path% fac worker --poll-interval 10\n\n   The actual clap argument is `--poll-interval-secs`\n   (crates/apm2-cli/src/commands/fac.rs:638):\n\n       #[arg(long, default_value_t = 5)]\n       pub poll_interval_secs: u64,\n\n   `--poll-interval` is not a recognized flag. The worker crashes on\n   startup with:\n       error: unexpected argument '--poll-interval' found\n         tip: a similar argument exists: '--poll-interval-secs'\n\n4. UNIT TEMPLATE ReadWritePaths MISSING ~/.local/share/apm2\n\n   `crates/apm2-cli/src/commands/daemon.rs:76`:\n\n       ReadWritePaths=%h/.apm2\\n\\\n\n   The daemon writes ledger, CAS, state, and logs to\n   `~/.local/share/apm2/` (the XDG data dir from `default_data_dir()`\n   at config/mod.rs:783-795). With `ProtectHome=read-only` (line 75)\n   and only `ReadWritePaths=%h/.apm2`, any write to\n   `~/.local/share/apm2/` gets EROFS (Read-only file system). The\n   template must also include `ReadWritePaths=%h/.local/share/apm2`.\n"
+    }
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "S1_DAEMONCONFIG_LEDGER_DB_FIELD",
+        "title": "Add ledger_db field to DaemonConfig",
+        "detail": "In `crates/apm2-core/src/config/mod.rs`:\n\n1. Add `fn default_ledger_db() -> Option<PathBuf>` returning\n   `Some(default_data_dir().join(\"ledger.db\"))`.\n2. Add field to `DaemonConfig` struct:\n   `#[serde(default = \"default_ledger_db\")] pub ledger_db: Option<PathBuf>`\n3. Add to `Default` impl: `ledger_db: default_ledger_db()`.\n4. Update `ecosystem.example.toml` if it exists.\n\nAcceptance:\n  - `DaemonConfig::default().ledger_db` returns\n    `Some(~/.local/share/apm2/ledger.db)`.\n  - ecosystem.toml with `ledger_db = \"/custom/path.db\"` deserializes\n    correctly into `DaemonConfig`.\n"
+      },
+      {
+        "id": "S2_DAEMON_CONFIG_FALLBACK",
+        "title": "Wire config fallback for ledger_db_path in daemon binary",
+        "detail": "In `crates/apm2-daemon/src/main.rs:186-187`:\n\nChange:\n    // Ledger DB path from args (config fallback not yet standard)\n    let ledger_db_path = args.ledger_db.clone();\n\nTo:\n    let ledger_db_path = args.ledger_db.clone()\n        .or_else(|| config.daemon.ledger_db.clone());\n\nThis matches the pattern used by every other path field (cas_path at\nlines 190-193, operator_socket_path at lines 169-172, etc.).\n\nAcceptance:\n  - Daemon started via `apm2 daemon --no-daemon` (no explicit\n    `--ledger-db`) opens the ledger at `~/.local/share/apm2/ledger.db`.\n  - Explicit `--ledger-db /custom/path.db` overrides config/default.\n  - Precedence chain: CLI arg > ecosystem.toml > XDG default.\n"
+      },
+      {
+        "id": "S3_WORKER_POLL_INTERVAL_FLAG",
+        "title": "Fix worker unit template --poll-interval to --poll-interval-secs",
+        "detail": "In `crates/apm2-cli/src/commands/daemon.rs`:\n\nLine 98 and line 127: change `--poll-interval 10` to\n`--poll-interval-secs 10` in both `WORKER_SERVICE_TEMPLATE` and\n`WORKER_TEMPLATE_SERVICE_TEMPLATE`.\n\nAcceptance:\n  - Worker service starts successfully after `apm2 daemon install`.\n  - No `unexpected argument '--poll-interval'` error.\n"
+      },
+      {
+        "id": "S4_READWRITEPATHS_XDG",
+        "title": "Add ReadWritePaths for ~/.local/share/apm2 to all unit templates",
+        "detail": "In `crates/apm2-cli/src/commands/daemon.rs`:\n\nAdd `ReadWritePaths=%h/.local/share/apm2` to all three service unit\ntemplates (daemon at line 76, worker at line 108, worker@ at line 137).\n\nEither append a second ReadWritePaths line or combine as:\n    ReadWritePaths=%h/.apm2 %h/.local/share/apm2\n\nAcceptance:\n  - Daemon can write to `~/.local/share/apm2/` under systemd\n    `ProtectHome=read-only` confinement.\n  - No EROFS errors when daemon writes ledger, CAS, or state files\n    to XDG data directory.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Changing the `apm2 daemon --no-daemon` CLI wrapper to forward `--ledger-db` / `--cas-path` explicitly (unnecessary once config fallback works).",
+      "Changing `DaemonConfig::default()` to set `ledger_db` to `Some(...)` instead of `None` (the `default_ledger_db()` function handles this via serde default).",
+      "Doctor false-positive fix for worker_liveness cache path (covered by TCK-00607 S1).",
+      "Adding ledger_db to `from_env()` zero-config path (the serde default handles it; `from_env()` only needs to override projection settings)."
+    ]
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "STEP_01",
+        "title": "Add ledger_db field to DaemonConfig",
+        "detail": "In `crates/apm2-core/src/config/mod.rs`:\n1. Add `fn default_ledger_db() -> Option<PathBuf>` returning\n   `Some(default_data_dir().join(\"ledger.db\"))`.\n2. Add `#[serde(default = \"default_ledger_db\")] pub ledger_db: Option<PathBuf>`\n   to the `DaemonConfig` struct.\n3. Add `ledger_db: default_ledger_db()` to the `Default` impl.\n4. Update ecosystem.example.toml if it exists.\n"
+      },
+      {
+        "id": "STEP_02",
+        "title": "Wire config fallback in daemon binary",
+        "detail": "In `crates/apm2-daemon/src/main.rs:186-187`:\n1. Change `let ledger_db_path = args.ledger_db.clone();` to\n   `let ledger_db_path = args.ledger_db.clone().or_else(|| config.daemon.ledger_db.clone());`\n2. Remove the comment \"config fallback not yet standard\".\n"
+      },
+      {
+        "id": "STEP_03",
+        "title": "Fix worker unit template flag",
+        "detail": "In `crates/apm2-cli/src/commands/daemon.rs`:\n1. Line 98: change `--poll-interval 10` to `--poll-interval-secs 10`.\n2. Line 127: change `--poll-interval 10` to `--poll-interval-secs 10`.\n"
+      },
+      {
+        "id": "STEP_04",
+        "title": "Fix ReadWritePaths in all unit templates",
+        "detail": "In `crates/apm2-cli/src/commands/daemon.rs`:\n1. Line 76: add `ReadWritePaths=%h/.local/share/apm2` (combine with\n   existing or add separate line).\n2. Line 108: same change for worker template.\n3. Line 137: same change for worker@ template.\n"
+      },
+      {
+        "id": "STEP_05",
+        "title": "Test and verify",
+        "detail": "1. `cargo test -p apm2-core` -- config serde round-trip tests,\n   `default_ledger_db()` produces XDG path.\n2. `cargo test -p apm2-daemon` -- daemon config resolution tests.\n3. `cargo test -p apm2-cli` -- unit template content assertions.\n4. Manual: `apm2 daemon install && systemctl --user restart apm2-daemon\n   && apm2 daemon doctor` -- verify `with_persistence_and_cas` log line\n   appears and doctor reports all green.\n"
+      }
+    ]
+  },
+  "definition_of_done": {
+    "evidence_ids": [],
+    "criteria": [
+      "Daemon started via `apm2 daemon --no-daemon` (no explicit `--ledger-db`) opens the ledger at `~/.local/share/apm2/ledger.db` and logs 'Using with_persistence_and_cas: session dispatcher fully wired'.",
+      "Explicit `--ledger-db /custom/path.db` overrides config/default (CLI args take precedence).",
+      "ecosystem.toml with `ledger_db = \"/custom/path.db\"` is respected when no CLI arg is passed.",
+      "Precedence chain: CLI arg > ecosystem.toml field > XDG default (`~/.local/share/apm2/ledger.db`).",
+      "Worker service starts successfully after `apm2 daemon install` (no `--poll-interval` crash).",
+      "Daemon can write to `~/.local/share/apm2/` under systemd `ProtectHome=read-only` confinement.",
+      "`apm2 daemon doctor` reports worker_liveness OK (ledger path now set, projection cache path derivation uses the correct ledger-adjacent location).",
+      "`cargo test -p apm2-core -p apm2-daemon -p apm2-cli` passes.",
+      "No regression: daemon started with explicit `--ledger-db` and `--cas-path` CLI args behaves identically to before."
+    ]
+  },
+  "notes": {
+    "context": "Discovered during systemd integration testing of the TCK-00595 turnkey\ndaemon path. The daemon binary starts successfully via `apm2 daemon\n--no-daemon` but is functionally hollow: no ledger, no CAS, no broker,\nno event emission. All session-scoped operations (tool execution, event\nemission, evidence publishing) fail closed because\n`with_persistence_and_cas()` is never reached.\n\nThe root cause is that `ledger_db_path` is the only daemon path field\nthat lacks a config/XDG fallback. Every other path (`operator_socket`,\n`session_socket`, `pid`, `state_file`, `cas_path`) follows the\n`args.X.unwrap_or_else(|| config.daemon.X.clone())` pattern and has a\ncorresponding `DaemonConfig` struct field with a serde default function.\n\nThree additional defects in the same unit-file template code path are\nincluded because they share the same root cause (TCK-00595 template\ngeneration not matching actual CLI arg names/paths):\n  - Worker template uses `--poll-interval` instead of `--poll-interval-secs`\n  - Unit templates missing `ReadWritePaths` for XDG data directory\n",
+    "security": "default-deny, least privilege, fail-closed"
+  }
+}

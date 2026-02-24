@@ -1,0 +1,153 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00143",
+      "title": "Add CLI command: apm2 export",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0007",
+      "rfc_id": "RFC-0011",
+      "requirements": [
+        {
+          "requirement_id": "CAC-REQ-0005",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0005.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "CAC-REQ-0013",
+          "requirement_ref": "documents/prds/PRD-0007/requirements/REQ-0013.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-0006",
+        "EVID-0009"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_TOOLING"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00141"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add apm2 export CLI command under root commands",
+        "--profile flag for target profile selection (required)",
+        "--pack flag for context pack input (file or stdin)",
+        "--output-dir flag for export destination (required)",
+        "--verify flag to run conformance checks after export",
+        "--format flag for manifest output (json/yaml)",
+        "Output ExportManifest on success",
+        "Output ExportReceipt if --verify is used"
+      ],
+      "out_of_scope": [
+        "Interactive export configuration",
+        "Incremental/differential exports",
+        "Remote export destinations"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add 'export' subcommand to apm2-cli main.rs Commands enum",
+        "Create crates/apm2-cli/src/commands/export.rs module",
+        "Define ExportArgs struct with clap derive attributes",
+        "Implement --profile <path> required flag for target profile",
+        "Implement --pack <path> flag for context pack (or stdin if '-')",
+        "Implement --output-dir <dir> required flag for output directory",
+        "Implement --verify flag to run conformance tests",
+        "Implement --format (json|yaml) flag for output formatting",
+        "Load TargetProfile and ContextPack from paths",
+        "Call ExportPipeline::export() and output manifest",
+        "If --verify, call conformance suite and output receipt",
+        "Write CLI integration tests"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0006",
+        "EVID-0009"
+      ],
+      "criteria": [
+        "apm2 export --help shows usage with all flags",
+        "--profile and --output-dir are required flags",
+        "Export succeeds and creates files in output directory",
+        "ExportManifest printed to stdout in requested format",
+        "--verify runs conformance and outputs ExportReceipt",
+        "Non-zero exit on conformance failure",
+        "All tests pass: cargo test cli_export"
+      ]
+    },
+    "notes": {
+      "security": "--verify provides immediate feedback on export correctness",
+      "architecture": "Follow existing CLI patterns in apm2-cli:\n- Use clap derive macros for argument parsing\n- Match pattern in main.rs for subcommand dispatch\n- Consistent exit codes: 0=success, 1=error, 2=conformance_failure\n\nCommand usage examples:\n```bash\n# Basic export\napm2 export --profile profiles/claude-code.yaml \\\n            --pack packs/my-pack.yaml \\\n            --output-dir ./export/\n\n# Export with verification\napm2 export --profile profiles/claude-code.yaml \\\n            --pack packs/my-pack.yaml \\\n            --output-dir ./export/ \\\n            --verify\n\n# Pipe pack from stdin\ncat pack.yaml | apm2 export --profile profiles/claude-code.yaml \\\n                             --pack - \\\n                             --output-dir ./export/\n```\n",
+      "rust_textbook_refs": [
+        {
+          "file": ".claude/skills/rust-textbook/07_errors_panics_diagnostics.md",
+          "rules": [
+            "CTR-0701: Failure Channel Selection (Result for CLI, not panic)",
+            "RSK-0701: Panic-as-DoS in Public/Untrusted Paths"
+          ]
+        },
+        {
+          "file": ".claude/skills/rust-textbook/16_io_protocol_boundaries.md",
+          "rules": [
+            "INV-1601: Partial Progress Is the Default at I/O Boundaries",
+            "CTR-1603: Bounded Reads and Allocation Control"
+          ]
+        },
+        {
+          "file": ".claude/skills/rust-textbook/15_paths_filesystem_os.md",
+          "rules": [
+            "Path validation for --output-dir"
+          ]
+        }
+      ],
+      "codebase_context": {
+        "files_to_reference": [
+          {
+            "path": "crates/apm2-cli/src/main.rs",
+            "purpose": "Pattern for command dispatch, Commands enum, FactoryCommands pattern"
+          },
+          {
+            "path": "crates/apm2-cli/src/commands/mod.rs",
+            "purpose": "Module structure for commands"
+          },
+          {
+            "path": "crates/apm2-cli/src/commands/factory/run.rs",
+            "purpose": "Pattern for async command execution with tokio"
+          },
+          {
+            "path": "crates/apm2-core/src/model_router/profile.rs",
+            "purpose": "Profile loading patterns (load_profile, load_profile_by_id)"
+          }
+        ],
+        "files_to_create": [
+          {
+            "path": "crates/apm2-cli/src/commands/export.rs",
+            "purpose": "Export CLI command implementation"
+          }
+        ],
+        "files_to_modify": [
+          {
+            "path": "crates/apm2-cli/src/main.rs",
+            "purpose": "Add Export variant to Commands enum"
+          },
+          {
+            "path": "crates/apm2-cli/src/commands/mod.rs",
+            "purpose": "Export export module"
+          }
+        ]
+      }
+    }
+  }
+}

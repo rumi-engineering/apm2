@@ -1,0 +1,97 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-25",
+    "template_version": "2026-01-25",
+    "ticket": {
+      "id": "TCK-00072",
+      "title": "Add Documentation Example Linting"
+    },
+    "binds": {
+      "prd_id": "NONE",
+      "rfc_id": "RFC-0006",
+      "requirements": [
+        {
+          "requirement_id": "MAINT-019",
+          "requirement_ref": "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[13]"
+        }
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_BUILD_RELEASE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00062"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Extend cargo xtask lint to extract code blocks from markdown files",
+        "Add pattern checks for common issues in documentation examples",
+        "Check 26_apm2_safe_patterns_and_anti_patterns.md and other coding guidelines for anti-patterns",
+        "Add to cargo xtask commit pre-flight checks",
+        "Detect unquoted shell paths in documentation examples",
+        "Detect insecure temp file patterns in documentation examples",
+        "Report warnings with file path, line number, and suggested fix"
+      ],
+      "out_of_scope": [
+        "Auto-fix for documentation examples",
+        "Linting of non-Rust code blocks (Python, JavaScript, etc.)",
+        "Linting of markdown formatting",
+        "Integration with external documentation tools"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Extend xtask/src/tasks/lint.rs with markdown scanning capability",
+        "Add pulldown-cmark = \"0.10\" to xtask/Cargo.toml for markdown parsing",
+        "Implement extract_code_blocks(markdown_content: &str) -> Vec<CodeBlock>",
+        "CodeBlock struct contains: language, content, line_number",
+        "Implement check_markdown_examples() function",
+        "Glob for *.md files in documents/skills/, documents/rfcs/",
+        "Extract Rust code blocks from each markdown file",
+        "Apply same anti-pattern checks used for .rs files",
+        "Check for unquoted shell paths: format!() with path without quote_path()",
+        "Check for insecure temp files: std::env::temp_dir in examples",
+        "Report warnings with markdown file path and approximate line number",
+        "Add call to check_markdown_examples() in lint.rs run() function",
+        "Update commit.rs to call lint command with --include-docs flag",
+        "Add --include-docs flag to LintArgs",
+        "Display warning during commit if doc examples violate patterns",
+        "Verify cargo build succeeds",
+        "Verify cargo test passes",
+        "Verify cargo clippy passes with no warnings"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "cargo xtask lint scans markdown code blocks when --include-docs is passed",
+        "Detects unquoted shell paths in markdown Rust code blocks",
+        "Detects insecure temp file patterns in markdown Rust code blocks",
+        "Reports warnings with: file path, line number, violation description",
+        "Warnings include suggestion text for proper pattern to use",
+        "26_apm2_safe_patterns_and_anti_patterns.md is checked for self-consistency",
+        "cargo xtask commit displays warning if doc examples violate patterns",
+        "pulldown-cmark dependency added to xtask/Cargo.toml",
+        "--include-docs flag added to LintArgs struct",
+        "cargo build succeeds",
+        "cargo test passes",
+        "cargo clippy passes with no warnings"
+      ]
+    },
+    "notes": {
+      "security": "Documentation examples that contain security anti-patterns can mislead developers.\nLinting examples ensures documentation teaches correct patterns.\nThis is especially important for security-sensitive patterns like temp files and shell escaping.\n",
+      "implementation_details": "Markdown parsing with pulldown-cmark (API may vary by version):\n```rust\nuse pulldown_cmark::{Parser, Event, Tag, CodeBlockKind};\n\nstruct CodeBlock {\n    language: String,\n    content: String,\n    start_line: usize,\n}\n\nfn extract_code_blocks(markdown: &str) -> Vec<CodeBlock> {\n    let parser = Parser::new(markdown);\n    let mut blocks = Vec::new();\n    let mut current_block: Option<CodeBlock> = None;\n    let mut line_number = 1;\n\n    for event in parser {\n        match &event {\n            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) => {\n                current_block = Some(CodeBlock {\n                    language: lang.to_string(),\n                    content: String::new(),\n                    start_line: line_number,\n                });\n            }\n            Event::Text(text) => {\n                // Track line numbers from text events\n                line_number += text.matches('\\n').count();\n                if let Some(ref mut block) = current_block {\n                    block.content.push_str(text);\n                }\n            }\n            Event::End(Tag::CodeBlock(_)) => {\n                if let Some(block) = current_block.take() {\n                    if block.language == \"rust\" || block.language.is_empty() {\n                        blocks.push(block);\n                    }\n                }\n            }\n            _ => {}\n        }\n    }\n    blocks\n}\n```\n\nAnti-pattern checks for doc examples:\n- std::env::temp_dir (suggest tempfile::NamedTempFile)\n- format!() with path.display() in shell strings (suggest quote_path())\n- Command::new(\"sh\").args([\"-c\", &format!()]) without escaping\n",
+      "api_versioning": "Implementers should verify pulldown-cmark crate API against the actual\ninstalled version (0.10.x specified in plan). The Parser and Event\nAPIs may differ between versions.\n",
+      "affected_files": "Modified: xtask/Cargo.toml (add pulldown-cmark dependency)\nModified: xtask/src/tasks/lint.rs (add markdown scanning)\nModified: xtask/src/tasks/commit.rs (call lint with --include-docs)\n"
+    }
+  }
+}

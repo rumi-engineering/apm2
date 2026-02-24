@@ -1,0 +1,86 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00349",
+      "title": "Session-typed state machine and fail-closed decoding hardening",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0003",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0003.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0003",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0101",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0101.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_KERNEL",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00348",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement/verify session-open to authority-bearing state transitions",
+        "Enforce bounded decode and bounded collections before/after decode",
+        "Enforce unknown/invalid enum fail-closed behavior without truncation"
+      ],
+      "out_of_scope": [
+        "Identity proof artifacts (TCK-00353..TCK-00357)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Implement/verify session-open to authority-bearing state transitions",
+        "Implement: Enforce bounded decode and bounded collections before/after decode",
+        "Implement: Enforce unknown/invalid enum fail-closed behavior without truncation",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0020/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0003",
+        "EVID-0101"
+      ],
+      "criteria": [
+        "No privileged route reachable before validated session-open state",
+        "Bound violations reject requests with structured defects",
+        "Invalid enum values never coerce to permissive defaults"
+      ]
+    },
+    "notes": {
+      "security": "Fail-closed, least privilege, and explicit authority proofs are mandatory.",
+      "verification": "Prefer deterministic tests, replay/CAS evidence, and bounded-resource checks; avoid process-local assumptions.",
+      "general": "Keep scope atomic to this ticket, preserve explicit dependency ordering, and avoid introducing semantic drift from RFC-0020."
+    }
+  }
+}

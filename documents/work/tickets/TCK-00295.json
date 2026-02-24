@@ -1,0 +1,92 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00295",
+      "title": "xtask Stage X1: optional internal receipts/events (still non-authoritative)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0001",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0001.yaml#rfc_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0001",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0001.yaml#rfc_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00294",
+          "reason": "Stage X0 banner and non-authoritative labeling must land first."
+        },
+        {
+          "ticket_id": "TCK-00290",
+          "reason": "Session endpoints must exist to emit internal receipts/events."
+        },
+        {
+          "ticket_id": "TCK-00293",
+          "reason": "CAS durability required for internal artifact emission."
+        },
+        {
+          "ticket_id": "TCK-00310",
+          "reason": "ChangeSetBundle/ChangeSetPublished required for internal FAC receipts."
+        },
+        {
+          "ticket_id": "TCK-00312",
+          "reason": "ReviewReceiptRecorded required for internal review receipts."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add optional flags for xtask to emit internal receipts/events.",
+        "Keep xtask non-authoritative and non-blocking on daemon availability."
+      ],
+      "out_of_scope": [
+        "Removing GitHub status writes (later stages)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add optional --emit-internal flag to xtask review/aat/security tasks.",
+        "Ensure daemon unavailability does not block xtask runs.",
+        "Document optional internal emission as non-authoritative."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0001"
+      ],
+      "criteria": [
+        "xtask can optionally emit internal receipts/events without blocking.",
+        "xtask remains explicitly non-authoritative.",
+        "GitHub status writes remain unchanged in Stage X1."
+      ]
+    },
+    "notes": {
+      "security": "Internal receipt emission must not elevate xtask authority; it is additive\nscaffolding only.\n",
+      "verification": "IT-00295-01: cargo test -p xtask xtask_optional_internal_receipts\n",
+      "general": "Stage X1 is optional and must not block or change existing dev workflows.\n"
+    }
+  }
+}

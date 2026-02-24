@@ -1,0 +1,114 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00314",
+      "title": "HEF NEW WORK REQUIRED: Capability allowlists for pulse topics + CAS reads",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0003",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0003.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-HEF-0005",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0005.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0002",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0002.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_EVIDENCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00287",
+          "reason": "Requires base protocol infrastructure"
+        },
+        {
+          "ticket_id": "TCK-00292",
+          "reason": "Requires capability manifest infrastructure"
+        },
+        {
+          "ticket_id": "TCK-00293",
+          "reason": "Requires lease/permission infrastructure"
+        },
+        {
+          "ticket_id": "TCK-00302",
+          "reason": "Requires subscription registry and ACL framework"
+        },
+        {
+          "ticket_id": "RFC-0017:TCK-00254",
+          "reason": "External dependency on RFC-0017 capability manifest schema"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Extend capability manifests with topic_allowlist field for pulse topic subscriptions",
+        "Extend capability manifests with cas_hash_allowlist field for CAS reads",
+        "Enforce topic allowlist at SubscribePulse handling in session_dispatch.rs",
+        "Implement daemon-side CAS access facade (policy/broker layer) in evidence module",
+        "Ensure cas_access.rs is sole entry point for session-context CAS reads",
+        "Reject session wildcard patterns in Phase 1",
+        "Support allowlisting for diff bundles, snapshots, and review artifacts"
+      ],
+      "out_of_scope": [
+        "Wildcard topic allowlists for session.sock (Phase 1 enumerated exact topics only)",
+        "CAS write allowlists (read-only access control in this ticket)",
+        "Operator.sock CAS access restrictions (operator has full access)",
+        "Dynamic allowlist updates during session lifetime"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read existing capability.rs to understand current manifest structure",
+        "Add topic_allowlist and cas_hash_allowlist fields to capability manifest struct",
+        "Update session_dispatch.rs to enforce topic allowlist on SubscribePulse",
+        "Create cas_access.rs as submodule of evidence module",
+        "Add pub mod cas_access; to evidence/mod.rs with header comment documenting module location",
+        "Implement policy-gated CAS read facade that checks cas_hash_allowlist",
+        "Ensure all session-context CAS reads route through cas_access.rs facade",
+        "Add unit tests for topic allowlist enforcement (exact match, rejection)",
+        "Add unit tests for CAS access facade (allowlisted hash, denied hash)",
+        "Add integration tests verifying ChangeSetBundle/Review artifact access control"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0002"
+      ],
+      "criteria": [
+        "Session subscriptions reject any topic not explicitly allowlisted.",
+        "Session wildcard patterns are rejected in Phase 1.",
+        "CAS reads for ChangeSetBundle/Review artifacts are denied unless hash allowlisted at daemon CAS access facade.",
+        "cas_access.rs MUST be the sole entry point for session-context CAS reads.",
+        "Direct CAS API calls from session_dispatch.rs or consume.rs bypassing the facade are forbidden.",
+        "Module location documented in evidence/mod.rs header comment."
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed",
+      "verification": "Test both positive (allowlisted) and negative (denied) cases for topic subscriptions and CAS reads",
+      "general": "Phase 1 restricts session.sock to enumerated exact topics; cas_access.rs facade pattern ensures single enforcement point"
+    }
+  }
+}

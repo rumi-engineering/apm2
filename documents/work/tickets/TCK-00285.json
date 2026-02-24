@@ -1,0 +1,71 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00285",
+      "title": "Remove xtask crate after bypass closure",
+      "status": "CANCELLED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0017",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0014"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00284"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "xtask crate removed from repository",
+      "verification": "xtask/ directory no longer exists"
+    },
+    {
+      "criterion": "Workspace builds without xtask",
+      "verification": "cargo build --workspace succeeds without xtask member"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [],
+    "files_to_delete": [
+      {
+        "path": "xtask/",
+        "reason": "xtask crate removal after bypass closure."
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Remove xtask from workspace members.\n",
+        "path": "Cargo.toml"
+      },
+      {
+        "changes": "Remove xtask aliases if present.\n",
+        "path": ".cargo/config.toml"
+      }
+    ],
+    "implementation_steps": [
+      "Verify TCK-00284 acceptance criteria satisfied.",
+      "Remove xtask crate and workspace references.",
+      "Remove xtask references from docs/onboarding."
+    ],
+    "summary": "Remove xtask crate after bypass closure (no telemetry gate)."
+  },
+  "notes": "Phase: PHASE-5\nAdded by Amendment A-001 (DD-009 hard cutover).\nReplaces cancelled telemetry-gated removal ticket (TCK-00277).\n",
+  "test_requirements": [
+    {
+      "description": "Workspace builds without xtask",
+      "test_id": "CI-00285-01",
+      "verification_command": "cargo build --workspace"
+    }
+  ]
+}

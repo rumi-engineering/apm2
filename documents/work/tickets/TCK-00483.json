@@ -1,0 +1,106 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00483",
+      "title": "PCAC mandatory cutover for IngestReviewReceipt handler",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0027",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0004.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0006.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0013",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0013.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0003",
+          "artifact_ref": "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_AUTHN_AUTHZ"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00424",
+          "reason": "TCK-00424 landed the optional PCAC wiring behind require_ajc_for_ingest_review_receipt policy flag."
+        },
+        {
+          "ticket_id": "TCK-00426",
+          "reason": "Durable consume index must be available for mandatory single-consume enforcement."
+        },
+        {
+          "ticket_id": "TCK-00482",
+          "reason": "DelegateSublease cutover establishes the pattern; review handler follows the same approach."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Set require_ajc_for_ingest_review_receipt to mandatory (remove policy toggle; PCAC is the only authority path).",
+        "Delete scattered authority checks in IngestReviewReceipt handler that the PCAC kernel now covers: manual reviewer identity binding + constant-time comparison (~41 lines), manual CAS existence validation (~53 lines), manual risk tier resolution + HTF envelope authority (~56 lines), manual attestation ratchet validation (~57 lines), manual idempotent replay closure with validate_receipt_replay() (~180 lines), manual review outcome binding validation (~64 lines).",
+        "Ensure kernel join/consume handles all replaced checks: identity binding via join input, freshness via revalidate, attestation floor via risk_tier input, linear consumption via DurableConsumeIndex.",
+        "Retain field admission checks (bounded decode, length validation, verdict enum validation) as pre-kernel input validation.",
+        "Retire WVR-0103 waiver (shape-only identity proof hash commitment) by requiring kernel-validated identity evidence.",
+        "Add regression tests proving: (a) no review ledger emission without consume(), (b) reviewer identity mismatch denied by kernel, (c) stale freshness denied by revalidate, (d) attestation floor violation denied, (e) duplicate consume denied by durable index."
+      ],
+      "out_of_scope": [
+        "DelegateSublease handler changes (TCK-00482).",
+        "Shared input builder extraction (TCK-00484).",
+        "Changes to review dispatch or review verdict semantics."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Remove require_ajc_for_ingest_review_receipt policy flag; make PCAC lifecycle unconditional.",
+        "Identify and delete each scattered authority check that the kernel join/revalidate/consume now covers.",
+        "Retire WVR-0103 waiver; replace PointerOnly identity with kernel-validated Verified evidence level.",
+        "Verify that kernel deny classes cover all removed check failure modes (IdentityMismatch, StaleFreshness, AttestationFloorViolation, LinearConsumptionViolation).",
+        "Add negative tests for each removed check path via kernel deny.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0003"
+      ],
+      "criteria": [
+        "No scattered authority checks remain in IngestReviewReceipt handler outside of PCAC kernel calls.",
+        "require_ajc_for_ingest_review_receipt flag is removed; PCAC lifecycle is unconditional.",
+        "WVR-0103 waiver retired; identity evidence is kernel-validated.",
+        "Estimated ~300-400 lines of scattered checks deleted, replaced by kernel calls.",
+        "All deny cases previously handled by scattered checks are now handled by kernel deny taxonomy.",
+        "Regression tests prove no authority-bearing review emission without consume()."
+      ]
+    },
+    "notes": {
+      "security": "This ticket transitions IngestReviewReceipt from dual-path (scattered + optional PCAC) to single-path\n(PCAC-only). Critically, this also retires WVR-0103 (identity proof hash as shape-only commitment),\nupgrading the review ingestion path from PointerOnly to Verified identity evidence. This closes\na known transitional gap in the review authority chain.\n",
+      "verification": "Include before/after line count evidence showing code reduction. Each deleted check must map to\na kernel law or deny class. WVR-0103 retirement must be evidenced by absence of PointerOnly\nadmission in the handler path.\n",
+      "general": "Completes RFC-0027 Phase 2 for the IngestReviewReceipt path. TCK-00424 landed the optional wiring;\nthis ticket makes it mandatory and deletes the old path. The WVR-0103 retirement is a security\nupgrade that was deferred during initial PCAC rollout.\n"
+    }
+  }
+}
