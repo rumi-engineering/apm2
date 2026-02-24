@@ -8727,10 +8727,6 @@ enum WorkIdResolutionMode {
     /// Require authoritative lease->work mapping and enforce hint equality
     /// when a `work_id_hint` is supplied.
     StrictLeaseMapping,
-    /// Require authoritative lease->work mapping and enforce hint equality,
-    /// but allow claim recovery by authoritative `work_id` when the specific
-    /// lease-scoped claim is unavailable.
-    StrictLeaseMappingAllowClaimFallback,
     /// Require authoritative lease->work mapping but ignore `work_id_hint`
     /// equality. Used for governance flows where a governing lease authorizes
     /// mutation of a different target work item (for example `OpenWork` and
@@ -10908,7 +10904,7 @@ impl PrivilegedDispatcher {
     ///
     /// If `work_id_hint` is provided, it must exactly match the authoritative
     /// lease->work mapping (constant-time comparison) when mode is
-    /// `StrictLeaseMapping` or `StrictLeaseMappingAllowClaimFallback`.
+    /// `StrictLeaseMapping`.
     ///
     /// Fail-closed behavior:
     /// - Missing lease->work mapping (and no valid hint) => Tier4, fallback
@@ -11017,24 +11013,15 @@ impl PrivilegedDispatcher {
                 ));
             }
         }
-        let claim =
-            if let Some(claim) = self.work_registry.get_claim_by_lease_id(&work_id, lease_id) {
-                claim
-            } else if work_id_resolution_mode
-                == WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback
-            {
-                self.work_registry.get_claim(&work_id).ok_or_else(|| {
+        let claim = self
+            .work_registry
+            .get_claim_by_lease_id(&work_id, lease_id)
+            .ok_or_else(|| {
                 format!(
-                    "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
-                     '{work_id}'"
+                    "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and \
+                     work '{work_id}'"
                 )
-            })?
-            } else {
-                return Err(format!(
-                    "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
-                 '{work_id}'"
-                ));
-            };
+            })?;
         let claim_work_matches = claim.work_id.len() == work_id.len()
             && bool::from(claim.work_id.as_bytes().ct_eq(work_id.as_bytes()));
         if !claim_work_matches {
@@ -18496,7 +18483,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
             changeset_digest,
-            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
         );
         if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
             warn!(
@@ -18514,7 +18501,7 @@ impl PrivilegedDispatcher {
         let claim_for_receipt = match self.resolve_authoritative_claim_binding(
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
         ) {
             Ok((_work_id, claim)) => claim,
             Err(error) => {
@@ -18782,7 +18769,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(authoritative_work_id.as_str()),
-                WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+                WorkIdResolutionMode::StrictLeaseMapping,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -18902,7 +18889,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -38195,6 +38182,103 @@ mod tests {
                     );
                 },
                 other => panic!("Expected CAS existence rejection, got: {other:?}"),
+            }
+        }
+
+        /// Regression (PR #803 follow-up): lease-scoped claim lookup must fail
+        /// closed when the authoritative lease claim is missing, even if an
+        /// unrelated claim exists for the same `work_id`.
+        #[test]
+        fn test_ingest_review_receipt_denies_when_authoritative_lease_claim_missing() {
+            let cas = Arc::new(MemoryCas::default());
+            cas.store(TEST_ARTIFACT_CONTENT)
+                .expect("test artifact should be stored in CAS");
+
+            let peer_creds = test_peer_credentials();
+            let executor_actor_id = derive_actor_id(&peer_creds);
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+
+            let work_id = "W-REVIEW-LEASE-BIND-001";
+            let authoritative_lease_id = "lease-review-authoritative-001";
+            let unrelated_lease_id = "lease-implementer-unrelated-001";
+            let gate_id = "gate-review-lease-bind";
+
+            dispatcher.lease_validator.register_lease_with_executor(
+                authoritative_lease_id,
+                work_id,
+                gate_id,
+                &executor_actor_id,
+            );
+            register_full_test_lease(&TestLeaseConfig {
+                dispatcher: &dispatcher,
+                cas: cas.as_ref(),
+                lease_id: authoritative_lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id: &executor_actor_id,
+                policy_hash: [0u8; 32],
+                wall_time_source: WallTimeSource::AuthenticatedNts,
+                include_attestation: true,
+            });
+
+            // Register only an unrelated implementer claim so role-agnostic
+            // fallback would have succeeded before the strict binding fix.
+            let policy_resolution = test_policy_resolution_with_lineage(
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                0,
+            );
+            seed_policy_lineage_for_test(
+                cas.as_ref(),
+                work_id,
+                &executor_actor_id,
+                WorkRole::Implementer,
+                &policy_resolution,
+            );
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: work_id.to_string(),
+                    lease_id: unrelated_lease_id.to_string(),
+                    actor_id: executor_actor_id,
+                    role: WorkRole::Implementer,
+                    policy_resolution,
+                    executor_custody_domains: vec![],
+                    author_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("unrelated implementer claim registration should succeed");
+
+            let ctx = ConnectionContext::privileged_session_open(Some(peer_creds));
+            let request = IngestReviewReceiptRequest {
+                lease_id: authoritative_lease_id.to_string(),
+                receipt_id: "RR-LEASE-BIND-001".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: test_artifact_bundle_hash(),
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("work claim not found for authoritative lease binding")
+                            || err.message.contains("work claim missing for lease"),
+                        "expected strict lease-scoped claim denial, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "expected fail-closed denial when authoritative lease claim is missing, got {other:?}"
+                ),
             }
         }
 

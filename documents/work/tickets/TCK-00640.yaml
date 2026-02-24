@@ -75,6 +75,7 @@ ticket_meta:
     - "`PublishChangeSetRequest` now requires `lease_id`; daemon enforces strict lease->work->claim->actor binding before CAS or ledger mutation."
     - "Lease fallback is fail-closed on ambiguous `lease_id -> (work_id, actor_id)` mappings and rejects empty bindings."
     - "Privileged PCAC lifecycle helpers now resolve claims strictly by `(lease_id, work_id)` and no longer use role-agnostic claim fallback."
+    - "IngestReviewReceipt now enforces strict lease-scoped claim binding with fail-closed denial when the authoritative lease claim is missing, even if unrelated same-work claims exist."
     - "Work-claim schema now includes `idx_work_claims_lease_id` to keep fallback lookup deterministic and performant."
     - "Work status runtime-binding branch now uses clippy-clean `lease_id.is_empty()` guard ordering (no behavior change)."
     - "Worker claimed-lock handling now retains the lock through terminal queue transition to close TOCTOU re-claim races."
@@ -114,6 +115,8 @@ ticket_meta:
     - "`cargo test -p apm2-cli test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure -- --nocapture`"
     - "`cargo test -p apm2-daemon tck_00639_work_pr_associated_unique_constraint_is_case_insensitive -- --nocapture`"
     - "`cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture`"
+    - "`cargo test -p apm2-daemon test_ingest_review_receipt_denies_when_authoritative_lease_claim_missing -- --nocapture`"
+    - "`cargo test -p apm2-daemon --test tck_00407_fac_receipt_identity_idempotency -- --nocapture`"
     full_package:
     - "`cargo test -p apm2-cli`"
     static_checks:
