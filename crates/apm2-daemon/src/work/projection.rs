@@ -672,7 +672,6 @@ struct CanonicalWorkEventEnvelopeJson {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SessionWorkEventEnvelopeJson {
     event_type: String,
     session_id: String,
@@ -1584,6 +1583,31 @@ mod tests {
             ),
             "non-JSON-prefixed payloads must fail on protobuf decode and never attempt envelope parsing"
         );
+    }
+
+    #[test]
+    fn decode_canonical_work_event_payload_accepts_legacy_session_envelope_extra_fields() {
+        let opened_payload = helpers::work_opened_payload(
+            "W-projection-legacy-session-envelope",
+            "TICKET",
+            vec![0x44; 32],
+            vec![],
+            vec![],
+        );
+        let envelope = serde_json::to_vec(&serde_json::json!({
+            "event_type": "work.opened",
+            "session_id": "W-projection-legacy-session-envelope",
+            "actor_id": "actor:test",
+            "payload": hex::encode(&opened_payload),
+            // Legacy envelopes may carry additional metadata fields.
+            "prev_hash": "legacy-prev-hash",
+            "seq_no": 12
+        }))
+        .expect("legacy session envelope should encode");
+
+        let decoded = decode_canonical_work_event_payload(&envelope, "work.opened")
+            .expect("legacy session envelope should decode");
+        assert_eq!(decoded, opened_payload);
     }
 
     #[test]
