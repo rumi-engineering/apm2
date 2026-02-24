@@ -1,0 +1,76 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-holon/src/episode",
+  "behaviors": [
+    {
+      "id": "BEH-HOLON-EPISODE-001",
+      "kind": "invariant",
+      "title": "Episode numbers are monotonically increasing within and across restarts",
+      "description": "INV-EP01: Episode numbers increase monotonically within a loop and across restarts via the initial_episode_number parameter.",
+      "rfc": ["RFC-0013", "RFC-0016"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-002",
+      "kind": "invariant",
+      "title": "initial_episode_number of 0 is clamped to 1 (episodes are 1-indexed)",
+      "description": "INV-EP02: Episodes are 1-indexed; an initial_episode_number of 0 is silently clamped to 1.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-003",
+      "kind": "invariant",
+      "title": "Budget deduction from lease applied after each episode",
+      "description": "INV-EP03: Budget deduction from the lease is applied after each episode; if deduction fails, the loop terminates with BudgetExhausted.",
+      "rfc": ["RFC-0019", "RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-004",
+      "kind": "invariant",
+      "title": "Stop conditions evaluated in priority order",
+      "description": "INV-EP04: context budget exhaustion > holon stop condition > max episodes reached.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-005",
+      "kind": "requirement",
+      "title": "run_episode_loop validates work_id and lease_id before processing",
+      "description": "CTR-EP01: Returns HolonError::InvalidInput on invalid IDs.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-006",
+      "kind": "requirement",
+      "title": "run_episode_loop validates goal_spec length and null bytes",
+      "description": "CTR-EP02: Returns HolonError::InvalidInput if spec exceeds MAX_GOAL_SPEC_LENGTH or contains null bytes.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-007",
+      "kind": "requirement",
+      "title": "Strict budget enforcement propagates non-recoverable errors as Err",
+      "description": "CTR-EP03: In strict mode, non-recoverable errors propagate as Err; otherwise the loop breaks with EpisodeLoopOutcome::Error.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-008",
+      "kind": "requirement",
+      "title": "RunReceipt generated when context pack is configured",
+      "description": "CTR-EP04: When a context pack is configured, a RunReceipt is generated at the end of the loop capturing pack sufficiency and budget delta.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-009",
+      "kind": "safety",
+      "title": "EpisodeControllerConfig rejects unknown fields during deserialization",
+      "description": "INV-EP05: deny_unknown_fields prevents fail-open parsing.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-EPISODE-010",
+      "kind": "requirement",
+      "title": "EpisodeLoopOutcome::can_continue() identifies resumable outcomes",
+      "description": "CTR-EP06: BudgetExhausted, MaxEpisodesReached, and Blocked can continue with more resources or unblocking.",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

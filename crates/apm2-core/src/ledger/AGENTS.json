@@ -1,0 +1,90 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/ledger",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-LEDGER-001",
+      "kind": "invariant",
+      "title": "Events are immutable once appended; ledger is append-only",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-002",
+      "kind": "invariant",
+      "title": "Sequence IDs are monotonically increasing and gap-free",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-003",
+      "kind": "invariant",
+      "title": "Hash chain integrity via SHA-256 linking",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-004",
+      "kind": "invariant",
+      "title": "WAL mode enabled for all file-backed ledgers",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-005",
+      "kind": "invariant",
+      "title": "Arc<Mutex<Connection>> ensures single-writer semantics",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-006",
+      "kind": "safety",
+      "title": "Schema validation happens before any storage operation",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-007",
+      "kind": "safety",
+      "title": "Fail-closed: unknown schemas rejected on append",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-008",
+      "kind": "invariant",
+      "title": "Migration is atomic: on failure the database is unchanged",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-009",
+      "kind": "invariant",
+      "title": "Migration is idempotent: running twice does not duplicate rows",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-010",
+      "kind": "invariant",
+      "title": "Hash chain is contiguous after migration: no NULL event_hash values",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-011",
+      "kind": "safety",
+      "title": "Fail-closed on ambiguous schema state (both tables have rows)",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-012",
+      "kind": "safety",
+      "title": "Fail-closed on data loss: frozen rows but empty canonical chain",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-013",
+      "kind": "invariant",
+      "title": "Post-migration writes route to canonical events table with hash chain",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-LEDGER-014",
+      "kind": "requirement",
+      "title": "Post-migration canonical mode check must pass or daemon must abort",
+      "rfc": ["RFC-0032"]
+    }
+  ]
+}

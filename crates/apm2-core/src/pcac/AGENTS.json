@@ -1,0 +1,108 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/pcac",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-PCAC-001",
+      "kind": "safety",
+      "title": "Fail-closed validation rejects empty strings, zero hashes, oversized collections",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-002",
+      "kind": "invariant",
+      "title": "Intent digest cryptographically binds the specific effect; zero-hash rejected",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-003",
+      "kind": "invariant",
+      "title": "Freshness witness tick must be strictly positive",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-004",
+      "kind": "invariant",
+      "title": "Each AJC authorizes at most one side effect (linear consumption)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-005",
+      "kind": "invariant",
+      "title": "Consumption after AJC expiry must be denied",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-006",
+      "kind": "invariant",
+      "title": "Lifecycle ordering: join < revalidate <= consume <= effect",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-007",
+      "kind": "invariant",
+      "title": "Consume verifies exact intent digest equality (Law 2)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-008",
+      "kind": "invariant",
+      "title": "Consume denies if revocation head has advanced since AJC issuance (Law 4)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-009",
+      "kind": "safety",
+      "title": "Fail-closed deny taxonomy: unknown authority state always maps to denial",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-010",
+      "kind": "invariant",
+      "title": "Replay-critical bindings: time_envelope_ref and ledger_anchor non-zero on denial",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-011",
+      "kind": "invariant",
+      "title": "Authoritative bindings require all fields populated and valid",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-012",
+      "kind": "invariant",
+      "title": "Receipt time_envelope_ref equals authoritative_bindings ref when both present",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-013",
+      "kind": "invariant",
+      "title": "Permeability and delegation chain hashes must both be present or both absent",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-014",
+      "kind": "invariant",
+      "title": "Temporal arbitration evaluator tuples sorted by strictly increasing evaluator_id",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-015",
+      "kind": "invariant",
+      "title": "Temporal deadline miss escalates transient disagreement to persistent",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-016",
+      "kind": "invariant",
+      "title": "Temporal arbitration receipts are Ed25519-signed; tampered receipts fail",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-PCAC-017",
+      "kind": "capability",
+      "title": "String fields bounded by MAX_STRING_LENGTH (256); collections by MAX 64",
+      "rfc": ["RFC-0027"]
+    }
+  ]
+}

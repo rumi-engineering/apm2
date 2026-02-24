@@ -1,0 +1,113 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00176",
+      "title": "Implement E2E tool and telemetry tests",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-TOOL-001"
+        },
+        {
+          "requirement_id": "REQ-TEL-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00174"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "E2E tests for tool mediation",
+      "verification": "Tool requests flow through broker"
+    },
+    {
+      "criterion": "Deduplication verification",
+      "verification": "Repeated requests return cached results"
+    },
+    {
+      "criterion": "Receipt binding verification",
+      "verification": "Receipts contain correct hashes"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "E2E tool mediation test",
+        "code": "#[tokio::test]\nasync fn test_tool_mediation() {\n    let daemon = TestDaemon::start().await;\n    let episode_id = daemon.create_and_start().await;\n\n    // Send tool request\n    let request = ToolRequest {\n        tool: \"read\".into(),\n        dedupe_key: dedupe_key!(\"test-read\"),\n        args_hash: hash_of(b\"test.txt\"),\n    };\n    let decision = daemon.tool_request(&episode_id, request.clone()).await.unwrap();\n    assert_eq!(decision.decision, Decision::Allow);\n\n    // Execute tool\n    let result = daemon.tool_execute(&episode_id, decision).await.unwrap();\n    assert!(result.receipt.verify(&daemon.public_key()).is_ok());\n\n    // Dedupe hit\n    let decision2 = daemon.tool_request(&episode_id, request).await.unwrap();\n    assert_eq!(decision2.decision, Decision::DedupeCacheHit { .. });\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/tests/e2e_tool.rs",
+        "purpose": "E2E tool mediation tests"
+      },
+      {
+        "path": "crates/apm2-daemon/tests/e2e_telemetry.rs",
+        "purpose": "E2E telemetry frame tests"
+      },
+      {
+        "path": "crates/apm2-daemon/tests/common/mock_harness.rs",
+        "purpose": "Mock harness for controlled testing"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Add mock harness to test registry",
+        "path": "crates/apm2-daemon/tests/common/mod.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Create MockHarness",
+        "details": "MockHarness for controlled testing:\n- Configurable output patterns\n- Programmable tool calls\n- Controlled exit codes\n- Deterministic behavior\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement tool mediation tests",
+        "details": "Test scenarios:\n- Allow decision flow\n- Deny decision (unauthorized)\n- Dedupe cache hit\n- Budget charging\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement deduplication tests",
+        "details": "Test scenarios:\n- Same dedupe key returns cached\n- Different dedupe key re-executes\n- Cache eviction on episode end\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement telemetry tests",
+        "details": "Test scenarios:\n- Frames emitted at configured rate\n- Metrics match resource consumption (within 5%)\n- Ring buffer bounds respected\n- Promotion triggers work\n"
+      },
+      {
+        "step": 5,
+        "action": "Verify receipt binding",
+        "details": "Assert receipt contents:\n- envelope_hash matches episode\n- result_hash matches stored result\n- signature verifies\n- evidence_refs exist in CAS\n"
+      }
+    ],
+    "summary": "Implement E2E tests for tool mediation, deduplication, and telemetry.\nVerifies tool request flow, receipt binding, and telemetry frame accuracy.\nUses MockHarness for controlled test scenarios.\n"
+  },
+  "notes": "Phase: PHASE-4 (Integration and CLI)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-018b.\n",
+  "test_requirements": [
+    {
+      "description": "Tool mediation E2E",
+      "test_id": "E2E-00176-01",
+      "verification_command": "cargo test -p apm2-daemon --test e2e_tool"
+    },
+    {
+      "description": "Telemetry E2E",
+      "test_id": "E2E-00176-02",
+      "verification_command": "cargo test -p apm2-daemon --test e2e_telemetry"
+    }
+  ]
+}

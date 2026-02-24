@@ -1,0 +1,61 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00514",
+      "title": "Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00513",
+          "reason": "Denial/quarantine receipts schema must exist."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add queue layout: `queue/denied/` and `queue/quarantine/`.",
+        "Implement deterministic move rules for malformed/tampered jobs vs policy-denied jobs.",
+        "Write denial/quarantine receipts and link them to moved job files.",
+        "Define retention policy: quarantined jobs preserved until GC prunes by TTL/quota (never silently deleted).",
+        "Ensure `apm2 fac gc` respects quarantine retention rules and emits receipts for prunes."
+      ],
+      "out_of_scope": [
+        "Remote forensics transport."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement directory creation and atomic rename targets.",
+        "Implement reason sidecar file format (e.g., `<job_id>.reason.json`) or embed in denial receipt.",
+        "Implement basic quota (max bytes) and TTL policy for quarantine."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Poison jobs do not loop forever; they are moved aside and a denial receipt is emitted.",
+        "Quarantine is not deleted by routine cleanup; only by explicit GC policy with receipts."
+      ]
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00394",
+      "title": "ChangeSet publishing IPC endpoint for daemon-anchored changeset submission",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018"
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_ORCHESTRATION"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00383",
+          "reason": "CAS must be wired to daemon for ChangeSetBundleV1 storage."
+        },
+        {
+          "ticket_id": "TCK-00395",
+          "reason": "Ledger event emission from IPC must work for ChangeSetPublished events."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add PublishChangeSet message type (tag TBD) to PrivilegedMessageType enum in dispatch.rs.",
+        "Implement handle_publish_changeset handler in PrivilegedDispatcher.",
+        "Handler accepts ChangeSetBundleV1 payload, validates it, stores in DurableCas.",
+        "Handler creates signed ChangeSetPublished event via ChangeSetPublished::create().",
+        "Handler emits ChangeSetPublished event to ledger.",
+        "Handler returns changeset_digest and cas_hash to caller for subsequent gate lease binding.",
+        "Add OperatorClient::publish_changeset method in protocol.rs.",
+        "Add integration test: submit ChangeSetBundleV1 via IPC, verify CAS storage and ledger event."
+      ],
+      "out_of_scope": [
+        "ChangeSetBundleV1 type implementation (already exists in changeset_bundle.rs).",
+        "ChangeSetPublished event type and signing (already exists with CHANGESET_PUBLISHED: domain separator).",
+        "DurableCas implementation (already exists in cas.rs, wired by TCK-00383).",
+        "Git diff computation (the caller computes the diff and submits the bundle).",
+        "xtask changeset flow migration (xtask currently creates PRs externally, separate concern)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add PublishChangeSet variant to PrivilegedMessageType enum (next available tag after existing 68).",
+        "Define PublishChangeSetRequest protobuf/serde message: contains serialized ChangeSetBundleV1.",
+        "Define PublishChangeSetResponse message: contains changeset_digest ([u8; 32] hex), cas_hash ([u8; 32] hex), work_id.",
+        "Add routing entry in dispatch_privileged match block (around line 3046-3083).",
+        "Implement handle_publish_changeset: (a) deserialize and validate ChangeSetBundleV1, (b) serialize bundle to canonical bytes, (c) store in DurableCas via self.cas.store(), (d) get cas_hash from CAS, (e) get HTF timestamp from clock, (f) create ChangeSetPublished::create(work_id, changeset_digest, cas_hash, timestamp, actor_id, signer), (g) emit to ledger, (h) return response with changeset_digest and cas_hash.",
+        "Validate that the work_id in the bundle corresponds to an existing claimed work item.",
+        "Add OperatorClient::publish_changeset(bundle: &ChangeSetBundleV1) -> Result<PublishChangeSetResponse> following the same pattern as claim_work, spawn_episode.",
+        "Add integration test: create work claim, publish changeset, query ledger for ChangeSetPublished event, verify changeset_digest matches.",
+        "Verify existing tests still pass."
+      ]
+    },
+    "definition_of_done": {
+      "criteria": [
+        "PublishChangeSet IPC endpoint accepts ChangeSetBundleV1 and returns changeset_digest + cas_hash.",
+        "ChangeSetBundleV1 is stored in DurableCas with correct content-addressable hash.",
+        "ChangeSetPublished event is emitted to ledger with domain-separated signature (CHANGESET_PUBLISHED: prefix).",
+        "work_id validation ensures changeset is associated with an existing claimed work item.",
+        "Idempotent: publishing the same changeset twice returns the same digest without duplicate events.",
+        "OperatorClient::publish_changeset method works for CLI and agent callers.",
+        "Integration test validates CAS storage, ledger event, and response values."
+      ]
+    },
+    "notes": {
+      "context": "No IPC endpoint exists for publishing a ChangeSetBundle to the daemon. The ChangeSetPublished\nevent is tested in hef_fac_v0_e2e.rs and changeset_published_integration.rs but these\nconstruct it directly in-process. For autonomous operation, an agent completing implementation\nwork needs to submit its changeset through the daemon to get it anchored in the ledger with\na ChangeSetPublished event before gates can run.\n\nCurrently xtask handles this by running `git diff` externally and creating PRs, but the\ndaemon FAC pipeline needs a formal PublishChangeSet operator socket message that:\n- Accepts a ChangeSetBundleV1 (file diffs + metadata)\n- Stores it in CAS via DurableCas\n- Emits ChangeSetPublished event to ledger\n- Returns the changeset_digest for subsequent gate lease binding (TCK-00388)\n\nThe ChangeSetBundleV1 (changeset_bundle.rs line 337) contains: changeset_id, base GitObjectRef,\nchangeset_digest (computed deterministically), diff_hash, file_manifest (Vec<FileChange>),\nbinary_detected flag. The builder (line 557) computes the changeset_digest automatically\nvia compute_digest() (line 668).\n\nThe ChangeSetPublished event (line 684) is created via ChangeSetPublished::create() (line 722)\nwhich signs with CHANGESET_PUBLISHED: domain separator (defined in domain_separator.rs line 128).\n\nThe PrivilegedMessageType enum (dispatch.rs line 1815-1869) currently has tags 1-15, 21-26,\n64, 66, 68. A new tag (e.g., 70) should be used for PublishChangeSet.\n\nThe OperatorClient (crates/apm2-cli/src/client/protocol.rs line 280) already provides methods\nlike claim_work, spawn_episode, work_status. Adding publish_changeset follows the same pattern.\n\nThis ticket bridges the gap between \"session does work\" and \"gates can run on the changeset.\"\nWithout it, the autonomous pipeline has no way to anchor a changeset in the ledger.\n",
+      "files": "- crates/apm2-core/src/fac/changeset_bundle.rs (ChangeSetBundleV1 at line 337, builder at line 557, ChangeSetPublished at line 684, create() at line 722)\n- crates/apm2-core/src/fac/domain_separator.rs (CHANGESET_PUBLISHED_PREFIX at line 128)\n- crates/apm2-daemon/src/protocol/dispatch.rs (PrivilegedMessageType enum at line 1815, dispatch routing at line 3046)\n- crates/apm2-daemon/src/cas.rs (DurableCas for content-addressable storage)\n- crates/apm2-cli/src/client/protocol.rs (OperatorClient at line 280, add publish_changeset method)\n- crates/apm2-daemon/src/ledger.rs (SqliteLedgerEventEmitter, needs emit_changeset_published method)\n- crates/apm2-daemon/tests/hef_fac_v0_e2e.rs (existing ChangeSetPublished test pattern)\n",
+      "security": "The ChangeSetPublished event's domain-separated signature (CHANGESET_PUBLISHED: prefix)\nprevents cross-domain replay attacks. The changeset_digest is computed deterministically\nover canonical bundle bytes, ensuring the same inputs always produce the same digest.\nThe handler must validate work_id exists and is in a valid state (Claimed or InProgress)\nbefore accepting a changeset, preventing orphaned changesets. CAS storage provides\ntamper-evident content addressing -- any modification to the stored bundle changes its\nhash, breaking the cas_hash binding in the ledger event. The handler must validate\nthe ChangeSetBundleV1 structure (no empty changeset_id, valid base GitObjectRef, at\nleast one FileChange in manifest) before storing. Idempotency prevents duplicate\nChangeSetPublished events which could confuse downstream gate orchestration.\n"
+    }
+  }
+}

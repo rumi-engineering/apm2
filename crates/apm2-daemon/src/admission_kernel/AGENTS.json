@@ -1,0 +1,259 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/admission_kernel",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-ADMIT-001",
+      "kind": "invariant",
+      "title": "Plan-then-execute ordering is structurally enforced by type system",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0023"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-002",
+      "kind": "safety",
+      "title": "Missing prerequisites produce denial for fail-closed tiers, not bypass",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0002"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-003",
+      "kind": "invariant",
+      "title": "Plan state transitions to Consumed BEFORE fallible operations",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0004"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-004",
+      "kind": "invariant",
+      "title": "Capability tokens only constructible within admission_kernel module",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-005",
+      "kind": "invariant",
+      "title": "Capability tokens are non-cloneable, non-copyable (single-use)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-006",
+      "kind": "invariant",
+      "title": "Bundle is sealed before any receipt/event emission (no digest cycles)",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0024"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-007",
+      "kind": "invariant",
+      "title": "Bundle digest equals content_hash() with domain-separated BLAKE3",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-008",
+      "kind": "invariant",
+      "title": "Bundle validated before sealing; zero fields and collection bounds checked",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-009",
+      "kind": "safety",
+      "title": "deny_unknown_fields rejects unknown JSON fields at deserialization boundary",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-010",
+      "kind": "invariant",
+      "title": "Collection fields bounded by MAX_BUNDLE_QUARANTINE_ACTIONS (16)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-011",
+      "kind": "invariant",
+      "title": "Evidence seed_hash must match seed content_hash (constant-time comparison)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-012",
+      "kind": "invariant",
+      "title": "Evidence provider_id and build_digest must match seed (anti-substitution)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-013",
+      "kind": "invariant",
+      "title": "measured_values bounded by MAX_WITNESS_EVIDENCE_MEASURED_VALUES (16)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-014",
+      "kind": "safety",
+      "title": "Waiver enforcement_tier must be Monitor, never FailClosed",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-015",
+      "kind": "safety",
+      "title": "Expired waivers are denied (non-zero expires_at_tick < current_tick)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-016",
+      "kind": "invariant",
+      "title": "Journal entries are append-only; no in-place mutation or deletion",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-017",
+      "kind": "safety",
+      "title": "Started without Completed on replay produces Unknown, never re-execution",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-018",
+      "kind": "safety",
+      "title": "Unknown state denies output unless explicit AllowReExecution resolution",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-019",
+      "kind": "invariant",
+      "title": "Journal replay tolerates torn tail entries from crash",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-020",
+      "kind": "invariant",
+      "title": "Active journal entry count bounded by MAX_JOURNAL_ENTRIES (100,000)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-021",
+      "kind": "invariant",
+      "title": "Exclusive file lock prevents concurrent journal access",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-022",
+      "kind": "invariant",
+      "title": "Binding data validated before persistence; zero hashes rejected",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-023",
+      "kind": "safety",
+      "title": "Fail-closed tiers MUST have effect journal wired or execute() denies",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-024",
+      "kind": "invariant",
+      "title": "Journal file created with mode 0600 (owner-only read/write)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-025",
+      "kind": "invariant",
+      "title": "Journal line length enforced at MAX_JOURNAL_LINE_LEN (64,000 bytes)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-026",
+      "kind": "invariant",
+      "title": "Journal file size checked BEFORE reading (256 MiB limit)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-027",
+      "kind": "invariant",
+      "title": "RootTrustBundle bounded by MAX_TRUST_BUNDLE_KEYS (64); empty rejected",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-028",
+      "kind": "invariant",
+      "title": "Key IDs must be unique within a trust bundle",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-029",
+      "kind": "invariant",
+      "title": "Seal signature chains to active key in RootTrustBundle at seal_epoch",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-030",
+      "kind": "invariant",
+      "title": "Hash chain integrity verified with constant-time comparisons",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-031",
+      "kind": "invariant",
+      "title": "HT monotonicity enforced (non-decreasing he_time)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-032",
+      "kind": "safety",
+      "title": "Seal-to-tip distance exceeding max fails closed unless fallback enabled",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-033",
+      "kind": "safety",
+      "title": "Governance events MUST be signed; unsigned events rejected",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-034",
+      "kind": "invariant",
+      "title": "Policy root cache bounded by MAX_POLICY_ROOT_CACHE_ENTRIES (64)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-035",
+      "kind": "invariant",
+      "title": "Anti-rollback regression checks enforce height non-decrease and hash match",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0030"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-036",
+      "kind": "safety",
+      "title": "DurableAntiRollbackAnchor detects anchor deletion after bootstrap",
+      "description": "Bootstrap receipt file prevents bypassing anti-rollback by deleting state file after genesis.",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0030"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-037",
+      "kind": "requirement",
+      "title": "finalize_anti_rollback() commits anchor AFTER confirmed effect success",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0030"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-038",
+      "kind": "requirement",
+      "title": "IdempotencyKeyV1 derived deterministically from (dedupe_key, request_id, ajc_id)",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-039",
+      "kind": "requirement",
+      "title": "Canonical phase ordering: join, revalidate, consume, effect -- no skip",
+      "rfc": ["RFC-0019"],
+      "req": ["RFC-0019#REQ-0004"]
+    },
+    {
+      "id": "BEH-DAEMON-ADMIT-040",
+      "kind": "requirement",
+      "title": "LedgerWriteCapability only minted for fail-closed tiers",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "documents",
+  "behaviors": [
+    {
+      "id": "BEH-DOC-001",
+      "kind": "requirement",
+      "title": "Document directories follow canonical naming and purpose assignments",
+      "description": "Each subdirectory (prds/, rfcs/, standards/, schemas/, theory/, skills/, work/, security/, strategy/, policy/, reviews/, releases/, runbooks/) has a defined purpose that must be respected.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-002",
+      "kind": "requirement",
+      "title": "Document sections use zero-padded numeric prefix naming convention",
+      "description": "Files within document directories follow 00_meta.yaml through 13_governance_model.yaml naming convention with defined content per section.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-003",
+      "kind": "requirement",
+      "title": "Tickets use TCK-NNNNN.yaml single-file format",
+      "description": "Each ticket is a single YAML file containing all metadata, scope, plan, and criteria. No separate markdown files.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-004",
+      "kind": "requirement",
+      "title": "Waivers use WVR-XXXX.yaml format with justification and expiration",
+      "description": "Approved deviation requests with justification, scope, and expiration criteria.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-005",
+      "kind": "requirement",
+      "title": "Skills follow SKILL.md agent-native executable specification format",
+      "description": "Agent-native executable specification containing capabilities, instructions, and reference mappings.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-006",
+      "kind": "requirement",
+      "title": "Schemas directory is the consolidated registry for all CAC JSON schemas",
+      "description": "All CAC JSON schemas and YAML structural definitions for the APM2 project are centralized in schemas/.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-007",
+      "kind": "requirement",
+      "title": "Standards contain normative definitions for documents, protocols, and data",
+      "description": "Includes enums (strongly typed constants), instructions (normative authoring standards), and cac (Context-as-Code manifests).",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

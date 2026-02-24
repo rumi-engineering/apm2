@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00539",
+      "title": "Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)",
+      "status": "MERGED",
+      "merge_evidence": [
+        {
+          "pr": 719,
+          "merge_commit": "7a86d426880884d88b0fa99fba2f1b5d439f060d",
+          "merged_at": "2026-02-17T16:11:40Z"
+        }
+      ]
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "Lane structures must exist."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement `apm2 fac lanes init` to create lane directories and default profiles.",
+        "Implement `apm2 fac lanes reconcile` to repair missing dirs and mark lanes CORRUPT if unrecoverable.",
+        "Allow configuring lane_count via config/env; ensure deterministic lane IDs.",
+        "Emit receipts for init/reconcile operations."
+      ],
+      "out_of_scope": [
+        "Auto-scaling lane count based on load."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement init and reconcile commands.",
+        "Add docs for first-time bootstrap."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "A fresh `$APM2_HOME` can be bootstrapped into a ready lane pool with one command."
+      ]
+    }
+  }
+}

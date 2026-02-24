@@ -1,0 +1,104 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00382",
+      "title": "Business continuity, formal gates, and federation stop/rotation governance",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0036",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0036",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0036.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0401",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0401.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0402",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0402.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_FORMAL_METHODS"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RELIABILITY",
+        "DOMAIN_SECURITY",
+        "DOMAIN_GOVERNANCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00365",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        },
+        {
+          "ticket_id": "TCK-00367",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        },
+        {
+          "ticket_id": "TCK-00368",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        },
+        {
+          "ticket_id": "TCK-00381",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Instrument and enforce stop-path SLOs, RPO/RTO, and emergency key rotation flows",
+        "Integrate formal gate artifacts (session model, anti-entropy model, bisimulation, functor law) into promotion checks",
+        "Enable governance channel for stop/rotation across cells with breakglass controls"
+      ],
+      "out_of_scope": [
+        "Any PQC migration work (explicitly out of RFC-0020 scope)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Instrument and enforce stop-path SLOs, RPO/RTO, and emergency key rotation flows",
+        "Implement: Integrate formal gate artifacts (session model, anti-entropy model, bisimulation, functor law) into promotion checks",
+        "Implement: Enable governance channel for stop/rotation across cells with breakglass controls",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0020/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0036",
+        "EVID-0401",
+        "EVID-0402"
+      ],
+      "criteria": [
+        "Stop-path SLO violations trigger automated fail-safe actions",
+        "Formal artifacts are required inputs for stage promotion gates",
+        "Cross-cell governance stop/rotation operations are authenticated and auditable"
+      ]
+    },
+    "notes": {
+      "security": "Fail-closed, least privilege, and explicit authority proofs are mandatory.",
+      "verification": "Prefer deterministic tests, replay/CAS evidence, and bounded-resource checks; avoid process-local assumptions.",
+      "general": "Keep scope atomic to this ticket, preserve explicit dependency ordering, and avoid introducing semantic drift from RFC-0020."
+    }
+  }
+}

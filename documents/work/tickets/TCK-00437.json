@@ -1,0 +1,123 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00437",
+      "title": "[Umbrella] FAC RoleSpec vNext rollout for WorkObject execution",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0017",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0017.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0018",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0018.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0019",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0019.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0012",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0012.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0013",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0013.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0014",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_OBSERVABILITY",
+        "DOMAIN_PERFORMANCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00415",
+          "reason": "WorkObject projection authority baseline."
+        },
+        {
+          "ticket_id": "TCK-00331",
+          "reason": "RoleSpec baseline schema/conformance harness."
+        },
+        {
+          "ticket_id": "TCK-00419",
+          "reason": "Instruction-plane FAC cutover baseline."
+        },
+        {
+          "ticket_id": "TCK-00401",
+          "reason": "Broker policy wiring baseline."
+        },
+        {
+          "ticket_id": "TCK-00446",
+          "reason": "RoleSpec contract/conformance slice."
+        },
+        {
+          "ticket_id": "TCK-00447",
+          "reason": "Context recipe/fingerprint slice."
+        },
+        {
+          "ticket_id": "TCK-00448",
+          "reason": "Production wiring and e2e slice."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Coordinate rollout of RoleSpec vNext contract, deterministic context compilation, and production binding.",
+        "Track cross-slice compatibility and final role-profile migration readiness."
+      ],
+      "out_of_scope": [
+        "Subagent launch command integration (covered by TCK-00438/TCK-00449..TCK-00452).",
+        "Direct implementation details delegated to TCK-00446..TCK-00448."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Execute TCK-00446..TCK-00448 in dependency order.",
+        "Validate integrated role/context hash lineage and fail-closed behavior.",
+        "Finalize migration documentation and closure criteria."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0012",
+        "EVID-0013",
+        "EVID-0014"
+      ],
+      "criteria": [
+        "All child tickets TCK-00446..TCK-00448 are complete.",
+        "RoleSpec vNext is production-selected by hash with deterministic context reconstruction.",
+        "Fail-closed behavior for role/context ambiguity is verified in end-to-end paths."
+      ]
+    },
+    "notes": {
+      "security": "Role/profile ambiguity is non-admissible for authoritative execution.\n",
+      "verification": "Ensure integration checks cover receipt lineage and side-effect path behavior.\n",
+      "general": "Detailed implementation moved to child slices to reduce ticket blast radius.\n"
+    }
+  }
+}

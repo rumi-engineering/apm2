@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "apm2.agents_context.v1",
+  "title": "APM2 Module Behavior Context",
+  "description": "Machine-readable behavior registry for a single module. Maps every invariant, safety property, functional requirement, and capability back to the RFC system specs that mandate them. Code comments reference behavior IDs (e.g. // [BEH-CORE-FAC-001]) in place of inline prose.",
+  "type": "object",
+  "required": ["schema", "module", "behaviors"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "apm2.agents_context.v1",
+      "description": "Schema identifier. Must be exactly this string."
+    },
+    "module": {
+      "type": "string",
+      "description": "Repository-relative path to the module this file describes (e.g. 'crates/apm2-core/src/fac')."
+    },
+    "behaviors": {
+      "type": "array",
+      "description": "Ordered list of behaviors this module is required to implement.",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/behavior"
+      }
+    }
+  },
+  "definitions": {
+    "behavior": {
+      "type": "object",
+      "required": ["id", "kind", "title", "rfc"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Globally unique, stable behavior identifier. Format: BEH-{NAMESPACE}-{NNN} where NAMESPACE is the module's short uppercase tag (e.g. CORE-FAC, DAEMON-GATE, CLI-FAC-REV) and NNN is a zero-padded sequence number.",
+          "pattern": "^BEH-[A-Z][A-Z0-9-]+-[0-9]{3}$",
+          "examples": ["BEH-CORE-FAC-001", "BEH-DAEMON-GATE-003", "BEH-CLI-FAC-REV-012"]
+        },
+        "kind": {
+          "type": "string",
+          "description": "The behavioral category. invariant = property that must always hold; safety = thing that must never happen; requirement = functional capability the RFC mandates; capability = what this module is authorized to do (OCAP boundary).",
+          "enum": ["invariant", "safety", "requirement", "capability"]
+        },
+        "title": {
+          "type": "string",
+          "description": "Short, imperative title (≤80 chars). This is what appears in code comment hover and tooling output.",
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "description": "Full description of the behavior, constraints, and rationale. Optional — omit only when title is self-explanatory."
+        },
+        "rfc": {
+          "type": "array",
+          "description": "One or more RFC IDs that mandate this behavior. Required and must be non-empty — every behavior traces to at least one system spec.",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^RFC-[0-9]{4}$"
+          },
+          "examples": [["RFC-0019"], ["RFC-0020", "RFC-0028"]]
+        },
+        "req": {
+          "type": "array",
+          "description": "Optional fine-grained requirement references within the cited RFCs. Use the format RFC-NNNN#REQ-ID or free-form if no formal ID exists.",
+          "items": {
+            "type": "string"
+          },
+          "examples": [["RFC-0019#REQ-FAC-LANE-001"], ["RFC-0020#INV-HSI-AUTH-003"]]
+        }
+      }
+    }
+  }
+}

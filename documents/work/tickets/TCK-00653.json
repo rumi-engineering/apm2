@@ -1,0 +1,85 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00653",
+      "title": "RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PROTOCOL",
+        "DOMAIN_OBSERVABILITY",
+        "DOMAIN_DAEMON"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00642",
+          "reason": "WorkGraph topics require multi-topic derivation"
+        },
+        {
+          "ticket_id": "TCK-00631",
+          "reason": "Canonical ledger append path influences commit notifications"
+        }
+      ]
+    },
+    "context": {
+      "observed_state": [
+        "Multi-topic derivation for `work_graph.edge.*` exists in `topic_derivation.rs`, but parity coverage for dotted reducer names vs typed discriminants is incomplete.",
+        "`pulse_outbox.rs` still decodes payloads as `KernelEvent` directly, which is too strict during bridge periods where commit payload formats differ."
+      ],
+      "code_evidence": [
+        "crates/apm2-daemon/src/protocol/pulse_outbox.rs:367-374 decodes only `KernelEvent` and drops decode failures.",
+        "crates/apm2-daemon/src/protocol/topic_derivation.rs:354-410 primarily matches typed names (e.g., `WorkOpened`) with limited dotted-name parity mapping."
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Complete PulsePublisher decoding so routing operates on `(event_type, namespace, payload_bytes)` without assuming all commits are `KernelEvent` envelopes.",
+        "Preserve and validate existing multi-topic derivation behavior (`Vec<String>`) for work graph edge events.",
+        "Add explicit typed/dotted parity mapping so semantically equivalent events (`WorkOpened` vs `work.opened`) route to identical topics.",
+        "Add/extend tests in `crates/apm2-daemon/src/protocol/topic_derivation.rs` and `pulse_outbox.rs` for bridge-format decoding and parity mapping."
+      ]
+    },
+    "out_of_scope": [
+      "Reworking the entire pulse transport protocol (focus is topic correctness + decoding assumptions)"
+    ],
+    "plan": {
+      "steps": [
+        "Audit current `pulse_outbox.rs` decode path; introduce bounded fallback decode paths when payload is not `KernelEvent`.",
+        "Implement minimal event_type-guided extractors for routing keys (work_id, session_id, changeset_digest) across bridge payload variants.",
+        "Add a small canonicalization layer mapping typed discriminants and dotted reducer names to the same routing class.",
+        "Add tests: same semantic event is routed to identical topics regardless of naming form or bridge payload envelope"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-TCK-00653-01 (unit): typed/dotted/legacy event-name parity normalizes to identical topic sets, including work_graph typed aliases",
+        "EVID-TCK-00653-02 (unit): bridge non-KernelEvent payload (`work_transitioned` JSON) routes to work topic instead of being dropped",
+        "EVID-TCK-00653-03 (unit): bridge raw `WorkGraphEvent` payload preserves multi-topic routing (`from_work_id` + `to_work_id`)",
+        "EVID-TCK-00653-04 (unit): malformed/oversized bridge payload handling remains bounded and publish loop continues"
+      ],
+      "criteria": [
+        "PulsePublisher can route bridge-period payload variants without dropping events solely because `KernelEvent` decode failed.",
+        "Topic derivation returns correct topic sets for work, session, and graph events and is covered by tests.",
+        "No polling is required for `--wait` flows once CLI integration lands."
+      ]
+    },
+    "notes": {
+      "security": "Topic derivation is part of admission-critical waits; decoding must be bounded and fail-closed on malformed payloads."
+    }
+  }
+}

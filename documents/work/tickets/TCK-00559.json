@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00559",
+      "title": "Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00537",
+          "reason": "Safe bounded parsing primitives should exist."
+        },
+        {
+          "ticket_id": "TCK-00516",
+          "reason": "safe_rmtree_v1 must exist to test it."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add fuzzing targets for FacJobSpecV1 bounded parsing and denial/quarantine behavior.",
+        "Add tests for queue tampering (digest mismatch, token mismatch, unknown fields).",
+        "Add property-style tests for safe_rmtree (symlink refusal, no parent escape, TOCTOU smoke)."
+      ],
+      "out_of_scope": [
+        "Full formal proofs."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add fuzz harness and CI hooks (time-bounded).",
+        "Add deterministic adversarial fixtures."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Common tamper vectors are caught by tests, preventing regression to fail-open behaviors."
+      ]
+    }
+  }
+}

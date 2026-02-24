@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-25",
+    "template_version": "2026-01-25",
+    "ticket": {
+      "id": "TCK-00088",
+      "title": "Define agent exit protocol and session cleanup"
+    },
+    "binds": {
+      "prd_id": "PRD-0004",
+      "rfc_id": "RFC-0008",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0008",
+          "requirement_ref": "documents/prds/PRD-0004/requirements/REQ-0008.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-8004"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00087"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define agent exit signal JSON schema",
+        "Implement exit signal parsing and validation",
+        "Emit AgentSessionCompleted event on valid exit signal",
+        "Update work item phase based on exit signal",
+        "Release lease on session cleanup",
+        "Document exit protocol for agent implementers",
+        "Add feature flag AGENT_EXIT_PROTOCOL_ENABLED"
+      ],
+      "out_of_scope": [
+        "Modifying existing agent implementations (separate effort)",
+        "Integration tests (TCK-00089)",
+        "Agent crash/timeout handling (future enhancement)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define ExitSignal struct matching JSON schema in contract",
+        "Implement serde deserialization with validation",
+        "Create exit signal handler that validates and processes signals",
+        "Implement AgentSessionCompleted event emission",
+        "Update work item phase based on phase_completed field",
+        "Implement lease release on session end",
+        "Add feature flag check before validation",
+        "Write protocol documentation with examples",
+        "Write unit tests for exit signal parsing",
+        "Write unit tests for session cleanup"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-8004"
+      ],
+      "criteria": [
+        "ExitSignal struct defined with all required fields",
+        "Exit signal validates protocol field is 'apm2_agent_exit'",
+        "Exit signal validates version field",
+        "Invalid exit signals return clear error messages",
+        "AgentSessionCompleted event emitted on valid exit",
+        "Work item phase updated based on exit signal",
+        "Lease released on session cleanup",
+        "Protocol documentation complete with examples",
+        "Feature flag AGENT_EXIT_PROTOCOL_ENABLED controls validation",
+        "Unit tests pass for parsing and cleanup"
+      ]
+    },
+    "notes": {
+      "implementation_details": "Exit signal schema:\n```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct ExitSignal {\n    pub protocol: String, // Must be \"apm2_agent_exit\"\n    pub version: String,  // \"1.0.0\"\n    pub phase_completed: WorkPhase,\n    pub exit_reason: ExitReason,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub pr_url: Option<String>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub evidence_bundle_ref: Option<String>,\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub notes: Option<String>,\n}\n\n#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ExitReason {\n    Completed,\n    Blocked,\n    Error,\n}\n\nimpl ExitSignal {\n    pub fn validate(&self) -> Result<(), ExitSignalError> {\n        if self.protocol != \"apm2_agent_exit\" {\n            return Err(ExitSignalError::UnknownProtocol(self.protocol.clone()));\n        }\n        if !self.version.starts_with(\"1.\") {\n            return Err(ExitSignalError::UnsupportedVersion(self.version.clone()));\n        }\n        Ok(())\n    }\n}\n```\n\nSession cleanup:\n```rust\nasync fn handle_session_end(\n    session_id: Uuid,\n    exit_signal: Option<ExitSignal>,\n    session_store: &SessionStore,\n    work_store: &WorkStore,\n    lease_store: &LeaseStore,\n) -> Result<(), Error> {\n    let session = session_store.get(session_id).await?;\n\n    // Release lease\n    if let Some(lease_id) = session.lease_id {\n        lease_store.release(lease_id).await?;\n    }\n\n    // Update work item if exit signal provided\n    if let Some(signal) = exit_signal {\n        if let Some(work_id) = session.work_id {\n            let next_phase = match signal.phase_completed {\n                WorkPhase::Implementation => WorkPhase::CIPending,\n                WorkPhase::Review => WorkPhase::ReadyForMerge,\n                _ => signal.phase_completed, // Keep same for others\n            };\n            work_store.transition(&work_id, next_phase).await?;\n        }\n    }\n\n    // Mark session as ended\n    session_store.end(session_id).await?;\n\n    Ok(())\n}\n```\n",
+      "protocol_documentation": "# Agent Exit Protocol\n\nWhen an agent completes a work phase, it MUST emit a structured exit signal\nto enable clean handoff to the next agent.\n\n## JSON Schema\n\n```json\n{\n  \"protocol\": \"apm2_agent_exit\",\n  \"version\": \"1.0.0\",\n  \"phase_completed\": \"IMPLEMENTATION\",\n  \"exit_reason\": \"completed\",\n  \"pr_url\": \"https://github.com/org/repo/pull/123\",\n  \"evidence_bundle_ref\": \"evidence/work/W-00042/phase_implementation.yaml\",\n  \"notes\": \"Implementation complete, ready for CI\"\n}\n```\n\n## Required Fields\n\n- `protocol`: Must be \"apm2_agent_exit\"\n- `version`: Protocol version (currently \"1.0.0\")\n- `phase_completed`: The work phase that was just completed\n- `exit_reason`: Why the session is ending\n  - \"completed\": Work phase finished successfully\n  - \"blocked\": Cannot proceed due to external blocker\n  - \"error\": Session ending due to error\n\n## Optional Fields\n\n- `pr_url`: GitHub PR URL if a PR was created\n- `evidence_bundle_ref`: Path to evidence bundle for this phase\n- `notes`: Human-readable notes about the exit\n\n## Example: Implementation Complete\n\n```json\n{\n  \"protocol\": \"apm2_agent_exit\",\n  \"version\": \"1.0.0\",\n  \"phase_completed\": \"IMPLEMENTATION\",\n  \"exit_reason\": \"completed\",\n  \"pr_url\": \"https://github.com/org/repo/pull/123\",\n  \"notes\": \"Implemented feature X, all tests passing locally\"\n}\n```\n\n## What Happens After Exit\n\n1. System validates the exit signal\n2. AgentSessionCompleted event is emitted to ledger\n3. Work item transitions to next phase (IMPLEMENTATION -> CI_PENDING)\n4. Lease is released\n5. CI runs (for CI_PENDING work)\n6. Fresh agent claims work when ready\n",
+      "affected_files": "New:\n  - crates/apm2-core/src/agent/exit.rs\n  - crates/apm2-core/src/agent/mod.rs\n  - documents/protocols/AGENT_EXIT_PROTOCOL.md\nModified:\n  - crates/apm2-core/src/lib.rs (add agent module)\n  - crates/apm2-core/src/session/mod.rs (add cleanup logic)\n"
+    }
+  }
+}

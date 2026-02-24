@@ -1,0 +1,62 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-001",
+      "kind": "invariant",
+      "title": "Deterministic reducers produce identical state from identical events",
+      "description": "All reducer implementations must produce identical state given identical event sequences. No randomness, no wall-clock reads during replay.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-002",
+      "kind": "invariant",
+      "title": "Hash-chain integrity for every appended event",
+      "description": "Every event appended to the ledger must include the hash of the preceding event. Breaking the chain is a hard error.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-003",
+      "kind": "safety",
+      "title": "Fail-closed security on missing config, unknown fields, expired leases",
+      "description": "Missing configuration, unknown fields, expired leases, and exhausted budgets all result in denial, never silent permissiveness.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-004",
+      "kind": "invariant",
+      "title": "Linear authority consumption for AJCs",
+      "description": "Authority Join Certificates (AJCs) authorize at most one side effect. Re-use is a hard error.",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-005",
+      "kind": "invariant",
+      "title": "Monotonic version counters for state objects",
+      "description": "State objects (work, session, lease) use monotonically increasing version numbers for optimistic concurrency. Versions never decrease.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-006",
+      "kind": "invariant",
+      "title": "Saturating arithmetic for budget deductions",
+      "description": "Budget deductions use saturating_sub to prevent underflow. Exhaustion is permanent once reached.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-007",
+      "kind": "safety",
+      "title": "Reject path traversal unconditionally",
+      "description": "Namespace and file path validation rejects '..' sequences unconditionally, even for unlimited-scope leases.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-008",
+      "kind": "requirement",
+      "title": "Proto event evolution follows standard proto rules",
+      "description": "Protobuf-generated event types may add fields and enum variants across versions. Public-facing library APIs must not use these relaxed semver rules.",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

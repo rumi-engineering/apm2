@@ -1,0 +1,73 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/quarantine_store",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-QUAR-001",
+      "kind": "safety",
+      "title": "Persistence failure rolls back in-memory state (fail-closed)",
+      "rfc": ["RFC-0028"],
+      "req": ["RFC-0028#REQ-0004"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-002",
+      "kind": "safety",
+      "title": "Missing SQLite backend denies all reservations",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-003",
+      "kind": "requirement",
+      "title": "Recovery loads persisted entries on construction",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-004",
+      "kind": "invariant",
+      "title": "All collections bounded by MAX_* constants",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-005",
+      "kind": "invariant",
+      "title": "reserve() uses caller-provided session_id for per-session quota isolation",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-006",
+      "kind": "invariant",
+      "title": "Eviction replacement is atomic within a single SQLite transaction",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-007",
+      "kind": "safety",
+      "title": "Reservation hash lookup uses constant-time comparison (timing attack prevention)",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-008",
+      "kind": "invariant",
+      "title": "remove/evict use persist-first-then-memory-commit to prevent drift",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-009",
+      "kind": "safety",
+      "title": "load_all() validates non-negative values before casting; rejects corrupted data",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-010",
+      "kind": "safety",
+      "title": "No evictable entry when at capacity returns deny (saturation-safe)",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-QUAR-011",
+      "kind": "safety",
+      "title": "Unexpired entries with priority >= incoming are never evicted",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

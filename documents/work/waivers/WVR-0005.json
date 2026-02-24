@@ -1,0 +1,63 @@
+{
+  "schema": "apm2.waiver.v1",
+  "waiver": {
+    "schema_version": "2026-02-08",
+    "id": "WVR-0005",
+    "title": "Temporary waiver: PR-branch AI review + gate projection on self-hosted runner",
+    "status": "APPROVED",
+    "scope": {
+      "gate_ids": [
+        "GATE-SECURITY-REVIEW",
+        "GATE-REVIEW-GATE-TRUST-BOUNDARY"
+      ],
+      "requirement_ids": [],
+      "quality_dimension_ids": [
+        "DEFAULT_DENY_SECURITY",
+        "OPERATIONAL_READINESS"
+      ]
+    },
+    "rationale": "APM2 is migrating CI to run fully on the `fac-ovh` self-hosted machine\n(TCK-00410). During this migration, we temporarily accept that:\n\n- AI reviewer workflows execute in PR-branch context for same-repo PRs.\n- The single authoritative merge signal is the `Review Gate Success` commit\n  status, projected from machine-readable PR comment artifacts.\n\nFork PR execution is explicitly excluded from self-hosted runners.\nThe remaining trust model assumes PR branch writers are trusted\ncollaborators for this repository.\n\nThis waiver expires once an immutable evaluator identity/provenance path is\nrestored (e.g., base-branch `pull_request_target` gate or equivalent\nattested reviewer identity), and/or dedicated bot identities are deployed.\n",
+    "mitigations": [
+      {
+        "description": "Hard-block fork PR heads on self-hosted runners for both CI and AI review workflows.",
+        "type": "TECHNICAL",
+        "owner": "CI maintainers"
+      },
+      {
+        "description": "Require machine-readable artifacts to be bound to exact PR number + head SHA; reject mismatches.",
+        "type": "TECHNICAL",
+        "owner": "CI maintainers"
+      },
+      {
+        "description": "Minimize workflow permissions and avoid broad secret propagation into review tasks.",
+        "type": "TECHNICAL",
+        "owner": "CI maintainers"
+      },
+      {
+        "description": "Time-bound exception with explicit remediation tracking to restore immutable evaluator provenance.",
+        "type": "PROCEDURAL",
+        "owner": "Security maintainer"
+      }
+    ],
+    "expiration_date": "2026-03-01",
+    "required_signoffs": [
+      "AUTH_SECURITY"
+    ],
+    "evidence_ids": [
+      "EVID-WVR-0005-TCK-00410"
+    ],
+    "references": {
+      "pr_url": "https://github.com/guardian-intelligence/apm2/pull/502",
+      "commit_sha": "8b7729d2cd8e92a44e53cf8b0ab6f8dcbf27c2e5",
+      "commit_message": "ci: scope HostToolsCheck to plan and harden PATH",
+      "related_ticket": "TCK-00410"
+    },
+    "approval": {
+      "approver": "repository_owner",
+      "approval_date": "2026-02-08",
+      "approval_notes": "Approved as a temporary migration waiver for self-hosted CI + AI review\nprojection restricted to same-repo PRs. Must be retired by expiration\nwith restored immutable evaluator provenance and/or dedicated reviewer\nidentities.\n"
+    },
+    "created_date": "2026-02-08",
+    "last_updated": "2026-02-08"
+  }
+}

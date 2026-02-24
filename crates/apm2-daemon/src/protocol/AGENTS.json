@@ -1,0 +1,117 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/protocol",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-PROTO-001",
+      "kind": "invariant",
+      "title": "Operator socket always has mode 0600",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-002",
+      "kind": "invariant",
+      "title": "Session socket always has mode 0660",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-003",
+      "kind": "invariant",
+      "title": "is_privileged determined solely by which socket accepted the connection",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-004",
+      "kind": "invariant",
+      "title": "Session endpoints require valid session_token",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-005",
+      "kind": "invariant",
+      "title": "Token validation uses constant-time HMAC comparison",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-006",
+      "kind": "safety",
+      "title": "Fail-closed tiers denied if neither AdmissionKernel nor LifecycleGate wired",
+      "rfc": ["RFC-0013", "RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-007",
+      "kind": "requirement",
+      "title": "AdmissionKernel plan/execute invoked for fail-closed tier requests",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-008",
+      "kind": "requirement",
+      "title": "EmitEvent and PublishEvidence enforce same kernel lifecycle as RequestTool",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-009",
+      "kind": "requirement",
+      "title": "Token validated BEFORE any handler logic executes",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-010",
+      "kind": "requirement",
+      "title": "Messages use bounded decoding (CTR-1603)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-011",
+      "kind": "invariant",
+      "title": "Domain separation with apm2.session_token.v1: prefix for session tokens",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-012",
+      "kind": "invariant",
+      "title": "Frame size validated BEFORE allocation (DoS prevention)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-013",
+      "kind": "invariant",
+      "title": "Connection closes on any framing or parse error",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-014",
+      "kind": "safety",
+      "title": "Fail-closed admission health gate on all token issuance paths",
+      "description": "admission_health_gate AtomicBool starts false and is re-evaluated by background health poller.",
+      "rfc": ["RFC-0013", "RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-015",
+      "kind": "requirement",
+      "title": "resolve_post_effect_anchor() called AFTER effect and BEFORE finalize",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-016",
+      "kind": "safety",
+      "title": "OpenWork pre-admission rejections use uniform CapabilityRequestRejected codes",
+      "description": "Prevents side-channel differentiation of rejection causes by unauthorized callers.",
+      "rfc": ["RFC-0013", "RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-017",
+      "kind": "invariant",
+      "title": "Work graph edge events produce two topics per event for both work IDs",
+      "rfc": ["RFC-0018"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-018",
+      "kind": "safety",
+      "title": "PCAC lifecycle enforcement runs BEFORE idempotency queries",
+      "description": "Prevents unauthorized callers from probing work_id existence (no existence oracle).",
+      "rfc": ["RFC-0027"]
+    }
+  ]
+}

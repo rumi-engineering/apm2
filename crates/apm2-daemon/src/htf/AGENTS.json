@@ -1,0 +1,36 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/htf",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-HTF-001",
+      "kind": "invariant",
+      "title": "Monotonic ticks never regress within a process lifetime",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-HTF-002",
+      "kind": "invariant",
+      "title": "HLC wall time is monotonically non-decreasing",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-HTF-003",
+      "kind": "invariant",
+      "title": "TimeEnvelope objects reference a pinned ClockProfile by hash",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-HTF-004",
+      "kind": "safety",
+      "title": "Remote HLC timestamps exceeding MAX_HLC_OFFSET_NS rejected (anti-drift)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-HTF-005",
+      "kind": "safety",
+      "title": "Clock regression emits CLOCK_REGRESSION defect and fails closed",
+      "rfc": ["RFC-0029"]
+    }
+  ]
+}

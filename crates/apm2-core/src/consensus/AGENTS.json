@@ -1,0 +1,55 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/consensus",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CONSENSUS-001",
+      "kind": "invariant",
+      "title": "All inter-node connections use mutual TLS 1.3",
+      "description": "TlsConfig requires both client and server certificates for mutual TLS 1.3 authentication.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-002",
+      "kind": "invariant",
+      "title": "Control plane messages use fixed-size 1024-byte frames",
+      "description": "All control plane frames are exactly CONTROL_FRAME_SIZE (1024) bytes for traffic analysis mitigation.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-003",
+      "kind": "invariant",
+      "title": "Connection pool enforces per-peer and total limits",
+      "description": "Maximum MAX_CONNECTIONS_PER_PEER (4) per peer and MAX_TOTAL_CONNECTIONS (64) total. Idle connections removed after 300s.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-004",
+      "kind": "invariant",
+      "title": "Peer list is bounded with stale peer cleanup",
+      "description": "Maximum MAX_PEERS (128) peers. Stale peers not seen for DEFAULT_PEER_TIMEOUT (300s) are removed.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-005",
+      "kind": "safety",
+      "title": "Join attempts rate-limited to prevent DoS",
+      "description": "Join attempts rate-limited to MAX_JOIN_ATTEMPTS_PER_MINUTE (10) per source to prevent DoS attacks on discovery service.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-006",
+      "kind": "safety",
+      "title": "Payload exceeding maximum size is rejected",
+      "description": "Payloads exceeding MAX_PAYLOAD_SIZE (1016 bytes) are rejected.",
+      "rfc": ["RFC-0014"]
+    },
+    {
+      "id": "BEH-CORE-CONSENSUS-007",
+      "kind": "requirement",
+      "title": "Node certificates must chain to network CA",
+      "description": "RootCertStore validates certificate chain. Node certificates must chain to the network CA.",
+      "rfc": ["RFC-0014"]
+    }
+  ]
+}

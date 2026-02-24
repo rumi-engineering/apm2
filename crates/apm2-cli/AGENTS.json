@@ -1,0 +1,237 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-001",
+      "kind": "invariant",
+      "title": "Config defaults to ecosystem.toml in current directory",
+      "description": "The `config` CLI argument defaults to `ecosystem.toml` in the working directory.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-002",
+      "kind": "invariant",
+      "title": "Socket path resolution order: CLI arg > config > default",
+      "description": "Socket path resolution follows: CLI `--socket` arg, then config file, then `/var/run/apm2/apm2.sock`.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-003",
+      "kind": "invariant",
+      "title": "CLI uses ProtocolServer framing; JSON framing prohibited",
+      "description": "CLI control-plane IPC must use ProtocolServer handshake and binary framing only. Legacy JSON IPC is forbidden by DD-009.",
+      "rfc": ["RFC-0013"],
+      "req": ["RFC-0013#DD-009"]
+    },
+    {
+      "id": "BEH-CLI-004",
+      "kind": "invariant",
+      "title": "Connection closed after each request-response cycle",
+      "description": "IPC connection is stateless: closed after each request-response cycle.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-005",
+      "kind": "invariant",
+      "title": "Operator and session sockets are distinct",
+      "description": "Privileged calls use operator.sock only; session-scoped calls use session.sock.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-006",
+      "kind": "requirement",
+      "title": "Daemon command spawns apm2-daemon binary, no direct logic",
+      "description": "The `Daemon` command spawns the `apm2-daemon` binary and does not implement daemon logic directly.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-007",
+      "kind": "safety",
+      "title": "Kill uses ProtocolServer; legacy JSON IPC forbidden",
+      "description": "The `Kill` command issues shutdown via ProtocolServer; legacy JSON IPC is forbidden.",
+      "rfc": ["RFC-0013"],
+      "req": ["RFC-0013#DD-009"]
+    },
+    {
+      "id": "BEH-CLI-008",
+      "kind": "requirement",
+      "title": "Process commands require daemon to be running",
+      "description": "All process management commands require a running daemon for IPC communication.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-009",
+      "kind": "requirement",
+      "title": "Login is client-side only, no daemon communication",
+      "description": "The `creds login` subcommand operates client-side only and does not communicate with the daemon.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-010",
+      "kind": "requirement",
+      "title": "Non-login credential commands require daemon connection",
+      "description": "All credential commands except `login` require a daemon connection.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-011",
+      "kind": "requirement",
+      "title": "Error exit with context on socket connection failure",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-012",
+      "kind": "requirement",
+      "title": "Error on daemon protocol error status",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-013",
+      "kind": "requirement",
+      "title": "Non-zero exit status on any error",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-014",
+      "kind": "safety",
+      "title": "Work file reads use handle-based bounded take to prevent TOCTOU",
+      "description": "File reads use handle-based `.take(MAX + 1)` bounding to prevent TOCTOU between stat and read. No separate metadata check.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-015",
+      "kind": "invariant",
+      "title": "work_id derived deterministically from ticket_id",
+      "description": "`work_id` is derived deterministically from `ticket_id` (`W-<ticket_id>`) so retrying the CLI with the same ticket yields the same `work_id`, preserving daemon-side idempotency.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-016",
+      "kind": "safety",
+      "title": "Daemon idempotency hash uses constant-time comparison",
+      "description": "Daemon idempotency hash comparison uses `subtle::ConstantTimeEq` to prevent timing side-channel leakage of cryptographic digests.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-017",
+      "kind": "safety",
+      "title": "Install binary reads bounded to MAX_BINARY_DIGEST_SIZE",
+      "description": "Binary reads for digest computation are bounded to `MAX_BINARY_DIGEST_SIZE`.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-018",
+      "kind": "safety",
+      "title": "Symlink creation uses atomic create-temp-then-rename",
+      "description": "Symlink creation uses atomic create-temp-then-rename(2) so the previous valid link is preserved unless the new link is fully materialized. Failure is fail-closed.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-019",
+      "kind": "safety",
+      "title": "Service restart failures cause non-zero exit unless --allow-partial",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-020",
+      "kind": "invariant",
+      "title": "Workspace root derived from current_exe, never from cwd",
+      "description": "Workspace root is derived from `current_exe()`, never from untrusted `current_dir()`.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-021",
+      "kind": "safety",
+      "title": "Config show is read-only; no state mutations",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-022",
+      "kind": "safety",
+      "title": "Config file reads are bounded",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-023",
+      "kind": "safety",
+      "title": "Unresolvable config fields report errors, not defaults",
+      "description": "Fail-closed: unresolvable fields report errors inline rather than omitting or synthesising default values.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-024",
+      "kind": "safety",
+      "title": "Reconciliation never silently drops jobs; all outcomes recorded",
+      "description": "No job is silently dropped; all outcomes recorded as receipts. Receipt persistence is mandatory.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-025",
+      "kind": "safety",
+      "title": "Stale lease detection is fail-closed to CORRUPT marking",
+      "description": "Ambiguous PID state results in CORRUPT marking, not recovery. Corrupt markers are durably persisted.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-026",
+      "kind": "safety",
+      "title": "Queue reads bounded by MAX_CLAIMED_SCAN_ENTRIES",
+      "description": "Every directory entry counts toward the cap before file-type filtering.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-027",
+      "kind": "invariant",
+      "title": "Stale lease recovery transitions through CLEANUP to IDLE",
+      "description": "Stale lease recovery transitions through CLEANUP to IDLE with durable evidence before lease removal.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-028",
+      "kind": "safety",
+      "title": "Move operations are fail-closed; counters increment after rename",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-029",
+      "kind": "safety",
+      "title": "Queue claimed directory rejects symlinked directories",
+      "description": "The `queue/claimed` directory is verified via `symlink_metadata()` before traversal; symlinked directories are rejected.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-030",
+      "kind": "invariant",
+      "title": "Reconciliation exempt from AJC lifecycle at startup",
+      "description": "Reconciliation is exempt from AJC lifecycle (RS-42, RFC-0027) as it runs at startup before the worker accepts any external authority.",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CLI-031",
+      "kind": "invariant",
+      "title": "At most one job executes in a lane at a time",
+      "description": "Enforced via `flock(LOCK_EX)` on the lane lock file.",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CLI-032",
+      "kind": "safety",
+      "title": "Lane reset refuses symlink traversal at any depth",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-033",
+      "kind": "safety",
+      "title": "Lane reset cannot delete outside allowed parent boundary",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-034",
+      "kind": "requirement",
+      "title": "FAC root preflight validates ownership and mode",
+      "description": "FAC root preflight validation enforces `private/fac` hierarchy ownership and mode checks before executing FAC commands.",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/htf",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-HTF-001",
+      "kind": "invariant",
+      "title": "LedgerTime ledger_id must not exceed MAX_STRING_LENGTH (4096 bytes)",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-002",
+      "kind": "invariant",
+      "title": "LedgerTime ordering is total and lexicographic",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-003",
+      "kind": "requirement",
+      "title": "Cross-node time comparison must use LedgerTime, never ticks or wall time",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-004",
+      "kind": "invariant",
+      "title": "HtfTick values are node-local; cross-node comparison is undefined",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-005",
+      "kind": "invariant",
+      "title": "TimeEnvelopeRef from_slice returns None if input is not 32 bytes",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-006",
+      "kind": "invariant",
+      "title": "BoundedWallInterval t_max >= t_min always enforced",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-007",
+      "kind": "invariant",
+      "title": "ClockProfile attestation bounded by MAX_ATTESTATION_SIZE (65536)",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-008",
+      "kind": "invariant",
+      "title": "Canonicalizable produces deterministic bytes for same input",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-009",
+      "kind": "invariant",
+      "title": "EpochSealV1 epoch_number must be > 0",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-010",
+      "kind": "invariant",
+      "title": "Epoch numbers must strictly increase per issuer (monotonicity)",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-011",
+      "kind": "safety",
+      "title": "Reject equivocating seals with same epoch but different root hashes",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-012",
+      "kind": "safety",
+      "title": "Fail-closed seal verification: no SignatureVerifier rejects ALL seals",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-013",
+      "kind": "invariant",
+      "title": "Tier2+ freshness policy must use StalenessAction::Deny",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-014",
+      "kind": "invariant",
+      "title": "Freshness thresholds monotonically non-increasing from Tier0 to Tier4",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-015",
+      "kind": "invariant",
+      "title": "VDF input_hash must be non-zero",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-016",
+      "kind": "invariant",
+      "title": "VDF output bounded to MAX_VDF_OUTPUT_LENGTH (256 bytes)",
+      "rfc": ["RFC-0016"]
+    },
+    {
+      "id": "BEH-CORE-HTF-017",
+      "kind": "invariant",
+      "title": "VDF difficulty bounded by MIN and MAX_VDF_DIFFICULTY",
+      "rfc": ["RFC-0016"]
+    }
+  ]
+}

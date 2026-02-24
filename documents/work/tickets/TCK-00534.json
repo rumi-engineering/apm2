@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00534",
+      "title": "Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "Leases exist and must be reconciled."
+        },
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker is the reconciler in default mode."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "On worker startup: reconcile `queue/claimed` and lane leases.",
+        "Detect stale leases (pid dead) and transition lane through CLEANUP to IDLE with receipts.",
+        "Detect claimed jobs without running unit: requeue or mark failed deterministically (policy-driven).",
+        "Implement `apm2 fac reconcile --dry-run|--apply` command (optional).",
+        "All reconciliations emit receipts."
+      ],
+      "out_of_scope": [
+        "Distributed reconciliation."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define recovery policy defaults.",
+        "Implement reconciler and atomic moves.",
+        "Add integration test simulating crash mid-job."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "After an unclean shutdown, the system converges to a consistent queue+lane state without manual file edits.",
+        "No job is silently dropped; outcomes are recorded as receipts."
+      ]
+    }
+  }
+}

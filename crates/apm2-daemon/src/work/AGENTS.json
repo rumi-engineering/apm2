@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/work",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-WORK-001",
+      "kind": "invariant",
+      "title": "Authority derived from ledger events only; filesystem state never consulted",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-002",
+      "kind": "invariant",
+      "title": "list_claimable() and list_all() bounded to MAX_WORK_LIST_ROWS (500)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-003",
+      "kind": "invariant",
+      "title": "Events replayed deterministically by (timestamp_ns, seq_id, original_index)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-004",
+      "kind": "safety",
+      "title": "Signature verification is fail-closed: invalid signatures rejected",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-005",
+      "kind": "requirement",
+      "title": "rebuild_from_events() resets reducer and replays in deterministic order",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-006",
+      "kind": "requirement",
+      "title": "Projection rebuilt lazily only when emitter reports different event count",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-007",
+      "kind": "safety",
+      "title": "resolve_ticket_alias() returns Err on ambiguity/lossy/saturated (fail-closed)",
+      "rfc": ["RFC-0017", "RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-008",
+      "kind": "invariant",
+      "title": "Alias index collections hard-capped by MAX_* constants per RS-27",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-009",
+      "kind": "requirement",
+      "title": "Single projection handle shared for both work authority and alias gate",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

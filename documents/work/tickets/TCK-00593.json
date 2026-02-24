@@ -1,0 +1,54 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00593",
+      "title": "Schema registry + bounded deserialization enforcement for all new FAC schemas (job/lease/profile/receipts/manifests)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Ensure every new schema in this RFC is implemented with:",
+        "  - stable schema id strings",
+        "  - deny_unknown_fields",
+        "  - bounded read size caps",
+        "  - canonicalization via apm2_core::determinism::canonicalize_json",
+        "Add a central registry list (or tests) preventing accidental schema id drift."
+      ],
+      "out_of_scope": [
+        "General schema evolution framework beyond FAC."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add schema structs and unit tests verifying schema ids.",
+        "Add bounded parsing wrappers reused across code."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "No schema is parsed without size bounds and deny_unknown_fields in default mode."
+      ]
+    }
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00587",
+      "title": "stop_revoke semantics: guarantee cancellation progress under load while still enforcing RFC-0028/0029 (explicit policy)",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00533",
+          "reason": "Cancellation job kind exists."
+        },
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker admission gating exists."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define explicit policy for stop_revoke jobs:",
+        "  - still require valid RFC-0028 token (no unauth cancel)",
+        "  - RFC-0029 admission: policy may allow a reserved lane share for stop_revoke to avoid deadlock",
+        "  - stop_revoke executes even when queue is congested (anti-starvation)",
+        "Record explicit stop_revoke admission trace in receipts."
+      ],
+      "out_of_scope": [
+        "Remote kill protocols."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add economics lane reservation for stop_revoke.",
+        "Add worker logic to prioritize cancellation safely."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Cancellation is reliable under heavy load without opening a bypass for unauthorized actuation."
+      ]
+    }
+  }
+}

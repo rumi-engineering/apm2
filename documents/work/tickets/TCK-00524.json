@@ -1,0 +1,65 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00524",
+      "title": "Disk preflight + enforced GC: implement `apm2 fac gc` + auto-GC escalation + GC receipts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00516",
+          "reason": "GC must use safe_rmtree_v1 for all deletions."
+        },
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "GC must respect lane leases and lane roots."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement disk preflight before RUNNING: check `$APM2_HOME` FS and lane workspace FS.",
+        "If below min-free threshold: run GC enforcement, re-check, fail closed if still low.",
+        "GC allowed deletions per RFC allowlist (lane targets/logs, fac cargo_home caches, legacy evidence logs, optional gate cache TTL).",
+        "Write `GcReceiptV1` content-addressed receipt with before/after free space and actions.",
+        "GC respects quarantine retention rules and emits receipts when pruning quarantine by policy."
+      ],
+      "out_of_scope": [
+        "Deleting worktrees outside lane roots."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement preflight helper and wire into worker before executing jobs.",
+        "Implement GC planner + executor + receipt writer.",
+        "Add dry-run + json output."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Low disk triggers auto-GC and prevents starting risky jobs.",
+        "GC never deletes outside allowed roots; uses safe_rmtree_v1."
+      ]
+    }
+  }
+}

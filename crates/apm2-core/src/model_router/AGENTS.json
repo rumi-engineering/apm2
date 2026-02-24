@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/model_router",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-MROUTER-001",
+      "kind": "invariant",
+      "title": "Profile IDs match ^[a-z][a-z0-9_-]*$ up to 64 characters",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-002",
+      "kind": "invariant",
+      "title": "Parsed profiles are immutable after loading",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-003",
+      "kind": "invariant",
+      "title": "Timeout values within 1000..=600000 ms",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-004",
+      "kind": "invariant",
+      "title": "Router is immutable after construction",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-005",
+      "kind": "safety",
+      "title": "Fail-closed: undefined stages return StageNotFound error",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-006",
+      "kind": "invariant",
+      "title": "Provider availability checked before routing",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-007",
+      "kind": "invariant",
+      "title": "Canary routes executed sequentially, not parallel",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-008",
+      "kind": "invariant",
+      "title": "Canary timing captured independently for each route",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-009",
+      "kind": "safety",
+      "title": "Profile file reads bounded to 1 MB (DoS protection)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-MROUTER-010",
+      "kind": "safety",
+      "title": "Path traversal prevented in profile paths via component analysis",
+      "rfc": ["RFC-0029"]
+    }
+  ]
+}

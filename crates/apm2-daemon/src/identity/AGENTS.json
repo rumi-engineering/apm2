@@ -1,0 +1,56 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/identity",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-IDENT-001",
+      "kind": "safety",
+      "title": "reject_free_floating_batch_root prevents seals with root but no proof",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-002",
+      "kind": "invariant",
+      "title": "Merkle proof depth bounded to MAX_MERKLE_PROOF_DEPTH",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-003",
+      "kind": "invariant",
+      "title": "Quorum signatures bounded to MAX_QUORUM_SIGNATURES",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-004",
+      "kind": "invariant",
+      "title": "Multi-proof leaves bounded to MAX_MULTIPROOF_LEAVES",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-005",
+      "kind": "safety",
+      "title": "Fail-closed parsing: unknown algorithm/set tags rejected, never defaulted",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#REQ-0007"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-006",
+      "kind": "invariant",
+      "title": "Strict canonical form rejects mixed case, whitespace, padding, Unicode",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#REQ-0007"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-007",
+      "kind": "invariant",
+      "title": "Text forms bounded to MAX_TEXT_LEN (96 bytes)",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-IDENT-008",
+      "kind": "invariant",
+      "title": "Lossless round-trip: binary-to-text-to-binary produces identical bytes",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

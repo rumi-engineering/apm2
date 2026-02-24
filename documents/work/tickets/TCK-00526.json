@@ -1,0 +1,59 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00526",
+      "title": "FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00521",
+          "reason": "Policy must define deny_ambient_cargo_home and env clearing/allowlist."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Set `CARGO_HOME=$APM2_HOME/private/fac/cargo_home` for all FAC jobs.",
+        "Clear environment by default and pass only allowlisted env vars into bounded units.",
+        "Deny ambient cargo home and ambient cargo config reliance.",
+        "Ensure bounded runner allowlist includes required env for correct execution."
+      ],
+      "out_of_scope": [
+        "Rustup toolchain installation automation."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement env builder from policy.",
+        "Propagate into systemd-run invocation and non-bounded paths."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "FAC runs are reproducible without relying on `~/.cargo/*` state.",
+        "Ambient secret env vars are not propagated into jobs by default."
+      ]
+    }
+  }
+}

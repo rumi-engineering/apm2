@@ -1,0 +1,108 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00492",
+      "title": "AdmissionKernel: implement plan/execute API with capability-gated effect surfaces + join-input assembly (witness seeds + ledger/policy prerequisites + safe plan semantics)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0023",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0023.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0002",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0002.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/rfcs/RFC-0028/requirements/REQ-0004.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0018",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0018.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00487",
+          "reason": "Spine addendum defines phase ordering, no-bypass, anti-rollback anchoring requirements, and required bindings."
+        },
+        {
+          "ticket_id": "TCK-00500",
+          "reason": "Kernel requires LedgerTrustVerifier + PolicyRootResolver interfaces to source validated anchors and governance-derived policy root."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Create `admission_kernel` module (or equivalent) with explicit plan/execute split for authority-bearing requests.",
+        "Kernel owns canonical phase ordering: join -> revalidate -> consume -> effect.",
+        "Kernel MUST assemble join inputs via canonical builder (PrivilegedPcacInputBuilder or module-equivalent). Manual join input assembly outside tests is forbidden.",
+        "Kernel MUST wire in authoritative prerequisites for fail-closed tiers via injected interfaces:",
+        "  - `LedgerTrustVerifier` validated anchors (fail closed if missing).",
+        "  - `PolicyRootResolver` governance-derived policy root (fail closed if missing).",
+        "  - `AntiRollbackAnchor` external anchor verification (fail closed if missing for fail-closed tiers; monitor tiers may proceed without).",
+        "Kernel MUST create and commit witness SEED hashes at join time for fail-closed tiers (NOT post-effect witness hashes).",
+        "Kernel MUST initialize boundary output mediation (buffer/stream gate) and MUST prevent early output release before post-effect checks for fail-closed tiers.",
+        "Kernel MUST implement safe plan semantics:",
+        "  - plan objects are single-use (execute rejects re-execution).",
+        "  - plan objects are non-serializable across trust boundaries.",
+        "  - join-time bindings (as_of anchor, policy root, seeds) are durably staged for restart-safe retry behavior.",
+        "Kernel MUST capability-gate effect execution, ledger writes, and quarantine insertion where feasible (EffectCapability/LedgerWriteCapability/QuarantineCapability).",
+        "Kernel MUST implement consume-adjacent durable guards for quarantine-mandatory policies (record a durable capacity guard/reservation token as part of consume barrier)."
+      ],
+      "out_of_scope": [
+        "RequestTool handler cutover (TCK-00494).",
+        "Quarantine eviction policy redesign (TCK-00496).",
+        "Effect execution journal (TCK-00501)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define kernel request structs and `AdmissionPlanV1` / `AdmissionResultV1`.",
+        "Implement plan phase: bounded decode -> HSI bindings -> validated anchor + policy root lookup -> witness seed creation -> join extension digest -> PCAC join -> PCAC revalidate.",
+        "Implement execute phase: revalidate (fresh) -> durable consume (conditional on revalidation state, includes any required durable guards) -> effect call through boundary mediation -> post-effect boundary checks + witness finalize -> bundle seal -> receipt emission.",
+        "Add tests: (a) missing policy-root denies for fail-closed tiers, (b) missing witness SEEDS deny for fail-closed tiers, (c) anti-rollback anchor missing denies for fail-closed tiers, (d) early output is impossible for fail-closed tiers, (e) intent mismatch denies at consume boundary, (f) plan cannot be executed twice."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0018"
+      ],
+      "criteria": [
+        "AdmissionKernel compiles and can be called from handlers without dependency cycles.",
+        "Join-input assembly uses the canonical builder (or equivalent) for privileged handlers.",
+        "Lifecycle ordering is enforced inside kernel; handler code cannot reorder it.",
+        "Fail-closed behavior for missing prerequisites is tested.",
+        "Kernel prevents early output release for fail-closed tiers (buffer or stream gate) and this is tested.",
+        "Plan re-execution is structurally impossible or denied and this is tested."
+      ]
+    },
+    "notes": {
+      "security": "This is the anti-7k-PR ticket: it creates the kernel aperture so future invariants do not land as cross-cutting edits.\nKey risk addressed: safe plan/execute split; without durable staging, restart can rebuild joins with different bindings.\n",
+      "verification": "Evidence is unit + integration tests demonstrating deny-on-missing prerequisites and consume-before-effect ordering.\n"
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/agent",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-AGENT-001",
+      "kind": "invariant",
+      "title": "Valid exit signals must emit AgentSessionCompleted events",
+      "description": "A valid ExitSignal that passes validate() MUST result in an AgentSessionCompleted event being emitted to the ledger.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-AGENT-002",
+      "kind": "safety",
+      "title": "Invalid exit signals never modify state",
+      "description": "An invalid ExitSignal (wrong protocol, unsupported version, malformed JSON) MUST NOT modify any work item state or emit any events.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-AGENT-003",
+      "kind": "invariant",
+      "title": "Feature flag cached once per process lifetime",
+      "description": "AGENT_EXIT_PROTOCOL_ENABLED is read once on first access and cached for the lifetime of the process, ensuring no hot-path env::var calls.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-AGENT-004",
+      "kind": "requirement",
+      "title": "Protocol field must be exactly apm2_agent_exit",
+      "description": "The protocol field MUST be exactly 'apm2_agent_exit'. Any other value is rejected with ExitSignalError::UnknownProtocol.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-AGENT-005",
+      "kind": "safety",
+      "title": "Deny unknown fields on exit signal types",
+      "description": "ExitSignal and AgentSessionCompleted use serde(deny_unknown_fields) to reject JSON with unexpected fields, preventing injection attacks.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-AGENT-006",
+      "kind": "requirement",
+      "title": "Exit signal protocol defaults to disabled (fail-closed)",
+      "description": "AGENT_EXIT_PROTOCOL_ENABLED defaults to false. Exit signals are NOT processed by default; explicit opt-in is required.",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

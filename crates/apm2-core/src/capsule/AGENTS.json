@@ -1,0 +1,69 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/capsule",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CAPSULE-001",
+      "kind": "invariant",
+      "title": "Capsule profiles are content-addressed via BLAKE3",
+      "description": "profile_hash is computed from a deterministic HashInput via BLAKE3. Profiles are identified by content hash, not profile ID string.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-002",
+      "kind": "invariant",
+      "title": "Deny-by-default egress is mandatory",
+      "description": "egress_policy.deny_by_default must be true. Fail-closed network security model.",
+      "rfc": ["RFC-0020", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-003",
+      "kind": "safety",
+      "title": "Tier3+ actuation without admitted capsule is rejected",
+      "description": "Tier3+ actuation without an admitted capsule profile is rejected. Admission is pinned to exact content hash.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-004",
+      "kind": "requirement",
+      "title": "All four core namespaces required for linux-ns-v1",
+      "description": "User, mount, pid, and net namespaces must all be enabled for the linux-ns-v1 capsule profile.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-005",
+      "kind": "requirement",
+      "title": "Seccomp level at least Restricted for linux-ns-v1",
+      "description": "Seccomp level must be at least Restricted for the linux-ns-v1 capsule profile.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-006",
+      "kind": "invariant",
+      "title": "Workspace confinement is fail-closed by construction",
+      "description": "WorkspaceConfinement is fail-closed by construction: the only public constructor validates the root path. Deserialization runs the same validation.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-007",
+      "kind": "safety",
+      "title": "Blocked system directories rejected at construction time",
+      "description": "Blocked system directories (/, /etc, /var, /proc, etc.) are rejected at WorkspaceConfinement construction time.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-008",
+      "kind": "safety",
+      "title": "Path traversal components rejected in workspace root",
+      "description": "ParentDir (..) and CurDir (.) components in workspace root paths are rejected.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-CAPSULE-009",
+      "kind": "requirement",
+      "title": "Cgroup limits must all be non-zero for linux-ns-v1",
+      "description": "Cgroup memory_limit_bytes, pids_max, and cpu_quota_us must all be non-zero for linux-ns-v1.",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-holon/src/ledger",
+  "behaviors": [
+    {
+      "id": "BEH-HOLON-LEDGER-001",
+      "kind": "invariant",
+      "title": "EventHash::ZERO is the sentinel value for genesis events",
+      "description": "INV-LG01: All bytes zero serves as the genesis sentinel.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-002",
+      "kind": "invariant",
+      "title": "Hash computation is pure and deterministic",
+      "description": "INV-LG02: Identical events always produce identical hashes.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-003",
+      "kind": "invariant",
+      "title": "EventType discriminants are stable across versions",
+      "description": "INV-LG04: New types may be added but existing representations do not change.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-004",
+      "kind": "safety",
+      "title": "EventType validate() enforces DoS-protective string and vector limits",
+      "description": "INV-LG05: MAX_STRING_LEN (4096) on all string fields and MAX_EVIDENCE_IDS (1000) on evidence ID vectors.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-005",
+      "kind": "invariant",
+      "title": "Event category predicates are mutually exclusive",
+      "description": "CTR-LG02: is_work_event, is_episode_event, is_artifact_event, is_lease_event, is_resource_event are mutually exclusive.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-006",
+      "kind": "invariant",
+      "title": "Genesis events have previous_hash == EventHash::ZERO",
+      "description": "INV-LG06: Genesis events are identified by their zero previous hash.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-007",
+      "kind": "invariant",
+      "title": "canonical_bytes() produces RFC 8785 JCS deterministic JSON",
+      "description": "INV-LG07: Canonical bytes exclude the signature field and use JCS for deterministic serialization.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-008",
+      "kind": "invariant",
+      "title": "compute_hash() uses BLAKE3 over canonical_bytes(), independent of signature",
+      "description": "INV-LG08: Hash is computed with BLAKE3 and is independent of the signature, enabling create-then-sign workflows.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-009",
+      "kind": "safety",
+      "title": "LedgerEvent validate() enforces field size limits for DoS protection",
+      "description": "INV-LG09: MAX_STRING_LEN on id, work_id, holon_id and MAX_SIGNATURE_LEN (128) on signature bytes.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-010",
+      "kind": "requirement",
+      "title": "verify_chain validates genesis, hash links, and timestamp ordering",
+      "description": "Chain verification checks for proper genesis event, unbroken hash links, and monotonic timestamp ordering.",
+      "rfc": ["RFC-0013", "RFC-0016"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-011",
+      "kind": "requirement",
+      "title": "validate_id rejects empty, oversized, path-traversal, and null-byte IDs",
+      "description": "CTR-LG17: Rejects empty strings, strings exceeding MAX_ID_LENGTH (256), strings containing '/' (path traversal prevention), and null bytes.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-012",
+      "kind": "safety",
+      "title": "EpisodeStarted and EpisodeCompleted use deny_unknown_fields",
+      "description": "INV-LG10/INV-LG12: Reject unknown fields during deserialization to prevent fail-open parsing.",
+      "rfc": ["RFC-0013", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-013",
+      "kind": "requirement",
+      "title": "EpisodeStarted.try_new() validates all ID fields via validate_id()",
+      "description": "CTR-LG09: Non-empty, at most 256 bytes, no '/' or null bytes. Returns HolonError::InvalidInput on failure.",
+      "rfc": ["RFC-0013", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-LEDGER-014",
+      "kind": "invariant",
+      "title": "LedgerEventBuilder panics if required fields not set",
+      "description": "CTR-LG07: event_id, work_id, holon_id, and event_type are required. Missing any causes a build-time panic.",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

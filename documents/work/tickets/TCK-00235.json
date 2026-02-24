@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00235",
+      "title": "FAC: Quarantine events and QuarantineProjection",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0117",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0025",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00202"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add quarantine proto messages (RunnerPoolQuarantined, AATSpecQuarantined, QuarantineCleared)",
+        "Implement QuarantineProjection struct",
+        "Implement apply() for event processing",
+        "Implement is_pool_quarantined() and is_spec_quarantined()"
+      ],
+      "out_of_scope": [
+        "Quarantine decision logic",
+        "Quarantine clearing UI"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add RunnerPoolQuarantined message to proto/kernel_events.proto",
+        "Add AATSpecQuarantined message",
+        "Add QuarantineCleared message",
+        "Create crates/apm2-core/src/fac/quarantine.rs",
+        "Define QuarantineProjection struct",
+        "Implement apply(event) for each event type",
+        "Implement is_pool_quarantined(pool_id)",
+        "Implement is_spec_quarantined(spec_id)",
+        "Write unit tests for projection updates",
+        "Write unit tests for quarantine clearing"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0025"
+      ],
+      "criteria": [
+        "Quarantine events update QuarantineProjection",
+        "Selection excludes quarantined pools/specs",
+        "QuarantineCleared re-enables targets",
+        "cargo test -p apm2-core fac::quarantine::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "Quarantine projection tracks quarantined runner pools and AAT specs.\nSelection must exclude quarantined resources to prevent flaky results.\n",
+      "implementation_details": "QuarantineProjection fields:\n- quarantined_pools: HashSet<String>\n- quarantined_specs: HashSet<String>\n\napply(event):\n- RunnerPoolQuarantined: add pool_id to quarantined_pools\n- AATSpecQuarantined: add spec_id to quarantined_specs\n- QuarantineCleared: remove target_id from both sets\n\nProto message fields:\n- quarantine_id, pool_id/spec_id, reason\n- evidence_refs, time_envelope_ref\n- issuer_actor_id, issuer_signature\n",
+      "affected_files": "Modified: proto/kernel_events.proto\nCreated: crates/apm2-core/src/fac/quarantine.rs\n"
+    }
+  }
+}

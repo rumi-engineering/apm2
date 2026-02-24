@@ -1,0 +1,56 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00546",
+      "title": "Optional patch bytes backend: integrate existing APM2 CAS as storage (with explicit GC decisions)",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00545",
+          "reason": "Start with fac_blobs_v1; CAS backend is optional."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add support for `bytes_backend: apm2_cas` in patch injection.",
+        "Define how CAS blobs are retained and pruned by FAC GC (explicit allowlist).",
+        "Fail-closed if backend is unknown or CAS policies not configured."
+      ],
+      "out_of_scope": [
+        "CAS redesign."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement CAS read/write integration.",
+        "Implement explicit FAC GC hooks for CAS paths used."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "CAS-backed patch bytes can be used safely without expanding GC authority to unrelated CAS data."
+      ]
+    }
+  }
+}

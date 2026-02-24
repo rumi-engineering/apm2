@@ -1,0 +1,105 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00051",
+      "title": "Implement PR parser logic"
+    },
+    "binds": {
+      "prd_id": "PRD-0003",
+      "rfc_id": "RFC-0004",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0001",
+          "requirement_ref": "documents/prds/PRD-0003/requirements/REQ-0001.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/prds/PRD-0003/evidence_artifacts/EVID-0001.yaml#prd_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_BUILD_RELEASE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00050",
+          "reason": "Requires shared types: ParsedPRDescription, OutcomeItem, KnownLimitation, ParseError"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Create xtask/src/aat/parser.rs with PR description parsing logic",
+        "Add pub mod parser to xtask/src/aat/mod.rs",
+        "Implement parse_pr_description(markdown: &str) -> Result<ParsedPRDescription, ParseError>",
+        "Use regex to extract ## Usage section content",
+        "Use regex to extract ## Expected Outcomes and parse checkbox items",
+        "Use regex to extract ## Evidence Script code block",
+        "Use regex to extract ## Known Limitations with WAIVER-ID references",
+        "Return ParseError::MissingUsage for missing ## Usage section",
+        "Return ParseError::MissingExpectedOutcomes for missing ## Expected Outcomes section",
+        "Handle markdown variations: extra whitespace, different heading levels, code fence styles",
+        "Write unit tests for parse_pr_description",
+        "Write unit tests for each internal parser helper"
+      ],
+      "out_of_scope": [
+        "Type definitions (TCK-00050)",
+        "LLM fallback for malformed descriptions",
+        "GitHub API integration (TCK-00054)",
+        "Hypothesis generation (handled by AAT skill)",
+        "Anti-gaming analysis (TCK-00052)",
+        "Evidence bundle generation (TCK-00053)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add pub mod parser to xtask/src/aat/mod.rs",
+        "Create xtask/src/aat/parser.rs",
+        "Import types from crate::aat::types",
+        "Implement SECTION_REGEX patterns for each of the 4 sections",
+        "Implement parse_usage() to extract content after ## Usage header",
+        "Implement parse_expected_outcomes() to extract checkbox items as Vec<OutcomeItem>",
+        "Implement parse_evidence_script() to extract bash/shell code block content",
+        "Implement parse_known_limitations() to extract items with optional (WAIVER-XXXX) references",
+        "Implement parse_pr_description() that calls all parsers and validates required fields",
+        "Write unit tests for each parser function",
+        "Write integration tests with realistic PR description samples"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001"
+      ],
+      "criteria": [
+        "xtask/src/aat/parser.rs exists",
+        "pub mod parser declared in xtask/src/aat/mod.rs",
+        "parse_pr_description() extracts all 4 sections from well-formed markdown",
+        "ParseError::MissingUsage returned when ## Usage is absent",
+        "ParseError::MissingExpectedOutcomes returned when ## Expected Outcomes is absent",
+        "Checkbox state correctly parsed from [ ] and [x] markers",
+        "WAIVER-ID extracted from Known Limitations entries",
+        "Unit tests cover: valid input, missing sections, malformed markdown",
+        "cargo build succeeds",
+        "cargo test passes",
+        "cargo clippy passes with no warnings"
+      ]
+    },
+    "notes": {
+      "security": "Sanitize all parsed content - PR descriptions are untrusted input from potentially adversarial agents",
+      "verification": "Test with real PR descriptions from this repository",
+      "general": "Uses types from TCK-00050. Keep the API simple and well-documented."
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00498",
+      "title": "Cutover PublishEvidence + EmitEvent to AdmissionKernel (enforce PCAC lifecycle + bundle binding + policy-root trust prerequisites)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0026",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0026.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0021",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0021.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00488",
+          "reason": "Kernel exists."
+        },
+        {
+          "ticket_id": "TCK-00489",
+          "reason": "Bundle binding required."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Route PublishEvidence and EmitEvent through AdmissionKernel in authoritative mode.",
+        "Ensure PCAC lifecycle ordering and bundle binding for emitted authoritative outcomes.",
+        "Require authoritative policy-root derivation prerequisites for fail-closed tiers.",
+        "Ensure endpoint responses (including any streaming or partial acknowledgements) are emitted only through kernel-controlled boundary mediation for fail-closed tiers."
+      ],
+      "out_of_scope": [
+        "Redesigning evidence schemas beyond binding completeness."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define endpoint-specific canonical request/effect digests.",
+        "Implement plan/execute wiring in kernel for these endpoints.",
+        "Add tests: deny on missing governance policy root for fail-closed tiers; deny on lifecycle bypass; receipts reference AdmissionBundle digest."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0021"
+      ],
+      "criteria": [
+        "PublishEvidence/EmitEvent do not bypass kernel in authoritative mode.",
+        "Lifecycle + evidence closure is enforced and tested."
+      ]
+    }
+  }
+}

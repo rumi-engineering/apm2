@@ -1,0 +1,85 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00376",
+      "title": "No-bypass path ratchet enforcement",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0030",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0030.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0030",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0030.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0307",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0307.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00375",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Remove all allow-by-manifest and non-broker actuation bypasses",
+        "Add regression tests proving tool execution requires broker+capability+context firewall",
+        "Set Tier2+ deny-default when required enforcement components unavailable"
+      ],
+      "out_of_scope": [
+        "Structured ToolKinds hardening (TCK-00377)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Remove all allow-by-manifest and non-broker actuation bypasses",
+        "Implement: Add regression tests proving tool execution requires broker+capability+context firewall",
+        "Implement: Set Tier2+ deny-default when required enforcement components unavailable",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0020/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0030",
+        "EVID-0307"
+      ],
+      "criteria": [
+        "No actuation path bypasses broker and policy checks",
+        "Unavailable enforcement dependency causes deny, never permissive fallback",
+        "Regression suite prevents bypass reintroduction"
+      ]
+    },
+    "notes": {
+      "security": "Fail-closed, least privilege, and explicit authority proofs are mandatory.",
+      "verification": "Prefer deterministic tests, replay/CAS evidence, and bounded-resource checks; avoid process-local assumptions.",
+      "general": "Keep scope atomic to this ticket, preserve explicit dependency ordering, and avoid introducing semantic drift from RFC-0020."
+    }
+  }
+}

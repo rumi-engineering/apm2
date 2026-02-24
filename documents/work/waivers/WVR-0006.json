@@ -1,0 +1,65 @@
+{
+  "schema": "apm2.waiver.v1",
+  "waiver": {
+    "schema_version": "2026-01-30",
+    "id": "WVR-0006",
+    "title": "Temporary FAC trigger downgrade to pull_request",
+    "status": "SUPERSEDED",
+    "scope": {
+      "gate_ids": [
+        "GATE-FAC-TRIGGER-TRUST-BOUNDARY"
+      ],
+      "requirement_ids": [
+        "REQ-HEF-0016"
+      ],
+      "quality_dimension_ids": [
+        "DEFAULT_DENY_SECURITY",
+        "OPERATIONAL_READINESS"
+      ]
+    },
+    "rationale": "Originally approved to temporarily permit pull_request trigger execution on\nthe self-hosted FAC runner. This introduced a fork-based attack vector where\nan external contributor could modify the workflow YAML in their PR branch to\nbypass barrier checks and execute arbitrary code on the runner.\n\nThe attack vector has been eliminated by splitting into two workflows:\n- forge-admission-barrier.yml: triggered by pull_request_target only (YAML\n  always from base/default branch)\n- forge-admission-cycle.yml: triggered by workflow_run (after barrier\n  completes) and workflow_dispatch (manual). workflow_run always executes\n  YAML from the default branch.\n\nThis waiver is now SUPERSEDED — no trigger trust boundary regression remains.\n",
+    "mitigations": [
+      {
+        "description": "Barrier job runs under pull_request_target (YAML from base branch, not PR branch)",
+        "type": "TECHNICAL",
+        "owner": "forge-admission-barrier.yml"
+      },
+      {
+        "description": "FAC job runs under workflow_run (YAML always from default branch)",
+        "type": "TECHNICAL",
+        "owner": "forge-admission-cycle.yml"
+      },
+      {
+        "description": "Workflow dispatch path remains permission-gated (write/maintain/admin + trusted ref)",
+        "type": "TECHNICAL",
+        "owner": "FAC dispatch-auth gate"
+      }
+    ],
+    "expiration_date": "2026-03-11",
+    "required_signoffs": [
+      "AUTH_SECURITY",
+      "AUTH_RELIABILITY"
+    ],
+    "evidence_ids": [
+      "EVID-WVR-0006-WORKFLOW-CHANGE"
+    ],
+    "references": {
+      "ticket_id": "TCK-00433",
+      "rfc_id": "RFC-0018",
+      "barrier_workflow": ".github/workflows/forge-admission-barrier.yml",
+      "cycle_workflow": ".github/workflows/forge-admission-cycle.yml",
+      "superseded_by_commit": "7fa539dbd023e4b354939bd388c43897e49309ae"
+    },
+    "approval": {
+      "approver": "repository_owner",
+      "approval_date": "2026-02-09",
+      "approval_notes": "Approved as a temporary operational waiver with explicit 30-day expiry\nand mandatory follow-up hardening audit.\n"
+    },
+    "superseded": {
+      "date": "2026-02-09",
+      "reason": "Two-workflow split eliminates pull_request trigger from FAC entirely"
+    },
+    "created_date": "2026-02-09",
+    "last_updated": "2026-02-09"
+  }
+}

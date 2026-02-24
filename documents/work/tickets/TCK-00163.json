@@ -1,0 +1,115 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00163",
+      "title": "Implement capability manifest and validation",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-TOOL-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00160"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "CapabilityManifest type with sealed references",
+      "verification": "Unit test verifies manifest structure"
+    },
+    {
+      "criterion": "Capability validation against tool requests",
+      "verification": "Unauthorized requests denied"
+    },
+    {
+      "criterion": "Policy integration for OCAP enforcement",
+      "verification": "Policy rules evaluated for each request"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "CapabilityManifest structure",
+        "code": "pub struct CapabilityManifest {\n    pub manifest_id: ManifestId,\n    pub capabilities: Vec<Capability>,\n    pub delegator_id: ActorId,\n    pub created_at: Timestamp,\n    pub expires_at: Option<Timestamp>,\n}\n\npub struct Capability {\n    pub capability_id: CapabilityId,\n    pub tool_class: ToolClass,\n    pub scope: CapabilityScope,\n    pub risk_tier_required: RiskTier,\n}\n\npub struct CapabilityScope {\n    pub root_paths: Vec<PathBuf>,\n    pub allowed_patterns: Vec<GlobPattern>,\n    pub size_limits: SizeLimits,\n    pub network_policy: Option<NetworkPolicy>,\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/src/episode/capability.rs",
+        "purpose": "CapabilityManifest and Capability types"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/scope.rs",
+        "purpose": "CapabilityScope and validation logic"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/tool_class.rs",
+        "purpose": "ToolClass enum and matching"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Export capability, scope, tool_class modules",
+        "path": "crates/apm2-daemon/src/episode/mod.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Define CapabilityManifest",
+        "details": "Create manifest type per AD-TOOL-002:\n- manifest_id: unique identifier\n- capabilities: Vec<Capability>\n- delegator_id: who granted\n- timestamps for audit\n"
+      },
+      {
+        "step": 2,
+        "action": "Define Capability struct",
+        "details": "Create sealed capability reference:\n- capability_id: unique\n- tool_class: Read | Write | Execute | Network | ...\n- scope: path patterns, size limits\n- risk_tier_required: minimum tier\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement CapabilityScope",
+        "details": "Create scope validation:\n- root_paths: allowed base directories\n- allowed_patterns: glob patterns for paths\n- size_limits: max bytes per operation\n- network_policy: allowed hosts/ports\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement validation logic",
+        "details": "CapabilityManifest.validate(tool_request):\n- Find matching capability by tool_class\n- Verify path within allowed patterns\n- Check size limits\n- Verify risk tier\n- Return Allow | Deny(reason)\n"
+      },
+      {
+        "step": 5,
+        "action": "Integrate with PolicyEngine",
+        "details": "CapabilityValidator struct:\n- load_manifest(hash: Hash) -> CapabilityManifest\n- validate_request(manifest, request) -> Decision\n- Uses apm2-core PolicyEngine for rule evaluation\n"
+      }
+    ],
+    "summary": "Implement capability manifest and validation per AD-TOOL-002.\nDefines sealed capability references with scoped parameters.\nCapabilities are delegated not discovered (OCAP enforcement).\n"
+  },
+  "notes": "Phase: PHASE-2A (Tool Broker Foundation)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-007.\n",
+  "test_requirements": [
+    {
+      "description": "Capability validation",
+      "test_id": "UT-00163-01",
+      "verification_command": "cargo test -p apm2-daemon capability_validation"
+    },
+    {
+      "description": "Scope pattern matching",
+      "test_id": "UT-00163-02",
+      "verification_command": "cargo test -p apm2-daemon scope_patterns"
+    },
+    {
+      "description": "Unauthorized denial",
+      "test_id": "UT-00163-03",
+      "verification_command": "cargo test -p apm2-daemon capability_deny"
+    }
+  ]
+}

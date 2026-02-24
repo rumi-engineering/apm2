@@ -1,0 +1,41 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "documents/work/tickets",
+  "behaviors": [
+    {
+      "id": "BEH-DOC-TICKETS-001",
+      "kind": "requirement",
+      "title": "Tickets use TCK-NNNNN ID format with zero-padded five digits",
+      "description": "ID Format uses TCK-NNNNN (e.g., TCK-00001).",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-TICKETS-002",
+      "kind": "requirement",
+      "title": "Each ticket is a single YAML file with no separate markdown files",
+      "description": "File naming is TCK-NNNNN.yaml containing all metadata, scope, plan, and criteria in a single file.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-TICKETS-003",
+      "kind": "requirement",
+      "title": "Tickets follow the ticket_meta schema structure",
+      "description": "Schema: standards/schemas/04_ticket_meta.schema.yaml. Sections: ticket, binds, custody, dependencies, scope, plan, definition_of_done, notes.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-TICKETS-004",
+      "kind": "requirement",
+      "title": "Tickets must link to PRD/RFC requirements via binds section",
+      "description": "Each ticket links to PRD/RFC requirements and evidence artifacts through the binds section.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-TICKETS-005",
+      "kind": "requirement",
+      "title": "Ticket completion requires evidence artifact verification",
+      "description": "definition_of_done contains evidence IDs and acceptance criteria that must be verified on completion.",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

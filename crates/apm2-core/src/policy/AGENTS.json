@@ -1,0 +1,78 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/policy",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-POLICY-001",
+      "kind": "invariant",
+      "title": "Default-deny: unmatched requests are always denied",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-002",
+      "kind": "safety",
+      "title": "Fail-closed: any evaluation error results in denial",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-003",
+      "kind": "invariant",
+      "title": "Deterministic: same policy hash + same request = same decision",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-004",
+      "kind": "safety",
+      "title": "Path traversal protection: paths containing .. always rejected",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-005",
+      "kind": "invariant",
+      "title": "Rule ID uniqueness enforced within a policy",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-006",
+      "kind": "invariant",
+      "title": "Policy must contain at least one rule",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-007",
+      "kind": "invariant",
+      "title": "Taint lattice monotonicity: taint levels can only increase",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-008",
+      "kind": "requirement",
+      "title": "Declassification requires valid receipt with cryptographic preimage",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-009",
+      "kind": "invariant",
+      "title": "Attestation floor monotonicity: can only tighten (increase)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-010",
+      "kind": "invariant",
+      "title": "Higher risk tiers require higher minimum attestation levels",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-011",
+      "kind": "invariant",
+      "title": "Authority delegation meet produces component-wise minimum (narrowing)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-POLICY-012",
+      "kind": "invariant",
+      "title": "Permeability receipt cryptographically binds meet result to parties",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/lease",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-LEASE-001",
+      "kind": "invariant",
+      "title": "Lease state transitions are irreversible: Active -> Released/Expired",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-002",
+      "kind": "invariant",
+      "title": "lease_id is unique across all leases",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-003",
+      "kind": "invariant",
+      "title": "expires_at > issued_at enforced at issuance",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-004",
+      "kind": "invariant",
+      "title": "renewal_count uses saturating arithmetic; cannot overflow",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-005",
+      "kind": "safety",
+      "title": "terminated_at set from lease expires_at to prevent pruning evasion",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-006",
+      "kind": "invariant",
+      "title": "Tick-based expiry immune to wall-clock manipulation (RFC-0016 HTF)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-007",
+      "kind": "invariant",
+      "title": "At most one active lease per work_id (at-most-one enforcement)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-008",
+      "kind": "invariant",
+      "title": "LeaseReducer is deterministic: same event sequence produces identical state",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-009",
+      "kind": "safety",
+      "title": "Reject lease issuance for already-leased work",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-010",
+      "kind": "safety",
+      "title": "Reject operations on terminal leases",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-011",
+      "kind": "safety",
+      "title": "Only lease holder can release their lease (authorization check)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-LEASE-012",
+      "kind": "safety",
+      "title": "Reject lease issuance with empty registrar signature",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

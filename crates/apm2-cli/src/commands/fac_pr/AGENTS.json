@@ -1,0 +1,76 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli/src/commands/fac_pr",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-FAC-PR-001",
+      "kind": "invariant",
+      "title": "Private key stored in keyring before config file written",
+      "description": "In keyring mode, private key is stored in OS keyring before any config file is written.",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-002",
+      "kind": "safety",
+      "title": "Config and PEM files written with mode 0600",
+      "description": "Config file and fallback PEM are written with mode 0600 (owner read/write only).",
+      "rfc": ["RFC-0015", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-003",
+      "kind": "safety",
+      "title": "Symlink targets rejected for private key paths via O_NOFOLLOW",
+      "description": "Symlink targets rejected at open time via `O_NOFOLLOW`. All private key reads use the open-once bounded strategy: open with `O_NOFOLLOW`, validate metadata on the handle, read bounded content from the same descriptor.",
+      "rfc": ["RFC-0015", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-004",
+      "kind": "safety",
+      "title": "Source PEM deleted after keyring import unless --keep-private-key-file",
+      "description": "Source PEM file is deleted after keyring import unless `--keep-private-key-file`. When source and destination paths alias the same file, deletion is skipped.",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-005",
+      "kind": "requirement",
+      "title": "Headless mode skips keyring and writes PEM to APM2_HOME",
+      "description": "In `--for-systemd` mode, keyring is skipped entirely and PEM is written to `$APM2_HOME/app-{app_id}.pem`.",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-006",
+      "kind": "safety",
+      "title": "App and installation IDs validated as strict numeric-only",
+      "description": "`app_id` and `installation_id` validated as strict numeric-only GitHub identifiers. Path separators, dot-segments, quotes, control characters, and whitespace are rejected.",
+      "rfc": ["RFC-0015", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-007",
+      "kind": "safety",
+      "title": "GitHub App TOML generated via typed serialization, not interpolation",
+      "description": "`github_app.toml` is generated via typed TOML serialization (`GitHubAppTomlConfig` struct), not manual string interpolation, to prevent config injection.",
+      "rfc": ["RFC-0015", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-008",
+      "kind": "safety",
+      "title": "Private key reads bounded to 16 KiB",
+      "description": "Private key reads are bounded to 16 KiB (`MAX_PRIVATE_KEY_FILE_SIZE`) to prevent resource exhaustion.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-009",
+      "kind": "requirement",
+      "title": "Credential resolution follows env > config > error chain",
+      "description": "Credential resolution order: environment variable, then config file, then error with remediation guidance.",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CLI-FAC-PR-010",
+      "kind": "requirement",
+      "title": "Private key resolution follows env > systemd > keyring > PEM chain",
+      "description": "Private key resolution order: environment variable, then systemd credential, then OS keyring, then PEM file fallback (only if enabled).",
+      "rfc": ["RFC-0015"]
+    }
+  ]
+}

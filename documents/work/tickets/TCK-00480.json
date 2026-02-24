@@ -1,0 +1,57 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00480",
+      "title": "FAC polling staleness check to prevent concurrency deadlock",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CI"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Add staleness check to FAC polling loop in forge-admission-cycle.yml.",
+        "On each poll iteration, verify the PR HEAD still matches the SHA being polled.",
+        "If HEAD has moved, exit cleanly to release the concurrency slot for the newer run."
+      ],
+      "out_of_scope": [
+        "Changes to the barrier or dispatch-auth jobs.",
+        "Changes to the concurrency group configuration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add gh API call at top of polling loop to fetch current PR HEAD SHA.",
+        "Compare against the SHA resolved at job start; exit 0 if superseded."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Stale FAC runs self-terminate within one poll interval (30s) when HEAD moves.",
+        "Concurrency slot is released cleanly, unblocking the run for the new HEAD."
+      ]
+    },
+    "notes": {
+      "security": "No security impact; the staleness check only causes early clean exit for superseded runs.\n",
+      "general": "Root cause: cancel-in-progress occasionally fails to cancel the older run, leaving\nthe FAC polling job blocking the concurrency group for up to 80 minutes on a SHA\nthat will never receive matching review verdicts. This fix is defense-in-depth.\n"
+    }
+  }
+}

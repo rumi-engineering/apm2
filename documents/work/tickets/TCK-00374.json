@@ -1,0 +1,88 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00374",
+      "title": "Capsule profile linux-ns-v1 hardening",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0028",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0028.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0028",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0028.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0307",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0307.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00351",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Enforce linux-ns-v1 profile with namespaces, seccomp, cgroups",
+        "Deny ambient egress by default and confine workspace root",
+        "Add capsule escape and path traversal adversarial tests",
+        "Type definitions, validation logic, and unit tests only"
+      ],
+      "out_of_scope": [
+        "Runtime integration of AdmissionGate::check into daemon actuation paths (deferred to TCK-00375)",
+        "No-bypass path ratchet for alternative spawn paths (deferred to TCK-00376)",
+        "Context firewall TOCTOU integrity checks (TCK-00375)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Enforce linux-ns-v1 profile with namespaces, seccomp, cgroups",
+        "Implement: Deny ambient egress by default and confine workspace root",
+        "Implement: Add capsule escape and path traversal adversarial tests",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0020/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0028",
+        "EVID-0307"
+      ],
+      "criteria": [
+        "Tier3+ actuation executes only inside admitted capsule profile",
+        "Capsule egress defaults to deny unless policy grants explicit route",
+        "Escape attempts become blocking defects"
+      ]
+    },
+    "notes": {
+      "security": "Fail-closed, least privilege, and explicit authority proofs are mandatory.",
+      "verification": "Prefer deterministic tests, replay/CAS evidence, and bounded-resource checks; avoid process-local assumptions.",
+      "general": "Keep scope atomic to this ticket, preserve explicit dependency ordering, and avoid introducing semantic drift from RFC-0020."
+    }
+  }
+}

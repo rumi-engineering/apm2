@@ -1,0 +1,41 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/bootstrap",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-BOOT-001",
+      "kind": "invariant",
+      "title": "Bootstrap schemas are embedded in the binary at build time",
+      "description": "Bootstrap schemas are embedded via include! macro and verified at runtime startup to ensure integrity.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-BOOT-002",
+      "kind": "requirement",
+      "title": "Verify bootstrap hash before processing CAC artifacts",
+      "description": "verify_bootstrap_hash() MUST be called before processing CAC artifacts. Application MUST terminate on VerificationFailed.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-BOOT-003",
+      "kind": "safety",
+      "title": "All modifications to bootstrap schemas are prevented",
+      "description": "Patches targeting bootstrap:* prefixed IDs are rejected unconditionally via reject_bootstrap_patch().",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-BOOT-004",
+      "kind": "invariant",
+      "title": "Bundle hash verified via BLAKE3 256-bit cryptographic hash",
+      "description": "Build-time bundle hash is checked at startup. BLAKE3 256-bit hash prevents collision attacks.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-BOOT-005",
+      "kind": "invariant",
+      "title": "VerificationFailed indicates binary tampering",
+      "description": "A VerificationFailed error from bootstrap hash verification indicates binary tampering or build inconsistency.",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

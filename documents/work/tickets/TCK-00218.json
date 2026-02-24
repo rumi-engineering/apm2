@@ -1,0 +1,86 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00218",
+      "title": "FAC: AatGateReceipt typed payload schema",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0015",
+      "requirements": [
+        {
+          "requirement_id": "FAC-REQ-0004",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        },
+        {
+          "requirement_id": "FAC-REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0015/01_problem_and_imports.yaml#rfc_imported_requirements"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-FAC-0007",
+          "artifact_ref": "documents/rfcs/RFC-0015/07_test_and_evidence.yaml#evidence_requirements"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_CORE"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00207"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add AatGateReceipt proto message",
+        "Create AatGateReceipt Rust type with 22 fields",
+        "Implement required field validation",
+        "Validate run_receipt_hashes.len() == run_count"
+      ],
+      "out_of_scope": [
+        "Terminal verifier types (TCK-00219)",
+        "Transcript binding (TCK-00220)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add AatGateReceipt message to proto/kernel_events.proto",
+        "Include all 22 required fields in proto",
+        "Create crates/apm2-core/src/fac/aat_receipt.rs",
+        "Define AatGateReceipt struct with all fields",
+        "Define DeterminismStatus, FlakeClass, AatVerdict, RiskTier enums",
+        "Implement validate_required_fields() method",
+        "Check run_receipt_hashes.len() == run_count",
+        "Write unit tests for required field validation",
+        "Write unit tests for run count matching"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-FAC-0007"
+      ],
+      "criteria": [
+        "AatGateReceipt has all 22 required fields",
+        "Missing fields are rejected",
+        "run_receipt_hashes.len() must equal run_count",
+        "cargo test -p apm2-core fac::aat_receipt::tests passes"
+      ]
+    },
+    "notes": {
+      "security": "AatGateReceipt is the typed payload for AAT gate results.\nAll 22 fields are required to ensure complete evidence binding.\n",
+      "implementation_details": "AatGateReceipt fields (22):\n1. view_commitment_hash, 2. rcp_manifest_hash, 3. rcp_profile_id\n4. policy_hash, 5. determinism_class, 6. determinism_status\n7. flake_class, 8. run_count, 9. run_receipt_hashes\n10. terminal_evidence_digest, 11. observational_evidence_digest\n12. terminal_verifier_outputs_digest, 13. stability_digest\n14. verdict, 15. transcript_chain_root_hash, 16. transcript_bundle_hash\n17. artifact_manifest_hash, 18. terminal_verifier_outputs\n19. verifier_policy_hash, 20. selection_policy_id, 21. risk_tier\n22. attestation\n",
+      "affected_files": "Modified: proto/kernel_events.proto\nCreated: crates/apm2-core/src/fac/aat_receipt.rs\n"
+    }
+  }
+}

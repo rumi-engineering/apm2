@@ -1,0 +1,59 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00530",
+      "title": "LaneProfile→systemd unit properties: single authoritative builder for CPU/mem/PIDs/IO/timeouts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00515",
+          "reason": "LaneProfileV1 must exist."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement a single builder that maps LaneProfileV1 + FacPolicyV1 to systemd properties.",
+        "Ensure consistent enforcement across backends (user-mode/system-mode).",
+        "Centralize defaults for CPUQuota, MemoryMax, TasksMax(PIDs), IOWeight, TimeoutStartSec/RuntimeMaxSec, KillMode.",
+        "Expose a `--print-unit` debug mode (optional) to show computed properties."
+      ],
+      "out_of_scope": [
+        "Dynamic per-testcase tuning."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define property mapping table.",
+        "Implement builder + tests verifying deterministic output.",
+        "Wire into both execution backends."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "All job executions use the builder (no ad-hoc unit property duplication).",
+        "Changing LaneProfileV1 changes runtime unit properties deterministically."
+      ]
+    }
+  }
+}

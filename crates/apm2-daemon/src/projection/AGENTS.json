@@ -1,0 +1,133 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/projection",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-PROJ-001",
+      "kind": "invariant",
+      "title": "Watermark is NOT advanced for events that fail due to missing dependencies",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-002",
+      "kind": "invariant",
+      "title": "Worker is idempotent: restarts do not duplicate comments",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-003",
+      "kind": "safety",
+      "title": "Adapter never reads GitHub status as truth (write-only)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-004",
+      "kind": "invariant",
+      "title": "Every projection generates a signed ProjectionReceipt",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-005",
+      "kind": "safety",
+      "title": "Divergence triggers DefectRecord and InterventionFreeze",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-006",
+      "kind": "safety",
+      "title": "No ReviewReceiptRecorded projection without economics admission gate",
+      "description": "When gate is NOT wired, those events are DENIED (fail-closed).",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-007",
+      "kind": "safety",
+      "title": "Missing gate inputs result in DENY, not default ALLOW",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-008",
+      "kind": "safety",
+      "title": "Events without economics selectors DENIED -- no bypass path",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-009",
+      "kind": "safety",
+      "title": "No external projection side effect unless lifecycle gate succeeds",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-010",
+      "kind": "invariant",
+      "title": "PROJECTION_ADMISSION_RECEIPT domain distinct from PROJECTION_RECEIPT",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-011",
+      "kind": "invariant",
+      "title": "time_authority_ref and window_ref must not be zero (fail-closed)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-012",
+      "kind": "invariant",
+      "title": "Deferred replay backlog never exceeds MAX_BACKLOG_ITEMS (65536)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-013",
+      "kind": "safety",
+      "title": "Authority revocation dominance: revoked intent DENIED even if gate ALLOWs",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-014",
+      "kind": "invariant",
+      "title": "Bounded replay: configurable batch size prevents thundering herd",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-015",
+      "kind": "invariant",
+      "title": "Canonical mode detection cached after first probe per poll cycle",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-016",
+      "kind": "invariant",
+      "title": "Merged ledger results always sorted by (timestamp_ns, event_id)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-017",
+      "kind": "safety",
+      "title": "Permanently malformed evidence.published events skipped to prevent blocking",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-018",
+      "kind": "safety",
+      "title": "Bounded lifecycle replay uses cursor-bounded event reads per tick",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-019",
+      "kind": "safety",
+      "title": "Terminal witness files never cleaned up from claimed/completed/denied dirs",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-020",
+      "kind": "safety",
+      "title": "Capacity exhaustion halts tick without advancing cursor (backpressure)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-PROJ-021",
+      "kind": "safety",
+      "title": "Projection scan validates queue_job_id against path traversal sequences",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

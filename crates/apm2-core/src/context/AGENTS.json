@@ -1,0 +1,78 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/context",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CTX-001",
+      "kind": "invariant",
+      "title": "Manifest seal is deterministic and tamper-evident",
+      "description": "Same manifest entries always produce the same BLAKE3 hash. Any modification changes the hash.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-002",
+      "kind": "requirement",
+      "title": "Manifest allowlist denies unlisted paths",
+      "description": "is_allowed() returns false for paths not in the manifest and for hash mismatches (constant-time comparison).",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-003",
+      "kind": "invariant",
+      "title": "ToolClass discriminant values maintain semver stability",
+      "description": "Explicit discriminant values on ToolClass maintain semver stability. from_u32() validates full range to prevent truncation attacks.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-004",
+      "kind": "safety",
+      "title": "All reads outside allowlist are denied",
+      "description": "DefaultContextFirewall denies all reads outside the allowlist. Path normalization prevents traversal attacks. Path length bounded by MAX_PATH_LENGTH (4096).",
+      "rfc": ["RFC-0011", "RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-CTX-005",
+      "kind": "requirement",
+      "title": "TOCTOU protection via runtime content hash verification",
+      "description": "Runtime content hash verified against manifest for TOCTOU protection.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-006",
+      "kind": "invariant",
+      "title": "Recipe required read paths are sorted and deduplicated",
+      "description": "Required read paths are sorted canonically with no duplicate paths after normalization. All paths are workspace-relative.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-007",
+      "kind": "safety",
+      "title": "Recipe compiler rejects symlinks and paths outside workspace",
+      "description": "ContextPackRecipeCompiler rejects symlink paths and paths outside workspace boundaries.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CTX-008",
+      "kind": "requirement",
+      "title": "Selector closure completeness for Tier1+ required",
+      "description": "Tier1+ selectors without complete loss profiles are denied with SelectorClosureIncomplete reason code.",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0002"]
+    },
+    {
+      "id": "BEH-CORE-CTX-009",
+      "kind": "invariant",
+      "title": "Proof cache bounded with no silent eviction",
+      "description": "Cache entries bounded by MAX_PROOF_CACHE_ENTRIES (100,000); overflow returns Err, never evicts silently.",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0003"]
+    },
+    {
+      "id": "BEH-CORE-CTX-010",
+      "kind": "safety",
+      "title": "Stale and revoked cache entries produce deterministic deny",
+      "description": "Stale entries (TTL exceeded) and revoked entries (older generation) produce deterministic deny. Clock regression detected and denied.",
+      "rfc": ["RFC-0029"]
+    }
+  ]
+}

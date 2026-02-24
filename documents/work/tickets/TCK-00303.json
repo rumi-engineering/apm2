@@ -1,0 +1,98 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00303",
+      "title": "HEF: Resource governance + backpressure/drop policy",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0004",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0004.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0007",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0007.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PROTOCOL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00287",
+          "reason": "Depends on base HEF protocol infrastructure"
+        },
+        {
+          "ticket_id": "TCK-00302",
+          "reason": "Requires subscription registry for quota enforcement"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Enforce max_subscriptions_per_connection=16 cap at daemon boundary",
+        "Enforce max_patterns_per_subscription=16 cap",
+        "Enforce max_total_patterns_per_connection=64 cap",
+        "Enforce max_pulses_per_sec_per_subscriber=100 rate limit",
+        "Enforce max_burst_pulses_per_subscriber=200 burst limit",
+        "Enforce max_queue_depth_per_subscriber=256 queue depth limit",
+        "Enforce max_bytes_in_flight_per_subscriber=1048576 bytes in-flight limit",
+        "Enforce max_pulse_payload_bytes=2048 payload size limit",
+        "Implement drop policy with ordered priority (episode.<episode_id>.io first)",
+        "Return RESOURCE_LIMIT error on oversubscription without daemon crash"
+      ],
+      "out_of_scope": [
+        "Dynamic cap adjustment at runtime",
+        "Per-topic rate limiting (only per-subscriber limits)",
+        "Persistent quota state across daemon restarts",
+        "Quota metrics export to external monitoring systems"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define resource quota configuration struct with all cap constants",
+        "Implement subscription counter tracking per connection",
+        "Implement pattern counter tracking per subscription and per connection",
+        "Add rate limiter for pulses per subscriber (token bucket with burst)",
+        "Implement queue depth tracking with bounded channel",
+        "Implement bytes in-flight tracking per subscriber",
+        "Add payload size validation on pulse emission",
+        "Implement drop policy with priority ordering for episode IO topics",
+        "Wire quota checks into subscription handling path",
+        "Return RESOURCE_LIMIT error code on quota violations",
+        "Add unit tests for each quota limit",
+        "Add integration test for oversubscription scenario"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0007"
+      ],
+      "criteria": [
+        "Oversubscription triggers RESOURCE_LIMIT without daemon crash.",
+        "Caps enforced: max_subscriptions_per_connection=16; max_patterns_per_subscription=16; max_total_patterns_per_connection=64.",
+        "Caps enforced: max_pulses_per_sec_per_subscriber=100; max_burst_pulses_per_subscriber=200; max_queue_depth_per_subscriber=256; max_bytes_in_flight_per_subscriber=1048576; max_pulse_payload_bytes=2048."
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed",
+      "verification": "All quota limits must be tested with boundary conditions and overflow attempts"
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00670",
+      "title": "Holon: converge holonic orchestration onto core Ledger+CAS substrate (BFT-ready) and deprecate the separate holon ledger chain",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0020",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_HOLON",
+        "DOMAIN_KERNEL",
+        "DOMAIN_EVIDENCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "crates/apm2-holon currently implements its own ledger (BLAKE3 hash-chained JSON events)\nand its own event vocabulary. Meanwhile, apm2-core/apm2-daemon already provide:\n\n  - a canonical SQLite-backed ledger with hash chain + schema digest + consensus fields,\n  - a CAS plane (trait + durable daemon implementation),\n  - BFT-integrated ledger backend for distributed finality.\n\nMaintaining a separate holon ledger duplicates critical invariants (hash chaining,\ndeterministic serialization, replay) and blocks convergence toward a single substrate\ncapable of scaling to 100B agents with BFT finality.\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "HL-001",
+        "title": "Introduce a holon ledger adapter that writes holon events into apm2-core ledger",
+        "detail": "Add an adapter layer in apm2-holon that targets apm2-core ledger as the event sink.\nInitial strategy:\n  - keep holon event vocabulary, but encode events as core ledger EventRecords with event_type prefix `holon.*`\n  - use canonical JSON (RFC 8785 / JCS) or protobuf where appropriate\n  - store large artifacts referenced by holon events in CAS and include digests in event payloads\n\nThe adapter must preserve:\n  - deterministic replay\n  - bounded decoding\n  - stable discriminants\n"
+      },
+      {
+        "id": "HL-002",
+        "title": "Deprecate direct use of apm2-holon/src/ledger/* for persistence",
+        "detail": "Keep the existing holon ledger implementation temporarily behind a feature flag\n(`legacy_holon_ledger`) or as a migration reader only.\n\nNew writes MUST go through the core-ledger adapter, not the legacy holon ledger.\n"
+      },
+      {
+        "id": "HL-003",
+        "title": "BFT-readiness: thread consensus metadata through holon authority events",
+        "detail": "For holon events that represent authority decisions (work claimed, lease issued, terminal decisions),\nensure they can be appended via BftLedgerBackend when consensus is enabled.\n\nThe holon code should not assume local finality; it must treat finality as an explicit signal.\n"
+      },
+      {
+        "id": "HL-004",
+        "title": "Verification: replay equivalence and ledger/CAS reconstructibility",
+        "detail": "Add tests that:\n  - fold holon state from ledger events (genesis..N) equals fold from checkpoint+delta\n  - deleting any derived caches does not lose truth (ledger+CAS reconstructs)\n  - event payloads remain bounded and deny unknown fields\n"
+      }
+    ],
+    "out_of_scope": [
+      "Full semantic unification of holon work model with RFC-0032 work object/graph (may follow once the substrate is unified).",
+      "Multi-node networking implementation (consensus backend exists, but holon networking is not in scope here)."
+    ]
+  },
+  "plan": {
+    "steps": [
+      "Implement adapter (core-ledger writer) and plumb through holon orchestration state machine.",
+      "Gate legacy holon ledger behind feature flag; add migration reader if needed.",
+      "Add tests for determinism and reconstructibility.",
+      "Add documentation in holon AGENTS.md pointing to the unified substrate."
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "Holon can run with core ledger as its durable event log and CAS as its artifact plane.",
+      "Legacy holon ledger is no longer used for new writes (feature-flagged compatibility only).",
+      "Tests demonstrate deterministic replay and reconstructibility.",
+      "Authority events are BFT-ready (finality explicit)."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-HL-01",
+      "title": "Large surface area change in holon crate",
+      "mitigation": "Keep migration staged: dual-write to both ledgers in a short transition period if necessary,\nthen cut over. Prefer adding adapter without changing holon domain logic initially.\n"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00678",
+      "title": "docs + enforcement: codify OrchestratorKernel doctrine (documentation, reviewer invariants, and anti-ad-hoc enforcement for orchestration loops + stores)",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0020",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_STANDARDS_STEWARD",
+        "AGENT_REVIEWER",
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_PRODUCT",
+        "DOMAIN_DAEMON",
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "id": "TCK-00674",
+          "reason": "Monotonic durability rule must be documented/enforced using the fixed implementation as reference."
+        },
+        {
+          "id": "TCK-00675",
+          "reason": "Freeze-aware ledger polling doctrine should reference the extracted shared poller module."
+        },
+        {
+          "id": "TCK-00676",
+          "reason": "Storage doctrine should reference the orchestrator_runtime adapter kit tables and APIs."
+        },
+        {
+          "id": "TCK-00677",
+          "reason": "Cursor doctrine must reference the cursor-generic KernelCursor trait."
+        }
+      ]
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "Even strong abstractions fail if:\n  1) implementor agents can easily reintroduce ad-hoc solutions, and\n  2) code-quality review does not enforce the new invariants consistently.\n\nAPM2 already has the building blocks (OrchestratorKernel in apm2-core, and soon an adapter kit\nin apm2-daemon), but there is currently no single doctrine that:\n  - documents the expected pattern (observe -> plan -> execute -> receipt),\n  - names the non-negotiable invariants (durable cursor, intent buffering, idempotent effects),\n  - defines what is forbidden (bespoke cursoring loops, bespoke sqlite intent tables, persisted monotonic truth),\n  - gives code-quality reviewers explicit rejection criteria.\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "DOC-OK-001",
+        "title": "Add OrchestratorKernel documentation in-code and in architecture docs",
+        "detail": "Add:\n  - crates/apm2-core/src/orchestrator_kernel/AGENTS.md:\n      * the kernel contract\n      * KernelCursor rules\n      * determinism + replay requirements\n      * effect journal crash windows + resolve_in_doubt fail-closed expectations\n      * examples (GateTimeoutKernel as the first reference)\n\n  - documents/architecture/orchestrator_kernel.md:\n      * how kernel composes with CAS + ledger (store big payloads in CAS, put digests in intents/events)\n      * how kernel composes with future BFT ledger (finality handled at LedgerReader boundary)\n      * migration guidance: how to refactor an existing loop onto the kernel\n\nUpdate crates/apm2-core/AGENTS.md module map to include orchestrator_kernel.\n"
+      },
+      {
+        "id": "DOC-OK-002",
+        "title": "Update implementor instruction prompt to privilege kernel + adapters over bespoke code",
+        "detail": "Update documents/prompts/instruction.alien_coding.v1.json to include an explicit section:\n\n  - \"OrchestratorKernel Doctrine\":\n      * If you are building an orchestration loop reading the ledger incrementally and producing receipts/effects,\n        you MUST use apm2_core::orchestrator_kernel and apm2_daemon::orchestrator_runtime adapters.\n      * New orchestrators must begin by identifying:\n          - the cursor type (KernelCursor),\n          - the durable cursor store,\n          - the intent store,\n          - the effect journal,\n          - the receipt writer.\n      * Explicitly instruct: no bespoke sqlite tables for cursor/intent/effect journal; use shared tables keyed by orchestrator_id.\n      * Explicitly instruct: no persisted monotonic timestamps as durable truth.\n\nThis is the mechanism by which implementor agents are steered away from ad-hoc solutions.\n"
+      },
+      {
+        "id": "DOC-OK-003",
+        "title": "Update code-quality reviewer prompt with explicit invariants and rejection criteria",
+        "detail": "Update documents/reviews/CODE_QUALITY_PROMPT.cac.json constraints.invariants with new entries:\n\n  - INV-CQ-OK-001 (MAJOR):\n      \"Any new orchestrator that tails the ledger and emits receipts MUST use OrchestratorKernel.\n       A bespoke observe/plan/execute/receipt loop is a finding.\"\n\n  - INV-CQ-OK-002 (MAJOR):\n      \"Kernel orchestrators MUST use orchestrator_runtime adapters for durable cursor/intent/effect journal.\n       New per-orchestrator sqlite tables for these concerns are a finding.\"\n\n  - INV-CQ-OK-003 (MAJOR):\n      \"No rusqlite work is permitted directly on async execution paths; must be offloaded via spawn_blocking\n       or a provided async wrapper in adapters/pollers.\"\n\n  - INV-CQ-OK-004 (MAJOR):\n      \"Monotonic timestamps are process-local and must not be treated as durable truth. Persisting monotonic\n       values requires explicit rebase-on-load logic; restart-induced irreversible actions are a finding.\"\n\n  - INV-CQ-OK-005 (MAJOR):\n      \"Any code that merges canonical `events` and legacy `ledger_events` MUST use the shared poller module.\"\n\nAdd a short \"review checklist\" section in the prompt body describing how to detect violations\nvia file paths and grep anchors (orchestrator_runtime, orchestrator_kernel, CREATE TABLE, Instant/OnceLock, etc).\n"
+      },
+      {
+        "id": "DOC-OK-004",
+        "title": "Update APM2 safe patterns / anti-patterns reference to include kernel doctrine",
+        "detail": "Update documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md with:\n  - Safe pattern: \"Kernelized Orchestrator Loop\" (cursor fold + durable intent buffer + effect journal).\n  - Anti-patterns:\n      * \"Bespoke orchestration loop reading ledger with local cursor + ad-hoc dedupe\"\n      * \"Per-orchestrator sqlite tables for kernel storage\"\n      * \"Persisted monotonic timestamps used for durable decisions\"\n      * \"Blocking sqlite in async contexts\"\n\nProvide concrete examples and file-path anchors so agents can self-correct quickly.\n"
+      }
+    ],
+    "out_of_scope": [
+      "Introducing automated lint tooling beyond prompt enforcement (optional follow-on).",
+      "Migrating additional orchestrators (separate work items)."
+    ]
+  },
+  "implementation_notes": {
+    "critical_structural_boundaries": [
+      {
+        "id": "IMPL-DOC-OK-01",
+        "title": "Enforcement must be explicit and greppable",
+        "detail": "Prompts and docs must include greppable anchors (module names, table names, key types) so\nboth implementor agents and reviewers can mechanically verify compliance.\n"
+      }
+    ]
+  },
+  "documentation_and_enforcement": {
+    "documentation_deliverables": [
+      "crates/apm2-core/src/orchestrator_kernel/AGENTS.md",
+      "documents/architecture/orchestrator_kernel.md",
+      "Updates to crates/apm2-core/AGENTS.md module map"
+    ],
+    "enforcement_deliverables": [
+      "New INV-CQ-OK-* invariants in CODE_QUALITY_PROMPT.cac.json",
+      "Alien coding instruction prompt updated with OrchestratorKernel doctrine",
+      "Safe patterns / anti-patterns updated with kernel doctrine and monotonic rule"
+    ]
+  },
+  "plan": {
+    "steps": [
+      "Write OrchestratorKernel doctrine docs (core AGENTS + architecture doc).",
+      "Update alien_coding instruction prompt with kernel/adapters mandates.",
+      "Update code-quality prompt with explicit invariants + rejection criteria + grep anchors.",
+      "Update safe patterns / anti-patterns reference.",
+      "Cross-link docs from relevant module AGENTS.md files (gate, projection, orchestrator_runtime)."
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "Docs exist and clearly state the kernel contract, storage contract, cursor contract, and time contract.",
+      "Implementor prompt explicitly steers agents to kernel + adapter kit and forbids ad-hoc alternatives.",
+      "Code-quality reviewer prompt contains explicit invariants and rejection criteria for ad-hoc solutions.",
+      "Safe patterns reference includes orchestrator kernel pattern and related anti-patterns."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-DOC-OK-01",
+      "title": "Prompt-only enforcement could be inconsistently applied",
+      "mitigation": "Use explicit invariants with MAJOR severity language and greppable anchors.\nConsider a follow-on ticket for an automated repo lint if drift is observed.\n"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00477",
+      "title": "RFC-0029 REQ-0008 authority-surface monotonicity and direct-GitHub non-regression",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0029",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0008",
+          "requirement_ref": "documents/rfcs/RFC-0029/requirements/REQ-0008.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0008",
+          "artifact_ref": "documents/rfcs/RFC-0029/evidence_artifacts/EVID-0008.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_INFRA"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00475",
+          "reason": "Authority-surface checks depend on optimization gate and canonical evidence-governance baseline."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Enforce production capability-surface monotonicity for optimization candidates.",
+        "Deny reintroduction of direct GitHub capability classes in production runtimes.",
+        "Require role-level capability-surface diff evidence for optimization admission.",
+        "Fail closed on missing, stale, or ambiguous authority-surface evidence."
+      ],
+      "out_of_scope": [
+        "Onboarding of new sink families beyond current profile envelope.",
+        "Organization-level GitHub governance outside runtime capability surface."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add runtime capability-surface checks into projection-isolation interlock gate path.",
+        "Bind optimization admissions to capability-surface diff evidence.",
+        "Implement structured deny defects for direct GitHub capability regressions.",
+        "Add negatives for stale surface evidence and ambiguous capability mappings."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0008"
+      ],
+      "criteria": [
+        "Production authority-surface increases are denied.",
+        "Direct GitHub capability classes remain absent in production runtime contexts.",
+        "Unknown/stale authority-surface evidence fails closed."
+      ]
+    },
+    "notes": {
+      "security": "Authority-surface monotonicity constrains optimization-induced containment regressions.\n",
+      "verification": "Include capability-surface diff reports and direct-capability regression deny traces.\n",
+      "general": "This ticket closes REQ-0008 non-regression requirements.\n"
+    }
+  }
+}

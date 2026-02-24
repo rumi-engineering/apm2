@@ -1,0 +1,63 @@
+{
+  "schema": "apm2.waiver.v1",
+  "waiver": {
+    "schema_version": "2026-02-07",
+    "id": "WVR-0004",
+    "title": "CAS quota may double-count on concurrent same-hash writes",
+    "status": "APPROVED",
+    "scope": {
+      "gate_ids": [
+        "GATE-HEF-FAC-V0",
+        "GATE-CODE-QUALITY-REVIEW"
+      ],
+      "requirement_ids": [],
+      "quality_dimension_ids": [
+        "RESOURCE_ACCOUNTING"
+      ]
+    },
+    "rationale": "When two threads concurrently store identical content (same BLAKE3 hash),\nboth may succeed through the rename happy-path because unique temp paths\n(PID + monotonic counter) prevent temp-file collisions.  The second rename\natomically overwrites the first's file with identical content, but the\nin-memory quota counter is incremented by both threads, over-reporting\nby one `size` increment.\n\nThis issue was identified during review round 5 of PR #488 after five\nconsecutive fix rounds targeting the CAS concurrent-write path.  Each\nround fixed one edge case but introduced a variant:\n  R3: concurrent_winner_exists fallback → R4: quota rollback leak →\n  R5: unique temp paths → R5-finding: quota double-count.\n\nContinued iteration risks thrashing (new fix reintroducing old failure\nmodes).  A waiver is issued to break the cycle.\n\nAccepted risk: the in-memory quota counter may over-report by the size\nof duplicated content.  This can lead to premature StorageFull rejections\nin pathological concurrent-duplicate workloads.\n",
+    "mitigations": [
+      {
+        "description": "calculate_total_size() recalculates from disk on daemon restart, self-healing any drift.",
+        "type": "TECHNICAL",
+        "owner": "CAS runtime maintainers"
+      },
+      {
+        "description": "Concurrent same-hash publishes are already deduplicated at the ledger layer by the partial unique index on (work_id, changeset_digest), making the CAS double-write an edge case reachable only under concurrent dispatch to the same work_id.",
+        "type": "TECHNICAL",
+        "owner": "Ledger maintainers"
+      },
+      {
+        "description": "CAS data integrity is not affected — the file content is correct regardless of which rename wins. Only the accounting counter drifts.",
+        "type": "TECHNICAL",
+        "owner": "CAS runtime maintainers"
+      },
+      {
+        "description": "A proper fix (check-before-reserve or file-level locking) will be implemented as part of CAS hardening in the next RFC cycle.",
+        "type": "PROCEDURAL",
+        "owner": "CAS runtime maintainers"
+      }
+    ],
+    "expiration_date": "2026-04-15",
+    "required_signoffs": [
+      "AUTH_ARCHITECTURE"
+    ],
+    "evidence_ids": [
+      "EVID-WVR-0004-CAS-QUOTA-DRIFT"
+    ],
+    "references": {
+      "related_tickets": [
+        "TCK-00412"
+      ],
+      "related_rfc": "RFC-0018",
+      "review_finding": "PR #488 round 5 code-quality MAJOR: concurrent same-hash writes double-count quota"
+    },
+    "approval": {
+      "approver": "orchestrator_dispatch",
+      "approval_date": "2026-02-07",
+      "approval_notes": "Approved to break a 5-round fix/review thrashing cycle.  The finding\nis valid but MAJOR-severity with self-healing on restart.  The primary\ndefense (ledger unique index) prevents duplicate event emission.\nCAS quota drift is a transient accounting issue, not a data integrity\nor security concern.\n"
+    },
+    "created_date": "2026-02-07",
+    "last_updated": "2026-02-07"
+  }
+}

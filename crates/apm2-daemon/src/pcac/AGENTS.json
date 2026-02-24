@@ -1,0 +1,72 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/pcac",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-PCAC-001",
+      "kind": "invariant",
+      "title": "Each AJC ID is consumed at most once (Linear Consumption law)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-002",
+      "kind": "invariant",
+      "title": "Consumed set held in memory with DurableConsumeIndex persistent backing",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-003",
+      "kind": "invariant",
+      "title": "Clock-sourced ticks derive from HolonicClock (never frozen)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-004",
+      "kind": "safety",
+      "title": "Clock regression fails closed rather than falling back",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-005",
+      "kind": "safety",
+      "title": "Stale sovereignty epochs are denied (epoch freshness check)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-006",
+      "kind": "safety",
+      "title": "Future-skewed epochs trigger hard freeze (anti-clock-manipulation)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-007",
+      "kind": "safety",
+      "title": "Missing or ambiguous sovereignty state produces denial (fail-closed)",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-008",
+      "kind": "invariant",
+      "title": "record_consume() returns Ok only after fsync completes",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-009",
+      "kind": "requirement",
+      "title": "Append-only log replayed on startup to rebuild in-memory index",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-010",
+      "kind": "safety",
+      "title": "Capacity exhaustion triggers fail-closed denial",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PCAC-011",
+      "kind": "requirement",
+      "title": "Verifier-economics bounds enforcement denies Tier2+ on budget exceedance",
+      "rfc": ["RFC-0027", "RFC-0028"]
+    }
+  ]
+}

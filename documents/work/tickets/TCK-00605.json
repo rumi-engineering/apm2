@@ -1,0 +1,356 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00605",
+      "title": "FAC agent reliability hardening — auto-verdict, doctor-as-oracle, recovery bypass, auto-merge",
+      "status": "MERGED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00604",
+          "reason": "TCK-00604 introduced the per-PR agent registry, lifecycle reducer, HMAC integrity, MAX_ACTIVE_AGENTS_PER_PR=2 cap, and initial doctor --pr implementation."
+        }
+      ]
+    },
+    "root_cause_analysis": {
+      "summary": "The FAC system was designed as if LLM review agents are reliable state\nmachines that always complete their protocol (emit findings → call\n`verdict set` → done). Field evidence from multi-PR orchestration runs\nshows they are not: agents crash, timeout, get confused by long decision\ntrees, and consistently fail to complete the verdict ceremony.\n\nEvery operational pain point traces back to this mismatch between the\nsystem's reliability assumptions and agent reality:\n\n1. VERDICT CEREMONY IS A SINGLE POINT OF FAILURE\n   Review agents (codex, gemini-3-pro, gemini-3-flash, codex-spark) emit\n   findings successfully but crash before calling `verdict set`. This is\n   the dominant failure mode — `decision_receipt_missing` on every run.\n   The review prompt decision tree is too long for models to complete\n   end-to-end. Findings contain all evidence needed to determine the\n   verdict; requiring a separate ceremony is a reliability tax.\n\n2. RECOVERY IS SUBJECT TO THE RULES IT'S TRYING TO REPAIR\n   `fac recover` goes through the same lifecycle reducer (`apply(state,\n   recover_requested)`) and HMAC verification that got the system into a\n   broken state. Every combination of --pr, --force, --refresh-identity\n   returns `illegal transition: <state> + recover_requested`. Recovery\n   should be the escape hatch, not subject to the same transition rules\n   it's trying to repair.\n\n3. SHA DRIFT CASCADES INTO UNRECOVERABLE STATES\n   After force-push / rebase / amend, the local identity projection at\n   `~/.apm2/fac_projection/repos/.../identity.json` retains the old SHA.\n   Every subsequent `fac restart` and `fac review dispatch` fails with\n   `stale_head_ambiguity` or `stale relative to authoritative PR head`.\n   Operators had to manually edit the identity JSON 3+ times per session.\n   `fac push` writes identity BEFORE gates/dispatch complete (premature\n   persistence), and `fac restart --refresh-identity` doesn't work.\n\n4. HMAC INTEGRITY BLOCKS RECOVERY\n   When reviewer processes die but the registry still shows\n   `state: dispatched`, every dispatch attempt hits `at_capacity`. `fac\n   review terminate` says \"no active reviewer\" (correct — process is dead),\n   but the registry entry stays dispatched. The registry file can't be\n   edited because of HMAC integrity check. Operators had to delete the\n   entire registry file to unblock, losing all tracking history.\n   Same problem with lifecycle state files — stuck in `gates_running`\n   after a partial restart, no way to fix without deleting the file.\n\n5. EXIT CODE CONFLATES INDEPENDENT OUTCOMES\n   `fac push` does 4 things: git push, gates, PR update, review dispatch.\n   If the first 3 succeed but dispatch fails (stale_head_ambiguity), the\n   whole command exits 1. CI/orchestrators see failure but the push worked.\n\n6. FINDINGS VS VERDICT MISMATCH\n   Findings show `verdict: \"FAIL\"` (derived from severities) but lane\n   status shows `quality_verdict: \"UNKNOWN\"`. Orchestrators must check\n   two inconsistent sources to determine review state.\n\n7. LEGACY BOUNDED TEST SHELL WRAPPER\n   FAC bounded test execution still depended on\n   `scripts/ci/run_bounded_tests.sh`, creating a second control plane for\n   runtime limits outside the Rust implementation. This wrapper can drift\n   from Rust policy and causes avoidable maintenance overhead.\n\n8. ORCHESTRATOR GLOBAL CAPACITY MISINTERPRETATION\n   The orchestrator-monitor SKILL.md SATURATION_CHECK step instructs the\n   orchestrator to check capacity globally via `fac_review_status (global)`,\n   effectively turning the per-PR cap of 2 into a system-wide cap of 2.\n   (Already fixed in this branch — skill instructions updated.)\n\n9. NO SINGLE SOURCE OF TRUTH FOR ORCHESTRATORS\n   Orchestrators must call `fac review status` + `fac review findings`\n   + mental arithmetic + event log reconstruction to build the per-PR\n   picture each tick. Two commands give contradictory answers to \"did\n   this review pass?\" Elapsed times require timestamp math. Model\n   fallback chains require event log archaeology. `fac review status`\n   without `--pr` shows stale pulse timestamps from previous runs.\n   `sequence_done` events fire prematurely, reporting security as\n   \"SKIPPED\" while the lane is still actively running on restart 3.\n\n10. DECISION LOGIC LIVES IN THE LLM ORCHESTRATOR\n    The most expensive and error-prone part of every orchestrator tick is\n    the LLM deciding what to do. It reads multiple data sources, reconciles\n    contradictions, and reasons about next actions. This reasoning is\n    unreliable — LLMs misinterpret signals, miss edge cases, and make\n    different decisions on identical state. The decision logic should be\n    in deterministic, testable Rust code, not in LLM prompts.\n\n11. GATE FAILURES ARE EPHEMERAL\n    When an agent runs `fac push` and gates fail, that evidence exists\n    only in the agent's stdout. The agent dies, the evidence vanishes.\n    The orchestrator must dig through `/tmp/claude-1000/.../tasks/<id>.output`\n    to learn \"test gate timed out after 261s.\" There is no FAC-visible\n    trace of a failed push attempt — no persistent record of which gate\n    failed, why, or when. This is the same architectural gap that\n    findings solved for reviews: reviews persist structured evidence;\n    gates do not.\n\nThe meta-insight: the system must reach a correct terminal state even\nwhen agents fail at any point in the protocol. Agents are the most\nunreliable component in the stack.\n"
+    },
+    "scope": {
+      "in_scope": [
+        {
+          "id": "P0_AUTO_VERDICT",
+          "title": "Auto-derive verdict from findings on reviewer process exit",
+          "detail": "When a reviewer process terminates (clean exit, crash, timeout, PID\nreap) without having called `verdict set`, the system must auto-derive\nthe verdict from accumulated findings for that PR/type/SHA:\n- Any BLOCKER or MAJOR findings exist → auto-deny\n- Only MINOR/NIT findings → auto-approve\n- Zero findings emitted → leave pending (no verdict set; retriable)\n\nImplementation site: the PID reaper in `reap_registry_stale_entries()`\nalready detects dead agents. When it reaps a reviewer with no verdict,\nit should call the findings store to enumerate accumulated findings\nfor that agent's (owner_repo, pr_number, review_type, sha), compute\nthe verdict, and write it via the same path as `verdict set`.\n\nThe explicit `verdict set` call by agents becomes an optimization\n(faster verdict propagation), not a requirement for lane completion.\n\nAuto-verdict projection (GitHub comment posting) is best-effort and\ndeferred — write the local verdict + lifecycle event synchronously,\nqueue or skip the GitHub projection. This prevents the reaper hot\npath (called during enforce_pr_capacity / register_agent_spawn) from\nblocking on external API calls.\n\nThis eliminates `decision_receipt_missing` as a failure mode.\n"
+        },
+        {
+          "id": "P0_LOCAL_AUTO_MERGE",
+          "title": "Local auto-merge into main when all verdicts approve",
+          "detail": "The local forge is authoritative. When the shared verdict finalization\nfunction (used by both explicit `verdict set` and the auto-verdict\nreaper) writes an approve verdict, it must check whether ALL review\ndimensions now approve for the current HEAD SHA. If so, the PR has\nreached terminal merge-ready state as a local fact — trigger local\nmerge immediately without waiting for GitHub CI round-trip.\n\nMerge procedure:\n(a) After writing the verdict, load all dimension verdicts for\n    (owner_repo, pr_number, current_head_sha).\n(b) If every active dimension (security, code-quality) is approve:\n    - Resolve the worktree path from the PR identity/projection.\n    - Execute `git merge --ff-only <branch>` into local main.\n      ff-only is mandatory — if it can't fast-forward, the branch\n      has diverged and needs human attention. Emit a lifecycle\n      event `merge_failed` with reason and do not retry.\n    - On success, emit lifecycle event `merged` to transition\n      the PR to terminal state.\n    - Fire-and-forget: spawn background `rm -rf <worktree>/target`\n      to reclaim disk from build artifacts. No error propagation —\n      if the worktree has no /target or cleanup fails, ignore it.\n(c) If not all dimensions approve yet, do nothing — the next\n    verdict finalization will re-check.\n\nThis is the natural terminal action in the lifecycle. GitHub\nauto-merge (already enabled by `fac push`) eventually catches up\nas a projection, but local main advances immediately.\n\nEdge cases:\n- Merge conflict (non-ff): emit `merge_failed` lifecycle event,\n  do NOT retry. PR transitions to a stuck-like state requiring\n  human/implementor rebase.\n- Worktree missing: skip /target cleanup, still merge from the\n  branch ref directly.\n- Concurrent pushes: verdict is SHA-bound, so a stale verdict\n  cannot trigger merge for a newer SHA. Safe by construction.\n"
+        },
+        {
+          "id": "P0_DOCTOR_FIX",
+          "title": "Doctor --fix: auto-repair broken state (absorbs `fac recover`)",
+          "detail": "Recovery is a feature of doctor, not a separate command. Doctor\nalready diagnoses problems and computes recommended_action with the\nexact repair needed. `--fix` means \"execute what you already computed.\"\n\n`apm2 fac doctor --pr <N> --fix` operates OUTSIDE the normal lifecycle\nreducer. It is a privileged escape hatch for broken state, not a\nnormal transition.\n\nWithout `--fix`, doctor remains purely read-only — no behavior change.\n\nRepair operations (executed when --fix is passed):\n(a) REAP STALE AGENTS: iterate the agent registry, check PID liveness\n    for every entry scoped to this PR, mark dead-PID entries as reaped,\n    auto-derive verdict from findings for reaped reviewers (ties into\n    P0_AUTO_VERDICT), recompute registry HMAC. Works even if the\n    current registry HMAC is invalid.\n(b) REFRESH IDENTITY: fetch the current PR HEAD SHA from GitHub API,\n    overwrite local identity.json with fresh data and fresh HMAC.\n    No stale-check — this IS the recovery for stale identity.\n(c) RESET LIFECYCLE: if lifecycle state is stuck/broken/corrupt,\n    reset to a clean starting point (e.g. `pushed`) preserving event\n    history where possible, with fresh HMAC.\n(d) Doctor decides which repairs to apply based on the health\n    diagnostics it already computes. Operators don't choose\n    individual recovery operations — doctor knows what's broken.\n\nAll repair operations:\n- Skip lifecycle state machine validation (no `apply(state, event)`)\n- Recompute HMAC after writing, never verify before writing\n- Log before/after state for audit trail\n- Never fail due to existing corrupt state\n- Are reported in the JSON output as `repairs_applied` array\n\nImplementation: recovery.rs module stays as internal implementation,\ncalled by doctor's --fix path, not exposed as a CLI subcommand.\n\n`fac recover` becomes a deprecated alias that prints:\n\"DEPRECATED: use `apm2 fac doctor --pr <N> --fix` instead.\"\n"
+        },
+        {
+          "id": "P0_DOCTOR_AS_ORACLE",
+          "title": "Superpower doctor --pr as the single-call orchestration oracle",
+          "detail": "`apm2 fac doctor --pr <N> --json` becomes the ONE command orchestrators\ncall per PR per tick. It must return a complete, self-consistent\nsnapshot with actionable recommendations — eliminating the need for\nany other status/findings call.\n\nNEW SECTIONS (added to existing doctor --pr output):\n\nRECOMMENDED_ACTION — \"What should I do next?\"\n(a) A deterministic `recommended_action` computed from the full PR\n    state. The action vocabulary is closed:\n    - wait: reviews in progress, nothing to do\n    - merge: all dimensions approve, gates pass, SHA fresh\n      (with P0_LOCAL_AUTO_MERGE this fires automatically, but\n      doctor still reports it for observability)\n    - dispatch_implementor: review denied with actionable findings\n    - restart_reviews: stale SHA, crashed reviewers, no active agents\n    - fix: stuck lifecycle, corrupt HMAC, error budget critical\n      (i.e. re-run `doctor --fix` — doctor prescribes itself)\n    - escalate: error budget exhausted, non-ff merge conflict,\n      requires human intervention\n(b) Each action includes:\n    - reason: human-readable explanation\n    - priority: high / medium / low\n    - command: the exact CLI command to run (when applicable)\n(c) This moves decision logic from the LLM orchestrator (unreliable,\n    expensive, inconsistent) into deterministic Rust (testable, fast,\n    same answer every time). The orchestrator becomes a thin dispatch\n    loop over doctor recommendations.\n\nFINDINGS_SUMMARY — \"What did reviewers find?\"\n(d) Per-dimension findings counts:\n    `{blocker: N, major: N, minor: N, nit: N}`\n    Orchestrators need this to write implementor handoffs without a\n    separate `fac review findings` call.\n(e) Per-dimension `formal_verdict` (from verdict store: approve/deny/\n    pending) alongside `computed_verdict` (derived from findings\n    severities: deny if BLOCKER/MAJOR, approve if only MINOR/NIT,\n    pending if none). Once P0_AUTO_VERDICT is live, these always\n    agree. The computed_verdict serves as a bridge during rollout and\n    as a consistency check after.\n\nMERGE_READINESS — \"Can I merge right now?\"\n(f) A single `merge_ready: true/false` with explicit sub-checks:\n    - all_verdicts_approve: bool\n    - gates_pass: bool\n    - sha_fresh: bool (local == remote HEAD)\n    - no_merge_conflicts: bool (ff-only would succeed)\n    This is the complete merge predicate in one field — not \"is the\n    lifecycle in the right state\" but \"would `git merge --ff-only`\n    succeed right now, and if not, which specific condition fails?\"\n\nAGENT ENRICHMENTS — \"Who's working and what have they tried?\"\n(g) `elapsed_seconds` on every agent entry (trivial: now - started_at).\n    Eliminates timestamp arithmetic by LLM orchestrators.\n(h) `models_attempted` list per dimension: accumulated from restart/\n    fallback events, e.g. [\"gpt-5.3-codex\", \"gemini-3-pro\",\n    \"gpt-5.3-codex\"]. Tells the orchestrator what's been tried\n    without event log archaeology.\n(i) `last_activity_seconds_ago`: time since last finding emitted,\n    last lifecycle event, or last pulse for this PR. Answers \"is\n    this agent making progress?\" without tailing logs.\n\nWORKTREE STATUS — \"Is the workspace healthy?\"\n(j) `worktree_exists: bool`, `worktree_clean: bool`,\n    `merge_conflicts: N`. Orchestrators need this to decide whether\n    to dispatch an implementor and what instructions to give.\n\nPROJECTION STATUS — \"Is GitHub in sync?\"\n(k) `github_projection`: auto_merge_enabled, last_comment_updated_at,\n    projection_lag_seconds. Tells the orchestrator whether GitHub\n    has caught up with local truth.\n\nSTALE DATA CLEANUP\n(l) Pulse data that does not match the current run_id is excluded\n    from doctor output. Eliminates ghost timestamps from previous\n    runs confusing orchestrators.\n\nSYSTEM-LEVEL DOCTOR (no --pr flag)\n(m) `apm2 fac doctor --json` (no --pr) returns system health (existing\n    behavior) PLUS a summary table of all tracked PRs with their\n    recommended_action. One-line-per-PR overview for discovery +\n    triage in a single call. This replaces the PR-discovery use case\n    of `fac review status` without --pr.\n"
+        },
+        {
+          "id": "P1_DEPRECATE_REVIEW_STATUS",
+          "title": "Deprecate `apm2 fac review status` in favor of doctor",
+          "detail": "With doctor --pr as the complete oracle, `fac review status` is\nredundant surface area that creates contradiction problems (findings\nvs status verdict disagreement, stale pulse data, premature\nsequence_done events).\n\n(a) Add deprecation warning to `fac review status` output:\n    \"DEPRECATED: use `apm2 fac doctor --pr <N> --json` instead.\n    This command will be removed in a future release.\"\n(b) Update orchestrator-monitor SKILL.md to use doctor exclusively\n    for all per-PR state queries. Remove all references to\n    `fac review status --pr`.\n(c) Keep `fac review status` functional for one release cycle.\n(d) The `--pr` discovery use case (list all PRs) is replaced by\n    `apm2 fac doctor --json` system-level summary.\n"
+        },
+        {
+          "id": "P1_SEQUENCE_DONE_BUG",
+          "title": "Fix premature sequence_done event when lanes are still alive",
+          "detail": "When quality hits max_restarts_exceeded, the sequence_done event fires\nwith security_state: null, security_verdict: \"SKIPPED\" — but security\nis actively running on restart 3. This is a bug.\n\nFix: sequence_done must not fire until ALL active lanes are terminal.\nIf one lane terminates while another is still alive, emit a lane-\nspecific terminal event (e.g. quality_terminated), not sequence_done.\nsequence_done fires only when every lane has reached a terminal state\n(done, failed, max_restarts_exceeded).\n"
+        },
+        {
+          "id": "P1_RESTART_REFRESH_IDENTITY",
+          "title": "`fac restart --refresh-identity` as lightweight SHA drift fix",
+          "detail": "`fac restart --refresh-identity --pr <N>` should:\n(a) Fetch authoritative PR HEAD SHA from GitHub API.\n(b) If local identity SHA differs, overwrite local identity.json\n    with the new SHA (fresh HMAC, new timestamp).\n(c) Proceed with normal restart logic using the refreshed SHA.\n\nThis is a lighter-weight fix than `doctor --fix` — it doesn't\nbypass the state machine, it just fixes the identity input before\nnormal restart processing. If the lifecycle state is also broken,\nthe operator escalates to `apm2 fac doctor --pr <N> --fix`.\n"
+        },
+        {
+          "id": "P1_PUSH_EXIT_CODE_SEPARATION",
+          "title": "Push exit code reflects push outcome, not dispatch outcome",
+          "detail": "`fac push` performs four sequential operations:\n(1) git push\n(2) evidence gates\n(3) PR creation/update + auto-merge enablement\n(4) review dispatch\n\nIf (1)-(3) succeed but (4) fails (stale_head_ambiguity, at_capacity,\ndispatch_spawn_failed, etc.), the command must exit 0, not exit 1.\nThe dispatch failure is reported as:\n- A `\"dispatch_warning\"` field in the JSON output\n- A warning line on stderr\n- NOT the exit code\n\nExit 1 is reserved for failures in the push itself (git push failed),\ngates (evidence gates failed), or PR creation (GitHub API error).\nThis aligns with the principle that projections (review dispatch) are\nbest-effort and must not block the truth plane (push + gates).\n"
+        },
+        {
+          "id": "P1_PUSH_ATTEMPT_LOG",
+          "title": "Persistent push attempt log — gate failures survive agent death",
+          "detail": "Every `fac push` invocation appends one structured NDJSON record to\n`~/.apm2/fac_projection/repos/<repo>/push_attempts/<pr>.ndjson`.\n\nEach record captures the outcome of every stage in the push pipeline:\n  ts, sha, and per-stage: {status: pass|fail|skipped, duration_s,\n  exit_code (on fail), error_hint (on fail)}.\n\nStages: git_push, gate_fmt, gate_clippy, gate_test, gate_doc,\npr_update, dispatch.\n\nThe `error_hint` field is the key signal-to-noise lever: last line\nof stderr from the failed gate, capped at 200 characters. Enough to\nknow WHAT failed without the full test log.\n\nDoctor reads the latest entry for the current SHA to inform\n`recommended_action`. If doctor sees the last push attempt failed\nat gate_test with exit code 1, it recommends `dispatch_implementor`\nwith reason \"last push: gate_test FAIL (exit 1, 261s) — test\nworkspace::merge_conflicts timed out.\"\n\nThis eliminates the need to dig through agent transcripts to learn\nwhy a push failed. Gate failures become first-class FAC evidence,\nparallel to how findings are first-class review evidence.\n\nOnly the latest entry per SHA matters for doctor decisions, but the\nfull NDJSON log is retained for audit/debugging.\n"
+        },
+        {
+          "id": "P1_MACHINE_READABLE_PROJECTIONS",
+          "title": "All GitHub projections are machine-readable — no markdown rendering",
+          "detail": "Every FAC projection to GitHub (PR body, findings comment, verdict\ncomment) must be machine-readable structured data, not rendered\nmarkdown. Agents, CI, and tooling need to parse these projections\nprogrammatically.\n\nCurrent state:\n- PR body: already YAML in a code fence (machine-readable) — no change.\n- Decision/verdict comment: YAML payload in code fence (good) BUT\n  appends `render_findings_markdown()` output with `## FAC Findings`\n  headers, bullet lists, and prose — this is the problem.\n\nRequired changes:\n(a) Replace `render_findings_markdown()` in verdict_projection.rs\n    with a structured format. The entire comment body should be a\n    single YAML (or JSON) code fence containing both the decision\n    payload and the findings array.\n(b) Each finding in the projected array retains its full structured\n    fields: type, severity, summary, risk, impact, location, body,\n    timestamp. No lossy rendering to prose.\n(c) The HTML comment marker (`<!-- DECISION_MARKER -->`) is retained\n    for comment upsert identification.\n(d) No markdown headers, no bullet lists, no prose formatting in\n    any FAC-generated GitHub comment.\n\nThis makes findings comments parseable by `yq`/`jq` after stripping\nthe code fence, identical to how PR bodies are already parsed.\n"
+        },
+        {
+          "id": "P2_PUSH_IDENTITY_LAST",
+          "title": "Push persists local identity LAST — after gates and dispatch",
+          "detail": "Currently `fac push` writes the local PR identity/projection BEFORE\nrunning gates and dispatching reviews. When `git push --force` advances\nthe remote HEAD, the local projection holds a SHA that was written\nprematurely. Subsequent `fac restart` then fails with stale identity.\n\nRequired ordering:\n(1) git push --force\n(2) evidence gates (using the new SHA)\n(3) PR creation/update\n(4) review dispatch\n(5) ONLY NOW: persist local identity with the new SHA and fresh HMAC\n\nIf step (2) or (4) fails, the local identity retains the previous\n(valid) SHA. The operator can re-run `fac push` without hitting stale\nidentity errors, because the identity file still points to the last\nfully-processed SHA.\n"
+        },
+        {
+          "id": "P2_REMOVE_BOUNDED_TEST_SHELL_WRAPPER",
+          "title": "Remove bounded test shell wrapper and keep bounded execution in Rust",
+          "detail": "Remove `scripts/ci/run_bounded_tests.sh` and replace all FAC usage\nwith Rust-native bounded command construction.\n\n`apm2 fac gates` and FAC pipeline execution must continue to enforce\nbounded execution (timeout, memory, pids, CPU) via Rust code using\n`systemd-run`, without shell-wrapper indirection.\n"
+        },
+        {
+          "id": "P2_FINDINGS_VERDICT_CONSISTENCY",
+          "title": "Eliminate findings/verdict status mismatch",
+          "detail": "When a reviewer emits findings (MAJOR, MINOR, NIT) but crashes before\nsetting a verdict, the system reports inconsistent state:\n- `apm2 fac review findings` shows `verdict: \"FAIL\"` (computed from\n  finding severities)\n- `apm2 fac review status` shows `quality_verdict: \"UNKNOWN\"`\n\nThis is a direct consequence of the verdict ceremony being a separate\nstep. The P0_AUTO_VERDICT fix resolves this structurally — once the\nreaper auto-derives verdict from findings, both sources will agree.\n\nAdditionally, `apm2 fac review findings` should NOT report a synthetic\n`verdict` field that contradicts the authoritative verdict store. If\nno verdict has been set, findings should report `verdict: \"pending\"`,\nnot `verdict: \"FAIL\"`. The verdict store is the single source of truth\nfor pass/fail; findings are evidence, not authority.\n"
+        },
+        {
+          "id": "P2_ORCHESTRATOR_SKILL_DOCTOR_MIGRATION",
+          "title": "Rewrite orchestrator-monitor SKILL.md around doctor-as-oracle",
+          "detail": "With doctor --pr as the single-call oracle, the orchestrator-monitor\nSKILL.md should be dramatically simplified:\n\n(a) Replace all `fac review status --pr` references with\n    `apm2 fac doctor --pr <N> --json`.\n(b) SNAPSHOT step becomes: call doctor --pr for each PR, read one\n    JSON object. No multi-command reconciliation.\n(c) CLASSIFY step becomes: read `doctor.recommended_action.action`\n    directly — the classification is already done in Rust.\n(d) PLAN_DISPATCH step becomes: filter PRs by recommended_action,\n    apply tick-level bounds (max 3 actions, max 1 per PR).\n(e) EXECUTE_ACTIONS step becomes: run the `command` from each PR's\n    recommended_action, or dispatch implementor with\n    `doctor.findings_summary` in the handoff.\n(f) SATURATION_CHECK becomes: read `doctor.agents.active_agents` vs\n    `doctor.agents.max_active_agents_per_pr` (already done).\n(g) REVIEW_GATE_DEFINITION becomes: read `doctor.merge_readiness`.\n(h) Remove all references to `fac review status`.\n(i) System-level discovery: `apm2 fac doctor --json` (no --pr) for\n    the per-PR summary table with recommended actions.\n\nThe orchestrator decision tree shrinks from ~150 lines of reasoning\ninstructions to a thin dispatch loop.\n"
+        },
+        {
+          "id": "DONE_ORCHESTRATOR_SKILL_CAPACITY",
+          "title": "Orchestrator-monitor SKILL.md per-PR capacity fix",
+          "detail": "Already completed in this branch:\n- SATURATION_CHECK updated to use per-PR `apm2 fac doctor --pr <N>`\n- ENFORCE_BACKPRESSURE scoped per-PR\n- RESOLVE_PR_SCOPE clarified as discovery-only\n- REVIEW_PROGRESS_ACTION uses explicit per-PR commands\n- New invariant: capacity cap is per-PR, not global\n"
+        },
+        {
+          "id": "P1_VERDICT_TRANSITION_FROM_GATES_PASSED",
+          "title": "Allow verdict_set transition from gates_passed state",
+          "detail": "Bug: `apm2 fac review verdict set` fails with \"illegal transition:\ngates_passed + verdict_set\". The lifecycle reducer (lifecycle.rs:2204-2245)\ndoes not include `GatesPassed` in the match arm for `VerdictSet`. When the\n`reviews_dispatched` transition is missed (dispatch failure in push.rs,\nstate cleared by recovery, restart after corruption), reviewers cannot set\nverdicts. This cascades into `decision_receipt_missing` on every restart\nattempt → `max_restarts_exceeded`.\n\nFix: Add `S::GatesPassed` to the `VerdictSet` match arm. If gates have\npassed, it is always valid for a reviewer to set a verdict. The\n`reviews_dispatched` intermediate state is a tracking optimization, not a\nsecurity gate.\n\nAlso make `verdict set` idempotent for the same SHA — re-setting an\nexisting verdict for the current SHA and dimension should succeed, not\nerror. This prevents the restart death spiral.\n\nReference: documents/work/prompts/lifecycle-verdict-transition-bug.md\n"
+        },
+        {
+          "id": "P1_DOCTOR_RESTART_FORCE_GAP",
+          "title": "Doctor recommends restart with --force after max_restarts_exceeded",
+          "detail": "Bug: After reviewers hit `max_restarts_exceeded`, doctor recommends\n`apm2 fac restart --pr <N> --refresh-identity` without `--force`.\nWithout `--force`, `determine_restart_strategy()` checks completion\nreceipts from a prior sequence and may noop, leaving the PR stuck.\n\nFix: Pass review run state (including `terminal_reason`) into\n`build_recommended_action()`. When terminal_reason is\n`max_restarts_exceeded`, include `--force` in the recommended command\nto break the restart death spiral.\n\nReference: documents/work/prompts/doctor-restart-force-gap.md\n"
+        },
+        {
+          "id": "P1_DOCTOR_EDGE_CASES",
+          "title": "Doctor edge case fixes from audit",
+          "detail": "Seven edge cases identified in the doctor command from crash analysis\nof 185 events across all PRs:\n\n1. recommended_action blind to terminal_reason — does not receive\n   review run state, cannot distinguish max_restarts_exceeded from\n   normal completion. (Overlaps P1_DOCTOR_RESTART_FORCE_GAP.)\n2. no_merge_conflicts defaults false when worktree missing — doctor\n   reports merge conflicts when the real issue is a missing worktree.\n   Fix: distinguish \"unknown\" from \"has conflicts\" with an enum.\n3. Lifecycle escalation on default values — verify\n   retry_budget_remaining is always initialized to a positive value.\n4. Activity scan bounded to last 4096 events — event log already\n   exceeds this window (~11,500 events). Doctor may report stale\n   last_activity_seconds_ago for older PRs. Fix: increase window or\n   index events by PR.\n5. DoctorReviewSnapshot lacks terminal_reason — orchestrators cannot\n   distinguish clean completion from crash loop. Fix: add\n   terminal_reason field.\n6. Stale identity with no remediation path — when GitHub API is down,\n   remote_head_sha is None, sha_fresh is false, doctor silently\n   reports \"wait\". Fix: emit health item for GitHub unavailability,\n   consider local SHA authoritative.\n7. denied_with_findings checks formal OR computed verdict — may\n   trigger dispatch_implementor for NIT-only findings when formal\n   verdict is deny from a prior run.\n\nReference: documents/work/prompts/doctor-edge-cases-audit.md\n"
+        },
+        {
+          "id": "P2_PROJECTION_DECOUPLING",
+          "title": "Decouple GitHub projection from core FAC review modules",
+          "detail": "Structural refactor: extract all GitHub projection logic (auth,\ncomments, publishing, reviewer identity, CI status, verdict rendering)\nfrom core FAC review modules into dedicated projection modules.\n\nNew modules:\n- github_auth.rs: auth boundary (ensure_gh_cli_ready,\n  resolve_authenticated_gh_login, resolve_local_reviewer_identity).\n  Deduplicates copies in barrier.rs and projection.rs.\n- github_reads.rs: read-only GitHub API queries (fetch_pr_data,\n  fetch_pr_head_sha remote, fetch_default_branch,\n  resolve_actor_permission, fetch_issue_comment).\n- verdict_projection.rs: verdict comment rendering/parsing/caching\n  (DecisionComment types, parse/render functions, verdict show,\n  termination authority resolution). Extracted from projection.rs\n  (~lines 706-1024).\n\nAfter extraction, core modules (lifecycle, dispatch, state, types,\nevents, evidence, gates, findings, logs, projection) must have zero\nCommand::new(\"gh\") calls and zero GitHub-specific type imports.\n\nConstraints: zero regressions, no logic changes (pure structural\nmove), preserve pub(super) visibility, deduplicate auth helpers,\nno new crate dependencies.\n\nReference: documents/work/prompts/codex-projection-decoupling.md\n"
+        },
+        {
+          "id": "DONE_BOUNDED_RUNNER_KILLSIGNAL_FIX",
+          "title": "Fix scope cleanup false-FAIL: KillSignal SIGTERM→SIGKILL",
+          "detail": "Already completed in this branch:\n- build_bounded_test_command() set KillSignal=SIGTERM, which allowed\n  TERM-ignoring descendant processes (e.g. tck_00392's\n  `trap '' TERM; sleep 600`) to survive scope stop, causing systemd to\n  wait for TimeoutStopSec and report `Failed with result 'timeout'`\n- Changed KillSignal=SIGTERM to KillSignal=SIGKILL so scope cleanup is\n  immediate and unconditional — stray processes cannot block scope stop\n- Combined with existing FinalKillSignal=SIGKILL, SendSIGKILL=yes, and\n  KillMode=control-group for defense-in-depth\n- Root cause: tests intentionally spawn TERM-resistant processes to\n  validate containment; the bounded runner must tolerate this\n"
+        },
+        {
+          "id": "DONE_BOUNDED_RUNNER_SETENV_FIX",
+          "title": "Fix env var forwarding gap in bounded test runner",
+          "detail": "Already completed in this branch:\n- build_bounded_test_command() now accepts extra_setenv parameter\n- Lane profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) are\n  forwarded via --setenv to the systemd-run scope\n- Both callers updated: gates.rs and evidence.rs\n- Root cause: compute_test_env() produced lane vars after the\n  bounded command was built; vars were set on the parent Command\n  via .env() but never forwarded via --setenv to the cgroup child\n"
+        }
+      ],
+      "out_of_scope": [
+        "Redesigning the gate cache format or attestation scheme.",
+        "Changes to the background pipeline gate execution path.",
+        "Changes to MAX_ACTIVE_AGENTS_PER_PR constant value.",
+        "Removing the CI workflow entirely (it remains the required status check).",
+        "Multi-model review prompt shortening (separate concern — the system should be resilient to long prompts, not require short ones).",
+        "Broker mode gate execution (removed — gates always run locally; `--direct` and `--wait-timeout` flags deleted).",
+        "Full removal of `fac review status` (deprecation only in this ticket; removal in a follow-up).",
+        "Full removal of `fac recover` (deprecation only in this ticket; removal in a follow-up).",
+        "GitHub CI re-trigger / `--ci-only` flag — local forge is authoritative; CI is a projection that catches up on its own. GitHub Actions concurrency limits are GitHub's problem, not the local system's.",
+        "Workspace root resolution bug (intermittent `$PWD` / worktree boundary issue in bounded test runner) → separate investigation ticket."
+      ]
+    },
+    "plan": {
+      "steps": [
+        {
+          "id": "STEP_01",
+          "title": "Auto-verdict reaper",
+          "detail": "In `reap_registry_stale_entries()` (lifecycle.rs), when a reviewer\nagent is reaped (dead PID, expired token):\n(a) Check if a verdict exists for (owner_repo, pr_number, review_type, sha).\n(b) If no verdict, load findings from findings_store for that scope.\n(c) Compute verdict: BLOCKER/MAJOR → deny, MINOR/NIT only → approve,\n    no findings → leave pending (no verdict set).\n(d) Write verdict via the existing verdict-set path (local only —\n    GitHub projection is best-effort/deferred, not synchronous).\n(e) Emit a lifecycle event: `verdict_auto_derived` with source=reaper.\n"
+        },
+        {
+          "id": "STEP_02",
+          "title": "Local auto-merge on all-approve",
+          "detail": "In the shared verdict finalization function (lifecycle.rs):\n(a) After writing verdict, load all dimension verdicts for current SHA.\n(b) If all approve: resolve worktree, `git merge --ff-only` into main.\n(c) On merge success: emit `merged` lifecycle event.\n(d) On merge failure (non-ff): emit `merge_failed` event, no retry.\n(e) Fire-and-forget: spawn background `rm -rf <worktree>/target`.\n(f) This runs on both explicit verdict-set and auto-verdict paths.\n"
+        },
+        {
+          "id": "STEP_03",
+          "title": "Doctor --fix: recovery bypass implementation",
+          "detail": "Add crates/apm2-cli/src/commands/fac_review/recovery.rs with privileged\nrepair operations that bypass reducer and HMAC. Called by doctor --fix,\nnot exposed as a standalone CLI subcommand.\n(a) reap_stale_agents_for_pr(): PID-liveness sweep + auto-verdict for\n    reaped reviewers + registry rewrite with fresh HMAC.\n(b) refresh_identity_from_authoritative(): GitHub API fetch + identity\n    overwrite with fresh HMAC.\n(c) reset_lifecycle_to_pushed(): state reset preserving event history,\n    fresh HMAC.\n(d) run_full_repair(): combines all three, returns RepairSummary.\n(e) All operations recompute HMAC after writing, never verify before.\n(f) All operations log before/after state for audit trail.\n(g) Add `--fix` flag to DoctorArgs in fac.rs. When set, run_doctor_inner\n    executes repairs based on computed health diagnostics, then\n    re-diagnoses to show post-repair state.\n(h) Add `repairs_applied` array to DoctorPrSummary JSON output.\nRecovery bypass read/write helpers must use a distinct naming convention\n(e.g. `load_registry_bypass_hmac`, `save_registry_bypass_hmac`) so that\nreviewers can immediately identify privileged paths. Normal command paths\nmust never call bypass helpers.\n"
+        },
+        {
+          "id": "STEP_04",
+          "title": "Doctor --pr oracle: recommended_action",
+          "detail": "In run_doctor_inner() (mod.rs), after assembling all existing sections,\ncompute recommended_action from the full state:\n(a) Define action vocabulary: wait, merge, dispatch_implementor,\n    restart_reviews, fix, escalate.\n(b) Priority-ordered decision logic in Rust:\n    - lifecycle stuck or error_budget exhausted → escalate\n    - HMAC corrupt or lifecycle broken → fix (doctor --fix)\n    - all verdicts approve + gates pass + sha fresh → merge\n    - verdict deny + findings exist → dispatch_implementor\n    - no active agents + no verdict → restart_reviews\n    - agents alive + making progress → wait\n(c) Include reason, priority, and command in the action object.\n"
+        },
+        {
+          "id": "STEP_05",
+          "title": "Doctor --pr oracle: findings_summary + verdict consistency",
+          "detail": "Add per-dimension findings_summary to doctor output:\n(a) Load findings for each dimension at current SHA.\n(b) Count by severity: {blocker: N, major: N, minor: N, nit: N}.\n(c) Include formal_verdict (from store) and computed_verdict (from\n    findings) side by side.\n"
+        },
+        {
+          "id": "STEP_06",
+          "title": "Doctor --pr oracle: merge_readiness",
+          "detail": "Add merge_readiness object:\n(a) all_verdicts_approve: bool\n(b) gates_pass: bool\n(c) sha_fresh: bool (local == remote)\n(d) no_merge_conflicts: bool (branch is ff-only mergeable)\n(e) merge_ready: all sub-checks true\n"
+        },
+        {
+          "id": "STEP_07",
+          "title": "Doctor --pr oracle: agent enrichments",
+          "detail": "Enrich agent entries:\n(a) elapsed_seconds: now - started_at for active entries.\n(b) models_attempted: list per dimension from restart/fallback events.\n(c) last_activity_seconds_ago: time since last finding/event/pulse.\n"
+        },
+        {
+          "id": "STEP_08",
+          "title": "Doctor --pr oracle: worktree + projection status",
+          "detail": "Add worktree and projection sections:\n(a) worktree_exists, worktree_clean, merge_conflicts count.\n(b) github_projection: auto_merge_enabled, last_comment_updated_at,\n    projection_lag_seconds.\n(c) Filter stale pulse data: exclude pulses that don't match current run_id.\n"
+        },
+        {
+          "id": "STEP_09",
+          "title": "Doctor system-level summary (no --pr)",
+          "detail": "Extend `apm2 fac doctor --json` (no --pr flag):\n(a) Keep existing system health checks (daemon, disk, token, socket).\n(b) Add `tracked_prs` array: one entry per tracked PR with:\n    pr_number, owner_repo, lifecycle_state, recommended_action,\n    active_agents, last_activity_seconds_ago.\n(c) This replaces the PR-discovery use case of `fac review status`\n    without --pr.\n"
+        },
+        {
+          "id": "STEP_10",
+          "title": "Fix sequence_done premature emission",
+          "detail": "In the event emission logic:\n(a) Do not emit sequence_done until ALL active lanes are terminal.\n(b) When one lane terminates while another is alive, emit a\n    lane-specific event (e.g. quality_terminated), not sequence_done.\n(c) sequence_done fires only when every lane has reached terminal\n    state (done, failed, max_restarts_exceeded).\n"
+        },
+        {
+          "id": "STEP_11",
+          "title": "Deprecate fac review status and fac recover",
+          "detail": "(a) Add deprecation warning to `fac review status` stderr output:\n    \"DEPRECATED: use `apm2 fac doctor --pr <N> --json` instead.\"\n(b) Add deprecation warning to `fac recover` stderr output:\n    \"DEPRECATED: use `apm2 fac doctor --pr <N> --fix` instead.\"\n(c) Update orchestrator-monitor SKILL.md: replace all status\n    and recover references with doctor / doctor --fix.\n"
+        },
+        {
+          "id": "STEP_12",
+          "title": "Restart --refresh-identity",
+          "detail": "Add `--refresh-identity` flag to `fac restart`:\n(a) Fetch authoritative SHA from GitHub API.\n(b) If local identity diverges, overwrite with fresh HMAC.\n(c) Proceed with normal restart logic.\n"
+        },
+        {
+          "id": "STEP_13",
+          "title": "Push exit code separation",
+          "detail": "In push.rs `dispatch_reviews_with_lifecycle()` error handling:\n(a) Catch dispatch errors after successful push+gates+PR.\n(b) Return exit 0 with `dispatch_warning` field in JSON.\n(c) Emit warning on stderr.\n(d) Exit 1 only for push/gate/PR-creation failures.\n"
+        },
+        {
+          "id": "STEP_14",
+          "title": "Push attempt log",
+          "detail": "In push.rs, after each push invocation completes (success or failure):\n(a) Build a PushAttemptRecord with: ts, sha, and per-stage outcome\n    (status: pass|fail|skipped, duration_s, exit_code, error_hint).\n(b) Stages: git_push, gate_fmt, gate_clippy, gate_test, gate_doc,\n    pr_update, dispatch.\n(c) error_hint: last line of stderr from the failed stage, capped\n    at 200 characters. High signal, low noise.\n(d) Append as one NDJSON line to\n    ~/.apm2/fac_projection/repos/<repo>/push_attempts/<pr>.ndjson\n(e) Create parent directories if needed. Append-only — never truncate.\n(f) Doctor reads the latest entry for the current SHA to populate\n    recommended_action reason (e.g. \"last push: gate_test FAIL\n    (exit 1, 261s) — test workspace::merge_conflicts timed out\").\n"
+        },
+        {
+          "id": "STEP_15",
+          "title": "Push identity-last ordering",
+          "detail": "Reorder push.rs flow:\n(a) git push → gates → PR create/update → dispatch → THEN persist identity.\n(b) If intermediate steps fail, identity retains the previous valid SHA.\n"
+        },
+        {
+          "id": "STEP_16",
+          "title": "Remove bounded test shell wrapper",
+          "detail": "Delete `scripts/ci/run_bounded_tests.sh` and rewire FAC bounded test\nexecution paths to Rust-native `systemd-run` command construction.\n"
+        },
+        {
+          "id": "STEP_17",
+          "title": "Findings verdict field consistency",
+          "detail": "In findings_store.rs / findings.rs:\n(a) Remove synthetic verdict computation from findings output.\n(b) If no verdict set, report `verdict: \"pending\"`, not \"FAIL\".\n(c) Verdict store remains single source of truth for pass/fail.\n"
+        },
+        {
+          "id": "STEP_18",
+          "title": "Machine-readable GitHub projections",
+          "detail": "In verdict_projection.rs:\n(a) Replace `render_findings_markdown()` with structured output.\n    The entire decision comment body becomes a single YAML code fence\n    containing both the decision payload and a `findings` array.\n(b) Each finding retains full structured fields: type, severity,\n    summary, risk, impact, location, body, timestamp.\n(c) Retain the `<!-- DECISION_MARKER -->` HTML comment for upsert.\n(d) No markdown headers, bullet lists, or prose in any FAC comment.\n(e) Update tests that assert on markdown-formatted output.\n"
+        },
+        {
+          "id": "STEP_19",
+          "title": "Run formatting, clippy, docs, and full test suite",
+          "detail": "cargo fmt, clippy, doc, test — mandatory pre-commit."
+        },
+        {
+          "id": "STEP_20",
+          "title": "Fix verdict_set transition from gates_passed",
+          "detail": "In lifecycle.rs:2204-2245, add S::GatesPassed to the VerdictSet\nmatch arm. Make verdict set idempotent for the same SHA/dimension\nto prevent restart death spiral.\n"
+        },
+        {
+          "id": "STEP_21",
+          "title": "Doctor restart --force for max_restarts_exceeded",
+          "detail": "Pass review run state (terminal_reason) into build_recommended_action().\nWhen terminal_reason is max_restarts_exceeded, recommend --force in\nthe restart command.\n"
+        },
+        {
+          "id": "STEP_22",
+          "title": "Doctor edge case fixes",
+          "detail": "(a) Distinguish \"unknown\" from \"has conflicts\" in merge_readiness\n    when worktree is missing.\n(b) Add terminal_reason to DoctorReviewSnapshot.\n(c) Increase event scan window beyond 4096 or add per-PR indexing.\n(d) Emit health item when GitHub API unavailable instead of\n    silently setting sha_fresh=false.\n(e) Verify lifecycle budget initialization.\n(f) Tighten denied_with_findings to use formal_verdict only.\n"
+        },
+        {
+          "id": "STEP_23",
+          "title": "Grand projection decoupling",
+          "detail": "(a) Create github_auth.rs: extract and deduplicate auth helpers\n    from barrier.rs and projection.rs.\n(b) Create github_reads.rs: extract read-only GitHub API queries\n    from barrier.rs and logs.rs.\n(c) Create verdict_projection.rs: extract verdict comment logic\n    from projection.rs (~lines 706-1024).\n(d) Clean up projection.rs to have zero gh calls.\n(e) Clean up logs.rs to have zero gh calls.\n(f) Audit and clean barrier.rs remnants.\n(g) Update all callers to use new module paths.\n(h) Verify zero regressions with full test suite.\n"
+        }
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "When a reviewer process exits without calling `verdict set`, the reaper auto-derives a verdict from accumulated findings (BLOCKER/MAJOR → deny, MINOR/NIT → approve, no findings → leave pending).",
+        "`decision_receipt_missing` is no longer a terminal failure mode — the reaper closes the lane.",
+        "Auto-verdict GitHub projection is best-effort/deferred, never synchronous in the reaper hot path.",
+        "When all review dimensions approve for the current HEAD SHA, the branch is automatically merged into local main via `git merge --ff-only`.",
+        "Non-fast-forward merge emits `merge_failed` lifecycle event and does not retry.",
+        "Worktree `/target` directory is cleaned up fire-and-forget after successful merge.",
+        "Auto-merge triggers on both explicit `verdict set` and reaper auto-verdict paths.",
+        "`apm2 fac doctor --pr <N> --fix` auto-repairs broken state: reaps stale agents, refreshes stale identity, resets stuck lifecycle.",
+        "Doctor --fix reaps dead-PID registry entries and recomputes HMAC, even when existing HMAC is invalid.",
+        "Doctor --fix fetches current PR HEAD from GitHub and overwrites stale local identity.",
+        "Doctor --fix resets stuck lifecycle state without going through the reducer transition validator.",
+        "Doctor --fix auto-derives verdict from findings for reaped reviewers (ties into auto-verdict).",
+        "Doctor without --fix remains purely read-only — no state mutations.",
+        "Doctor --fix reports all repairs in `repairs_applied` array with before/after state.",
+        "Repair operations never fail due to existing corrupt HMAC or illegal transition state.",
+        "Recovery bypass helpers use distinct naming convention (e.g. `_bypass_hmac` suffix).",
+        "`fac recover` is deprecated with warning directing to `fac doctor --pr <N> --fix`.",
+        "`apm2 fac doctor --pr <N> --json` includes `recommended_action` with action, reason, priority, and command.",
+        "Doctor recommended_action vocabulary is closed: wait, merge, dispatch_implementor, restart_reviews, fix, escalate.",
+        "Doctor includes `findings_summary` per dimension with blocker/major/minor/nit counts.",
+        "Doctor includes `formal_verdict` and `computed_verdict` per dimension.",
+        "Doctor includes `merge_readiness` with all_verdicts_approve, gates_pass, sha_fresh, no_merge_conflicts sub-checks.",
+        "Doctor agent entries include `elapsed_seconds`, `models_attempted`, and `last_activity_seconds_ago`.",
+        "Doctor includes `worktree_exists`, `worktree_clean`, and `merge_conflicts` count.",
+        "Doctor includes `github_projection` status (auto_merge_enabled, projection_lag_seconds).",
+        "Doctor excludes stale pulse data from previous run_ids.",
+        "`apm2 fac doctor --json` (no --pr) includes `tracked_prs` summary table with per-PR recommended_action.",
+        "sequence_done event does not fire until ALL active lanes are terminal.",
+        "Lane-specific terminal events (e.g. quality_terminated) fire independently of sequence_done.",
+        "`apm2 fac review status` emits deprecation warning directing users to `doctor --pr`.",
+        "`apm2 fac recover` emits deprecation warning directing users to `doctor --fix`.",
+        "Orchestrator-monitor SKILL.md uses doctor exclusively for all per-PR queries and recovery.",
+        "`apm2 fac restart --refresh-identity --pr <N>` fetches authoritative SHA and updates local identity before proceeding with normal restart.",
+        "Every `fac push` invocation appends a structured NDJSON record to `~/.apm2/fac_projection/repos/<repo>/push_attempts/<pr>.ndjson` with per-stage outcomes.",
+        "Push attempt records include per-stage status (pass/fail/skipped), duration_s, exit_code, and error_hint (last stderr line, max 200 chars) for failed stages.",
+        "Doctor reads the latest push attempt record for the current SHA and incorporates gate failure details into `recommended_action` reason.",
+        "Gate failures survive agent death — orchestrators can determine why a push failed without reading agent transcripts.",
+        "`apm2 fac push` exits 0 when push+gates+PR succeed but dispatch fails; dispatch failure is reported as a warning, not the exit code.",
+        "`apm2 fac push` persists local identity AFTER gates pass and dispatch completes, not before.",
+        "`scripts/ci/run_bounded_tests.sh` is removed.",
+        "FAC bounded test execution remains enforced via Rust `systemd-run` command paths.",
+        "`apm2 fac review findings` reports `verdict: \"pending\"` (not `\"FAIL\"`) when no explicit verdict has been set.",
+        "Findings and verdict status are always consistent — no `verdict: FAIL` in findings with `verdict: UNKNOWN` in status.",
+        "SATURATION_CHECK in orchestrator-monitor SKILL.md uses per-PR capacity checks, not global.",
+        "GitHub decision/verdict comments contain a single structured YAML code fence with both the decision payload and a findings array — no markdown headers, bullet lists, or prose.",
+        "Each projected finding retains full structured fields (type, severity, summary, risk, impact, location, body, timestamp) — no lossy rendering.",
+        "`render_findings_markdown()` is removed; all GitHub comment rendering is machine-readable.",
+        "`apm2 fac review verdict set` succeeds from `gates_passed` lifecycle state — the `reviews_dispatched` intermediate is not required.",
+        "`verdict set` is idempotent for the same SHA and dimension — re-setting an existing verdict does not error.",
+        "Doctor recommends `--force` when terminal_reason is `max_restarts_exceeded`, breaking the restart noop loop.",
+        "`build_recommended_action()` receives review run terminal_reason and incorporates it into recommendations.",
+        "Doctor merge_readiness distinguishes 'unknown' (worktree missing) from 'has conflicts' — missing worktree does not trigger merge-conflict escalation.",
+        "DoctorReviewSnapshot includes terminal_reason field for crash-loop visibility.",
+        "Doctor event scan window handles event logs exceeding 4096 entries without reporting stale activity timestamps.",
+        "Doctor emits a health item when GitHub API is unavailable instead of silently failing sha_fresh.",
+        "Core FAC modules (lifecycle, dispatch, state, types, events, evidence, gates, findings, logs, projection) contain zero `Command::new(\"gh\")` calls after projection decoupling.",
+        "github_auth.rs is the single canonical location for `ensure_gh_cli_ready` and `resolve_authenticated_gh_login` — no copies in barrier.rs or projection.rs.",
+        "verdict_projection.rs contains all verdict comment rendering/parsing logic previously in projection.rs.",
+        "Bounded test runner uses KillSignal=SIGKILL so TERM-ignoring descendant processes (from containment tests) cannot cause false-FAIL via scope stop timeout.",
+        "`build_bounded_test_command()` forwards caller-supplied lane profile env vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) via --setenv to the systemd-run scope.",
+        "All evidence gates and tests pass."
+      ]
+    },
+    "notes": {
+      "context": "Field evidence from multi-PR orchestration sessions with 4+ LLM backends\n(codex, gemini-3-pro, gemini-3-flash, codex-spark). Consistent failure\npattern: happy path works, but any agent crash, SHA drift (rebase, amend,\nforce-push), or partial completion puts the system in a state that requires\nmanually deleting state files to recover.\n\nThe design principle driving this ticket: the system must reach a correct\nterminal state even when agents fail at any point in the protocol. LLM\nagents are the most unreliable component in the stack — the system must\nbe designed for their failure, not assume their success.\n\nThe second design principle: move decision logic from LLM orchestrators\ninto deterministic Rust code. The orchestrator should be a thin dispatch\nloop over doctor recommendations, not a complex reasoning agent parsing\nmultiple inconsistent data sources.\n\nPriority ordering:\n  P0 — auto-verdict + auto-merge + recovery bypass + doctor-as-oracle\n  P1 — deprecate status, fix sequence_done, restart refresh, push exit code, push attempt log\n  P2 — identity-last ordering, bounded shell wrapper removal, findings consistency, skill rewrite\n\nThe orchestrator-monitor SKILL.md per-PR capacity fix is already done in\nthis branch (SATURATION_CHECK, ENFORCE_BACKPRESSURE, invariants updated).\n",
+      "amendments": [
+        {
+          "amendment_id": "AMD-2026-02-16-FAC-THROUGHPUT-PIVOT",
+          "summary": "Bounded test execution remains mandatory as containment; throughput defaults move to host-aware profile resolution.",
+          "replacement": [
+            "Use gate throughput profiles (`throughput`, `balanced`, `conservative`) for CPU/test parallelism defaults.",
+            "Use queue admission as the primary contention control on high-capacity hosts."
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/health",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-HEALTH-001",
+      "kind": "invariant",
+      "title": "Timeout must be less than interval for meaningful scheduling",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-002",
+      "kind": "invariant",
+      "title": "Thresholds must be at least 1",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-003",
+      "kind": "invariant",
+      "title": "None variant disables health checking entirely",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-004",
+      "kind": "invariant",
+      "title": "Script execution must respect parent timeout configuration",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-005",
+      "kind": "invariant",
+      "title": "Initial health status is always Unknown",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-006",
+      "kind": "invariant",
+      "title": "Status transitions require threshold crossings, not single results",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-007",
+      "kind": "invariant",
+      "title": "History bounded to 100 entries with FIFO eviction",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-HEALTH-008",
+      "kind": "invariant",
+      "title": "Consecutive success and failure counters are mutually exclusive",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

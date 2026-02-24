@@ -1,0 +1,86 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00365",
+      "title": "EpochSealV1 monotonic sealing and validation path",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0019",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0019.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0019",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0019.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0309",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_HTF",
+        "DOMAIN_CONSENSUS",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00364",
+          "reason": "Prerequisite per RFC-0020 ticket decomposition ordering"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement EpochSealV1 schema, issuance, and verifier checks",
+        "Bind directory heads and receipt-batch epochs to epoch seals",
+        "Enforce monotonicity and reject rollback/equivocation in admission path"
+      ],
+      "out_of_scope": [
+        "Optional VDF profile (TCK-00366)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Read the bound requirement(s) and this ticket scope; confirm no scope creep beyond out_of_scope list.",
+        "Implement: Implement EpochSealV1 schema, issuance, and verifier checks",
+        "Implement: Bind directory heads and receipt-batch epochs to epoch seals",
+        "Implement: Enforce monotonicity and reject rollback/equivocation in admission path",
+        "Add/adjust unit/integration tests to cover acceptance criteria and regression risks per RFC-0020/07_test_and_evidence.yaml.",
+        "Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding EVID-* artifact with concrete artifact pointers."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0019",
+        "EVID-0309"
+      ],
+      "criteria": [
+        "Epoch seals issued for configured freshness-critical artifacts",
+        "Admission path rejects non-monotone or conflicting epoch sequences",
+        "Tier2+ authority admissions fail closed on missing/invalid seals"
+      ]
+    },
+    "notes": {
+      "security": "Fail-closed, least privilege, and explicit authority proofs are mandatory.",
+      "verification": "Prefer deterministic tests, replay/CAS evidence, and bounded-resource checks; avoid process-local assumptions.",
+      "general": "Keep scope atomic to this ticket, preserve explicit dependency ordering, and avoid introducing semantic drift from RFC-0020."
+    }
+  }
+}

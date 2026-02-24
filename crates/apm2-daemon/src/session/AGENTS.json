@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/session",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-SESSION-001",
+      "kind": "safety",
+      "title": "lease_id redacted in Debug output and skipped during serialization",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-002",
+      "kind": "requirement",
+      "title": "Session state persisted when SpawnEpisode succeeds",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-003",
+      "kind": "invariant",
+      "title": "Ephemeral handle generated using UUID v4 (random)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-004",
+      "kind": "safety",
+      "title": "No embedded user data or secrets in ephemeral handle",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-005",
+      "kind": "invariant",
+      "title": "Terminated sessions preserved with TTL for post-termination queries",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-006",
+      "kind": "safety",
+      "title": "Persistence failures are propagated (fail-closed)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-007",
+      "kind": "safety",
+      "title": "Default-deny: all reads denied unless explicitly allowed by manifest",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-008",
+      "kind": "requirement",
+      "title": "Context miss triggers session termination with CONTEXT_MISS rationale",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-DAEMON-SESSION-009",
+      "kind": "invariant",
+      "title": "Refinement attempts bounded to MAX_REFINEMENT_ATTEMPTS (10)",
+      "rfc": ["RFC-0015"]
+    }
+  ]
+}

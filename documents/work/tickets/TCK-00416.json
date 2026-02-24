@@ -1,0 +1,90 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00416",
+      "title": "Lifecycle authority bindings: mandatory delegation/context/stop/budget/view contracts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0013",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0013.yaml#rfc_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0014",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0014.yaml#rfc_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_DAEMON"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00314",
+          "reason": "Capability/context allowlist baseline is required for binding enforcement."
+        },
+        {
+          "ticket_id": "TCK-00312",
+          "reason": "Review artifact/receipt bindings are prerequisite for view/evidence contract enforcement."
+        },
+        {
+          "ticket_id": "TCK-00415",
+          "reason": "Requires projection-authority runtime path from WorkObject cutover."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Enforce required authority bindings in transition validators (lease, permeability, capability/context, stop, budgets, policy refs).",
+        "Enforce required outcome bindings (view_commitment_hash, tool_log_index_hash, summary_receipt_hash).",
+        "Reject missing/unresolvable bindings fail-closed before authoritative side-effects.",
+        "Emit structured defects for every rejected authority/binding violation."
+      ],
+      "out_of_scope": [
+        "HTF profile/tick policy validation internals (handled by TCK-00418).",
+        "xtask demotion/instruction cutover (handled by TCK-00419)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define required-binding matrix by lifecycle state and transition class.",
+        "Implement CAS-resolution validation for required hashes at transition time.",
+        "Add negative tests for each missing/invalid binding class.",
+        "Ensure successful transitions persist complete binding references for downstream replay.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0014"
+      ],
+      "criteria": [
+        "Transitions fail closed on missing required authority bindings.",
+        "Review/projection outcomes carry required commitment and evidence-index bindings.",
+        "Binding validation includes CAS resolvability checks."
+      ]
+    },
+    "notes": {
+      "security": "No best-effort authority transitions; missing bindings are hard denials.\n",
+      "verification": "Negative-path matrix must be exhaustive for required binding fields.\n"
+    }
+  }
+}

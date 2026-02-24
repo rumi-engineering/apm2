@@ -1,0 +1,18 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/webhook",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-WEBHOOK-001",
+      "kind": "invariant",
+      "title": "Webhook payloads validated via HMAC-SHA256 signature verification",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-WEBHOOK-002",
+      "kind": "safety",
+      "title": "Fail-closed: invalid or missing webhook signatures reject the payload",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00111",
+      "title": "Implement CCP component atlas generation",
+      "status": "READY"
+    },
+    "binds": {
+      "rfc_id": "RFC-0010",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0002"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00110"
+      }
+    ]
+  },
+  "implementation": {
+    "summary": "Create the CCP component atlas generator that discovers AGENTS.md files\nin crate directories, parses invariants/contracts/extension points, and\ngenerates stable component IDs. The atlas provides the semantic inventory\nof the codebase that grounds all RFC file path references.\n",
+    "files_to_modify": [],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-core/src/ccp/mod.rs",
+        "purpose": "CCP module root exporting component_atlas, crate_graph, and index submodules"
+      },
+      {
+        "path": "crates/apm2-core/src/ccp/component_atlas.rs",
+        "purpose": "Component atlas generation: AGENTS.md discovery, parsing, and stable ID generation"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Create CCP module structure",
+        "details": "Create crates/apm2-core/src/ccp/mod.rs with:\npub mod component_atlas;\n// pub mod crate_graph; (added in TCK-00112)\n// pub mod index; (added in TCK-00113)\n\nRe-export key types:\npub use component_atlas::{ComponentAtlas, Component, Invariant, Contract, ExtensionPoint, CcpError};\n"
+      },
+      {
+        "step": 2,
+        "action": "Define data structures",
+        "details": "In component_atlas.rs, define:\n\npub struct ComponentAtlas {\n    pub schema_version: String,\n    pub generated_at: DateTime<Utc>,\n    pub repo_root: PathBuf,\n    pub components: Vec<Component>,\n}\n\npub struct Component {\n    pub id: String,           // COMP-{UPPER_SNAKE_CASE} from crate name\n    pub name: String,         // Human-readable name\n    pub crate_path: PathBuf,  // e.g., crates/apm2-core\n    pub component_type: ComponentType,\n    pub description: String,\n    pub agents_md_path: Option<PathBuf>,\n    pub invariants: Vec<Invariant>,\n    pub contracts: Vec<Contract>,\n    pub extension_points: Vec<ExtensionPoint>,\n}\n\npub enum ComponentType { Library, Binary, XTask, Skill }\n\npub struct Invariant { pub id: String, pub description: String }\npub struct Contract { pub id: String, pub description: String }\npub struct ExtensionPoint { pub id: String, pub description: String, pub stability: Stability }\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement AGENTS.md discovery",
+        "details": "fn discover_agents_md(repo_root: &Path) -> Vec<PathBuf>\n- Glob for crates/*/AGENTS.md and crates/*/*/AGENTS.md\n- Return sorted list of paths (for determinism)\n- Handle missing crates/ directory gracefully\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement AGENTS.md parsing",
+        "details": "fn parse_agents_md(path: &Path) -> Result<ParsedAgentsMd, CcpError>\n- Read file content\n- Extract invariants: lines matching /^INV-\\d+:/ or markdown sections with INV- references\n- Extract contracts: lines matching /^CTR-\\d+:/ or markdown sections with CTR- references\n- Extract extension points: sections marked with EXT- or \"Extension Points\" headers\n- Be tolerant of format variations (the file is markdown for humans)\n\n**Supported format variations (parser must handle all):**\n1. List format: `- INV-001: statement here`\n2. Definition format: `INV-001: statement here` (no leading dash)\n3. Header-prefixed: `### INV-001: Title\\nstatement on next line`\n4. Table format: `| INV-001 | statement |`\n\n**Regex patterns for each format:**\n```rust\n// Format 1 (List): captures id and statement\nlet list_re = Regex::new(r\"^-\\s*(INV|CTR|EXT)-(\\d+):\\s*(.+)$\").unwrap();\n\n// Format 2 (Definition): captures id and statement\nlet def_re = Regex::new(r\"^(INV|CTR|EXT)-(\\d+):\\s*(.+)$\").unwrap();\n\n// Format 3 (Header): captures id and title, statement on next line\nlet header_re = Regex::new(r\"^#{1,4}\\s*(INV|CTR|EXT)-(\\d+):\\s*(.+)$\").unwrap();\n\n// Format 4 (Table): captures id and statement from markdown table row\nlet table_re = Regex::new(r\"^\\|\\s*(INV|CTR|EXT)-(\\d+)\\s*\\|\\s*(.+?)\\s*\\|\").unwrap();\n```\n\n**Sample AGENTS.md fixture for tests:**\n```markdown\n# Component AGENTS.md\n\n## Invariants\n- INV-001: All operations must be atomic\nINV-002: State is always consistent after operation\n\n### INV-003: Thread Safety\nAll public methods are thread-safe.\n\n| ID | Description |\n|----|-------------|\n| INV-004 | Memory usage bounded by config |\n\n## Contracts\n- CTR-001: Caller must validate input before calling\n\n## Extension Points\n- EXT-001: Custom handlers can be registered via trait\n```\n\nIf a format cannot be parsed, log warning and continue (graceful degradation).\nParser tests should cover all four formats with sample AGENTS.md fixtures.\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement component ID generation",
+        "details": "fn generate_component_id(crate_name: &str) -> String\n- Convert crate name to UPPER_SNAKE_CASE\n- Prefix with \"COMP-\"\n- Example: \"apm2-core\" -> \"COMP-APM2_CORE\"\n- Must be deterministic and stable\n"
+      },
+      {
+        "step": 6,
+        "action": "Implement build_component_atlas",
+        "details": "pub fn build_component_atlas(repo_root: &Path) -> Result<ComponentAtlas, CcpError>\n1. Discover all crate directories (parse workspace Cargo.toml or glob)\n2. For each crate, check for AGENTS.md\n3. If AGENTS.md exists, parse it; otherwise create placeholder entry\n4. Generate stable component ID from crate name\n5. Sort components by ID for determinism\n6. Return ComponentAtlas with schema_version and generated_at timestamp\n"
+      }
+    ],
+    "code_examples": [
+      {
+        "description": "Building a component atlas",
+        "code": "use apm2_core::ccp::build_component_atlas;\nuse std::path::Path;\n\nlet atlas = build_component_atlas(Path::new(\"/repo/root\"))?;\nfor component in &atlas.components {\n    println!(\"{}: {} invariants, {} extension points\",\n        component.id,\n        component.invariants.len(),\n        component.extension_points.len());\n}\n"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "Component IDs are stable across runs",
+      "verification": "Unit test runs build_component_atlas twice on same repo - component IDs must match exactly"
+    },
+    {
+      "criterion": "AGENTS.md invariants are correctly extracted",
+      "verification": "Unit test with sample AGENTS.md containing INV-001, INV-002 - verify both extracted with correct descriptions"
+    },
+    {
+      "criterion": "Components without AGENTS.md get placeholder entries",
+      "verification": "Unit test with crate lacking AGENTS.md - verify component created with empty invariants/contracts/extension_points"
+    }
+  ],
+  "test_requirements": [
+    {
+      "test_id": "UT-111-01",
+      "description": "Test component ID generation is deterministic",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas::tests::test_component_id_deterministic"
+    },
+    {
+      "test_id": "UT-111-02",
+      "description": "Test AGENTS.md discovery finds all files",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas::tests::test_agents_md_discovery"
+    },
+    {
+      "test_id": "UT-111-03",
+      "description": "Test AGENTS.md parsing extracts invariants",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas::tests::test_parse_invariants"
+    },
+    {
+      "test_id": "UT-111-04",
+      "description": "Test AGENTS.md parsing extracts extension points",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas::tests::test_parse_extension_points"
+    },
+    {
+      "test_id": "UT-111-05",
+      "description": "Test placeholder components for crates without AGENTS.md",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas::tests::test_placeholder_components"
+    },
+    {
+      "test_id": "IT-111-01",
+      "description": "Integration test: full component atlas build",
+      "verification_command": "cargo test -p apm2-core ccp::component_atlas"
+    }
+  ],
+  "notes": "The component atlas is the semantic foundation of the CCP. It captures what\neach crate promises (invariants), expects (contracts), and exposes (extension\npoints). This information is used by Impact Map generation to determine where\nnew requirements should be implemented.\n\nAGENTS.md parsing should be tolerant - these files are primarily documentation\nfor human agents, so the parser should extract what it can and not fail on\nunexpected formatting.\n\nBlocked by TCK-00110 because component atlas output must use canonical YAML\nfrom the determinism module to ensure stable, reproducible outputs.\n"
+}

@@ -1,0 +1,72 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/evidence",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-EVID-001",
+      "kind": "invariant",
+      "title": "Receipts are immutable after creation",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-002",
+      "kind": "invariant",
+      "title": "canonical_bytes() excludes signature for signing (unsigned canonical bytes)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-003",
+      "kind": "invariant",
+      "title": "Evidence refs are sorted for determinism",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-004",
+      "kind": "invariant",
+      "title": "Evidence refs bounded to MAX_EVIDENCE_REFS",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-005",
+      "kind": "requirement",
+      "title": "Constant-time Ed25519 signature verification",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-006",
+      "kind": "requirement",
+      "title": "Keys stored in OS keychain with version rotation",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-007",
+      "kind": "invariant",
+      "title": "Ring buffers bounded by MAX_BUFFER_CAPACITY",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-008",
+      "kind": "invariant",
+      "title": "Recorder configuration varies by risk tier",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-009",
+      "kind": "invariant",
+      "title": "Pinned artifacts are not evicted regardless of TTL",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-010",
+      "kind": "requirement",
+      "title": "MAX_EVICTIONS_PER_RUN bounds work per enforcement cycle",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-EVID-011",
+      "kind": "requirement",
+      "title": "Keychain uses fs_safe primitives for manifest persistence",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

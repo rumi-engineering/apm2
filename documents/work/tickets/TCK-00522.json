@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00522",
+      "title": "Economics integration: enforce RFC-0029 BudgetAdmissionDecision using EconomicsProfile bound in FacPolicyV1",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY",
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00521",
+          "reason": "Policy must include economics_profile_hash and defaults."
+        },
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker must evaluate budgets before execution."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add `economics_profile_hash` and default tier/intent class fields to policy.",
+        "Worker evaluates `BudgetAdmissionEvaluator` prior to job execution and records decision in receipt.",
+        "Denies on missing/unknown economics profile state (fail-closed).",
+        "Define job-kind to (tier,intent_class) mapping: gates/warm/gc/reset are actuation intents."
+      ],
+      "out_of_scope": [
+        "Tuning economics parameters for multi-node throughput."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define baseline EconomicsProfile artifact (CAS content-addressed).",
+        "Wire worker evaluation and receipt emission.",
+        "Add tests: missing profile → deny; valid profile → allow."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Every executed job receipt includes `eio29_budget_admission`.",
+        "Budget admission denies when profile/horizons/envelopes are absent or invalid."
+      ]
+    }
+  }
+}

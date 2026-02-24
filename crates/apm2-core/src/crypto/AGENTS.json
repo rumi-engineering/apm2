@@ -1,0 +1,55 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/crypto",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CRYPTO-001",
+      "kind": "invariant",
+      "title": "Hash outputs are always exactly 32 bytes",
+      "description": "BLAKE3 hash outputs are always exactly 32 bytes (HASH_SIZE). Hash function is deterministic.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-002",
+      "kind": "invariant",
+      "title": "Genesis events use 32 zero bytes as previous hash",
+      "description": "Genesis events use GENESIS_PREV_HASH (32 zero bytes) as their previous hash. Hash chain is BLAKE3(prev_hash || content).",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-003",
+      "kind": "invariant",
+      "title": "Secret keys zeroized on drop",
+      "description": "Secret keys are zeroized on drop via the zeroize crate, mitigating cold-boot attacks.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-004",
+      "kind": "invariant",
+      "title": "Ed25519 signatures are deterministic",
+      "description": "Same key + message always produces same signature (RFC 8032), avoiding randomness-related vulnerabilities.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-005",
+      "kind": "safety",
+      "title": "Key files stored with 0600 permissions only",
+      "description": "File-based keys stored with 0600 permissions (owner read/write only). Key directory created with 0700 permissions. Insecure permissions rejected.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-006",
+      "kind": "safety",
+      "title": "Actor ID validation prevents path traversal",
+      "description": "Actor IDs validated: 1-128 chars, alphanumeric with hyphens/underscores. Path traversal attempts (../, /, \\) are rejected.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CRYPTO-007",
+      "kind": "safety",
+      "title": "Key overwrites prevented to avoid accidental loss",
+      "description": "store_keypair() does not allow overwrites; use delete_keypair() first. generate_keypair() fails with KeyAlreadyExists if actor ID already has a key.",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

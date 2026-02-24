@@ -1,0 +1,51 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00557",
+      "title": "flake.nix + packaging: ensure devShell invariants and (optional) package broker/worker binaries",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Ensure devShell includes required tools (cargo-nextest, git, any broker/worker deps).",
+        "Optionally provide Nix packages for broker/worker for reproducible deployment.",
+        "Document how to run broker/worker under nix develop on Ubuntu baseline."
+      ],
+      "out_of_scope": [
+        "NixOS migration."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Update flake devShell.",
+        "Optionally define packages and apps."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "`nix develop` provides all mandatory FAC substrate tools for running gates/warm/worker locally."
+      ]
+    }
+  }
+}

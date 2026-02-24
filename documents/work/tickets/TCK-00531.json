@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00531",
+      "title": "RFC-0029 scheduler state persistence: stable state file + restart safety + anti-starvation continuity",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00511",
+          "reason": "Worker must compute admissions."
+        },
+        {
+          "ticket_id": "TCK-00510",
+          "reason": "Broker provides envelopes/horizons."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Persist scheduler state under `$APM2_HOME/private/fac/scheduler/state.v1.json`.",
+        "State must include: lane backlog snapshots, max_wait_ticks per lane, last evaluation tick, and any RFC-0029 state required to preserve anti-starvation across restarts.",
+        "Worker loads state on startup; if missing/corrupt, reconstructs conservatively and emits a recovery receipt.",
+        "State file writes are atomic and symlink-safe."
+      ],
+      "out_of_scope": [
+        "Distributed scheduler convergence."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define SchedulerStateV1 schema.",
+        "Implement atomic writer and bounded reader.",
+        "Integrate with RFC-0029 evaluation input construction."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Restarting worker preserves fairness/anti-starvation behavior (no permanent starvation regression).",
+        "Malformed state triggers fail-closed conservative behavior and a recovery receipt."
+      ]
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00187",
+      "title": "BFT State Machine Core",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0014"
+    }
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "State machine transitions correctly through protocol phases",
+      "verification": "Manual verification required"
+    },
+    {
+      "criterion": "Safety preserved under asynchronous network assumptions",
+      "verification": "Manual verification required"
+    }
+  ],
+  "implementation": {
+    "code_examples": [],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-core/src/consensus/bft_machine.rs"
+      }
+    ],
+    "files_to_modify": [],
+    "implementation_steps": [],
+    "summary": "Implement the core BFT consensus state machine (HotStuff or PBFT).\nHandle phase transitions per EVID-0007.\n"
+  },
+  "notes": "Phase: P2\nGenerated from RFC RFC-0014 ticket decomposition on 2026-01-28.",
+  "test_requirements": [
+    {
+      "description": "Unit tests pass",
+      "test_id": "UT-00187-01",
+      "verification_command": "cargo test -p apm2-core tck_00187"
+    },
+    {
+      "description": "Integration test",
+      "test_id": "IT-00187-01",
+      "verification_command": "cargo run --bin apm2 -- factory tickets emit --rfc RFC-0014"
+    }
+  ]
+}

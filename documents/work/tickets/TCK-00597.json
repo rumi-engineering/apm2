@@ -1,0 +1,64 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00597",
+      "title": "Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00596",
+          "reason": "Credential mounts + systemd credentials need to exist."
+        },
+        {
+          "ticket_id": "TCK-00575",
+          "reason": "Lane-scoped HOME/XDG roots must be deterministic."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Update GitHub-facing CLI flows to accept `GH_TOKEN` (injected) without requiring `gh auth login`.",
+        "Remove hard dependency on `gh auth status` when token-based auth is present.",
+        "Ensure GitHub CLI config dirs are lane-scoped (HOME/XDG_CONFIG_HOME), never user-global by default.",
+        "Ensure failures are deterministic and do not block `gates`."
+      ],
+      "out_of_scope": [
+        "Replacing gh CLI with a pure-Rust GitHub client (optional future)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Adjust readiness checks in `fac_review` to validate token-based auth paths.",
+        "Thread credential mounts into GitHub calls (GH_TOKEN env) and ensure redaction.",
+        "Document provisioning via systemd credentials."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "GitHub-facing workflows succeed with only `GH_TOKEN` provisioned via systemd credentials.",
+        "No requirement for interactive login or persistent ~/.config/gh state."
+      ]
+    }
+  }
+}

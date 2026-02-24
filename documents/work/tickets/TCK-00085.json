@@ -1,0 +1,91 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-25",
+    "template_version": "2026-01-25",
+    "ticket": {
+      "id": "TCK-00085",
+      "title": "Implement GitHub webhook handler for workflow_run.completed"
+    },
+    "binds": {
+      "prd_id": "PRD-0004",
+      "rfc_id": "RFC-0008",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0015",
+          "requirement_ref": "documents/prds/PRD-0004/requirements/REQ-0015.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-8001"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Create HTTP endpoint POST /webhooks/github using axum",
+        "Implement HMAC-SHA256 signature validation",
+        "Parse X-Hub-Signature-256 header",
+        "Parse X-GitHub-Event and X-GitHub-Delivery headers",
+        "Parse workflow_run.completed payload structure",
+        "Add rate limiting to prevent abuse",
+        "Add feature flag WEBHOOK_HANDLER_ENABLED",
+        "Return appropriate HTTP status codes (200, 202, 400, 401, 429)",
+        "Log webhook requests for audit trail"
+      ],
+      "out_of_scope": [
+        "Ledger event emission (TCK-00086)",
+        "Task queue integration (TCK-00087)",
+        "Other webhook event types (check_run, pull_request, etc.)",
+        "Webhook redelivery handling"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add axum, hmac, sha2 dependencies to apm2-core/Cargo.toml",
+        "Create webhook module structure: crates/apm2-core/src/webhook/",
+        "Implement SignatureValidator with HMAC-SHA256 verification",
+        "Create WebhookPayload structs for workflow_run.completed",
+        "Implement axum handler with signature extraction from headers",
+        "Add rate limiting middleware",
+        "Add feature flag check at handler entry",
+        "Write unit tests for signature validation",
+        "Write unit tests for payload parsing",
+        "Write integration test for full handler flow"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-8001"
+      ],
+      "criteria": [
+        "Webhook endpoint accepts POST requests",
+        "X-Hub-Signature-256 header is parsed and validated",
+        "Valid signatures return 200 or 202",
+        "Invalid signatures return 401 Unauthorized",
+        "Malformed payloads return 400 Bad Request",
+        "Rate limit exceeded returns 429 Too Many Requests",
+        "Feature flag WEBHOOK_HANDLER_ENABLED controls endpoint",
+        "All webhook requests are logged with IP and delivery_id",
+        "Unit tests pass for signature validation",
+        "Integration test passes for handler flow"
+      ]
+    },
+    "notes": {
+      "security": "This ticket establishes the security foundation for the webhook system.\nKey security properties:\n- Signature validation uses constant-time comparison to prevent timing attacks\n- Secret is loaded from environment variable (not hardcoded)\n- Logging excludes the secret and signature (prevent accidental exposure)\n- Rate limiting prevents denial of service\n\nThe webhook secret MUST be:\n- At least 32 bytes of cryptographically random data\n- Stored securely (environment variable or secrets manager)\n- Never logged or exposed in error messages\n",
+      "implementation_details": "Axum handler structure:\n```rust\nasync fn webhook_handler(\n    State(config): State<WebhookConfig>,\n    headers: HeaderMap,\n    body: Bytes,\n) -> Result<StatusCode, WebhookError> {\n    // 1. Check feature flag\n    if !config.webhook_handler_enabled {\n        return Err(WebhookError::Disabled);\n    }\n\n    // 2. Extract and validate signature\n    let signature = headers\n        .get(\"X-Hub-Signature-256\")\n        .ok_or(WebhookError::MissingSignature)?;\n    config.validator.verify(&body, signature)?;\n\n    // 3. Parse payload\n    let event_type = headers.get(\"X-GitHub-Event\");\n    let delivery_id = headers.get(\"X-GitHub-Delivery\");\n    let payload: WorkflowRunPayload = serde_json::from_slice(&body)?;\n\n    // 4. Process (Phase 0: just log and return)\n    tracing::info!(delivery_id = ?delivery_id, \"Webhook received\");\n\n    Ok(StatusCode::ACCEPTED)\n}\n```\n",
+      "affected_files": "New:\n  - crates/apm2-core/src/webhook/mod.rs\n  - crates/apm2-core/src/webhook/signature.rs\n  - crates/apm2-core/src/webhook/handler.rs\n  - crates/apm2-core/src/webhook/payload.rs\nModified:\n  - crates/apm2-core/src/lib.rs (add webhook module)\n  - crates/apm2-core/Cargo.toml (add axum, hmac, sha2)\n"
+    }
+  }
+}

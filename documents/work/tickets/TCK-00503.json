@@ -1,0 +1,125 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00503",
+      "title": "FAC review UX: worktree-aware dispatch, per-SHA finding comments, gate status in PR body",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0003",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0003.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0006.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0013",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0013.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0003",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0003.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0006",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0006.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_GOVERNANCE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "WS1: Add worktree.rs module with resolve_worktree_for_sha() that parses `git worktree list --porcelain` to find the worktree whose HEAD matches the dispatch target SHA.",
+        "WS1: Add WorktreeEntry struct { path: PathBuf, head_sha: String, branch: Option<String> } and parse_worktree_list() pure parser for unit-testable porcelain parsing.",
+        "WS1: Modify dispatch.rs spawn_detached_review() to accept an explicit workspace_root: &Path parameter instead of using std::env::current_dir(). Use it for both systemd-run --property WorkingDirectory= and .current_dir().",
+        "WS1: Modify dispatch_single_review_with_force() to call resolve_worktree_for_sha(head_sha) after SHA resolution and before the merge conflict check, then pass the resolved path to spawn_detached_review().",
+        "WS1: Fall back to current_dir() with a warning if no worktree matches; fail closed with a clear error if neither worktree nor cwd HEAD matches the target SHA.",
+        "WS2: Add `apm2 fac review comment` subcommand that posts a single finding comment bound to a SHA, with auto-resolved SHA from git rev-parse HEAD.",
+        "WS2: Add ReviewCommentArgs struct with --repo (default guardian-intelligence/apm2), --pr/--pr-url (auto-resolved from branch), --sha (auto-resolved from HEAD), --severity (blocker/major/minor/nit), --type (security/code-quality), and --body <TEXT> (read from stdin if absent).",
+        "WS2: Each comment includes a machine-readable finding marker (<!-- apm2-finding:v1:{type}:{sha_short}:{severity} -->) and appended JSON metadata block (schema apm2.finding.v1) with review_type, severity, head_sha, pr_number, reviewer_id.",
+        "WS2: Make publish.rs create_issue_comment() pub(super) for reuse by comment.rs.",
+        "WS2: Extend findings.rs build_findings_report() to recognize individual finding markers (<!-- apm2-finding:v1:... -->) alongside monolithic review markers, parse per-finding metadata, and merge into the same DimensionFindings output.",
+        "WS3: Add pr_body.rs module that syncs gate status to the PR description body using HTML comment markers (<!-- apm2-gate-status:start --> / <!-- apm2-gate-status:end -->) for idempotent section replacement.",
+        "WS3: Add ShaGateStatus { sha, short_sha, timestamp, gates: Vec<GateResult>, all_passed } and GateResult { name, passed, duration_secs } structs.",
+        "WS3: Implement fetch_pr_body() via `gh pr view --json body --jq .body`, parse_pr_body() to split into (before_markers, existing_gate_statuses, after_markers), render_gate_status_section() for markdown table + <details> blocks (max 5 previous retained), and sync_gate_status_to_pr() orchestrator.",
+        "WS3: Latest SHA gate results shown expanded as a markdown table; previous SHA results collapsed in <details> tags.",
+        "WS3: Modify push.rs run_blocking_evidence_gates() to return EvidenceGateResult vec instead of discarding results on success. Call sync_gate_status_to_pr() from run_push() after evidence gates complete and PR is created/updated.",
+        "WS4: Update fac_review/AGENTS.md to document new submodules (worktree.rs, comment.rs, pr_body.rs), the worktree resolution contract, per-SHA finding comment format, and PR body gate status format.",
+        "WS4: Add `apm2 fac review comment` to the command listing in fac.rs module-level doc comment."
+      ],
+      "out_of_scope": [
+        "Changing the review agent prompt to use per-SHA comments automatically (future).",
+        "Replacing the monolithic review comment flow (this is additive).",
+        "Reordering the push flow (gates remain before PR create/update).",
+        "Remote/distributed worktree management.",
+        "Superseding the comment-based CI status approach in ci_status.rs (future convergence)."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "WS1-1: Create crates/apm2-cli/src/commands/fac_review/worktree.rs with WorktreeEntry struct, parse_worktree_list() porcelain parser, and resolve_worktree_for_sha() that runs `git worktree list --porcelain`, parses output, and matches worktree whose HEAD == expected_sha. Fallback: current_dir() with warning; fail closed if cwd HEAD also mismatches.",
+        "WS1-2: Add unit tests for parse_worktree_list() with sample porcelain output (main worktree, linked worktree, bare worktree, detached HEAD).",
+        "WS1-3: Modify dispatch.rs dispatch_single_review_with_force() (line 939): after resolving head_sha and before merge conflict check, call resolve_worktree_for_sha(head_sha) to get correct cwd. Pass to spawn_detached_review().",
+        "WS1-4: Modify dispatch.rs spawn_detached_review() (line 970): add workspace_root: &Path parameter. Replace std::env::current_dir() with this parameter for both systemd-run WorkingDirectory and .current_dir().",
+        "WS1-5: Add `mod worktree;` to fac_review/mod.rs.",
+        "WS3-1: Create crates/apm2-cli/src/commands/fac_review/pr_body.rs with GATE_STATUS_START/END constants, ShaGateStatus/GateResult structs, fetch_pr_body(), parse_pr_body(), render_gate_status_section(), and sync_gate_status_to_pr().",
+        "WS3-2: Add unit tests for parse_pr_body() roundtrip and render_gate_status_section() output format (expanded current + collapsed previous with max 5 retained).",
+        "WS3-3: Modify push.rs run_blocking_evidence_gates() to return Result<Vec<EvidenceGateResult>, String> instead of Result<(), String>. Capture gate results and pass to sync_gate_status_to_pr() after PR create/update in run_push().",
+        "WS3-4: Add `mod pr_body;` to fac_review/mod.rs.",
+        "WS2-1: Add Comment(ReviewCommentArgs) variant to ReviewSubcommand enum in fac.rs. Add ReviewCommentArgs struct with --repo, --pr/--pr-url, --sha, --severity, --type, --body fields.",
+        "WS2-2: Create crates/apm2-cli/src/commands/fac_review/comment.rs with run_comment() that resolves PR target, SHA, reads body (from --body or stdin), wraps in finding marker, appends metadata JSON, and calls create_issue_comment().",
+        "WS2-3: Make publish.rs create_issue_comment() pub(super) for reuse.",
+        "WS2-4: Extend findings.rs build_findings_report() to recognize individual finding markers (<!-- apm2-finding:v1:... -->), parse per-finding metadata JSON, and merge individual findings into DimensionFindings alongside monolithic review comment findings.",
+        "WS2-5: Add `mod comment;` to fac_review/mod.rs. Wire ReviewSubcommand::Comment match arm to call run_comment().",
+        "WS2-6: Add run_comment() pub function to fac_review/mod.rs public API.",
+        "WS4-1: Update fac_review/AGENTS.md to document worktree.rs, comment.rs, pr_body.rs in the architecture diagram and module listing.",
+        "WS4-2: Add `apm2 fac review comment` to the command listing in fac.rs module-level doc comment (lines 1-55).",
+        "WS4-3: Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0003",
+        "EVID-0006"
+      ],
+      "criteria": [
+        "Review agents dispatched from the main checkout start in the correct ticket worktree (verified by log output showing correct WorkingDirectory).",
+        "parse_worktree_list() unit tests pass with sample porcelain output covering main worktree, linked worktree, bare worktree, and detached HEAD cases.",
+        "resolve_worktree_for_sha() falls back to current_dir() with warning when no worktree matches, and fails closed when cwd HEAD also mismatches.",
+        "`apm2 fac review comment --severity minor --type security --body 'test'` posts a finding comment with correct <!-- apm2-finding:v1:security:{sha_short}:minor --> marker and apm2.finding.v1 metadata JSON block.",
+        "findings.rs aggregates both monolithic review comments (apm2-review-metadata:v1) and individual finding comments (apm2-finding:v1) into a single FindingsReport.",
+        "After `apm2 fac push`, the PR description includes a gate status table between <!-- apm2-gate-status:start --> and <!-- apm2-gate-status:end --> markers with pass/fail per gate and duration.",
+        "Re-pushing with a new SHA collapses the previous gate results into a <details> block and shows the new results expanded. Maximum 5 previous results retained.",
+        "parse_pr_body() roundtrip unit tests pass: parse existing body with gate section, modify, re-render, and verify content outside markers is preserved.",
+        "All cargo fmt/clippy/doc/test pass."
+      ]
+    },
+    "notes": {
+      "security": "WS1: Worktree resolution uses local git state only (not GitHub API). GitHub is a projection,\nnot truth. Fail closed if no matching worktree is found and cwd HEAD also mismatches.\n\nWS2: Finding comments use the same trusted-author filtering as monolithic review comments in\nfindings.rs. Only comments authored by the authenticated `gh` login are trusted. The finding\nmarker format (<!-- apm2-finding:v1:... -->) is distinct from the monolithic review marker\n(<!-- apm2-review-metadata:v1:... -->) to avoid parsing ambiguity.\n\nWS3: PR body updates preserve existing content outside the gate-status markers. Never include\nlocal filesystem paths, environment variables, compilation output, or sensitive diagnostics in\nthe PR body. The update uses `gh pr edit --body` which requires write access to the PR.\n",
+      "verification": "WS1: Unit test the porcelain parser with synthetic output. Manual verification: run\n`apm2 fac review dispatch <PR_URL>` from the main checkout and verify the spawned process\nlogs show the correct worktree path in WorkingDirectory.\n\nWS2: Unit test comment metadata rendering and findings aggregation with individual finding\nmarkers. Manual: `echo \"test finding\" | apm2 fac review comment --pr 123 --severity minor --type security`.\n\nWS3: Unit test PR body parsing roundtrip and rendering. Manual: run `apm2 fac push` and\nverify the PR body includes a gate status table with correct markers.\n\nFull gate: cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo doc --workspace --no-deps && cargo test --workspace\n"
+    }
+  }
+}

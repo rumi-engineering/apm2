@@ -1,0 +1,122 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-27",
+    "template_version": "2026-01-27",
+    "ticket": {
+      "id": "TCK-00173",
+      "title": "Implement Claude Code harness adapter",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0013",
+      "requirements": [
+        {
+          "requirement_id": "REQ-ADAPTER-001"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00162"
+      },
+      {
+        "ticket_id": "TCK-00164"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "PTY output parser for Claude Code CLI",
+      "verification": "Parser extracts tool calls from output"
+    },
+    {
+      "criterion": "Tool call detection and extraction",
+      "verification": "Tool requests emit HarnessEvent::ToolRequest"
+    },
+    {
+      "criterion": "Test fixtures from real Claude Code sessions",
+      "verification": "Fixtures parse correctly"
+    }
+  ],
+  "implementation": {
+    "code_examples": [
+      {
+        "description": "ClaudeCodeAdapter structure",
+        "code": "pub struct ClaudeCodeAdapter {\n    parser: ClaudeCodeParser,\n}\n\nimpl HarnessAdapter for ClaudeCodeAdapter {\n    fn adapter_type(&self) -> AdapterType {\n        AdapterType::ClaudeCode\n    }\n\n    fn output_stream(&self, handle: &HarnessHandle) -> impl Stream<Item = HarnessEvent> {\n        handle.pty_output()\n            .flat_map(|chunk| self.parser.parse(chunk))\n    }\n}\n\npub struct ClaudeCodeParser {\n    state: ParserState,\n    buffer: Vec<u8>,\n}\n\nimpl ClaudeCodeParser {\n    pub fn parse(&mut self, chunk: &[u8]) -> Vec<HarnessEvent>;\n}\n"
+      }
+    ],
+    "files_to_create": [
+      {
+        "path": "crates/apm2-daemon/src/episode/claude_code.rs",
+        "purpose": "ClaudeCodeAdapter implementation"
+      },
+      {
+        "path": "crates/apm2-daemon/src/episode/claude_parser.rs",
+        "purpose": "Parser for Claude Code PTY output"
+      },
+      {
+        "path": "crates/apm2-daemon/tests/fixtures/claude_code/",
+        "purpose": "Test fixtures from real sessions"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "changes": "Export claude_code module, register adapter",
+        "path": "crates/apm2-daemon/src/episode/mod.rs"
+      },
+      {
+        "changes": "Register ClaudeCodeAdapter in default registry",
+        "path": "crates/apm2-daemon/src/episode/registry.rs"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Implement ClaudeCodeParser",
+        "details": "Deterministic parser state machine per AD-ADAPT-001:\n- States: Idle, InToolCall, InOutput\n- Detect tool call markers in output\n- Extract tool name and arguments\n- Emit HarnessEvent::ToolRequest\n"
+      },
+      {
+        "step": 2,
+        "action": "Handle parsing failures",
+        "details": "Per AD-ADAPT-001:\n- Parsing failures emit DefectRecord\n- Never crash on malformed input\n- Log parsing errors as defects\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement ANSI sanitization",
+        "details": "Per TB-ADAPTER-001:\n- Strip ANSI escape sequences\n- Normalize line endings\n- Handle partial UTF-8\n"
+      },
+      {
+        "step": 4,
+        "action": "Create test fixtures",
+        "details": "Capture real Claude Code sessions:\n- Simple command execution\n- File read/write operations\n- Multi-tool sequences\n- Error scenarios\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement rate limiting",
+        "details": "Per TB-ADAPTER-001:\n- Rate limit tool request extraction\n- Prevent DoS via rapid tool markers\n- Configurable limit (default: 10/sec)\n"
+      }
+    ],
+    "summary": "Implement Claude Code harness adapter per AD-ADAPT-001.\nParses PTY output to detect tool calls and emit structured events.\nIncludes test fixtures from real Claude Code sessions.\n"
+  },
+  "notes": "Phase: PHASE-3B (Vendor Adapter)\nGenerated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.\nMaps to TCK-PEND-016.\n",
+  "test_requirements": [
+    {
+      "description": "Parser extracts tool calls",
+      "test_id": "UT-00173-01",
+      "verification_command": "cargo test -p apm2-daemon claude_parser"
+    },
+    {
+      "description": "Fixture parsing",
+      "test_id": "UT-00173-02",
+      "verification_command": "cargo test -p apm2-daemon claude_fixtures"
+    },
+    {
+      "description": "Malformed input handling",
+      "test_id": "UT-00173-03",
+      "verification_command": "cargo test -p apm2-daemon claude_malformed"
+    }
+  ]
+}

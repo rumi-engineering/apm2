@@ -1,0 +1,48 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/budget",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-BUDGET-001",
+      "kind": "invariant",
+      "title": "Budget of zero means unlimited (no enforcement)",
+      "description": "A budget value of 0 means unlimited for that dimension; no enforcement is applied.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-BUDGET-002",
+      "kind": "invariant",
+      "title": "Budgets are immutable once a session starts",
+      "description": "Budget configuration cannot be changed after session initialization.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-BUDGET-003",
+      "kind": "invariant",
+      "title": "Consumption counters use saturating arithmetic",
+      "description": "Budget consumption counters use saturating arithmetic to prevent overflow.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-BUDGET-004",
+      "kind": "safety",
+      "title": "Requests denied when any budget is exceeded (fail-closed)",
+      "description": "Budget enforcement is fail-closed: requests are denied when any budget dimension is exceeded. Budget checks occur before tool execution.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-BUDGET-005",
+      "kind": "requirement",
+      "title": "Time budget cannot be charged directly",
+      "description": "Time budget is tracked automatically and cannot be charged directly. charge() returns Err(TimeCannotBeCharged) for BudgetType::Time.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-BUDGET-006",
+      "kind": "requirement",
+      "title": "Budget checks occur before policy rule evaluation",
+      "description": "In evaluate_with_budget(), budget checks occur BEFORE policy rule evaluation as a fail-closed gate. Policy rules cannot override budget limits.",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

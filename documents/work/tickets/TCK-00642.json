@@ -1,0 +1,78 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00642",
+      "title": "RFC-0032 Phase 3: add WorkGraphEvent protobuf + canonical event types `work_graph.edge.*` + topic-derivation tests",
+      "status": "IN_PROGRESS"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PROTOCOL",
+        "DOMAIN_KERNEL",
+        "DOMAIN_DAEMON"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00631",
+          "reason": "Canonical ledger append path required for new event types"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add `WorkGraphEvent` proto messages to `proto/kernel_events.proto` (WorkEdgeAdded/Removed/Waived, WorkEdgeType enum)",
+        "Define canonical event_type strings: work_graph.edge.added/removed/waived (MUST NOT start with `work.` to avoid WorkReducer decoding)",
+        "Extend topic derivation to emit work topics for both from_work_id and to_work_id (multi-topic derivation required)",
+        "Add dedicated topic derivation tests for each new event type per drift barrier D1.2"
+      ],
+      "out_of_scope": [
+        "RPC handlers and projections for graph edges (separate ticket)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Update proto definitions and regenerate Rust protobufs",
+        "Update `crates/apm2-daemon/src/protocol/topic_derivation.rs` to decode WorkGraphEvent payloads and return Vec<String>",
+        "Add tests asserting exact topic sets emitted for added/removed/waived edge events"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "WorkGraphEvent protos compile and are used for topic derivation without touching WorkReducer.",
+        "Topic derivation tests exist for each `work_graph.edge.*` event type and assert exact topics."
+      ]
+    }
+  },
+  "fac_security_contract": {
+    "source": "documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml",
+    "profile": "FAC-RFC0032-BASELINE",
+    "required_invariants": [
+      "INV-FAC-TRUTH-001",
+      "INV-FAC-WORK-BIND-001",
+      "INV-FAC-CLAIM-BIND-001",
+      "INV-FAC-ACTOR-BIND-001",
+      "INV-FAC-IDEMP-001",
+      "INV-FAC-EVID-001"
+    ],
+    "enforcement_requirements": [
+      "Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.",
+      "Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.",
+      "Reviewer denial is expected for invariant-unmapped behavior changes."
+    ]
+  }
+}

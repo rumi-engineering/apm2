@@ -1,0 +1,131 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00117",
+      "title": "Add lint rules for clutter prevention",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0010",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0005"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00116"
+      }
+    ]
+  },
+  "implementation": {
+    "summary": "Add three new lint rules to LINT_SPEC.yaml and implement corresponding\nchecks in xtask/src/tasks/lint.rs. These rules prevent codebase clutter\nby requiring justification for new modules, detecting cousin abstractions,\nand requiring deletion plans for new API surface.\n",
+    "files_to_create": [],
+    "files_to_modify": [
+      {
+        "path": "documents/standards/lint/LINT_SPEC.yaml",
+        "changes": "Add LINT-0013, LINT-0014, LINT-0015 rule definitions"
+      },
+      {
+        "path": "xtask/src/tasks/lint.rs",
+        "changes": "Implement check functions for new lint rules"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Add LINT-0013 to LINT_SPEC.yaml",
+        "details": "Add rule definition for no-new-module-without-justification:\n- id: LINT-0013\n- name: no-new-module-without-justification\n- severity: error\n- description: New modules must have justification in RFC\n- check: Verify new mod.rs files have corresponding RFC reference\n- auto_fix: false\n"
+      },
+      {
+        "step": 2,
+        "action": "Add LINT-0014 to LINT_SPEC.yaml",
+        "details": "Add rule definition for cousin-abstraction-detector:\n- id: LINT-0014\n- name: cousin-abstraction-detector\n- severity: warning\n- description: Detect similar abstractions that may be duplicates\n- check: Heuristic match on struct/trait names and signatures\n- auto_fix: false\n"
+      },
+      {
+        "step": 3,
+        "action": "Add LINT-0015 to LINT_SPEC.yaml",
+        "details": "Add rule definition for deletion-migration-plan-required:\n- id: LINT-0015\n- name: deletion-migration-plan-required\n- severity: error\n- description: New public API surface must have deletion plan\n- check: Verify pub items have deletion_plan in RFC\n- auto_fix: false\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement LINT-0013 check in lint.rs",
+        "details": "Implement check_no_new_module_without_justification():\n- Scan for new mod.rs files (not in git HEAD)\n- Load RFC references from CCP\n- Fail if new module lacks RFC justification\n- Return LintResult with file paths and error messages\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement LINT-0014 check in lint.rs",
+        "details": "Implement check_cousin_abstractions():\n- Parse all struct/trait definitions using syn crate\n- Compute similarity scores (Levenshtein on names, structural on fields)\n- Warn when similarity > threshold (configurable, default 0.8)\n- Report potential cousins with confidence score\n\n**AST extraction using syn crate:**\n```rust\nuse syn::{parse_file, Item, Fields, ItemStruct, ItemTrait, TraitItem};\n\nfn extract_struct_fields(item: &ItemStruct) -> Vec<String> {\n    match &item.fields {\n        Fields::Named(fields) => fields.named.iter()\n            .filter_map(|f| f.ident.as_ref().map(|i| i.to_string()))\n            .collect(),\n        _ => vec![],\n    }\n}\n\nfn extract_trait_methods(item: &ItemTrait) -> Vec<(String, usize)> {\n    item.items.iter()\n        .filter_map(|ti| match ti {\n            TraitItem::Fn(f) => Some((\n                f.sig.ident.to_string(),\n                f.sig.inputs.len()\n            )),\n            _ => None,\n        })\n        .collect()\n}\n```\n\n**Structural comparison algorithm:**\n1. Name similarity: Normalized Levenshtein distance (0.0-1.0)\n2. Field similarity (structs): Jaccard coefficient of field names\n3. Method similarity (traits): Jaccard coefficient of method signatures\n   (name + param count, ignoring types for initial implementation)\n4. Combined score: 0.4 * name_sim + 0.6 * structural_sim\n\n**Expected false positive rate:** ~15-20% (acceptable for warning-level lint)\nThe heuristic is intentionally sensitive; human review resolves false positives.\n\n**Dependencies to add to xtask/Cargo.toml:**\n- syn = { version = \"2.0\", features = [\"full\", \"parsing\"] }\n- strsim = \"0.11\" # for Levenshtein distance\n"
+      },
+      {
+        "step": 6,
+        "action": "Implement LINT-0015 check in lint.rs",
+        "details": "Implement check_deletion_plan_required():\n- Scan for new pub items (fn, struct, trait, mod)\n- Load deletion_plan section from RFC\n- Fail if pub item lacks corresponding deletion plan\n- Return LintResult with missing plan details\n"
+      },
+      {
+        "step": 7,
+        "action": "Register new lint checks in main lint function",
+        "details": "Update run_lint() or equivalent main function:\n- Add calls to new check functions\n- Aggregate results with existing lint checks\n- Respect severity levels (error vs warning)\n"
+      },
+      {
+        "step": 8,
+        "action": "Add tests for new lint rules",
+        "details": "Add test cases:\n- Test LINT-0013 with justified and unjustified modules\n- Test LINT-0014 with similar and dissimilar abstractions\n- Test LINT-0015 with and without deletion plans\n"
+      }
+    ],
+    "code_examples": []
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "LINT-0013 fails if new module lacks justification",
+      "verification": "Create new mod.rs without RFC reference and run cargo xtask lint"
+    },
+    {
+      "criterion": "LINT-0014 warns on cousin abstractions",
+      "verification": "Create similar struct names and verify warning is emitted"
+    },
+    {
+      "criterion": "LINT-0015 fails if new surface lacks deletion plan",
+      "verification": "Add pub fn without deletion plan and verify lint fails"
+    }
+  ],
+  "test_requirements": [
+    {
+      "test_id": "UT-117-01",
+      "description": "Test LINT-0013 detects unjustified modules",
+      "verification_command": "cargo test -p xtask lint::tests::lint_0013"
+    },
+    {
+      "test_id": "UT-117-02",
+      "description": "Test LINT-0013 passes for justified modules",
+      "verification_command": "cargo test -p xtask lint::tests::lint_0013_justified"
+    },
+    {
+      "test_id": "UT-117-03",
+      "description": "Test LINT-0014 detects cousin abstractions",
+      "verification_command": "cargo test -p xtask lint::tests::lint_0014"
+    },
+    {
+      "test_id": "UT-117-04",
+      "description": "Test LINT-0014 similarity threshold",
+      "verification_command": "cargo test -p xtask lint::tests::lint_0014_threshold"
+    },
+    {
+      "test_id": "UT-117-05",
+      "description": "Test LINT-0015 requires deletion plans",
+      "verification_command": "cargo test -p xtask lint::tests::lint_0015"
+    },
+    {
+      "test_id": "IT-117-01",
+      "description": "Integration test: full lint run with new rules",
+      "verification_command": "cargo xtask lint"
+    }
+  ],
+  "notes": "This ticket implements Phase 3 of RFC-0010. The lint rules enforce\nanti-clutter discipline, preventing codebase growth without justification.\n\nKey design decisions:\n- LINT-0013 and LINT-0015 are errors (block CI)\n- LINT-0014 is a warning (advisory, human review)\n- Cousin detection uses heuristics, not perfect matching\n- Deletion plans ensure every new surface has sunset criteria\n\nLINT-0014 cousin detection thresholds:\n- Name similarity: Levenshtein distance normalized\n- Structural similarity: Field/method signature matching\n- Combined score with configurable weights\n\nDepends on TCK-00116 (ticket emitter) being complete.\nThese lint rules will validate tickets emitted by the factory pipeline.\n"
+}

@@ -1,0 +1,62 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/adapter",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-ADAPTER-001",
+      "kind": "invariant",
+      "title": "AdapterEvent sequence is strictly monotonically increasing",
+      "description": "The sequence field on AdapterEvent is strictly monotonically increasing within a single adapter instance.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-002",
+      "kind": "invariant",
+      "title": "First event is ProcessStarted, last event is ProcessExited",
+      "description": "First event is always ProcessStarted; last event is always ProcessExited (unless adapter crashes).",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-003",
+      "kind": "invariant",
+      "title": "Session ID is immutable for adapter lifetime",
+      "description": "The session_id is immutable for the lifetime of the adapter.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-004",
+      "kind": "requirement",
+      "title": "All adapters emit normalized AdapterEvent instances",
+      "description": "All adapters emit normalized AdapterEvent instances regardless of adapter type.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-005",
+      "kind": "invariant",
+      "title": "BlackBoxAdapter state machine has no cycles",
+      "description": "State machine transitions follow Idle -> Running -> Stopped with no cycles.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-006",
+      "kind": "invariant",
+      "title": "Default-deny environment inheritance",
+      "description": "Default inherit=false enforces default-deny security model for environment variables passed to child processes.",
+      "rfc": ["RFC-0001", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-007",
+      "kind": "safety",
+      "title": "Sensitive environment variables never passed to child process",
+      "description": "Default exclude list contains sensitive keys (AWS_SECRET_ACCESS_KEY, ANTHROPIC_API_KEY, etc.) that are never passed to child processes.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-ADAPTER-008",
+      "kind": "safety",
+      "title": "Process cleanup on adapter drop via kill_on_drop",
+      "description": "Process spawned with kill_on_drop(true) ensures cleanup on adapter drop.",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

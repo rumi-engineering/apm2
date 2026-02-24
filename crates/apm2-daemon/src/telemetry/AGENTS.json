@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/telemetry",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-TELEM-001",
+      "kind": "invariant",
+      "title": "Sequence numbers are monotonically increasing per episode",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-002",
+      "kind": "invariant",
+      "title": "All values bounded to prevent overflow (MAX_FRAME_NS, MAX_FRAME_BYTES)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-003",
+      "kind": "invariant",
+      "title": "Timestamps are monotonic (from CLOCK_MONOTONIC)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-004",
+      "kind": "invariant",
+      "title": "Cgroup paths bounded to MAX_CGROUP_PATH_LEN",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-005",
+      "kind": "invariant",
+      "title": "Telemetry file reads bounded to MAX_TELEMETRY_FILE_SIZE",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-006",
+      "kind": "invariant",
+      "title": "Sample period bounded to [MIN_SAMPLE_PERIOD_MS, MAX_SAMPLE_PERIOD_MS]",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-007",
+      "kind": "invariant",
+      "title": "Ring buffer capacity bounded to [MIN, MAX_RING_BUFFER_CAPACITY]",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-008",
+      "kind": "requirement",
+      "title": "Reports cpu_ms and bytes_io to BudgetTracker for budget enforcement",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-DAEMON-TELEM-009",
+      "kind": "requirement",
+      "title": "Triggers stop if budget is exhausted",
+      "rfc": ["RFC-0029"]
+    }
+  ]
+}

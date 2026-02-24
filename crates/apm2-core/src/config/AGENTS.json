@@ -1,0 +1,69 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/config",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CONFIG-001",
+      "kind": "invariant",
+      "title": "Partial TOML files parse without error via serde defaults",
+      "description": "All serde(default) attributes ensure partial TOML files parse without error.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-002",
+      "kind": "requirement",
+      "title": "Config parsing never panics on malformed input",
+      "description": "from_file() and from_toml() return Result<Self, ConfigError> and never panic on malformed input.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-003",
+      "kind": "invariant",
+      "title": "Default paths use XDG-compliant fallback chain",
+      "description": "All daemon paths have sensible defaults: APM2_DATA_DIR > ProjectDirs > $HOME/.local/share/apm2.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-004",
+      "kind": "requirement",
+      "title": "Dual-socket architecture requires both socket paths",
+      "description": "operator_socket and session_socket are required in TOML config. Legacy 'socket' field is rejected.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-005",
+      "kind": "invariant",
+      "title": "Audit retention defaults prevent disk exhaustion",
+      "description": "Audit retention policy defaults to 30 days / 1GB to prevent disk exhaustion.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-006",
+      "kind": "safety",
+      "title": "CAS path must be absolute, symlink-free, mode 0700",
+      "description": "cas_path must be absolute, must not contain symbolic link components, and is created with mode 0700 (owner-only access).",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-007",
+      "kind": "requirement",
+      "title": "Projection sink profiles validated eagerly at startup",
+      "description": "Trusted signer keys validated eagerly at config parse time. Invalid hex, wrong key length, or empty signers lists prevent daemon startup.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-008",
+      "kind": "requirement",
+      "title": "Minimum 2 sinks required when projection configured",
+      "description": "When projection sinks are configured, at least 2 sinks are required for multi-sink continuity. Exactly 1 sink is rejected at startup.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-CONFIG-009",
+      "kind": "safety",
+      "title": "Token resolution never panics and redacts secrets",
+      "description": "Token resolution never panics, returns None on all failure paths. Returns SecretString for redaction. Credential files opened with O_NOFOLLOW and bounded to 4 KiB.",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

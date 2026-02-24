@@ -1,0 +1,72 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00293",
+      "title": "Durable CAS backend + wiring (replace stub/in-memory CAS in production)",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0018",
+      "requirements": [
+        {
+          "requirement_id": "REQ-HEF-0009",
+          "requirement_ref": "documents/rfcs/RFC-0018/requirements/REQ-HEF-0009.yaml#rfc_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-HEF-0009",
+          "artifact_ref": "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0009.yaml#rfc_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Implement durable CAS backend (filesystem or sqlite).",
+        "Wire durable CAS into ToolBroker and ToolExecutor.",
+        "Retain MemoryCas for tests only."
+      ],
+      "out_of_scope": [
+        "Remote object storage backends (S3) for Phase 1."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Implement durable CAS backend with size limits and hash verification.",
+        "Replace StubContentAddressedStore in production wiring.",
+        "Add restart persistence tests."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-HEF-0009"
+      ],
+      "criteria": [
+        "Durable CAS persists artifacts across daemon restarts.",
+        "Stub/in-memory CAS is not used in production paths.",
+        "CAS size limits and hash verification are enforced."
+      ]
+    },
+    "notes": {
+      "security": "Evidence artifacts must be durable and content-addressed; transient CAS is\nnot acceptable for FAC v0.\n",
+      "verification": "IT-00293-01: cargo test -p apm2-daemon cas_persistence_restart\n",
+      "general": "Required for ChangeSetBundle/Review artifacts to be authoritative.\n"
+    }
+  }
+}

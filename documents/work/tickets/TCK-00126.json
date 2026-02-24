@@ -1,0 +1,72 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00126",
+      "title": "Implement escalation and adjudication protocol for AAT",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0003",
+      "rfc_id": "RFC-0004",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0010",
+          "requirement_ref": "documents/prds/PRD-0003/requirements/REQ-0010.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-0003",
+        "EVID-0004"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_PRODUCT",
+        "DOMAIN_TOOLING"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00054"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define 'NEEDS_ADJUDICATION' verdict for ambiguous AAT cases",
+        "Implement tiered timeout protocol (4h -> 24h -> Auto-fail)",
+        "Add adjudication recording to evidence bundle",
+        "Implement notification triggers for AUTH_AAT on escalation"
+      ],
+      "out_of_scope": [
+        "Building the notification system (slack/email) itself (call existing utility)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Update AAT Verdict enum to include NeedsAdjudication",
+        "Implement EscalationManager in xtask",
+        "Add 'AdjudicationRecord' schema to EvidenceBundle",
+        "Write logic for tiered timeouts and auto-fail fallback"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0004"
+      ],
+      "criteria": [
+        "AAT can transition from 'NeedsAdjudication' to 'Fail' after 28 hours",
+        "Adjudication decision (manual override) is signed and recorded",
+        "Escalation events emitted to ledger"
+      ]
+    },
+    "notes": {
+      "security": "Manual adjudication requires valid signature from authorized role"
+    }
+  }
+}

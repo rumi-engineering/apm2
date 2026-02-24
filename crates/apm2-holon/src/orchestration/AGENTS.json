@@ -1,0 +1,90 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-holon/src/orchestration",
+  "behaviors": [
+    {
+      "id": "BEH-HOLON-ORCH-001",
+      "kind": "invariant",
+      "title": "iteration_count is monotonically increasing",
+      "description": "INV-OR01: Incremented via record_iteration; never decreases.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-002",
+      "kind": "invariant",
+      "title": "tokens_consumed and time_consumed_ms are monotonically increasing",
+      "description": "INV-OR02: Saturating addition ensures monotonic increase.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-003",
+      "kind": "invariant",
+      "title": "Terminated state is permanent with first-write-wins semantics",
+      "description": "INV-OR03: Once termination_reason is Some, the state is terminal; terminate() returns false on subsequent calls.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-004",
+      "kind": "invariant",
+      "title": "iteration_count never exceeds max_iterations",
+      "description": "INV-OR04: Enforced by record_iteration returning a termination reason.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-005",
+      "kind": "safety",
+      "title": "All orchestration config and state types use deny_unknown_fields",
+      "description": "INV-OR05/INV-OR06/INV-OR07: Prevents fail-open parsing from typos or unexpected fields.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-006",
+      "kind": "requirement",
+      "title": "try_new() validates IDs and enforces max_iterations in [1, 100]",
+      "description": "CTR-OR01: Validates work_id and orchestration_id via validate_id(). max_iterations must be in [1, 100], budgets must be positive.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-007",
+      "kind": "requirement",
+      "title": "record_iteration returns termination reason on budget or limit exhaustion",
+      "description": "CTR-OR03: Returns Some(TerminationReason) if tokens exhausted, time exhausted, or max iterations reached.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-008",
+      "kind": "requirement",
+      "title": "resume_from_events reconstructs state with consistency validation",
+      "description": "CTR-OR09: Validates iteration number continuity, timestamp monotonicity, and termination summary totals matching reconstructed state (LAW-07).",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-009",
+      "kind": "requirement",
+      "title": "check_termination evaluates stop conditions in priority order",
+      "description": "CTR-OR10: already terminated > token budget exhausted > time budget exhausted > max iterations reached.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-010",
+      "kind": "safety",
+      "title": "TerminationReason validate() enforces string length limits",
+      "description": "CTR-OR15: MAX_ROLE_LENGTH (256) on resource names and operator IDs, MAX_REASON_LENGTH (1024) on reason/error strings.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-011",
+      "kind": "requirement",
+      "title": "Crash-only recovery model derives all state from ledger events",
+      "description": "The orchestrator follows a crash-only recovery model: all state is derived from ledger events, enabling deterministic restart from any checkpoint.",
+      "rfc": ["RFC-0015", "RFC-0019"]
+    },
+    {
+      "id": "BEH-HOLON-ORCH-012",
+      "kind": "requirement",
+      "title": "as_budget() converts remaining orchestration resources to Budget",
+      "description": "CTR-OR05: Sets tool_calls to u64::MAX since tool calls are not tracked at orchestration level.",
+      "rfc": ["RFC-0015", "RFC-0019", "RFC-0029"]
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00674",
+      "title": "apm2-daemon gate_timeout_kernel: eliminate restart-induced mass timeouts by rebasing persisted monotonic deadlines (monotonic is process-local cache, not durable truth)",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0020",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_RUNTIME",
+        "DOMAIN_GATE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    }
+  },
+  "root_cause_analysis": {
+    "summary": "The gate timeout kernel persists `observed_monotonic_ns` and `deadline_monotonic_ns`\nto SQLite in `gate_timeout_observed_leases` (crates/apm2-daemon/src/gate/timeout_kernel.rs).\n\nMonotonic time is anchored to process start (`MONO_EPOCH: OnceLock<Instant>`), so it\n*resets* on daemon restart. Current logic treats monotonic rewind as a timeout:\n\n  - ObservedLeaseState::is_timed_out():\n      if monotonic_now_ns < observed_monotonic_ns => true (fail-closed timeout)\n\nAdditionally, SqliteTimeoutObservedLeaseStore::load_all() handles legacy rows\n(monotonic columns missing/0) by setting deadline == now_monotonic, making them\nimmediately eligible for timeout (\"fail-closed\").\n\nFailure mode: after restart, many persisted leases appear \"timed out\" solely due to\nmonotonic epoch reset, triggering mass \"gate.timed_out\" receipts and destabilizing\nthe gate pipeline.\n\nThis is a correctness bug: persisted monotonic timestamps cannot be treated as\ndurable truth across process boundaries. They may be used as *cache* only and must\nbe rebased at runtime using wall-clock lease expiry (`GateLease.expires_at`).\n"
+  },
+  "scope": {
+    "in_scope": [
+      {
+        "id": "GT-TIME-001",
+        "title": "Rebase monotonic baselines on load (and on detection of rewind) instead of failing closed",
+        "detail": "Update `SqliteTimeoutObservedLeaseStore::load_all()` and/or `GateTimeoutDomain::new()` to\nrebase monotonic state for each loaded lease whenever:\n  - observed_monotonic_ns == 0 OR deadline_monotonic_ns == 0 (legacy rows), OR\n  - observed_monotonic_ns > current monotonic_now_ns (daemon restart), OR\n  - deadline_monotonic_ns < observed_monotonic_ns (corrupt row / bug).\n\nRebase algorithm (must be deterministic and safe):\n  - now_wall_ms = epoch_now_ms_u64()\n  - now_monotonic_ns = monotonic_now_ns()\n  - remaining_ms = lease.expires_at.saturating_sub(now_wall_ms)\n  - new_deadline_monotonic_ns = now_monotonic_ns + remaining_ms * 1_000_000\n  - new_observed_wall_ms = now_wall_ms\n  - new_observed_monotonic_ns = now_monotonic_ns\n  - persist the rebased values via `upsert()` (or a targeted UPDATE) so\n    future loads are consistent.\n\nIMPORTANT: \"fail-closed\" still applies, but must be based on *lease.expires_at*:\n  - If lease.expires_at <= now_wall_ms => remaining_ms == 0 => deadline == now => timed out.\n"
+      },
+      {
+        "id": "GT-TIME-002",
+        "title": "Make ObservedLeaseState timeout predicate robust to monotonic rewind without emitting timeouts",
+        "detail": "Modify `ObservedLeaseState::is_timed_out(monotonic_now_ns)` so monotonic rewind does NOT\nimmediately return true.\n\nAcceptable implementations:\n  A) Remove the rewind check entirely and rely on rebasing on load/tick so state never\n     contains a future observed_monotonic_ns.\n  B) Change rewind behavior to return false (not timed out) and ensure caller triggers\n     a rebase path before planning timeouts.\n\nAdditionally, add a small guard in the plan phase:\n  - before generating timeout intents, scan observed leases for \"needs rebase\" and\n    repair+persist them, so a long-running daemon can't be wedged by corrupted rows.\n"
+      },
+      {
+        "id": "GT-TIME-003",
+        "title": "Regression tests that simulate restart + legacy rows without causing false timeouts",
+        "detail": "Extend `#[cfg(test)] mod tests` in crates/apm2-daemon/src/gate/timeout_kernel.rs with:\n\n  - test_observed_lease_store_sqlite_rebases_monotonic_after_restart:\n      Insert a lease row with observed_monotonic_ns and deadline_monotonic_ns far in the\n      future compared to the process monotonic clock (simulate persisted values from\n      prior run). Ensure load_all() returns a rebased state whose deadline is in the future\n      when lease.expires_at is in the future, and `is_timed_out(now_monotonic)` is false.\n\n  - test_observed_lease_store_sqlite_legacy_rows_rebase_instead_of_immediate_timeout:\n      Insert a row with observed_monotonic_ns=0 and deadline_monotonic_ns=0 but expires_at in\n      the future. Ensure load_all() rebases and does not immediately time out.\n\nTests must be time-robust:\n  - Use now_wall_ms = epoch_now_ms_u64() inside the test and set expires_at = now_wall_ms + N.\n  - Avoid asserting exact timestamps; assert ordering properties (deadline >= now, etc).\n"
+      },
+      {
+        "id": "GT-TIME-004",
+        "title": "Documentation + invariant enforcement for 'monotonic is not durable'",
+        "detail": "Documentation:\n  - Add a comment block near `monotonic_now_ns()` and `ObservedLeaseState` explicitly stating:\n    \"Monotonic time is process-local. Never persist monotonic timestamps as durable truth.\n     If persisted for caching, it MUST be rebased on load.\"\n\nEnforcement:\n  - Add an explicit reviewer invariant to CODE_QUALITY_PROMPT.cac.json (or reference TCK-00678\n    if that ticket centralizes prompt edits):\n      *Any persisted monotonic timestamp must have an explicit rebase-on-load path and MUST\n       not trigger irreversible actions solely due to monotonic rewind.*\n\nProvide exact grep anchors for reviewers:\n  - \"observed_monotonic_ns\"\n  - \"deadline_monotonic_ns\"\n  - \"Instant::now\" / \"MONO_EPOCH\"\n"
+      }
+    ],
+    "out_of_scope": [
+      "Dropping monotonic columns entirely (allowed later, but not required here).",
+      "Redesigning the gate timeout kernel architecture beyond the monotonic correctness fix.",
+      "Changing the public `GateLease` wall-clock semantics."
+    ]
+  },
+  "implementation_notes": {
+    "critical_structural_boundaries": [
+      {
+        "id": "IMPL-GT-TIME-01",
+        "title": "Fail-closed semantics must remain anchored to GateLease.expires_at",
+        "detail": "The only legitimate basis for timeout is the wall-clock lease expiry already minted in the lease.\nMonotonic is an optimization to avoid wall-clock drift, not an authority signal.\n"
+      },
+      {
+        "id": "IMPL-GT-TIME-02",
+        "title": "No new time sources",
+        "detail": "Reuse the existing `epoch_now_*` helpers and `monotonic_now_ns()`; do not introduce\na second monotonic epoch or mixed units. Keep all conversions explicit.\n"
+      }
+    ]
+  },
+  "documentation_and_enforcement": {
+    "documentation_deliverables": [
+      "Inline doc comment near ObservedLeaseState/monotonic_now_ns explaining durability boundaries.",
+      "Update crates/apm2-daemon/src/gate/AGENTS.md (INV-GT04) to clarify timeouts are based on lease.expires_at and monotonic is a cache."
+    ],
+    "enforcement_deliverables": [
+      "Add/extend reviewer invariant in documents/reviews/CODE_QUALITY_PROMPT.cac.json (or via TCK-00678) covering persisted monotonic rebasing and preventing restart-induced actions.",
+      "Add an entry to documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md documenting this as an APM2 anti-pattern."
+    ]
+  },
+  "plan": {
+    "steps": [
+      "Implement `ObservedLeaseState::rebase(now_wall_ms, now_monotonic_ns)` returning a new, consistent state.",
+      "Update SqliteTimeoutObservedLeaseStore::load_all() to detect stale/legacy monotonic values and rebase.",
+      "Optionally persist rebased values immediately using store.upsert() (idempotent).",
+      "Update ObservedLeaseState::is_timed_out() to avoid 'monotonic rewind => timeout'.",
+      "Add regression tests described in GT-TIME-003.",
+      "Add documentation + enforcement artifacts described in GT-TIME-004."
+    ]
+  },
+  "definition_of_done": {
+    "criteria": [
+      "Restart simulation tests pass and demonstrate no false timeouts due to monotonic rewind.",
+      "Legacy rows with missing monotonic state no longer produce immediate timeouts unless expires_at <= now.",
+      "Code contains explicit documentation stating persisted monotonic timestamps are caches and must be rebased.",
+      "Reviewer enforcement guidance exists (prompt and/or safe-patterns doc updated)."
+    ]
+  },
+  "risks": [
+    {
+      "id": "R-GT-TIME-01",
+      "title": "Incorrect rebasing could delay legitimate timeouts under severe wall-clock skew",
+      "mitigation": "Timeout authority is `lease.expires_at` (wall clock). Under wall-clock skew, the system may\ndelay or accelerate timeouts; this is already true today. The change removes a *false*\ntimeout trigger due to monotonic reset. Add tests for expires_at <= now => immediate timeout.\n"
+    }
+  ]
+}

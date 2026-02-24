@@ -1,0 +1,76 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00056",
+      "title": "Fix AI review status creation in xtask push"
+    },
+    "binds": {
+      "prd_id": "NONE",
+      "rfc_id": "RFC-0005",
+      "requirements": [
+        {
+          "requirement_id": "MAINT-002",
+          "requirement_ref": "documents/rfcs/RFC-0005/01_problem_and_imports.yaml#rfc_local_requirements.requirements[1]"
+        }
+      ],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_BUILD_RELEASE"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Fix create_pending_statuses function in xtask/src/tasks/push.rs",
+        "Use separate variables for multi-word -f values in gh api calls",
+        "Check actual command output/status, not just .is_ok()",
+        "Report errors to user when status creation fails",
+        "Verify status creation via GitHub API after creation"
+      ],
+      "out_of_scope": [
+        "Changes to other xtask commands",
+        "New status types",
+        "GitHub API changes"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Extract description strings into variables before cmd! macro",
+        "Use interpolated variables in cmd! for description field",
+        "Change from .is_ok() to proper error handling with .run()",
+        "Capture command stderr/stdout for error reporting",
+        "Print actual error message when status creation fails",
+        "Verify with gh api call that status was actually created",
+        "Add integration test that checks status exists after creation"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "cargo xtask push creates ai-review/security status on GitHub",
+        "cargo xtask push creates ai-review/code-quality status on GitHub",
+        "Statuses visible via: gh api /repos/{owner}/{repo}/commits/{sha}/statuses",
+        "Errors reported when status creation fails (no silent failures)",
+        "gh api arguments correctly escaped for multi-word description values",
+        "cargo build succeeds",
+        "cargo test passes",
+        "cargo clippy passes with no warnings"
+      ]
+    },
+    "notes": {
+      "security": "Uses gh CLI for API calls - credentials managed externally",
+      "root_cause": "xshell cmd! macro splits multi-word strings; use variables for interpolation",
+      "affected_file": "xtask/src/tasks/push.rs lines 366-390 (create_pending_statuses function)"
+    }
+  }
+}

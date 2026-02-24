@@ -1,0 +1,55 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00512",
+      "title": "Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Define and implement `job_spec_digest` computation (canonical JSON; token field null; schema_id domain separation).",
+        "Extend `FacJobSpecV1` schema with `actuation{ lease_id, request_id, channel_context_token }`.",
+        "Update queue writer paths (`fac enqueue`, `fac gates`, etc.) to populate digest + request_id.",
+        "Update worker parser to validate digest and request_id match.",
+        "Update receipts to include `job_spec_digest`."
+      ],
+      "out_of_scope": [
+        "Any PCAC/AJC redesign."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Add schema structs with `deny_unknown_fields`.",
+        "Add canonical JSON hashing helper for job specs.",
+        "Wire into enqueue path and worker validation."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "A tampered job spec file is detected (digest mismatch) and denied/quarantined.",
+        "Token request_id mismatch is detected and denied."
+      ]
+    }
+  }
+}

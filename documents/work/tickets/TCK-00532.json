@@ -1,0 +1,63 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00532",
+      "title": "RFC-0029 cost model: job cost estimation + post-run calibration from receipts",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0019",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00513",
+          "reason": "Receipts must include admissions and runtime stats."
+        },
+        {
+          "ticket_id": "TCK-00531",
+          "reason": "Scheduler state must exist."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define per-job-kind cost estimates used for queue admission (e.g., expected ticks or wait units).",
+        "Record observed runtime/cost metrics in receipts.",
+        "Implement a calibration mechanism that updates cost estimates conservatively over time (bounded, monotone-safe).",
+        "Expose `apm2 fac scheduler stats` (optional) showing cost model and denial reasons."
+      ],
+      "out_of_scope": [
+        "ML-based prediction."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Define CostModelV1 with conservative defaults.",
+        "Add receipt fields for duration/cpu_time/bytes_written (best-effort).",
+        "Update worker to refine estimates within policy bounds."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "Queue admission inputs contain a deterministic cost estimate for every job.",
+        "Calibration never makes the system less safe (never increases concurrency or budgets)."
+      ]
+    }
+  }
+}

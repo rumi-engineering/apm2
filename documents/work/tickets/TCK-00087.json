@@ -1,0 +1,91 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-25",
+    "template_version": "2026-01-25",
+    "ticket": {
+      "id": "TCK-00087",
+      "title": "Implement task queue for CI-gated work items"
+    },
+    "binds": {
+      "prd_id": "PRD-0004",
+      "rfc_id": "RFC-0008",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/prds/PRD-0004/requirements/REQ-0004.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        "EVID-8003"
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        "TCK-00086"
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Add CI_PENDING phase to work item phase enum",
+        "Add READY_FOR_REVIEW phase to work item phase enum",
+        "Add BLOCKED phase to work item phase enum",
+        "Subscribe to CIWorkflowCompleted events from ledger",
+        "Implement phase transition logic on CI event",
+        "Match CI events to work items via PR number and commit SHA",
+        "Integrate with PRD-0004 lease mechanism for claiming",
+        "Add feature flag CI_GATED_QUEUE_ENABLED",
+        "Emit WorkReadyForNextPhase event on transition"
+      ],
+      "out_of_scope": [
+        "Agent exit protocol (TCK-00088)",
+        "Integration tests (TCK-00089)",
+        "Work item creation (separate from this RFC)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Extend WorkPhase enum with CI_PENDING, READY_FOR_REVIEW, BLOCKED",
+        "Create phase transition state machine with allowed transitions",
+        "Subscribe to CIWorkflowCompleted events (event handler pattern)",
+        "Implement work item lookup by PR number",
+        "Implement transition logic: success -> READY_FOR_REVIEW, failure -> BLOCKED",
+        "Emit WorkReadyForNextPhase event on transition",
+        "Update task queue claiming to respect CI-gated phases",
+        "Add feature flag check before processing CI events",
+        "Write unit tests for phase transitions",
+        "Write integration test for event -> transition flow"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-8003"
+      ],
+      "criteria": [
+        "WorkPhase enum includes CI_PENDING, READY_FOR_REVIEW, BLOCKED",
+        "Phase transition state machine enforces valid transitions",
+        "CIWorkflowCompleted events are processed",
+        "CI success transitions CI_PENDING -> READY_FOR_REVIEW",
+        "CI failure transitions CI_PENDING -> BLOCKED",
+        "Agents can claim READY_FOR_REVIEW work items",
+        "Agents cannot claim CI_PENDING work items",
+        "WorkReadyForNextPhase event emitted on transition",
+        "Feature flag CI_GATED_QUEUE_ENABLED controls behavior",
+        "Unit tests pass for phase transitions",
+        "Integration test passes for event processing"
+      ]
+    },
+    "notes": {
+      "implementation_details": "Phase transition state machine:\n```rust\nimpl WorkPhase {\n    pub fn can_transition_to(&self, target: WorkPhase) -> bool {\n        match (self, target) {\n            (WorkPhase::Draft, WorkPhase::Implementation) => true,\n            (WorkPhase::Implementation, WorkPhase::CIPending) => true,\n            (WorkPhase::CIPending, WorkPhase::ReadyForReview) => true,\n            (WorkPhase::CIPending, WorkPhase::Blocked) => true,\n            (WorkPhase::ReadyForReview, WorkPhase::Review) => true,\n            (WorkPhase::Review, WorkPhase::ReadyForMerge) => true,\n            (WorkPhase::ReadyForMerge, WorkPhase::Completed) => true,\n            (WorkPhase::Blocked, WorkPhase::CIPending) => true, // retry\n            _ => false,\n        }\n    }\n\n    pub fn is_claimable(&self) -> bool {\n        matches!(self,\n            WorkPhase::Draft |\n            WorkPhase::ReadyForReview |\n            WorkPhase::ReadyForMerge\n        )\n    }\n}\n```\n\nEvent handler:\n```rust\nasync fn handle_ci_completed(\n    event: CIWorkflowCompleted,\n    work_store: &WorkStore,\n) -> Result<(), Error> {\n    let work_item = work_store\n        .find_by_pr(event.payload.pr_number)\n        .await?\n        .ok_or(Error::WorkItemNotFound)?;\n\n    if work_item.phase != WorkPhase::CIPending {\n        return Ok(()); // Already transitioned\n    }\n\n    let next_phase = match event.payload.conclusion {\n        CIConclusion::Success => WorkPhase::ReadyForReview,\n        CIConclusion::Failure => WorkPhase::Blocked,\n        CIConclusion::Cancelled => return Ok(()), // Stay in CI_PENDING\n    };\n\n    work_store.transition(&work_item.id, next_phase).await?;\n\n    // Emit transition event\n    let transition_event = WorkReadyForNextPhase {\n        work_id: work_item.id,\n        previous_phase: WorkPhase::CIPending,\n        next_phase,\n        triggered_by: event.event_id,\n    };\n    ledger.emit(transition_event).await?;\n\n    Ok(())\n}\n```\n",
+      "affected_files": "New:\n  - crates/apm2-core/src/work/phase.rs\n  - crates/apm2-core/src/work/transition.rs\nModified:\n  - crates/apm2-core/src/work/mod.rs (add phase module)\n  - crates/apm2-core/src/work/queue.rs (add CI-gated claiming)\n"
+    }
+  }
+}

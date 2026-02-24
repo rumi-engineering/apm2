@@ -1,0 +1,94 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00423",
+      "title": "RequestTool join/revalidate/consume lifecycle wiring",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0027",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0001",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0001.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0005",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0005.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0006",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0006.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0009",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0009.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0002",
+          "artifact_ref": "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0002.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00422",
+          "reason": "Core PCAC schema and deny taxonomy must exist before runtime lifecycle wiring."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Wire RequestTool to require join, revalidate, and consume before side effects.",
+        "Bind pre-actuation receipt selectors as consume prerequisites when policy requires pre-actuation checks.",
+        "Enforce intent digest equality at consume-time.",
+        "Emit lifecycle receipts in replay-verifiable order for RequestTool execution."
+      ],
+      "out_of_scope": [
+        "DelegateSublease and IngestReviewReceipt lifecycle adoption.",
+        "Acceptance-fact pointer/seal composition for batched receipt auth paths."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Integrate AuthorityJoinKernel invocation points into RequestTool control flow in session dispatch.",
+        "Add explicit pre-actuation prerequisite binding and consume-time enforcement checks.",
+        "Emit lifecycle receipts and ensure replay ordering checks pass for positive and negative paths.",
+        "Add integration tests proving no side effect executes without successful consume.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0002"
+      ],
+      "criteria": [
+        "RequestTool authoritative side effects require successful join/revalidate/consume.",
+        "Pre-actuation-required paths deny when prerequisite selectors are missing.",
+        "Replay ordering for RequestTool is deterministic and lifecycle-complete."
+      ]
+    },
+    "notes": {
+      "security": "Any lifecycle stage failure must deny before side-effect execution.\n",
+      "verification": "Include replay-order failure injections and intent-mismatch denial coverage.\n",
+      "general": "Draft mapped from RFC-0027 06_ticket_decomposition.yaml (TCK-PCAC-0002).\n"
+    }
+  }
+}

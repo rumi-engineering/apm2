@@ -1,0 +1,106 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00407",
+      "title": "Normalize ledger identity binding and semantic idempotency across FAC events",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0010",
+      "rfc_id": "RFC-0020",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0004.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0016",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0016.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0034",
+          "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0034.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/rfcs/RFC-0020/evidence_artifacts/EVID-0001.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_DATA"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00389",
+          "reason": "Review receipt ingestion path currently has binding/idempotency defects called out in re-review."
+        },
+        {
+          "ticket_id": "TCK-00394",
+          "reason": "PublishChangeSet path currently has semantic idempotency and ownership-validation defects."
+        },
+        {
+          "ticket_id": "TCK-00350",
+          "reason": "Receipt binding completeness requirements must be enforced with canonical identity fields."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define canonical identity tuple per FAC event type (for example receipt_id, lease_id, work_id, digest) and enforce it uniformly.",
+        "Ensure canonical work_id derivation from authoritative lease/work state (no aliasing to lease_id or receipt_id in work_id column).",
+        "Implement semantic idempotency keys and lookups for receipt and changeset ingestion paths.",
+        "Add/validate DB uniqueness constraints aligned to semantic identity (not transport/event UUID only).",
+        "Ensure all relevant emitters use stable domain prefixes and JCS canonicalization before signing.",
+        "Add replay/integration tests proving duplicate requests are idempotent and return stable authoritative event identity."
+      ],
+      "out_of_scope": [
+        "Schema redesign beyond identity/idempotency correctness.",
+        "Historical ledger migration for already-merged incorrect events.",
+        "Non-FAC event families."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Document canonical identity fields per event type and publish as developer contract in code/docs.",
+        "Update ingestion handlers to resolve and validate canonical work_id from authoritative state before event emission.",
+        "Introduce keyed lookup helpers (for example by receipt_id and by work_id+digest) and wire them into idempotency checks.",
+        "Add SQLite indexes/constraints for semantic uniqueness where required.",
+        "Refactor emitter paths to share canonicalization and domain-prefix helpers to prevent drift.",
+        "Add integration tests for duplicate ingest, conflicting duplicate ingest, and incorrect identity-field rejection.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001"
+      ],
+      "criteria": [
+        "FAC ingestion handlers use canonical work identity consistently.",
+        "Duplicate logical requests are idempotent and return stable event identity.",
+        "Semantic uniqueness constraints prevent conflicting duplicates at persistence boundary.",
+        "All affected signatures are produced from stable canonical bytes with pinned domain prefixes.",
+        "Integration tests cover approve/blocked receipts, changeset publish, and delegated lease identity paths."
+      ]
+    },
+    "notes": {
+      "context": "Re-reviews identified repeated binding and idempotency defects: wrong identity\nkey usage, incorrect work_id binding, and idempotency keyed to transport IDs\ninstead of semantic tuples. These defects appeared across PRs #444, #445, #453.\n",
+      "files": "- crates/apm2-daemon/src/protocol/dispatch.rs\n- crates/apm2-daemon/src/ledger.rs\n- crates/apm2-core/src/fac/\n- crates/apm2-daemon/tests/\n",
+      "security": "- Identity mismatches must fail closed before signing or persistence.\n- Idempotency checks must be semantic and replay-safe.\n- Canonicalization and domain separation must be deterministic and drift-resistant.\n"
+    }
+  }
+}

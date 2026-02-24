@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.waiver.v1",
+  "waiver": {
+    "schema_version": "2026-02-07",
+    "id": "WVR-0003",
+    "title": "Adapter profile hash accepted without governance policy binding",
+    "status": "APPROVED",
+    "scope": {
+      "gate_ids": [
+        "GATE-HEF-FAC-V0",
+        "GATE-SECURITY-REVIEW"
+      ],
+      "requirement_ids": [],
+      "quality_dimension_ids": [
+        "DEFAULT_DENY_SECURITY"
+      ]
+    },
+    "rationale": "The `expected_adapter_profile_hash` field in `PolicyResolution` is not yet\npopulated by the governance resolution pipeline. Until governance wiring is\ncomplete (TCK-00415+), adapter profile hashes are accepted when they exist\nin the content-addressed store (CAS), without policy-level binding.\n\nAccepted risk: CAS-existence serves as the authorization check. An actor\nwith write access to CAS could publish arbitrary profiles. This is mitigated\nby CAS write restrictions (only daemon can seed builtin profiles) and the\ntime-bounded nature of this waiver.\n\nOnce governance populates `expected_adapter_profile_hash`, the waiver code\npath (dispatch.rs WVR-0003 branches) will be removed and mismatches will\nbe hard-rejected.\n",
+    "mitigations": [
+      {
+        "description": "CAS write is restricted to daemon-initiated seed operations; no external write path.",
+        "type": "TECHNICAL",
+        "owner": "FAC runtime maintainers"
+      },
+      {
+        "description": "Adapter profile hash is always logged in SessionStarted event payload for audit trail.",
+        "type": "TECHNICAL",
+        "owner": "FAC runtime maintainers"
+      },
+      {
+        "description": "Policy binding enforcement will be added when governance resolution populates expected_adapter_profile_hash.",
+        "type": "PROCEDURAL",
+        "owner": "Security reviewers"
+      }
+    ],
+    "expiration_date": "2026-04-15",
+    "required_signoffs": [
+      "AUTH_SECURITY",
+      "AUTH_ARCHITECTURE"
+    ],
+    "evidence_ids": [
+      "EVID-WVR-0003-ADAPTER-BINDING"
+    ],
+    "references": {
+      "related_tickets": [
+        "TCK-00400",
+        "TCK-00415"
+      ],
+      "related_rfc": "RFC-0018",
+      "related_prompt": "documents/reviews/SECURITY_REVIEW_PROMPT.md"
+    },
+    "approval": {
+      "approver": "repository_owner",
+      "approval_date": "2026-02-07",
+      "approval_notes": "Approved as a time-bounded rollout waiver. CAS-existence provides\nsufficient authorization for the current rollout phase. Full policy\nbinding is tracked by TCK-00415.\n"
+    },
+    "created_date": "2026-02-07",
+    "last_updated": "2026-02-07"
+  }
+}

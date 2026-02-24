@@ -1,0 +1,76 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-24",
+    "template_version": "2026-01-24",
+    "ticket": {
+      "id": "TCK-00013",
+      "title": "Define tool request/response contract"
+    },
+    "binds": {
+      "prd_id": "PRD-0001",
+      "rfc_id": "RFC-0001",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0004",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0004.yaml#prd_requirement"
+        },
+        {
+          "requirement_id": "REQ-0012",
+          "requirement_ref": "documents/prds/PRD-0001/requirements/REQ-0012.yaml#prd_requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0008",
+          "artifact_ref": "documents/prds/PRD-0001/evidence_artifacts/EVID-0008.yaml#prd_evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_KERNEL"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00002",
+          "reason": "Requires proto event schemas from 'Define kernel event schemas with prost'"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Define ToolRequest protobuf messages",
+        "Define ToolResponse protobuf messages",
+        "Define tool types (FileRead, FileWrite, ShellExec, etc.)",
+        "Implement request parsing and validation"
+      ],
+      "out_of_scope": [
+        "Specific tool implementations (TCK-00014, 15, 16)"
+      ]
+    },
+    "plan": {
+      "steps": []
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0008"
+      ],
+      "criteria": [
+        "ToolRequest/ToolResponse protos defined",
+        "All tool types covered",
+        "Request validation rejects malformed input",
+        "Fuzz tests for request parsing",
+        "Documentation for tool contract"
+      ]
+    },
+    "notes": {
+      "security": "default-deny, least privilege, fail-closed"
+    }
+  }
+}

@@ -1,0 +1,142 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00122",
+      "title": "Implement Refactor Radar stage",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0010",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0011"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00120"
+      }
+    ]
+  },
+  "implementation": {
+    "summary": "Create the Refactor Radar module that aggregates CCP signals (hotspots,\nduplication heuristics, complexity metrics) into bounded, prioritized\nmaintenance recommendations. Includes CLI command for on-demand analysis\nand circuit breaker to suspend output when maintenance backlog exceeds\nconfigurable threshold.\n",
+    "files_to_create": [
+      {
+        "path": "crates/apm2-core/src/refactor_radar/mod.rs",
+        "purpose": "Module entry point exposing radar and signals submodules"
+      },
+      {
+        "path": "crates/apm2-core/src/refactor_radar/radar.rs",
+        "purpose": "Core radar logic aggregating signals into recommendations"
+      },
+      {
+        "path": "crates/apm2-core/src/refactor_radar/signals.rs",
+        "purpose": "Signal collectors for hotspots, duplication, complexity"
+      },
+      {
+        "path": "crates/apm2-cli/src/commands/factory/refactor.rs",
+        "purpose": "CLI command for refactor radar invocation"
+      }
+    ],
+    "files_to_modify": [
+      {
+        "path": "crates/apm2-core/src/lib.rs",
+        "changes": "Add pub mod refactor_radar declaration"
+      },
+      {
+        "path": "crates/apm2-cli/src/main.rs",
+        "changes": "Register refactor subcommand under factory"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Define signal types",
+        "details": "In signals.rs:\n- HotspotSignal: files with high churn rate in time window\n- DuplicationSignal: heuristic matches for cousin abstractions\n- ComplexitySignal: files exceeding complexity thresholds\n- Each signal includes: source_path, severity, evidence, suggested_action\n"
+      },
+      {
+        "step": 2,
+        "action": "Implement signal collectors",
+        "details": "In signals.rs:\n- HotspotCollector: analyze git log for file churn\n- DuplicationCollector: pattern match for similar structures\n- ComplexityCollector: analyze code metrics (cyclomatic, etc.)\n- Each collector returns Vec<Signal> for its category\n\n**HotspotCollector git command:**\n```rust\nuse std::process::Command;\n\nfn collect_hotspots(repo_root: &Path, window: Duration) -> Vec<HotspotSignal> {\n    let since = format!(\"--since={} days ago\", window.as_secs() / 86400);\n    let output = Command::new(\"git\")\n        .args([\"log\", \"--format=%H\", \"--name-only\", &since])\n        .current_dir(repo_root)\n        .output()\n        .expect(\"git command failed\");\n\n    let stdout = String::from_utf8_lossy(&output.stdout);\n    let mut file_counts: HashMap<String, usize> = HashMap::new();\n\n    // Parse git log output: commit hashes followed by file paths\n    for line in stdout.lines() {\n        let line = line.trim();\n        if line.is_empty() || line.len() == 40 { // skip empty lines and commit hashes\n            continue;\n        }\n        *file_counts.entry(line.to_string()).or_insert(0) += 1;\n    }\n\n    // Convert to signals, sorted by count descending\n    file_counts.into_iter()\n        .map(|(path, count)| HotspotSignal {\n            source_path: PathBuf::from(path),\n            churn_count: count,\n            severity: if count > 20 { \"high\" } else if count > 10 { \"medium\" } else { \"low\" },\n        })\n        .collect()\n}\n```\n"
+      },
+      {
+        "step": 3,
+        "action": "Implement radar aggregation",
+        "details": "In radar.rs:\n- Radar struct aggregates signals from all collectors\n- Prioritization logic based on severity and recency\n- Bounded output: configurable max_recommendations (default: 10)\n- Recommendations include: priority rank, rationale, suggested ticket\n"
+      },
+      {
+        "step": 4,
+        "action": "Implement circuit breaker",
+        "details": "In radar.rs:\n- CircuitBreaker checks existing maintenance ticket count\n- If backlog_count > backlog_threshold, suspend output\n- Return CircuitBreakerTripped status with current count\n- Configurable threshold (default: 20 open maintenance tickets)\n"
+      },
+      {
+        "step": 5,
+        "action": "Implement CLI command",
+        "details": "In refactor.rs:\n- apm2 factory refactor radar --window <DURATION>\n- --window: time window for analysis (e.g., 7d, 30d)\n- --max-items: override max recommendations\n- --ignore-breaker: force output even if circuit breaker tripped\n- Output as YAML or JSON\n"
+      },
+      {
+        "step": 6,
+        "action": "Wire up modules",
+        "details": "In mod.rs, lib.rs, main.rs:\n- Export public types\n- Add module declaration to crate root\n- Register CLI command\n"
+      }
+    ],
+    "code_examples": [
+      {
+        "description": "CLI usage",
+        "code": "# Analyze last 7 days of changes\napm2 factory refactor radar --window 7d\n\n# Increase recommendation limit\napm2 factory refactor radar --window 30d --max-items 20\n\n# Force output even if backlog is high\napm2 factory refactor radar --window 7d --ignore-breaker\n"
+      },
+      {
+        "description": "Recommendation output structure",
+        "code": "recommendations:\n  - priority: 1\n    signal_type: hotspot\n    source_path: \"crates/apm2-core/src/legacy/parser.rs\"\n    rationale: \"Modified 47 times in last 7 days, high churn indicates instability\"\n    suggested_action: \"Consider refactoring into smaller modules\"\n    suggested_ticket:\n      title: \"Refactor parser.rs to reduce churn\"\n      type: maintenance\n\n  - priority: 2\n    signal_type: duplication\n    source_path: \"crates/apm2-cli/src/commands/build.rs\"\n    rationale: \"85% structural similarity with deploy.rs\"\n    suggested_action: \"Extract common logic to shared module\"\n\ncircuit_breaker:\n  status: ok\n  current_backlog: 8\n  threshold: 20\n"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "Radar output is bounded",
+      "verification": "Tests verify output never exceeds max_recommendations setting"
+    },
+    {
+      "criterion": "Recommendations include prioritization",
+      "verification": "Each recommendation includes priority rank and rationale explaining ranking"
+    },
+    {
+      "criterion": "Circuit breaker suspends output when backlog exceeds threshold",
+      "verification": "Tests verify no recommendations emitted when backlog > threshold (unless --ignore-breaker)"
+    }
+  ],
+  "test_requirements": [
+    {
+      "test_id": "UT-122-01",
+      "description": "Test hotspot signal collection from git history",
+      "verification_command": "cargo test -p apm2-core refactor_radar::signals::hotspot"
+    },
+    {
+      "test_id": "UT-122-02",
+      "description": "Test duplication signal heuristic matching",
+      "verification_command": "cargo test -p apm2-core refactor_radar::signals::duplication"
+    },
+    {
+      "test_id": "UT-122-03",
+      "description": "Test radar aggregation respects max_recommendations bound",
+      "verification_command": "cargo test -p apm2-core refactor_radar::radar::bounded"
+    },
+    {
+      "test_id": "UT-122-04",
+      "description": "Test circuit breaker trips when backlog exceeds threshold",
+      "verification_command": "cargo test -p apm2-core refactor_radar::radar::circuit_breaker"
+    },
+    {
+      "test_id": "IT-122-05",
+      "description": "Integration test for CLI command",
+      "verification_command": "cargo run --bin apm2 -- factory refactor radar --window 7d"
+    }
+  ],
+  "notes": "This ticket implements REQ-0011 (refactor radar) from RFC-0010.\n\nKey design decisions:\n- Bounded output prevents overwhelming developers with recommendations.\n- Prioritization uses weighted scoring: severity * recency * impact.\n- Circuit breaker prevents recommendation pile-up when maintenance backlog\n  is already high, avoiding \"recommendation fatigue\".\n- Duplication detection uses structural heuristics, not exact matching,\n  to catch \"cousin abstractions\" that share patterns but not code.\n\nCCP grounding: COMP-CORE module, operates on CCP signals.\n\nThe Refactor Radar is designed as a sustainable maintenance tool that\nrespects team capacity through bounded output and circuit breaker logic.\n"
+}

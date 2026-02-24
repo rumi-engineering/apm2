@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00641",
+      "title": "RFC-0032 Phase 2: daemon CI processor emits CI transitions from changeset publication (InProgress->CiPending->ReadyForReview/Blocked)",
+      "status": "OPEN"
+    },
+    "binds": {
+      "prd_id": "PRD-PLACEHOLDER",
+      "rfc_id": "RFC-0032",
+      "requirements": [],
+      "evidence_artifacts": []
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_DAEMON",
+        "DOMAIN_CI",
+        "DOMAIN_ORCHESTRATION"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00640",
+          "reason": "Requires authoritative push work_id binding, terminal marker publication, and projection-safe work envelope decoding"
+        },
+        {
+          "ticket_id": "TCK-00631",
+          "reason": "Canonical ledger append"
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Implement/extend a daemon-side CI processor that observes changeset publication events and emits `work.transitioned` CI-authorized transitions as `system:ci-processor`",
+        "Consume only lease-bound changeset publications (originating from authoritative `(work_id, lease_id, actor_id)` validation) and fail closed on ambiguous identity",
+        "Maintain `work_latest_changeset` projection (work_id -> latest changeset digest) and ensure transitions only apply to latest digest",
+        "Emit `work.transitioned(InProgress -> CiPending)` when a new latest changeset is observed",
+        "Emit `work.transitioned(CiPending -> ReadyForReview)` or `Blocked` based on gate/receipt outcomes (existing gate orchestrator integration)",
+        "Ensure processor wiring reads only canonical ledger/projection state (no filesystem/state-file authority shortcuts)",
+        "Preserve fail-closed behavior if latest changeset binding is missing/ambiguous for a candidate receipt"
+      ],
+      "out_of_scope": [
+        "Making CI actor id configurable (explicitly deferred; reducer hard-codes `system:ci-processor` today)"
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Identify existing daemon component responsible for CI/gate observation (if any) and extend it to key off changeset_published bound to work_id",
+        "Add/extend `work_latest_changeset` projection maintained from changeset publication events",
+        "Gate transitions based on latest digest; reject stale receipts",
+        "Add tests: stale receipt does not transition work; latest receipt does"
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [],
+      "criteria": [
+        "CI processor emits transitions with actor_id exactly `system:ci-processor` to satisfy current WorkReducer checks.",
+        "CI processor never transitions from changeset events that cannot be traced to lease-bound authoritative publish validation.",
+        "Transitions are only emitted for the latest changeset digest per work (no stale transitions).",
+        "Projections and reducers remain replayable from ledger+CAS (no hidden SQLite authority).",
+        "Processor behavior is deterministic under replay and does not depend on ephemeral daemon state files."
+      ]
+    }
+  },
+  "fac_security_contract": {
+    "source": "documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml",
+    "profile": "FAC-RFC0032-BASELINE",
+    "required_invariants": [
+      "INV-FAC-TRUTH-001",
+      "INV-FAC-WORK-BIND-001",
+      "INV-FAC-CLAIM-BIND-001",
+      "INV-FAC-ACTOR-BIND-001",
+      "INV-FAC-IDEMP-001",
+      "INV-FAC-EVID-001"
+    ],
+    "enforcement_requirements": [
+      "Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.",
+      "Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.",
+      "Reviewer denial is expected for invariant-unmapped behavior changes."
+    ]
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-26",
+    "template_version": "2026-01-26",
+    "ticket": {
+      "id": "TCK-00121",
+      "title": "Update idea-compiler and rfc-council skills",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "rfc_id": "RFC-0010",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0010"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "tickets": [
+      {
+        "ticket_id": "TCK-00120"
+      }
+    ]
+  },
+  "implementation": {
+    "summary": "Update the idea-compiler and rfc-council skill files to integrate with the\nnew apm2 factory compile pipeline. The idea-compiler skill needs complete\nCLI invocation guides, and rfc-council needs to enforce CCP and Impact Map\nprerequisites before RFC review.\n",
+    "files_to_create": [],
+    "files_to_modify": [
+      {
+        "path": ".claude/skills/idea-compiler/SKILL.md",
+        "changes": "Add complete CLI invocation guide for apm2 factory compile with all flags and workflow examples"
+      },
+      {
+        "path": ".claude/skills/rfc-council/SKILL.md",
+        "changes": "Add CCP and Impact Map validation requirements; fail fast if artifacts missing"
+      }
+    ],
+    "implementation_steps": [
+      {
+        "step": 1,
+        "action": "Update idea-compiler skill with CLI guide",
+        "details": "In SKILL.md:\n- Add section \"CLI Integration\" with full command reference\n- Document apm2 factory compile --prd <PRD-ID> workflow\n- Include --dry-run usage for validation before execution\n- Document --profile flag for routing configuration\n- Add troubleshooting section for common errors\n"
+      },
+      {
+        "step": 2,
+        "action": "Add idea-compiler workflow examples",
+        "details": "In SKILL.md:\n- Example: Full compilation from PRD to tickets\n- Example: Dry-run validation workflow\n- Example: Using custom routing profiles\n- Example: Interpreting NDJSON output\n"
+      },
+      {
+        "step": 3,
+        "action": "Update rfc-council with prerequisites",
+        "details": "In SKILL.md:\n- Add \"Prerequisites\" section\n- Require CCP index exists at evidence/prd/<PRD-ID>/ccp/ccp_index.json\n- Require Impact Map exists at evidence/prd/<PRD-ID>/impact_map/\n- Document how to generate missing artifacts using apm2 CLI\n"
+      },
+      {
+        "step": 4,
+        "action": "Add rfc-council validation logic",
+        "details": "In SKILL.md:\n- Add decision tree for prerequisite validation\n- If CCP missing: instruct to run apm2 factory ccp build\n- If Impact Map missing: instruct to run apm2 factory impact-map build\n- Only proceed with RFC review after artifacts validated\n"
+      },
+      {
+        "step": 5,
+        "action": "Validate skill formatting",
+        "details": "Run cargo xtask lint to ensure:\n- Skill files pass lint rules\n- No broken references\n- Consistent formatting\n"
+      }
+    ],
+    "code_examples": [
+      {
+        "description": "idea-compiler CLI section",
+        "code": "## CLI Integration\n\nThe idea-compiler skill orchestrates the apm2 factory compile pipeline:\n\n```bash\n# Full compilation from PRD to tickets\napm2 factory compile --prd PRD-0005 --rfc RFC-0011\n\n# Dry-run to preview changes without writing files\napm2 factory compile --prd PRD-0005 --dry-run\n\n# With production routing profile and signing\napm2 factory compile --prd PRD-0005 --profile production --sign\n```\n"
+      },
+      {
+        "description": "rfc-council prerequisites section",
+        "code": "## Prerequisites\n\nBefore RFC review can proceed, the following artifacts MUST exist:\n\n1. **CCP Index**: `evidence/prd/<PRD-ID>/ccp/ccp_index.json`\n   - Generate with: `apm2 factory ccp build --prd <PRD-ID>`\n\n2. **Impact Map**: `evidence/prd/<PRD-ID>/impact_map/impact_map.yaml`\n   - Generate with: `apm2 factory impact-map build --prd <PRD-ID>`\n\nIf artifacts are missing, generate them before proceeding with RFC review.\n"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "idea-compiler invokes apm2 factory compile correctly",
+      "verification": "Skill file contains accurate CLI commands that match implemented interface"
+    },
+    {
+      "criterion": "rfc-council validates CCP/Impact Map exist",
+      "verification": "Skill file includes prerequisite checks and instructions for generating missing artifacts"
+    }
+  ],
+  "test_requirements": [
+    {
+      "test_id": "LT-121-01",
+      "description": "Lint validation of updated skill files",
+      "verification_command": "cargo xtask lint"
+    },
+    {
+      "test_id": "MT-121-02",
+      "description": "Manual verification that skill CLI commands match implementation",
+      "verification_command": "apm2 factory compile --help"
+    }
+  ],
+  "notes": "This ticket implements REQ-0010 (skill integration) from RFC-0010.\n\nKey design decisions:\n- Skills provide agent-consumable documentation of CLI capabilities.\n- rfc-council enforces CCP grounding by requiring artifacts before review.\n- Failing fast on missing prerequisites prevents wasted review cycles.\n\nCCP grounding: COMP-SKILLS, integrates with compile pipeline from TCK-00120.\n\nThe skill updates are documentation-focused but critical for agent workflows\nto correctly invoke the new pipeline capabilities.\n"
+}

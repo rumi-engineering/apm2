@@ -1625,6 +1625,32 @@ fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
     command
 }
 
+fn should_force_doc_gate() -> bool {
+    std::env::var("APM2_FAC_FORCE_DOC_GATE")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
+}
+
+const fn doc_gate_skip_reason(
+    scope: &CargoGateExecutionScope,
+    force_doc_gate: bool,
+) -> Option<&'static str> {
+    if force_doc_gate {
+        return None;
+    }
+    match scope {
+        CargoGateExecutionScope::FullWorkspace => None,
+        CargoGateExecutionScope::ScopedPackages(_) => Some("scoped_latency_budget"),
+        CargoGateExecutionScope::NoCargoImpact => Some("no_cargo_impact"),
+    }
+}
+
 fn build_scoped_nextest_command(scope: &CargoGateExecutionScope) -> Vec<String> {
     let mut command = vec![
         "cargo".to_string(),
@@ -2193,10 +2219,14 @@ pub(super) fn run_evidence_gates_with_lane_context(
     if emit_human_logs {
         eprintln!("fac gates: cargo execution scope={}", cargo_scope.summary());
     }
+    let force_doc_gate = should_force_doc_gate();
+    let doc_skip_reason = doc_gate_skip_reason(&cargo_scope, force_doc_gate);
     let skip_cargo_heavy_gates = matches!(cargo_scope, CargoGateExecutionScope::NoCargoImpact);
 
     // Fastest-first ordering for cargo-backed gates. We always keep rustfmt
-    // active; doc/clippy/test are scoped or skipped based on cargo impact.
+    // active. doc is skipped for package-scoped pushes to stay within gate
+    // latency SLO (override with APM2_FAC_FORCE_DOC_GATE=1).
+    // clippy/test are scoped or skipped based on cargo impact.
     let phase2_gate_specs = vec![
         Phase2GateSpec {
             gate_name: "rustfmt",
@@ -2211,7 +2241,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         Phase2GateSpec {
             gate_name: "doc",
             command: build_doc_gate_command(&cargo_scope),
-            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
+            skip_reason: doc_skip_reason,
         },
         Phase2GateSpec {
             gate_name: "clippy",
@@ -2376,8 +2406,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let gate_network_policy =
                 apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
             let mut specs = Vec::new();
-            for &(gate_name, cmd_args) in gates {
-                let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+            for spec in phase2_gate_specs
+                .iter()
+                .filter(|phase2| phase2.skip_reason.is_none())
+            {
+                let gate_name = spec.gate_name;
+                let gate_cmd = spec.command.clone();
                 let gate_unit_name = opts
                     .and_then(|options| options.bounded_gate_unit_base.as_ref())
                     .map(|base| format!("{base}-{gate_name}"));
@@ -2407,8 +2441,35 @@ pub(super) fn run_evidence_gates_with_lane_context(
             Some(specs)
         };
 
-    for (idx, &(gate_name, cmd_args)) in gates.iter().enumerate() {
+    for spec in &phase2_gate_specs {
+        let gate_name = spec.gate_name;
         let log_path = logs_dir.join(format!("{gate_name}.log"));
+
+        if let Some(skip_reason) = spec.skip_reason {
+            emit_gate_started(opts, gate_name);
+            let stream_stats = write_skipped_gate_log_marker(&log_path, gate_name, skip_reason);
+            let skipped_result = build_evidence_gate_result(
+                gate_name,
+                true,
+                0,
+                Some(&log_path),
+                Some(&stream_stats),
+            );
+            emit_gate_completed(opts, &skipped_result);
+            gate_results.push(skipped_result);
+            let ts = now_iso8601();
+            if emit_human_logs {
+                eprintln!(
+                    "ts={ts} sha={sha} gate={gate_name} status=SKIP reason={skip_reason} log={}",
+                    log_path.display()
+                );
+            }
+            evidence_lines.push(format!(
+                "ts={ts} sha={sha} gate={gate_name} status=SKIP reason={skip_reason} log={}",
+                log_path.display()
+            ));
+            continue;
+        }
 
         // TCK-00626 round 4: Hoist cache_decision so it is available on both
         // hit and miss paths — gate_finished must always carry the decision.
@@ -2490,33 +2551,57 @@ pub(super) fn run_evidence_gates_with_lane_context(
         // TCK-00574: Use bounded gate command (with network isolation) in
         // full mode; fall back to bare command in quick mode.
         let (passed, stream_stats) = if let Some(ref specs) = bounded_gate_specs {
-            let (_, ref bounded_cmd, ref bounded_env) = specs[idx];
-            let (bcmd, bargs) = bounded_cmd
-                .split_first()
-                .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
-            // The outer env includes D-Bus runtime variables needed by
-            // systemd-run; the inner unit gets env via --setenv.
-            let mut outer_env = gate_env.clone();
-            outer_env.extend(bounded_env.iter().cloned());
-            run_single_evidence_gate_with_env_and_progress(
-                workspace_root,
-                sha,
-                gate_name,
-                bcmd,
-                &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
-                &log_path,
-                Some(&outer_env),
-                gate_wrapper_strip_ref,
-                emit_human_logs,
-                on_gate_progress,
-            )
+            if let Some((_, bounded_cmd, bounded_env)) =
+                specs.iter().find(|(name, _, _)| *name == gate_name)
+            {
+                let (bcmd, bargs) = bounded_cmd
+                    .split_first()
+                    .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
+                // The outer env includes D-Bus runtime variables needed by
+                // systemd-run; the inner unit gets env via --setenv.
+                let mut outer_env = gate_env.clone();
+                outer_env.extend(bounded_env.iter().cloned());
+                run_single_evidence_gate_with_env_and_progress(
+                    workspace_root,
+                    sha,
+                    gate_name,
+                    bcmd,
+                    &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &log_path,
+                    Some(&outer_env),
+                    gate_wrapper_strip_ref,
+                    emit_human_logs,
+                    on_gate_progress,
+                )
+            } else {
+                let (command, args) = spec
+                    .command
+                    .split_first()
+                    .ok_or_else(|| format!("gate command is empty for {gate_name}"))?;
+                run_single_evidence_gate_with_env_and_progress(
+                    workspace_root,
+                    sha,
+                    gate_name,
+                    command,
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &log_path,
+                    Some(&gate_env),
+                    gate_wrapper_strip_ref,
+                    emit_human_logs,
+                    on_gate_progress,
+                )
+            }
         } else {
+            let (command, args) = spec
+                .command
+                .split_first()
+                .ok_or_else(|| format!("gate command is empty for {gate_name}"))?;
             run_single_evidence_gate_with_env_and_progress(
                 workspace_root,
                 sha,
                 gate_name,
-                cmd_args[0],
-                &cmd_args[1..],
+                command,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
                 Some(&gate_env),
                 gate_wrapper_strip_ref,
@@ -2557,18 +2642,28 @@ pub(super) fn run_evidence_gates_with_lane_context(
     snapshot_workspace_integrity(workspace_root);
 
     let test_log = logs_dir.join("test.log");
-    if skip_test_gate {
-        let skip_msg = b"quick mode enabled: skipped heavyweight test gate\n";
-        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(&test_log, skip_msg);
+    let skip_test_for_scope =
+        skip_cargo_heavy_gates && opts.and_then(|o| o.test_command.as_ref()).is_none();
+    if skip_test_gate || skip_test_for_scope {
+        let skip_reason = if skip_test_gate {
+            "quick_mode"
+        } else {
+            "no_cargo_impact"
+        };
+        let skip_msg = format!("scope={skip_reason}: skipped heavyweight test gate\n");
+        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+            &test_log,
+            skip_msg.as_bytes(),
+        );
         let ts = now_iso8601();
         if emit_human_logs {
             eprintln!(
-                "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+                "ts={ts} sha={sha} gate=test status=SKIP reason={skip_reason} log={}",
                 test_log.display()
             );
         }
         evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+            "ts={ts} sha={sha} gate=test status=SKIP reason={skip_reason} log={}",
             test_log.display()
         ));
         let test_result = build_evidence_gate_result(
@@ -2586,8 +2681,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
         gate_results.push(test_result);
     } else {
         // TCK-00540 fix round 3: Cache reuse for the test gate.
-        let test_command_override =
-            resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
+        let test_command_override = resolve_evidence_test_command_with_scope(
+            opts.and_then(|o| o.test_command.as_deref()),
+            &cargo_scope,
+        );
         let mut test_cache_hit = false;
         // TCK-00626 round 4: Hoist cache_decision for miss path.
         let mut test_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
@@ -3867,10 +3964,84 @@ mod tests {
 
     #[test]
     fn default_evidence_test_command_uses_nextest() {
-        let command = resolve_evidence_test_command_override(None);
+        let command =
+            resolve_evidence_test_command_with_scope(None, &CargoGateExecutionScope::FullWorkspace);
         let joined = command.join(" ");
         assert!(joined.contains("cargo nextest run --workspace"));
         assert!(!joined.contains("cargo test --workspace"));
+    }
+
+    #[test]
+    fn cargo_scope_classifies_docs_only_changes_as_no_cargo_impact() {
+        let scope = classify_cargo_gate_scope(
+            &["documents/strategy/ROADMAP.json".to_string()],
+            &[("crates/apm2-cli".to_string(), "apm2-cli".to_string())],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::NoCargoImpact);
+    }
+
+    #[test]
+    fn cargo_scope_classifies_crate_changes_as_scoped_packages() {
+        let scope = classify_cargo_gate_scope(
+            &[
+                "crates/apm2-cli/src/main.rs".to_string(),
+                "crates/apm2-cli/src/lib.rs".to_string(),
+            ],
+            &[
+                ("crates/apm2-cli".to_string(), "apm2-cli".to_string()),
+                ("crates/apm2-core".to_string(), "apm2-core".to_string()),
+            ],
+        );
+        assert_eq!(
+            scope,
+            CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()])
+        );
+    }
+
+    #[test]
+    fn cargo_scope_escalates_lockfile_changes_to_full_workspace() {
+        let scope = classify_cargo_gate_scope(
+            &["Cargo.lock".to_string()],
+            &[("crates/apm2-cli".to_string(), "apm2-cli".to_string())],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::FullWorkspace);
+    }
+
+    #[test]
+    fn scoped_commands_emit_package_flags_without_workspace_flag() {
+        let scope = CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()]);
+        let nextest = build_scoped_nextest_command(&scope).join(" ");
+        let doc = build_doc_gate_command(&scope).join(" ");
+        let clippy = build_clippy_gate_command(&scope).join(" ");
+
+        assert!(nextest.contains("cargo nextest run -p apm2-cli"));
+        assert!(!nextest.contains("--workspace"));
+        assert!(doc.contains("cargo doc -p apm2-cli --no-deps"));
+        assert!(!doc.contains("--workspace"));
+        assert!(clippy.contains("cargo clippy -p apm2-cli"));
+        assert!(!clippy.contains("--workspace"));
+    }
+
+    #[test]
+    fn doc_gate_skip_reason_defaults_to_skip_for_scoped_packages() {
+        let scope = CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()]);
+        assert_eq!(
+            doc_gate_skip_reason(&scope, false),
+            Some("scoped_latency_budget")
+        );
+        assert_eq!(doc_gate_skip_reason(&scope, true), None);
+    }
+
+    #[test]
+    fn doc_gate_skip_reason_respects_scope_transitions() {
+        assert_eq!(
+            doc_gate_skip_reason(&CargoGateExecutionScope::FullWorkspace, false),
+            None
+        );
+        assert_eq!(
+            doc_gate_skip_reason(&CargoGateExecutionScope::NoCargoImpact, false),
+            Some("no_cargo_impact")
+        );
     }
 
     #[test]

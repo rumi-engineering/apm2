@@ -1,0 +1,87 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00422",
+      "title": "Define PCAC core schemas and deny taxonomy",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0027",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0001",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0001.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0007",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0007.yaml#requirement"
+        },
+        {
+          "requirement_id": "REQ-0008",
+          "requirement_ref": "documents/rfcs/RFC-0027/requirements/REQ-0008.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0001",
+          "artifact_ref": "documents/rfcs/RFC-0027/evidence_artifacts/EVID-0001.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_DATA"
+      ]
+    },
+    "dependencies": {
+      "tickets": []
+    },
+    "scope": {
+      "in_scope": [
+        "Define AuthorityJoinInputV1 and AuthorityJoinCertificateV1 structures with canonical binding fields.",
+        "Define lifecycle receipt schemas (join/revalidate/consume/deny) with canonicalizer and digest metadata requirements.",
+        "Define machine-checkable deny taxonomy for lifecycle failures and missing authoritative bindings.",
+        "Enforce required revocation-head and authority-join hash bindings in core contracts."
+      ],
+      "out_of_scope": [
+        "RequestTool flow wiring.",
+        "Privileged handler rollout.",
+        "Durable consume storage backend implementation."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Create/patch schema types for AJC join inputs, certificates, receipts, and deny subclasses.",
+        "Add canonicalization and digest metadata validation checks at decode/verify boundaries.",
+        "Add unit tests for missing-field, malformed, and deny-taxonomy classification paths.",
+        "Link implementation outputs to EVID-0001 expected contents.",
+        "Run cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0001"
+      ],
+      "criteria": [
+        "Core PCAC schema surfaces exist with required normative fields.",
+        "Lifecycle deny classes are deterministic and machine-checkable.",
+        "Missing required authoritative bindings fail closed in tests."
+      ]
+    },
+    "notes": {
+      "security": "Schema incompleteness must fail closed; no permissive decode path is allowed in\nauthority-critical artifacts.\n",
+      "verification": "Use deterministic canonicalization vectors and negative tests for all required field\nfamilies.\n",
+      "general": "Draft mapped from RFC-0027 06_ticket_decomposition.yaml (TCK-PCAC-0001).\n"
+    }
+  }
+}

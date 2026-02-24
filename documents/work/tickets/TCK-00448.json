@@ -1,0 +1,97 @@
+{
+  "schema": "apm2.ticket.v1",
+  "ticket_meta": {
+    "schema_version": "2026-01-29",
+    "template_version": "2026-01-29",
+    "ticket": {
+      "id": "TCK-00448",
+      "title": "Production WorkObject role binding and end-to-end fail-closed validation",
+      "status": "CLOSED"
+    },
+    "binds": {
+      "prd_id": "PRD-0009",
+      "rfc_id": "RFC-0019",
+      "requirements": [
+        {
+          "requirement_id": "REQ-0019",
+          "requirement_ref": "documents/rfcs/RFC-0019/requirements/REQ-0019.yaml#requirement"
+        }
+      ],
+      "evidence_artifacts": [
+        {
+          "evidence_id": "EVID-0012",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0012.yaml#evidence_artifact"
+        },
+        {
+          "evidence_id": "EVID-0014",
+          "artifact_ref": "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0014.yaml#evidence_artifact"
+        }
+      ]
+    },
+    "custody": {
+      "agent_roles": [
+        "AGENT_IMPLEMENTER",
+        "AGENT_REVIEWER",
+        "AGENT_QA"
+      ],
+      "responsibility_domains": [
+        "DOMAIN_RUNTIME",
+        "DOMAIN_SECURITY",
+        "DOMAIN_OBSERVABILITY"
+      ]
+    },
+    "dependencies": {
+      "tickets": [
+        {
+          "ticket_id": "TCK-00446",
+          "reason": "RoleSpec v2 contract must exist before production role binding."
+        },
+        {
+          "ticket_id": "TCK-00447",
+          "reason": "Context recipe/fingerprint outputs must exist before production wiring and replay tests."
+        },
+        {
+          "ticket_id": "TCK-00419",
+          "reason": "FAC command authority cutover baseline is required."
+        }
+      ]
+    },
+    "scope": {
+      "in_scope": [
+        "Wire production WorkObject execution path to select implementor RoleSpec by hash.",
+        "Bind role/context hash lineage into authoritative receipts/events.",
+        "Add integration and adversarial tests for missing/stale/ambiguous role/context state.",
+        "Verify no optional-gate bypass path in authoritative execution flow."
+      ],
+      "out_of_scope": [
+        "Subagent launch CLI surfaces and liveness pulse contract.",
+        "Workflow projection orchestration changes."
+      ]
+    },
+    "plan": {
+      "steps": [
+        "Integrate role hash selection into production dispatcher path.",
+        "Emit lineage fields in authoritative receipts/events.",
+        "Implement fail-closed integration tests for authority/context ambiguity.",
+        "Add regression tests for optional-gate bypass classes.",
+        "Run required checks."
+      ]
+    },
+    "definition_of_done": {
+      "evidence_ids": [
+        "EVID-0012",
+        "EVID-0014"
+      ],
+      "criteria": [
+        "Production path uses hash-selected role profile with recorded lineage fields.",
+        "Ambiguous/missing role or context state denies authoritative progression.",
+        "End-to-end tests validate side-effect path behavior and fail-closed guarantees."
+      ]
+    },
+    "notes": {
+      "security": "Role/context ambiguity in production path is non-admissible and must deny.\n",
+      "verification": "Include integration tests validating side effects and receipt bindings, not only shape checks.\n",
+      "general": "This ticket closes the runtime wiring gap between role contracts and authoritative execution.\n"
+    }
+  }
+}

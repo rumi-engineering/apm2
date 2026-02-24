@@ -1,0 +1,68 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/github",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-GH-001",
+      "kind": "invariant",
+      "title": "Risk tiers ordered: Low < Med < High",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-002",
+      "kind": "invariant",
+      "title": "Higher tiers can use apps of lower tiers (scope attenuation only)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-003",
+      "kind": "invariant",
+      "title": "TTL decreases monotonically as tier increases",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-004",
+      "kind": "invariant",
+      "title": "Apps form strict hierarchy: Reader subset Developer subset Operator",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-005",
+      "kind": "safety",
+      "title": "Raw token is NEVER stored; only SHA-256 hash persisted",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-006",
+      "kind": "invariant",
+      "title": "Lease state transitions are irreversible: Active -> Revoked/Expired",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-007",
+      "kind": "safety",
+      "title": "terminated_at uses lease expires_at to prevent pruning evasion",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-GH-008",
+      "kind": "requirement",
+      "title": "Rate-limited token provider enforces per-episode issuance limits",
+      "description": "Higher risk tiers get fewer tokens (inverse proportionality).",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-GH-009",
+      "kind": "safety",
+      "title": "All private key reads use open-once strategy eliminating TOCTOU",
+      "description": "Open with O_NOFOLLOW, validate metadata, read bounded content from same descriptor.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-GH-010",
+      "kind": "safety",
+      "title": "Remote URL parsing rejects URLs over 2048 bytes and invalid chars",
+      "rfc": ["RFC-0015"]
+    }
+  ]
+}
