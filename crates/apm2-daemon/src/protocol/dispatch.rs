@@ -17751,7 +17751,12 @@ impl PrivilegedDispatcher {
             response.actor_id = Some(claim.actor_id);
             response.role = Some(claim.role.into());
             let lease_id = claim.lease_id.trim();
-            if !lease_id.is_empty() {
+            if lease_id.is_empty() {
+                warn!(
+                    work_id = %authority_status.work_id,
+                    "WorkStatus detected claim with empty lease_id; omitting runtime lease/session bindings"
+                );
+            } else {
                 match self.lease_validator.get_lease_work_id(lease_id) {
                     Some(mapped_work_id) => {
                         let work_id_matches = mapped_work_id.len()
@@ -17785,11 +17790,6 @@ impl PrivilegedDispatcher {
                         );
                     },
                 }
-            } else {
-                warn!(
-                    work_id = %authority_status.work_id,
-                    "WorkStatus detected claim with empty lease_id; omitting runtime lease/session bindings"
-                );
             }
         }
 

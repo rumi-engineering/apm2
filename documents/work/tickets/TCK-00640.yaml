@@ -61,6 +61,7 @@ ticket_meta:
     - "Sqlite lease validation now recovers lease->work and executor actor bindings from persisted `work_claims` when legacy claims predate canonical `gate_lease_issued` rows."
     - "Lease fallback is fail-closed on ambiguous `lease_id -> (work_id, actor_id)` mappings and rejects empty bindings."
     - "Work-claim schema now includes `idx_work_claims_lease_id` to keep fallback lookup deterministic and performant."
+    - "Work status runtime-binding branch now uses clippy-clean `lease_id.is_empty()` guard ordering (no behavior change)."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
