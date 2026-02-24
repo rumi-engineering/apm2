@@ -120,7 +120,7 @@ mod tests;
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
 pub use core_ledger_adapter::{
-    CoreLedgerAdapterError, FinalitySignal, HolonEventEnvelope, ReplayVerification,
+    CoreLedgerAdapterError, FinalitySignal, HexDigest, HolonEventEnvelope, ReplayStats,
 };
 pub use defect::{
     DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal,
@@ -156,7 +156,7 @@ pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
     pub use crate::core_ledger_adapter::{
-        CoreLedgerAdapterError, FinalitySignal, HolonEventEnvelope, ReplayVerification,
+        CoreLedgerAdapterError, FinalitySignal, HexDigest, HolonEventEnvelope, ReplayStats,
     };
     pub use crate::defect::{
         DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity,
