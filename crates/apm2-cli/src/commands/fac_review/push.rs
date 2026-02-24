@@ -1755,7 +1755,7 @@ fn unresolved_push_alias_message(ticket_alias: &str) -> String {
     format!(
         "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
          Refusing projection fallback to prevent cross-ticket misbinding. \
-         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.json --lease-id <LEASE_ID>`, \
          then claim it (or pass explicit `--work-id`)."
     )
 }

@@ -667,7 +667,7 @@ pub struct ServicesStatusArgs {}
 /// Work subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkSubcommand {
-    /// Open a work item from a ticket YAML using RFC-0032 `OpenWork`.
+    /// Open a work item from a ticket document using RFC-0032 `OpenWork`.
     Open(WorkOpenArgs),
 
     /// Claim an existing work item using RFC-0032 `ClaimWorkV2`.
@@ -728,7 +728,7 @@ pub struct WorkCurrentArgs {
 /// Arguments for `apm2 fac work open`.
 #[derive(Debug, Args)]
 pub struct WorkOpenArgs {
-    /// Ticket YAML path to open as `WorkSpec`.
+    /// Ticket document path to open as `WorkSpec`.
     #[arg(long = "from-ticket")]
     pub from_ticket: PathBuf,
 
@@ -4142,7 +4142,7 @@ fn unresolved_work_current_alias_message(ticket_alias: &str) -> String {
     format!(
         "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
          Refusing projection fallback to prevent cross-ticket misbinding. \
-         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.json --lease-id <LEASE_ID>`, \
          then claim it (or provide explicit `--ticket-alias`)."
     )
 }
@@ -7711,7 +7711,7 @@ mod tests {
             "work",
             "open",
             "--from-ticket",
-            "documents/work/tickets/TCK-00640.yaml",
+            "documents/work/tickets/TCK-00640.json",
             "--lease-id",
             "L-governing-001",
         ]);
