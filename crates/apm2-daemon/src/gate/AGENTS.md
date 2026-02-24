@@ -42,6 +42,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [CTR-GT02] Gate receipt signatures are verified against the executor's verifying key.
 - [CTR-GT03] Events are returned per-invocation, not buffered in shared state.
 - [CTR-GT04] Idempotency keys bounded to `MAX_IDEMPOTENCY_KEYS`.
+- [CTR-GT07] Both `GateStartKernel` and `GateTimeoutKernel` implement the cursor-generic `orchestrator_kernel` traits (`CursorEvent<CompositeCursor>`, `LedgerReader` with `type Cursor = CompositeCursor`, `CursorStore<CompositeCursor>`). New kernel consumers should choose a `KernelCursor` matching their ledger truth.
 
 ### `GateType`
 
