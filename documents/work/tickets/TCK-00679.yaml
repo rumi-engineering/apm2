@@ -121,6 +121,9 @@ scope:
       detail: |
         Add a test that simulates worker crash during gate execution and
         verifies the lane recovers within 60s without manual intervention.
+  requirement_clarifications:
+    - "safe_rmtree pre-delete normalization must use handle-based directory operations (no symlink-following chmod path) and bounded traversal to prevent TOCTOU/DoS regressions."
+    - "Lane recovery must remain doctor-driven and deterministic under repeated crash/restart cycles."
 
   out_of_scope:
     - "Changing broker_requests creation mode from 0333 to 0700 (Option C — may be considered separately)"

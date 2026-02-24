@@ -14,6 +14,16 @@ use crate::commands::fac_permissions;
 use crate::exit_codes::codes as exit_codes;
 
 const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
+const PREPARE_INLINE_LINE_LIMIT: usize = 2_000;
+
+#[derive(Debug, Serialize)]
+struct PrepareArtifactMetadata {
+    path: String,
+    bytes: usize,
+    lines: usize,
+    inlined: bool,
+    omitted_lines: usize,
+}
 
 #[derive(Debug, Serialize)]
 struct PrepareSummary {
@@ -27,9 +37,110 @@ struct PrepareSummary {
     base_source: String,
     diff_path: String,
     commit_history_path: String,
+    output_mode: String,
+    inline_line_limit: usize,
+    inline_line_count: usize,
+    omitted_line_count: usize,
+    diff: PrepareArtifactMetadata,
+    commit_history: PrepareArtifactMetadata,
     diff_content: String,
     commit_history_content: String,
     temp_dir: String,
+}
+
+#[derive(Debug)]
+struct PrepareInlineContent {
+    output_mode: &'static str,
+    inline_line_count: usize,
+    omitted_line_count: usize,
+    diff_content: String,
+    diff_inlined: bool,
+    diff_omitted_lines: usize,
+    commit_history_content: String,
+    commit_history_inlined: bool,
+    commit_history_omitted_lines: usize,
+}
+
+fn count_text_lines(content: &str) -> usize {
+    if content.is_empty() {
+        0
+    } else {
+        content.lines().count()
+    }
+}
+
+fn omitted_payload_notice(kind: &str, path: &Path, lines: usize, line_limit: usize) -> String {
+    format!(
+        "<<prepare omitted inline {kind} payload: {lines} lines exceed inline limit {line_limit}; read {}>>",
+        path.display()
+    )
+}
+
+fn build_prepare_inline_content(
+    diff: &str,
+    diff_path: &Path,
+    commit_history: &str,
+    commit_history_path: &Path,
+    line_limit: usize,
+) -> PrepareInlineContent {
+    let diff_lines = count_text_lines(diff);
+    let commit_history_lines = count_text_lines(commit_history);
+    let total_lines = diff_lines.saturating_add(commit_history_lines);
+    if total_lines <= line_limit {
+        return PrepareInlineContent {
+            output_mode: "inline",
+            inline_line_count: total_lines,
+            omitted_line_count: 0,
+            diff_content: diff.to_string(),
+            diff_inlined: true,
+            diff_omitted_lines: 0,
+            commit_history_content: commit_history.to_string(),
+            commit_history_inlined: true,
+            commit_history_omitted_lines: 0,
+        };
+    }
+
+    let mut remaining_budget = line_limit;
+
+    let (diff_content, diff_inlined, diff_omitted_lines) = if diff_lines <= remaining_budget {
+        remaining_budget = remaining_budget.saturating_sub(diff_lines);
+        (diff.to_string(), true, 0)
+    } else {
+        let notice = omitted_payload_notice("diff", diff_path, diff_lines, line_limit);
+        remaining_budget = remaining_budget.saturating_sub(count_text_lines(&notice));
+        (notice, false, diff_lines)
+    };
+
+    let (commit_history_content, commit_history_inlined, commit_history_omitted_lines) =
+        if commit_history_lines <= remaining_budget {
+            (commit_history.to_string(), true, 0)
+        } else {
+            (
+                omitted_payload_notice(
+                    "commit_history",
+                    commit_history_path,
+                    commit_history_lines,
+                    line_limit,
+                ),
+                false,
+                commit_history_lines,
+            )
+        };
+
+    let inline_line_count =
+        count_text_lines(&diff_content).saturating_add(count_text_lines(&commit_history_content));
+    let omitted_line_count = diff_omitted_lines.saturating_add(commit_history_omitted_lines);
+    PrepareInlineContent {
+        output_mode: "artifact_reference",
+        inline_line_count,
+        omitted_line_count,
+        diff_content,
+        diff_inlined,
+        diff_omitted_lines,
+        commit_history_content,
+        commit_history_inlined,
+        commit_history_omitted_lines,
+    }
 }
 
 pub fn run_prepare(
@@ -94,6 +205,16 @@ pub fn run_prepare(
         },
     )?;
 
+    let inline_payload = build_prepare_inline_content(
+        &diff,
+        &diff_path,
+        &commit_history,
+        &history_path,
+        PREPARE_INLINE_LINE_LIMIT,
+    );
+    let diff_lines = count_text_lines(&diff);
+    let commit_history_lines = count_text_lines(&commit_history);
+
     let summary = PrepareSummary {
         schema: PREPARE_SCHEMA.to_string(),
         repo: owner_repo.clone(),
@@ -105,8 +226,26 @@ pub fn run_prepare(
         base_source: resolved_base.base_source.to_string(),
         diff_path: diff_path.display().to_string(),
         commit_history_path: history_path.display().to_string(),
-        diff_content: diff,
-        commit_history_content: commit_history,
+        output_mode: inline_payload.output_mode.to_string(),
+        inline_line_limit: PREPARE_INLINE_LINE_LIMIT,
+        inline_line_count: inline_payload.inline_line_count,
+        omitted_line_count: inline_payload.omitted_line_count,
+        diff: PrepareArtifactMetadata {
+            path: diff_path.display().to_string(),
+            bytes: diff.len(),
+            lines: diff_lines,
+            inlined: inline_payload.diff_inlined,
+            omitted_lines: inline_payload.diff_omitted_lines,
+        },
+        commit_history: PrepareArtifactMetadata {
+            path: history_path.display().to_string(),
+            bytes: commit_history.len(),
+            lines: commit_history_lines,
+            inlined: inline_payload.commit_history_inlined,
+            omitted_lines: inline_payload.commit_history_omitted_lines,
+        },
+        diff_content: inline_payload.diff_content,
+        commit_history_content: inline_payload.commit_history_content,
         temp_dir: prepared_dir.display().to_string(),
     };
 
@@ -536,8 +675,9 @@ pub fn prepared_review_dir(owner_repo: &str, pr_number: u32, head_sha: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_prepared_review_inputs_at, prepared_review_dir_from_root,
-        resolve_base_ref_for_pr_with, resolve_head_sha_with, sha_is_locally_reachable,
+        PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content, cleanup_prepared_review_inputs_at,
+        count_text_lines, prepared_review_dir_from_root, resolve_base_ref_for_pr_with,
+        resolve_head_sha_with, sha_is_locally_reachable,
     };
 
     #[test]
@@ -901,5 +1041,92 @@ mod tests {
         )
         .expect_err("invalid local fallback head must fail");
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn build_prepare_inline_content_inlines_when_under_limit() {
+        let payload = build_prepare_inline_content(
+            "line1\nline2\n",
+            std::path::Path::new("/tmp/review.diff"),
+            "commit1\ncommit2\n",
+            std::path::Path::new("/tmp/commit_history.txt"),
+            PREPARE_INLINE_LINE_LIMIT,
+        );
+        assert_eq!(payload.output_mode, "inline");
+        assert!(payload.diff_inlined);
+        assert!(payload.commit_history_inlined);
+        assert_eq!(payload.inline_line_count, 4);
+        assert_eq!(payload.omitted_line_count, 0);
+        assert_eq!(payload.diff_content, "line1\nline2\n");
+        assert_eq!(payload.commit_history_content, "commit1\ncommit2\n");
+    }
+
+    #[test]
+    fn build_prepare_inline_content_spills_large_diff_and_keeps_history() {
+        let large_diff = "d\n".repeat(PREPARE_INLINE_LINE_LIMIT.saturating_add(25));
+        let commit_history = "commit-a\ncommit-b\n";
+        let payload = build_prepare_inline_content(
+            &large_diff,
+            std::path::Path::new("/tmp/review.diff"),
+            commit_history,
+            std::path::Path::new("/tmp/commit_history.txt"),
+            PREPARE_INLINE_LINE_LIMIT,
+        );
+        assert_eq!(payload.output_mode, "artifact_reference");
+        assert!(!payload.diff_inlined);
+        assert!(payload.commit_history_inlined);
+        assert!(
+            payload
+                .diff_content
+                .contains("prepare omitted inline diff payload")
+        );
+        assert!(payload.diff_content.contains("/tmp/review.diff"));
+        assert_eq!(
+            payload.diff_omitted_lines,
+            PREPARE_INLINE_LINE_LIMIT.saturating_add(25)
+        );
+        assert_eq!(payload.commit_history_content, commit_history);
+        assert!(
+            payload.inline_line_count <= PREPARE_INLINE_LINE_LIMIT,
+            "inline line count must remain bounded"
+        );
+    }
+
+    #[test]
+    fn build_prepare_inline_content_spills_both_payloads_when_needed() {
+        let large_diff = "d\n".repeat(PREPARE_INLINE_LINE_LIMIT.saturating_add(1));
+        let large_history = "h\n".repeat(PREPARE_INLINE_LINE_LIMIT.saturating_add(1));
+        let payload = build_prepare_inline_content(
+            &large_diff,
+            std::path::Path::new("/tmp/review.diff"),
+            &large_history,
+            std::path::Path::new("/tmp/commit_history.txt"),
+            PREPARE_INLINE_LINE_LIMIT,
+        );
+        assert_eq!(payload.output_mode, "artifact_reference");
+        assert!(!payload.diff_inlined);
+        assert!(!payload.commit_history_inlined);
+        assert!(
+            payload
+                .commit_history_content
+                .contains("prepare omitted inline commit_history payload")
+        );
+        assert!(
+            payload.inline_line_count <= PREPARE_INLINE_LINE_LIMIT,
+            "inline line count must stay bounded even when both payloads are large"
+        );
+        assert_eq!(
+            payload.omitted_line_count,
+            PREPARE_INLINE_LINE_LIMIT
+                .saturating_mul(2)
+                .saturating_add(2)
+        );
+    }
+
+    #[test]
+    fn count_text_lines_handles_empty_and_non_empty_content() {
+        assert_eq!(count_text_lines(""), 0);
+        assert_eq!(count_text_lines("single"), 1);
+        assert_eq!(count_text_lines("a\nb\n"), 2);
     }
 }

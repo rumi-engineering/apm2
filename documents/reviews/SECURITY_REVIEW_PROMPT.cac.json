@@ -93,7 +93,7 @@
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history"]
             },
             {
               "action": "on_failure",
@@ -113,6 +113,10 @@
             },
             {"action": "use_captured", "from": "diff_content", "purpose": "Full PR diff from prepare output"},
             {"action": "use_captured", "from": "commit_history_content", "purpose": "Commit history from prepare output"},
+            {
+              "action": "fallback_rule",
+              "rule": "If `diff_content` or `commit_history_content` includes an inline-omission marker from prepare output, read full content from `diff_path` and `commit_history_path` before analysis."
+            },
             {
               "action": "read_module_agents",
               "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."

@@ -1016,24 +1016,35 @@ where
                             thread::sleep(delay);
                             continue;
                         }
-                    } else {
-                        // BF-001 (TCK-00626 round 4): Non-terminal joined
-                        // with no PID — assume unit-based supervision is
-                        // keeping the dispatch alive. In the systemd detached
-                        // path, dispatches are created with unit-based
-                        // supervision and no PID recorded, so pid=None is the
-                        // normal steady-state for healthy unit-supervised
-                        // reviews. Treating these as dead would cause
-                        // spurious retry loops and duplicate dispatches.
-                        // Only apply PID identity checks when a PID IS
-                        // present (the branch above).
+                    } else if let Some(unit) = result
+                        .unit
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                    {
                         if emit_logs {
                             eprintln!(
                                 "fac push: {review_type} dispatch returned 'joined' with no PID in non-terminal \
-                                 state '{}'; assuming unit-supervised liveness",
+                                 state '{}'; using unit handle {unit}",
                                 result.run_state,
                             );
                         }
+                    } else {
+                        let err = format!(
+                            "{review_type} joined dispatch missing runtime handle in non-terminal state (run_state={})",
+                            result.run_state
+                        );
+                        let delay = retry_delay_or_fail(
+                            &mut retry_counts,
+                            retry_budget,
+                            review_type,
+                            "dispatch_contract",
+                            PushRetryClass::DispatchTransient,
+                            &err,
+                            emit_logs,
+                        )?;
+                        thread::sleep(delay);
+                        continue;
                     }
                 }
                 break result;

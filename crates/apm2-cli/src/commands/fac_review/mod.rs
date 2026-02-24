@@ -420,12 +420,16 @@ enum DoctorRunStateCondition {
     Missing,
     Corrupt,
     Ambiguous,
+    InconsistentRuntimeHandle,
     Unavailable,
 }
 
 impl DoctorRunStateCondition {
     const fn requires_repair(self) -> bool {
-        matches!(self, Self::Corrupt | Self::Ambiguous)
+        matches!(
+            self,
+            Self::Corrupt | Self::Ambiguous | Self::InconsistentRuntimeHandle
+        )
     }
 }
 
@@ -4046,6 +4050,57 @@ fn canonical_review_dimension(value: &str) -> String {
     }
 }
 
+fn diagnose_present_run_state(
+    review_type: &str,
+    state: &types::ReviewRunState,
+) -> (DoctorRunStateCondition, Option<String>) {
+    if state.status.is_terminal() {
+        return (DoctorRunStateCondition::Healthy, None);
+    }
+
+    if state.status == types::ReviewRunStatus::Alive && state.pid.is_none() {
+        return (
+            DoctorRunStateCondition::InconsistentRuntimeHandle,
+            Some(format!(
+                "{review_type} run-state is Alive but missing pid (run_id={})",
+                state.run_id
+            )),
+        );
+    }
+
+    if let Some(pid) = state.pid {
+        let Some(expected_start_time) = state.proc_start_time else {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state has pid={pid} but missing proc_start_time (run_id={})",
+                    state.run_id
+                )),
+            );
+        };
+        if !state::is_process_alive(pid) {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state references dead pid={pid} (run_id={})",
+                    state.run_id
+                )),
+            );
+        }
+        let observed_start_time = state::get_process_start_time(pid);
+        if observed_start_time != Some(expected_start_time) {
+            return (
+                DoctorRunStateCondition::InconsistentRuntimeHandle,
+                Some(format!(
+                    "{review_type} run-state process identity mismatch for pid={pid} expected_start={expected_start_time} observed_start={observed_start_time:?}",
+                )),
+            );
+        }
+    }
+
+    (DoctorRunStateCondition::Healthy, None)
+}
+
 fn collect_run_state_diagnostics(
     pr_number: u32,
     health: &mut Vec<DoctorHealthItem>,
@@ -4081,13 +4136,26 @@ fn collect_run_state_diagnostics(
         };
         match load_review_run_state(pr_number, review_type) {
             Ok(state::ReviewRunStateLoad::Present(state)) => {
+                let (condition, detail) = diagnose_present_run_state(review_type, &state);
                 diagnostics.push(DoctorRunStateDiagnostic {
                     review_type: review_type.to_string(),
-                    condition: DoctorRunStateCondition::Healthy,
+                    condition,
                     canonical_path,
-                    detail: None,
+                    detail: detail.clone(),
                     candidates: Vec::new(),
                 });
+                if condition.requires_repair() {
+                    health.push(DoctorHealthItem {
+                        severity: "high",
+                        message: format!(
+                            "{review_type} run-state has inconsistent runtime handle: {}",
+                            detail.unwrap_or_else(|| "unknown inconsistency".to_string())
+                        ),
+                        remediation:
+                            "run `apm2 fac doctor --pr <PR_NUMBER> --fix` to rebuild stale/non-authoritative run-state"
+                                .to_string(),
+                    });
+                }
                 reasons.insert(dimension.to_string(), state.terminal_reason);
             },
             Ok(state::ReviewRunStateLoad::Missing { .. }) => {
@@ -6783,6 +6851,37 @@ mod tests {
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    #[test]
+    fn diagnose_present_run_state_marks_alive_missing_pid_inconsistent() {
+        let mut state = sample_run_state(next_test_pr(), 1234, "abcdef1234567890", Some(111));
+        state.pid = None;
+        let (condition, detail) = super::diagnose_present_run_state("security", &state);
+        assert_eq!(
+            condition,
+            super::DoctorRunStateCondition::InconsistentRuntimeHandle
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|value| value.contains("missing pid"))
+        );
+    }
+
+    #[test]
+    fn diagnose_present_run_state_marks_missing_proc_start_time_inconsistent() {
+        let state = sample_run_state(next_test_pr(), 1234, "abcdef1234567890", None);
+        let (condition, detail) = super::diagnose_present_run_state("security", &state);
+        assert_eq!(
+            condition,
+            super::DoctorRunStateCondition::InconsistentRuntimeHandle
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|value| value.contains("missing proc_start_time"))
+        );
     }
 
     fn seed_decision_projection_for_terminate(

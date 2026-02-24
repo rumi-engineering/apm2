@@ -1344,6 +1344,9 @@ pub struct ReviewPrepareArgs {
     pub pr: Option<u32>,
 
     /// Optional head SHA override (defaults to PR head SHA).
+    ///
+    /// Note: prepare JSON output inlines review payloads only up to a bounded
+    /// line budget; oversized payloads are returned as artifact references.
     #[arg(long)]
     pub sha: Option<String>,
 }

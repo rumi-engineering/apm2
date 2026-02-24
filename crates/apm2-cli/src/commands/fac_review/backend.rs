@@ -24,6 +24,8 @@ use super::types::ReviewBackend;
 pub struct SpawnCommand {
     pub program: String,
     pub args: Vec<String>,
+    /// Additional environment variables to set for the child process.
+    pub env: Vec<(String, String)>,
     /// Path to the log file for stdout/stderr capture.
     pub log_path: PathBuf,
     /// If true, append to the log file rather than truncating.
@@ -67,8 +69,12 @@ impl SpawnCommand {
             None => Stdio::null(),
         };
 
-        Command::new(&self.program)
-            .args(&self.args)
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        command
             .stdin(stdin_cfg)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr_log))
@@ -112,6 +118,7 @@ pub fn build_gemini_spawn_command(
             "-p".to_string(),
             prompt_content,
         ],
+        env: Vec::new(),
         log_path: log_path.to_path_buf(),
         append_log: false,
         stdin_file: None,
@@ -145,6 +152,7 @@ pub fn build_spawn_command_for_backend(
             Ok(SpawnCommand {
                 program: "codex".to_string(),
                 args,
+                env: Vec::new(),
                 log_path: log_path.to_path_buf(),
                 append_log: false,
                 stdin_file: Some(prompt_path.to_path_buf()),
@@ -184,6 +192,7 @@ pub fn build_spawn_command_for_backend(
             Ok(SpawnCommand {
                 program: "claude".to_string(),
                 args: program_args,
+                env: Vec::new(),
                 log_path: log_path.to_path_buf(),
                 append_log: false,
                 stdin_file,
@@ -212,6 +221,7 @@ pub fn build_resume_spawn_command_for_backend(
                 "--json".to_string(),
                 "-".to_string(),
             ],
+            env: Vec::new(),
             log_path: log_path.to_path_buf(),
             append_log: true,
             stdin_file: Some(resume_prompt_path.to_path_buf()),
@@ -227,6 +237,7 @@ pub fn build_resume_spawn_command_for_backend(
                 "-p".to_string(),
                 String::new(),
             ],
+            env: Vec::new(),
             log_path: log_path.to_path_buf(),
             append_log: true,
             stdin_file: Some(resume_prompt_path.to_path_buf()),
@@ -243,6 +254,7 @@ pub fn build_resume_spawn_command_for_backend(
                 "plan".to_string(),
                 "--resume".to_string(),
             ],
+            env: Vec::new(),
             log_path: log_path.to_path_buf(),
             append_log: true,
             stdin_file: Some(resume_prompt_path.to_path_buf()),

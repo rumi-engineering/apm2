@@ -45,6 +45,31 @@ ticket_meta:
     - Harden projection rebuild decoder to current session envelope contract and remove historical raw/payload-only branches
     - Add early PR-association preflight to `fac push` fast checks (non-mutating validation path)
     - Add/maintain regression tests for idempotent push replay and lease-mapping recovery in publication closures
+  implementation_status:
+    completed_in_this_pr:
+    - "`apm2 fac push` requires canonical work binding for publication paths and enforces IMPLEMENTER_TERMINAL publication on every push attempt."
+    - "`--handoff-note` is optional; HANDOFF_NOTE context publication is conditional while IMPLEMENTER_TERMINAL remains mandatory."
+    - "Fast preflight checks (including PR association compatibility) execute before expensive gate execution."
+    - "Projection rebuild rejects historical raw protobuf/payload-only work envelopes and requires the canonical session envelope contract."
+    - "Review dispatch/runtime joins are fail-closed on missing runtime handles and PID identity mismatches."
+    - "`fac review prepare` now bounds inline output (2000-line limit) and returns artifact references/metadata for oversized payloads."
+    - "Reviewer subprocess context now carries authoritative PR/head/run identifiers via environment propagation."
+    remaining_focus:
+    - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
+  verification_matrix:
+    targeted_tests:
+    - "`cargo test -p apm2-cli dispatch::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli prepare::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli target::tests -- --nocapture`"
+    - "`cargo test -p apm2-cli load_pr_identity_by_head_sha -- --nocapture`"
+    - "`cargo test -p apm2-cli reviewer_context_env_contains_required_identifiers -- --nocapture`"
+    - "`cargo test -p apm2-cli diagnose_present_run_state_marks -- --nocapture`"
+    - "`cargo test -p apm2-cli repair_run_state_present_with_inconsistent_runtime_handle_rebuilds_state -- --nocapture`"
+    full_package:
+    - "`cargo test -p apm2-cli`"
+    static_checks:
+    - "`cargo fmt --all`"
+    - "`cargo clippy -p apm2-cli --all-targets --all-features -- -D warnings`"
   definition_of_done:
     evidence_ids: []
     criteria:

@@ -25,6 +25,10 @@ delivery_notes:
   remaining_focus:
     - "Operational wiring hardening (doctor/fix orchestration, stale-runtime detection, bounded reconciler guarantees under restart churn)."
     - "Final removal/deprecation path for manual/legacy queue repair entrypoints that conflict with ledger-authoritative behavior."
+  requirement_clarifications:
+    - "Queue lifecycle authority is ledger+projection only; filesystem queue state must remain a recoverable cache and never gate authority-critical decisions without projection corroboration."
+    - "Doctor/fix is the canonical operator recovery workflow; direct/manual mutation commands must not bypass the reconciler state machine."
+    - "Any remaining queue health/status surfaces must read from daemon projection or daemon RPCs, not ad-hoc local state files."
 
 root_cause_analysis:
   summary: |
