@@ -777,6 +777,19 @@ pub trait LedgerEventEmitter: Send + Sync {
             .find(|e| e.event_type == event_type)
     }
 
+    /// Returns true if a `work.pr_associated` event already exists for the
+    /// semantic tuple `(work_id, pr_number, commit_sha)`.
+    ///
+    /// Implementations MUST use a bounded query (e.g. SQL `LIMIT 1`) or
+    /// short-circuit iteration and must not materialize the full event history
+    /// for `work_id`.
+    fn has_work_pr_association_tuple(
+        &self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+    ) -> bool;
+
     /// Returns the most recent `work_transitioned` event for a
     /// `(work_id, rationale_code)` pair, or `None` if no match exists.
     ///
@@ -3953,6 +3966,33 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             event_ids.iter().find_map(|id| {
                 let event = guard.1.get(id)?;
                 (event.event_type == event_type).then(|| event.clone())
+            })
+        })
+    }
+
+    fn has_work_pr_association_tuple(
+        &self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+    ) -> bool {
+        // Lock ordering: events (B) then events_by_work_id (A), matching
+        // writer ordering in emit_* methods to prevent AB-BA deadlock.
+        let guard = self.events.read().expect("lock poisoned");
+        let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
+
+        events_by_work.get(work_id).is_some_and(|event_ids| {
+            event_ids.iter().any(|id| {
+                let Some(event) = guard.1.get(id) else {
+                    return false;
+                };
+                if event.event_type != "work.pr_associated" {
+                    return false;
+                }
+                PrivilegedDispatcher::extract_work_pr_association_fields(&event.payload)
+                    .is_some_and(|(existing_pr, existing_sha)| {
+                        existing_pr == pr_number && existing_sha.eq_ignore_ascii_case(commit_sha)
+                    })
             })
         })
     }
@@ -21037,14 +21077,10 @@ impl PrivilegedDispatcher {
         pr_number: u64,
         commit_sha: &str,
     ) -> bool {
+        // Security-critical path: delegate to the emitter's bounded tuple
+        // lookup instead of materializing full work history.
         self.event_emitter
-            .get_events_by_work_id(work_id)
-            .into_iter()
-            .filter(|event| event.event_type == "work.pr_associated")
-            .filter_map(|event| Self::extract_work_pr_association_fields(&event.payload))
-            .any(|(existing_pr, existing_sha)| {
-                existing_pr == pr_number && existing_sha.eq_ignore_ascii_case(commit_sha)
-            })
+            .has_work_pr_association_tuple(work_id, pr_number, commit_sha)
     }
 
     /// Deterministic dedupe key for PR LINKOUT publishing.

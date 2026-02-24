@@ -13383,6 +13383,16 @@ mod tests {
             events
         }
 
+        fn has_work_pr_association_tuple(
+            &self,
+            work_id: &str,
+            pr_number: u64,
+            commit_sha: &str,
+        ) -> bool {
+            self.inner
+                .has_work_pr_association_tuple(work_id, pr_number, commit_sha)
+        }
+
         fn get_all_events(&self) -> Vec<crate::protocol::dispatch::SignedLedgerEvent> {
             let mut events = self.inner.get_all_events();
             events.extend(self.events_by_receipt_id.values().cloned());
@@ -17595,6 +17605,16 @@ mod tests {
 
             fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
                 self.inner.get_events_by_work_id(work_id)
+            }
+
+            fn has_work_pr_association_tuple(
+                &self,
+                work_id: &str,
+                pr_number: u64,
+                commit_sha: &str,
+            ) -> bool {
+                self.inner
+                    .has_work_pr_association_tuple(work_id, pr_number, commit_sha)
             }
 
             fn get_all_events(&self) -> Vec<SignedLedgerEvent> {
