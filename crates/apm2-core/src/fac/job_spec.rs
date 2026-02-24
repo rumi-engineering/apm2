@@ -50,6 +50,9 @@ pub const MAX_DECODED_SOURCE_LENGTH: usize = 64;
 /// Maximum length for `repo_id` in the source block.
 pub const MAX_REPO_ID_LENGTH: usize = 256;
 
+/// Maximum length for canonical `work_id` in the source block.
+pub const MAX_WORK_ID_LENGTH: usize = 256;
+
 /// Maximum length for `head_sha` in the source block.
 pub const MAX_HEAD_SHA_LENGTH: usize = 128;
 
@@ -463,6 +466,12 @@ pub struct JobSource {
     /// Stable logical repository identifier.
     pub repo_id: String,
 
+    /// Canonical work identifier associated with this job.
+    ///
+    /// This must be a logical identifier (not a filesystem path) and should
+    /// use the canonical `W-...` namespace.
+    pub work_id: String,
+
     /// HEAD commit SHA.
     pub head_sha: String,
 
@@ -602,6 +611,7 @@ impl FacJobSpecV1 {
         check_non_empty("actuation.request_id", &self.actuation.request_id)?;
         check_non_empty("source.kind", &self.source.kind)?;
         check_non_empty("source.repo_id", &self.source.repo_id)?;
+        check_non_empty("source.work_id", &self.source.work_id)?;
         check_non_empty("source.head_sha", &self.source.head_sha)?;
         if !VALID_JOB_KINDS.contains(&self.kind.as_str()) {
             return Err(JobSpecError::InvalidFormat {
@@ -616,6 +626,7 @@ impl FacJobSpecV1 {
             });
         }
         validate_repo_id(&self.source.repo_id)?;
+        validate_work_id(&self.source.work_id)?;
         validate_head_sha(&self.source.head_sha)?;
         if self.source.kind == "patch_injection" {
             self.validate_patch_source()?;
@@ -669,6 +680,7 @@ impl FacJobSpecV1 {
         }
         check_length("source.kind", &self.source.kind, MAX_SOURCE_KIND_LENGTH)?;
         check_length("source.repo_id", &self.source.repo_id, MAX_REPO_ID_LENGTH)?;
+        check_length("source.work_id", &self.source.work_id, MAX_WORK_ID_LENGTH)?;
         check_length(
             "source.head_sha",
             &self.source.head_sha,
@@ -817,6 +829,7 @@ pub fn validate_job_spec(spec: &FacJobSpecV1) -> Result<(), JobSpecError> {
     // `reject_filesystem_paths` provides defense-in-depth for repo_id and a
     // second barrier for job_id.
     reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("source.work_id", &spec.source.work_id)?;
     reject_filesystem_paths("job_id", &spec.job_id)?;
 
     if parse_b3_256_digest(&spec.job_spec_digest).is_none() {
@@ -934,6 +947,7 @@ pub fn validate_job_spec_control_lane(spec: &FacJobSpecV1) -> Result<(), JobSpec
     // Filesystem path rejection in key fields (INV-JS-006).  Mirrors the
     // same defense-in-depth check in `validate_job_spec`.
     reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("source.work_id", &spec.source.work_id)?;
     reject_filesystem_paths("job_id", &spec.job_id)?;
 
     if parse_b3_256_digest(&spec.job_spec_digest).is_none() {
@@ -1111,6 +1125,7 @@ pub fn validate_job_spec_with_policy(
 
     // Filesystem path rejection in key fields (INV-JS-006).
     reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("source.work_id", &spec.source.work_id)?;
     reject_filesystem_paths("job_id", &spec.job_id)?;
 
     Ok(())
@@ -1150,6 +1165,7 @@ pub fn validate_job_spec_control_lane_with_policy(
 
     // Filesystem path rejection in key fields (INV-JS-006).
     reject_filesystem_paths("source.repo_id", &spec.source.repo_id)?;
+    reject_filesystem_paths("source.work_id", &spec.source.work_id)?;
     reject_filesystem_paths("job_id", &spec.job_id)?;
 
     Ok(())
@@ -1543,6 +1559,43 @@ fn validate_repo_id(repo_id: &str) -> Result<(), JobSpecError> {
     Ok(())
 }
 
+fn validate_work_id(work_id: &str) -> Result<(), JobSpecError> {
+    if work_id.is_empty() {
+        return Err(JobSpecError::EmptyField {
+            field: "source.work_id",
+        });
+    }
+    if work_id.len() > MAX_WORK_ID_LENGTH {
+        return Err(JobSpecError::FieldTooLong {
+            field: "source.work_id",
+            len: work_id.len(),
+            max: MAX_WORK_ID_LENGTH,
+        });
+    }
+    if !work_id.starts_with("W-") {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.work_id",
+            value: work_id.to_string(),
+        });
+    }
+    if work_id.contains('\\') || work_id.contains('/') || work_id.contains("..") {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.work_id",
+            value: work_id.to_string(),
+        });
+    }
+    if !work_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(JobSpecError::InvalidFormat {
+            field: "source.work_id",
+            value: work_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_head_sha(head_sha: &str) -> Result<(), JobSpecError> {
     let is_hex = |value: &str| value.as_bytes().iter().all(u8::is_ascii_hexdigit);
     match head_sha.len() {
@@ -1609,6 +1662,7 @@ mod tests {
         JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         }
@@ -1618,6 +1672,7 @@ mod tests {
         JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: CONTROL_LANE_REPO_ID.to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "0".repeat(40),
             patch: None,
         }
@@ -2162,6 +2217,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8=",
@@ -2180,6 +2236,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8=",
@@ -2195,6 +2252,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8=",
@@ -2213,6 +2271,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8=",
@@ -2231,6 +2290,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8="
@@ -2460,6 +2520,7 @@ mod tests {
         let source = JobSource {
             kind: "patch_injection".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: Some(serde_json::json!({
                 "bytes": "aGVsbG8=",
@@ -2687,6 +2748,7 @@ mod tests {
         let bad_source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "attacker/evil-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "0".repeat(40),
             patch: None,
         };
@@ -2716,6 +2778,7 @@ mod tests {
         let workload_source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         };
@@ -2745,6 +2808,7 @@ mod tests {
         let bad_source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "sneaky/repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "0".repeat(40),
             patch: None,
         };
@@ -2798,6 +2862,7 @@ mod tests {
         let wrong_case_source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "Internal/Control".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "0".repeat(40),
             patch: None,
         };

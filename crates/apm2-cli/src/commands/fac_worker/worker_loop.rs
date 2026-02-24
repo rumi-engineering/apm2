@@ -250,6 +250,10 @@ pub(super) fn emit_runtime_reconcile_outcome(
     }
 }
 
+pub(super) const fn should_start_background_runtime(once: bool) -> bool {
+    !once
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn spawn_queue_watch_thread(
     queue_root: &Path,
@@ -844,16 +848,21 @@ pub(super) fn run_fac_worker_impl(
         jobs_skipped: 0,
     };
 
-    // TCK-00600: Notify systemd that the worker is ready and spawn a
-    // background thread for watchdog pings. The background thread pings
-    // independently of the job processing loop, preventing systemd from
-    // restarting the worker during long-running jobs (the execution path can
-    // take minutes). The daemon already uses this pattern (background
-    // poller task). The thread is marked as a daemon thread and will
-    // exit when the main worker thread exits.
+    // `once` mode is used by inline FAC gates fallback (`fac push` wait path).
+    // Do not start long-lived background threads in one-shot mode: repeated
+    // inline cycles run in-process and must not accumulate watcher/watchdog
+    // threads or inotify instances.
+    let continuous_runtime = should_start_background_runtime(once);
+
+    // TCK-00600: Notify systemd that the worker is ready for continuous mode.
+    // In one-shot mode we still emit a status message but skip long-lived
+    // background runtime primitives.
     let _ = apm2_core::fac::sd_notify::notify_ready();
-    let _ =
-        apm2_core::fac::sd_notify::notify_status("worker ready, waiting for queue wake signals");
+    let _ = if continuous_runtime {
+        apm2_core::fac::sd_notify::notify_status("worker ready, waiting for queue wake signals")
+    } else {
+        apm2_core::fac::sd_notify::notify_status("worker one-shot cycle started")
+    };
 
     // Spawn a background thread for watchdog pings, independent of job
     // processing. This follows the same pattern as the daemon's poller
@@ -867,7 +876,7 @@ pub(super) fn run_fac_worker_impl(
     //   visible to the background thread.
     let watchdog_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog_stop_bg = std::sync::Arc::clone(&watchdog_stop);
-    let _watchdog_thread = {
+    let _watchdog_thread = if continuous_runtime {
         let ticker = apm2_core::fac::sd_notify::WatchdogTicker::new();
         if ticker.is_enabled() {
             let ping_interval = Duration::from_secs(ticker.ping_interval_secs());
@@ -884,17 +893,23 @@ pub(super) fn run_fac_worker_impl(
         } else {
             None
         }
+    } else {
+        None
     };
 
     let (wake_tx, wake_rx) = mpsc::sync_channel::<WorkerWakeSignal>(WORKER_WAKE_SIGNAL_BUFFER);
     let mut watcher_mode = QueueWatcherMode::Active;
-    let _queue_watcher_thread = match spawn_queue_watch_thread(&queue_root, wake_tx.clone()) {
-        Ok(handle) => Some(handle),
-        Err(reason) => {
-            watcher_mode.transition_to_degraded(reason.clone());
-            emit_watcher_degraded_diagnostic(json_output, &reason, safety_nudge_secs);
-            None
-        },
+    let _queue_watcher_thread = if continuous_runtime {
+        match spawn_queue_watch_thread(&queue_root, wake_tx.clone()) {
+            Ok(handle) => Some(handle),
+            Err(reason) => {
+                watcher_mode.transition_to_degraded(reason.clone());
+                emit_watcher_degraded_diagnostic(json_output, &reason, safety_nudge_secs);
+                None
+            },
+        }
+    } else {
+        None
     };
 
     let mut repair_coordinator = RuntimeRepairCoordinator::new(RuntimeQueueReconcileConfig {

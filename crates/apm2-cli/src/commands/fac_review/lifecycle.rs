@@ -46,7 +46,6 @@ const MAX_EVENT_HISTORY: usize = 256;
 const MAX_ACTIVE_AGENTS_PER_PR: usize = 2;
 const MAX_REGISTRY_ENTRIES: usize = 4096;
 const MAX_PR_STATE_SCAN_ENTRIES: usize = 4096;
-const MAX_REPO_DIR_SCAN_ENTRIES: usize = 512;
 const MAX_ERROR_BUDGET: u32 = 10;
 const DEFAULT_RETRY_BUDGET: u32 = 3;
 const REGISTRY_NON_ACTIVE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1267,50 +1266,111 @@ fn parse_pr_number_from_state_file_name(file_name: &str) -> Option<u32> {
     value.parse::<u32>().ok()
 }
 
+fn list_lifecycle_repo_dirs(pr_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(pr_root).map_err(|err| {
+        format!(
+            "failed to list lifecycle repos directory {}: {err}",
+            pr_root.display()
+        )
+    })?;
+    let mut repo_dirs = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            repo_dirs.push(entry.path());
+        }
+    }
+    repo_dirs.sort_unstable_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
+    Ok(repo_dirs)
+}
+
+fn list_pr_state_entries(repo_dir: &Path) -> Result<Vec<(u32, PathBuf)>, String> {
+    let entries = fs::read_dir(repo_dir).map_err(|err| {
+        format!(
+            "failed to list lifecycle state directory {}: {err}",
+            repo_dir.display()
+        )
+    })?;
+    let mut pr_states = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) else {
+            continue;
+        };
+        pr_states.push((pr_number, entry.path()));
+    }
+    pr_states.sort_unstable_by(|(left_pr, left_path), (right_pr, right_path)| {
+        right_pr
+            .cmp(left_pr)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    if pr_states.len() > MAX_PR_STATE_SCAN_ENTRIES {
+        pr_states.truncate(MAX_PR_STATE_SCAN_ENTRIES);
+    }
+    Ok(pr_states)
+}
+
+fn tracked_pr_from_state_file(path: &Path, expected_pr_number: u32) -> Option<(u32, String)> {
+    let bytes = fs::read(path).ok()?;
+    let state = serde_json::from_slice::<PrLifecycleRecord>(&bytes).ok()?;
+    if state.schema != PR_STATE_SCHEMA || state.pr_number != expected_pr_number {
+        return None;
+    }
+    let owner_repo = state.owner_repo.trim();
+    if owner_repo.is_empty() {
+        return None;
+    }
+    Some((expected_pr_number, owner_repo.to_string()))
+}
+
+fn collect_tracked_prs_from_repo_dir(repo_dir: &Path, tracked_prs: &mut Vec<(u32, String)>) {
+    let Ok(pr_state_entries) = list_pr_state_entries(repo_dir) else {
+        return;
+    };
+    for (pr_number, state_path) in pr_state_entries {
+        if let Some(tracked) = tracked_pr_from_state_file(&state_path, pr_number) {
+            tracked_prs.push(tracked);
+        }
+    }
+}
+
 pub fn list_all_tracked_prs() -> Result<Vec<(u32, String)>, String> {
     let pr_root = lifecycle_root()?.join("pr");
     if !pr_root.is_dir() {
         return Ok(Vec::new());
     }
 
-    let entries = fs::read_dir(&pr_root).map_err(|err| {
-        format!(
-            "failed to list lifecycle repos directory {}: {err}",
-            pr_root.display()
-        )
-    })?;
-
     let mut tracked_prs = Vec::new();
-
-    for (repo_idx, entry) in entries.flatten().enumerate() {
-        if repo_idx >= MAX_REPO_DIR_SCAN_ENTRIES {
-            break;
-        }
-        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-            let repo_dir = entry.path();
-            if let Ok(pr_entries) = fs::read_dir(&repo_dir) {
-                for (idx, pr_entry) in pr_entries.enumerate() {
-                    if idx >= MAX_PR_STATE_SCAN_ENTRIES {
-                        break;
-                    }
-                    if let Ok(pr_entry) = pr_entry {
-                        let file_name = pr_entry.file_name().to_string_lossy().to_string();
-                        if let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) {
-                            // read the state to get the real owner_repo
-                            if let Ok(bytes) = fs::read(pr_entry.path()) {
-                                if let Ok(state) =
-                                    serde_json::from_slice::<PrLifecycleRecord>(&bytes)
-                                {
-                                    tracked_prs.push((pr_number, state.owner_repo));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    for repo_dir in list_lifecycle_repo_dirs(&pr_root)? {
+        collect_tracked_prs_from_repo_dir(&repo_dir, &mut tracked_prs);
     }
 
+    tracked_prs.sort_unstable();
+    tracked_prs.dedup();
+    Ok(tracked_prs)
+}
+
+pub fn list_tracked_prs_for_repo(owner_repo: &str) -> Result<Vec<(u32, String)>, String> {
+    let normalized_owner_repo = owner_repo.trim();
+    if normalized_owner_repo.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repo_dir = lifecycle_root()?
+        .join("pr")
+        .join(sanitize_for_path(normalized_owner_repo));
+    if !repo_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut tracked_prs = Vec::new();
+    collect_tracked_prs_from_repo_dir(&repo_dir, &mut tracked_prs);
+    tracked_prs
+        .retain(|(_, tracked_repo)| tracked_repo.eq_ignore_ascii_case(normalized_owner_repo));
     tracked_prs.sort_unstable();
     tracked_prs.dedup();
     Ok(tracked_prs)
@@ -1323,24 +1383,10 @@ fn list_repo_pr_numbers(owner_repo: &str) -> Result<Vec<u32>, String> {
     if !repo_dir.is_dir() {
         return Ok(Vec::new());
     }
-    let entries = fs::read_dir(&repo_dir).map_err(|err| {
-        format!(
-            "failed to list lifecycle state directory {}: {err}",
-            repo_dir.display()
-        )
-    })?;
-    let mut pr_numbers = Vec::new();
-    for (idx, entry) in entries.enumerate() {
-        if idx >= MAX_PR_STATE_SCAN_ENTRIES {
-            break;
-        }
-        let Ok(entry) = entry else { continue };
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if let Some(pr_number) = parse_pr_number_from_state_file_name(&file_name) {
-            pr_numbers.push(pr_number);
-        }
-    }
+    let mut pr_numbers = list_pr_state_entries(&repo_dir)?
+        .into_iter()
+        .map(|(pr_number, _)| pr_number)
+        .collect::<Vec<_>>();
     pr_numbers.sort_unstable();
     pr_numbers.dedup();
     Ok(pr_numbers)
@@ -5704,6 +5750,7 @@ pub fn run_verdict_show(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5730,7 +5777,7 @@ mod tests {
     use crate::commands::fac_review::state::{
         get_process_start_time, load_review_run_completion_receipt, write_review_run_state,
     };
-    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus};
+    use crate::commands::fac_review::types::{ReviewRunState, ReviewRunStatus, sanitize_for_path};
     use crate::commands::fac_review::verdict_projection::resolve_verdict_for_dimension;
 
     static UNIQUE_PR_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -5751,6 +5798,28 @@ mod tests {
 
     fn next_repo(tag: &str, pr: u32) -> String {
         format!("example/{tag}-{pr}")
+    }
+
+    fn write_lifecycle_state_fixture(owner_repo: &str, pr_number: u32, root: &Path) {
+        let repo_dir = root.join(sanitize_for_path(owner_repo));
+        fs::create_dir_all(&repo_dir).expect("create lifecycle fixture repo dir");
+        let record = super::PrLifecycleRecord {
+            schema: "apm2.fac.lifecycle_state.v1".to_string(),
+            owner_repo: owner_repo.to_ascii_lowercase(),
+            pr_number,
+            current_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            pr_state: super::PrLifecycleState::Pushed,
+            verdicts: std::collections::BTreeMap::new(),
+            error_budget_used: 0,
+            retry_budget_remaining: 3,
+            updated_at: "2026-02-23T00:00:00Z".to_string(),
+            last_event_seq: 0,
+            events: Vec::new(),
+            integrity_hmac: None,
+        };
+        let payload = serde_json::to_vec(&record).expect("serialize lifecycle fixture");
+        fs::write(repo_dir.join(format!("pr-{pr_number}.json")), payload)
+            .expect("write lifecycle fixture");
     }
 
     fn verdict_snapshot(
@@ -7665,6 +7734,48 @@ mod tests {
             assert!(entry.get("from_states").is_some());
             assert!(entry.get("to_states").is_some());
         }
+    }
+
+    #[test]
+    fn list_all_tracked_prs_scans_beyond_legacy_repo_dir_cap() {
+        let lifecycle_pr_root = super::lifecycle_root().expect("lifecycle root").join("pr");
+        fs::create_dir_all(&lifecycle_pr_root).expect("create lifecycle pr root");
+
+        let total_fixture_repos = 600_u32;
+        let seed = next_pr();
+        let mut expected = std::collections::BTreeSet::new();
+        for idx in 0..total_fixture_repos {
+            let owner_repo = format!("scan-cap-{seed}-{idx}/repo");
+            let pr_number = 3_600_000_000_u32.saturating_add(idx);
+            write_lifecycle_state_fixture(&owner_repo, pr_number, &lifecycle_pr_root);
+            expected.insert((pr_number, owner_repo.to_ascii_lowercase()));
+        }
+
+        let tracked = super::list_all_tracked_prs().expect("list tracked prs");
+        let tracked_set = tracked
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for entry in expected {
+            assert!(
+                tracked_set.contains(&entry),
+                "missing tracked entry {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_tracked_prs_for_repo_returns_only_requested_repo() {
+        let lifecycle_pr_root = super::lifecycle_root().expect("lifecycle root").join("pr");
+        fs::create_dir_all(&lifecycle_pr_root).expect("create lifecycle pr root");
+
+        let seed = next_pr();
+        let target_repo = format!("guardian-intelligence/apm2-{seed}");
+        write_lifecycle_state_fixture(&target_repo, 42, &lifecycle_pr_root);
+        write_lifecycle_state_fixture("guardian-intelligence/unrelated", 42, &lifecycle_pr_root);
+        write_lifecycle_state_fixture("example/placeholder", 42, &lifecycle_pr_root);
+
+        let tracked = super::list_tracked_prs_for_repo(&target_repo).expect("tracked repo list");
+        assert_eq!(tracked, vec![(42, target_repo.to_ascii_lowercase())]);
     }
 
     #[test]

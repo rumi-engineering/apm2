@@ -27,6 +27,7 @@ const GATES_ADMISSION_SCHEMA: &str = "apm2.fac.projection.gates_admission.v1";
 const VERDICT_PROJECTION_PENDING_SCHEMA: &str = "apm2.fac.projection.verdict_projection_pending.v1";
 const MERGE_PROJECTION_PENDING_SCHEMA: &str = "apm2.fac.projection.merge_projection_pending.v1";
 const SHA256_HEX_LEN: usize = 64;
+const MAX_IDENTITY_HEAD_SCAN_PR_DIRS: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -610,6 +611,77 @@ pub(super) fn load_branch_identity(
         return Ok(None);
     };
     load_pr_identity(&hint.owner_repo, hint.pr_number)
+}
+
+pub(super) fn load_pr_identity_by_head_sha(
+    owner_repo: &str,
+    head_sha: &str,
+) -> Result<Option<ProjectionIdentityRecord>, String> {
+    validate_expected_head_sha(head_sha)?;
+    let normalized_head_sha = head_sha.to_ascii_lowercase();
+    let repo_path = repo_dir(owner_repo)?;
+    let entries = match fs::read_dir(&repo_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to list projection repo directory {}: {err}",
+                repo_path.display()
+            ));
+        },
+    };
+
+    let mut scanned_pr_dirs: usize = 0;
+    let mut matched: Option<ProjectionIdentityRecord> = None;
+    for entry in entries {
+        scanned_pr_dirs = scanned_pr_dirs.saturating_add(1);
+        if scanned_pr_dirs > MAX_IDENTITY_HEAD_SCAN_PR_DIRS {
+            return Err(format!(
+                "head-sha identity scan exceeded directory cap ({MAX_IDENTITY_HEAD_SCAN_PR_DIRS}) for repo `{owner_repo}`"
+            ));
+        }
+        let entry =
+            entry.map_err(|err| format!("failed to enumerate PR projection directory: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to read projection entry type: {err}"))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(pr_number) = entry
+            .file_name()
+            .to_string_lossy()
+            .strip_prefix("pr-")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let candidate_path =
+            sha_dir(owner_repo, pr_number, &normalized_head_sha)?.join("identity.json");
+        let Some(identity) = read_json_optional::<ProjectionIdentityRecord>(&candidate_path)?
+        else {
+            continue;
+        };
+        if !identity.owner_repo.eq_ignore_ascii_case(owner_repo)
+            || identity.pr_number != pr_number
+            || !identity.head_sha.eq_ignore_ascii_case(&normalized_head_sha)
+        {
+            return Err(format!(
+                "invalid projection identity at {} for repo `{owner_repo}` and head `{normalized_head_sha}`",
+                candidate_path.display()
+            ));
+        }
+        if let Some(existing) = matched.as_ref()
+            && existing.pr_number != identity.pr_number
+        {
+            return Err(format!(
+                "ambiguous projection identity for repo `{owner_repo}` and head `{normalized_head_sha}`: PR #{} and PR #{}",
+                existing.pr_number, identity.pr_number
+            ));
+        }
+        matched = Some(identity);
+    }
+    Ok(matched)
 }
 
 pub(super) fn load_issue_comments_cache<T: DeserializeOwned>(
@@ -1211,9 +1283,9 @@ mod tests {
         VerdictProjectionPendingSaveRequest, clear_merge_projection_pending,
         clear_verdict_projection_pending, list_merge_projection_pending_for_repo,
         list_verdict_projection_pending_for_repo, load_gates_admission,
-        load_merge_projection_pending, load_prepare_base_snapshot, load_verdict_projection_pending,
-        save_gates_admission, save_merge_projection_pending, save_prepare_base_snapshot,
-        save_verdict_projection_pending,
+        load_merge_projection_pending, load_pr_identity_by_head_sha, load_prepare_base_snapshot,
+        load_verdict_projection_pending, save_gates_admission, save_identity,
+        save_merge_projection_pending, save_prepare_base_snapshot, save_verdict_projection_pending,
     };
 
     fn unique_repo(tag: &str) -> String {
@@ -1630,5 +1702,54 @@ mod tests {
 
         let listed = list_merge_projection_pending_for_repo(&owner_repo, 1).expect("list pending");
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn load_pr_identity_by_head_sha_returns_match() {
+        let owner_repo = unique_repo("identity-by-head");
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        save_identity(
+            &owner_repo,
+            640,
+            head_sha,
+            Some("ticket/TCK-00640"),
+            None,
+            "test",
+        )
+        .expect("save identity");
+        let loaded = load_pr_identity_by_head_sha(&owner_repo, head_sha)
+            .expect("load identity by head")
+            .expect("identity should exist");
+        assert_eq!(loaded.pr_number, 640);
+        assert_eq!(loaded.owner_repo, owner_repo);
+        assert_eq!(loaded.head_sha, head_sha);
+    }
+
+    #[test]
+    fn load_pr_identity_by_head_sha_rejects_ambiguous_matches() {
+        let owner_repo = unique_repo("identity-by-head-ambiguous");
+        let head_sha = "89abcdef0123456789abcdef0123456789abcdef";
+        save_identity(
+            &owner_repo,
+            640,
+            head_sha,
+            Some("ticket/TCK-00640-a"),
+            None,
+            "test",
+        )
+        .expect("save first identity");
+        save_identity(
+            &owner_repo,
+            641,
+            head_sha,
+            Some("ticket/TCK-00640-b"),
+            None,
+            "test",
+        )
+        .expect("save second identity");
+
+        let err = load_pr_identity_by_head_sha(&owner_repo, head_sha)
+            .expect_err("ambiguous head identity must fail closed");
+        assert!(err.contains("ambiguous projection identity"));
     }
 }

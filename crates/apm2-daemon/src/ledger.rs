@@ -33,12 +33,13 @@ use crate::protocol::WorkRole;
 use crate::protocol::dispatch::{
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX, DEFECT_RECORDED_DOMAIN_PREFIX,
     EPISODE_EVENT_DOMAIN_PREFIX, EventTypeClass, GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX,
-    LeaseValidationError, LeaseValidator, LedgerEventEmitter, LedgerEventError,
-    MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts, REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX,
-    RedundancyReceiptConsumption, SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX,
-    STOP_FLAGS_MUTATED_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent,
-    StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim,
-    WorkRegistry, WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
+    INV_FAC_PR_BIND_001, LeaseValidationError, LeaseValidator, LedgerEventEmitter,
+    LedgerEventError, MAX_PROJECTION_EVENTS, PrivilegedPcacLifecycleArtifacts,
+    REVIEW_BLOCKED_RECORDED_LEDGER_PREFIX, RedundancyReceiptConsumption,
+    SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX, STOP_FLAGS_MUTATED_DOMAIN_PREFIX,
+    STOP_FLAGS_MUTATED_WORK_ID, SignedLedgerEvent, StopFlagsMutation, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_PR_BINDING_CONFLICT_TAG, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkClaim, WorkRegistry,
+    WorkRegistryError, WorkTransition, append_privileged_pcac_lifecycle_fields,
     build_session_started_payload, classify_event_type,
 };
 
@@ -790,7 +791,7 @@ impl SqliteLedgerEventEmitter {
                  AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
                  GROUP BY work_id, \
                           json_extract(CAST(payload AS TEXT), '$.pr_number'), \
-                          json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                          lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
              ) AND event_type = 'work.pr_associated' \
              AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
              AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
@@ -815,29 +816,26 @@ impl SqliteLedgerEventEmitter {
              AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
             [],
         )?;
-
-        // TCK-00639 CODE QUALITY FIX: enforce single canonical
-        // `work.pr_associated` event per work_id to prevent PR flapping races
-        // where concurrent conflicting tuples could both commit.
-        let legacy_work_pr_singleton_dedup = conn.execute(
-            "DELETE FROM ledger_events WHERE rowid NOT IN ( \
-                 SELECT MIN(rowid) FROM ledger_events \
-                 WHERE event_type = 'work.pr_associated' \
-                 GROUP BY work_id \
-             ) AND event_type = 'work.pr_associated'",
+        // Case-insensitive tuple uniqueness to close mixed-case replay races
+        // against historical payloads and align with lower(...) tuple probes.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_unique_ci \
+             ON ledger_events( \
+                work_id, \
+                json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
+             ) \
+             WHERE event_type = 'work.pr_associated' \
+             AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+             AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
             [],
         )?;
-        if legacy_work_pr_singleton_dedup > 0 {
-            warn!(
-                count = legacy_work_pr_singleton_dedup,
-                "deduped historical conflicting work.pr_associated rows by work_id in legacy ledger_events"
-            );
-            migration_changes_applied = true;
-        }
+
+        // Product semantics: a work item may publish multiple commits for the
+        // same PR over time. Keep tuple uniqueness, drop historical singleton
+        // index if present.
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_singleton_unique \
-             ON ledger_events(work_id) \
-             WHERE event_type = 'work.pr_associated'",
+            "DROP INDEX IF EXISTS idx_work_pr_associated_singleton_unique",
             [],
         )?;
 
@@ -944,7 +942,7 @@ impl SqliteLedgerEventEmitter {
                      AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
                      GROUP BY session_id, \
                               json_extract(CAST(payload AS TEXT), '$.pr_number'), \
-                              json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                              lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
                  ) AND event_type = 'work.pr_associated' \
                  AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
                  AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
@@ -969,26 +967,21 @@ impl SqliteLedgerEventEmitter {
                  AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
                 [],
             )?;
-
-            let canonical_work_pr_singleton_dedup = conn.execute(
-                "DELETE FROM events WHERE rowid NOT IN ( \
-                     SELECT MIN(rowid) FROM events \
-                     WHERE event_type = 'work.pr_associated' \
-                     GROUP BY session_id \
-                 ) AND event_type = 'work.pr_associated'",
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_unique_ci \
+                 ON events( \
+                    session_id, \
+                    json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                    lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
+                 ) \
+                 WHERE event_type = 'work.pr_associated' \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
                 [],
             )?;
-            if canonical_work_pr_singleton_dedup > 0 {
-                warn!(
-                    count = canonical_work_pr_singleton_dedup,
-                    "deduped historical conflicting work.pr_associated rows by work_id in canonical events"
-                );
-                migration_changes_applied = true;
-            }
+
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_singleton_unique \
-                 ON events(session_id) \
-                 WHERE event_type = 'work.pr_associated'",
+                "DROP INDEX IF EXISTS idx_canonical_work_pr_associated_singleton_unique",
                 [],
             )?;
         }
@@ -2432,6 +2425,103 @@ impl SqliteLedgerEventEmitter {
         // Convert the hex SHA to a 32-byte array via BLAKE3 hashing.
         Some(*blake3::hash(result_selector.as_bytes()).as_bytes())
     }
+
+    fn routed_work_pr_bound_pr_number(
+        &self,
+        conn: &Connection,
+        work_id: &str,
+    ) -> Result<Option<u64>, LedgerEventError> {
+        let query_result: Result<Option<i64>, rusqlite::Error> = if self.is_frozen_internal() {
+            conn.query_row(
+                "SELECT json_extract(CAST(payload AS TEXT), '$.pr_number') \
+                 FROM events \
+                 WHERE session_id = ?1 \
+                   AND event_type = 'work.pr_associated' \
+                   AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 ORDER BY timestamp_ns ASC, rowid ASC \
+                 LIMIT 1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+        } else {
+            conn.query_row(
+                "SELECT json_extract(CAST(payload AS TEXT), '$.pr_number') \
+                 FROM ledger_events \
+                 WHERE work_id = ?1 \
+                   AND event_type = 'work.pr_associated' \
+                   AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 ORDER BY timestamp_ns ASC, rowid ASC \
+                 LIMIT 1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+        };
+
+        let pr_number_i64 = query_result.map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("work.pr_associated binding query failed: {e}"),
+        })?;
+        pr_number_i64
+            .map(|value| {
+                u64::try_from(value).map_err(|_| LedgerEventError::PersistenceFailed {
+                    message: format!(
+                        "work.pr_associated binding pr_number out of range for work_id '{work_id}'"
+                    ),
+                })
+            })
+            .transpose()
+    }
+
+    fn persist_work_pr_associated_with_binding_guard(
+        &self,
+        conn: &Connection,
+        signed_event: &SignedLedgerEvent,
+        prev_hash: &str,
+        event_hash: &str,
+        requested_pr_number: u64,
+    ) -> Result<(), LedgerEventError> {
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| LedgerEventError::PersistenceFailed {
+                message: format!("failed to begin work.pr_associated transaction: {e}"),
+            })?;
+
+        let persistence_result = (|| {
+            if let Some(bound_pr_number) =
+                self.routed_work_pr_bound_pr_number(conn, &signed_event.work_id)?
+            {
+                if bound_pr_number != requested_pr_number {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: format!(
+                            "{WORK_PR_BINDING_CONFLICT_TAG}: [{INV_FAC_PR_BIND_001}] work_id '{}' \
+                             is bound to pr_number={}, requested={}",
+                            signed_event.work_id, bound_pr_number, requested_pr_number
+                        ),
+                    });
+                }
+            }
+
+            self.persist_signed_event(conn, signed_event, prev_hash, event_hash)
+        })();
+
+        match persistence_result {
+            Ok(()) => {
+                conn.execute("COMMIT", []).map_err(|e| {
+                    let _ = conn.execute("ROLLBACK", []);
+                    LedgerEventError::PersistenceFailed {
+                        message: format!(
+                            "failed to commit work.pr_associated transaction (rolled back): {e}"
+                        ),
+                    }
+                })?;
+                Ok(())
+            },
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(error)
+            },
+        }
+    }
 }
 
 impl LedgerEventEmitter for SqliteLedgerEventEmitter {
@@ -2654,6 +2744,22 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             });
         }
 
+        let work_pr_associated_pr_number = if event_type == "work.pr_associated" {
+            let Some(pr_number) = payload_object
+                .get("pr_number")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Err(LedgerEventError::ValidationFailed {
+                    message:
+                        "work.pr_associated envelope missing required numeric 'pr_number' field"
+                            .to_string(),
+                });
+            };
+            Some(pr_number)
+        } else {
+            None
+        };
+
         let conn = self
             .conn
             .lock()
@@ -2670,7 +2776,17 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             SESSION_EVENT_DOMAIN_PREFIX,
             &prev_hash,
         )?;
-        self.persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
+        if let Some(pr_number) = work_pr_associated_pr_number {
+            self.persist_work_pr_associated_with_binding_guard(
+                &conn,
+                &signed_event,
+                &prev_hash,
+                &event_hash,
+                pr_number,
+            )?;
+        } else {
+            self.persist_signed_event(&conn, &signed_event, &prev_hash, &event_hash)?;
+        }
 
         info!(
             event_id = %signed_event.event_id,
@@ -2956,6 +3072,60 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         }
 
         None
+    }
+
+    fn has_work_pr_association_tuple(
+        &self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+    ) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        let Ok(pr_number_i64) = i64::try_from(pr_number) else {
+            return false;
+        };
+
+        let legacy_hit = conn
+            .query_row(
+                "SELECT 1 \
+                 FROM ledger_events \
+                 WHERE work_id = ?1 \
+                   AND event_type = 'work.pr_associated' \
+                   AND json_extract(CAST(payload AS TEXT), '$.pr_number') = ?2 \
+                   AND lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) = lower(?3) \
+                 LIMIT 1",
+                params![work_id, pr_number_i64, commit_sha],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+        if legacy_hit {
+            return true;
+        }
+
+        if !self.is_frozen_internal() {
+            return false;
+        }
+
+        conn.query_row(
+            "SELECT 1 \
+             FROM events \
+             WHERE session_id = ?1 \
+               AND event_type = 'work.pr_associated' \
+               AND json_extract(CAST(payload AS TEXT), '$.pr_number') = ?2 \
+               AND lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) = lower(?3) \
+             LIMIT 1",
+            params![work_id, pr_number_i64, commit_sha],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
     }
 
     /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for the
@@ -4836,6 +5006,11 @@ impl SqliteWorkRegistry {
              ON work_claims(work_id, role)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_work_claims_lease_id \
+             ON work_claims(lease_id)",
+            [],
+        )?;
         Ok(())
     }
 }
@@ -5207,6 +5382,64 @@ impl SqliteLeaseValidator {
             .optional()
     }
 
+    fn distinct_work_claim_binding_count(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<u64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM (\
+                SELECT work_id, actor_id \
+                FROM work_claims \
+                WHERE lease_id = ?1 \
+                GROUP BY work_id, actor_id\
+            )",
+            params![lease_id],
+            |row| row.get(0),
+        )
+    }
+
+    fn latest_work_claim_lease_binding(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let distinct_bindings = Self::distinct_work_claim_binding_count(conn, lease_id)?;
+        if distinct_bindings > 1 {
+            warn!(
+                lease_id = %lease_id,
+                distinct_bindings,
+                "lease fallback denied: multiple distinct work_claim bindings found for lease"
+            );
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT work_id, actor_id FROM work_claims \
+             WHERE lease_id = ?1 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| {
+                let work_id: String = row.get(0)?;
+                let actor_id: String = row.get(1)?;
+                Ok((work_id, actor_id))
+            },
+        )
+        .optional()
+        .map(|binding| {
+            binding.filter(|(work_id, actor_id)| {
+                let work_ok = !work_id.trim().is_empty();
+                let actor_ok = !actor_id.trim().is_empty();
+                if !work_ok || !actor_ok {
+                    warn!(
+                        lease_id = %lease_id,
+                        work_ok,
+                        actor_ok,
+                        "lease fallback denied: invalid empty work/actor binding in work_claims"
+                    );
+                }
+                work_ok && actor_ok
+            })
+        })
+    }
+
     fn canonicalize_lease_payload(payload: &serde_json::Value) -> Result<Vec<u8>, String> {
         let payload_json = payload.to_string();
         let canonical_payload = canonicalize_json(&payload_json)
@@ -5520,13 +5753,25 @@ impl LeaseValidator for SqliteLeaseValidator {
         } else {
             None
         };
-        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
+        if let Some(payload_bytes) =
+            Self::select_newest_by_timestamp(legacy_payload, canonical_payload)
+        {
+            let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+            if let Some(actor_id) = payload
+                .get("executor_actor_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                return Some(actor_id);
+            }
+        }
 
-        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        payload
-            .get("executor_actor_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
+        // Migration fallback: recover executor actor from persisted work claim
+        // rows when no canonical gate lease payload is available.
+        Self::latest_work_claim_lease_binding(&conn, lease_id)
+            .ok()
+            .flatten()
+            .map(|(_, actor_id)| actor_id)
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -5697,7 +5942,16 @@ impl LeaseValidator for SqliteLeaseValidator {
             None
         };
 
-        Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
+        if let Some(work_id) = Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup) {
+            return Some(work_id);
+        }
+
+        // Migration fallback: recover lease->work binding from persisted work
+        // claim rows when no canonical gate lease event exists yet.
+        Self::latest_work_claim_lease_binding(&conn, lease_id)
+            .ok()
+            .flatten()
+            .map(|(work_id, _)| work_id)
     }
 
     // Full leases are persisted in signed ledger rows. Reads remain
@@ -9105,6 +9359,376 @@ mod tests {
         );
     }
 
+    /// TCK-00639 anti-flap guard: concurrent writes with different
+    /// `pr_number` values for the same `work_id` must not both commit.
+    #[test]
+    fn tck_00639_frozen_work_pr_binding_conflict_rejects_different_pr_numbers() {
+        use std::sync::Arc;
+
+        use apm2_core::ledger::{init_canonical_schema, migrate_legacy_ledger_events};
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, \
+             payload, signature, timestamp_ns) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "evt-seed-pr-binding",
+                "test.event",
+                "work-seed",
+                "actor-1",
+                b"{\"n\":1}",
+                b"sig",
+                1_000_000_000_u64,
+            ],
+        )
+        .unwrap();
+
+        init_canonical_schema(&conn).unwrap();
+        let stats = migrate_legacy_ledger_events(&conn).unwrap();
+        assert_eq!(stats.rows_migrated, 1);
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn).unwrap();
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn_arc = Arc::new(Mutex::new(conn));
+        let emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            Arc::clone(&conn_arc),
+            signing_key,
+        ));
+        {
+            let guard = conn_arc.lock().unwrap();
+            emitter.freeze_legacy_writes(&guard).unwrap();
+        }
+        assert!(
+            emitter.is_frozen(),
+            "emitter must be frozen for canonical writes"
+        );
+
+        let work_id = "W-race-binding-pr-001";
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [
+            (5001_u64, "ffffffffffffffffffffffffffffffffffffffff"),
+            (5002_u64, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        ];
+
+        let handles: Vec<_> = attempts
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (pr_number, commit_sha))| {
+                let e = Arc::clone(&emitter);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    let payload = apm2_core::work::helpers::work_pr_associated_payload(
+                        work_id, pr_number, commit_sha,
+                    );
+                    let envelope = serde_json::json!({
+                        "event_type": "work.pr_associated",
+                        "session_id": work_id,
+                        "actor_id": format!("actor-{idx}"),
+                        "payload": hex::encode(payload),
+                        "pr_number": pr_number,
+                        "commit_sha": commit_sha,
+                    });
+                    e.emit_session_event_with_envelope(
+                        work_id,
+                        "work.pr_associated",
+                        &envelope,
+                        &format!("actor-{idx}"),
+                        2_100_000_000 + u64::try_from(idx).expect("index must fit in u64"),
+                    )
+                })
+            })
+            .collect();
+
+        let mut success_count = 0_u32;
+        let mut binding_conflict_count = 0_u32;
+        for handle in handles {
+            match handle.join().expect("thread panicked") {
+                Ok(_) => success_count += 1,
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains(WORK_PR_BINDING_CONFLICT_TAG),
+                        "non-success must be work-pr binding conflict, got: {message}"
+                    );
+                    binding_conflict_count += 1;
+                },
+            }
+        }
+
+        assert_eq!(success_count, 1, "exactly one write must succeed");
+        assert_eq!(
+            binding_conflict_count, 1,
+            "exactly one conflicting write must be rejected"
+        );
+
+        let conn_guard = conn_arc.lock().unwrap();
+        let row_count: i64 = conn_guard
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE event_type = 'work.pr_associated' AND session_id = ?1",
+                rusqlite::params![work_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "only one work.pr_associated row may persist");
+    }
+
+    #[test]
+    fn tck_00639_has_work_pr_association_tuple_uses_semantic_tuple_lookup() {
+        let emitter = test_emitter();
+
+        let legacy_work_id = "W-PR-LOOKUP-LEGACY-001";
+        let legacy_pr_number = 910_u64;
+        let legacy_commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            legacy_work_id,
+            legacy_pr_number,
+            legacy_commit_sha,
+        );
+        let legacy_envelope = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": legacy_work_id,
+            "actor_id": "actor-legacy",
+            "payload": hex::encode(legacy_payload),
+            "pr_number": legacy_pr_number,
+            "commit_sha": legacy_commit_sha,
+        });
+
+        emitter
+            .emit_session_event_with_envelope(
+                legacy_work_id,
+                "work.pr_associated",
+                &legacy_envelope,
+                "actor-legacy",
+                1_000_000_000,
+            )
+            .expect("legacy work.pr_associated insert should succeed");
+
+        assert!(emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            legacy_commit_sha
+        ));
+        assert!(emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            &legacy_commit_sha.to_ascii_uppercase()
+        ));
+        assert!(!emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number + 1,
+            legacy_commit_sha
+        ));
+        assert!(!emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+
+        {
+            let guard = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available");
+            apm2_core::ledger::init_canonical_schema(&guard)
+                .expect("canonical schema init should succeed");
+            apm2_core::ledger::migrate_legacy_ledger_events(&guard)
+                .expect("legacy event migration should succeed");
+            // Re-run emitter schema init so canonical partial indexes (including
+            // case-insensitive work.pr_associated tuple uniqueness) are
+            // installed when `events` exists.
+            SqliteLedgerEventEmitter::init_schema_for_test(&guard)
+                .expect("schema re-init should install canonical indexes");
+            emitter
+                .freeze_legacy_writes(&guard)
+                .expect("freeze should succeed");
+        }
+
+        let canonical_work_id = "W-PR-LOOKUP-CANONICAL-001";
+        let canonical_pr_number = 911_u64;
+        let canonical_commit_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let canonical_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_sha,
+        );
+        let canonical_envelope = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical",
+            "payload": hex::encode(canonical_payload),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_sha,
+        });
+
+        emitter
+            .emit_session_event_with_envelope(
+                canonical_work_id,
+                "work.pr_associated",
+                &canonical_envelope,
+                "actor-canonical",
+                2_000_000_000,
+            )
+            .expect("canonical work.pr_associated insert should succeed");
+
+        assert!(emitter.has_work_pr_association_tuple(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_sha
+        ));
+        assert!(emitter.has_work_pr_association_tuple(
+            canonical_work_id,
+            canonical_pr_number,
+            &canonical_commit_sha.to_ascii_uppercase()
+        ));
+    }
+
+    #[test]
+    fn tck_00639_work_pr_associated_unique_constraint_is_case_insensitive() {
+        let emitter = test_emitter();
+
+        let work_id = "W-PR-UNIQUE-CI-LEGACY-001";
+        let pr_number = 912_u64;
+        let commit_sha_lower = "dddddddddddddddddddddddddddddddddddddddd";
+        let commit_sha_upper = commit_sha_lower.to_ascii_uppercase();
+
+        let payload = apm2_core::work::helpers::work_pr_associated_payload(
+            work_id,
+            pr_number,
+            commit_sha_lower,
+        );
+        let envelope_lower = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": work_id,
+            "actor_id": "actor-legacy-ci",
+            "payload": hex::encode(payload),
+            "pr_number": pr_number,
+            "commit_sha": commit_sha_lower,
+        });
+        emitter
+            .emit_session_event_with_envelope(
+                work_id,
+                "work.pr_associated",
+                &envelope_lower,
+                "actor-legacy-ci",
+                3_000_000_000,
+            )
+            .expect("legacy lowercase tuple insert should succeed");
+
+        let payload_upper = apm2_core::work::helpers::work_pr_associated_payload(
+            work_id,
+            pr_number,
+            &commit_sha_upper,
+        );
+        let envelope_upper = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": work_id,
+            "actor_id": "actor-legacy-ci",
+            "payload": hex::encode(payload_upper),
+            "pr_number": pr_number,
+            "commit_sha": commit_sha_upper,
+        });
+        let legacy_duplicate = emitter.emit_session_event_with_envelope(
+            work_id,
+            "work.pr_associated",
+            &envelope_upper,
+            "actor-legacy-ci",
+            4_000_000_000,
+        );
+        assert!(
+            legacy_duplicate
+                .err()
+                .is_some_and(|err| err.to_string().contains("UNIQUE constraint")),
+            "legacy tuple with case-only commit variation must hit UNIQUE constraint"
+        );
+
+        {
+            let guard = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available");
+            apm2_core::ledger::init_canonical_schema(&guard)
+                .expect("canonical schema init should succeed");
+            apm2_core::ledger::migrate_legacy_ledger_events(&guard)
+                .expect("legacy event migration should succeed");
+            SqliteLedgerEventEmitter::init_schema_for_test(&guard)
+                .expect("schema re-init should install canonical indexes");
+            emitter
+                .freeze_legacy_writes(&guard)
+                .expect("freeze should succeed");
+        }
+
+        let canonical_work_id = "W-PR-UNIQUE-CI-CANONICAL-001";
+        let canonical_pr_number = 913_u64;
+        let canonical_commit_lower = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let canonical_commit_upper = canonical_commit_lower.to_ascii_uppercase();
+
+        let canonical_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_lower,
+        );
+        let canonical_envelope_lower = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical-ci",
+            "payload": hex::encode(canonical_payload),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_lower,
+        });
+        emitter
+            .emit_session_event_with_envelope(
+                canonical_work_id,
+                "work.pr_associated",
+                &canonical_envelope_lower,
+                "actor-canonical-ci",
+                5_000_000_000,
+            )
+            .expect("canonical lowercase tuple insert should succeed");
+
+        let canonical_payload_upper = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            &canonical_commit_upper,
+        );
+        let canonical_envelope_upper = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical-ci",
+            "payload": hex::encode(canonical_payload_upper),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_upper,
+        });
+        let canonical_duplicate = emitter.emit_session_event_with_envelope(
+            canonical_work_id,
+            "work.pr_associated",
+            &canonical_envelope_upper,
+            "actor-canonical-ci",
+            6_000_000_000,
+        );
+        assert!(
+            canonical_duplicate
+                .err()
+                .is_some_and(|err| err.to_string().contains("UNIQUE constraint")),
+            "canonical tuple with case-only commit variation must hit UNIQUE constraint"
+        );
+    }
+
     /// Regression: `get_event_by_evidence_identity` on
     /// `SqliteLedgerEventEmitter` must decode the JSON envelope, hex-decode
     /// the protobuf payload, and verify `published.evidence_id == entry_id`
@@ -10052,6 +10676,157 @@ mod tests {
                 .get_claim_age_for_role(&claim.work_id, claim.role)
                 .is_none(),
             "clear_claim_age must remove age metadata after success"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_fallback_resolves_work_claim_binding() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let claim = crate::protocol::dispatch::WorkClaim {
+            work_id: "W-fallback-lease-001".to_string(),
+            lease_id: "L-fallback-lease-001".to_string(),
+            actor_id: "actor:fallback".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        registry
+            .register_claim(claim.clone())
+            .expect("register fallback claim");
+
+        assert_eq!(
+            validator.get_lease_work_id(&claim.lease_id),
+            Some(claim.work_id.clone()),
+            "lease validator should recover lease->work binding from persisted work_claims when no gate_lease_issued event exists"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(&claim.lease_id),
+            Some(claim.actor_id.clone()),
+            "lease validator should recover executor actor from persisted work_claims when no lease payload exists"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_authoritative_lease_precedes_fallback() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let lease_id = "L-authoritative-lease-001";
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-claim-fallback-001".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:claim-fallback".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register fallback claim");
+
+        validator.register_lease_with_executor(
+            lease_id,
+            "W-authoritative-001",
+            "gate-test",
+            "actor:authoritative",
+        );
+
+        assert_eq!(
+            validator.get_lease_work_id(lease_id),
+            Some("W-authoritative-001".to_string()),
+            "authoritative gate lease event should override work_claim fallback binding"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(lease_id),
+            Some("actor:authoritative".to_string()),
+            "authoritative gate lease payload should override fallback actor binding"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_fallback_denies_ambiguous_work_claim_bindings() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let lease_id = "L-ambiguous-fallback-001";
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-ambiguous-a".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:ambiguous-a".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register first fallback claim");
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-ambiguous-b".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:ambiguous-b".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register second fallback claim");
+
+        assert_eq!(
+            validator.get_lease_work_id(lease_id),
+            None,
+            "fallback must fail closed when lease_id maps to multiple distinct work_claim bindings"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(lease_id),
+            None,
+            "executor actor lookup must fail closed on ambiguous fallback bindings"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_work_registry_schema_creates_lease_lookup_index() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+        let has_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_work_claims_lease_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index existence query should succeed");
+        assert!(
+            has_index,
+            "work_claims schema must include idx_work_claims_lease_id for lease fallback lookups"
         );
     }
 }

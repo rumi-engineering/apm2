@@ -1007,6 +1007,9 @@ mod tests {
             node_fingerprint: None,
             toolchain_fingerprint: None,
             observed_usage: None,
+            claimed_lock_continuity_v1: None,
+            claimed_lock_acquired_at_epoch_ms: None,
+            claimed_lock_release_phase: None,
             timestamp_secs: timestamp,
             content_hash: content_hash.to_string(),
         }

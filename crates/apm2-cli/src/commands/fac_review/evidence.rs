@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use apm2_core::fac::gate_cache_v3::{GateCacheV3, V3CompoundKey};
 use apm2_core::fac::{
-    FacPolicyV1, LaneLockGuard, LaneManager, apply_lane_env_overrides, build_job_environment,
-    compute_test_env_for_parallelism, ensure_lane_env_dirs,
+    FacPolicyV1, LaneLockGuard, LaneManager, build_job_environment,
+    compute_test_env_for_parallelism,
 };
 use blake3;
 use sha2::{Digest, Sha256};
@@ -261,13 +261,19 @@ fn emit_gate_completed_via_cb(cb: &dyn Fn(GateProgressEvent), result: &EvidenceG
 /// the gate list is defined in a single place.
 pub const LANE_EVIDENCE_GATES: &[&str] = &[
     "merge_conflict_main",
+    "review_artifact_lint",
     "rustfmt",
     "doc",
     "clippy",
     "test_safety_guard",
+    "fac_review_machine_spec_snapshot",
     "test",
     "workspace_integrity",
+];
+const FRONTLOADED_NATIVE_EVIDENCE_GATES: &[&str] = &[
     "review_artifact_lint",
+    "test_safety_guard",
+    "fac_review_machine_spec_snapshot",
 ];
 
 const SHORT_TEST_OUTPUT_HINT_THRESHOLD_BYTES: usize = 1024;
@@ -1041,6 +1047,9 @@ fn run_native_evidence_gate(
     let started = Instant::now();
     let execution = match gate_name {
         "test_safety_guard" => gate_checks::run_test_safety_guard(workspace_root),
+        "fac_review_machine_spec_snapshot" => {
+            gate_checks::run_fac_review_machine_spec_guard(workspace_root)
+        },
         "review_artifact_lint" => gate_checks::run_review_artifact_lint(workspace_root),
         _ => Err(format!("unknown native evidence gate `{gate_name}`")),
     };
@@ -1256,8 +1265,7 @@ fn build_pipeline_test_command(
     // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
     // to maintain lock/env coupling (round 2 fix: was previously hardcoded
     // to lane-00).
-    ensure_lane_env_dirs(lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, lane_dir);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -1419,8 +1427,7 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
     // Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
-    ensure_lane_env_dirs(lane_dir)?;
-    apply_lane_env_overrides(&mut policy_env, lane_dir);
+    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
 
     Ok(policy_env.into_iter().collect())
 }
@@ -1445,8 +1452,8 @@ pub(super) struct EvidenceLaneContext {
     /// Path to the lane's root directory
     /// (`$APM2_HOME/private/fac/lanes/<lane_id>`). Used to derive per-lane
     /// env isolation directories (`HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
-    /// `XDG_CONFIG_HOME`) via `ensure_lane_env_dirs` +
-    /// `apply_lane_env_overrides`.
+    /// `XDG_CONFIG_HOME`) via
+    /// `policy_loader::apply_review_lane_environment`.
     ///
     /// SAFETY: This `lane_dir` corresponds to the lane protected by
     /// `_lane_guard`. Callers MUST use this `lane_dir` (not a hardcoded
@@ -1910,12 +1917,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
         ),
     ];
 
-    // Native gates that run BEFORE tests (no ordering dependency on test).
-    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
-
-    // Native gates that run AFTER tests (ordering dependency on test).
-    let post_test_native_gates: &[&str] = &["review_artifact_lint"];
-
     let mut evidence_lines = Vec::new();
     let mut gate_results = Vec::new();
 
@@ -1947,7 +1948,110 @@ pub(super) fn run_evidence_gates_with_lane_context(
         }
     }
 
-    // Phase 1: cargo fmt/doc/clippy — all receive the policy-filtered env
+    // Phase 1: fail-fast native gates.
+    for gate_name in FRONTLOADED_NATIVE_EVIDENCE_GATES {
+        let log_path = logs_dir.join(format!("{gate_name}.log"));
+
+        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
+
+        if cache_reuse_active {
+            let reuse_grp = cache_reuse_policy
+                .as_ref()
+                .expect("guarded by cache_reuse_active");
+            let attestation_digest =
+                gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
+            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
+                v3_cache_loaded.as_ref(),
+                cached_gate_cache.as_ref(),
+                gate_name,
+                attestation_digest.as_deref(),
+                fac_verifying_key.as_ref(),
+                v3_root_ns.as_deref(),
+                v3_compound_key_ns.as_ref(),
+                Some(sha),
+            );
+            gate_cache_decision.clone_from(&cache_decision_local);
+            if reuse.reusable {
+                if let Some(cached) = resolve_cached_payload(
+                    &reuse,
+                    v3_cache_loaded.as_ref(),
+                    cached_gate_cache.as_ref(),
+                    gate_name,
+                ) {
+                    emit_gate_started(opts, gate_name);
+                    let stream_stats = write_cached_gate_log_marker(
+                        &log_path,
+                        gate_name,
+                        reuse.reason,
+                        attestation_digest.as_deref(),
+                    );
+                    let cached_result = build_evidence_gate_result_with_cache_decision(
+                        gate_name,
+                        true,
+                        cached.duration_secs,
+                        Some(&log_path),
+                        Some(&stream_stats),
+                        cache_decision_local,
+                    );
+                    emit_gate_completed(opts, &cached_result);
+                    gate_results.push(cached_result);
+                    if emit_human_logs {
+                        eprintln!(
+                            "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
+                            now_iso8601(),
+                            reuse.reason,
+                        );
+                    }
+                    evidence_lines.push(format!(
+                        "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
+                        now_iso8601(),
+                        reuse.reason,
+                    ));
+                    continue;
+                }
+            }
+            if emit_human_logs {
+                eprintln!(
+                    "ts={} sha={sha} gate={gate_name} reuse_status=miss reuse_reason={}",
+                    now_iso8601(),
+                    reuse.reason,
+                );
+            }
+        }
+
+        emit_gate_started(opts, gate_name);
+        let started = Instant::now();
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
+        let duration = started.elapsed().as_secs();
+        let result = build_evidence_gate_result_with_cache_decision(
+            gate_name,
+            passed,
+            duration,
+            Some(&log_path),
+            Some(&stream_stats),
+            gate_cache_decision.take(),
+        );
+        emit_gate_completed(opts, &result);
+        gate_results.push(result);
+        let ts = now_iso8601();
+        let status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
+            log_path.display()
+        ));
+        if !passed {
+            if let Some(file) = projection_log {
+                for line in &evidence_lines {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
+            return Ok((false, gate_results));
+        }
+    }
+
+    // Phase 2: cargo fmt/doc/clippy — all receive the policy-filtered env
     // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
     //
     // TCK-00574 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
@@ -2118,113 +2222,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
             )
         };
 
-        let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result_with_cache_decision(
-            gate_name,
-            passed,
-            duration,
-            Some(&log_path),
-            Some(&stream_stats),
-            gate_cache_decision.take(),
-        );
-        emit_gate_completed(opts, &result);
-        gate_results.push(result);
-        let ts = now_iso8601();
-        let status = if passed { "PASS" } else { "FAIL" };
-        evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
-            log_path.display()
-        ));
-        if !passed {
-            if let Some(file) = projection_log {
-                for line in &evidence_lines {
-                    let _ = writeln!(file, "{line}");
-                }
-            }
-            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-            return Ok((false, gate_results));
-        }
-    }
-
-    // Phase 2: pre-test native gates.
-    for gate_name in pre_test_native_gates {
-        let log_path = logs_dir.join(format!("{gate_name}.log"));
-
-        // TCK-00626 round 4: Hoist cache_decision for miss path.
-        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
-
-        // TCK-00540 fix round 3: Cache reuse for pre-test native gates.
-        if cache_reuse_active {
-            let reuse_grp = cache_reuse_policy
-                .as_ref()
-                .expect("guarded by cache_reuse_active");
-            let attestation_digest =
-                gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
-                v3_cache_loaded.as_ref(),
-                cached_gate_cache.as_ref(),
-                gate_name,
-                attestation_digest.as_deref(),
-                fac_verifying_key.as_ref(),
-                v3_root_ns.as_deref(),
-                v3_compound_key_ns.as_ref(),
-                Some(sha),
-            );
-            // TCK-00626 round 4: propagate cache decision to outer scope so
-            // both hit and miss paths include it in gate_finished.
-            gate_cache_decision.clone_from(&cache_decision_local);
-            if reuse.reusable {
-                if let Some(cached) = resolve_cached_payload(
-                    &reuse,
-                    v3_cache_loaded.as_ref(),
-                    cached_gate_cache.as_ref(),
-                    gate_name,
-                ) {
-                    emit_gate_started(opts, gate_name);
-                    let stream_stats = write_cached_gate_log_marker(
-                        &log_path,
-                        gate_name,
-                        reuse.reason,
-                        attestation_digest.as_deref(),
-                    );
-                    let cached_result = build_evidence_gate_result_with_cache_decision(
-                        gate_name,
-                        true,
-                        cached.duration_secs,
-                        Some(&log_path),
-                        Some(&stream_stats),
-                        cache_decision_local,
-                    );
-                    emit_gate_completed(opts, &cached_result);
-                    gate_results.push(cached_result);
-                    if emit_human_logs {
-                        eprintln!(
-                            "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
-                            now_iso8601(),
-                            reuse.reason,
-                        );
-                    }
-                    evidence_lines.push(format!(
-                        "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
-                        now_iso8601(),
-                        reuse.reason,
-                    ));
-                    continue;
-                }
-            }
-            if emit_human_logs {
-                eprintln!(
-                    "ts={} sha={sha} gate={gate_name} reuse_status=miss reuse_reason={}",
-                    now_iso8601(),
-                    reuse.reason,
-                );
-            }
-        }
-
-        emit_gate_started(opts, gate_name);
-        let started = Instant::now();
-        let (passed, stream_stats) =
-            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
         let result = build_evidence_gate_result_with_cache_decision(
             gate_name,
@@ -2516,113 +2513,6 @@ pub(super) fn run_evidence_gates_with_lane_context(
         }
     }
 
-    // Phase 4: post-test native gates.
-    for gate_name in post_test_native_gates {
-        let log_path = logs_dir.join(format!("{gate_name}.log"));
-
-        // TCK-00626 round 4: Hoist cache_decision for miss path.
-        let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
-
-        // TCK-00540 fix round 3: Cache reuse for post-test native gates.
-        if cache_reuse_active {
-            let reuse_grp = cache_reuse_policy
-                .as_ref()
-                .expect("guarded by cache_reuse_active");
-            let attestation_digest =
-                gate_attestation_digest(workspace_root, sha, gate_name, None, reuse_grp);
-            let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
-                v3_cache_loaded.as_ref(),
-                cached_gate_cache.as_ref(),
-                gate_name,
-                attestation_digest.as_deref(),
-                fac_verifying_key.as_ref(),
-                v3_root_ns.as_deref(),
-                v3_compound_key_ns.as_ref(),
-                Some(sha),
-            );
-            // TCK-00626 round 4: propagate cache decision to outer scope so
-            // both hit and miss paths include it in gate_finished.
-            gate_cache_decision.clone_from(&cache_decision_local);
-            if reuse.reusable {
-                if let Some(cached) = resolve_cached_payload(
-                    &reuse,
-                    v3_cache_loaded.as_ref(),
-                    cached_gate_cache.as_ref(),
-                    gate_name,
-                ) {
-                    emit_gate_started(opts, gate_name);
-                    let stream_stats = write_cached_gate_log_marker(
-                        &log_path,
-                        gate_name,
-                        reuse.reason,
-                        attestation_digest.as_deref(),
-                    );
-                    let cached_result = build_evidence_gate_result_with_cache_decision(
-                        gate_name,
-                        true,
-                        cached.duration_secs,
-                        Some(&log_path),
-                        Some(&stream_stats),
-                        cache_decision_local,
-                    );
-                    emit_gate_completed(opts, &cached_result);
-                    gate_results.push(cached_result);
-                    if emit_human_logs {
-                        eprintln!(
-                            "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
-                            now_iso8601(),
-                            reuse.reason,
-                        );
-                    }
-                    evidence_lines.push(format!(
-                        "ts={} sha={sha} gate={gate_name} status=PASS cached=true reuse_reason={}",
-                        now_iso8601(),
-                        reuse.reason,
-                    ));
-                    continue;
-                }
-            }
-            if emit_human_logs {
-                eprintln!(
-                    "ts={} sha={sha} gate={gate_name} reuse_status=miss reuse_reason={}",
-                    now_iso8601(),
-                    reuse.reason,
-                );
-            }
-        }
-
-        emit_gate_started(opts, gate_name);
-        let started = Instant::now();
-        let (passed, stream_stats) =
-            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
-        let duration = started.elapsed().as_secs();
-        let result = build_evidence_gate_result_with_cache_decision(
-            gate_name,
-            passed,
-            duration,
-            Some(&log_path),
-            Some(&stream_stats),
-            gate_cache_decision.take(),
-        );
-        emit_gate_completed(opts, &result);
-        gate_results.push(result);
-        let ts = now_iso8601();
-        let status = if passed { "PASS" } else { "FAIL" };
-        evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate={gate_name} status={status} log={}",
-            log_path.display()
-        ));
-        if !passed {
-            if let Some(file) = projection_log {
-                for line in &evidence_lines {
-                    let _ = writeln!(file, "{line}");
-                }
-            }
-            attach_log_bundle_hash(&mut gate_results, &logs_dir)?;
-            return Ok((false, gate_results));
-        }
-    }
-
     if let Some(file) = projection_log {
         for line in &evidence_lines {
             let _ = writeln!(file, "{line}");
@@ -2786,11 +2676,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         ),
     ];
 
-    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
-
-    // Native gates that run AFTER tests (ordering dependency on test).
-    let post_test_native_gates: &[&str] = &["review_artifact_lint"];
-
     let mut evidence_lines = Vec::new();
     let mut gate_results = Vec::new();
 
@@ -2828,6 +2713,182 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             merge_digest,
             log_path.to_str().map(str::to_string),
         );
+        if !passed {
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+                &fac_signer,
+                v3_gate_cache.as_mut(),
+            )?;
+            return Ok((false, gate_results));
+        }
+    }
+
+    // Phase 1: front-loaded native gates.
+    for gate_name in FRONTLOADED_NATIVE_EVIDENCE_GATES {
+        let log_path = logs_dir.join(format!("{gate_name}.log"));
+        let attestation_digest =
+            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
+        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
+            v3_cache_loaded.as_ref(),
+            cache.as_ref(),
+            gate_name,
+            attestation_digest.as_deref(),
+            Some(&fac_verifying_key),
+            v3_root.as_deref(),
+            v3_compound_key.as_ref(),
+            Some(sha),
+        );
+        if reuse.reusable {
+            if let Some(cached) =
+                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
+            {
+                emit_gate_started_cb(on_gate_progress, gate_name);
+                status.set_running(gate_name);
+                updater.update(&status);
+                let stream_stats = write_cached_gate_log_marker(
+                    &log_path,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest.as_deref(),
+                );
+                status.set_result(gate_name, true, cached.duration_secs);
+                updater.update(&status);
+                let cached_result = build_evidence_gate_result_with_cache_decision(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    Some(&log_path),
+                    Some(&stream_stats),
+                    cache_decision_local,
+                );
+                emit_gate_completed_cb(on_gate_progress, &cached_result);
+                gate_results.push(cached_result);
+                gate_cache.set_with_attestation(
+                    gate_name,
+                    true,
+                    cached.duration_secs,
+                    attestation_digest.clone(),
+                    false,
+                    cached.evidence_log_digest,
+                    cached.log_path,
+                );
+                evidence_lines.push(format!(
+                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
+                    now_iso8601(),
+                    sha,
+                    gate_name,
+                    reuse.reason,
+                    attestation_digest
+                        .as_deref()
+                        .map_or_else(|| "unknown".to_string(), short_digest),
+                ));
+                continue;
+            }
+            emit_gate_started_cb(on_gate_progress, gate_name);
+            status.set_running(gate_name);
+            updater.update(&status);
+            status.set_result(gate_name, false, 0);
+            updater.update(&status);
+            let fail_result = build_evidence_gate_result_with_cache_decision(
+                gate_name,
+                false,
+                0,
+                Some(&log_path),
+                Some(&StreamStats {
+                    bytes_written: 0,
+                    bytes_total: 0,
+                    was_truncated: false,
+                }),
+                cache_decision_local,
+            );
+            emit_gate_completed_cb(on_gate_progress, &fail_result);
+            gate_results.push(fail_result);
+            gate_cache.set_with_attestation(
+                gate_name,
+                false,
+                0,
+                attestation_digest,
+                false,
+                None,
+                log_path.to_str().map(str::to_string),
+            );
+            evidence_lines.push(format!(
+                "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
+                now_iso8601(),
+                sha,
+                gate_name
+            ));
+            finalize_status_gate_run(
+                projection_log,
+                &evidence_lines,
+                &mut gate_results,
+                &logs_dir,
+                &mut gate_cache,
+                &updater,
+                &status,
+                &fac_signer,
+                v3_gate_cache.as_mut(),
+            )?;
+            return Ok((false, gate_results));
+        }
+
+        if emit_human_logs {
+            eprintln!(
+                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
+                now_iso8601(),
+                sha,
+                gate_name,
+                reuse.reason,
+                attestation_digest
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_string(), short_digest),
+            );
+        }
+        emit_gate_started_cb(on_gate_progress, gate_name);
+        status.set_running(gate_name);
+        updater.update(&status);
+        let started = Instant::now();
+        let (passed, stream_stats) =
+            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
+        let duration = started.elapsed().as_secs();
+
+        status.set_result(gate_name, passed, duration);
+        updater.update(&status);
+        let exec_result = build_evidence_gate_result_with_cache_decision(
+            gate_name,
+            passed,
+            duration,
+            Some(&log_path),
+            Some(&stream_stats),
+            cache_decision_local.clone(),
+        );
+        emit_gate_completed_cb(on_gate_progress, &exec_result);
+        gate_results.push(exec_result);
+        gate_cache.set_with_attestation(
+            gate_name,
+            passed,
+            duration,
+            attestation_digest.clone(),
+            false,
+            sha256_file_hex(&log_path),
+            log_path.to_str().map(str::to_string),
+        );
+        let gate_status = if passed { "PASS" } else { "FAIL" };
+        evidence_lines.push(format!(
+            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
+            now_iso8601(),
+            sha,
+            gate_name,
+            gate_status,
+            log_path.display(),
+            reuse.reason,
+        ));
         if !passed {
             finalize_status_gate_run(
                 projection_log,
@@ -2884,7 +2945,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         specs
     };
 
-    // Phase 1: cargo fmt/doc/clippy.
+    // Phase 2: cargo fmt/doc/clippy.
     for (idx, &(gate_name, _cmd_args)) in gates.iter().enumerate() {
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
@@ -3028,182 +3089,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
             emit_human_logs,
             on_gate_progress,
         );
-        let duration = started.elapsed().as_secs();
-
-        status.set_result(gate_name, passed, duration);
-        updater.update(&status);
-        let exec_result = build_evidence_gate_result_with_cache_decision(
-            gate_name,
-            passed,
-            duration,
-            Some(&log_path),
-            Some(&stream_stats),
-            cache_decision_local.clone(),
-        );
-        emit_gate_completed_cb(on_gate_progress, &exec_result);
-        gate_results.push(exec_result);
-        gate_cache.set_with_attestation(
-            gate_name,
-            passed,
-            duration,
-            attestation_digest.clone(),
-            false,
-            sha256_file_hex(&log_path),
-            log_path.to_str().map(str::to_string),
-        );
-        let gate_status = if passed { "PASS" } else { "FAIL" };
-        evidence_lines.push(format!(
-            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
-            now_iso8601(),
-            sha,
-            gate_name,
-            gate_status,
-            log_path.display(),
-            reuse.reason,
-        ));
-        if !passed {
-            finalize_status_gate_run(
-                projection_log,
-                &evidence_lines,
-                &mut gate_results,
-                &logs_dir,
-                &mut gate_cache,
-                &updater,
-                &status,
-                &fac_signer,
-                v3_gate_cache.as_mut(),
-            )?;
-            return Ok((false, gate_results));
-        }
-    }
-
-    // Phase 2: pre-test native gates.
-    for gate_name in pre_test_native_gates {
-        let log_path = logs_dir.join(format!("{gate_name}.log"));
-        let attestation_digest =
-            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
-            v3_cache_loaded.as_ref(),
-            cache.as_ref(),
-            gate_name,
-            attestation_digest.as_deref(),
-            Some(&fac_verifying_key),
-            v3_root.as_deref(),
-            v3_compound_key.as_ref(),
-            Some(sha),
-        );
-        if reuse.reusable {
-            if let Some(cached) =
-                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
-            {
-                emit_gate_started_cb(on_gate_progress, gate_name);
-                status.set_running(gate_name);
-                updater.update(&status);
-                let stream_stats = write_cached_gate_log_marker(
-                    &log_path,
-                    gate_name,
-                    reuse.reason,
-                    attestation_digest.as_deref(),
-                );
-                status.set_result(gate_name, true, cached.duration_secs);
-                updater.update(&status);
-                let cached_result = build_evidence_gate_result_with_cache_decision(
-                    gate_name,
-                    true,
-                    cached.duration_secs,
-                    Some(&log_path),
-                    Some(&stream_stats),
-                    cache_decision_local,
-                );
-                emit_gate_completed_cb(on_gate_progress, &cached_result);
-                gate_results.push(cached_result);
-                gate_cache.set_with_attestation(
-                    gate_name,
-                    true,
-                    cached.duration_secs,
-                    attestation_digest.clone(),
-                    false,
-                    cached.evidence_log_digest,
-                    cached.log_path,
-                );
-                evidence_lines.push(format!(
-                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
-                    now_iso8601(),
-                    sha,
-                    gate_name,
-                    reuse.reason,
-                    attestation_digest
-                        .as_deref()
-                    .map_or_else(|| "unknown".to_string(), short_digest),
-                ));
-                continue;
-            }
-            emit_gate_started_cb(on_gate_progress, gate_name);
-            status.set_running(gate_name);
-            updater.update(&status);
-            status.set_result(gate_name, false, 0);
-            updater.update(&status);
-            let fail_result = build_evidence_gate_result_with_cache_decision(
-                gate_name,
-                false,
-                0,
-                Some(&log_path),
-                Some(&StreamStats {
-                    bytes_written: 0,
-                    bytes_total: 0,
-                    was_truncated: false,
-                }),
-                cache_decision_local,
-            );
-            emit_gate_completed_cb(on_gate_progress, &fail_result);
-            gate_results.push(fail_result);
-            gate_cache.set_with_attestation(
-                gate_name,
-                false,
-                0,
-                attestation_digest,
-                false,
-                None,
-                log_path.to_str().map(str::to_string),
-            );
-            evidence_lines.push(format!(
-                "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
-                now_iso8601(),
-                sha,
-                gate_name
-            ));
-            finalize_status_gate_run(
-                projection_log,
-                &evidence_lines,
-                &mut gate_results,
-                &logs_dir,
-                &mut gate_cache,
-                &updater,
-                &status,
-                &fac_signer,
-                v3_gate_cache.as_mut(),
-            )?;
-            return Ok((false, gate_results));
-        }
-
-        if emit_human_logs {
-            eprintln!(
-                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-                now_iso8601(),
-                sha,
-                gate_name,
-                reuse.reason,
-                attestation_digest
-                    .as_deref()
-                    .map_or_else(|| "unknown".to_string(), short_digest),
-            );
-        }
-        emit_gate_started_cb(on_gate_progress, gate_name);
-        status.set_running(gate_name);
-        updater.update(&status);
-        let started = Instant::now();
-        let (passed, stream_stats) =
-            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
         let duration = started.elapsed().as_secs();
 
         status.set_result(gate_name, passed, duration);
@@ -3600,180 +3485,6 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
-    // Phase 4: post-test native gates.
-    for gate_name in post_test_native_gates {
-        let log_path = logs_dir.join(format!("{gate_name}.log"));
-        let attestation_digest =
-            gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
-        let (reuse, cache_decision_local) = reuse_decision_with_v3_fallback(
-            v3_cache_loaded.as_ref(),
-            cache.as_ref(),
-            gate_name,
-            attestation_digest.as_deref(),
-            Some(&fac_verifying_key),
-            v3_root.as_deref(),
-            v3_compound_key.as_ref(),
-            Some(sha),
-        );
-        if reuse.reusable {
-            if let Some(cached) =
-                resolve_cached_payload(&reuse, v3_cache_loaded.as_ref(), cache.as_ref(), gate_name)
-            {
-                emit_gate_started_cb(on_gate_progress, gate_name);
-                status.set_running(gate_name);
-                updater.update(&status);
-                let stream_stats = write_cached_gate_log_marker(
-                    &log_path,
-                    gate_name,
-                    reuse.reason,
-                    attestation_digest.as_deref(),
-                );
-                status.set_result(gate_name, true, cached.duration_secs);
-                updater.update(&status);
-                let cached_result = build_evidence_gate_result_with_cache_decision(
-                    gate_name,
-                    true,
-                    cached.duration_secs,
-                    Some(&log_path),
-                    Some(&stream_stats),
-                    cache_decision_local,
-                );
-                emit_gate_completed_cb(on_gate_progress, &cached_result);
-                gate_results.push(cached_result);
-                gate_cache.set_with_attestation(
-                    gate_name,
-                    true,
-                    cached.duration_secs,
-                    attestation_digest.clone(),
-                    false,
-                    cached.evidence_log_digest,
-                    cached.log_path,
-                );
-                evidence_lines.push(format!(
-                    "ts={} sha={} gate={} status=PASS cached=true reuse_status=hit reuse_reason={} attestation_digest={}",
-                    now_iso8601(),
-                    sha,
-                    gate_name,
-                    reuse.reason,
-                    attestation_digest
-                        .as_deref()
-                        .map_or_else(|| "unknown".to_string(), short_digest),
-                ));
-                continue;
-            }
-            emit_gate_started_cb(on_gate_progress, gate_name);
-            status.set_running(gate_name);
-            updater.update(&status);
-            status.set_result(gate_name, false, 0);
-            updater.update(&status);
-            let fail_result = build_evidence_gate_result_with_cache_decision(
-                gate_name,
-                false,
-                0,
-                Some(&log_path),
-                Some(&StreamStats {
-                    bytes_written: 0,
-                    bytes_total: 0,
-                    was_truncated: false,
-                }),
-                cache_decision_local,
-            );
-            emit_gate_completed_cb(on_gate_progress, &fail_result);
-            gate_results.push(fail_result);
-            gate_cache.set_with_attestation(
-                gate_name,
-                false,
-                0,
-                attestation_digest,
-                false,
-                None,
-                log_path.to_str().map(str::to_string),
-            );
-            evidence_lines.push(format!(
-                "ts={} sha={} gate={} status=FAIL reuse_status=miss reuse_reason=inconsistent_cache_entry",
-                now_iso8601(),
-                sha,
-                gate_name
-            ));
-            finalize_status_gate_run(
-                projection_log,
-                &evidence_lines,
-                &mut gate_results,
-                &logs_dir,
-                &mut gate_cache,
-                &updater,
-                &status,
-                &fac_signer,
-                v3_gate_cache.as_mut(),
-            )?;
-            return Ok((false, gate_results));
-        }
-
-        if emit_human_logs {
-            eprintln!(
-                "ts={} sha={} gate={} reuse_status=miss reuse_reason={} attestation_digest={}",
-                now_iso8601(),
-                sha,
-                gate_name,
-                reuse.reason,
-                attestation_digest
-                    .as_deref()
-                    .map_or_else(|| "unknown".to_string(), short_digest),
-            );
-        }
-        emit_gate_started_cb(on_gate_progress, gate_name);
-        status.set_running(gate_name);
-        updater.update(&status);
-        let started = Instant::now();
-        let (passed, stream_stats) =
-            run_native_evidence_gate(workspace_root, sha, gate_name, &log_path, emit_human_logs);
-        let duration = started.elapsed().as_secs();
-        status.set_result(gate_name, passed, duration);
-        updater.update(&status);
-        let exec_result = build_evidence_gate_result_with_cache_decision(
-            gate_name,
-            passed,
-            duration,
-            Some(&log_path),
-            Some(&stream_stats),
-            cache_decision_local.clone(),
-        );
-        emit_gate_completed_cb(on_gate_progress, &exec_result);
-        gate_results.push(exec_result);
-        gate_cache.set_with_attestation(
-            gate_name,
-            passed,
-            duration,
-            attestation_digest.clone(),
-            false,
-            sha256_file_hex(&log_path),
-            log_path.to_str().map(str::to_string),
-        );
-        let gate_status = if passed { "PASS" } else { "FAIL" };
-        evidence_lines.push(format!(
-            "ts={} sha={} gate={} status={} log={} reuse_status=miss reuse_reason={}",
-            now_iso8601(),
-            sha,
-            gate_name,
-            gate_status,
-            log_path.display(),
-            reuse.reason,
-        ));
-        if !passed {
-            finalize_status_gate_run(
-                projection_log,
-                &evidence_lines,
-                &mut gate_results,
-                &logs_dir,
-                &mut gate_cache,
-                &updater,
-                &status,
-                &fac_signer,
-                v3_gate_cache.as_mut(),
-            )?;
-            return Ok((false, gate_results));
-        }
-    }
     finalize_status_gate_run(
         projection_log,
         &evidence_lines,
@@ -4471,9 +4182,10 @@ mod tests {
             ("clippy", 12_u64),
             ("doc", 13_u64),
             ("test_safety_guard", 14_u64),
-            ("test", 15_u64),
-            ("workspace_integrity", 16_u64),
-            ("review_artifact_lint", 17_u64),
+            ("fac_review_machine_spec_snapshot", 15_u64),
+            ("test", 16_u64),
+            ("workspace_integrity", 17_u64),
+            ("review_artifact_lint", 18_u64),
         ];
         for (gate_name, duration_secs) in expected_durations {
             let attestation_digest = if gate_name == "test" {

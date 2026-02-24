@@ -88,6 +88,13 @@ pub const MAX_DIR_ENTRIES: usize = 10_000;
 /// callers that opt in to large-directory deletion.
 pub const MAX_LOG_DIR_ENTRIES: usize = 1_000_000;
 
+/// Maximum number of directories scanned during pre-delete mode
+/// normalization.
+///
+/// Prevents unbounded CPU consumption from adversarially deep/wide trees
+/// when repairing owner `rwx` bits prior to deletion.
+pub const MAX_MODE_NORMALIZATION_DIRS: usize = 100_000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Error Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +187,19 @@ pub enum SafeRmtreeError {
         max: usize,
     },
 
+    /// Total scanned directories exceeded a bounded limit during
+    /// normalization.
+    #[error(
+        "directory scan exceeded maximum of {max} directories while processing {}",
+        path.display()
+    )]
+    TooManyDirectoriesScanned {
+        /// Directory where the global scan limit was exceeded.
+        path: PathBuf,
+        /// Maximum allowed scanned directories.
+        max: usize,
+    },
+
     /// Path contains `.` or `..` components (INV-RMTREE-010).
     #[error("path contains dot-segment components (. or ..): {}", path.display())]
     DotSegment {
@@ -229,6 +249,20 @@ impl fmt::Display for SafeRmtreeOutcome {
             Self::AlreadyAbsent => write!(f, "already absent (no-op)"),
         }
     }
+}
+
+/// Summary for user-owned directory mode normalization performed before
+/// `safe_rmtree_v1*` deletion.
+///
+/// This helper is used by lane cleanup paths to recover from directories
+/// created with restrictive mode bits (for example, `0333` sandbox IPC
+/// directories) while preserving fail-closed ownership boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirModeNormalizationSummary {
+    /// Number of directories inspected.
+    pub directories_scanned: u64,
+    /// Number of directories whose mode bits were updated.
+    pub directories_repaired: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,6 +423,330 @@ pub fn safe_rmtree_v1_with_entry_limit(
     #[cfg(not(unix))]
     {
         safe_rmtree_v1_non_unix_with_limit(root, allowed_parent, effective_limit)
+    }
+}
+
+/// Ensure user-owned directories under `root` are traversable for subsequent
+/// safe deletion by adding owner `rwx` bits where missing.
+///
+/// This is a bounded, fail-closed preflight used by lane cleanup and doctor
+/// recovery paths before invoking `safe_rmtree_v1*`. It never follows symlinks.
+///
+/// On Unix:
+/// - Only directories owned by the current effective UID are modified.
+/// - Mode repair is `mode |= 0o700`, preserving all existing non-owner bits.
+/// - Directory entry traversal is bounded by `max_entries_per_dir`.
+///
+/// On non-Unix platforms this function is a no-op and returns a zero summary.
+///
+/// # Errors
+///
+/// Returns [`SafeRmtreeError`] when:
+/// - `root` is not absolute or contains dot segments.
+/// - metadata/stat/chmod/read-dir operations fail.
+/// - per-directory scan exceeds `max_entries_per_dir` (clamped to
+///   [`MAX_LOG_DIR_ENTRIES`]).
+pub fn normalize_user_owned_dir_modes_for_safe_delete(
+    root: &Path,
+    max_entries_per_dir: usize,
+) -> Result<DirModeNormalizationSummary, SafeRmtreeError> {
+    let effective_limit = max_entries_per_dir.min(MAX_LOG_DIR_ENTRIES);
+
+    if !root.is_absolute() {
+        return Err(SafeRmtreeError::NotAbsolute {
+            path: root.to_path_buf(),
+        });
+    }
+    reject_dot_segments(root)?;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (root, effective_limit);
+        return Ok(DirModeNormalizationSummary::default());
+    }
+
+    #[cfg(unix)]
+    {
+        normalize_user_owned_dir_modes_for_safe_delete_unix_with_limits(
+            root,
+            effective_limit,
+            MAX_MODE_NORMALIZATION_DIRS,
+        )
+    }
+}
+
+/// Unix implementation with explicit bounds for per-directory entry scan and
+/// total directories scanned.
+///
+/// Uses fd-relative traversal with `O_NOFOLLOW | O_DIRECTORY` and applies mode
+/// repairs via handle-relative `fchmodat` calls, eliminating path-based
+/// TOCTOU windows during permission changes.
+#[cfg(unix)]
+fn normalize_user_owned_dir_modes_for_safe_delete_unix_with_limits(
+    root: &Path,
+    max_entries_per_dir: usize,
+    max_directories_scanned: usize,
+) -> Result<DirModeNormalizationSummary, SafeRmtreeError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use nix::fcntl::OFlag;
+
+    struct NormalizeDirFrame {
+        dir_fd: std::os::fd::OwnedFd,
+        path: PathBuf,
+        depth: usize,
+    }
+
+    let handle_open_flags = normalization_handle_open_flags();
+    let iter_open_flags =
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+
+    let Some(root_dir) = open_root_directory_handle_for_normalization(root, handle_open_flags)?
+    else {
+        return Ok(DirModeNormalizationSummary::default());
+    };
+
+    let max_directories_scanned_u64 = u64::try_from(max_directories_scanned).unwrap_or(u64::MAX);
+    let current_uid = nix::unistd::geteuid().as_raw();
+    let mut summary = DirModeNormalizationSummary::default();
+    let mut stack: Vec<NormalizeDirFrame> = vec![NormalizeDirFrame {
+        dir_fd: root_dir,
+        path: root.to_path_buf(),
+        depth: 0,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if frame.depth >= MAX_TRAVERSAL_DEPTH {
+            return Err(SafeRmtreeError::DepthExceeded {
+                path: frame.path,
+                max: MAX_TRAVERSAL_DEPTH,
+            });
+        }
+
+        if summary.directories_scanned >= max_directories_scanned_u64 {
+            return Err(SafeRmtreeError::TooManyDirectoriesScanned {
+                path: frame.path,
+                max: max_directories_scanned,
+            });
+        }
+
+        summary.directories_scanned = summary.directories_scanned.saturating_add(1);
+        maybe_repair_directory_mode_for_current_uid(
+            &frame.dir_fd,
+            &frame.path,
+            current_uid,
+            &mut summary,
+        )?;
+        let mut iter_dir =
+            open_directory_iterator_from_handle(&frame.dir_fd, &frame.path, iter_open_flags)?;
+
+        let mut entry_count: usize = 0;
+        for entry_result in iter_dir.iter() {
+            let entry = entry_result.map_err(|err| {
+                SafeRmtreeError::io(
+                    format!("reading entry in {}", frame.path.display()),
+                    io::Error::from(err),
+                )
+            })?;
+
+            let name_cstr = entry.file_name();
+            let name_bytes = name_cstr.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > max_entries_per_dir {
+                return Err(SafeRmtreeError::TooManyEntries {
+                    path: frame.path,
+                    max: max_entries_per_dir,
+                });
+            }
+
+            let Some(child_dir) = open_child_directory_handle_if_dir(
+                &frame.dir_fd,
+                &frame.path,
+                name_cstr,
+                name_bytes,
+                handle_open_flags,
+            )?
+            else {
+                continue;
+            };
+
+            stack.push(NormalizeDirFrame {
+                dir_fd: child_dir,
+                path: frame.path.join(std::ffi::OsStr::from_bytes(name_bytes)),
+                depth: frame.depth.saturating_add(1),
+            });
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Open flags used to acquire stable directory handles during mode
+/// normalization.
+///
+/// Linux uses `O_PATH` to allow opening write/execute-only directories before
+/// owner `rwx` repair; other Unix targets fall back to `O_RDONLY`.
+#[cfg(unix)]
+fn normalization_handle_open_flags() -> nix::fcntl::OFlag {
+    #[cfg(target_os = "linux")]
+    {
+        nix::fcntl::OFlag::O_PATH
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_CLOEXEC
+    }
+}
+
+/// Open a stable root directory handle for mode normalization.
+///
+/// Returns `Ok(None)` when `root` is absent, a symlink, or not a directory.
+#[cfg(unix)]
+fn open_root_directory_handle_for_normalization(
+    root: &Path,
+    handle_open_flags: nix::fcntl::OFlag,
+) -> Result<Option<std::os::fd::OwnedFd>, SafeRmtreeError> {
+    use nix::sys::stat::Mode;
+
+    match nix::fcntl::open(root, handle_open_flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+            Ok(None)
+        },
+        Err(err) => Err(SafeRmtreeError::io(
+            format!("open root directory {}", root.display()),
+            io::Error::from(err),
+        )),
+    }
+}
+
+/// Add owner `rwx` bits to `dir_path` if the opened directory is owned by the
+/// current user and the bits are missing.
+#[cfg(unix)]
+fn maybe_repair_directory_mode_for_current_uid(
+    dir_fd: &std::os::fd::OwnedFd,
+    dir_path: &Path,
+    current_uid: libc::uid_t,
+    summary: &mut DirModeNormalizationSummary,
+) -> Result<(), SafeRmtreeError> {
+    use nix::sys::stat::{self, Mode};
+
+    let dir_stat = stat::fstat(dir_fd).map_err(|err| {
+        SafeRmtreeError::io(
+            format!("fstat directory {}", dir_path.display()),
+            io::Error::from(err),
+        )
+    })?;
+    if dir_stat.st_uid != current_uid {
+        return Ok(());
+    }
+
+    let current_mode = dir_stat.st_mode & 0o7777;
+    let repaired_mode = current_mode | 0o700;
+    if repaired_mode == current_mode {
+        return Ok(());
+    }
+
+    // Apply mode repair relative to the previously-opened handle. We avoid
+    // `AT_SYMLINK_NOFOLLOW` because Linux rejects that flag for chmod-style
+    // operations (`EOPNOTSUPP`); safety is preserved because `dir_fd` was
+    // opened with `O_NOFOLLOW|O_DIRECTORY`.
+    stat::fchmodat(
+        dir_fd,
+        Path::new("."),
+        Mode::from_bits_truncate(repaired_mode),
+        stat::FchmodatFlags::FollowSymlink,
+    )
+    .map_err(|err| {
+        SafeRmtreeError::io(
+            format!("fchmodat user-rwx {}", dir_path.display()),
+            io::Error::from(err),
+        )
+    })?;
+    summary.directories_repaired = summary.directories_repaired.saturating_add(1);
+    Ok(())
+}
+
+/// Open a readable iterator view for an already-opened directory handle.
+#[cfg(unix)]
+fn open_directory_iterator_from_handle(
+    dir_fd: &std::os::fd::OwnedFd,
+    dir_path: &Path,
+    iter_open_flags: nix::fcntl::OFlag,
+) -> Result<nix::dir::Dir, SafeRmtreeError> {
+    use nix::sys::stat::Mode;
+
+    let iter_fd = nix::fcntl::openat(dir_fd, Path::new("."), iter_open_flags, Mode::empty())
+        .map_err(|err| {
+            SafeRmtreeError::io(
+                format!("openat directory for iteration {}", dir_path.display()),
+                io::Error::from(err),
+            )
+        })?;
+    nix::dir::Dir::from_fd(iter_fd).map_err(|err| {
+        SafeRmtreeError::io(
+            format!("Dir::from_fd for {}", dir_path.display()),
+            io::Error::from(err),
+        )
+    })
+}
+
+/// Resolve a child entry and return a stable directory handle if it is a
+/// directory at scan time (symlinks are never followed).
+#[cfg(unix)]
+fn open_child_directory_handle_if_dir(
+    parent_fd: &std::os::fd::OwnedFd,
+    parent_path: &Path,
+    child_name: &std::ffi::CStr,
+    child_name_bytes: &[u8],
+    handle_open_flags: nix::fcntl::OFlag,
+) -> Result<Option<std::os::fd::OwnedFd>, SafeRmtreeError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::{self, Mode};
+
+    let child_stat = match stat::fstatat(parent_fd, child_name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(err) => {
+            let child_name = std::ffi::OsStr::from_bytes(child_name_bytes);
+            return Err(SafeRmtreeError::io(
+                format!("fstatat entry {}", parent_path.join(child_name).display()),
+                io::Error::from(err),
+            ));
+        },
+    };
+
+    if (child_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Ok(None);
+    }
+
+    match nix::fcntl::openat(parent_fd, child_name, handle_open_flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+            Ok(None)
+        },
+        Err(err) => {
+            let child_name = std::ffi::OsStr::from_bytes(child_name_bytes);
+            Err(SafeRmtreeError::io(
+                format!(
+                    "openat directory {}",
+                    parent_path.join(child_name).display()
+                ),
+                io::Error::from(err),
+            ))
+        },
     }
 }
 
@@ -1731,6 +2089,93 @@ mod tests {
             SafeRmtreeError::PermissionDenied { .. } => {},
             other => panic!("expected PermissionDenied, got {other}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_repairs_write_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        let nested = root.join("queue").join("broker_requests");
+        fs::create_dir_all(&nested).expect("create nested tree");
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o333)).expect("chmod root to 0333");
+        fs::set_permissions(root.join("queue"), fs::Permissions::from_mode(0o333))
+            .expect("chmod queue to 0333");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let summary =
+            normalize_user_owned_dir_modes_for_safe_delete(&root, 64).expect("normalize modes");
+        assert!(
+            summary.directories_repaired >= 3,
+            "expected recursive permission repair to touch all 0333 dirs, got {summary:?}"
+        );
+
+        for path in [&root, &root.join("queue"), &nested] {
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o700;
+            assert_eq!(
+                mode,
+                0o700,
+                "owner rwx bits must be present after normalization for {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_enforces_entry_limit() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        fs::create_dir_all(&root).expect("create tmp root");
+        for idx in 0..4 {
+            fs::write(root.join(format!("entry-{idx}.txt")), b"x").expect("write entry");
+        }
+
+        let result = normalize_user_owned_dir_modes_for_safe_delete(&root, 2);
+        assert!(
+            matches!(result, Err(SafeRmtreeError::TooManyEntries { .. })),
+            "expected TooManyEntries when scan limit is exceeded, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_enforces_global_directory_limit() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+
+        let result = normalize_user_owned_dir_modes_for_safe_delete_unix_with_limits(&root, 64, 2);
+        assert!(
+            matches!(
+                result,
+                Err(SafeRmtreeError::TooManyDirectoriesScanned { .. })
+            ),
+            "expected TooManyDirectoriesScanned when total directory scan limit is exceeded, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_user_owned_dir_modes_enforces_depth_limit() {
+        let parent = make_allowed_parent();
+        let root = parent.path().join("tmp");
+        let mut cursor = root.clone();
+        for idx in 0..=MAX_TRAVERSAL_DEPTH {
+            cursor = cursor.join(format!("d{idx}"));
+        }
+        fs::create_dir_all(&cursor).expect("create deep nested dirs");
+
+        let result = normalize_user_owned_dir_modes_for_safe_delete(&root, 64);
+        assert!(
+            matches!(result, Err(SafeRmtreeError::DepthExceeded { .. })),
+            "expected DepthExceeded when normalization exceeds max traversal depth, got {result:?}"
+        );
     }
 
     // ── Depth Limit ──────────────────────────────────────────────────

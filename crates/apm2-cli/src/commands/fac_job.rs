@@ -609,6 +609,7 @@ fn build_stop_revoke_spec(
     let source = JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: CONTROL_LANE_REPO_ID.to_string(),
+        work_id: "W-INTERNAL-CONTROL".to_string(),
         head_sha: "0".repeat(40),
         patch: None,
     };

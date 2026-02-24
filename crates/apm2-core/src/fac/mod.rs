@@ -823,8 +823,10 @@ pub use node_identity::{
 pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
 // Re-export safe rmtree types (TCK-00516)
 pub use safe_rmtree::{
-    MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH, RefusedDeleteReceipt,
-    SafeRmtreeError, SafeRmtreeOutcome, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit,
+    DirModeNormalizationSummary, MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH,
+    RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
+    normalize_user_owned_dir_modes_for_safe_delete, safe_rmtree_v1,
+    safe_rmtree_v1_with_entry_limit,
 };
 pub use systemd_properties::{
     NetworkPolicy, SandboxHardeningProfile, SystemdUnitProperties, resolve_network_policy,

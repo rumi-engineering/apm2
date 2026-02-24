@@ -180,6 +180,11 @@ fn gate_input_paths(gate_name: &str) -> &'static [&'static str] {
             "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
             "documents/reviews/test-safety-allowlist.txt",
         ],
+        "fac_review_machine_spec_snapshot" => &[
+            "crates/apm2-cli/src/commands/fac_review/mod.rs",
+            "documents/reviews/fac_review_state_machine.cac.json",
+            "documents/reviews/fac_review_requirements.cac.json",
+        ],
         "workspace_integrity" => &["crates/apm2-cli/src/commands/fac_review/gate_checks.rs"],
         "review_artifact_lint" => &[
             "crates/apm2-cli/src/commands/fac_review/gate_checks.rs",
@@ -474,6 +479,10 @@ pub fn gate_command_for_attestation(
             "apm2-internal-gate".to_string(),
             "test_safety_guard".to_string(),
         ]),
+        "fac_review_machine_spec_snapshot" => Some(vec![
+            "apm2-internal-gate".to_string(),
+            "fac_review_machine_spec_snapshot".to_string(),
+        ]),
         "workspace_integrity" => {
             let snapshot = workspace_root.join(gate_checks::WORKSPACE_INTEGRITY_SNAPSHOT_REL_PATH);
             Some(vec![
@@ -593,6 +602,34 @@ mod tests {
         assert!(
             paths.contains(&".cargo/config.toml"),
             "test gate must include .cargo/config.toml; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn fac_review_machine_spec_gate_inputs_include_snapshot_and_requirements() {
+        let paths = gate_input_paths("fac_review_machine_spec_snapshot");
+        assert!(
+            paths.contains(&"documents/reviews/fac_review_state_machine.cac.json"),
+            "machine-spec gate must include state machine snapshot input; got: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"documents/reviews/fac_review_requirements.cac.json"),
+            "machine-spec gate must include requirements snapshot input; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn fac_review_machine_spec_gate_command_is_stable() {
+        let dir = tempdir().expect("tempdir");
+        let command =
+            gate_command_for_attestation(dir.path(), "fac_review_machine_spec_snapshot", None)
+                .expect("command");
+        assert_eq!(
+            command,
+            vec![
+                "apm2-internal-gate".to_string(),
+                "fac_review_machine_spec_snapshot".to_string()
+            ]
         );
     }
 

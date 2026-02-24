@@ -29,7 +29,7 @@ ticket_meta:
     - Validate commit_sha format (40-hex) and PR number > 0
     - Emit canonical `work.pr_associated` WorkEvent with (work_id, pr_number, commit_sha) only
     - If pr_url is provided, publish a WORK_CONTEXT_ENTRY of kind LINKOUT with the PR URL (do not bloat WorkEvent)
-    - Idempotency on (work_id, pr_number, commit_sha) and avoid PR flapping
+    - Idempotency on (work_id, pr_number, commit_sha); enforce anti-flap on `pr_number` per `work_id` while allowing commit progression on the same PR
     out_of_scope:
     - GitHub API integration in daemon (CLI supplies PR info per RFC)
   plan:
@@ -43,4 +43,5 @@ ticket_meta:
     criteria:
     - PR association can be replayed deterministically from ledger+CAS (repo identity comes from WorkSpec).
     - Duplicate RecordWorkPrAssociation requests do not create duplicate events.
+    - The same `work_id` can record new `commit_sha` values for the same `pr_number` across multiple pushes.
     - Projection keys are collision-free for multi-repo scenarios.

@@ -46,6 +46,79 @@ pub(super) const SCHEDULER_RECOVERY_SCHEMA: &str = "apm2.scheduler_recovery.v1";
 /// - Async suspension: not applicable (synchronous path).
 pub(super) const ENQUEUE_LOCKFILE: &str = ".enqueue.lock";
 
+/// Lock acquisition method identifier for claimed-file ownership.
+pub(super) const CLAIMED_LOCK_ACQUISITION_METHOD_FLOCK_EXCLUSIVE: &str =
+    "claimed_file_flock_exclusive_v1";
+pub(super) const CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT: &str = "post_terminal_commit";
+
+/// Single-owner claimed-file lock guard for CLCK continuity.
+///
+/// This guard is created only by `claim_pending_job_with_exclusive_lock` and
+/// must be threaded through execution until terminal commit completes. The lock
+/// is released only when this guard is dropped.
+pub(super) struct ClaimedJobLockGuardV1 {
+    job_id: String,
+    claimed_path: PathBuf,
+    lock_acquired_at_epoch_ms: u64,
+    lock_acquisition_method: &'static str,
+    lock_file: fs::File,
+}
+
+impl std::fmt::Debug for ClaimedJobLockGuardV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimedJobLockGuardV1")
+            .field("job_id", &self.job_id)
+            .field("claimed_path", &self.claimed_path)
+            .field("lock_acquired_at_epoch_ms", &self.lock_acquired_at_epoch_ms)
+            .field("lock_acquisition_method", &self.lock_acquisition_method)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClaimedJobLockGuardV1 {
+    pub(super) fn from_claimed_lock(
+        job_id: String,
+        claimed_path: PathBuf,
+        lock_file: fs::File,
+    ) -> Self {
+        Self {
+            job_id,
+            claimed_path,
+            lock_acquired_at_epoch_ms: current_epoch_millis(),
+            lock_acquisition_method: CLAIMED_LOCK_ACQUISITION_METHOD_FLOCK_EXCLUSIVE,
+            lock_file,
+        }
+    }
+
+    pub(super) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub(super) fn claimed_path(&self) -> &Path {
+        &self.claimed_path
+    }
+
+    pub(super) const fn lock_acquired_at_epoch_ms(&self) -> u64 {
+        self.lock_acquired_at_epoch_ms
+    }
+
+    pub(super) const fn lock_acquisition_method(&self) -> &'static str {
+        self.lock_acquisition_method
+    }
+
+    pub(super) const fn lock_file(&self) -> &fs::File {
+        &self.lock_file
+    }
+}
+
+fn current_epoch_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// FAC receipt directory under `$APM2_HOME/private/fac`.
 pub(super) const FAC_RECEIPTS_DIR: &str = "receipts";
 pub(super) const CORRUPT_MARKER_PERSIST_RETRIES: usize = 3;

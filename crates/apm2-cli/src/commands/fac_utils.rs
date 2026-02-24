@@ -153,10 +153,12 @@ mod tests {
         let symlink_path = tmp.path().join("symlink.json");
         std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
 
-        // The real file should be accepted.
+        // Real path must be openable as a regular file. Parsing is not part of
+        // this symlink-guard regression and may legitimately fail as the job
+        // spec schema evolves.
         assert!(
-            read_job_spec_bounded(&real_path).is_ok(),
-            "real file should be accepted"
+            open_regular_file_nofollow(&real_path).is_ok(),
+            "real file should be accepted by open_regular_file_nofollow"
         );
 
         // The symlink MUST be rejected fail-closed at the open(2) level

@@ -117,15 +117,16 @@ pub enum WorkError {
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(#[from] prost::DecodeError),
 
-    /// PR association only allowed from `InProgress` state.
+    /// PR association only allowed from `Claimed` or `InProgress` state.
     ///
     /// # Security
     ///
-    /// Restricting PR association to `InProgress` prevents an agent from
-    /// bypassing CI gating by associating a work item with a PR that has
-    /// already passed CI while the work is in `CiPending` or `Blocked` state.
+    /// Restricting PR association to pre-CI states (`Claimed`/`InProgress`)
+    /// prevents an agent from bypassing CI gating by associating a work item
+    /// with a PR that has already passed CI while the work is in
+    /// `CiPending` or `Blocked` state.
     #[error(
-        "PR association only allowed from InProgress state, work {work_id} is in {current_state}"
+        "PR association only allowed from Claimed/InProgress states, work {work_id} is in {current_state}"
     )]
     PrAssociationNotAllowed {
         /// The work ID.

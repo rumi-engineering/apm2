@@ -37,6 +37,7 @@ fn sample_source() -> JobSource {
     JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "org-repo".to_string(),
+        work_id: "W-TEST".to_string(),
         head_sha: "a".repeat(40),
         patch: None,
     }
@@ -341,6 +342,7 @@ mod job_spec_adversarial {
             let source = JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: bad_id.to_string(),
+                work_id: "W-TEST".to_string(),
                 head_sha: "a".repeat(40),
                 patch: None,
             };
@@ -370,6 +372,7 @@ mod job_spec_adversarial {
         let source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "~/important-file".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(40),
             patch: None,
         };
@@ -406,6 +409,7 @@ mod job_spec_adversarial {
             let source = JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: "org-repo".to_string(),
+                work_id: "W-TEST".to_string(),
                 head_sha: bad_sha.clone(),
                 patch: None,
             };
@@ -427,6 +431,7 @@ mod job_spec_adversarial {
         let source = JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: "org-repo".to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "a".repeat(64), // SHA-256 length
             patch: None,
         };
@@ -562,6 +567,7 @@ mod queue_tampering {
         JobSource {
             kind: "mirror_commit".to_string(),
             repo_id: CONTROL_LANE_REPO_ID.to_string(),
+            work_id: "W-TEST".to_string(),
             head_sha: "0".repeat(40),
             patch: None,
         }
@@ -842,6 +848,7 @@ mod queue_tampering {
             let source = JobSource {
                 kind: "mirror_commit".to_string(),
                 repo_id: CONTROL_LANE_REPO_ID.to_string(),
+                work_id: "W-TEST".to_string(),
                 head_sha: "0".repeat(40),
                 patch: None,
             };

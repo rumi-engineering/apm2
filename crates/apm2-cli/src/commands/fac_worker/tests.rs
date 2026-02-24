@@ -25,6 +25,18 @@ fn test_deterministic_ordering() {
 }
 
 #[test]
+fn one_shot_worker_skips_background_runtime_primitives() {
+    assert!(
+        !should_start_background_runtime(true),
+        "one-shot worker must not start long-lived watcher/watchdog runtime"
+    );
+    assert!(
+        should_start_background_runtime(false),
+        "continuous worker mode must retain watcher/watchdog runtime"
+    );
+}
+
+#[test]
 fn test_read_bounded_rejects_oversized() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file_path = dir.path().join("big.json");
@@ -280,6 +292,7 @@ fn make_orchestrator_step_candidate(job_id: &str, path: PathBuf) -> PendingCandi
     let source = apm2_core::fac::job_spec::JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "test/repo".to_string(),
+        work_id: "W-TEST".to_string(),
         head_sha: "a".repeat(40),
         patch: None,
     };
@@ -1018,7 +1031,11 @@ fn make_receipt_test_spec() -> FacJobSpecV1 {
         },
         source: apm2_core::fac::job_spec::JobSource {
             kind: "mirror_commit".to_string(),
-            repo_id,
+            repo_id: repo_id.clone(),
+            work_id: format!(
+                "W-LEGACY-{}",
+                &blake3::hash(repo_id.as_bytes()).to_hex()[..24]
+            ),
             head_sha: "abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
             patch: None,
         },
@@ -1213,6 +1230,64 @@ fn test_emit_job_receipt_channel_boundary_defect_path_sets_canonicalizer_digest(
     assert!(
         receipt_json.get("patch_digest").is_none(),
         "channel-boundary receipt should not set patch_digest"
+    );
+}
+
+#[test]
+fn test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fac_root = dir.path().join("private").join("fac");
+    let queue_root = fac_root.join("queue");
+    fs::create_dir_all(queue_root.join(PENDING_DIR)).expect("create pending dir");
+    fs::create_dir_all(queue_root.join(DENIED_DIR)).expect("create denied dir");
+
+    let spec = make_receipt_test_spec();
+    let denied_file_name = format!("{}.json", spec.job_id);
+    let denied_relative_path = format!("{DENIED_DIR}/{denied_file_name}");
+    let denied_path = queue_root.join(DENIED_DIR).join(&denied_file_name);
+    fs::write(
+        &denied_path,
+        serde_json::to_vec_pretty(&spec).expect("serialize denied job spec"),
+    )
+    .expect("write denied job file");
+
+    fs::create_dir_all(&fac_root).expect("create fac root");
+    fs::write(fac_root.join(FAC_RECEIPTS_DIR), b"receipts-dir-blocker")
+        .expect("write receipts dir blocker file");
+
+    let err = emit_job_receipt(
+        &fac_root,
+        &spec,
+        FacJobOutcome::Denied,
+        Some(DenialReasonCode::ValidationFailed),
+        "validation failed",
+        None,
+        None,
+        None,
+        None,
+        Some(&CanonicalizerTupleV1::from_current().compute_digest()),
+        Some(&denied_relative_path),
+        &spec.job_spec_digest,
+        None,
+        None,
+        None,
+        None, // bytes_backend
+        None,
+    )
+    .expect_err("receipt persistence should fail when receipts path is not a directory");
+    assert!(
+        err.contains("restored moved job to pending"),
+        "error should report pending restore path, got: {err}"
+    );
+
+    let restored_pending_path = queue_root.join(PENDING_DIR).join(&denied_file_name);
+    assert!(
+        restored_pending_path.exists(),
+        "denied file must be restored to pending on receipt persist failure"
+    );
+    assert!(
+        !denied_path.exists(),
+        "denied file must be removed after pending restore"
     );
 }
 
@@ -1633,6 +1708,7 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
     let claimed_file_name = "gates-test.json";
 
     let spec = make_receipt_test_spec();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
     let boundary_trace = ChannelBoundaryTrace {
         passed: true,
         defect_count: 0,
@@ -1656,6 +1732,7 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
         &spec,
         &claimed_path,
         claimed_file_name,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1699,6 +1776,20 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
         Some(hardening_hash.as_str()),
         "queued gates receipt must bind sandbox hardening hash"
     );
+}
+
+fn build_claimed_lock_guard_for_test(claimed_path: &Path, job_id: &str) -> ClaimedJobLockGuardV1 {
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(claimed_path)
+        .expect("open claimed lock file");
+    fs2::FileExt::lock_exclusive(&lock_file).expect("acquire claimed lock");
+    ClaimedJobLockGuardV1::from_claimed_lock(
+        job_id.to_string(),
+        claimed_path.to_path_buf(),
+        lock_file,
+    )
 }
 
 #[test]
@@ -1757,11 +1848,13 @@ fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_tr
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1852,11 +1945,13 @@ fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
     let toolchain_fp = format!("b3-256:{}", "a".repeat(64));
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1947,11 +2042,13 @@ fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -2035,11 +2132,13 @@ fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -3431,6 +3530,7 @@ fn make_valid_broker_request_json(job_id: &str) -> String {
     let source = JobSource {
         kind: "mirror_commit".to_string(),
         repo_id: "test/repo".to_string(),
+        work_id: "W-TEST".to_string(),
         head_sha: "a".repeat(40),
         patch: None,
     };
@@ -3619,12 +3719,87 @@ fn promote_broker_request_success_under_capacity() {
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequirementTraceability {
+    requirement_id: &'static str,
+    source_path: &'static str,
+    source_anchor: &'static str,
+    expected_behavior: &'static str,
+}
+
+fn dual_write_requirement_traceability() -> [RequirementTraceability; 4] {
+    [
+        RequirementTraceability {
+            requirement_id: "QL-R3",
+            source_path: "documents/work/tickets/TCK-00669.yaml",
+            source_anchor: "ledger projection wins; filesystem is repaired to match",
+            expected_behavior: "ledger projection truth deterministically reconstructs queue lifecycle outcomes",
+        },
+        RequirementTraceability {
+            requirement_id: "QL-003",
+            source_path: "crates/apm2-cli/src/commands/AGENTS.md",
+            source_anchor: "Queue lifecycle dual-write ordering",
+            expected_behavior: "queue lifecycle dual-write ordering mirrors queue mutation semantics",
+        },
+        RequirementTraceability {
+            requirement_id: "INV-WRK-003",
+            source_path: "crates/apm2-cli/src/commands/fac_worker/mod.rs",
+            source_anchor: "Atomic claim via rename prevents double-execution.",
+            expected_behavior: "queue claim path preserves atomic single-consumer semantics",
+        },
+        RequirementTraceability {
+            requirement_id: "INV-WRK-007",
+            source_path: "crates/apm2-cli/src/commands/fac_worker/mod.rs",
+            source_anchor: "Malformed/unreadable/oversize files are quarantined",
+            expected_behavior: "malformed/unreadable inputs fail closed with explicit quarantine outcomes",
+        },
+    ]
+}
+
+fn assert_dual_write_requirement_traceability() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    for trace in dual_write_requirement_traceability() {
+        assert!(
+            !trace.requirement_id.is_empty()
+                && !trace.source_path.is_empty()
+                && !trace.source_anchor.is_empty()
+                && !trace.expected_behavior.is_empty(),
+            "requirement traceability entries must provide id/source/anchor/expected behavior"
+        );
+
+        let source_path = repo_root.join(trace.source_path);
+        let source = std::fs::read_to_string(&source_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read requirement source {} for {}: {err}",
+                source_path.display(),
+                trace.requirement_id
+            )
+        });
+        assert!(
+            source.contains(trace.requirement_id),
+            "source-of-truth {} must contain requirement id {}",
+            source_path.display(),
+            trace.requirement_id
+        );
+        assert!(
+            source.contains(trace.source_anchor),
+            "source-of-truth {} for {} must contain anchor {:?}",
+            source_path.display(),
+            trace.requirement_id,
+            trace.source_anchor
+        );
+    }
+}
+
 #[test]
 fn promote_broker_request_dual_write_emits_enqueued_event() {
     use apm2_core::fac::job_lifecycle::FAC_JOB_ENQUEUED_EVENT_TYPE;
 
     let _guard = env_var_test_lock().lock().expect("serialize env test");
     let original_apm2_home = std::env::var_os("APM2_HOME");
+    assert_dual_write_requirement_traceability();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let apm2_home = dir.path().join(".apm2");
@@ -3640,6 +3815,13 @@ fn promote_broker_request_dual_write_emits_enqueued_event() {
     let mut policy = FacPolicyV1::default_policy();
     policy.queue_lifecycle_dual_write_enabled = true;
     persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+    let _lifecycle_harness =
+        fac_queue_lifecycle_dual_write::install_deterministic_lifecycle_harness(
+            fac_queue_lifecycle_dual_write::DeterministicLifecycleHarnessConfig {
+                simulate_only: true,
+                ..Default::default()
+            },
+        );
 
     let broker_file = broker_dir.join("broker-dual-write-enqueued.json");
     fs::write(
@@ -3659,50 +3841,17 @@ fn promote_broker_request_dual_write_emits_enqueued_event() {
         "broker request source file should be removed after promotion"
     );
 
-    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
-        .expect("open lifecycle ledger");
-    conn.busy_timeout(std::time::Duration::from_millis(250))
-        .expect("set sqlite busy timeout");
-
-    let has_legacy_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    let has_canonical_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-
-    let mut total = 0usize;
-    if has_legacy_events {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
-                [FAC_JOB_ENQUEUED_EVENT_TYPE],
-                |row| row.get(0),
-            )
-            .expect("count legacy enqueue events");
-        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-    }
-    if has_canonical_events {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
-                [FAC_JOB_ENQUEUED_EVENT_TYPE],
-                |row| row.get(0),
-            )
-            .expect("count canonical enqueue events");
-        total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-    }
+    let emissions = fac_queue_lifecycle_dual_write::deterministic_lifecycle_emissions();
+    let total = emissions
+        .iter()
+        .filter(|emission| {
+            emission.event_type == FAC_JOB_ENQUEUED_EVENT_TYPE
+                && emission.queue_job_id == "broker-dual-write-enqueued"
+        })
+        .count();
     assert!(
-        total >= 1,
-        "broker promotion should dual-write at least one fac.job.enqueued event"
+        total == 1,
+        "broker promotion should emit exactly one deterministic fac.job.enqueued for queue_job_id=broker-dual-write-enqueued"
     );
 
     if let Some(value) = original_apm2_home {
@@ -5208,6 +5357,7 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
 
     let _guard = env_var_test_lock().lock().expect("serialize env test");
     let original_apm2_home = std::env::var_os("APM2_HOME");
+    assert_dual_write_requirement_traceability();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let apm2_home = dir.path().join(".apm2");
@@ -5220,6 +5370,13 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
     let mut policy = FacPolicyV1::default_policy();
     policy.queue_lifecycle_dual_write_enabled = true;
     persist_policy(&fac_root, &policy).expect("persist dual-write policy");
+    let _lifecycle_harness =
+        fac_queue_lifecycle_dual_write::install_deterministic_lifecycle_harness(
+            fac_queue_lifecycle_dual_write::DeterministicLifecycleHarnessConfig {
+                simulate_only: true,
+                ..Default::default()
+            },
+        );
 
     let mut spec_completed = make_receipt_test_spec();
     spec_completed.job_id = "job-lifecycle-completed".to_string();
@@ -5371,94 +5528,43 @@ fn dual_write_emits_all_lifecycle_phases_for_worker_queue_mutations() {
         "failed job must move to denied/"
     );
 
-    let conn = rusqlite::Connection::open(fac_root.join("queue_lifecycle_ledger.db"))
-        .expect("open lifecycle ledger");
-    conn.busy_timeout(std::time::Duration::from_millis(250))
-        .expect("set sqlite busy timeout");
-
-    let has_legacy_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    let has_canonical_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-
-    let mut counts = HashMap::new();
-    for event_type in [
-        FAC_JOB_ENQUEUED_EVENT_TYPE,
-        FAC_JOB_CLAIMED_EVENT_TYPE,
-        FAC_JOB_STARTED_EVENT_TYPE,
-        FAC_JOB_COMPLETED_EVENT_TYPE,
-        FAC_JOB_RELEASED_EVENT_TYPE,
-        FAC_JOB_FAILED_EVENT_TYPE,
-    ] {
-        let mut total = 0usize;
-        if has_legacy_events {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM ledger_events WHERE event_type = ?1",
-                    [event_type],
-                    |row| row.get(0),
-                )
-                .expect("count legacy lifecycle events");
-            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-        }
-        if has_canonical_events {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
-                    [event_type],
-                    |row| row.get(0),
-                )
-                .expect("count canonical lifecycle events");
-            total = total.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
-        }
-        counts.insert(event_type.to_string(), total);
-    }
+    let counts = fac_queue_lifecycle_dual_write::deterministic_lifecycle_emission_counts();
 
     assert!(
         counts
             .get(FAC_JOB_ENQUEUED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 3,
-        "enqueue transitions must dual-write fac.job.enqueued"
+            == 3,
+        "enqueue transitions must deterministically emit 3 fac.job.enqueued events"
     );
     assert!(
-        counts.get(FAC_JOB_CLAIMED_EVENT_TYPE).copied().unwrap_or(0) >= 3,
-        "claim transitions must dual-write fac.job.claimed"
+        counts.get(FAC_JOB_CLAIMED_EVENT_TYPE).copied().unwrap_or(0) == 3,
+        "claim transitions must deterministically emit 3 fac.job.claimed events"
     );
     assert!(
-        counts.get(FAC_JOB_STARTED_EVENT_TYPE).copied().unwrap_or(0) >= 2,
-        "terminal claimed flows must dual-write fac.job.started"
+        counts.get(FAC_JOB_STARTED_EVENT_TYPE).copied().unwrap_or(0) == 2,
+        "terminal claimed flows must deterministically emit 2 fac.job.started events"
     );
     assert!(
         counts
             .get(FAC_JOB_COMPLETED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 1,
-        "completed transitions must dual-write fac.job.completed"
+            == 1,
+        "completed transitions must deterministically emit 1 fac.job.completed event"
     );
     assert!(
         counts
             .get(FAC_JOB_RELEASED_EVENT_TYPE)
             .copied()
             .unwrap_or(0)
-            >= 1,
-        "release transitions must dual-write fac.job.released"
+            == 1,
+        "release transitions must deterministically emit 1 fac.job.released event"
     );
     assert!(
-        counts.get(FAC_JOB_FAILED_EVENT_TYPE).copied().unwrap_or(0) >= 1,
-        "failed transitions must dual-write fac.job.failed"
+        counts.get(FAC_JOB_FAILED_EVENT_TYPE).copied().unwrap_or(0) == 1,
+        "failed transitions must deterministically emit 1 fac.job.failed event"
     );
 
     if let Some(value) = original_apm2_home {

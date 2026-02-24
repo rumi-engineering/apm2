@@ -52,7 +52,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::execution_backend::{ExecutionBackend, select_backend};
-use super::safe_rmtree::{MAX_LOG_DIR_ENTRIES, safe_rmtree_v1, safe_rmtree_v1_with_entry_limit};
+use super::safe_rmtree::{
+    MAX_LOG_DIR_ENTRIES, normalize_user_owned_dir_modes_for_safe_delete,
+    safe_rmtree_v1_with_entry_limit,
+};
 use super::systemd_unit::{
     FacUnitLiveness, ORPHANED_SYSTEMD_UNIT_REASON_CODE, check_fac_unit_liveness,
 };
@@ -2508,7 +2511,20 @@ impl LaneManager {
         // Step 3: Prune temp directory.
         let tmp_dir = lanes_dir.join("tmp");
         if tmp_dir.exists() {
-            if let Err(err) = safe_rmtree_v1(&tmp_dir, &lanes_dir) {
+            if let Err(err) =
+                normalize_user_owned_dir_modes_for_safe_delete(&tmp_dir, MAX_LOG_DIR_ENTRIES)
+            {
+                persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                return Err(LaneCleanupError::TempPruneFailed {
+                    step: CLEANUP_STEP_TEMP_PRUNE,
+                    reason: format!("tmp permission repair failed: {err}"),
+                    steps_completed: steps_completed.clone(),
+                    failure_step: Some(CLEANUP_STEP_TEMP_PRUNE.to_string()),
+                });
+            }
+            if let Err(err) =
+                safe_rmtree_v1_with_entry_limit(&tmp_dir, &lanes_dir, MAX_LOG_DIR_ENTRIES)
+            {
                 persist_lease_state(&mut lease, LaneState::Corrupt)?;
                 return Err(LaneCleanupError::TempPruneFailed {
                     step: CLEANUP_STEP_TEMP_PRUNE,
@@ -2530,7 +2546,23 @@ impl LaneManager {
 
             let env_dir = lanes_dir.join(env_subdir);
             if env_dir.exists() {
-                if let Err(err) = safe_rmtree_v1(&env_dir, &lanes_dir) {
+                if let Err(err) =
+                    normalize_user_owned_dir_modes_for_safe_delete(&env_dir, MAX_LOG_DIR_ENTRIES)
+                {
+                    persist_lease_state(&mut lease, LaneState::Corrupt)?;
+                    return Err(LaneCleanupError::EnvDirPruneFailed {
+                        step: CLEANUP_STEP_ENV_DIR_PRUNE,
+                        reason: format!(
+                            "failed to repair env dir permissions {}: {err}",
+                            env_dir.display()
+                        ),
+                        steps_completed: steps_completed.clone(),
+                        failure_step: Some(CLEANUP_STEP_ENV_DIR_PRUNE.to_string()),
+                    });
+                }
+                if let Err(err) =
+                    safe_rmtree_v1_with_entry_limit(&env_dir, &lanes_dir, MAX_LOG_DIR_ENTRIES)
+                {
                     persist_lease_state(&mut lease, LaneState::Corrupt)?;
                     return Err(LaneCleanupError::EnvDirPruneFailed {
                         step: CLEANUP_STEP_ENV_DIR_PRUNE,
@@ -5511,6 +5543,55 @@ mod tests {
                 "{env_subdir} should be deleted during cleanup"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lane_cleanup_recovers_write_only_broker_requests_tmp_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let fac_root = root.path().join("private").join("fac");
+        fs::create_dir_all(&fac_root).expect("create fac root");
+        let manager = LaneManager::new(fac_root).expect("create manager");
+        manager.ensure_directories().expect("ensure dirs");
+
+        let lane_id = "lane-00";
+        let lane_dir = manager.lane_dir(lane_id);
+        let workspace = lane_dir.join("workspace");
+        init_git_workspace(&workspace);
+        persist_running_lease(&manager, lane_id);
+
+        let nested_dir = lane_dir
+            .join("tmp")
+            .join(".tmp-crash")
+            .join("queue")
+            .join("broker_requests");
+        fs::create_dir_all(&nested_dir).expect("create nested broker_requests tree");
+        fs::write(nested_dir.join("request.json"), b"{\"op\":\"ping\"}")
+            .expect("write broker request");
+        fs::set_permissions(
+            nested_dir.parent().expect("broker_requests parent exists"),
+            fs::Permissions::from_mode(0o333),
+        )
+        .expect("chmod queue to 0333");
+        fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o333))
+            .expect("chmod broker_requests to 0333");
+
+        let steps_completed = manager
+            .run_lane_cleanup(lane_id, &workspace)
+            .expect("cleanup should recover write-only tmp trees");
+        assert!(
+            steps_completed.contains(&CLEANUP_STEP_TEMP_PRUNE.to_string()),
+            "tmp prune step should complete successfully"
+        );
+        assert!(
+            !lane_dir.join("tmp").exists(),
+            "tmp tree should be removed by lane cleanup"
+        );
+
+        let status = manager.lane_status(lane_id).expect("lane status");
+        assert_eq!(status.state, LaneState::Idle);
     }
 
     #[test]
