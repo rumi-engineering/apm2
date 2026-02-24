@@ -4431,6 +4431,7 @@ fn compute_nextest_test_environment(
     let fac_root = apm2_home.join("private/fac");
     let lane_dir = fac_root.join("lanes/lane-00");
     super::policy_loader::apply_review_lane_environment(&mut policy_env, &lane_dir, &ambient)?;
+    super::evidence::apply_lane_compiler_cache_env(&mut policy_env, &lane_dir)?;
 
     // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy

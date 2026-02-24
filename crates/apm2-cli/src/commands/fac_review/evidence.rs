@@ -1267,6 +1267,7 @@ fn build_pipeline_test_command(
     // to maintain lock/env coupling (round 2 fix: was previously hardcoded
     // to lane-00).
     super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir)?;
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -1316,6 +1317,28 @@ fn build_pipeline_test_command(
         sandbox_hardening_hash,
         network_policy_hash,
     })
+}
+
+pub(super) fn apply_lane_compiler_cache_env(
+    policy_env: &mut std::collections::BTreeMap<String, String>,
+    lane_dir: &Path,
+) -> Result<(), String> {
+    let toolchain_fingerprint = compute_toolchain_fingerprint();
+    let target_dir_name = apm2_core::fac::fingerprint_short_hex(&toolchain_fingerprint)
+        .map_or_else(|| "target".to_string(), |hex16| format!("target-{hex16}"));
+    let cargo_target_dir = lane_dir.join(target_dir_name);
+    fs::create_dir_all(&cargo_target_dir).map_err(|err| {
+        format!(
+            "cannot create lane CARGO_TARGET_DIR {}: {err}",
+            cargo_target_dir.display()
+        )
+    })?;
+    policy_env.insert("CARGO_INCREMENTAL".to_string(), "1".to_string());
+    policy_env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        cargo_target_dir.to_string_lossy().into_owned(),
+    );
+    Ok(())
 }
 
 fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -1605,6 +1628,21 @@ fn append_scope_package_args(command: &mut Vec<String>, scope: &CargoGateExecuti
     }
 }
 
+fn build_rustfmt_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec!["cargo".to_string(), "fmt".to_string()];
+    match scope {
+        CargoGateExecutionScope::ScopedPackages(packages) if !packages.is_empty() => {
+            for package in packages {
+                command.push("-p".to_string());
+                command.push(package.clone());
+            }
+        },
+        _ => command.push("--all".to_string()),
+    }
+    command.extend(["--".to_string(), "--check".to_string()]);
+    command
+}
+
 fn build_doc_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
     let mut command = vec!["cargo".to_string(), "doc".to_string()];
     append_scope_package_args(&mut command, scope);
@@ -1736,6 +1774,7 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     // Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
     super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir)?;
 
     Ok(policy_env.into_iter().collect())
 }
@@ -2223,20 +2262,15 @@ pub(super) fn run_evidence_gates_with_lane_context(
     let doc_skip_reason = doc_gate_skip_reason(&cargo_scope, force_doc_gate);
     let skip_cargo_heavy_gates = matches!(cargo_scope, CargoGateExecutionScope::NoCargoImpact);
 
-    // Fastest-first ordering for cargo-backed gates. We always keep rustfmt
-    // active. doc is skipped for package-scoped pushes to stay within gate
-    // latency SLO (override with APM2_FAC_FORCE_DOC_GATE=1).
-    // clippy/test are scoped or skipped based on cargo impact.
+    // Fastest-first ordering for cargo-backed gates.
+    // rustfmt/doc/clippy/test are scoped or skipped based on cargo impact.
+    // doc is skipped for package-scoped pushes to stay within gate latency
+    // SLO (override with APM2_FAC_FORCE_DOC_GATE=1).
     let phase2_gate_specs = vec![
         Phase2GateSpec {
             gate_name: "rustfmt",
-            command: vec![
-                "cargo".to_string(),
-                "fmt".to_string(),
-                "--all".to_string(),
-                "--check".to_string(),
-            ],
-            skip_reason: None,
+            command: build_rustfmt_gate_command(&cargo_scope),
+            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
         },
         Phase2GateSpec {
             gate_name: "doc",
@@ -4010,10 +4044,13 @@ mod tests {
     #[test]
     fn scoped_commands_emit_package_flags_without_workspace_flag() {
         let scope = CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()]);
+        let rustfmt = build_rustfmt_gate_command(&scope).join(" ");
         let nextest = build_scoped_nextest_command(&scope).join(" ");
         let doc = build_doc_gate_command(&scope).join(" ");
         let clippy = build_clippy_gate_command(&scope).join(" ");
 
+        assert!(rustfmt.contains("cargo fmt -p apm2-cli -- --check"));
+        assert!(!rustfmt.contains("--all"));
         assert!(nextest.contains("cargo nextest run -p apm2-cli"));
         assert!(!nextest.contains("--workspace"));
         assert!(doc.contains("cargo doc -p apm2-cli --no-deps"));
@@ -4096,6 +4133,31 @@ mod tests {
                 );
             },
         }
+    }
+
+    #[test]
+    fn lane_compiler_cache_env_sets_incremental_and_lane_target_dir() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let lane_dir = temp_dir.path().join("lane-00");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+        let mut env = std::collections::BTreeMap::new();
+
+        apply_lane_compiler_cache_env(&mut env, &lane_dir).expect("compiler cache env");
+
+        assert_eq!(env.get("CARGO_INCREMENTAL").map(String::as_str), Some("1"));
+        let target_dir = env
+            .get("CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR must be set");
+        let target_path = std::path::Path::new(target_dir);
+        assert!(target_path.starts_with(&lane_dir));
+        assert!(target_path.is_dir());
+        assert!(
+            target_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("target")),
+            "target dir must be namespaced under lane dir: {target_dir}"
+        );
     }
 
     #[test]

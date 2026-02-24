@@ -766,6 +766,7 @@ pub fn compute_test_env_for_parallelism(parallelism: u32) -> Vec<(String, String
     vec![
         ("NEXTEST_TEST_THREADS".to_string(), cpu_count.to_string()),
         ("CARGO_BUILD_JOBS".to_string(), cpu_count.to_string()),
+        ("CARGO_INCREMENTAL".to_string(), "1".to_string()),
     ]
 }
 
@@ -4227,7 +4228,7 @@ mod tests {
     #[test]
     fn compute_test_env_for_parallelism_sets_both_env_vars() {
         let env = compute_test_env_for_parallelism(3);
-        assert_eq!(env.len(), 2);
+        assert_eq!(env.len(), 3);
         let threads = env
             .iter()
             .find(|(k, _)| k == "NEXTEST_TEST_THREADS")
@@ -4238,8 +4239,13 @@ mod tests {
             .find(|(k, _)| k == "CARGO_BUILD_JOBS")
             .and_then(|(_, v)| v.parse::<u32>().ok())
             .unwrap_or(0);
+        let incremental = env
+            .iter()
+            .find(|(k, _)| k == "CARGO_INCREMENTAL")
+            .map(|(_, v)| v.as_str());
         assert_eq!(threads, 3);
         assert_eq!(threads, build_jobs);
+        assert_eq!(incremental, Some("1"));
     }
 
     #[test]
@@ -4250,6 +4256,10 @@ mod tests {
                 .any(|(k, v)| k == "NEXTEST_TEST_THREADS" && v == "1")
         );
         assert!(env.iter().any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "1"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CARGO_INCREMENTAL" && v == "1")
+        );
     }
 
     #[test]
