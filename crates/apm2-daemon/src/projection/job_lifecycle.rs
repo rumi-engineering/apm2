@@ -3,6 +3,8 @@
 //! The projection treats `fac.job.*` ledger events as truth and repairs the
 //! queue filesystem (`pending/`, `claimed/`, `completed/`, `denied/`) as a
 //! witnessed cache.
+//!
+//! QL-R3: ledger projection wins; filesystem is repaired to match.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;

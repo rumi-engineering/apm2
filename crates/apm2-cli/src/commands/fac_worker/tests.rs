@@ -3731,7 +3731,7 @@ fn dual_write_requirement_traceability() -> [RequirementTraceability; 4] {
     [
         RequirementTraceability {
             requirement_id: "QL-R3",
-            source_path: "documents/work/tickets/TCK-00669.json",
+            source_path: "crates/apm2-daemon/src/projection/job_lifecycle.rs",
             source_anchor: "ledger projection wins; filesystem is repaired to match",
             expected_behavior: "ledger projection truth deterministically reconstructs queue lifecycle outcomes",
         },
