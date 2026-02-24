@@ -648,9 +648,9 @@
         "evaluation": "first_matching_guard_applies",
         "schema": "apm2.fac.review.gates_wait_machine.v1",
         "states": [
+          "probe_receipt",
           "evaluate_timeout",
-          "check_receipt",
-          "evaluate_queue_mode",
+          "detect_queue_mode",
           "sleep",
           "run_inline_worker",
           "exit_with_receipt",
@@ -658,16 +658,16 @@
         ],
         "transitions": [
           {
-            "from": "check_receipt",
-            "guard_id": "GW-WAIT-003",
+            "from": "probe_receipt",
+            "guard_id": "GW-WAIT-001",
             "guard_kind": "receipt_found",
             "guard_predicate": "facts.receipt_found",
             "priority": 1,
             "to": "exit_with_receipt"
           },
           {
-            "from": "check_receipt",
-            "guard_id": "GW-WAIT-004",
+            "from": "probe_receipt",
+            "guard_id": "GW-WAIT-002",
             "guard_kind": "always",
             "guard_predicate": "default",
             "priority": 2,
@@ -675,7 +675,7 @@
           },
           {
             "from": "evaluate_timeout",
-            "guard_id": "GW-WAIT-001",
+            "guard_id": "GW-WAIT-003",
             "guard_kind": "timed_out",
             "guard_predicate": "facts.timed_out",
             "priority": 3,
@@ -683,14 +683,14 @@
           },
           {
             "from": "evaluate_timeout",
-            "guard_id": "GW-WAIT-002",
+            "guard_id": "GW-WAIT-004",
             "guard_kind": "always",
             "guard_predicate": "default",
             "priority": 4,
-            "to": "evaluate_queue_mode"
+            "to": "detect_queue_mode"
           },
           {
-            "from": "evaluate_queue_mode",
+            "from": "detect_queue_mode",
             "guard_id": "GW-WAIT-005",
             "guard_kind": "inline_fallback_allowed",
             "guard_predicate": "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
@@ -698,7 +698,7 @@
             "to": "run_inline_worker"
           },
           {
-            "from": "evaluate_queue_mode",
+            "from": "detect_queue_mode",
             "guard_id": "GW-WAIT-006",
             "guard_kind": "always",
             "guard_predicate": "default",
@@ -709,9 +709,9 @@
             "from": "run_inline_worker",
             "guard_id": "GW-WAIT-007",
             "guard_kind": "always",
-            "guard_predicate": "always",
+            "guard_predicate": "inline worker cycle completed",
             "priority": 7,
-            "to": "check_receipt"
+            "to": "sleep"
           },
           {
             "from": "sleep",
@@ -719,7 +719,7 @@
             "guard_kind": "always",
             "guard_predicate": "always",
             "priority": 8,
-            "to": "check_receipt"
+            "to": "probe_receipt"
           }
         ]
       },
@@ -1661,39 +1661,39 @@
         },
         "gates_wait_transitions_by_guard_id": {
           "GW-WAIT-001": {
-            "from": "evaluate_timeout",
+            "from": "probe_receipt",
             "guard_id": "GW-WAIT-001",
-            "guard_kind": "timed_out",
-            "guard_predicate": "facts.timed_out",
-            "priority": 3,
-            "to": "exit_timeout"
-          },
-          "GW-WAIT-002": {
-            "from": "evaluate_timeout",
-            "guard_id": "GW-WAIT-002",
-            "guard_kind": "always",
-            "guard_predicate": "default",
-            "priority": 4,
-            "to": "evaluate_queue_mode"
-          },
-          "GW-WAIT-003": {
-            "from": "check_receipt",
-            "guard_id": "GW-WAIT-003",
             "guard_kind": "receipt_found",
             "guard_predicate": "facts.receipt_found",
             "priority": 1,
             "to": "exit_with_receipt"
           },
-          "GW-WAIT-004": {
-            "from": "check_receipt",
-            "guard_id": "GW-WAIT-004",
+          "GW-WAIT-002": {
+            "from": "probe_receipt",
+            "guard_id": "GW-WAIT-002",
             "guard_kind": "always",
             "guard_predicate": "default",
             "priority": 2,
             "to": "evaluate_timeout"
           },
+          "GW-WAIT-003": {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-003",
+            "guard_kind": "timed_out",
+            "guard_predicate": "facts.timed_out",
+            "priority": 3,
+            "to": "exit_timeout"
+          },
+          "GW-WAIT-004": {
+            "from": "evaluate_timeout",
+            "guard_id": "GW-WAIT-004",
+            "guard_kind": "always",
+            "guard_predicate": "default",
+            "priority": 4,
+            "to": "detect_queue_mode"
+          },
           "GW-WAIT-005": {
-            "from": "evaluate_queue_mode",
+            "from": "detect_queue_mode",
             "guard_id": "GW-WAIT-005",
             "guard_kind": "inline_fallback_allowed",
             "guard_predicate": "facts.queue_mode == inline_single_job && facts.allow_inline_fallback",
@@ -1701,7 +1701,7 @@
             "to": "run_inline_worker"
           },
           "GW-WAIT-006": {
-            "from": "evaluate_queue_mode",
+            "from": "detect_queue_mode",
             "guard_id": "GW-WAIT-006",
             "guard_kind": "always",
             "guard_predicate": "default",
@@ -1712,9 +1712,9 @@
             "from": "run_inline_worker",
             "guard_id": "GW-WAIT-007",
             "guard_kind": "always",
-            "guard_predicate": "always",
+            "guard_predicate": "inline worker cycle completed",
             "priority": 7,
-            "to": "check_receipt"
+            "to": "sleep"
           },
           "GW-WAIT-008": {
             "from": "sleep",
@@ -1722,7 +1722,7 @@
             "guard_kind": "always",
             "guard_predicate": "always",
             "priority": 8,
-            "to": "check_receipt"
+            "to": "probe_receipt"
           }
         },
         "lifecycle_transitions_by_id": {

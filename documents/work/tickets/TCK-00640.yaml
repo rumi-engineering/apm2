@@ -38,6 +38,7 @@ ticket_meta:
     - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
     - Prevent one-shot inline worker fallback cycles from spawning persistent queue watcher/watchdog threads so `fac push` cannot leak inotify instances/threads under retries
     - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
+    - Run FAC review machine-spec snapshot fast check before queued gates; fail closed when `documents/reviews/fac_review_state_machine.cac.json` is stale relative to code-generated spec
     - Preserve queue claim lock ownership through terminal transition commit paths so no second worker can re-claim mid-transition
     - Enforce case-insensitive `(work_id, pr_number, commit_sha)` uniqueness for `work.pr_associated` in both legacy and canonical sqlite schemas
     out_of_scope:
@@ -60,6 +61,7 @@ ticket_meta:
     - "`apm2 fac push` requires canonical work binding for publication paths and enforces IMPLEMENTER_TERMINAL publication on every push attempt."
     - "`--handoff-note` is optional; HANDOFF_NOTE context publication is conditional while IMPLEMENTER_TERMINAL remains mandatory."
     - "Fast preflight checks (including PR association compatibility) execute before expensive gate execution."
+    - "Fast preflight now includes FAC review machine-spec snapshot consistency guard and fails closed before gate enqueue when snapshot drift is detected."
     - "Projection rebuild rejects historical raw protobuf/payload-only work envelopes and requires the canonical session envelope contract."
     - "Review dispatch/runtime joins are fail-closed on missing runtime handles and PID identity mismatches."
     - "`fac review prepare` now bounds inline output (2000-line limit) and returns artifact references/metadata for oversized payloads."
@@ -90,6 +92,8 @@ ticket_meta:
     - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
     - "`cargo test -p apm2-cli one_shot_worker_skips_background_runtime_primitives -- --nocapture`"
     - "`cargo test -p apm2-cli gates_wait_machine -- --nocapture`"
+    - "`cargo test -p apm2-cli fac_review_machine_spec_guard -- --nocapture`"
+    - "`cargo test -p apm2-cli fac_review_machine_spec_snapshot_is_current -- --nocapture`"
     - "`cargo test -p apm2-cli test_emit_job_receipt_restores_denied_job_to_pending_on_persist_failure -- --nocapture`"
     - "`cargo test -p apm2-daemon tck_00639_work_pr_associated_unique_constraint_is_case_insensitive -- --nocapture`"
     - "`cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture`"
@@ -108,5 +112,6 @@ ticket_meta:
     - Queue terminal transitions are serialized by retaining the claimed lock until transition commit completion.
     - One-shot inline worker fallback cannot leak long-lived watcher/watchdog runtime primitives across retries.
     - PR association idempotency is robust to commit SHA case variants in both legacy and canonical ledger storage.
+    - Fast-check phase fails before queued gates when FAC review machine-spec snapshot drift is present.
   notes:
     verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.

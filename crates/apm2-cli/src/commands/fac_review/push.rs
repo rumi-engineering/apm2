@@ -42,7 +42,9 @@ use super::types::{
     DispatchReviewResult, ReviewKind, apm2_home_dir, ensure_parent_dir, now_iso8601,
     sanitize_for_path,
 };
-use super::{github_projection, lifecycle, projection_store, state, verdict_projection};
+use super::{
+    gate_checks, github_projection, lifecycle, projection_store, state, verdict_projection,
+};
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::commands::fac_pr::sync_required_status_ruleset;
 use crate::commands::work_identity::{
@@ -1488,6 +1490,15 @@ fn parse_failed_gates_from_error(error: &str) -> Vec<String> {
         .collect()
 }
 
+fn summarize_native_gate_failure(output: &str, fallback: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("ERROR:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn lane_evidence_log_dirs(home: &Path) -> Vec<PathBuf> {
     let lanes_dir = home.join("private/fac/lanes");
     let mut logs = Vec::new();
@@ -2631,6 +2642,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         serde_json::json!({
             "checks": [
                 "ticket_metadata_resolution",
+                "fac_review_machine_spec_snapshot_guard",
                 "work_binding_resolution",
                 "clean_worktree",
                 "head_drift_check",
@@ -2655,6 +2667,33 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             fail_with_attempt!("fac_push_repo_root_resolution_failed", err);
         },
     };
+    let machine_spec_guard_started = Instant::now();
+    let machine_spec_guard = match gate_checks::run_fac_review_machine_spec_guard(&repo_root) {
+        Ok(check) => check,
+        Err(err) => {
+            fail_with_attempt!("fac_push_machine_spec_fast_check_failed", err);
+        },
+    };
+    emit_stage(
+        "fast_check_machine_spec_snapshot_completed",
+        serde_json::json!({
+            "status": if machine_spec_guard.passed { "pass" } else { "fail" },
+            "duration_secs": machine_spec_guard_started.elapsed().as_secs(),
+        }),
+    );
+    if !machine_spec_guard.passed {
+        let message = summarize_native_gate_failure(
+            &machine_spec_guard.output,
+            "FAC review machine spec snapshot guard failed",
+        );
+        fail_with_attempt!(
+            "fac_push_machine_spec_snapshot_stale",
+            format!(
+                "{message}; regenerate and commit documents/reviews/fac_review_state_machine.cac.json before `apm2 fac push`"
+            )
+        );
+    }
+
     let commit_history = match collect_commit_history(remote, &branch) {
         Ok(value) => value,
         Err(err) => {
@@ -2992,14 +3031,16 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                         let duration = gates_started.elapsed().as_secs();
                         let failed_gates = parse_failed_gates_from_error(&err);
                         if failed_gates.is_empty() {
-                            for stage in ["gate_fmt", "gate_clippy", "gate_test", "gate_doc"] {
-                                attempt.set_stage_fail(
-                                    stage,
-                                    duration,
-                                    None,
-                                    normalize_error_hint(&err),
-                                );
-                            }
+                            // Preserve accurate push-attempt timing: when we
+                            // cannot attribute a failure to a specific gate,
+                            // record only the synthetic "test" stage instead
+                            // of marking all stages with the same duration.
+                            attempt.set_stage_fail(
+                                "gate_test",
+                                duration,
+                                None,
+                                normalize_error_hint(&err),
+                            );
                         } else {
                             for gate_name in &failed_gates {
                                 attempt.set_stage_fail(
@@ -5039,6 +5080,21 @@ mod tests {
     fn parse_failed_gates_from_error_returns_empty_without_marker() {
         let parsed = parse_failed_gates_from_error("gates failed with exit code 1");
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn summarize_native_gate_failure_prefers_first_error_line() {
+        let summary = summarize_native_gate_failure(
+            "INFO: start\nERROR: stale snapshot\nERROR: additional detail\n",
+            "fallback",
+        );
+        assert_eq!(summary, "stale snapshot");
+    }
+
+    #[test]
+    fn summarize_native_gate_failure_uses_fallback_when_no_error_lines() {
+        let summary = summarize_native_gate_failure("INFO: clean\n", "fallback summary");
+        assert_eq!(summary, "fallback summary");
     }
 
     #[test]

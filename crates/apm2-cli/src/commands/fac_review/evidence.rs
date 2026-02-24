@@ -265,6 +265,7 @@ pub const LANE_EVIDENCE_GATES: &[&str] = &[
     "doc",
     "clippy",
     "test_safety_guard",
+    "fac_review_machine_spec_snapshot",
     "test",
     "workspace_integrity",
     "review_artifact_lint",
@@ -1041,6 +1042,9 @@ fn run_native_evidence_gate(
     let started = Instant::now();
     let execution = match gate_name {
         "test_safety_guard" => gate_checks::run_test_safety_guard(workspace_root),
+        "fac_review_machine_spec_snapshot" => {
+            gate_checks::run_fac_review_machine_spec_guard(workspace_root)
+        },
         "review_artifact_lint" => gate_checks::run_review_artifact_lint(workspace_root),
         _ => Err(format!("unknown native evidence gate `{gate_name}`")),
     };
@@ -1909,7 +1913,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     ];
 
     // Native gates that run BEFORE tests (no ordering dependency on test).
-    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
+    let pre_test_native_gates: &[&str] = &["test_safety_guard", "fac_review_machine_spec_snapshot"];
 
     // Native gates that run AFTER tests (ordering dependency on test).
     let post_test_native_gates: &[&str] = &["review_artifact_lint"];
@@ -2784,7 +2788,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         ),
     ];
 
-    let pre_test_native_gates: &[&str] = &["test_safety_guard"];
+    let pre_test_native_gates: &[&str] = &["test_safety_guard", "fac_review_machine_spec_snapshot"];
 
     // Native gates that run AFTER tests (ordering dependency on test).
     let post_test_native_gates: &[&str] = &["review_artifact_lint"];
@@ -4469,9 +4473,10 @@ mod tests {
             ("clippy", 12_u64),
             ("doc", 13_u64),
             ("test_safety_guard", 14_u64),
-            ("test", 15_u64),
-            ("workspace_integrity", 16_u64),
-            ("review_artifact_lint", 17_u64),
+            ("fac_review_machine_spec_snapshot", 15_u64),
+            ("test", 16_u64),
+            ("workspace_integrity", 17_u64),
+            ("review_artifact_lint", 18_u64),
         ];
         for (gate_name, duration_secs) in expected_durations {
             let attestation_digest = if gate_name == "test" {
