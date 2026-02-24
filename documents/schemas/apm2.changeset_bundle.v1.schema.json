@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/changeset_bundle_v1.yaml",
+  "title": "ChangeSetBundleV1",
+  "description": "Canonical diff bundle stored in CAS; changeset_digest is computed over canonical bundle bytes with the changeset_digest field omitted from the hash input.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "changeset_id",
+    "base",
+    "changeset_digest",
+    "diff_format",
+    "diff_hash",
+    "file_manifest",
+    "binary_detected"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.changeset_bundle.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "changeset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "base": {
+      "allOf": [
+        {
+          "$ref": "git_object_ref.schema.json"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_kind": {
+              "enum": [
+                "commit",
+                "tree"
+              ]
+            }
+          },
+          "required": [
+            "object_kind"
+          ]
+        }
+      ]
+    },
+    "changeset_digest": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte BLAKE3 digest of canonical bundle bytes with this field omitted from the hash input.",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "diff_format": {
+      "type": "string",
+      "enum": [
+        "git_unified_diff"
+      ]
+    },
+    "diff_hash": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte BLAKE3 hash of diff bytes stored in CAS.",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "file_manifest": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "change_kind"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "change_kind": {
+            "type": "string",
+            "enum": [
+              "ADD",
+              "MODIFY",
+              "DELETE",
+              "RENAME"
+            ]
+          },
+          "old_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "unevaluatedProperties": false
+      }
+    },
+    "binary_detected": {
+      "type": "boolean",
+      "description": "True if any non-text/binary change was detected (v0 blocks on this)."
+    }
+  },
+  "unevaluatedProperties": false
+}

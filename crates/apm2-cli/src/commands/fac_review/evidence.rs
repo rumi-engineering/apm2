@@ -1595,8 +1595,17 @@ fn path_requires_full_workspace(path: &str) -> bool {
 fn path_is_non_cargo_impact(path: &str) -> bool {
     if matches!(
         path,
-        "AGENTS.md" | "README.md" | "SECURITY.md" | "DAEMON.md" | "LICENSE-APACHE" | "LICENSE-MIT"
+        "AGENTS.md"
+            | "AGENTS.json"
+            | "README.md"
+            | "SECURITY.md"
+            | "DAEMON.md"
+            | "LICENSE-APACHE"
+            | "LICENSE-MIT"
     ) {
+        return true;
+    }
+    if path.ends_with("/AGENTS.md") || path.ends_with("/AGENTS.json") {
         return true;
     }
     path.starts_with("documents/")
@@ -4010,6 +4019,21 @@ mod tests {
         let scope = classify_cargo_gate_scope(
             &["documents/strategy/ROADMAP.json".to_string()],
             &[("crates/apm2-cli".to_string(), "apm2-cli".to_string())],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::NoCargoImpact);
+    }
+
+    #[test]
+    fn cargo_scope_classifies_agents_docs_as_no_cargo_impact() {
+        let scope = classify_cargo_gate_scope(
+            &[
+                "crates/apm2-core/AGENTS.json".to_string(),
+                "crates/apm2-daemon/src/gate/AGENTS.md".to_string(),
+            ],
+            &[
+                ("crates/apm2-core".to_string(), "apm2-core".to_string()),
+                ("crates/apm2-daemon".to_string(), "apm2-daemon".to_string()),
+            ],
         );
         assert_eq!(scope, CargoGateExecutionScope::NoCargoImpact);
     }
