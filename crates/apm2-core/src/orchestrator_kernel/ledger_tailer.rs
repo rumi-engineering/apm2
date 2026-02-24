@@ -1,79 +1,88 @@
-//! Ledger observation traits and composite cursor helpers.
+//! Ledger observation traits and cursor-generic helpers.
+//!
+//! Cursors are ledger-specific.  The kernel requires only [`Ord`] to compare
+//! and advance cursors; the concrete cursor type is chosen by each
+//! [`LedgerReader`] implementation.
+//! [`CompositeCursor`](super::types::CompositeCursor) remains the default for
+//! timestamp + event-id ledgers.
 
-use crate::orchestrator_kernel::types::CompositeCursor;
+use crate::orchestrator_kernel::types::KernelCursor;
 
-/// Trait for event types that can be ordered by composite cursor.
-pub trait CursorEvent {
-    /// Event timestamp in nanoseconds since Unix epoch.
-    fn timestamp_ns(&self) -> u64;
-    /// Stable event identifier used as tie-breaker within equal timestamps.
-    fn event_id(&self) -> &str;
+/// Trait for event types that expose a cursor for ordering.
+///
+/// The cursor type `C` must implement [`KernelCursor`] and its total order
+/// must be consistent with the ledger reader's returned event order.
+pub trait CursorEvent<C: KernelCursor> {
+    /// Returns the cursor position of this event.
+    fn cursor(&self) -> C;
 }
 
-/// Returns `true` when `event` is strictly after `cursor`.
+/// Returns `true` when `event` is strictly after `cursor` using `Ord`.
 #[must_use]
-pub fn is_after_cursor<E: CursorEvent>(event: &E, cursor: &CompositeCursor) -> bool {
-    event.timestamp_ns() > cursor.timestamp_ns
-        || (event.timestamp_ns() == cursor.timestamp_ns
-            && event.event_id() > cursor.event_id.as_str())
+pub fn is_after_cursor<C: KernelCursor, E: CursorEvent<C>>(event: &E, cursor: &C) -> bool {
+    event.cursor() > *cursor
 }
 
 /// Returns the next cursor obtained by advancing with `event`.
+///
+/// Takes the maximum of the current cursor and the event's cursor.
 #[must_use]
-pub fn advance_cursor_with_event<E: CursorEvent>(
-    cursor: &CompositeCursor,
-    event: &E,
-) -> CompositeCursor {
-    if is_after_cursor(event, cursor) {
-        CompositeCursor {
-            timestamp_ns: event.timestamp_ns(),
-            event_id: event.event_id().to_string(),
-        }
+pub fn advance_cursor_with_event<C: KernelCursor, E: CursorEvent<C>>(cursor: &C, event: &E) -> C {
+    let event_cursor = event.cursor();
+    if event_cursor > *cursor {
+        event_cursor
     } else {
         cursor.clone()
     }
 }
 
-/// Deterministically sorts events by `(timestamp_ns, event_id)` and truncates
-/// to `limit`.
+/// Deterministically sorts events by cursor order and truncates to `limit`.
 #[must_use]
-pub fn sort_and_truncate_events<E: CursorEvent>(mut events: Vec<E>, limit: usize) -> Vec<E> {
-    events.sort_by(|a, b| {
-        a.timestamp_ns()
-            .cmp(&b.timestamp_ns())
-            .then_with(|| a.event_id().cmp(b.event_id()))
-    });
+pub fn sort_and_truncate_events<C: KernelCursor, E: CursorEvent<C>>(
+    mut events: Vec<E>,
+    limit: usize,
+) -> Vec<E> {
+    events.sort_by_key(CursorEvent::cursor);
     events.truncate(limit);
     events
 }
 
 /// Read-only ledger poll contract for kernel Observe phase.
+///
+/// The associated `Cursor` type determines the cursor used for ordering
+/// and checkpointing.
 #[allow(async_fn_in_trait)]
 pub trait LedgerReader<Event>: Send + Sync {
+    /// Cursor type for this ledger.
+    type Cursor: KernelCursor;
+
     /// Reader-specific error type.
     type Error;
 
     /// Polls events strictly after `cursor`, bounded by `limit`.
-    async fn poll(&self, cursor: &CompositeCursor, limit: usize)
-    -> Result<Vec<Event>, Self::Error>;
+    async fn poll(&self, cursor: &Self::Cursor, limit: usize) -> Result<Vec<Event>, Self::Error>;
 }
 
 /// Durable cursor storage contract.
+///
+/// The cursor type `C` must implement [`KernelCursor`] for serialization
+/// and ordering guarantees.
 #[allow(async_fn_in_trait)]
-pub trait CursorStore: Send + Sync {
+pub trait CursorStore<C: KernelCursor>: Send + Sync {
     /// Store-specific error type.
     type Error;
 
     /// Loads the latest durable cursor.
-    async fn load(&self) -> Result<CompositeCursor, Self::Error>;
+    async fn load(&self) -> Result<C, Self::Error>;
 
     /// Saves the latest durable cursor.
-    async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error>;
+    async fn save(&self, cursor: &C) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator_kernel::types::CompositeCursor;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestEvent {
@@ -81,13 +90,12 @@ mod tests {
         event_id: &'static str,
     }
 
-    impl CursorEvent for TestEvent {
-        fn timestamp_ns(&self) -> u64 {
-            self.timestamp_ns
-        }
-
-        fn event_id(&self) -> &str {
-            self.event_id
+    impl CursorEvent<CompositeCursor> for TestEvent {
+        fn cursor(&self) -> CompositeCursor {
+            CompositeCursor {
+                timestamp_ns: self.timestamp_ns,
+                event_id: self.event_id.to_string(),
+            }
         }
     }
 
@@ -142,7 +150,7 @@ mod tests {
         ];
 
         let sorted = sort_and_truncate_events(events, 3);
-        let ids: Vec<&str> = sorted.iter().map(CursorEvent::event_id).collect();
+        let ids: Vec<String> = sorted.iter().map(|e| e.cursor().event_id).collect();
         assert_eq!(
             ids,
             vec![
@@ -151,5 +159,54 @@ mod tests {
                 "canonical-00000000000000000010",
             ]
         );
+    }
+
+    /// Verify that `CompositeCursor`'s derived `Ord` is consistent with the
+    /// legacy manual `(timestamp_ns, event_id)` comparison.
+    #[test]
+    fn composite_cursor_ord_is_consistent_with_legacy_manual_comparison() {
+        let a = CompositeCursor {
+            timestamp_ns: 100,
+            event_id: "evt-001".to_string(),
+        };
+        let b = CompositeCursor {
+            timestamp_ns: 100,
+            event_id: "evt-002".to_string(),
+        };
+        let c = CompositeCursor {
+            timestamp_ns: 101,
+            event_id: "evt-000".to_string(),
+        };
+
+        assert!(a < b, "same ts, smaller event_id should be less");
+        assert!(b < c, "smaller ts should be less regardless of event_id");
+        assert!(a < c);
+    }
+
+    /// Verify `advance_cursor_with_event` takes the maximum cursor.
+    #[test]
+    fn advance_cursor_takes_max() {
+        let cursor = CompositeCursor {
+            timestamp_ns: 50,
+            event_id: "evt-005".to_string(),
+        };
+        let earlier = TestEvent {
+            timestamp_ns: 49,
+            event_id: "evt-999",
+        };
+        let same = TestEvent {
+            timestamp_ns: 50,
+            event_id: "evt-005",
+        };
+        let later = TestEvent {
+            timestamp_ns: 50,
+            event_id: "evt-006",
+        };
+
+        assert_eq!(advance_cursor_with_event(&cursor, &earlier), cursor);
+        assert_eq!(advance_cursor_with_event(&cursor, &same), cursor);
+        let advanced = advance_cursor_with_event(&cursor, &later);
+        assert_eq!(advanced.timestamp_ns, 50);
+        assert_eq!(advanced.event_id, "evt-006");
     }
 }
