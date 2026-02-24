@@ -27,7 +27,8 @@ ticket_meta:
       reason: Needs ticket-alias -> work_id resolution
   scope:
     in_scope:
-    - Resolve `work_id` deterministically for `apm2 fac push` via priority order: explicit `--work-id`, branch ticket alias (`TCK-*`), then daemon-side claim/projection recovery
+    - Resolve `work_id` deterministically for `apm2 fac push` via priority order: explicit `--work-id`, explicit/derived ticket alias (`TCK-*`) via daemon alias authority; unresolved alias must fail closed (no implicit global fallback)
+    - Allow daemon projection fallback only when explicitly requested (`--lease-id`/`--session-id`) and no branch/worktree TCK alias context is available
     - 'After push/PR update: call daemon RPCs in order: PublishChangeSet(work_id, lease_id), RecordWorkPrAssociation, PublishWorkContextEntry(HANDOFF_NOTE optional), PublishWorkContextEntry(IMPLEMENTER_TERMINAL required)'
     - Enforce terminal contract from ledger+CAS truth: IMPLEMENTER_TERMINAL is mandatory per push attempt; HANDOFF_NOTE is optional
     - Keep CLI non-authoritative for lifecycle transitions (no direct `work.transitioned` emission)
@@ -87,6 +88,8 @@ ticket_meta:
     - "One-shot worker cycles (`run_fac_worker(..., once=true)`) now skip queue watcher and watchdog thread startup, preventing in-process thread/inotify accumulation during inline `fac push` fallback."
     - "Gates wait FSM was rewritten to explicit probe/evaluate/detect/act/sleep states with bounded inline cooldown, eliminating busy-spin inline fallback loops."
     - "Direct receipt-emission paths now fail closed when receipt persistence fails after terminal move: denied/quarantined files are restored to `queue/pending` for reconcile-safe retry instead of remaining terminal-without-receipt."
+    - "Push/work-current identity resolution now fail closed when branch-derived `TCK-*` alias is unresolved; implicit global active-work fallback is disabled to prevent cross-PR/work misbinding."
+    - "Projection fallback for identity recovery is now explicit-only (`--lease-id`/`--session-id`) when no alias context is derivable."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:

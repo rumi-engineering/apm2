@@ -74,6 +74,7 @@ const FAC_DOCTOR_SYSTEM_SCHEMA: &str = "apm2.fac.doctor.system.v1";
 const FAC_DOCTOR_SYSTEM_FIX_SCHEMA: &str = "apm2.fac.doctor.system_fix.v1";
 const MAX_TMP_SCRUB_ENTRIES: usize = 250_000;
 const WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE: &str = "Required format: include `TCK-12345` in the branch name (recommended: `ticket/RFC-0018/TCK-12345`) or in the worktree directory name (example: `apm2-TCK-12345`).";
+const WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE: &str = "Refusing implicit projection fallback to prevent cross-ticket misbinding; pass `--ticket-alias`/`--work-id` context or explicitly request fallback via `--lease-id`/`--session-id`.";
 
 // =============================================================================
 // Command Types
@@ -715,11 +716,11 @@ pub struct WorkCurrentArgs {
     #[arg(long = "ticket-alias")]
     pub ticket_alias: Option<String>,
 
-    /// Optional lease filter for projection fallback disambiguation.
+    /// Optional lease filter for explicit projection fallback disambiguation.
     #[arg(long = "lease-id")]
     pub lease_id: Option<String>,
 
-    /// Optional session filter for projection fallback disambiguation.
+    /// Optional session filter for explicit projection fallback disambiguation.
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
 }
@@ -1198,7 +1199,10 @@ pub struct PushArgs {
 
     /// Canonical work identifier to bind projection and daemon publication.
     /// If omitted, `fac push` derives work binding via ticket alias and
-    /// projection fallback. Use `apm2 fac work current` to inspect.
+    /// fail-closed TCK alias resolution.
+    /// Projection fallback is only used when explicitly requested with
+    /// `--lease-id`/`--session-id`.
+    /// Use `apm2 fac work current` to inspect.
     /// If no work exists yet, create/claim one via `apm2 fac work open` and
     /// `apm2 fac work claim`.
     #[arg(long = "work-id")]
@@ -1206,8 +1210,8 @@ pub struct PushArgs {
 
     /// Optional ticket alias (for example `TCK-00640`) used to resolve
     /// canonical `work_id` via daemon projection authority.
-    /// If omitted, branch/worktree TCK derivation and projection fallback
-    /// apply.
+    /// If omitted, branch/worktree TCK derivation applies.
+    /// Unresolved aliases fail closed to prevent cross-ticket misbinding.
     #[arg(long = "ticket-alias")]
     pub ticket_alias: Option<String>,
 
@@ -4132,6 +4136,22 @@ fn resolve_ticket_alias_to_work_id_via_daemon(
     Ok(Some(response.work_id))
 }
 
+fn work_current_projection_fallback_requested(
+    lease_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> bool {
+    lease_filter.is_some() || session_filter.is_some()
+}
+
+fn unresolved_work_current_alias_message(ticket_alias: &str) -> String {
+    format!(
+        "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
+         Refusing projection fallback to prevent cross-ticket misbinding. \
+         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         then claim it (or provide explicit `--ticket-alias`)."
+    )
+}
+
 fn is_active_work_fallback_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_uppercase().as_str(),
@@ -4245,6 +4265,10 @@ fn resolve_work_current_identity(
 
     let branch = normalize_non_empty_arg(args.branch.as_deref())
         .map_or_else(|| resolve_current_branch_name().ok(), Some);
+    let fallback_requested = work_current_projection_fallback_requested(
+        requested_lease_id.as_deref(),
+        requested_session_id.as_deref(),
+    );
 
     let explicit_alias = normalize_non_empty_arg(args.ticket_alias.as_deref());
     if let Some(alias) = explicit_alias {
@@ -4259,23 +4283,8 @@ fn resolve_work_current_identity(
                 branch,
             ));
         }
-        let fallback_work_id = resolve_work_current_from_projection_fallback(
-            operator_socket,
-            requested_lease_id.as_deref(),
-            requested_session_id.as_deref(),
-        )
-        .map_err(|fallback_err| {
-            format!(
-                "ticket alias `{alias}` did not resolve to a canonical work_id and projection fallback failed: {fallback_err}"
-            )
-        })?;
-        return Ok((
-            WorkCurrentResolution {
-                work_id: fallback_work_id,
-                ticket_alias: None,
-                source: WorkCurrentResolutionSource::ProjectionFallback,
-            },
-            branch,
+        return Err(format!(
+            "ticket alias `{alias}` did not resolve to a canonical work_id; explicit `--ticket-alias` inputs are fail-closed"
         ));
     }
 
@@ -4298,25 +4307,28 @@ fn resolve_work_current_identity(
                     branch,
                 ));
             }
-            let fallback_work_id = resolve_work_current_from_projection_fallback(
-                operator_socket,
-                requested_lease_id.as_deref(),
-                requested_session_id.as_deref(),
-            )
-            .map_err(|fallback_err| {
-                format!(
-                    "derived ticket alias `{derived_alias}` did not resolve to a canonical work_id and projection fallback failed: {fallback_err}"
-                )
-            })?;
-            return Ok((
-                WorkCurrentResolution {
-                    work_id: fallback_work_id,
-                    ticket_alias: None,
-                    source: WorkCurrentResolutionSource::ProjectionFallback,
-                },
-                branch,
-            ));
+            return Err(unresolved_work_current_alias_message(&derived_alias));
         }
+    }
+
+    if !fallback_requested {
+        return Err(branch.as_deref().map_or_else(
+            || {
+                format!(
+                    "could not derive TCK from branch/worktree context. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}"
+                )
+            },
+            |branch_value| {
+                format!(
+                    "could not derive TCK from branch `{branch_value}` or worktree `{}`. \
+                     {WORK_CURRENT_REQUIRED_TCK_FORMAT_MESSAGE} \
+                     {WORK_CURRENT_EXPLICIT_FALLBACK_REQUIRED_MESSAGE}",
+                    worktree_dir.display()
+                )
+            },
+        ));
     }
 
     let fallback_work_id = resolve_work_current_from_projection_fallback(
@@ -8763,6 +8775,27 @@ mod tests {
         let error = select_work_current_fallback_work_id(&items, None, None)
             .expect_err("multiple active candidates must fail closed");
         assert!(error.contains("multiple active Implementer work items"));
+    }
+
+    #[test]
+    fn work_current_projection_fallback_requested_requires_explicit_filters() {
+        assert!(!work_current_projection_fallback_requested(None, None));
+        assert!(work_current_projection_fallback_requested(
+            Some("L-123"),
+            None
+        ));
+        assert!(work_current_projection_fallback_requested(
+            None,
+            Some("S-123")
+        ));
+    }
+
+    #[test]
+    fn unresolved_work_current_alias_message_includes_fail_closed_guidance() {
+        let msg = unresolved_work_current_alias_message("TCK-00640");
+        assert!(msg.contains("TCK-00640"));
+        assert!(msg.contains("Refusing projection fallback"));
+        assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
 
     #[test]
