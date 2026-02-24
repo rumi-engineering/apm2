@@ -8729,8 +8729,8 @@ enum WorkIdResolutionMode {
     StrictLeaseMapping,
     /// Require authoritative lease->work mapping but ignore `work_id_hint`
     /// equality. Used for governance flows where a governing lease authorizes
-    /// mutation of a different target work item (for example OpenWork and
-    /// ClaimWorkV2 target transitions).
+    /// mutation of a different target work item (for example `OpenWork` and
+    /// `ClaimWorkV2` target transitions).
     LeaseMappingOnly,
 }
 
