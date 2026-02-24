@@ -2544,6 +2544,11 @@ fn run_inline_worker_cycle() -> Result<(), String> {
     }
 }
 
+/// Maximum prep duration (ms) for a run to qualify as warm-path.
+/// INV-SLO-001: `is_warm_run` requires `prep_duration_ms <=
+/// WARM_PATH_PREP_THRESHOLD_MS`.
+const WARM_PATH_PREP_THRESHOLD_MS: u64 = 500;
+
 #[derive(Debug, serde::Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 struct GatesSummary {
@@ -2558,6 +2563,24 @@ struct GatesSummary {
     effective_timeout_seconds: u64,
     prep_duration_ms: u64,
     execute_duration_ms: u64,
+    /// Total wall-clock duration of prep + execute phases (ms).
+    /// Uses monotonic `Instant` (INV-2501).
+    total_duration_ms: u64,
+    /// Total number of evidence gates in this run (excludes the merge gate).
+    /// Used to determine `is_warm_run`: a run is warm only when
+    /// `cache_hit_count == total_gate_count` (every gate hit), preventing
+    /// uncacheable gates from being silently ignored.
+    total_gate_count: u32,
+    /// Number of evidence gates where cache returned a hit.
+    cache_hit_count: u32,
+    /// Number of evidence gates where cache returned a miss.
+    cache_miss_count: u32,
+    /// True iff ALL evidence gates hit the cache AND `prep_duration_ms` <= 500.
+    is_warm_run: bool,
+    /// Human-readable SLO breach description, or null when within SLO.
+    /// SLO violation is a warning only — never causes non-zero exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slo_violation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase_failed: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2968,6 +2991,61 @@ fn duration_ms(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Compute cache hit/miss counts from evidence gate results.
+///
+/// Each `EvidenceGateResult` may carry a `cache_decision`. A decision with
+/// `hit == true` is a cache hit; `hit == false` is a cache miss. Gates
+/// without a decision (e.g. merge-conflict gate) are excluded from the
+/// count.
+fn compute_cache_counts(gate_results: &[EvidenceGateResult]) -> (u32, u32) {
+    let mut hits: u32 = 0;
+    let mut misses: u32 = 0;
+    for result in gate_results {
+        if let Some(ref decision) = result.cache_decision {
+            if decision.hit {
+                hits = hits.saturating_add(1);
+            } else {
+                misses = misses.saturating_add(1);
+            }
+        }
+    }
+    (hits, misses)
+}
+
+/// Compute `is_warm_run` and `slo_violation` from summary fields.
+///
+/// INV-SLO-001: `is_warm_run = true` iff `cache_hit_count == total_gate_count`
+/// (i.e. every evidence gate hit the cache, including those with `None` cache
+/// decisions) AND `prep_duration_ms <= WARM_PATH_PREP_THRESHOLD_MS`.
+///
+/// `total_gate_count` is the number of evidence gates in the run (not counting
+/// the merge gate). Gates with `cache_decision: None` are neither hits nor
+/// misses, so checking `cache_miss_count == 0` alone would incorrectly mark a
+/// run as warm when uncacheable gates exist.
+///
+/// SLO violation is a warning only — it never causes a non-zero exit code
+/// (INV-SLO-002).
+fn compute_warm_path_slo(
+    total_gate_count: u32,
+    cache_hit_count: u32,
+    prep_duration_ms: u64,
+) -> (bool, Option<String>) {
+    let all_gates_hit = total_gate_count > 0 && cache_hit_count == total_gate_count;
+    let prep_within_threshold = prep_duration_ms <= WARM_PATH_PREP_THRESHOLD_MS;
+    let is_warm_run = all_gates_hit && prep_within_threshold;
+
+    let slo_violation = if all_gates_hit && !prep_within_threshold {
+        Some(format!(
+            "warm-path SLO violated: all gates hit cache but prep_duration_ms ({prep_duration_ms}) \
+             exceeds threshold ({WARM_PATH_PREP_THRESHOLD_MS} ms)"
+        ))
+    } else {
+        None
+    };
+
+    (is_warm_run, slo_violation)
+}
+
 fn build_gates_event(event: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut payload = match extra {
         serde_json::Value::Object(map) => map,
@@ -3227,14 +3305,28 @@ fn run_summary_event(run_id: &str, summary: &GatesSummary) -> serde_json::Value 
             })
         })
         .collect::<Vec<_>>();
+
+    // TCK-00627 S2: Emit SLO violation as a WARNING to stderr when set.
+    // SLO violation is informational only — never causes a non-zero exit
+    // code (INV-SLO-002).
+    if let Some(ref violation) = summary.slo_violation {
+        eprintln!("WARNING: {violation}");
+    }
+
     build_gates_event(
         "run_summary",
         serde_json::json!({
             "run_id": run_id,
             "sha": summary.sha.as_str(),
             "passed": summary.passed,
+            "total_duration_ms": summary.total_duration_ms,
             "prep_duration_ms": summary.prep_duration_ms,
             "execute_duration_ms": summary.execute_duration_ms,
+            "total_gate_count": summary.total_gate_count,
+            "cache_hit_count": summary.cache_hit_count,
+            "cache_miss_count": summary.cache_miss_count,
+            "is_warm_run": summary.is_warm_run,
+            "slo_violation": summary.slo_violation.as_deref(),
             "phase_failed": summary.phase_failed.as_deref(),
             "gate_verdicts": gate_verdicts,
         }),
@@ -3713,6 +3805,18 @@ fn run_gates_inner_detailed(
         Ok((prep_duration_ms, execute_duration_ms, mut summary)) => {
             summary.prep_duration_ms = prep_duration_ms;
             summary.execute_duration_ms = execute_duration_ms;
+            // TCK-00627 S1: total_duration_ms = prep + execute (monotonic).
+            summary.total_duration_ms = prep_duration_ms.saturating_add(execute_duration_ms);
+            // TCK-00627 S2: Compute warm-path SLO after durations are finalized.
+            // Uses total_gate_count (not cache_miss_count) to detect uncacheable
+            // gates that would otherwise be silently ignored.
+            let (is_warm_run, slo_violation) = compute_warm_path_slo(
+                summary.total_gate_count,
+                summary.cache_hit_count,
+                prep_duration_ms,
+            );
+            summary.is_warm_run = is_warm_run;
+            summary.slo_violation = slo_violation;
             summary.phase_failed = if summary.passed {
                 None
             } else {
@@ -3840,6 +3944,12 @@ fn run_execute_phase(
             effective_timeout_seconds: timeout_decision.effective_seconds,
             prep_duration_ms: 0,
             execute_duration_ms: 0,
+            total_duration_ms: 0,
+            total_gate_count: 0,
+            cache_hit_count: 0,
+            cache_miss_count: 0,
+            is_warm_run: false,
+            slo_violation: None,
             phase_failed: Some(GatesRunPhase::Execute.as_str().to_string()),
             prep_steps: Vec::new(),
             cache_status: "disabled (merge conflicts)".to_string(),
@@ -4144,6 +4254,13 @@ fn run_execute_phase(
 
     assert_execute_ambient_mutation_invariant(workspace_root, &execute_workspace_fingerprint)?;
 
+    // TCK-00627 S1: Compute cache hit/miss counts from evidence gate results.
+    let (cache_hit_count, cache_miss_count) = compute_cache_counts(&gate_results);
+    // TCK-00627 MAJOR fix: track total evidence gate count for is_warm_run.
+    // Truncation is safe: LANE_EVIDENCE_GATES.len() is a small constant (< 10).
+    #[allow(clippy::cast_possible_truncation)]
+    let total_gate_count = gate_results.len() as u32;
+
     Ok(GatesSummary {
         sha,
         passed,
@@ -4156,6 +4273,14 @@ fn run_execute_phase(
         effective_timeout_seconds: timeout_decision.effective_seconds,
         prep_duration_ms: 0,
         execute_duration_ms: 0,
+        // total_duration_ms, is_warm_run, and slo_violation are computed
+        // in run_gates_inner_detailed after prep/execute durations are known.
+        total_duration_ms: 0,
+        total_gate_count,
+        cache_hit_count,
+        cache_miss_count,
+        is_warm_run: false,
+        slo_violation: None,
         phase_failed: if passed {
             None
         } else {
@@ -4839,6 +4964,12 @@ mod tests {
             effective_timeout_seconds: 60,
             prep_duration_ms: 0,
             execute_duration_ms: 0,
+            total_duration_ms: 0,
+            total_gate_count: 0,
+            cache_hit_count: 0,
+            cache_miss_count: 0,
+            is_warm_run: false,
+            slo_violation: None,
             phase_failed: None,
             prep_steps: Vec::new(),
             cache_status: "write-through".to_string(),
@@ -7341,6 +7472,24 @@ time.sleep(20)\n",
             .expect("write code quality prompt");
         fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
             .expect("write security prompt");
+        let machine_spec = crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+            .expect("render FAC review machine spec snapshot fixture");
+        fs::write(
+            review_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec,
+        )
+        .expect("write FAC review machine spec snapshot fixture");
+        run_git(
+            &repo,
+            &[
+                "add",
+                "documents/reviews/test-safety-allowlist.txt",
+                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+                "documents/reviews/fac_review_state_machine.cac.json",
+            ],
+        );
+        run_git(&repo, &["commit", "-m", "add review fixtures"]);
         let cargo_path = bin_dir.join("cargo");
         fs::set_permissions(cargo_path, fs::Permissions::from_mode(0o755))
             .expect("set fake cargo mode");
@@ -7520,5 +7669,650 @@ time.sleep(20)\n",
                 "GateCache::load must return None when v2 is not persisted"
             );
         });
+    }
+
+    // ========================================================================
+    // TCK-00627 S4: Unit regression tests for is_warm_run and slo_violation
+    // ========================================================================
+
+    #[test]
+    fn warm_path_slo_all_gates_hit_prep_within_threshold() {
+        // All gates hit + prep < 500 ms => is_warm_run=true, slo_violation=null.
+        // Args: (total_gate_count=5, cache_hit_count=5, prep_duration_ms=200).
+        let (is_warm, violation) = compute_warm_path_slo(5, 5, 200);
+        assert!(
+            is_warm,
+            "expected is_warm_run=true when all gates hit and prep < 500ms"
+        );
+        assert!(
+            violation.is_none(),
+            "expected slo_violation=None when warm-path SLO satisfied"
+        );
+    }
+
+    #[test]
+    fn warm_path_slo_one_gate_miss() {
+        // One gate miss => is_warm_run=false.
+        // 5 total gates, only 4 hit => cache_hit_count < total_gate_count.
+        let (is_warm, violation) = compute_warm_path_slo(5, 4, 200);
+        assert!(
+            !is_warm,
+            "expected is_warm_run=false when at least one gate misses cache"
+        );
+        assert!(
+            violation.is_none(),
+            "expected slo_violation=None when gates missed (not a prep SLO violation)"
+        );
+    }
+
+    #[test]
+    fn warm_path_slo_all_hits_prep_exceeds_threshold() {
+        // All hits + prep > 500 ms => is_warm_run=false, slo_violation set.
+        let (is_warm, violation) = compute_warm_path_slo(5, 5, 600);
+        assert!(
+            !is_warm,
+            "expected is_warm_run=false when prep exceeds threshold"
+        );
+        assert!(
+            violation.is_some(),
+            "expected slo_violation set when all gates hit but prep exceeds 500ms"
+        );
+        let msg = violation.unwrap();
+        assert!(
+            msg.contains("600"),
+            "slo_violation should mention actual prep_duration_ms"
+        );
+        assert!(
+            msg.contains("500"),
+            "slo_violation should mention threshold"
+        );
+    }
+
+    #[test]
+    fn warm_path_slo_no_gates_at_all() {
+        // Edge case: 0 total gates, 0 hits.
+        // Cannot be warm if there were no gates.
+        let (is_warm, violation) = compute_warm_path_slo(0, 0, 100);
+        assert!(!is_warm, "expected is_warm_run=false with zero gates");
+        assert!(
+            violation.is_none(),
+            "expected slo_violation=None with zero gates"
+        );
+    }
+
+    #[test]
+    fn warm_path_slo_prep_exactly_at_threshold() {
+        // Boundary: prep == 500 ms with all hits => is_warm_run=true.
+        let (is_warm, violation) = compute_warm_path_slo(3, 3, 500);
+        assert!(
+            is_warm,
+            "expected is_warm_run=true when prep_duration_ms == 500 (threshold is <=)"
+        );
+        assert!(violation.is_none());
+    }
+
+    #[test]
+    fn warm_path_slo_prep_one_above_threshold() {
+        // Boundary: prep == 501 ms with all hits => is_warm_run=false, violation set.
+        let (is_warm, violation) = compute_warm_path_slo(3, 3, 501);
+        assert!(
+            !is_warm,
+            "expected is_warm_run=false when prep_duration_ms == 501"
+        );
+        assert!(violation.is_some());
+    }
+
+    #[test]
+    fn warm_path_slo_uncacheable_gate_prevents_warm_run() {
+        // MAJOR fix regression: 6 total gates but only 5 have cache_decision,
+        // and all 5 hit (cache_miss_count == 0). With the old logic
+        // (cache_miss_count == 0 && cache_hit_count > 0) this would
+        // incorrectly return is_warm_run=true. With total_gate_count-based
+        // logic, is_warm_run must be false because 5 < 6.
+        let (is_warm, violation) = compute_warm_path_slo(6, 5, 200);
+        assert!(
+            !is_warm,
+            "expected is_warm_run=false when uncacheable gate exists \
+             (cache_hit_count=5 < total_gate_count=6)"
+        );
+        assert!(
+            violation.is_none(),
+            "expected slo_violation=None (not all gates hit, so no prep SLO check)"
+        );
+    }
+
+    #[test]
+    fn slo_violation_does_not_affect_exit_code() {
+        // TCK-00627 S4: SLO violation does NOT cause non-zero exit code.
+        // The run_summary_event function emits a warning but does not change
+        // the summary.passed flag or return an error.
+        let mut summary = sample_phase_summary(true);
+        summary.cache_hit_count = 5;
+        summary.cache_miss_count = 0;
+        summary.prep_duration_ms = 700;
+        summary.slo_violation = Some("warm-path SLO violated: prep too slow".to_string());
+
+        // Verify that passed remains true despite SLO violation.
+        assert!(
+            summary.passed,
+            "SLO violation must not flip the passed flag"
+        );
+
+        // Verify the event is emitted successfully (no panic).
+        let payload = run_summary_event("run-slo", &summary);
+        assert_eq!(
+            payload.get("passed").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "passed must remain true in the emitted event"
+        );
+        assert_eq!(
+            payload
+                .get("slo_violation")
+                .and_then(serde_json::Value::as_str),
+            Some("warm-path SLO violated: prep too slow"),
+            "slo_violation must be present in the emitted event"
+        );
+    }
+
+    #[test]
+    fn compute_cache_counts_from_evidence_gate_results() {
+        use apm2_core::fac::gate_cache_v3::{CacheDecision, CacheReasonCode};
+
+        let results = vec![
+            EvidenceGateResult {
+                gate_name: "fmt".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                cache_decision: Some(CacheDecision::cache_hit("abc")),
+            },
+            EvidenceGateResult {
+                gate_name: "clippy".to_string(),
+                passed: true,
+                duration_secs: 2,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                cache_decision: Some(CacheDecision::cache_miss(
+                    CacheReasonCode::ShaMiss,
+                    Some("sha1"),
+                )),
+            },
+            EvidenceGateResult {
+                gate_name: "doc".to_string(),
+                passed: true,
+                duration_secs: 1,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                cache_decision: Some(CacheDecision::cache_hit("def")),
+            },
+            EvidenceGateResult {
+                gate_name: "test".to_string(),
+                passed: true,
+                duration_secs: 10,
+                log_path: None,
+                bytes_written: None,
+                bytes_total: None,
+                was_truncated: None,
+                log_bundle_hash: None,
+                // No cache decision (e.g. cache not applicable).
+                cache_decision: None,
+            },
+        ];
+
+        let (hits, misses) = compute_cache_counts(&results);
+        assert_eq!(hits, 2, "expected 2 cache hits");
+        assert_eq!(misses, 1, "expected 1 cache miss");
+    }
+
+    #[test]
+    fn run_summary_event_contains_warm_path_fields() {
+        let mut summary = sample_phase_summary(true);
+        summary.prep_duration_ms = 100;
+        summary.execute_duration_ms = 500;
+        summary.total_duration_ms = 600;
+        summary.total_gate_count = 5;
+        summary.cache_hit_count = 5;
+        summary.cache_miss_count = 0;
+        summary.is_warm_run = true;
+        summary.slo_violation = None;
+
+        let payload = run_summary_event("run-warm", &summary);
+
+        assert_eq!(
+            payload
+                .get("total_duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(600),
+            "total_duration_ms must be present in run_summary event"
+        );
+        assert_eq!(
+            payload
+                .get("cache_hit_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(5),
+            "cache_hit_count must be present in run_summary event"
+        );
+        assert_eq!(
+            payload
+                .get("cache_miss_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(0),
+            "cache_miss_count must be present in run_summary event"
+        );
+        assert_eq!(
+            payload
+                .get("is_warm_run")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "is_warm_run must be present in run_summary event"
+        );
+        assert!(
+            payload
+                .get("slo_violation")
+                .is_none_or(serde_json::Value::is_null),
+            "slo_violation must be null when no violation"
+        );
+    }
+
+    #[test]
+    fn run_summary_event_contains_slo_violation_when_set() {
+        let mut summary = sample_phase_summary(true);
+        summary.cache_hit_count = 5;
+        summary.cache_miss_count = 0;
+        summary.prep_duration_ms = 750;
+        summary.is_warm_run = false;
+        summary.slo_violation = Some(
+            "warm-path SLO violated: prep_duration_ms (750) exceeds threshold (500 ms)".to_string(),
+        );
+
+        let payload = run_summary_event("run-slo-fail", &summary);
+        assert_eq!(
+            payload
+                .get("is_warm_run")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+        );
+        assert!(
+            payload
+                .get("slo_violation")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains("750")),
+            "slo_violation must contain actual prep_duration_ms"
+        );
+    }
+
+    // ========================================================================
+    // TCK-00627 S3: CI benchmark — warm-path SLO verification
+    //
+    // This integration test invokes `run_gates_inner` end-to-end against a
+    // hermetic git workspace (prep → execute → summary) and then verifies the
+    // warm-path SLO invariants specified by the ticket.
+    //
+    // The test exercises two scenarios:
+    //
+    // Part A — Pipeline end-to-end: calls `run_gates_inner` twice to confirm
+    //   the full gate pipeline produces well-formed `GatesSummary` values with
+    //   populated timing and gate-count fields.
+    //
+    // Part B — Warm path with seeded v3 cache: seeds a signed v3 gate cache
+    //   using run1's real SHA and attestation digests, then invokes the
+    //   pipeline again (quick=false) so the evidence layer reads and reuses
+    //   cached entries. All SLO assertions evaluate the *actual* run2
+    //   `GatesSummary` fields:
+    //     - cache_hit_count == total_gate_count (real cache hits)
+    //     - total_duration_ms <= run1.total_duration_ms * 0.20 (real timing)
+    //     - prep_duration_ms <= 500
+    //     - is_warm_run == true
+    //
+    // Run 1 uses quick=false (full cold-path baseline). Between runs the v3
+    // gate cache is seeded. Run 2 uses quick=false so the evidence layer
+    // activates cache reuse. All gates hit cache — no actual compilation or
+    // systemd execution occurs even though the bounded commands are built.
+    // ========================================================================
+
+    #[allow(unsafe_code)] // Env var mutation required for hermetic test setup.
+    #[test]
+    fn ci_benchmark_warm_path_slo_two_consecutive_runs() {
+        use std::env;
+        use std::ffi::OsString;
+
+        struct EnvGuard {
+            vars: Vec<(&'static str, Option<OsString>)>,
+            current_dir: Option<std::path::PathBuf>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in self.vars.drain(..) {
+                    if let Some(value) = value {
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
+                        unsafe { std::env::set_var(name, value) };
+                    } else {
+                        // SAFETY: serialized via crate::commands::env_var_test_lock
+                        unsafe { std::env::remove_var(name) };
+                    }
+                }
+                if let Some(path) = self.current_dir.take() {
+                    let _ = std::env::set_current_dir(path);
+                }
+            }
+        }
+
+        let _guard = crate::commands::env_var_test_lock()
+            .lock()
+            .expect("serialize env-mutating integration test");
+
+        // --- Set up hermetic git workspace ---
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo = temp_dir.path().join("workspace");
+        fs::create_dir_all(&repo).expect("create workspace");
+        let apm2_home = temp_dir.path().join("apm2_home");
+        let bin_dir = temp_dir.path().join("fake-bin");
+        let review_dir = repo.join("documents").join("reviews");
+
+        let apm2_private = apm2_home.join("private");
+        let apm2_fac = apm2_private.join("fac");
+        fs::create_dir_all(&apm2_fac).expect("create apm2 home");
+        fs::set_permissions(&apm2_home, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 home mode");
+        fs::set_permissions(&apm2_private, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 private mode");
+        fs::set_permissions(&apm2_fac, fs::Permissions::from_mode(0o700))
+            .expect("set apm2 fac mode");
+        fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+        fs::create_dir_all(&review_dir).expect("create review dir");
+
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "fac gates benchmark test\n").expect("write repo file");
+        fs::write(repo.join(".gitignore"), "target/\n").expect("write gitignore");
+        run_git(&repo, &["add", "README.md", ".gitignore"]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["branch", "-M", "main"]);
+
+        // Shell scripts use $phase / $1 / $HOME etc. — NOT Rust format args.
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let fake_cargo = "#!/bin/sh\nexit 0\n";
+        fs::write(bin_dir.join("cargo"), fake_cargo).expect("write fake cargo");
+        fs::set_permissions(bin_dir.join("cargo"), fs::Permissions::from_mode(0o755))
+            .expect("set fake cargo mode");
+
+        fs::write(review_dir.join("test-safety-allowlist.txt"), b"# empty\n")
+            .expect("write allowlist");
+
+        let prompt = concat!(
+            "{\n",
+            "  \"payload\": {\n",
+            "    \"commands\": {\n",
+            "      \"binary_prefix\": \"apm2\",\n",
+            "      \"prepare\": \"apm2 fac review prepare --pr $PR_NUMBER --sha $HEAD_SHA\",\n",
+            "      \"finding\": \"apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA\",\n",
+            "      \"verdict\": \"apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA\"\n",
+            "    },\n",
+            "    \"constraints\": {\n",
+            "      \"forbidden_operations\": [\n",
+            "        \"Always pass --pr $PR_NUMBER --sha $HEAD_SHA when running prepare/finding/verdict.\"\n",
+            "      ],\n",
+            "      \"invariants\": [\n",
+            "        \"Bind commands using $PR_NUMBER and $HEAD_SHA.\"\n",
+            "      ]\n",
+            "    }\n",
+            "  }\n",
+            "}\n"
+        );
+        fs::write(review_dir.join("CODE_QUALITY_PROMPT.cac.json"), prompt)
+            .expect("write code quality prompt");
+        fs::write(review_dir.join("SECURITY_REVIEW_PROMPT.cac.json"), prompt)
+            .expect("write security prompt");
+        let machine_spec = crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+            .expect("render FAC review machine spec snapshot fixture");
+        fs::write(
+            review_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec,
+        )
+        .expect("write FAC review machine spec snapshot fixture");
+
+        run_git(
+            &repo,
+            &[
+                "add",
+                "documents/reviews/test-safety-allowlist.txt",
+                "documents/reviews/CODE_QUALITY_PROMPT.cac.json",
+                "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
+                "documents/reviews/fac_review_state_machine.cac.json",
+            ],
+        );
+        run_git(&repo, &["commit", "-m", "add review fixtures"]);
+
+        // --- Configure hermetic environment ---
+        let original_path = env::var_os("PATH");
+        let original_apm2_home = env::var_os("APM2_HOME");
+        let original_lane_count = env::var_os("APM2_FAC_LANE_COUNT");
+        let original_dir = env::current_dir().expect("capture current dir");
+        let path_override = format!(
+            "{}:{}",
+            bin_dir.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+
+        // SAFETY: serialized via crate::commands::env_var_test_lock
+        unsafe {
+            env::set_var("PATH", path_override);
+            env::set_var("APM2_HOME", &apm2_home);
+            env::set_var("APM2_FAC_LANE_COUNT", "1");
+        }
+        let _env_guard = EnvGuard {
+            vars: vec![
+                ("PATH", original_path),
+                ("APM2_HOME", original_apm2_home),
+                ("APM2_FAC_LANE_COUNT", original_lane_count),
+            ],
+            current_dir: Some(original_dir),
+        };
+
+        env::set_current_dir(&repo).expect("set test repository as cwd");
+
+        let preflight_status = Command::new("git")
+            .args(["status", "--short", "--untracked-files=all"])
+            .current_dir(&repo)
+            .output()
+            .expect("collect preflight git status");
+        assert!(
+            preflight_status.status.success(),
+            "git status preflight should succeed: {}",
+            String::from_utf8_lossy(&preflight_status.stderr)
+        );
+        let preflight_status_text = String::from_utf8_lossy(&preflight_status.stdout);
+        assert!(
+            preflight_status_text.trim().is_empty(),
+            "benchmark fixture repo must start clean, found:\n{preflight_status_text}",
+        );
+
+        // ---- Run 1 (cold): exercises the full gate pipeline ----
+        let run1 = run_gates_inner(
+            &repo,
+            false, // force
+            false, // quick=false so cold-path baseline reflects full FAC gate profile
+            30,
+            "128M",
+            128,
+            "100%",
+            GateThroughputProfile::Conservative,
+            2,
+            false,
+            None,
+        )
+        .expect("run1 (cold) should complete the full pipeline successfully");
+        assert!(
+            run1.passed,
+            "run1 must pass all evidence gates; run1_summary={}",
+            serde_json::to_string(&run1).expect("serialize run1 summary"),
+        );
+        assert!(
+            run1.total_gate_count > 0,
+            "pipeline must execute at least one evidence gate"
+        );
+        assert_eq!(
+            run1.total_duration_ms,
+            run1.prep_duration_ms
+                .saturating_add(run1.execute_duration_ms),
+            "total_duration_ms must equal prep + execute"
+        );
+
+        // Promote run1 cache entries with receipt binding flags to emulate the
+        // post-receipt promotion step that occurs in production push flows.
+        // Without this, reuse is fail-closed with `receipt_binding_missing`.
+        let fac_root = apm2_home.join("private/fac");
+        let v3_root = fac_root.join("gate_cache_v3");
+        let fac_policy = load_or_create_gate_policy(&fac_root).expect("load fac policy");
+        let sandbox_hardening_hash = fac_policy.sandbox_hardening.content_hash_hex();
+        let gate_network_policy =
+            apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
+        let network_policy_hash = gate_network_policy.content_hash_hex();
+        let compound_key = compute_v3_compound_key(
+            &run1.sha,
+            &fac_policy,
+            &sandbox_hardening_hash,
+            &network_policy_hash,
+        )
+        .expect("compute v3 compound key for receipt promotion");
+        let mut v3_cache = GateCacheV3::load_from_dir(&v3_root, &run1.sha, &compound_key)
+            .expect("run1 must persist v3 cache");
+        let gates_to_bind: Vec<String> = v3_cache.gates.keys().cloned().collect();
+        for gate in gates_to_bind {
+            v3_cache.bind_receipt_evidence(&gate, true, true);
+        }
+        let signer =
+            crate::commands::fac_key_material::load_or_generate_persistent_signer(&fac_root)
+                .expect("persistent signer for receipt promotion");
+        v3_cache.sign_all(&signer);
+        v3_cache
+            .save_to_dir(&v3_root)
+            .expect("persist receipt-promoted v3 cache");
+
+        // ---- Run 2 (warm): production path ----
+        // Execute the second run through the same production helper used by
+        // run1 so we assert directly on real run-summary fields.
+        let run2_progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run2_progress_sink = std::sync::Arc::clone(&run2_progress);
+        let run2 = run_gates_inner(
+            &repo,
+            false, // force
+            false, // quick=false to preserve parity with run1
+            30,
+            "128M",
+            128,
+            "100%",
+            GateThroughputProfile::Conservative,
+            2,
+            false,
+            Some(Box::new(move |event| {
+                if let GateProgressEvent::Completed {
+                    gate_name,
+                    cache_decision,
+                    ..
+                } = event
+                {
+                    let mut guard = run2_progress_sink
+                        .lock()
+                        .expect("run2 progress lock must not be poisoned");
+                    guard.push((gate_name, cache_decision));
+                }
+            })),
+        )
+        .expect("run2 (warm) should complete the full pipeline successfully");
+        assert!(
+            run2.passed,
+            "run2 must pass all evidence gates; run2_summary={}",
+            serde_json::to_string(&run2).expect("serialize run2 summary"),
+        );
+
+        assert_eq!(
+            run2.total_gate_count, run1.total_gate_count,
+            "both runs must discover the same number of evidence gates"
+        );
+        assert_eq!(
+            run2.cache_hit_count,
+            run1.total_gate_count,
+            "run2 cache_hit_count ({}) must equal run1 gate count ({}); run2_summary={}, \
+             run2_progress={:?}",
+            run2.cache_hit_count,
+            run1.total_gate_count,
+            serde_json::to_string(&run2).expect("serialize run2 summary"),
+            run2_progress
+                .lock()
+                .expect("run2 progress lock must not be poisoned")
+                .as_slice(),
+        );
+
+        // S3 invariant 4: run2.total_duration_ms <= run1.total_duration_ms * 0.20.
+        let cold_total_ms = run1.total_duration_ms.max(1);
+        let threshold_20_pct = cold_total_ms / 5;
+        assert!(
+            run2.total_duration_ms <= threshold_20_pct,
+            "run2 total_duration_ms ({}) must be <= 20%% of run1 total ({cold_total_ms}) = \
+             {threshold_20_pct}",
+            run2.total_duration_ms,
+        );
+
+        // S3 invariant 5: run2.prep_duration_ms <= 500.
+        assert!(
+            run2.prep_duration_ms <= WARM_PATH_PREP_THRESHOLD_MS,
+            "run2 prep_duration_ms ({}) must be <= {WARM_PATH_PREP_THRESHOLD_MS} ms",
+            run2.prep_duration_ms,
+        );
+
+        // S3 invariant 6: is_warm_run == true with no violation payload.
+        assert!(
+            run2.is_warm_run,
+            "run2 must be a warm run; cache_hit_count={}, total_gate_count={}, prep_duration_ms={}",
+            run2.cache_hit_count, run2.total_gate_count, run2.prep_duration_ms,
+        );
+        assert!(
+            run2.slo_violation.is_none(),
+            "run2 must have no SLO violation; got: {:?}",
+            run2.slo_violation,
+        );
+
+        // Verify emitted run_summary fields from the production run2 summary.
+        let payload = run_summary_event("run-warm-benchmark", &run2);
+        assert_eq!(
+            payload
+                .get("is_warm_run")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "emitted run_summary must reflect is_warm_run=true"
+        );
+        assert_eq!(
+            payload
+                .get("cache_hit_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(run2.cache_hit_count)),
+            "emitted cache_hit_count must match actual run2 cache_hit_count"
+        );
+        assert_eq!(
+            payload
+                .get("total_gate_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(run2.total_gate_count)),
+            "emitted total_gate_count must be present in run_summary event"
+        );
+        assert_eq!(
+            payload
+                .get("prep_duration_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(run2.prep_duration_ms),
+            "emitted prep_duration_ms must match actual run2 prep phase timing"
+        );
     }
 }

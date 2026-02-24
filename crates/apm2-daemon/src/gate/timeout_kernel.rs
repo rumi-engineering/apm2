@@ -2066,11 +2066,17 @@ fn parse_gate_type_from_gate_id(gate_id: &str) -> Option<GateType> {
 fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), String> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode gate_lease_issued payload json: {e}"))?;
-    let full_lease = payload_json
+    let (lease_value, decode_context) = payload_json
         .get("full_lease")
-        .ok_or_else(|| "gate_lease_issued payload missing full_lease".to_string())?;
-    let lease: GateLease = serde_json::from_value(full_lease.clone())
-        .map_err(|e| format!("failed to decode full_lease payload: {e}"))?;
+        .cloned()
+        // Legacy persisted shape stored GateLease fields at top-level.
+        .map_or_else(
+            || (payload_json.clone(), "legacy_top_level"),
+            |value| (value, "full_lease"),
+        );
+    let lease: GateLease = serde_json::from_value(lease_value).map_err(|e| {
+        format!("failed to decode gate_lease_issued payload ({decode_context}): {e}")
+    })?;
     let gate_type = parse_gate_type_from_gate_id(&lease.gate_id).ok_or_else(|| {
         format!(
             "gate_lease_issued full_lease has unsupported gate_id '{}'",
@@ -2177,6 +2183,31 @@ mod tests {
             observed_monotonic_ns,
             deadline_monotonic_ns,
         }
+    }
+
+    #[test]
+    fn parse_gate_lease_payload_accepts_full_lease_envelope() {
+        let lease = sample_gate_lease("lease-parse-envelope", 2_000);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "full_lease": lease,
+        }))
+        .expect("payload serialize");
+
+        let (parsed, gate_type) =
+            parse_gate_lease_payload(&payload).expect("full_lease envelope should parse");
+        assert_eq!(parsed.lease_id, "lease-parse-envelope");
+        assert_eq!(gate_type, GateType::Quality);
+    }
+
+    #[test]
+    fn parse_gate_lease_payload_accepts_legacy_top_level_shape() {
+        let lease = sample_gate_lease("lease-parse-legacy", 3_000);
+        let payload = serde_json::to_vec(&lease).expect("legacy payload serialize");
+
+        let (parsed, gate_type) =
+            parse_gate_lease_payload(&payload).expect("legacy top-level payload should parse");
+        assert_eq!(parsed.lease_id, "lease-parse-legacy");
+        assert_eq!(gate_type, GateType::Quality);
     }
 
     #[test]
