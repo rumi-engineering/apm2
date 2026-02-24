@@ -273,7 +273,22 @@ impl WorkObjectProjection {
                     Err(error) => return Err(error),
                 };
             for reducer_event in &reducer_events {
-                self.apply_reducer_event(reducer_event)?;
+                if let Err(error) = self.apply_reducer_event(reducer_event) {
+                    if reducer_event.event_type == "work.pr_associated" {
+                        // Legacy ledgers can contain PR association events in
+                        // non-canonical lifecycle positions. Skipping these
+                        // malformed replay artifacts preserves projection
+                        // availability for authoritative lifecycle reads.
+                        warn!(
+                            event_type = %reducer_event.event_type,
+                            work_id = %reducer_event.session_id,
+                            error = %error,
+                            "Skipping non-replayable work.pr_associated reducer event during projection rebuild"
+                        );
+                        continue;
+                    }
+                    return Err(error.into());
+                }
             }
 
             if let Some(graph_event) = decode_work_graph_event(event)? {
@@ -1401,6 +1416,20 @@ mod tests {
         )
     }
 
+    fn work_pr_associated_event(
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+        timestamp_ns: u64,
+    ) -> SignedLedgerEvent {
+        signed_event(
+            "work.pr_associated",
+            work_id,
+            helpers::work_pr_associated_payload(work_id, pr_number, commit_sha),
+            timestamp_ns,
+        )
+    }
+
     fn work_graph_added_event(
         from_work_id: &str,
         to_work_id: &str,
@@ -1641,6 +1670,32 @@ mod tests {
             .get_work(work_id)
             .expect("work.opened must remain projected even when malformed PR association exists");
         assert_eq!(opened.state, WorkState::Open);
+    }
+
+    #[test]
+    fn rebuild_skips_non_replayable_work_pr_associated_reducer_event() {
+        let mut projection = WorkObjectProjection::new();
+        let work_id = "W-skip-non-replayable-pr-associated";
+
+        let events = vec![
+            work_opened_event(work_id, 1_000),
+            work_transitioned_event(work_id, "OPEN", "CLAIMED", 0, 1_001),
+            work_pr_associated_event(
+                work_id,
+                88,
+                "0123456789abcdef0123456789abcdef01234567",
+                1_002,
+            ),
+        ];
+
+        projection
+            .rebuild_from_signed_events(&events)
+            .expect("non-replayable work.pr_associated should be skipped, not poison projection");
+
+        let projected = projection
+            .get_work(work_id)
+            .expect("work should remain available after skipping non-replayable association");
+        assert_eq!(projected.state, WorkState::Claimed);
     }
 
     #[test]
