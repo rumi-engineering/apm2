@@ -1,4 +1,4 @@
-//! Integration tests for TCK-00429: verifier economics enforcement.
+//! Integration tests for RFC-0020::REQ-0048: verifier economics enforcement.
 //!
 //! Tests verify:
 //! - Tier2+ operations fail closed when bounds exceeded

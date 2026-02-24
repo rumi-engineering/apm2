@@ -1,7 +1,7 @@
-//! Real tool handlers for core tool classes (TCK-00291).
+//! Real tool handlers for core tool classes (RFC-0032::REQ-0093).
 //!
 //! This module provides real implementations of the core tool handlers per
-//! TCK-00291. These handlers perform actual I/O and command execution with
+//! RFC-0032::REQ-0093. These handlers perform actual I/O and command execution with
 //! strict bounds and security controls.
 //!
 //! # Implemented Handlers
@@ -29,7 +29,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00291: Real tool handler implementation
+//! - RFC-0032::REQ-0093: Real tool handler implementation
 //! - CTR-1503: Path traversal prevention
 //! - CTR-1502: Atomic file updates
 
@@ -49,13 +49,13 @@ use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultDat
 use super::verified_content::normalized_verified_content_lookup_keys;
 
 // =============================================================================
-// Platform-Specific O_NOFOLLOW Support (TCK-00319 TOCTOU Mitigation)
+// Platform-Specific O_NOFOLLOW Support (RFC-0032::REQ-0113 TOCTOU Mitigation)
 // =============================================================================
 
 /// Opens a file with `O_NOFOLLOW` on Unix platforms to prevent TOCTOU symlink
 /// attacks.
 ///
-/// # Security (TCK-00319)
+/// # Security (RFC-0032::REQ-0113)
 ///
 /// On Unix, this uses `OpenOptionsExt::custom_flags(libc::O_NOFOLLOW)` to
 /// ensure the kernel rejects symlinks at open time. This closes the TOCTOU
@@ -92,7 +92,7 @@ async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Err
 
 /// Opens a file for writing with `O_NOFOLLOW` on Unix platforms.
 ///
-/// # Security (TCK-00319)
+/// # Security (RFC-0032::REQ-0113)
 ///
 /// See `open_file_nofollow` for security rationale.
 #[cfg(unix)]
@@ -135,7 +135,7 @@ async fn open_file_write_nofollow(
 }
 
 // =============================================================================
-// Path Validation Helpers (TCK-00319 Security Module)
+// Path Validation Helpers (RFC-0032::REQ-0113 Security Module)
 // =============================================================================
 
 /// Validates a path for security issues.
@@ -281,7 +281,7 @@ fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerEr
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // TCK-00319 SECURITY FIX: Do NOT break early on NotFound!
+                // RFC-0032::REQ-0113 SECURITY FIX: Do NOT break early on NotFound!
                 //
                 // Breaking here allows attackers to bypass symlink checks using
                 // paths like `nonexistent/symlink_to_etc/file`. The attacker
@@ -323,7 +323,7 @@ fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerEr
 ///
 /// # Security
 ///
-/// This function combines multiple layers of defense per TCK-00319:
+/// This function combines multiple layers of defense per RFC-0032::REQ-0113:
 ///
 /// 1. **Syntactic validation** - Rejects `..`, absolute paths, null bytes
 /// 2. **Symlink component check** - Uses `symlink_metadata` on each component
@@ -403,7 +403,7 @@ pub struct ReadFileHandler {
     root: PathBuf,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `ReadFileHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -418,7 +418,7 @@ impl Default for ReadFileHandler {
 impl ReadFileHandler {
     /// Creates a new read file handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -428,7 +428,7 @@ impl ReadFileHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -475,7 +475,7 @@ impl ReadFileHandler {
         // Start timing I/O operations (MAJOR 2 fix)
         let io_start = Instant::now();
 
-        // Canonicalize root for comparison (TCK-00319: TOCTOU mitigation)
+        // Canonicalize root for comparison (RFC-0032::REQ-0113: TOCTOU mitigation)
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -485,7 +485,7 @@ impl ReadFileHandler {
                 ),
             })?;
 
-        // TCK-00319: Use TOCTOU-mitigating validation that checks for symlinks
+        // RFC-0032::REQ-0113: Use TOCTOU-mitigating validation that checks for symlinks
         // BEFORE canonicalization to prevent symlink-swap attacks
         let validated_path =
             validate_path_with_toctou_mitigation(&read_args.path, &canonical_root)?;
@@ -516,7 +516,7 @@ impl ReadFileHandler {
                 });
             }
         } else {
-            // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
+            // RFC-0032::REQ-0113: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
             // This ensures the kernel rejects symlinks at open time, closing the window
             // between validation and access.
             let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
@@ -644,7 +644,7 @@ pub struct WriteFileHandler {
     root: PathBuf,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `WriteFileHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -659,7 +659,7 @@ impl Default for WriteFileHandler {
 impl WriteFileHandler {
     /// Creates a new write file handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -669,7 +669,7 @@ impl WriteFileHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -707,7 +707,7 @@ impl ToolHandler for WriteFileHandler {
         // Start timing I/O operations (MAJOR 2 fix)
         let io_start = Instant::now();
 
-        // Canonicalize root for comparison (TCK-00319: TOCTOU mitigation)
+        // Canonicalize root for comparison (RFC-0032::REQ-0113: TOCTOU mitigation)
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -717,7 +717,7 @@ impl ToolHandler for WriteFileHandler {
                 ),
             })?;
 
-        // TCK-00319: VALIDATE FIRST before any filesystem mutations!
+        // RFC-0032::REQ-0113: VALIDATE FIRST before any filesystem mutations!
         // This prevents path traversal attacks via create_dir_all
         // Step 1: Syntactic validation (rejects .., absolute paths, null bytes)
         validate_path(&write_args.path)?;
@@ -731,7 +731,7 @@ impl ToolHandler for WriteFileHandler {
         reject_symlinks_in_path(&full_path, &canonical_root)?;
 
         // Step 4: Create parent directories if requested (AFTER symlink validation)
-        // TCK-00319 SECURITY: Full validation BEFORE any filesystem mutations.
+        // RFC-0032::REQ-0113 SECURITY: Full validation BEFORE any filesystem mutations.
         //
         // The initial symlink check (Step 3) validates existing components.
         // After create_dir_all, we MUST re-validate to catch any TOCTOU attacks
@@ -752,7 +752,7 @@ impl ToolHandler for WriteFileHandler {
                     }
                 })?;
 
-                // TCK-00319 SECURITY: Re-validate parent for symlinks IMMEDIATELY
+                // RFC-0032::REQ-0113 SECURITY: Re-validate parent for symlinks IMMEDIATELY
                 // after create_dir_all to catch TOCTOU races. An attacker might:
                 // 1. Wait for create_dir_all to create /workspace/a/
                 // 2. Race to replace /workspace/a/ with symlink to /etc/
@@ -776,7 +776,7 @@ impl ToolHandler for WriteFileHandler {
         if write_args.append {
             // Append mode: cannot be strictly atomic, but standard O_APPEND is safe
             // for appends.
-            // TCK-00319: Use O_NOFOLLOW to prevent TOCTOU symlink attacks.
+            // RFC-0032::REQ-0113: Use O_NOFOLLOW to prevent TOCTOU symlink attacks.
             let mut file = open_file_write_nofollow(&validated_path, true, true)
                 .await
                 .map_err(|e| ToolHandlerError::ExecutionFailed {
@@ -939,7 +939,7 @@ const ENV_BLOCKLIST_PATTERNS: &[&str] = &[
 ];
 
 // =============================================================================
-// TCK-00338: Shell Argument Escaping (SEC-CTRL-FAC-0016)
+// RFC-0032::REQ-0129: Shell Argument Escaping (SEC-CTRL-FAC-0016)
 // =============================================================================
 
 /// Characters that require shell escaping when appearing in arguments.
@@ -958,7 +958,7 @@ const SHELL_SPECIAL_CHARS: &[char] = &[
 
 /// Escapes a shell argument to prevent injection attacks.
 ///
-/// # Security (TCK-00338)
+/// # Security (RFC-0032::REQ-0129)
 ///
 /// This function ensures that arguments are properly escaped when building
 /// a command line string for allowlist matching. Without escaping, an argument
@@ -1009,7 +1009,7 @@ fn escape_shell_arg(arg: &str) -> String {
 
 /// Builds a shell-safe command line string for allowlist matching.
 ///
-/// # Security (TCK-00338)
+/// # Security (RFC-0032::REQ-0129)
 ///
 /// This function constructs a command line representation where each argument
 /// is properly escaped to prevent injection attacks. The resulting string
@@ -1034,7 +1034,7 @@ fn build_escaped_command_line(command: &str, args: &[String]) -> String {
     }
 }
 
-/// Configuration for sandboxed command execution (TCK-00338).
+/// Configuration for sandboxed command execution (RFC-0032::REQ-0129).
 ///
 /// This struct encapsulates security policies for the `ExecuteHandler`:
 /// - Shell command allowlist (fail-closed if empty)
@@ -1155,7 +1155,7 @@ impl SandboxConfig {
 /// This handler executes commands in a sandboxed environment (restricted to
 /// CWD/workspace), enforces timeouts, and bounds output capture.
 ///
-/// # Security (TCK-00338)
+/// # Security (RFC-0032::REQ-0129)
 ///
 /// - **Shell Allowlist**: Commands must match patterns in
 ///   `SandboxConfig::shell_allowlist`. Empty allowlist means fail-closed (no
@@ -1174,7 +1174,7 @@ pub struct ExecuteHandler {
     sandbox_config: SandboxConfig,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `ExecuteHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -1191,7 +1191,7 @@ impl Default for ExecuteHandler {
 impl ExecuteHandler {
     /// Creates a new execute handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -1201,7 +1201,7 @@ impl ExecuteHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1213,7 +1213,7 @@ impl ExecuteHandler {
 
     /// Creates a new execute handler with a specific root directory.
     ///
-    /// # Security (TCK-00338)
+    /// # Security (RFC-0032::REQ-0129)
     ///
     /// This constructor uses a fail-closed sandbox config (empty allowlist).
     /// No commands will be allowed unless you explicitly configure the sandbox
@@ -1226,14 +1226,14 @@ impl ExecuteHandler {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            // TCK-00338: Fail-closed by default (no commands allowed)
+            // RFC-0032::REQ-0129: Fail-closed by default (no commands allowed)
             sandbox_config: SandboxConfig::default(),
         }
     }
 
     /// Creates a new execute handler with permissive sandbox config.
     ///
-    /// # Security Warning (TCK-00338)
+    /// # Security Warning (RFC-0032::REQ-0129)
     ///
     /// This constructor allows ALL commands to execute. Only use in:
     /// - Tests that need backwards-compatible permissive behavior
@@ -1251,7 +1251,7 @@ impl ExecuteHandler {
 
     /// Creates a new execute handler with explicit sandbox configuration.
     ///
-    /// # Security (TCK-00338)
+    /// # Security (RFC-0032::REQ-0129)
     ///
     /// This is the recommended constructor for production use. It allows you to
     /// specify:
@@ -1308,7 +1308,7 @@ impl ToolHandler for ExecuteHandler {
         let exec_start = Instant::now();
 
         // =====================================================================
-        // TCK-00338: Shell Allowlist Validation (SEC-CTRL-FAC-0016)
+        // RFC-0032::REQ-0129: Shell Allowlist Validation (SEC-CTRL-FAC-0016)
         // =====================================================================
         // Build full command line for allowlist matching.
         // Arguments are escaped to prevent injection attacks where special
@@ -1335,7 +1335,7 @@ impl ToolHandler for ExecuteHandler {
         cmd.args(&exec_args.args);
 
         // =====================================================================
-        // TCK-00338: Environment Variable Scrubbing (SEC-CTRL-FAC-0016)
+        // RFC-0032::REQ-0129: Environment Variable Scrubbing (SEC-CTRL-FAC-0016)
         // =====================================================================
         // Clear all environment variables to prevent credential/secret leakage,
         // then selectively restore only allowlisted variables.
@@ -1350,7 +1350,7 @@ impl ToolHandler for ExecuteHandler {
             }
         }
 
-        // Set working directory with symlink-aware validation (TCK-00319: TOCTOU
+        // Set working directory with symlink-aware validation (RFC-0032::REQ-0113: TOCTOU
         // mitigation) Canonicalize root for comparison
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
@@ -1363,7 +1363,7 @@ impl ToolHandler for ExecuteHandler {
 
         // If cwd is provided, it's relative to root.
         // If not provided, use root as CWD (which is the canonical root).
-        // TCK-00319: Use TOCTOU-mitigating validation for cwd paths
+        // RFC-0032::REQ-0113: Use TOCTOU-mitigating validation for cwd paths
         let validated_cwd = if let Some(ref cwd) = exec_args.cwd {
             validate_path_with_toctou_mitigation(cwd, &canonical_root)?
         } else {
@@ -1406,7 +1406,7 @@ impl ToolHandler for ExecuteHandler {
         let timeout_ms = exec_args.timeout_ms.unwrap_or(30_000);
         let timeout = Duration::from_millis(timeout_ms);
 
-        // TCK-00338: Stall detection timeout configuration
+        // RFC-0032::REQ-0129: Stall detection timeout configuration
         let stall_timeout_ms = self.sandbox_config.stall_timeout_ms;
         let stall_detection_enabled = stall_timeout_ms > 0;
 
@@ -1431,7 +1431,7 @@ impl ToolHandler for ExecuteHandler {
         // other
         let per_stream_limit = MAX_TOOL_OUTPUT_SIZE / 2;
 
-        // TCK-00338: Shared state for stall detection - tracks last output time
+        // RFC-0032::REQ-0129: Shared state for stall detection - tracks last output time
         // across both stdout and stderr readers using atomic operations.
         // Note: truncation from u128 to u64 is safe here as millis since exec_start
         // will never approach u64::MAX in any reasonable execution.
@@ -1456,7 +1456,7 @@ impl ToolHandler for ExecuteHandler {
                 match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
-                        // TCK-00338: Update last output time on successful read
+                        // RFC-0032::REQ-0129: Update last output time on successful read
                         update_last_output(&last_output_stdout, exec_start);
 
                         if buf.len() + n > per_stream_limit {
@@ -1481,7 +1481,7 @@ impl ToolHandler for ExecuteHandler {
                 match stderr.read(&mut chunk).await {
                     Ok(0) | Err(_) => break, // EOF or read error
                     Ok(n) => {
-                        // TCK-00338: Update last output time on successful read
+                        // RFC-0032::REQ-0129: Update last output time on successful read
                         update_last_output(&last_output_stderr, exec_start);
 
                         if buf.len() + n > per_stream_limit {
@@ -1496,7 +1496,7 @@ impl ToolHandler for ExecuteHandler {
             (buf, false)
         };
 
-        // TCK-00338: Stall detection monitor task
+        // RFC-0032::REQ-0129: Stall detection monitor task
         // Periodically checks if the process has produced any output recently.
         // If no output for stall_timeout_ms, signals that the process is stalled.
         let last_output_monitor = last_output_time.clone();
@@ -1702,13 +1702,13 @@ impl ToolHandler for ExecuteHandler {
 /// # Contract References
 ///
 /// - REQ-HEF-0010: Tool handler hardening requirements
-/// - TCK-00313: `GitOperation` + `ArtifactFetch` handler hardening
+/// - RFC-0032::REQ-0107: `GitOperation` + `ArtifactFetch` handler hardening
 #[derive(Debug)]
 pub struct GitOperationHandler {
     root: PathBuf,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `GitOperationHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -1726,7 +1726,7 @@ const GIT_TIMEOUT_MS: u64 = 30_000;
 impl GitOperationHandler {
     /// Creates a new git operation handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -1736,7 +1736,7 @@ impl GitOperationHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1802,7 +1802,7 @@ impl ToolHandler for GitOperationHandler {
 
         let exec_start = Instant::now();
 
-        // Canonicalize root for comparison (TCK-00319: TOCTOU mitigation)
+        // Canonicalize root for comparison (RFC-0032::REQ-0113: TOCTOU mitigation)
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -1812,7 +1812,7 @@ impl ToolHandler for GitOperationHandler {
                 ),
             })?;
 
-        // TCK-00319: Use TOCTOU-mitigating validation for repo_path
+        // RFC-0032::REQ-0113: Use TOCTOU-mitigating validation for repo_path
         let validated_work_dir = if let Some(ref repo_path) = git_args.repo_path {
             validate_path_with_toctou_mitigation(repo_path, &canonical_root)?
         } else {
@@ -1855,7 +1855,7 @@ impl ToolHandler for GitOperationHandler {
             cmd.env("XDG_CONFIG_HOME", xdg_config);
         }
 
-        // TCK-00263: Set SSH_AUTH_SOCK if credential is provided and looks like a valid
+        // RFC-0032::REQ-0079: Set SSH_AUTH_SOCK if credential is provided and looks like a valid
         // path
         if let Some(cred) = credential {
             let secret = cred.expose_secret();
@@ -2123,7 +2123,7 @@ impl ToolHandler for GitOperationHandler {
 /// # Contract References
 ///
 /// - REQ-HEF-0010: Tool handler hardening requirements
-/// - TCK-00313: `GitOperation` + `ArtifactFetch` handler hardening
+/// - RFC-0032::REQ-0107: `GitOperation` + `ArtifactFetch` handler hardening
 #[derive(Debug)]
 pub struct ArtifactFetchHandler {
     cas: std::sync::Arc<dyn ContentAddressedStore>,
@@ -2262,10 +2262,10 @@ impl ToolHandler for ArtifactFetchHandler {
 }
 
 // =============================================================================
-// ListFilesHandler (TCK-00315)
+// ListFilesHandler (RFC-0032::REQ-0109)
 // =============================================================================
 
-/// Handler for directory listing operations per TCK-00315.
+/// Handler for directory listing operations per RFC-0032::REQ-0109.
 ///
 /// This handler lists files in a directory with strict bounds and security
 /// controls for FAC v0 reviewer navigation.
@@ -2281,14 +2281,14 @@ impl ToolHandler for ArtifactFetchHandler {
 ///
 /// # Contract References
 ///
-/// - TCK-00315: Reviewer navigation tool surface
+/// - RFC-0032::REQ-0109: Reviewer navigation tool surface
 /// - REQ-HEF-0010: Tool handler security requirements
 #[derive(Debug)]
 pub struct ListFilesHandler {
     root: PathBuf,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `ListFilesHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -2303,7 +2303,7 @@ impl Default for ListFilesHandler {
 impl ListFilesHandler {
     /// Creates a new list files handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -2313,7 +2313,7 @@ impl ListFilesHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -2401,7 +2401,7 @@ impl ListFilesHandler {
 
         let io_start = Instant::now();
 
-        // Canonicalize root for comparison (TCK-00319: TOCTOU mitigation)
+        // Canonicalize root for comparison (RFC-0032::REQ-0113: TOCTOU mitigation)
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -2411,7 +2411,7 @@ impl ListFilesHandler {
                 ),
             })?;
 
-        // TCK-00319: Use TOCTOU-mitigating validation that checks for symlinks
+        // RFC-0032::REQ-0113: Use TOCTOU-mitigating validation that checks for symlinks
         // BEFORE canonicalization to prevent symlink-swap attacks
         let validated_target =
             validate_path_with_toctou_mitigation(&ls_args.path, &canonical_root)?;
@@ -2433,7 +2433,7 @@ impl ListFilesHandler {
             }
         })?;
 
-        // TCK-00315: Bound the number of entries *scanned* (not just returned) to
+        // RFC-0032::REQ-0109: Bound the number of entries *scanned* (not just returned) to
         // prevent denial-of-service on very large directories, especially when
         // a pattern is set that matches rarely.
         let mut scanned_entries = 0usize;
@@ -2618,10 +2618,10 @@ impl ToolHandler for ListFilesHandler {
 }
 
 // =============================================================================
-// SearchHandler (TCK-00315)
+// SearchHandler (RFC-0032::REQ-0109)
 // =============================================================================
 
-/// Handler for text search operations per TCK-00315.
+/// Handler for text search operations per RFC-0032::REQ-0109.
 ///
 /// This handler searches for text within files with strict bounds and security
 /// controls for FAC v0 reviewer navigation.
@@ -2637,14 +2637,14 @@ impl ToolHandler for ListFilesHandler {
 ///
 /// # Contract References
 ///
-/// - TCK-00315: Reviewer navigation tool surface
+/// - RFC-0032::REQ-0109: Reviewer navigation tool surface
 /// - REQ-HEF-0010: Tool handler security requirements
 #[derive(Debug)]
 pub struct SearchHandler {
     root: PathBuf,
 }
 
-/// TCK-00319: Default implementation is restricted to test builds only.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
 /// Production code MUST use `SearchHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
@@ -2697,7 +2697,7 @@ struct SearchOutputState {
 impl SearchHandler {
     /// Creates a new search handler using CWD as root.
     ///
-    /// # Security Warning (TCK-00319)
+    /// # Security Warning (RFC-0032::REQ-0113)
     ///
     /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
     /// explicitly specify the workspace directory. This prevents:
@@ -2707,7 +2707,7 @@ impl SearchHandler {
         since = "0.1.0",
         note = "use with_root() with explicit workspace path for production code"
     )]
-    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
+    #[allow(clippy::new_without_default)] // RFC-0032::REQ-0113: Default is test-only
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -2902,7 +2902,7 @@ impl SearchHandler {
 
         let search_start = Instant::now();
 
-        // Canonicalize root for comparison (TCK-00319: TOCTOU mitigation)
+        // Canonicalize root for comparison (RFC-0032::REQ-0113: TOCTOU mitigation)
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -2912,7 +2912,7 @@ impl SearchHandler {
                 ),
             })?;
 
-        // TCK-00319: Use TOCTOU-mitigating validation that checks for symlinks
+        // RFC-0032::REQ-0113: Use TOCTOU-mitigating validation that checks for symlinks
         // BEFORE canonicalization to prevent symlink-swap attacks
         let validated_scope =
             validate_path_with_toctou_mitigation(&search_args.scope, &canonical_root)?;
@@ -3203,13 +3203,13 @@ impl ToolHandler for SearchHandler {
 ///
 /// # Security Warning
 ///
-/// Per TCK-00319, tool handlers MUST be rooted to an explicit workspace
+/// Per RFC-0032::REQ-0113, tool handlers MUST be rooted to an explicit workspace
 /// directory, not the daemon's CWD. Failure to do so can result in:
 /// - Tool operations accessing daemon-local files
 /// - Path traversal attacks escaping the intended workspace
 /// - Reviewers observing incorrect filesystem state
 ///
-/// **TCK-00319**: This function is now restricted to test builds only.
+/// **RFC-0032::REQ-0113**: This function is now restricted to test builds only.
 #[cfg(test)]
 #[deprecated(
     since = "0.1.0",
@@ -3238,7 +3238,7 @@ pub fn register_stub_handlers(
 ///
 /// # Security
 ///
-/// Per TCK-00319 (Root tool handlers per workspace):
+/// Per RFC-0032::REQ-0113 (Root tool handlers per workspace):
 /// - All tool handlers are rooted to `workspace_root`
 /// - Path traversal prevention is enforced via canonical root containment
 ///   checks
@@ -3301,7 +3301,7 @@ pub fn register_handlers_with_root(
     // `register_handlers_with_root_and_sandbox` instead.
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    // TCK-00338: This deprecated function uses permissive mode for backwards compat
+    // RFC-0032::REQ-0129: This deprecated function uses permissive mode for backwards compat
     executor.register_handler(Box::new(ExecuteHandler::with_root_permissive(
         &canonical_root,
     )))?;
@@ -3315,7 +3315,7 @@ pub fn register_handlers_with_root(
 /// Registers all tool handlers with an executor using a specified workspace
 /// root and explicit sandbox configuration.
 ///
-/// # Security (TCK-00338)
+/// # Security (RFC-0032::REQ-0129)
 ///
 /// This is the recommended registration function for production use. It ensures
 /// that the `ExecuteHandler` uses an explicit `SandboxConfig` rather than
@@ -3380,7 +3380,7 @@ pub fn register_handlers_with_root_and_sandbox(
     // Register all handlers with the canonical workspace root
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    // Use explicit sandbox config for ExecuteHandler (TCK-00338: fail-closed)
+    // Use explicit sandbox config for ExecuteHandler (RFC-0032::REQ-0129: fail-closed)
     executor.register_handler(Box::new(ExecuteHandler::with_root_and_sandbox(
         &canonical_root,
         sandbox_config,
@@ -3614,7 +3614,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Symlink escape prevention tests (TCK-00319)
+    // Symlink escape prevention tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[test]
@@ -4314,7 +4314,7 @@ mod tests {
     }
 
     // =========================================================================
-    // GitOperationHandler tests (TCK-00313)
+    // GitOperationHandler tests (RFC-0032::REQ-0107)
     // =========================================================================
 
     #[test]
@@ -4478,7 +4478,7 @@ mod tests {
     }
 
     // =========================================================================
-    // ArtifactFetchHandler validation tests (TCK-00313)
+    // ArtifactFetchHandler validation tests (RFC-0032::REQ-0107)
     // =========================================================================
 
     #[tokio::test]
@@ -4532,7 +4532,7 @@ mod tests {
     }
 
     // =========================================================================
-    // ListFilesHandler tests (TCK-00315)
+    // ListFilesHandler tests (RFC-0032::REQ-0109)
     // =========================================================================
 
     use crate::episode::tool_handler::{ListFilesArgs, SearchArgs};
@@ -4620,7 +4620,7 @@ mod tests {
     }
 
     // =========================================================================
-    // SearchHandler tests (TCK-00315)
+    // SearchHandler tests (RFC-0032::REQ-0109)
     // =========================================================================
 
     #[test]
@@ -4846,7 +4846,7 @@ mod tests {
     }
 
     // =========================================================================
-    // ToolArgs tests for ListFiles and Search (TCK-00315)
+    // ToolArgs tests for ListFiles and Search (RFC-0032::REQ-0109)
     // =========================================================================
 
     #[test]
@@ -4871,7 +4871,7 @@ mod tests {
     }
 
     // =========================================================================
-    // ListFilesHandler symlink escape tests (TCK-00319)
+    // ListFilesHandler symlink escape tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[tokio::test]
@@ -4929,7 +4929,7 @@ mod tests {
     }
 
     // =========================================================================
-    // SearchHandler symlink escape tests (TCK-00319)
+    // SearchHandler symlink escape tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[tokio::test]
@@ -4994,7 +4994,7 @@ mod tests {
     }
 
     // =========================================================================
-    // GitOperationHandler symlink tests (TCK-00319)
+    // GitOperationHandler symlink tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[tokio::test]
@@ -5028,7 +5028,7 @@ mod tests {
     }
 
     // =========================================================================
-    // register_handlers_with_root tests (TCK-00319)
+    // register_handlers_with_root tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[test]
@@ -5078,7 +5078,7 @@ mod tests {
     }
 
     // =========================================================================
-    // register_handlers_with_root_and_sandbox tests (TCK-00338)
+    // register_handlers_with_root_and_sandbox tests (RFC-0032::REQ-0129)
     // =========================================================================
 
     #[test]
@@ -5164,7 +5164,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Stall detection tests (TCK-00338)
+    // Stall detection tests (RFC-0032::REQ-0129)
     // =========================================================================
 
     #[tokio::test]
@@ -5189,7 +5189,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TOCTOU mitigation integration tests (TCK-00319)
+    // TOCTOU mitigation integration tests (RFC-0032::REQ-0113)
     // =========================================================================
 
     #[tokio::test]
@@ -5428,7 +5428,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00338: SandboxConfig Tests (SEC-CTRL-FAC-0016)
+    // RFC-0032::REQ-0129: SandboxConfig Tests (SEC-CTRL-FAC-0016)
     // =========================================================================
 
     #[test]
@@ -5472,7 +5472,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00338: Shell Argument Escaping Tests (SEC-CTRL-FAC-0016)
+    // RFC-0032::REQ-0129: Shell Argument Escaping Tests (SEC-CTRL-FAC-0016)
     // =========================================================================
 
     #[test]

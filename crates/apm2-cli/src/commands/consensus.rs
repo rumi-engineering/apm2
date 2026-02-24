@@ -2,7 +2,7 @@
 //! Consensus cluster management CLI commands.
 //!
 //! This module implements the `apm2 consensus` subcommands for monitoring
-//! and managing the distributed consensus layer per RFC-0014 and TCK-00193.
+//! and managing the distributed consensus layer per RFC-0014 and RFC-0033::REQ-0053.
 //!
 //! # Commands
 //!
@@ -24,7 +24,7 @@
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
 //! - `05_rollout_and_ops.yaml`: CLI commands specification
-//! - TCK-00345: Consensus commands daemon integration
+//! - RFC-0032::REQ-0135: Consensus commands daemon integration
 
 use std::path::Path;
 

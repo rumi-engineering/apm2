@@ -29,7 +29,7 @@ pub trait Validate {
 
 impl Validate for DefectRecorded {
     fn validate(&self) -> Result<(), String> {
-        // TCK-00307: Validation bounds for DefectRecorded
+        // RFC-0032::REQ-0103: Validation bounds for DefectRecorded
         // Prevents DoS via unbounded strings/bytes.
 
         // defect_id: max 128 chars

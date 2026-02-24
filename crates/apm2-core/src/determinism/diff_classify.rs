@@ -530,7 +530,7 @@ level1:
         let old = r"
 schema_version: '2024-01'
 ticket:
-  id: TCK-00110
+  id: RFC-0011::REQ-0029
   title: Implement feature
   status: READY
   description: Original description for the feature
@@ -550,7 +550,7 @@ ticket:
         let new = r"
 schema_version: '2024-01'
 ticket:
-  id: TCK-00110
+  id: RFC-0011::REQ-0029
   title: Implement feature
   status: READY
   description: Updated description with more context

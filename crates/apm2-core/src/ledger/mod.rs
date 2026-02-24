@@ -77,12 +77,12 @@ pub use storage::{
 };
 
 // ============================================================================
-// Post-Commit Notification (TCK-00304: HEF Outbox)
+// Post-Commit Notification (RFC-0032::REQ-0100: HEF Outbox)
 // ============================================================================
 
 /// Channel capacity for commit notifications.
 ///
-/// Per TCK-00304: Channel type is
+/// Per RFC-0032::REQ-0100: Channel type is
 /// `tokio::sync::mpsc::Sender<CommitNotification>` with capacity 1024. This
 /// bounds memory usage while providing sufficient buffering for burst
 /// scenarios.
@@ -90,14 +90,14 @@ pub const COMMIT_NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum length for event type strings in commit notifications.
 ///
-/// Per TCK-00304 security review: Unbounded string fields enable memory denial
+/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable memory denial
 /// of service. This bound matches segment bounds in HEF topic grammar (64
 /// chars).
 pub const MAX_EVENT_TYPE_LEN: usize = 64;
 
 /// Maximum length for namespace strings in commit notifications.
 ///
-/// Per TCK-00304 security review: Unbounded string fields enable memory denial
+/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable memory denial
 /// of service. This bound matches segment bounds in HEF topic grammar (64
 /// chars).
 pub const MAX_NAMESPACE_LEN: usize = 64;
@@ -108,7 +108,7 @@ pub const MAX_NAMESPACE_LEN: usize = 64;
 /// outbox enqueue -> pulse publish. This struct carries the minimal information
 /// needed for the daemon's pulse publisher to emit `PulseEvent` messages.
 ///
-/// # Design Constraints (TCK-00304)
+/// # Design Constraints (RFC-0032::REQ-0100)
 ///
 /// - Defined in apm2-core with NO daemon type dependencies
 /// - Contains only primitive types and stdlib types
@@ -154,7 +154,7 @@ pub struct CommitNotification {
 impl CommitNotification {
     /// Creates a new commit notification.
     ///
-    /// # String Bounds (TCK-00304 Security Review)
+    /// # String Bounds (RFC-0032::REQ-0100 Security Review)
     ///
     /// The `event_type` and `namespace` fields are truncated to their maximum
     /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
@@ -180,7 +180,7 @@ impl CommitNotification {
 
     /// Creates a commit notification with consensus index.
     ///
-    /// # String Bounds (TCK-00304 Security Review)
+    /// # String Bounds (RFC-0032::REQ-0100 Security Review)
     ///
     /// The `event_type` and `namespace` fields are truncated to their maximum
     /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
@@ -226,7 +226,7 @@ impl CommitNotification {
 
 /// Type alias for the commit notification sender.
 ///
-/// Per TCK-00304: Uses `tokio::sync::mpsc::Sender` with capacity 1024.
+/// Per RFC-0032::REQ-0100: Uses `tokio::sync::mpsc::Sender` with capacity 1024.
 /// The sender is stored optionally in `BftLedgerBackend` and used via
 /// `try_send()` for non-blocking notification.
 pub type CommitNotificationSender = tokio::sync::mpsc::Sender<CommitNotification>;

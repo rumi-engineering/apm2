@@ -1020,7 +1020,7 @@
               "children": [],
               "data": {
                 "level": "MUST",
-                "statement": "Tier3+ actuation MUST execute within admitted capsule profiles with namespace, seccomp, cgroup, and deny-by-default egress controls and no ambient OS authority.\n\nMulti-ticket delivery: TCK-00374 delivers policy types, validation logic,\nand unit tests. TCK-00375 wires AdmissionGate::check into the daemon\nactuation path. TCK-00376 ensures no-bypass path ratchet.",
+                "statement": "Tier3+ actuation MUST execute within admitted capsule profiles with namespace, seccomp, cgroup, and deny-by-default egress controls and no ambient OS authority.\n\nMulti-ticket delivery: RFC-0020::REQ-0028 delivers policy types, validation logic,\nand unit tests. RFC-0020::REQ-0029 wires AdmissionGate::check into the daemon\nactuation path. RFC-0020::REQ-0030 ensures no-bypass path ratchet.",
                 "acceptance": [
                   "Tier3+ actuation executes only inside admitted capsule profile",
                   "Capsule egress defaults to deny unless policy grants explicit route",
@@ -1388,6 +1388,331 @@
             "heading_level": 2
           },
           "body": "Primary implementation surfaces:\n\n* Protocol framing + handshake: `crates/apm2-daemon/src/protocol/*`\n* HSI contract manifest generation and validation: `crates/apm2-daemon/src/hsi_contract/*`\n* Markov-blanket enforcement: `crates/apm2-core/src/channel/enforcement.rs`\n* Bisimulation gate (consensus hook): `crates/apm2-core/src/consensus/bisimulation.rs`\n* Epoch sealing + VDF profile types: `crates/apm2-core/src/htf/epoch_seal.rs`\n"
+        },
+        {
+          "type": "section",
+          "title": "Migrated Requirements (from deleted ticket/RFC traceability)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0023",
+              "title": "Bounded expected free energy planner integration (advisory-only)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Bounded expected free energy planner integration (advisory-only)",
+                "domain": [
+                  "hsi"
+                ],
+                "migrated_from": "RFC-0020"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0041",
+              "title": "Define PCAC core schemas and deny taxonomy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Define PCAC core schemas and deny taxonomy",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0042",
+              "title": "RequestTool join/revalidate/consume lifecycle wiring",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RequestTool join/revalidate/consume lifecycle wiring",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0043",
+              "title": "Privileged lifecycle integration for sublease and review handlers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Privileged lifecycle integration for sublease and review handlers",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0044",
+              "title": "Acceptance-fact receipt authentication composition",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Acceptance-fact receipt authentication composition",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0045",
+              "title": "Durable consume index and pre-effect durability barrier",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Durable consume index and pre-effect durability barrier",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0046",
+              "title": "Tier2+ sovereignty composition checks in revalidate and consume",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tier2+ sovereignty composition checks in revalidate and consume",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0047",
+              "title": "PCAC policy surface implementation and fail-closed defaults",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PCAC policy surface implementation and fail-closed defaults",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0048",
+              "title": "PCAC verifier economics instrumentation and bounded enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PCAC verifier economics instrumentation and bounded enforcement",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0049",
+              "title": "Objective and gate evidence exporters for RFC-0027",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Objective and gate evidence exporters for RFC-0027",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0050",
+              "title": "PCAC conformance and falsification suite",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PCAC conformance and falsification suite",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0051",
+              "title": "RFC-0028 REQ-0009 projection compromise detection, containment, and replay recovery",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0028 REQ-0009 projection compromise detection, containment, and replay recovery",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0052",
+              "title": "PCAC-gated declassification receipts with durable single-use and request-scoped binding",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PCAC-gated declassification receipts with durable single-use and request-scoped binding",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0053",
+              "title": "Ledger hash-chain signature verification and incremental startup validation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Ledger hash-chain signature verification and incremental startup validation",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0054",
+              "title": "Authoritative boundary-flow leakage and timing witnesses with fail-closed admission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Authoritative boundary-flow leakage and timing witnesses with fail-closed admission",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0055",
+              "title": "Priority-aware quarantine lifecycle with saturation-safe insertion",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Priority-aware quarantine lifecycle with saturation-safe insertion",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0056",
+              "title": "Normalize all declassification receipt consumption as PCAC-gated effects (sweep remaining ad-hoc consume paths; enforce request-scoped binding + non-colliding indexes)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Normalize all declassification receipt consumption as PCAC-gated effects (sweep remaining ad-hoc consume paths; enforce request-scoped binding + non-colliding indexes)",
+                "domain": [
+                  "pcac"
+                ],
+                "migrated_from": "RFC-0027"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0057",
+              "title": "Quarantine lifecycle hardening: priority-aware eviction, saturation-safe insertion (deny), per-session quota isolation, and restart-safe persistence for fail-closed tiers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Quarantine lifecycle hardening: priority-aware eviction, saturation-safe insertion (deny), per-session quota isolation, and restart-safe persistence for fail-closed tiers",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0058",
+              "title": "Authoritative witness closure: require daemon-instrumented witnesses for fail-closed tiers and bind to AJC join + AdmissionBundle",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Authoritative witness closure: require daemon-instrumented witnesses for fail-closed tiers and bind to AJC join + AdmissionBundle",
+                "domain": [
+                  "boundary_flow"
+                ],
+                "migrated_from": "RFC-0028"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0059",
+              "title": "Security follow-up for boundary enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security follow-up for boundary enforcement",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0060",
+              "title": "Security follow-up for attestation tightening",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security follow-up for attestation tightening",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "These requirement nodes were migrated from deleted ticket files (TCK-NNNNN) and their associated old RFCs. Each node preserves the original ticket title as the requirement statement."
         }
       ]
     }

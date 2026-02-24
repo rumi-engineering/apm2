@@ -1,7 +1,7 @@
 //! Event management CLI commands.
 //!
 //! This module implements `apm2 event` subcommands for ledger event emission
-//! using the protocol-based session socket (TCK-00288).
+//! using the protocol-based session socket (RFC-0032::REQ-0090).
 //!
 //! # Commands
 //!

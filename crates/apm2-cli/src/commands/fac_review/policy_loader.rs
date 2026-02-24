@@ -1,7 +1,7 @@
 //! Shared FAC policy loading and managed `CARGO_HOME` creation.
 //!
 //! Extracted from duplicate implementations in `evidence.rs` and `gates.rs`
-//! (TCK-00526). Both the gates path and the pipeline/evidence path use these
+//! (RFC-0032::REQ-0185). Both the gates path and the pipeline/evidence path use these
 //! helpers to load-or-create the FAC policy and ensure the managed `CARGO_HOME`
 //! directory exists.
 //!
@@ -87,7 +87,7 @@ pub fn load_or_create_fac_policy(fac_root: &Path) -> Result<FacPolicyV1, String>
 
 /// Ensure the managed `CARGO_HOME` directory exists with restrictive
 /// permissions (0o700 in operator mode, 0o770 in system-mode, CTR-2611). This
-/// is a one-time setup for FAC-managed cargo home isolation (TCK-00526).
+/// is a one-time setup for FAC-managed cargo home isolation (RFC-0032::REQ-0185).
 ///
 /// Uses atomic creation (mkdir, handle `AlreadyExists`) to eliminate the
 /// TOCTOU window between existence checks and creation. Rejects symlinks
@@ -323,7 +323,7 @@ pub fn resolve_workspace_rustup_toolchain(workspace_root: &Path) -> Option<Strin
 /// not a symlink (INV-LANE-ENV-001).
 ///
 /// Delegates to the shared [`apm2_core::fac::verify_dir_permissions`]
-/// helper with a "managed `CARGO_HOME`" context label (TCK-00575 round 2
+/// helper with a "managed `CARGO_HOME`" context label (RFC-0032::REQ-0225 round 2
 /// NIT: deduplicated permission verification).
 #[cfg(unix)]
 fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {

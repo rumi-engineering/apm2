@@ -153,7 +153,7 @@ pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
         },
     };
 
-    // TCK-00589: Run legacy evidence migration before GC planning.
+    // RFC-0032::REQ-0239: Run legacy evidence migration before GC planning.
     // This ensures upgraded installations automatically migrate files from
     // `evidence/` to `legacy/` during routine garbage collection. The
     // migration helper is bounded and idempotent; it is a no-op when the
@@ -191,7 +191,7 @@ pub fn run_gc(args: &GcArgs, parent_json_output: bool) -> u8 {
     let quarantine_ttl_secs = u64::from(policy.quarantine_ttl_days).saturating_mul(24 * 3600);
     let denied_ttl_secs = u64::from(policy.denied_ttl_days).saturating_mul(24 * 3600);
 
-    // TCK-00571: Derive log retention config from policy.
+    // RFC-0032::REQ-0221: Derive log retention config from policy.
     let log_retention = LogRetentionConfig {
         per_lane_log_max_bytes: policy.per_lane_log_max_bytes,
         per_job_log_ttl_secs: u64::from(policy.per_job_log_ttl_days).saturating_mul(24 * 3600),

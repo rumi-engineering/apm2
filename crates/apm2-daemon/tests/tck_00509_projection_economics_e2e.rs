@@ -1,4 +1,4 @@
-//! TCK-00509: End-to-end projection replay economics and lifecycle tests.
+//! RFC-0033::REQ-0067: End-to-end projection replay economics and lifecycle tests.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};

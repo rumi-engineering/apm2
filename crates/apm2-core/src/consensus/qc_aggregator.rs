@@ -33,7 +33,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00190: Quorum Certificate Generation and Verification
+//! - RFC-0033::REQ-0051: Quorum Certificate Generation and Verification
 //! - DD-0007: Quorum Certificate Structure
 
 use std::collections::{HashMap, HashSet};
@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TCK-00190 Acceptance Criteria Tests
+    // RFC-0033::REQ-0051 Acceptance Criteria Tests
     // -------------------------------------------------------------------------
 
     /// AC1: QC generated after 2f+1 votes collected

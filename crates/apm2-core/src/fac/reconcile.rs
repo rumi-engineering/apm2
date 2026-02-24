@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00534)
+// AGENT-AUTHORED (RFC-0032::REQ-0190)
 //! Crash recovery and reconciliation for FAC queue and lane state.
 //!
 //! After an unclean shutdown (crash, SIGKILL, OOM-kill), the queue and lane
@@ -366,7 +366,7 @@ pub enum QueueRecoveryAction {
         lane_id: String,
     },
     /// Torn state recovered: receipt existed but job was still in claimed/.
-    /// The job was moved to its correct terminal directory (TCK-00564
+    /// The job was moved to its correct terminal directory (RFC-0032::REQ-0215
     /// BLOCKER-2).
     TornStateRecovered {
         /// Job ID.
@@ -408,7 +408,7 @@ pub struct ReconcileReceiptV1 {
     /// Number of orphaned jobs marked failed.
     pub orphaned_jobs_failed: usize,
     /// Number of torn states recovered (receipt existed but job still in
-    /// claimed/). Added by TCK-00564 BLOCKER-2.
+    /// claimed/). Added by RFC-0032::REQ-0215 BLOCKER-2.
     #[serde(default)]
     pub torn_states_recovered: usize,
     /// Number of lanes marked corrupt.
@@ -1761,7 +1761,7 @@ fn reconcile_queue(
             continue;
         }
 
-        // TCK-00564 BLOCKER-2: Detect and repair torn receipt states.
+        // RFC-0032::REQ-0215 BLOCKER-2: Detect and repair torn receipt states.
         //
         // Before applying the orphan policy, check if a receipt already exists
         // for this job. If a receipt exists, the worker completed the job and

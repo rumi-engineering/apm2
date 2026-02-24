@@ -328,7 +328,7 @@ impl_bounded_decode_simple!(
     UpdateStopFlagsRequest,
     UpdateStopFlagsResponse,
     PrivilegedError,
-    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, RFC-0032::REQ-0068)
     RequestToolRequest,
     RequestToolResponse,
     EmitEventRequest,
@@ -338,18 +338,18 @@ impl_bounded_decode_simple!(
     StreamTelemetryRequest,
     StreamTelemetryResponse,
     SessionError,
-    // TCK-00344: Status query endpoints
+    // RFC-0032::REQ-0134: Status query endpoints
     AuditorLaunchProjectionRequest,
     OrchestratorLaunchProjectionRequest,
     WorkStatusRequest,
     WorkListRequest,
     SessionStatusRequest,
     SessionStatusResponse,
-    // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
+    // CTR-PROTO-009: Crash Recovery Signals (RFC-0032::REQ-0083)
     LeaseRevoked,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
-    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, RFC-0032::REQ-0096)
     // Simple messages without repeated fields
     EntityRef,
     CasRef,
@@ -360,7 +360,7 @@ impl_bounded_decode_simple!(
     UnsubscribePulseResponse,
     PulseEvent,
     HefError,
-    // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+    // CTR-PROTO-011: Process Management Endpoints (RFC-0032::REQ-0132)
     ListProcessesRequest,
     ProcessInfo,
     ProcessStatusRequest,
@@ -375,7 +375,7 @@ impl_bounded_decode_simple!(
     ReloadProcessResponse,
     StreamLogsRequest,
     LogEntry,
-    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, RFC-0032::REQ-0135)
     ConsensusStatusRequest,
     ConsensusStatusResponse,
     ConsensusValidatorsRequest,
@@ -385,7 +385,7 @@ impl_bounded_decode_simple!(
     ConsensusByzantineEvidenceRequest,
     ByzantineEvidenceEntry,
     ConsensusError,
-    // CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+    // CTR-PROTO-012: Credential Management (RFC-0018, RFC-0032::REQ-0133)
     CredentialProfile,
     ListCredentialsRequest,
     AddCredentialRequest,
@@ -398,42 +398,42 @@ impl_bounded_decode_simple!(
     SwitchCredentialResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
-    // TCK-00395: EndSession for session termination with ledger events
+    // RFC-0032::REQ-0149: EndSession for session termination with ledger events
     EndSessionRequest,
     EndSessionResponse,
-    // TCK-00389: Review receipt ingestion
+    // RFC-0032::REQ-0143: Review receipt ingestion
     IngestReviewReceiptRequest,
     IngestReviewReceiptResponse,
-    // TCK-00394: ChangeSet publishing
+    // RFC-0032::REQ-0148: ChangeSet publishing
     PublishChangeSetRequest,
     PublishChangeSetResponse,
-    // TCK-00340: Sublease delegation
+    // RFC-0032::REQ-0131: Sublease delegation
     DelegateSubleaseRequest,
     DelegateSubleaseResponse,
-    // TCK-00487: Explicit full-chain verification
+    // RFC-0020::REQ-0053: Explicit full-chain verification
     VerifyLedgerChainRequest,
     VerifyLedgerChainResponse,
-    // TCK-00469: Projection recovery
+    // RFC-0020::REQ-0051: Projection recovery
     RegisterRecoveryEvidenceRequest,
     RegisterRecoveryEvidenceResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
-    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
     OpenWorkRequest,
     OpenWorkResponse,
-    // TCK-00638: Work context entry publishing
+    // RFC-0032::REQ-0266: Work context entry publishing
     PublishWorkContextEntryRequest,
     PublishWorkContextEntryResponse,
-    // TCK-00645: Work loop profile publishing
+    // RFC-0032::REQ-0270: Work loop profile publishing
     PublishWorkLoopProfileRequest,
     PublishWorkLoopProfileResponse,
-    // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0265: ClaimWorkV2 (RFC-0032 Phase 2)
     ClaimWorkV2Request,
     ClaimWorkV2Response,
-    // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0267: RecordWorkPrAssociation (RFC-0032 Phase 2)
     RecordWorkPrAssociationRequest,
     RecordWorkPrAssociationResponse,
-    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
     ResolveTicketAliasRequest,
     ResolveTicketAliasResponse,
 );
@@ -447,23 +447,23 @@ impl_bounded_decode_with_repeated!(CompactionCompleted, tombstoned_hashes);
 impl_bounded_decode_with_repeated!(TelemetryPolicy, promote_triggers);
 // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
 impl_bounded_decode_with_repeated!(CapabilityRequest, read_patterns, write_patterns);
-// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, RFC-0032::REQ-0096)
 impl_bounded_decode_with_repeated!(PulseEnvelopeV1, entities, cas_refs);
 impl_bounded_decode_with_repeated!(SubscribePulseRequest, topic_patterns);
 impl_bounded_decode_with_repeated!(SubscribePulseResponse, accepted_patterns, rejected_patterns);
-// CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+// CTR-PROTO-011: Process Management Endpoints (RFC-0032::REQ-0132)
 impl_bounded_decode_with_repeated!(ListProcessesResponse, processes);
 impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
-// TCK-00415: Projection-backed work list
+// RFC-0032::REQ-0159: Projection-backed work list
 impl_bounded_decode_with_repeated!(WorkListResponse, work_items);
 impl_bounded_decode_with_repeated!(WorkStatusResponse, dependency_diagnostics);
-// TCK-00452: Auditor/orchestrator projections with uncertainty flags.
+// RFC-0020::REQ-0040: Auditor/orchestrator projections with uncertainty flags.
 impl_bounded_decode_with_repeated!(AuditorLaunchProjectionResponse, uncertainty_flags);
 impl_bounded_decode_with_repeated!(OrchestratorLaunchProjectionResponse, uncertainty_flags);
-// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, RFC-0032::REQ-0135)
 impl_bounded_decode_with_repeated!(ConsensusValidatorsResponse, validators);
 impl_bounded_decode_with_repeated!(ConsensusByzantineEvidenceResponse, evidence);
-// CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+// CTR-PROTO-012: Credential Management (RFC-0018, RFC-0032::REQ-0133)
 impl_bounded_decode_with_repeated!(ListCredentialsResponse, profiles);
 
 // ============================================================================

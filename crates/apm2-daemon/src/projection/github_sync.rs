@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00212)
+// AGENT-AUTHORED (RFC-0032::REQ-0058)
 //! GitHub projection adapter for the FAC (Forge Admission Cycle).
 //!
 //! This module implements a write-only projection adapter that synchronizes
@@ -27,7 +27,7 @@
 //!
 //! # Divergence and Tamper Detection
 //!
-//! Divergence watchdog (TCK-00213) and tamper detection (TCK-00214) are
+//! Divergence watchdog (RFC-0032::REQ-0059) and tamper detection (RFC-0032::REQ-0060) are
 //! implemented separately. This module focuses solely on write-only projection.
 //!
 //! # Example
@@ -230,7 +230,7 @@ pub struct TamperResult {
 
     /// The `DefectRecorded` event to emit to the ledger.
     ///
-    /// TCK-00307 MAJOR FIX: The `on_tamper` method now produces a
+    /// RFC-0032::REQ-0103 MAJOR FIX: The `on_tamper` method now produces a
     /// `DefectRecorded` event that callers should emit to the ledger via
     /// `ledger.emit_defect_recorded(&defect_event, timestamp)`.
     pub defect_event: DefectRecorded,
@@ -530,21 +530,21 @@ struct IdempotencyCache {
 impl IdempotencyCache {
     /// Opens or creates an idempotency cache at the specified path.
     ///
-    /// # Security (TCK-00322 MAJOR FIX)
+    /// # Security (RFC-0032::REQ-0116 MAJOR FIX)
     ///
     /// The cache file is created with mode 0600 (owner read/write only) to
     /// prevent unauthorized access to projection receipts and idempotency data.
     fn open(path: impl AsRef<Path>) -> Result<Self, ProjectionError> {
         let path = path.as_ref();
 
-        // TCK-00322 MAJOR FIX: Ensure parent directory exists
+        // RFC-0032::REQ-0116 MAJOR FIX: Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ProjectionError::DatabaseError(format!("failed to create cache directory: {e}"))
             })?;
         }
 
-        // TCK-00322 MAJOR FIX: Set secure permissions (0600) on cache file.
+        // RFC-0032::REQ-0116 MAJOR FIX: Set secure permissions (0600) on cache file.
         // We need to handle two cases:
         // 1. File doesn't exist: Create it with umask then fix permissions
         // 2. File exists: Fix permissions if needed
@@ -571,7 +571,7 @@ impl IdempotencyCache {
         )
         .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
 
-        // TCK-00322 MAJOR FIX: Set permissions after file creation (for new files)
+        // RFC-0032::REQ-0116 MAJOR FIX: Set permissions after file creation (for new files)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1154,7 +1154,7 @@ impl GitHubClient {
     /// - AD-NET-001: Request timeout via `tokio::time::timeout`
     /// - AD-SEC-001: API token uses `SecretString` (via config)
     ///
-    /// # TCK-00322: PR Comment Projection
+    /// # RFC-0032::REQ-0116: PR Comment Projection
     ///
     /// Per RFC-0019, the projection worker posts review comments to PRs.
     /// This enables automated code review feedback from the FAC.
@@ -1585,7 +1585,7 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     }
 
     // =========================================================================
-    // Tamper Detection (TCK-00214)
+    // Tamper Detection (RFC-0032::REQ-0060)
     // =========================================================================
 
     /// Returns the current timestamp from the injected time source.
@@ -1825,7 +1825,7 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
             "created PROJECTION_TAMPER defect"
         );
 
-        // TCK-00307 MAJOR FIX: Create DefectRecorded event for ledger emission.
+        // RFC-0032::REQ-0103 MAJOR FIX: Create DefectRecorded event for ledger emission.
         // Per the security review, on_tamper must emit a DefectRecorded event
         // so that PROJECTION_TAMPER defects are recorded on the ledger.
         //
@@ -1899,7 +1899,7 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     }
 
     // =========================================================================
-    // PR Comment Projection (TCK-00322)
+    // PR Comment Projection (RFC-0032::REQ-0116)
     // =========================================================================
 
     /// Posts a comment to a GitHub PR.
@@ -2582,7 +2582,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Tamper Detection Tests (TCK-00214)
+    // Tamper Detection Tests (RFC-0032::REQ-0060)
     // =========================================================================
 
     /// Submodule for tamper detection tests.

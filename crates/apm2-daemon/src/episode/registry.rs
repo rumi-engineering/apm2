@@ -4,7 +4,7 @@
 //! harness adapters by type. Per AD-LAYER-001 and AD-ADAPT-001, the registry
 //! acts as a factory for per-episode Holon instances.
 //!
-//! # Profile-Based Selection (TCK-00328)
+//! # Profile-Based Selection (RFC-0032::REQ-0121)
 //!
 //! Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts. Profile
 //! selection is explicit by hash; **ambient defaults are forbidden**.
@@ -89,7 +89,7 @@ impl From<AgentAdapterProfileError> for AdapterRegistryError {
 /// by their type. The registry owns the adapter instances and acts as a
 /// factory for per-episode Holon instances.
 ///
-/// # Profile-Based Selection (TCK-00328)
+/// # Profile-Based Selection (RFC-0032::REQ-0121)
 ///
 /// Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts.
 /// The registry records the `profile_hash` for attribution in ledger events.
@@ -118,13 +118,13 @@ impl From<AgentAdapterProfileError> for AdapterRegistryError {
 pub struct AdapterRegistry {
     /// Registered adapters by type.
     adapters: HashMap<AdapterType, Box<dyn HarnessAdapter>>,
-    /// CAS hash of the loaded profile (TCK-00328).
+    /// CAS hash of the loaded profile (RFC-0032::REQ-0121).
     ///
     /// This is `Some` when the registry was created via `with_profile()`,
     /// and `None` when created via legacy methods (`new()`, `with_defaults()`).
     /// The hash is used for ledger attribution per SEC-CTRL-FAC-0015.
     profile_hash: Option<[u8; 32]>,
-    /// The loaded profile configuration (TCK-00328).
+    /// The loaded profile configuration (RFC-0032::REQ-0121).
     ///
     /// Stored for reference by execution code that needs profile parameters.
     profile: Option<AgentAdapterProfileV1>,
@@ -144,7 +144,7 @@ impl AdapterRegistry {
 
     /// Create a new registry with default adapters registered.
     ///
-    /// # Deprecation Notice (TCK-00328)
+    /// # Deprecation Notice (RFC-0032::REQ-0121)
     ///
     /// This method uses ambient defaults, which is **deprecated** per RFC-0019
     /// Addendum. For production use, prefer
@@ -164,7 +164,7 @@ impl AdapterRegistry {
         registry
     }
 
-    /// Create a new registry from a CAS-addressed profile (TCK-00328).
+    /// Create a new registry from a CAS-addressed profile (RFC-0032::REQ-0121).
     ///
     /// Per RFC-0019 Addendum, adapter profiles are CAS-addressed artifacts.
     /// Profile selection is explicit by hash; ambient defaults are forbidden.
@@ -212,7 +212,7 @@ impl AdapterRegistry {
         registry.register(Box::new(ClaudeCodeAdapter::new()));
         registry.register(Box::new(RawAdapter::new()));
 
-        // TCK-00402: Register Codex adapter when codex-cli-v1 is selected.
+        // RFC-0032::REQ-0154: Register Codex adapter when codex-cli-v1 is selected.
         if let Some(profile) = registry.profile.as_ref() {
             if profile.profile_id == CODEX_CLI_PROFILE_ID {
                 let tool_bridge = profile.tool_bridge.clone().ok_or_else(|| {
@@ -235,7 +235,7 @@ impl AdapterRegistry {
         Ok(registry)
     }
 
-    /// Returns the CAS hash of the loaded profile (TCK-00328).
+    /// Returns the CAS hash of the loaded profile (RFC-0032::REQ-0121).
     ///
     /// This hash is used for ledger attribution per SEC-CTRL-FAC-0015.
     /// Returns `None` if the registry was created in legacy mode.
@@ -254,7 +254,7 @@ impl AdapterRegistry {
         self.profile_hash.as_ref()
     }
 
-    /// Returns the loaded profile configuration (TCK-00328).
+    /// Returns the loaded profile configuration (RFC-0032::REQ-0121).
     ///
     /// Returns `None` if the registry was created in legacy mode.
     #[must_use]
@@ -640,7 +640,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00328: Profile-Based Selection Tests
+    // RFC-0032::REQ-0121: Profile-Based Selection Tests
     // =========================================================================
 
     #[test]
@@ -820,7 +820,7 @@ mod tests {
 }
 
 // =============================================================================
-// Session Registry (TCK-00259)
+// Session Registry (RFC-0032::REQ-0075)
 // =============================================================================
 
 use std::collections::VecDeque;
@@ -842,7 +842,7 @@ pub const MAX_SESSIONS: usize = 10_000;
 #[cfg(test)]
 pub const MAX_SESSIONS: usize = 128;
 
-/// Maximum number of terminated session entries retained (TCK-00385).
+/// Maximum number of terminated session entries retained (RFC-0032::REQ-0139).
 ///
 /// Per CTR-1303: The terminated-session store must also be bounded to
 /// prevent unbounded memory growth under high session churn. When this
@@ -858,7 +858,7 @@ pub const MAX_TERMINATED_SESSIONS: usize = 10_000;
 #[cfg(test)]
 pub const MAX_TERMINATED_SESSIONS: usize = 256;
 
-/// TTL for terminated session entries in seconds (TCK-00385).
+/// TTL for terminated session entries in seconds (RFC-0032::REQ-0139).
 ///
 /// Terminated sessions are preserved in the registry for this duration
 /// so that `SessionStatus` queries return useful termination details
@@ -866,7 +866,7 @@ pub const MAX_TERMINATED_SESSIONS: usize = 256;
 /// to prevent unbounded memory growth.
 pub const TERMINATED_SESSION_TTL_SECS: u64 = 300; // 5 minutes
 
-/// Known termination reasons for session end-of-life (TCK-00385, MAJOR 1).
+/// Known termination reasons for session end-of-life (RFC-0032::REQ-0139, MAJOR 1).
 ///
 /// This enum provides a strict allowlist of termination reasons that may
 /// appear in the `termination_reason` field of `SessionStatusResponse`.
@@ -944,7 +944,7 @@ impl std::fmt::Display for TerminationReason {
     }
 }
 
-/// A terminated session entry preserved for TTL-based cleanup (TCK-00385).
+/// A terminated session entry preserved for TTL-based cleanup (RFC-0032::REQ-0139).
 #[derive(Debug, Clone)]
 struct TerminatedEntry {
     /// The termination details.
@@ -967,7 +967,7 @@ struct RegistryState {
     by_id: HashMap<String, SessionState>,
     /// Session ID lookup by ephemeral handle.
     by_handle: HashMap<String, String>,
-    /// Terminated session entries preserved for TTL-based queries (TCK-00385).
+    /// Terminated session entries preserved for TTL-based queries (RFC-0032::REQ-0139).
     ///
     /// Keyed by session ID. Entries are cleaned up when their TTL expires.
     terminated: HashMap<String, TerminatedEntry>,
@@ -981,7 +981,7 @@ struct RegistryState {
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new session.
 ///
-/// # TCK-00385: Termination Tracking
+/// # RFC-0032::REQ-0139: Termination Tracking
 ///
 /// When a session terminates, its entry is moved to a separate
 /// terminated-entries map with a TTL of [`TERMINATED_SESSION_TTL_SECS`].
@@ -1014,7 +1014,7 @@ impl SessionRegistry for InMemorySessionRegistry {
     ) -> Result<Vec<SessionState>, SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
-        // TCK-00385 MINOR 1: Centralize TTL cleanup on all write paths.
+        // RFC-0032::REQ-0139 MINOR 1: Centralize TTL cleanup on all write paths.
         // Lazily clean up expired terminated entries during registration
         // (not only during mark_terminated) to prevent stale entries from
         // accumulating when no sessions are being terminated.
@@ -1028,7 +1028,7 @@ impl SessionRegistry for InMemorySessionRegistry {
         }
 
         // CTR-1303: Evict oldest entry if at capacity.
-        // TCK-00384 security fix: Return full evicted SessionState so
+        // RFC-0032::REQ-0138 security fix: Return full evicted SessionState so
         // callers can both clean up telemetry AND restore sessions on
         // transactional rollback if a later spawn step fails.
         let mut evicted = Vec::new();
@@ -1205,7 +1205,7 @@ impl InMemorySessionRegistry {
     }
 
     /// Returns the number of terminated sessions still in the TTL window
-    /// (TCK-00385).
+    /// (RFC-0032::REQ-0139).
     pub fn terminated_count(&self) -> usize {
         let state = self.state.read().expect("lock poisoned");
         let now = Instant::now();
@@ -1218,7 +1218,7 @@ impl InMemorySessionRegistry {
 }
 
 // =============================================================================
-// Crash Recovery Manager (TCK-00267)
+// Crash Recovery Manager (RFC-0032::REQ-0083)
 // =============================================================================
 
 use std::time::{Duration, Instant};
@@ -1254,7 +1254,7 @@ impl From<RecoveryResult> for RecoverSessionsResponse {
 
 /// Manager for crash recovery operations.
 ///
-/// Per TCK-00267, this handles:
+/// Per RFC-0032::REQ-0083, this handles:
 /// 1. Loading persistent state on daemon startup
 /// 2. Sending `LEASE_REVOKED` signals to recovered sessions
 /// 3. Cleaning up orphaned processes
@@ -1399,7 +1399,7 @@ impl RecoveryManager {
 
         // Clear the registry after recovery.
         //
-        // IMPORTANT (TCK-00384): Callers MUST also clear the
+        // IMPORTANT (RFC-0032::REQ-0138): Callers MUST also clear the
         // `SessionTelemetryStore` after invoking `recover_sessions` to
         // prevent orphaned telemetry entries. The recovery manager does not
         // hold a reference to the telemetry store; lifecycle cleanup is the
@@ -1503,7 +1503,7 @@ fn wall_clock_secs() -> u64 {
 }
 
 // =============================================================================
-// Persistent Session Registry (TCK-00266)
+// Persistent Session Registry (RFC-0032::REQ-0082)
 // =============================================================================
 
 use std::io::{BufReader, Read};
@@ -1539,10 +1539,10 @@ struct PersistableSessionState {
     pub ephemeral_handle: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,
-    /// PCAC policy configuration (TCK-00428).
+    /// PCAC policy configuration (RFC-0020::REQ-0047).
     #[serde(default)]
     pub pcac_policy: Option<apm2_core::pcac::PcacPolicyKnobs>,
-    /// Active waiver for `PointerOnly` identity (TCK-00428).
+    /// Active waiver for `PointerOnly` identity (RFC-0020::REQ-0047).
     #[serde(default)]
     pub pointer_only_waiver: Option<apm2_core::pcac::PointerOnlyWaiver>,
     /// Hash of the capability manifest for this session.
@@ -1585,7 +1585,7 @@ impl From<PersistableSessionState> for SessionState {
     }
 }
 
-/// Serializable representation of a terminated session entry (TCK-00385 BLOCKER
+/// Serializable representation of a terminated session entry (RFC-0032::REQ-0139 BLOCKER
 /// 2).
 ///
 /// This struct pairs a terminated session's state with its termination info
@@ -1629,7 +1629,7 @@ struct PersistableTerminatedEntry {
 
 /// Serializable state file format for persistent session registry.
 ///
-/// Per TCK-00266 and DD-005, the state file is JSON for human readability
+/// Per RFC-0032::REQ-0082 and DD-005, the state file is JSON for human readability
 /// and debugging.
 ///
 /// # Security (SEC-001)
@@ -1646,7 +1646,7 @@ struct PersistentStateFile {
     version: u32,
     /// Active sessions persisted to disk (without credentials).
     sessions: Vec<PersistableSessionState>,
-    /// Terminated sessions preserved for TTL-based queries (TCK-00385 BLOCKER
+    /// Terminated sessions preserved for TTL-based queries (RFC-0032::REQ-0139 BLOCKER
     /// 2).
     ///
     /// Defaults to empty for backward compatibility with v1 state files that
@@ -1735,7 +1735,7 @@ pub enum PersistentRegistryError {
 
 /// Persistent session registry for crash recovery.
 ///
-/// Per TCK-00266 and DD-005, this registry wraps [`InMemorySessionRegistry`]
+/// Per RFC-0032::REQ-0082 and DD-005, this registry wraps [`InMemorySessionRegistry`]
 /// and persists session state to a JSON file using atomic writes
 /// (write-to-temp + rename).
 ///
@@ -1796,7 +1796,7 @@ impl PersistentSessionRegistry {
         let registry = Self::new(path);
 
         if path.exists() {
-            // SEC-003 + TCK-00537: Use safe_open (O_NOFOLLOW + regular-file
+            // SEC-003 + RFC-0032::REQ-0193: Use safe_open (O_NOFOLLOW + regular-file
             // verification) to prevent symlink replacement attacks, then
             // check metadata on the handle to avoid TOCTOU.
             let file = fs_safe::safe_open(path)
@@ -1861,7 +1861,7 @@ impl PersistentSessionRegistry {
                     .map_err(PersistentRegistryError::from)?;
             }
 
-            // TCK-00385 BLOCKER 2: Reload terminated entries.
+            // RFC-0032::REQ-0139 BLOCKER 2: Reload terminated entries.
             // SEC-MAJOR-1: Use absolute wall-clock expiry timestamps.
             // Entries whose absolute expiry is in the past are compacted on
             // startup rather than being loaded.  For backward compatibility
@@ -1951,7 +1951,7 @@ impl PersistentSessionRegistry {
         let state = self.inner.state.read().expect("lock poisoned");
 
         // SEC-001: Convert to PersistableSessionState to exclude lease_id
-        // TCK-00385 BLOCKER 2: Also serialize terminated entries
+        // RFC-0032::REQ-0139 BLOCKER 2: Also serialize terminated entries
         // SEC-MAJOR-1: Use absolute wall-clock expiry timestamps so downtime
         // does not silently extend terminated-entry lifetimes.
         let now_mono = Instant::now();
@@ -1989,7 +1989,7 @@ impl PersistentSessionRegistry {
             terminated,
         };
 
-        // TCK-00537: Use atomic_write_json for crash-safe persistence with
+        // RFC-0032::REQ-0193: Use atomic_write_json for crash-safe persistence with
         // restrictive permissions (0600 file, 0700 parent dir).
         fs_safe::atomic_write_json(&self.state_file_path, &state_file)
             .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
@@ -2015,7 +2015,7 @@ impl PersistentSessionRegistry {
     }
 
     /// Clears all sessions from the in-memory registry and persists the empty
-    /// state to disk (TCK-00387).
+    /// state to disk (RFC-0032::REQ-0141).
     ///
     /// This makes crash recovery idempotent: after clearing, a second startup
     /// will load an empty state file and find no sessions to recover.
@@ -2054,7 +2054,7 @@ impl PersistentSessionRegistry {
             terminated: Vec::new(),
         };
 
-        // TCK-00537: Use atomic_write_json for crash-safe empty-state
+        // RFC-0032::REQ-0193: Use atomic_write_json for crash-safe empty-state
         // persistence.
         fs_safe::atomic_write_json(&self.state_file_path, &state_file)
             .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
@@ -2110,7 +2110,7 @@ impl PersistentSessionRegistry {
         };
         drop(state);
 
-        // TCK-00537: Use atomic_write_json for crash-safe persistence.
+        // RFC-0032::REQ-0193: Use atomic_write_json for crash-safe persistence.
         fs_safe::atomic_write_json(&self.state_file_path, &state_file)
             .map_err(|e| PersistentRegistryError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -2160,7 +2160,7 @@ impl SessionRegistry for PersistentSessionRegistry {
     ) -> Result<Option<SessionState>, SessionRegistryError> {
         let removed = self.inner.remove_session(session_id)?;
         if removed.is_some() {
-            // TCK-00384 security BLOCKER 2: persist after removal so the
+            // RFC-0032::REQ-0138 security BLOCKER 2: persist after removal so the
             // delete is durable across restarts.  Persistence failures are
             // now propagated (fail-closed) instead of silently swallowed.
             self.persist()
@@ -2245,7 +2245,7 @@ impl SessionRegistry for PersistentSessionRegistry {
             })
     }
 
-    /// Returns all sessions for crash recovery (TCK-00387).
+    /// Returns all sessions for crash recovery (RFC-0032::REQ-0141).
     ///
     /// Unlike the default (empty) implementation, the persistent registry
     /// returns sessions that were loaded from the state file.
@@ -2253,7 +2253,7 @@ impl SessionRegistry for PersistentSessionRegistry {
         self.all_sessions()
     }
 
-    /// Clears all sessions and persists the empty state (TCK-00387).
+    /// Clears all sessions and persists the empty state (RFC-0032::REQ-0141).
     ///
     /// This makes crash recovery idempotent: after clearing, a second
     /// startup will see no sessions to recover.
@@ -2488,7 +2488,7 @@ mod session_registry_tests {
             .register_session(make_session("sess-new", "handle-new"))
             .unwrap();
 
-        // TCK-00384: Verify full evicted SessionState is returned
+        // RFC-0032::REQ-0138: Verify full evicted SessionState is returned
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].session_id, "sess-0");
 
@@ -2716,7 +2716,7 @@ mod session_registry_tests {
         assert_eq!(registry.session_count(), 0);
     }
 
-    /// TCK-00384 Security BLOCKER: Verify that `remove_session` is durable --
+    /// RFC-0032::REQ-0138 Security BLOCKER: Verify that `remove_session` is durable --
     /// a removed session must NOT reappear after a save/reload cycle.
     #[test]
     fn test_durable_remove_session_persists_after_reload() {
@@ -2767,7 +2767,7 @@ mod session_registry_tests {
         }
     }
 
-    /// TCK-00384 Quality BLOCKER: Verify that evicted sessions returned by
+    /// RFC-0032::REQ-0138 Quality BLOCKER: Verify that evicted sessions returned by
     /// `register_session` contain full `SessionState` (not just IDs), enabling
     /// transactional rollback to restore them on spawn failure.
     #[test]
@@ -2809,7 +2809,7 @@ mod session_registry_tests {
         );
     }
 
-    /// TCK-00384 Security BLOCKER 2: Verify that
+    /// RFC-0032::REQ-0138 Security BLOCKER 2: Verify that
     /// `PersistentSessionRegistry::remove_session` propagates persistence
     /// failures via `SessionRegistryError::PersistenceFailed` instead of
     /// silently logging them.
@@ -3366,7 +3366,7 @@ mod session_registry_tests {
 }
 
 // =============================================================================
-// TCK-00267: `LEASE_REVOKED` Signal and Crash Recovery Tests
+// RFC-0032::REQ-0083: `LEASE_REVOKED` Signal and Crash Recovery Tests
 // =============================================================================
 
 #[cfg(test)]
@@ -3397,7 +3397,7 @@ mod tck_00267 {
     // AC1: Sessions receive `LEASE_REVOKED` within 5s
     // =========================================================================
 
-    /// TCK-00267 AC1: ``LEASE_REVOKED`` signal is sent to recovered sessions.
+    /// RFC-0032::REQ-0083 AC1: ``LEASE_REVOKED`` signal is sent to recovered sessions.
     #[test]
     fn lease_revoked_signal_sent_to_recovered_sessions() {
         let registry = InMemorySessionRegistry::new();
@@ -3443,7 +3443,7 @@ mod tck_00267 {
         assert_eq!(signals_sent.load(Ordering::SeqCst), 3);
     }
 
-    /// TCK-00267 AC1: Recovery completes within 5 seconds.
+    /// RFC-0032::REQ-0083 AC1: Recovery completes within 5 seconds.
     #[test]
     fn recovery_completes_within_5_seconds() {
         let registry = InMemorySessionRegistry::new();
@@ -3487,7 +3487,7 @@ mod tck_00267 {
         );
     }
 
-    /// TCK-00267 AC1: Recovery times out if processing takes too long.
+    /// RFC-0032::REQ-0083 AC1: Recovery times out if processing takes too long.
     #[test]
     fn recovery_timeout_when_signal_processing_slow() {
         let registry = InMemorySessionRegistry::new();
@@ -3523,7 +3523,7 @@ mod tck_00267 {
         }
     }
 
-    /// TCK-00267: ``LEASE_REVOKED`` message has correct reason for daemon
+    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` message has correct reason for daemon
     /// restart.
     #[test]
     fn lease_revoked_has_daemon_restart_reason() {
@@ -3545,7 +3545,7 @@ mod tck_00267 {
         assert_eq!(signal.message, Some("Daemon restarted".to_string()));
     }
 
-    /// TCK-00267: `RecoveryResult` converts to `RecoverSessionsResponse`
+    /// RFC-0032::REQ-0083: `RecoveryResult` converts to `RecoverSessionsResponse`
     /// correctly.
     #[test]
     fn recovery_result_to_proto_response() {
@@ -3568,7 +3568,7 @@ mod tck_00267 {
     // AC2: No orphaned processes after recovery
     // =========================================================================
 
-    /// TCK-00267 AC2: Registry is cleared after successful recovery.
+    /// RFC-0032::REQ-0083 AC2: Registry is cleared after successful recovery.
     #[test]
     fn registry_cleared_after_recovery() {
         let registry = InMemorySessionRegistry::new();
@@ -3595,7 +3595,7 @@ mod tck_00267 {
         assert_eq!(registry.len(), 0);
     }
 
-    /// TCK-00267 AC2: Recovery reports orphaned process cleanup count.
+    /// RFC-0032::REQ-0083 AC2: Recovery reports orphaned process cleanup count.
     #[test]
     fn recovery_reports_orphaned_process_count() {
         let registry = InMemorySessionRegistry::new();
@@ -3610,7 +3610,7 @@ mod tck_00267 {
         assert_eq!(result.orphaned_processes_cleaned, 0);
     }
 
-    /// TCK-00267: Recovery handles empty registry gracefully.
+    /// RFC-0032::REQ-0083: Recovery handles empty registry gracefully.
     #[test]
     fn recovery_handles_empty_registry() {
         let registry = InMemorySessionRegistry::new();
@@ -3628,7 +3628,7 @@ mod tck_00267 {
         assert!(result.recovery_time_ms < 100); // Should be very fast
     }
 
-    /// TCK-00267: Recovery handles signal send failure.
+    /// RFC-0032::REQ-0083: Recovery handles signal send failure.
     #[test]
     fn recovery_handles_signal_send_failure() {
         let registry = InMemorySessionRegistry::new();
@@ -3655,7 +3655,7 @@ mod tck_00267 {
         }
     }
 
-    /// TCK-00267: Default recovery timeout is 5 seconds.
+    /// RFC-0032::REQ-0083: Default recovery timeout is 5 seconds.
     #[test]
     fn default_recovery_timeout_is_5_seconds() {
         assert_eq!(DEFAULT_RECOVERY_TIMEOUT_MS, 5000);
@@ -3664,7 +3664,7 @@ mod tck_00267 {
         assert_eq!(recovery_manager.timeout(), Duration::from_millis(5000));
     }
 
-    /// TCK-00267: Custom recovery timeout is respected.
+    /// RFC-0032::REQ-0083: Custom recovery timeout is respected.
     #[test]
     fn custom_recovery_timeout_is_respected() {
         let recovery_manager = RecoveryManager::with_timeout(1000);
@@ -3674,7 +3674,7 @@ mod tck_00267 {
         assert_eq!(recovery_manager_short.timeout(), Duration::from_millis(100));
     }
 
-    /// TCK-00267: ``LEASE_REVOKED`` reasons cover all revocation scenarios.
+    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` reasons cover all revocation scenarios.
     #[test]
     fn lease_revoked_reason_variants() {
         // Verify all reason variants are defined
@@ -3693,7 +3693,7 @@ mod tck_00267 {
 }
 
 // =============================================================================
-// TCK-00385: Security Fix Tests (BLOCKER 1, BLOCKER 2, MAJOR 1)
+// RFC-0032::REQ-0139: Security Fix Tests (BLOCKER 1, BLOCKER 2, MAJOR 1)
 // =============================================================================
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! E2E receipt verification tests for TCK-00177.
+//! E2E receipt verification tests for RFC-0033::REQ-0043.
 //!
 //! This module tests the full receipt signing and verification flow including:
 //! - Ed25519 signature generation
@@ -15,7 +15,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00177: E2E evidence and receipt verification tests
+//! - RFC-0033::REQ-0043: E2E evidence and receipt verification tests
 //! - AD-RECEIPT-001: Tool receipt generation
 //! - AD-KEY-001: Key lifecycle management
 //! - AD-VERIFY-001: Receipt verification

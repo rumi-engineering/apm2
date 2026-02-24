@@ -809,7 +809,7 @@ pub struct QueueAdmissionTrace {
     pub tp003_passed: bool,
     /// Current tick at evaluation time.
     pub evaluated_at_tick: u64,
-    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission decision.
     /// Present when the cost model provided the estimate; absent for legacy
     /// admission traces created before cost model integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1136,12 +1136,12 @@ impl AntiEntropyBudget {
 }
 
 // ============================================================================
-// Stop/revoke admission policy (TCK-00587)
+// Stop/revoke admission policy (RFC-0032::REQ-0237)
 // ============================================================================
 
 /// Explicit policy for `stop_revoke` job admission under RFC-0028/0029.
 ///
-/// TCK-00587: Defines the admission semantics for cancellation jobs. This
+/// RFC-0032::REQ-0237: Defines the admission semantics for cancellation jobs. This
 /// policy is the single source of truth for how `stop_revoke` jobs are admitted
 /// under the RFC-0028 (security) and RFC-0029 (efficiency) constraints.
 ///
@@ -1168,7 +1168,7 @@ impl AntiEntropyBudget {
 /// - **Worker priority**: Workers MUST process `stop_revoke` candidates before
 ///   any other lane in each processing cycle (two-pass scan).
 ///
-/// # RFC-0028 Token Policy (TCK-00587)
+/// # RFC-0028 Token Policy (RFC-0032::REQ-0237)
 ///
 /// Control-lane `stop_revoke` jobs carry a self-signed RFC-0028 channel
 /// context token issued by the cancel command using the persistent FAC
@@ -1219,7 +1219,7 @@ impl StopRevokeAdmissionPolicy {
 
 /// Structured admission trace for `stop_revoke` jobs recorded in receipts.
 ///
-/// TCK-00587: Every `stop_revoke` admission decision produces this trace for
+/// RFC-0032::REQ-0237: Every `stop_revoke` admission decision produces this trace for
 /// audit and replay verification. The trace captures which policy provisions
 /// were exercised and whether anti-starvation guarantees were activated.
 #[allow(clippy::struct_excessive_bools)]
@@ -1315,7 +1315,7 @@ pub trait SignatureVerifier: Send + Sync {
 /// `NoOpVerifier` is gated behind `#[cfg(any(test, feature =
 /// "unsafe_no_verify"))]`. Default builds **cannot** reference this type,
 /// enforcing the CI guardrail that production code must inject a real
-/// `SignatureVerifier` (TCK-00550).
+/// `SignatureVerifier` (RFC-0032::REQ-0205).
 #[cfg(any(test, feature = "unsafe_no_verify"))]
 pub struct NoOpVerifier;
 
@@ -1385,7 +1385,7 @@ pub fn validate_envelope_tp001(
 
     // Cryptographic signature verification (fail-closed when no verifier).
     // When verifier is None, deny immediately — NoOpVerifier is gated behind
-    // cfg(test)/feature="unsafe_no_verify" (TCK-00550).
+    // cfg(test)/feature="unsafe_no_verify" (RFC-0032::REQ-0205).
     let sig_verifier: &dyn SignatureVerifier = match verifier {
         Some(v) => v,
         None => return Err(DENY_SIGNATURE_VERIFICATION_NOT_CONFIGURED),
@@ -3294,7 +3294,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00587: StopRevokeAdmissionPolicy and StopRevokeAdmissionTrace tests
+    // RFC-0032::REQ-0237: StopRevokeAdmissionPolicy and StopRevokeAdmissionTrace tests
     // ========================================================================
 
     #[test]

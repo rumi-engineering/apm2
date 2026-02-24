@@ -1210,7 +1210,7 @@ impl SiblingNode {
 ///
 /// The `entry_status` field is cryptographically bound by the ADS leaf
 /// commitment (`key || value_hash || entry_status`). This ensures the entry
-/// status is proof-derived and cannot be caller-asserted (TCK-00356 Fix 4).
+/// status is proof-derived and cannot be caller-asserted (RFC-0020::REQ-0010 Fix 4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirectoryProofV1 {
     kind: DirectoryProofKindV1,
@@ -1499,7 +1499,7 @@ impl DirectoryProofV1 {
     ///
     /// This status is committed into the directory leaf value by the
     /// directory authority and is verified as part of the ADS proof.
-    /// It MUST NOT be caller-asserted (TCK-00356 Fix 4).
+    /// It MUST NOT be caller-asserted (RFC-0020::REQ-0010 Fix 4).
     pub const fn entry_status(&self) -> DirectoryEntryStatus {
         self.entry_status
     }
@@ -1712,7 +1712,7 @@ impl IdentityProofV1 {
     ///    caller-asserted).
     /// 6. Enforce tick-based freshness.
     ///
-    /// # Entry Status (TCK-00356 Fix 4)
+    /// # Entry Status (RFC-0020::REQ-0010 Fix 4)
     ///
     /// The entry status is **proof-derived**: it comes from the
     /// `DirectoryProofV1::entry_status` field, which is committed into the
@@ -1887,7 +1887,7 @@ impl IdentityProofV1 {
             profile.verify_directory_proof(directory_head, self.directory_proof())?;
         } else {
             // Tier0/Tier1 transitional fallback while session-open identity
-            // dereference wiring remains deferred (WVR-0103 / TCK-00361).
+            // dereference wiring remains deferred (WVR-0103 / RFC-0020::REQ-0015).
             self.directory_proof.verify_against_root(
                 directory_head.directory_root_hash(),
                 directory_head.max_proof_bytes(),
@@ -1910,7 +1910,7 @@ impl IdentityProofV1 {
 
         // Step 5b: Verify directory entry status (proof-derived).
         //
-        // SECURITY (TCK-00356 Fix 4): The entry status is extracted from
+        // SECURITY (RFC-0020::REQ-0010 Fix 4): The entry status is extracted from
         // the proof's `DirectoryProofV1::entry_status` field, which is
         // committed into the directory leaf by the directory authority.
         // This prevents callers from asserting an Active status for a
@@ -1988,7 +1988,7 @@ pub(crate) struct VerifiedHead {
 /// The invalidation path is deterministic and auditable: every cache mutation
 /// emits exactly one event of this type, and the event is sufficient to
 /// reconstruct the invalidation decision.
-// NOTE: `pub(crate)` for session-open integration (TCK-00361). Until that
+// NOTE: `pub(crate)` for session-open integration (RFC-0020::REQ-0015). Until that
 // wiring is complete, these types are exercised only by the test suite.
 #[allow(dead_code)]
 #[allow(clippy::redundant_pub_crate)]
@@ -2792,7 +2792,7 @@ fn hash_bytes(bytes: &[u8]) -> Hash {
 /// its content hash.
 ///
 /// Full CAS dereference + `IdentityProofV1::verify()` requires CAS
-/// transport integration, which is deferred to TCK-00359 (verifier cache
+/// transport integration, which is deferred to RFC-0020::REQ-0013 (verifier cache
 /// contract and invalidation correctness). Until then, the hash is bound
 /// into signed ledger event payloads for audit traceability.
 ///
@@ -2820,7 +2820,7 @@ pub fn validate_identity_proof_hash(hash: &[u8]) -> Result<(), IdentityProofErro
         });
     }
 
-    // NOTE(TCK-00359): The verifier cache contract is implemented in
+    // NOTE(RFC-0020::REQ-0013): The verifier cache contract is implemented in
     // `VerifiedHeadCache` with deterministic invalidation on revocation,
     // rotation, and head advancement. Full CAS dereference integration
     // is tracked as a follow-on integration concern. The hash continues
@@ -3759,7 +3759,7 @@ mod tests {
 
         let key = derive_directory_key(holon_cert.holon_id());
         let value_hash = [0xAB; HASH_BYTES];
-        // TCK-00356 Fix 4: Revoked status is now proof-derived, not caller-asserted.
+        // RFC-0020::REQ-0010 Fix 4: Revoked status is now proof-derived, not caller-asserted.
         // The directory proof itself carries DirectoryEntryStatus::Revoked.
         let proof = DirectoryProofV1::new(
             DirectoryProofKindV1::Smt256CompressedV1,
@@ -3879,7 +3879,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00357: malformed proof negatives
+    // RFC-0020::REQ-0011: malformed proof negatives
     // ====================================================================
 
     #[test]
@@ -3984,7 +3984,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00357: over-depth / over-size negatives
+    // RFC-0020::REQ-0011: over-depth / over-size negatives
     // ====================================================================
 
     #[test]
@@ -4090,7 +4090,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00357: forged proof negatives
+    // RFC-0020::REQ-0011: forged proof negatives
     // ====================================================================
 
     #[test]
@@ -4224,7 +4224,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00357: kind compatibility negatives
+    // RFC-0020::REQ-0011: kind compatibility negatives
     // ====================================================================
 
     #[test]
@@ -4295,7 +4295,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00357: profile/cache implementation tests
+    // RFC-0020::REQ-0011: profile/cache implementation tests
     // ====================================================================
 
     #[test]
@@ -4465,7 +4465,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // TCK-00359: Verifier cache invalidation correctness tests
+    // RFC-0020::REQ-0013: Verifier cache invalidation correctness tests
     // ---------------------------------------------------------------
 
     /// Helper to create a second cell certificate with a different `cell_id`.

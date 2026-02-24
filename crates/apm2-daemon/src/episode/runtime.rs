@@ -71,7 +71,7 @@ pub const MAX_CONCURRENT_EPISODES: usize = 10_000;
 /// which is acceptable for daemon processes.
 ///
 /// The previous value of 100,000 could result in ~1.5GB heap usage, which
-/// risks OOM on resource-constrained nodes (TCK-00240 review feedback).
+/// risks OOM on resource-constrained nodes (RFC-0016::REQ-0002 review feedback).
 pub const MAX_EVENTS_BUFFER_SIZE: usize = 10_000;
 
 /// Hash type (BLAKE3-256).
@@ -146,7 +146,7 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
-    /// Clock profile was published (TCK-00240).
+    /// Clock profile was published (RFC-0016::REQ-0002).
     ///
     /// This event is emitted when the runtime is initialized with a
     /// `HolonicClock`. It publishes the `ClockProfile` to the ledger so that
@@ -170,7 +170,7 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
-    /// Lease issuance was denied (TCK-00258).
+    /// Lease issuance was denied (RFC-0032::REQ-0074).
     ///
     /// Per REQ-DCP-0006, this event is emitted when a spawn request is rejected
     /// due to policy violations such as `SoD` (Separation of Duties) custody
@@ -194,7 +194,7 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
-    /// Tool execution completed (TCK-00320).
+    /// Tool execution completed (RFC-0032::REQ-0114).
     ///
     /// Per SEC-CTRL-FAC-0015, this event is emitted after each tool execution
     /// completes, providing the CAS result hash for evidence linking.
@@ -203,7 +203,7 @@ pub enum EpisodeEvent {
     ///
     /// The `result_hash` field provides a verifiable reference to the full
     /// `ToolResultData` stored in CAS. This enables:
-    /// - Downstream indexing (TCK-00327: `ToolLogIndexV1`)
+    /// - Downstream indexing (RFC-0032::REQ-0120: `ToolLogIndexV1`)
     /// - Receipt verification
     /// - Audit trail integrity
     ToolExecuted {
@@ -419,8 +419,8 @@ impl EpisodeRuntimeConfig {
     }
 }
 
-/// Maximum number of tool result hashes per episode (TCK-00320).
-/// Maximum tool result hashes per episode (TCK-00320).
+/// Maximum number of tool result hashes per episode (RFC-0032::REQ-0114).
+/// Maximum tool result hashes per episode (RFC-0032::REQ-0114).
 ///
 /// This limit prevents unbounded memory growth per CTR-1303. Episodes
 /// exceeding this limit will have their oldest result hashes evicted.
@@ -439,13 +439,13 @@ struct EpisodeEntry {
     handle: Option<SessionHandle>,
     /// Tool executor if initialized.
     executor: Option<SharedToolExecutor>,
-    /// Accumulated tool result hashes in execution order (TCK-00320).
+    /// Accumulated tool result hashes in execution order (RFC-0032::REQ-0114).
     ///
     /// Per SEC-CTRL-FAC-0015, this accumulates CAS hashes of all
     /// `ToolResultData` in deterministic tool sequence order. Used for
-    /// downstream indexing (TCK-00327: `ToolLogIndexV1`).
+    /// downstream indexing (RFC-0032::REQ-0120: `ToolLogIndexV1`).
     result_hashes: Vec<Hash>,
-    /// TCK-00399: Harness handle for the spawned agent CLI process.
+    /// RFC-0032::REQ-0151: Harness handle for the spawned agent CLI process.
     ///
     /// Stored for lifecycle management: `stop()` calls
     /// `adapter.terminate()` via this handle. Set after a successful
@@ -482,7 +482,7 @@ struct EpisodeEntry {
 /// // Stop the episode
 /// runtime.stop(&episode_id, TerminationClass::Success, timestamp_ns).await?;
 /// ```
-/// Type alias for workspace-rooted handler factory functions (TCK-00319).
+/// Type alias for workspace-rooted handler factory functions (RFC-0032::REQ-0113).
 ///
 /// These factories take a workspace root path and produce handlers that are
 /// confined to that workspace. This is the preferred factory type for
@@ -517,12 +517,12 @@ pub struct EpisodeRuntime {
     cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Factories for creating tool handlers (legacy, CWD-rooted).
     ///
-    /// **DEPRECATED (TCK-00319)**: Prefer `rooted_handler_factories` for
+    /// **DEPRECATED (RFC-0032::REQ-0113)**: Prefer `rooted_handler_factories` for
     /// production use. These factories create handlers rooted to CWD, which
     /// is a security anti-pattern.
     #[allow(clippy::type_complexity)]
     handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
-    /// Factories for creating workspace-rooted tool handlers (TCK-00319).
+    /// Factories for creating workspace-rooted tool handlers (RFC-0032::REQ-0113).
     ///
     /// These factories take a workspace root path and produce handlers that are
     /// confined to that workspace. This is the preferred factory type for
@@ -530,7 +530,7 @@ pub struct EpisodeRuntime {
     rooted_handler_factories: RwLock<Vec<RootedHandlerFactory>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
-    /// Ledger event emitter for durable episode event persistence (TCK-00321).
+    /// Ledger event emitter for durable episode event persistence (RFC-0032::REQ-0115).
     ///
     /// Per REQ-0005, when present, episode events are streamed directly to the
     /// ledger as they occur (rather than buffered in memory). This enables:
@@ -541,7 +541,7 @@ pub struct EpisodeRuntime {
     /// When `None`, events are buffered in memory (legacy behavior for tests).
     ledger_emitter: Option<Arc<dyn LedgerEventEmitter>>,
     /// Session registry for wiring episode lifecycle to session termination
-    /// (TCK-00385 BLOCKER fix).
+    /// (RFC-0032::REQ-0139 BLOCKER fix).
     ///
     /// When present, episode `stop()` and `quarantine()` calls automatically
     /// mark the corresponding session as terminated via
@@ -549,7 +549,7 @@ pub struct EpisodeRuntime {
     /// (normal, crash, timeout, quarantined, budget-exhausted) produce a
     /// `TERMINATED + reason/exit_code` status in the session registry.
     session_registry: Option<Arc<dyn SessionRegistry>>,
-    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    /// RFC-0032::REQ-0151: Adapter registry for spawning agent CLI processes.
     ///
     /// When present, `spawn_adapter()` uses this registry to look up the
     /// appropriate `HarnessAdapter` and spawn the agent process.
@@ -589,11 +589,11 @@ impl EpisodeRuntime {
             // via unbounded resource consumption. Consumers can override
             // with `with_default_budget()` if needed.
             default_budget: EpisodeBudget::default(),
-            // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
+            // RFC-0032::REQ-0115: No ledger emitter by default (tests use in-memory buffer)
             ledger_emitter: None,
-            // TCK-00385: No session registry by default (tests don't need it)
+            // RFC-0032::REQ-0139: No session registry by default (tests don't need it)
             session_registry: None,
-            // TCK-00399: No adapter registry by default
+            // RFC-0032::REQ-0151: No adapter registry by default
             adapter_registry: None,
             // MAJOR security fix: empty orphan tracker
             orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
@@ -625,11 +625,11 @@ impl EpisodeRuntime {
             rooted_handler_factories: RwLock::new(Vec::new()),
             // SEC-CTRL-FAC-0015: Fail-closed default budget
             default_budget: EpisodeBudget::default(),
-            // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
+            // RFC-0032::REQ-0115: No ledger emitter by default (tests use in-memory buffer)
             ledger_emitter: None,
-            // TCK-00385: No session registry by default
+            // RFC-0032::REQ-0139: No session registry by default
             session_registry: None,
-            // TCK-00399: No adapter registry by default
+            // RFC-0032::REQ-0151: No adapter registry by default
             adapter_registry: None,
             // MAJOR security fix: empty orphan tracker
             orphan_harness_handles: tokio::sync::Mutex::new(Vec::new()),
@@ -742,7 +742,7 @@ impl EpisodeRuntime {
     }
 
     /// Sets the ledger emitter for durable episode event persistence
-    /// (TCK-00321).
+    /// (RFC-0032::REQ-0115).
     ///
     /// Per REQ-0005, when a ledger emitter is configured, episode events are
     /// streamed directly to the ledger as they occur. This enables:
@@ -773,7 +773,7 @@ impl EpisodeRuntime {
     }
 
     /// Sets the session registry for wiring episode lifecycle to session
-    /// termination (TCK-00385 BLOCKER fix).
+    /// termination (RFC-0032::REQ-0139 BLOCKER fix).
     ///
     /// When configured, `stop()` and `quarantine()` automatically call
     /// `session_registry.mark_terminated()` for the session associated with
@@ -786,7 +786,7 @@ impl EpisodeRuntime {
         self
     }
 
-    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    /// Sets the adapter registry for spawning agent CLI processes (RFC-0032::REQ-0151).
     #[must_use]
     pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
@@ -844,11 +844,11 @@ impl EpisodeRuntime {
 
     /// Registers a factory for creating tool handlers (builder pattern).
     ///
-    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer
+    /// **DEPRECATED (RFC-0032::REQ-0113, RFC-0032::REQ-0128)**: Prefer
     /// `with_rooted_handler_factory` for production use. These factories
     /// create handlers rooted to CWD, which is a security anti-pattern.
     ///
-    /// # Security Warning (TCK-00336)
+    /// # Security Warning (RFC-0032::REQ-0128)
     ///
     /// CWD-rooted handlers violate workspace isolation. Using this method
     /// in production creates a security vulnerability where tool handlers
@@ -857,7 +857,7 @@ impl EpisodeRuntime {
     #[must_use]
     #[deprecated(
         since = "0.1.0",
-        note = "TCK-00336: Use with_rooted_handler_factory for workspace isolation"
+        note = "RFC-0032::REQ-0128: Use with_rooted_handler_factory for workspace isolation"
     )]
     pub fn with_handler_factory<F>(mut self, factory: F) -> Self
     where
@@ -869,7 +869,7 @@ impl EpisodeRuntime {
 
     /// Registers a workspace-rooted handler factory (builder pattern).
     ///
-    /// # TCK-00319: Production Handler Registration
+    /// # RFC-0032::REQ-0113: Production Handler Registration
     ///
     /// This is the **preferred** method for registering tool handlers in
     /// production. The factory receives the workspace root path at episode
@@ -901,19 +901,19 @@ impl EpisodeRuntime {
 
     /// Registers a factory for creating tool handlers.
     ///
-    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer
+    /// **DEPRECATED (RFC-0032::REQ-0113, RFC-0032::REQ-0128)**: Prefer
     /// `register_rooted_handler_factory` for production use.
     ///
     /// This allows the runtime to spawn fresh handlers for each episode
     /// (needed because handlers are consumed by the executor).
     ///
-    /// # Security Warning (TCK-00336)
+    /// # Security Warning (RFC-0032::REQ-0128)
     ///
     /// CWD-rooted handlers violate workspace isolation. See
     /// `with_handler_factory` for details.
     #[deprecated(
         since = "0.1.0",
-        note = "TCK-00336: Use register_rooted_handler_factory for workspace isolation"
+        note = "RFC-0032::REQ-0128: Use register_rooted_handler_factory for workspace isolation"
     )]
     pub async fn register_tool_handler_factory<F>(&self, factory: F)
     where
@@ -925,7 +925,7 @@ impl EpisodeRuntime {
 
     /// Registers a workspace-rooted handler factory.
     ///
-    /// # TCK-00319: Production Handler Registration
+    /// # RFC-0032::REQ-0113: Production Handler Registration
     ///
     /// See [`Self::with_rooted_handler_factory`] for details.
     pub async fn register_rooted_handler_factory<F>(&self, factory: F)
@@ -1045,8 +1045,8 @@ impl EpisodeRuntime {
                     state,
                     handle: None,
                     executor: None,
-                    result_hashes: Vec::new(), // TCK-00320: Accumulate result hashes
-                    harness_handle: None,      // TCK-00399: Set after spawn_adapter()
+                    result_hashes: Vec::new(), // RFC-0032::REQ-0114: Accumulate result hashes
+                    harness_handle: None,      // RFC-0032::REQ-0151: Set after spawn_adapter()
                 },
             );
         }
@@ -1079,11 +1079,11 @@ impl EpisodeRuntime {
 
     /// Starts an episode, transitioning it from CREATED to RUNNING.
     ///
-    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer `start_with_workspace` for
+    /// **DEPRECATED (RFC-0032::REQ-0113, RFC-0032::REQ-0128)**: Prefer `start_with_workspace` for
     /// production use. This method uses CWD-rooted handlers, which is a
     /// security anti-pattern that violates workspace isolation.
     ///
-    /// # Security Warning (TCK-00336)
+    /// # Security Warning (RFC-0032::REQ-0128)
     ///
     /// Using this method in production creates a security vulnerability where
     /// tool handlers can access files outside the intended workspace. The
@@ -1113,7 +1113,7 @@ impl EpisodeRuntime {
     /// Emits `episode.started` event (INV-ER002).
     #[deprecated(
         since = "0.1.0",
-        note = "TCK-00336: Use start_with_workspace for workspace isolation"
+        note = "RFC-0032::REQ-0128: Use start_with_workspace for workspace isolation"
     )]
     #[instrument(skip(self, lease_id))]
     pub async fn start(
@@ -1127,13 +1127,13 @@ impl EpisodeRuntime {
             .await
     }
 
-    /// Starts an episode with a specific workspace root (TCK-00319).
+    /// Starts an episode with a specific workspace root (RFC-0032::REQ-0113).
     ///
     /// This is the **preferred** method for starting episodes in production.
     /// Tool handlers will be rooted to the specified workspace, preventing
     /// access to the daemon's CWD or other directories.
     ///
-    /// # TCK-00319: Workspace Root Plumbing
+    /// # RFC-0032::REQ-0113: Workspace Root Plumbing
     ///
     /// This method addresses BLOCKER 2: it accepts a workspace root and uses it
     /// to initialize tool handlers via the rooted handler factories.
@@ -1278,7 +1278,7 @@ impl EpisodeRuntime {
                     executor = executor.with_clock(clock.clone());
                 }
 
-                // TCK-00319: Register handlers from rooted factories first (preferred)
+                // RFC-0032::REQ-0113: Register handlers from rooted factories first (preferred)
                 if let Some(root) = workspace_root {
                     let rooted_factories = self.rooted_handler_factories.read().await;
                     for factory in rooted_factories.iter() {
@@ -1293,17 +1293,17 @@ impl EpisodeRuntime {
                 }
 
                 // Register handlers from legacy (CWD-rooted) factories
-                // TCK-00336: These are deprecated and should only be used in tests.
+                // RFC-0032::REQ-0128: These are deprecated and should only be used in tests.
                 // Production code MUST use rooted_handler_factories with a workspace root.
                 let factories = self.handler_factories.read().await;
                 if !factories.is_empty() && workspace_root.is_none() {
-                    // TCK-00336: Emit security warning when using CWD-rooted handlers
+                    // RFC-0032::REQ-0128: Emit security warning when using CWD-rooted handlers
                     // without workspace isolation in non-test contexts.
                     warn!(
                         episode_id = %episode_id,
                         factory_count = factories.len(),
                         "SECURITY: Using deprecated CWD-rooted handler factories without workspace root. \
-                         This violates workspace isolation (TCK-00336). Use start_with_workspace() \
+                         This violates workspace isolation (RFC-0032::REQ-0128). Use start_with_workspace() \
                          and register_rooted_handler_factory() for production."
                     );
                 }
@@ -1354,7 +1354,7 @@ impl EpisodeRuntime {
         Ok(handle)
     }
 
-    /// Spawns an agent CLI process for the given episode (TCK-00399).
+    /// Spawns an agent CLI process for the given episode (RFC-0032::REQ-0151).
     ///
     /// Validates the episode is in RUNNING state, calls
     /// `HarnessAdapter::spawn()`, stores the `HarnessHandle` in the episode
@@ -1403,7 +1403,7 @@ impl EpisodeRuntime {
         }
 
         // Spawn the agent process.
-        // TCK-00400: Use typed `AdapterSpawnFailed` variant to preserve the
+        // RFC-0032::REQ-0152: Use typed `AdapterSpawnFailed` variant to preserve the
         // `AdapterError` variant so callers can classify rate-limit errors
         // without heuristic string matching.
         let (handle, event_stream) =
@@ -1548,7 +1548,7 @@ impl EpisodeRuntime {
 
         // Spawn background bridge task to consume the event stream.
         // Tool-request intents are captured with explicit stub markers
-        // (tool execution is deferred to TCK-00401).
+        // (tool execution is deferred to RFC-0032::REQ-0153).
         let bridge_episode_id = episode_id.clone();
         tokio::spawn(async move {
             Self::event_stream_bridge(bridge_episode_id, event_stream).await;
@@ -1560,7 +1560,7 @@ impl EpisodeRuntime {
     /// Background bridge task that consumes a `HarnessEventStream`.
     ///
     /// Tool-request intents are logged with stub markers. Actual tool
-    /// execution is deferred to TCK-00401.
+    /// execution is deferred to RFC-0032::REQ-0153.
     async fn event_stream_bridge(
         episode_id: EpisodeId,
         mut event_stream: crate::episode::adapter::HarnessEventStream,
@@ -1577,7 +1577,7 @@ impl EpisodeRuntime {
                         episode_id = %episode_id,
                         request_id = %request_id,
                         tool = %tool,
-                        "[STUB] tool-request intent captured (execution deferred to TCK-00401)"
+                        "[STUB] tool-request intent captured (execution deferred to RFC-0032::REQ-0153)"
                     );
                 },
                 HarnessEvent::Terminated {
@@ -1755,7 +1755,7 @@ impl EpisodeRuntime {
                 });
             }
 
-            // TCK-00399: Take the harness handle. State stays Running until
+            // RFC-0032::REQ-0151: Take the harness handle. State stays Running until
             // process death is confirmed (fail-closed). The terminal
             // transition is committed in Phase 3 below.
             let harness_handle = entry.harness_handle.take();
@@ -1868,12 +1868,12 @@ impl EpisodeRuntime {
     }
 
     /// Stops an episode and emits a `SessionTerminated` ledger event
-    /// (TCK-00395).
+    /// (RFC-0032::REQ-0149).
     ///
     /// This is a convenience wrapper around [`Self::stop`] that additionally
     /// emits a `SessionTerminated` event to the ledger when a
     /// `ledger_emitter` is configured. This enables the `GateOrchestrator`
-    /// (TCK-00388) to observe session termination and trigger gate lifecycle.
+    /// (RFC-0032::REQ-0142) to observe session termination and trigger gate lifecycle.
     ///
     /// # Arguments
     ///
@@ -1901,7 +1901,7 @@ impl EpisodeRuntime {
         self.stop(episode_id, termination_class, timestamp_ns)
             .await?;
 
-        // TCK-00395: Emit SessionTerminated event to ledger if emitter is configured
+        // RFC-0032::REQ-0149: Emit SessionTerminated event to ledger if emitter is configured
         if let Some(ref emitter) = self.ledger_emitter {
             let exit_code = match termination_class {
                 TerminationClass::Success => 0,
@@ -1940,7 +1940,7 @@ impl EpisodeRuntime {
         Ok(())
     }
 
-    /// Stops all running episodes with session context (TCK-00395 BLOCKER 1).
+    /// Stops all running episodes with session context (RFC-0032::REQ-0149 BLOCKER 1).
     ///
     /// This method iterates all running episodes and stops each one, emitting
     /// `SessionTerminated` ledger events for all sessions. It is intended for
@@ -2244,7 +2244,7 @@ impl EpisodeRuntime {
 
     /// Executes a tool in the context of an episode.
     ///
-    /// Per TCK-00320, this method:
+    /// Per RFC-0032::REQ-0114, this method:
     /// 1. Executes the tool via the executor
     /// 2. Records the CAS result hash in the episode's accumulator
     /// 3. Emits a `ToolExecuted` event for downstream indexing
@@ -2287,7 +2287,7 @@ impl EpisodeRuntime {
     }
 
     /// Executes a tool with request-scoped TOCTOU-verified file content
-    /// (TCK-00375).
+    /// (RFC-0020::REQ-0029).
     #[allow(clippy::too_many_arguments)] // Carries request-scoped execution invariants.
     pub async fn execute_tool_with_verified_content(
         &self,
@@ -2341,7 +2341,7 @@ impl EpisodeRuntime {
             })?;
         drop(executor_guard); // Release executor lock before acquiring episodes write lock
 
-        // Step 3: Record result hash and emit event (TCK-00320)
+        // Step 3: Record result hash and emit event (RFC-0032::REQ-0114)
         if let Some(result_hash) = result.result_hash {
             self.record_tool_result(
                 episode_id,
@@ -2356,7 +2356,7 @@ impl EpisodeRuntime {
         Ok(result)
     }
 
-    /// Records a tool result hash and emits a `ToolExecuted` event (TCK-00320).
+    /// Records a tool result hash and emits a `ToolExecuted` event (RFC-0032::REQ-0114).
     ///
     /// Per SEC-CTRL-FAC-0015, this method:
     /// 1. Accumulates the result hash in the episode's ordered collection
@@ -2445,10 +2445,10 @@ impl EpisodeRuntime {
         Ok(())
     }
 
-    /// Returns the accumulated result hashes for an episode (TCK-00320).
+    /// Returns the accumulated result hashes for an episode (RFC-0032::REQ-0114).
     ///
     /// The result hashes are returned in deterministic tool sequence order.
-    /// This is used for downstream indexing (TCK-00327: `ToolLogIndexV1`).
+    /// This is used for downstream indexing (RFC-0032::REQ-0120: `ToolLogIndexV1`).
     ///
     /// # Arguments
     ///
@@ -2469,7 +2469,7 @@ impl EpisodeRuntime {
     /// Emits a `LeaseIssueDenied` event for `SoD` violations and other spawn
     /// rejections.
     ///
-    /// Per TCK-00258 and REQ-DCP-0006, this method emits a diagnostic event
+    /// Per RFC-0032::REQ-0074 and REQ-DCP-0006, this method emits a diagnostic event
     /// when a spawn request is rejected due to policy violations such as
     /// custody domain overlap.
     ///
@@ -2620,7 +2620,7 @@ impl EpisodeRuntime {
 
     /// Emits an event to the ledger (if configured) or internal buffer.
     ///
-    /// # TCK-00321: Ledger-Backed Event Persistence
+    /// # RFC-0032::REQ-0115: Ledger-Backed Event Persistence
     ///
     /// Per REQ-0005, when a ledger emitter is configured, episode events are
     /// streamed directly to the ledger as they occur. This enables:
@@ -2636,7 +2636,7 @@ impl EpisodeRuntime {
     /// If ledger emission fails, this method returns an error (Fail-Closed)
     /// to ensure the episode does not continue without audit logging.
     async fn emit_event(&self, event: EpisodeEvent) -> Result<(), EpisodeError> {
-        // TCK-00321: Stream to ledger when emitter is configured
+        // RFC-0032::REQ-0115: Stream to ledger when emitter is configured
         if let Some(emitter) = &self.ledger_emitter {
             let event_type = event.event_type();
             let episode_id = event
@@ -2655,7 +2655,7 @@ impl EpisodeRuntime {
             let episode_id_cloned = episode_id.clone();
             let payload_cloned = payload;
 
-            // Blocking I/O in async context must be spawned (TCK-00321 Quality Review)
+            // Blocking I/O in async context must be spawned (RFC-0032::REQ-0115 Quality Review)
             let result = tokio::task::spawn_blocking(move || {
                 emitter.emit_episode_event(
                     &episode_id_cloned,
@@ -2710,7 +2710,7 @@ impl EpisodeRuntime {
 
     /// Serializes an `EpisodeEvent` to JSON bytes for ledger persistence.
     ///
-    /// # TCK-00321: Event Serialization
+    /// # RFC-0032::REQ-0115: Event Serialization
     ///
     /// This method produces a JSON representation of the event suitable for
     /// ledger persistence. The format is designed to be:
@@ -2898,7 +2898,7 @@ pub async fn new_shared_runtime_with_clock_initialized(
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // TCK-00336: Tests use deprecated methods intentionally for coverage
+#[allow(deprecated)] // RFC-0032::REQ-0128: Tests use deprecated methods intentionally for coverage
 mod tests {
     use super::*;
 
@@ -3207,7 +3207,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00399: Adapter spawning tests
+    // RFC-0032::REQ-0151: Adapter spawning tests
     // =========================================================================
 
     /// Mock adapter for testing `spawn_adapter` without real PTY processes.
@@ -3787,10 +3787,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00240: HolonicClock integration tests
+    // RFC-0016::REQ-0002: HolonicClock integration tests
     // =========================================================================
 
-    /// TCK-00240: Verify that events include `time_envelope_ref` when clock is
+    /// RFC-0016::REQ-0002: Verify that events include `time_envelope_ref` when clock is
     /// provided.
     #[tokio::test]
     async fn tck_00240_events_have_time_envelope_ref_with_clock() {
@@ -3840,7 +3840,7 @@ mod tests {
         }
     }
 
-    /// TCK-00240: Verify that quarantine events also get `time_envelope_ref`.
+    /// RFC-0016::REQ-0002: Verify that quarantine events also get `time_envelope_ref`.
     #[tokio::test]
     async fn tck_00240_quarantine_event_has_time_envelope_ref() {
         use crate::htf::{ClockConfig, HolonicClock};
@@ -3886,7 +3886,7 @@ mod tests {
         );
     }
 
-    /// TCK-00240: Verify that events have `time_envelope_ref: None` when no
+    /// RFC-0016::REQ-0002: Verify that events have `time_envelope_ref: None` when no
     /// clock is provided (backward compatibility).
     #[tokio::test]
     async fn tck_00240_events_have_no_time_envelope_ref_without_clock() {
@@ -3907,7 +3907,7 @@ mod tests {
         );
     }
 
-    /// TCK-00240: Verify that `ClockProfilePublished` event is emitted when
+    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` event is emitted when
     /// using `with_clock_initialized`.
     #[tokio::test]
     async fn tck_00240_clock_profile_published_event() {
@@ -3956,7 +3956,7 @@ mod tests {
         }
     }
 
-    /// TCK-00240: Verify that `ClockProfilePublished` has `episode_id() ==
+    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` has `episode_id() ==
     /// None`.
     #[tokio::test]
     async fn tck_00240_clock_profile_published_has_no_episode_id() {
@@ -3977,7 +3977,7 @@ mod tests {
         );
     }
 
-    /// TCK-00319: Verify that `start_with_workspace` correctly initializes
+    /// RFC-0032::REQ-0113: Verify that `start_with_workspace` correctly initializes
     /// rooted handlers and that they are confined to the workspace.
     #[tokio::test]
     async fn tck_00319_start_with_workspace_roots_handlers() {
@@ -4058,10 +4058,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00385 BLOCKER: Episode stop/quarantine wires session termination
+    // RFC-0032::REQ-0139 BLOCKER: Episode stop/quarantine wires session termination
     // =========================================================================
 
-    /// TCK-00385 BLOCKER regression: `stop()` with `session_registry` marks
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `session_registry` marks
     /// the session as TERMINATED with correct reason and exit code.
     #[tokio::test]
     async fn tck_00385_stop_wires_session_terminated() {
@@ -4128,7 +4128,7 @@ mod tests {
         );
     }
 
-    /// TCK-00385 BLOCKER regression: `stop()` with `BudgetExhausted` maps to
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `BudgetExhausted` maps to
     /// correct reason.
     #[tokio::test]
     async fn tck_00385_stop_budget_exhausted_wires_reason() {
@@ -4182,7 +4182,7 @@ mod tests {
         assert_eq!(term_info.exit_classification, "FAILURE");
     }
 
-    /// TCK-00385 BLOCKER regression: `stop()` with Timeout maps correctly.
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with Timeout maps correctly.
     #[tokio::test]
     async fn tck_00385_stop_timeout_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4235,7 +4235,7 @@ mod tests {
         assert_eq!(term_info.exit_classification, "FAILURE");
     }
 
-    /// TCK-00385 BLOCKER regression: `quarantine()` wires session termination
+    /// RFC-0032::REQ-0139 BLOCKER regression: `quarantine()` wires session termination
     /// with "quarantined" reason.
     #[tokio::test]
     async fn tck_00385_quarantine_wires_session_terminated() {
@@ -4296,7 +4296,7 @@ mod tests {
         );
     }
 
-    /// TCK-00385 BLOCKER regression: Without `session_registry`,
+    /// RFC-0032::REQ-0139 BLOCKER regression: Without `session_registry`,
     /// stop/quarantine still works (backward compatibility).
     #[tokio::test]
     async fn tck_00385_stop_without_registry_still_works() {
@@ -4326,7 +4326,7 @@ mod tests {
         assert!(matches!(state, EpisodeState::Terminated { .. }));
     }
 
-    /// TCK-00385 BLOCKER: `stop()` with Crashed maps to crash/FAILURE/exit 1.
+    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Crashed maps to crash/FAILURE/exit 1.
     #[tokio::test]
     async fn tck_00385_stop_crashed_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4380,7 +4380,7 @@ mod tests {
         assert_eq!(term_info.exit_code, Some(1));
     }
 
-    /// TCK-00385 BLOCKER: `stop()` with Killed maps to crash/FAILURE/exit 137.
+    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Killed maps to crash/FAILURE/exit 137.
     #[tokio::test]
     async fn tck_00385_stop_killed_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4435,7 +4435,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00385 MAJOR 1: Fail-closed error propagation
+    // RFC-0032::REQ-0139 MAJOR 1: Fail-closed error propagation
     // =========================================================================
 
     /// A session registry that always fails on `mark_terminated`.
@@ -4493,7 +4493,7 @@ mod tests {
         }
     }
 
-    /// TCK-00385 MAJOR 1: `stop()` returns `SessionTerminationFailed` when
+    /// RFC-0032::REQ-0139 MAJOR 1: `stop()` returns `SessionTerminationFailed` when
     /// `mark_terminated` fails, enforcing the fail-closed contract.
     #[tokio::test]
     async fn tck_00385_stop_propagates_mark_terminated_error() {
@@ -4534,7 +4534,7 @@ mod tests {
         );
     }
 
-    /// TCK-00385 MAJOR 1: `quarantine()` returns `SessionTerminationFailed`
+    /// RFC-0032::REQ-0139 MAJOR 1: `quarantine()` returns `SessionTerminationFailed`
     /// when `mark_terminated` fails, enforcing the fail-closed contract.
     #[tokio::test]
     async fn tck_00385_quarantine_propagates_mark_terminated_error() {

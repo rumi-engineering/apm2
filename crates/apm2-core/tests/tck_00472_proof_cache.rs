@@ -1,4 +1,4 @@
-//! TCK-00472: RFC-0029 REQ-0003 integration tests for verification
+//! RFC-0033::REQ-0061: RFC-0029 REQ-0003 integration tests for verification
 //! amortization and proof-cache discipline.
 
 use apm2_core::context::proof_cache::{

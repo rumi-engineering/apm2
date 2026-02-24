@@ -145,14 +145,14 @@ pub struct EpisodeStarted {
     /// Goal specification for this episode.
     goal_spec: Option<String>,
 
-    /// BLAKE3 hash of the `RoleSpecV1` governing this episode (TCK-00331).
+    /// BLAKE3 hash of the `RoleSpecV1` governing this episode (RFC-0032::REQ-0124).
     ///
     /// Per RFC-0019 Addendum, role specs are CAS-addressed artifacts. This hash
     /// provides attribution for which role's tool allowlist and budgets were in
     /// effect during the episode.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00331.
+    /// before RFC-0032::REQ-0124.
     #[serde(skip_serializing_if = "Option::is_none")]
     role_spec_hash: Option<[u8; 32]>,
 }
@@ -331,7 +331,7 @@ impl EpisodeStarted {
         self
     }
 
-    /// Returns the role spec hash (TCK-00331).
+    /// Returns the role spec hash (RFC-0032::REQ-0124).
     ///
     /// This hash identifies the `RoleSpecV1` that governed this episode's
     /// tool allowlist and budgets.
@@ -340,7 +340,7 @@ impl EpisodeStarted {
         self.role_spec_hash.as_ref()
     }
 
-    /// Sets the role spec hash (TCK-00331).
+    /// Sets the role spec hash (RFC-0032::REQ-0124).
     ///
     /// # Arguments
     ///

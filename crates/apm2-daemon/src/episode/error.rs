@@ -205,7 +205,7 @@ pub enum EpisodeError {
         message: String,
     },
 
-    /// Session termination persistence failed (TCK-00385 MAJOR 1).
+    /// Session termination persistence failed (RFC-0032::REQ-0139 MAJOR 1).
     ///
     /// Per the fail-closed contract (session/mod.rs), persistence failures
     /// during `mark_terminated` are fatal for the session lifecycle. The
@@ -223,7 +223,7 @@ pub enum EpisodeError {
         message: String,
     },
 
-    /// Adapter spawn failed (TCK-00400).
+    /// Adapter spawn failed (RFC-0032::REQ-0152).
     ///
     /// Preserves the typed [`super::adapter::AdapterError`] so callers can
     /// inspect the variant for structured classification (e.g.

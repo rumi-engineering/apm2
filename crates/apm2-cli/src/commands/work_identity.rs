@@ -116,11 +116,11 @@ mod tests {
     #[test]
     fn extract_tck_from_text_matches_exact_five_digits() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0032/TCK-00640-work"),
-            Some("TCK-00640".to_string())
+            extract_tck_from_text("ticket/RFC-0032/RFC-0032::REQ-0268-work"),
+            Some("RFC-0032::REQ-0268".to_string())
         );
         assert_eq!(
-            extract_tck_from_text("ticket/TCK-006401"),
+            extract_tck_from_text("ticket/RFC-0032::REQ-02681"),
             None,
             "six-digit token must not partially match"
         );
@@ -128,9 +128,9 @@ mod tests {
 
     #[test]
     fn derive_adhoc_session_id_is_deterministic() {
-        let first = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
-        let second = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
-        let third = derive_adhoc_session_id("W-TCK-00640", "L-issued-002");
+        let first = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-001");
+        let second = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-001");
+        let third = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-002");
         assert_eq!(first, second);
         assert_ne!(first, third);
         assert!(first.starts_with("S-adhoc-"));

@@ -1368,6 +1368,3736 @@
             "heading_level": 2
           },
           "body": "Primary implementation surfaces:\n\n* FAC core: `crates/apm2-core/src/fac/*`\n* Work model: `crates/apm2-core/src/work/*`\n* Broker/scheduler: `crates/apm2-core/src/fac/broker/*`, `crates/apm2-core/src/fac/scheduler/*`\n* Daemon FAC endpoints (HSI routes): `crates/apm2-daemon/src/dispatch/*`\n* Evidence + receipts storage: `crates/apm2-daemon/src/cas/*`, `crates/apm2-core/src/ledger/*`\n"
+        },
+        {
+          "type": "section",
+          "title": "Migrated Requirements (from deleted ticket/RFC traceability)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0042",
+              "title": "Create spawn_holon orchestration function",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Create spawn_holon orchestration function",
+                "domain": [
+                  "orchestration"
+                ],
+                "migrated_from": "RFC-0003"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0043",
+              "title": "Create example-holon skill demonstrating pattern",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Create example-holon skill demonstrating pattern",
+                "domain": [
+                  "orchestration"
+                ],
+                "migrated_from": "RFC-0003"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0044",
+              "title": "Update dev-rfc to use holon pattern",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Update dev-rfc to use holon pattern",
+                "domain": [
+                  "orchestration"
+                ],
+                "migrated_from": "RFC-0003"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0045",
+              "title": "Define agent exit protocol and session cleanup",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Define agent exit protocol and session cleanup",
+                "domain": [
+                  "agent_exit"
+                ],
+                "migrated_from": "RFC-0008"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0046",
+              "title": "Add agent handoff integration tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Add agent handoff integration tests",
+                "domain": [
+                  "agent_exit"
+                ],
+                "migrated_from": "RFC-0008"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0047",
+              "title": "SUPERSEDED: RFC-0009 ticket (migrated to RFC-0032::REQ-0277)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "SUPERSEDED: RFC-0009 ticket (migrated to RFC-0032::REQ-0277)",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0009"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0048",
+              "title": "Implement CoordinationState and event type definitions",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement CoordinationState and event type definitions",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0049",
+              "title": "Implement CoordinationReducer with determinism property tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement CoordinationReducer with determinism property tests",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0050",
+              "title": "Implement CoordinationController serial execution loop",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement CoordinationController serial execution loop",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0051",
+              "title": "Implement coordination budget enforcement and tracking",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement coordination budget enforcement and tracking",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0052",
+              "title": "Implement stop conditions and circuit breaker logic",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement stop conditions and circuit breaker logic",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0053",
+              "title": "Implement apm2 coordinate CLI command",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement apm2 coordinate CLI command",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0054",
+              "title": "Implement CoordinationReceipt and CAS storage",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement CoordinationReceipt and CAS storage",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0055",
+              "title": "Implement coordination end-to-end integration tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement coordination end-to-end integration tests",
+                "domain": [
+                  "coordination"
+                ],
+                "migrated_from": "RFC-0012"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0056",
+              "title": "FAC: GateLease proto message and Rust types",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: GateLease proto message and Rust types",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0057",
+              "title": "FAC: Context firewall integration with PolicyEngine",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: Context firewall integration with PolicyEngine",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0058",
+              "title": "FAC: GitHub projection adapter (write-only)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: GitHub projection adapter (write-only)",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0059",
+              "title": "FAC: Divergence watchdog with InterventionFreeze",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: Divergence watchdog with InterventionFreeze",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0060",
+              "title": "FAC: Tamper detection and overwrite",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: Tamper detection and overwrite",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0061",
+              "title": "FAC: AAT lease binding with custody domain validation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: AAT lease binding with custody domain validation",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0062",
+              "title": "FAC: Evidence hygiene enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: Evidence hygiene enforcement",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0063",
+              "title": "FAC: AAT harness sandboxing schema (Phase 1 - schema only)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: AAT harness sandboxing schema (Phase 1 - schema only)",
+                "domain": [
+                  "fac"
+                ],
+                "migrated_from": "RFC-0015"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0064",
+              "title": "Add SO_PEERCRED authentication to ProtocolServer",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Add SO_PEERCRED authentication to ProtocolServer",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0065",
+              "title": "Implement dual-socket topology for privilege separation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement dual-socket topology for privilege separation",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0066",
+              "title": "Add per-connection session token issuance",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Add per-connection session token issuance",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0067",
+              "title": "Implement privileged endpoint dispatcher",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement privileged endpoint dispatcher",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0068",
+              "title": "Implement session-scoped endpoint dispatcher",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement session-scoped endpoint dispatcher",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0069",
+              "title": "Implement ClaimWork handler with policy resolution",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement ClaimWork handler with policy resolution",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0070",
+              "title": "Extend CapabilityManifest with tool and path allowlists",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Extend CapabilityManifest with tool and path allowlists",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0071",
+              "title": "Implement ContextPack sealing with hash verification",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement ContextPack sealing with hash verification",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0072",
+              "title": "Implement SpawnEpisode with PolicyResolvedForChangeSet check",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement SpawnEpisode with PolicyResolvedForChangeSet check",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0073",
+              "title": "Add GateLeaseIssued validation for GATE_EXECUTOR spawn",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Add GateLeaseIssued validation for GATE_EXECUTOR spawn",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0074",
+              "title": "Implement SoD custody domain validation at spawn",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement SoD custody domain validation at spawn",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0075",
+              "title": "Implement ephemeral session handle generation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement ephemeral session handle generation",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0076",
+              "title": "Implement tool broker with capability manifest validation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement tool broker with capability manifest validation",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0077",
+              "title": "Implement context firewall with deny + terminate semantics",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement context firewall with deny + terminate semantics",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0078",
+              "title": "Implement credential broker for GitHub operations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement credential broker for GitHub operations",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0079",
+              "title": "Implement credential broker for SSH operations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement credential broker for SSH operations",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0080",
+              "title": "Extend Canonicalize trait for RFC-0017 kernel events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Extend Canonicalize trait for RFC-0017 kernel events",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0081",
+              "title": "Implement signature verification on ledger ingestion",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement signature verification on ledger ingestion",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0082",
+              "title": "Implement session registry with persistent state file",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement session registry with persistent state file",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0083",
+              "title": "Implement LEASE_REVOKED signal and crash recovery",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement LEASE_REVOKED signal and crash recovery",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0084",
+              "title": "Add Prometheus metrics for daemon health",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Add Prometheus metrics for daemon health",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0085",
+              "title": "ProtocolServer-only daemon entrypoint",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ProtocolServer-only daemon entrypoint",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0086",
+              "title": "Delete legacy JSON IPC modules",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Delete legacy JSON IPC modules",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0087",
+              "title": "CI guardrails against legacy IPC",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CI guardrails against legacy IPC",
+                "domain": [
+                  "dcp_protocol"
+                ],
+                "migrated_from": "RFC-0017"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0088",
+              "title": "Fix context firewall security findings from PR #335",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Fix context firewall security findings from PR #335",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0089",
+              "title": "Routing cutover: ProtocolServer dispatchers on operator/session sockets",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Routing cutover: ProtocolServer dispatchers on operator/session sockets",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0090",
+              "title": "CLI dual-socket + protocol client alignment (no JSON IPC)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI dual-socket + protocol client alignment (no JSON IPC)",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0091",
+              "title": "Privileged dispatcher: replace stubs with real governance + IssueCapability",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Privileged dispatcher: replace stubs with real governance + IssueCapability",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0092",
+              "title": "Session dispatcher viability: RequestTool execution + real EmitEvent/PublishEvidence",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Session dispatcher viability: RequestTool execution + real EmitEvent/PublishEvidence",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0093",
+              "title": "Tool handlers: replace Read/Write/Execute stubs with real implementations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tool handlers: replace Read/Write/Execute stubs with real implementations",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0094",
+              "title": "Policy engine integration: replace StubPolicyEngine in ToolBroker",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Policy engine integration: replace StubPolicyEngine in ToolBroker",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0095",
+              "title": "Durable CAS backend + wiring (replace stub/in-memory CAS in production)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Durable CAS backend + wiring (replace stub/in-memory CAS in production)",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0096",
+              "title": "HEF: Extend ProtocolServer proto with PulseEnvelope + Subscribe/Unsubscribe",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Extend ProtocolServer proto with PulseEnvelope + Subscribe/Unsubscribe",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0097",
+              "title": "HEF: Topic grammar + wildcard matcher with bounded complexity",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Topic grammar + wildcard matcher with bounded complexity",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0098",
+              "title": "HEF: Subscription registry + ACL enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Subscription registry + ACL enforcement",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0099",
+              "title": "HEF: Resource governance + backpressure/drop policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Resource governance + backpressure/drop policy",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0100",
+              "title": "HEF: Outbox + pulse publisher (post-commit)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Outbox + pulse publisher (post-commit)",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0101",
+              "title": "HEF: Topic->trigger mapping for Work and Gate events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Topic->trigger mapping for Work and Gate events",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0102",
+              "title": "HEF NEW WORK REQUIRED: Episode lifecycle/tool/io truth-plane events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF NEW WORK REQUIRED: Episode lifecycle/tool/io truth-plane events",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0103",
+              "title": "HEF NEW WORK REQUIRED: DefectRecord ledger event",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF NEW WORK REQUIRED: DefectRecord ledger event",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0104",
+              "title": "HEF: Red-team and resilience test suite",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF: Red-team and resilience test suite",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0105",
+              "title": "FAC v0 NEW WORK REQUIRED: Workspace snapshot/apply + ReviewBlocked",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC v0 NEW WORK REQUIRED: Workspace snapshot/apply + ReviewBlocked",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0106",
+              "title": "FAC v0 NEW WORK REQUIRED: ReviewReceipt artifacts + ledger event",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC v0 NEW WORK REQUIRED: ReviewReceipt artifacts + ledger event",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0107",
+              "title": "FAC v0: End-to-end autonomous run harness",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC v0: End-to-end autonomous run harness",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0108",
+              "title": "HEF NEW WORK REQUIRED: Capability allowlists for pulse topics + CAS reads",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HEF NEW WORK REQUIRED: Capability allowlists for pulse topics + CAS reads",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0109",
+              "title": "FAC v0 NEW WORK REQUIRED: Reviewer navigation tool surface (ListFiles/Search)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC v0 NEW WORK REQUIRED: Reviewer navigation tool surface (ListFiles/Search)",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0110",
+              "title": "Session dispatcher viability closure",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Session dispatcher viability closure",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0111",
+              "title": "Reviewer capability manifest (real allowlist)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Reviewer capability manifest (real allowlist)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0112",
+              "title": "Workspace apply implementation (safe patch apply)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Workspace apply implementation (safe patch apply)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0113",
+              "title": "Root tool handlers per workspace",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Root tool handlers per workspace",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0114",
+              "title": "Tool result hash propagation (executor -> events -> artifacts)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tool result hash propagation (executor -> events -> artifacts)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0115",
+              "title": "Episode event sink to ledger",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Episode event sink to ledger",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0116",
+              "title": "Projection worker (daemon integration)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Projection worker (daemon integration)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0117",
+              "title": "ProjectionReceiptRecorded kernel event",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ProjectionReceiptRecorded kernel event",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0118",
+              "title": "ViewCommitment capture + embedding in review artifacts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ViewCommitment capture + embedding in review artifacts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0119",
+              "title": "ContextPack sealing + broker firewall initialization (end-to-end)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ContextPack sealing + broker firewall initialization (end-to-end)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0120",
+              "title": "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt integration",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0121",
+              "title": "AgentAdapterProfileV1 schema + registry selection by hash",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "AgentAdapterProfileV1 schema + registry selection by hash",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0122",
+              "title": "Adapter profiles for claude-code, gemini-cli, codex-cli, local-inference",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Adapter profiles for claude-code, gemini-cli, codex-cli, local-inference",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0123",
+              "title": "Adapter conformance tests + ledger attribution",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Adapter conformance tests + ledger attribution",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0124",
+              "title": "RoleSpecV1 + tool-call matrix + instruction conformance harness",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RoleSpecV1 + tool-call matrix + instruction conformance harness",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0125",
+              "title": "Orchestrator revision loop (1..100 cycles) with deterministic stop conditions",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Orchestrator revision loop (1..100 cycles) with deterministic stop conditions",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0126",
+              "title": "Horizontal specialization: specialist roles + diff-based routing",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Horizontal specialization: specialist roles + diff-based routing",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0127",
+              "title": "Efficiency primitives: context deltas, caching, and summary-first iteration economics",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Efficiency primitives: context deltas, caching, and summary-first iteration economics",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0128",
+              "title": "Refactor: remove unsafe-by-default protocol/bypass paths (exclude xtask)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Refactor: remove unsafe-by-default protocol/bypass paths (exclude xtask)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0129",
+              "title": "Security hardening: broker sandboxing (allowlists, canonical paths, env scrub, timeouts)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security hardening: broker sandboxing (allowlists, canonical paths, env scrub, timeouts)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0130",
+              "title": "Security hardening: prompt-injection resistance via evidence taint tracking",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security hardening: prompt-injection resistance via evidence taint tracking",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0131",
+              "title": "Security hardening: multi-holon policy inheritance enforcement + attestation tightening",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security hardening: multi-holon policy inheritance enforcement + attestation tightening",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0132",
+              "title": "CLI process management commands: migrate to ProtocolServer IPC",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI process management commands: migrate to ProtocolServer IPC",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0133",
+              "title": "CLI credential management commands: migrate to ProtocolServer IPC",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI credential management commands: migrate to ProtocolServer IPC",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0134",
+              "title": "CLI episode session-status and work status: add protocol support",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI episode session-status and work status: add protocol support",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0135",
+              "title": "CLI consensus commands: daemon integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI consensus commands: daemon integration",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0136",
+              "title": "CLI coordinate command: daemon integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CLI coordinate command: daemon integration",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0137",
+              "title": "Daemon session dispatcher: wire CAS, broker, ledger, and clock via with_persistence_and_cas",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Daemon session dispatcher: wire CAS, broker, ledger, and clock via with_persistence_and_cas",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0138",
+              "title": "Session telemetry tracking: wire tool_calls, events_emitted, and started_at counters",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Session telemetry tracking: wire tool_calls, events_emitted, and started_at counters",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0139",
+              "title": "Session termination signal: return terminal state and exit reason in SessionStatus",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Session termination signal: return terminal state and exit reason in SessionStatus",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0140",
+              "title": "Coordinate command: replace heartbeat polling with session termination signal",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Coordinate command: replace heartbeat polling with session termination signal",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0141",
+              "title": "Daemon crash recovery: wire persistent session state to lease revocation and work cleanup",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Daemon crash recovery: wire persistent session state to lease revocation and work cleanup",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0142",
+              "title": "Gate execution orchestrator: autonomous gate lifecycle after session termination",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Gate execution orchestrator: autonomous gate lifecycle after session termination",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0143",
+              "title": "Review receipt ingestion: daemon endpoint for external reviewer results",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Review receipt ingestion: daemon endpoint for external reviewer results",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0144",
+              "title": "Daemon-side merge executor: autonomous merge after gate approval",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Daemon-side merge executor: autonomous merge after gate approval",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0145",
+              "title": "Autonomous FAC end-to-end integration test: full lifecycle without xtask",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Autonomous FAC end-to-end integration test: full lifecycle without xtask",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0146",
+              "title": "Wire IPC shutdown handler to daemon graceful shutdown signal",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Wire IPC shutdown handler to daemon graceful shutdown signal",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0147",
+              "title": "Wire divergence watchdog into daemon main loop",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Wire divergence watchdog into daemon main loop",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0148",
+              "title": "ChangeSet publishing IPC endpoint for daemon-anchored changeset submission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ChangeSet publishing IPC endpoint for daemon-anchored changeset submission",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0149",
+              "title": "Emit ledger events from privileged IPC handlers for work lifecycle observability",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Emit ledger events from privileged IPC handlers for work lifecycle observability",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0150",
+              "title": "Unify ledger write and read schemas (ledger_events vs events table split)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Unify ledger write and read schemas (ledger_events vs events table split)",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0151",
+              "title": "Wire AdapterRegistry into SpawnEpisode to spawn agent CLI processes",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Wire AdapterRegistry into SpawnEpisode to spawn agent CLI processes",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0152",
+              "title": "Implement weighted random adapter profile selection for multi-model rotation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement weighted random adapter profile selection for multi-model rotation",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0153",
+              "title": "Initialize ToolBroker with capability manifest and policy engine in production path",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Initialize ToolBroker with capability manifest and policy engine in production path",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0154",
+              "title": "Implement CodexCliAdapter with TI1 tool bridge protocol for blanket-preserving Codex integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement CodexCliAdapter with TI1 tool bridge protocol for blanket-preserving Codex integration",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0155",
+              "title": "End-to-end FAC lifecycle integration test: claim -> spawn -> tool execute -> evidence -> terminate",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "End-to-end FAC lifecycle integration test: claim -> spawn -> tool execute -> evidence -> terminate",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0156",
+              "title": "Enforce fail-closed side-effect cutover and durable projection acknowledgement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Enforce fail-closed side-effect cutover and durable projection acknowledgement",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0157",
+              "title": "FAC-local gate execution (self-hosted OVH runner) + fail-closed test safety guardrails",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC-local gate execution (self-hosted OVH runner) + fail-closed test safety guardrails",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0158",
+              "title": "PublishChangeSet fail-closed closure: production CAS wiring, ownership binding, digest integrity, and semantic idempotency",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PublishChangeSet fail-closed closure: production CAS wiring, ownership binding, digest integrity, and semantic idempotency",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0159",
+              "title": "WorkObject ledger authority cutover: filesystem ticket exit and projection-only truth",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "WorkObject ledger authority cutover: filesystem ticket exit and projection-only truth",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0160",
+              "title": "Lifecycle authority bindings: mandatory delegation/context/stop/budget/view contracts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lifecycle authority bindings: mandatory delegation/context/stop/budget/view contracts",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0161",
+              "title": "Event-family convergence and replay-equivalence gates for work lifecycle",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Event-family convergence and replay-equivalence gates for work lifecycle",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0162",
+              "title": "HTF authority hardening for FAC lifecycle transitions",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HTF authority hardening for FAC lifecycle transitions",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0163",
+              "title": "Staged xtask demotion and instruction-plane cutover to apm2 fac",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Staged xtask demotion and instruction-plane cutover to apm2 fac",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0164",
+              "title": "TCK alias observation window, reconciliation gates, and snapshot-emitter sunset",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "TCK alias observation window, reconciliation gates, and snapshot-emitter sunset",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0165",
+              "title": "Digest-first scale validation: summary receipts, bounded control planes, replay-safe projection",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Digest-first scale validation: summary receipts, bounded control planes, replay-safe projection",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0166",
+              "title": "[Umbrella] FAC RoleSpec vNext rollout for WorkObject execution",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "[Umbrella] FAC RoleSpec vNext rollout for WorkObject execution",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0167",
+              "title": "FAC review CLI contract and deterministic run-state schema",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC review CLI contract and deterministic run-state schema",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0168",
+              "title": "Reviewer telemetry contract and bounded projection visibility",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Reviewer telemetry contract and bounded projection visibility",
+                "domain": [
+                  "hef_fac"
+                ],
+                "migrated_from": "RFC-0018"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0169",
+              "title": "Production WorkObject role binding and end-to-end fail-closed validation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Production WorkObject role binding and end-to-end fail-closed validation",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0170",
+              "title": "AdmissionKernel: implement plan/execute API with capability-gated effect surfaces + join-input assembly (witness seeds + ledger/policy prerequisites + safe plan semantics)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "AdmissionKernel: implement plan/execute API with capability-gated effect surfaces + join-input assembly (witness seeds + ledger/policy prerequisites + safe plan semantics)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0171",
+              "title": "Admission evidence closure: seal AdmissionBundleV1 (CAS) before receipt/event emission; bind all authoritative outcomes to bundle digest (no digest cycles)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Admission evidence closure: seal AdmissionBundleV1 (CAS) before receipt/event emission; bind all authoritative outcomes to bundle digest (no digest cycles)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0172",
+              "title": "RequestTool cutover: handler becomes thin wrapper over AdmissionKernel plan/execute (no direct broker/effect calls)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RequestTool cutover: handler becomes thin wrapper over AdmissionKernel plan/execute (no direct broker/effect calls)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0173",
+              "title": "Cutover PublishEvidence + EmitEvent to AdmissionKernel (enforce PCAC lifecycle + bundle binding + policy-root trust prerequisites)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Cutover PublishEvidence + EmitEvent to AdmissionKernel (enforce PCAC lifecycle + bundle binding + policy-root trust prerequisites)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0174",
+              "title": "Spine conformance suite: no-bypass, replay across restart, tamper detection, fail-closed prerequisites, anti-rollback anchoring, downgrade resistance, and bounded-work regressions",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Spine conformance suite: no-bypass, replay across restart, tamper detection, fail-closed prerequisites, anti-rollback anchoring, downgrade resistance, and bounded-work regressions",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0175",
+              "title": "Ledger trust stack: RootTrustBundle, trusted seals, checkpoint-bounded startup, and governance-derived PolicyRootResolver",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Ledger trust stack: RootTrustBundle, trusted seals, checkpoint-bounded startup, and governance-derived PolicyRootResolver",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0176",
+              "title": "Crash-safe effect execution: effect journal + RequestId idempotency key propagation + fail-closed in-doubt handling",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Crash-safe effect execution: effect journal + RequestId idempotency key propagation + fail-closed in-doubt handling",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0177",
+              "title": "Anti-rollback anchoring: implement external anchor provider(s) and enforce fail-closed tier gating when missing/mismatched",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Anti-rollback anchoring: implement external anchor provider(s) and enforce fail-closed tier gating when missing/mismatched",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0178",
+              "title": "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC Broker service: RFC-0028 channel tokens + RFC-0029 envelopes/horizons (mandatory default-mode authority)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0179",
+              "title": "Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Job spec hardening: add `job_spec_digest` + `actuation` block (RFC-0028 binding) to FacJobSpecV1",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0180",
+              "title": "Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Queue hygiene: add denied/quarantine dirs + denial/quarantine receipts + retention policy",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0181",
+              "title": "Lanes v1: lane directories + LaneProfileV1 + LaneLeaseV1 + `apm2 fac lane status`",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lanes v1: lane directories + LaneProfileV1 + LaneLeaseV1 + `apm2 fac lane status`",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0182",
+              "title": "Symlink-safe deletion primitive: `safe_rmtree_v1` + lane reset command",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Symlink-safe deletion primitive: `safe_rmtree_v1` + lane reset command",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0183",
+              "title": "Attestation fail-closed fixes: include .cargo/config.toml + rustfmt version; extend env allowlist (future-proof wrappers)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Attestation fail-closed fixes: include .cargo/config.toml + rustfmt version; extend env allowlist (future-proof wrappers)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0184",
+              "title": "`apm2 fac warm`: lane-scoped prewarm with receipts + economics + authorization",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "`apm2 fac warm`: lane-scoped prewarm with receipts + economics + authorization",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0185",
+              "title": "FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC-managed CARGO_HOME + env clearing policy (eliminate ambient user state)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0186",
+              "title": "Evidence bundle export/import commands exercising RFC-0028 boundary validation + RFC-0029 receipt validation (local-only)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Evidence bundle export/import commands exercising RFC-0028 boundary validation + RFC-0029 receipt validation (local-only)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0187",
+              "title": "System-mode execution path: run jobs without user-bus dependency (broker-managed transient units)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "System-mode execution path: run jobs without user-bus dependency (broker-managed transient units)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0188",
+              "title": "RFC-0029 cost model: job cost estimation + post-run calibration from receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0029 cost model: job cost estimation + post-run calibration from receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0189",
+              "title": "Cancellation semantics: stop_revoke lane + kill running unit + receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Cancellation semantics: stop_revoke lane + kill running unit + receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0190",
+              "title": "Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Crash recovery + reconcile: repair queue/leases on worker startup; emit recovery receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0191",
+              "title": "Introspection CLI: queue status + job show + receipts list (forensics-first UX)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Introspection CLI: queue status + job show + receipts list (forensics-first UX)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0192",
+              "title": "Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Permissions hardening: enforce 0700 roots, safe ownership checks, and refuse unsafe `$APM2_HOME/private/fac` perms",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0193",
+              "title": "Safe atomic file I/O primitives: atomic JSON write + O_NOFOLLOW open + bounded read helper (queue/leases/receipts)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Safe atomic file I/O primitives: atomic JSON write + O_NOFOLLOW open + bounded read helper (queue/leases/receipts)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0194",
+              "title": "ToolchainFingerprintV1: stable derivation, caching, and inclusion in receipts/attestation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ToolchainFingerprintV1: stable derivation, caching, and inclusion in receipts/attestation",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0195",
+              "title": "Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lane init/reconcile: create lanes, write profiles, and repair missing lane roots (operator-friendly bootstrap)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0196",
+              "title": "Legacy gate cache v2 reuse policy: default deny unless bound to RFC-0028/0029 receipts; add unsafe override flag",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Legacy gate cache v2 reuse policy: default deny unless bound to RFC-0028/0029 receipts; add unsafe override flag",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0197",
+              "title": "Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Gate cache v3 (optional): receipt-indexed cache store keyed by attestation+policy+toolchain (fail-closed by construction)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0198",
+              "title": "Evidence bundle schemas in code: manifest+envelope + hashing + bounded parsing + export/import integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Evidence bundle schemas in code: manifest+envelope + hashing + bounded parsing + export/import integration",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0199",
+              "title": "Receipt stream merge tool: set-union merge + deterministic ordering + conflict audit report",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Receipt stream merge tool: set-union merge + deterministic ordering + conflict audit report",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0200",
+              "title": "`apm2 fac pipeline` integration: route evidence phase through queue/lanes (eliminate SHA drift + dirty attests-clean hazard)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "`apm2 fac pipeline` integration: route evidence phase through queue/lanes (eliminate SHA drift + dirty attests-clean hazard)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0201",
+              "title": "Optional patch bytes backend: integrate existing APM2 CAS as storage (with explicit GC decisions)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Optional patch bytes backend: integrate existing APM2 CAS as storage (with explicit GC decisions)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0202",
+              "title": "`apm2 fac doctor`: verify prerequisites (services, liveness, toolchain, permissions, credentials posture)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "`apm2 fac doctor`: verify prerequisites (services, liveness, toolchain, permissions, credentials posture)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0203",
+              "title": "Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Containment verification: cgroup membership check for rustc/nextest children; enforce gating when sccache enabled",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0204",
+              "title": "Bounded executor rewrite: replace bash bounded runner with Rust streaming executor (policy-driven env + caps)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Bounded executor rewrite: replace bash bounded runner with Rust streaming executor (policy-driven env + caps)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0205",
+              "title": "CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CI guardrails: ban NoOpVerifier in default builds; enforce RFC-0028/0029 fields present in execution receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0206",
+              "title": "Observability: metrics from receipts (throughput, queue latency, denial/quarantine rate, disk usage) + status summaries",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Observability: metrics from receipts (throughput, queue latency, denial/quarantine rate, disk usage) + status summaries",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0207",
+              "title": "Benchmark harness: measure cold/warm gate times, disk footprint collapse, and concurrency stability (prove 10x claim)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Benchmark harness: measure cold/warm gate times, disk footprint collapse, and concurrency stability (prove 10x claim)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0208",
+              "title": "sccache explicit activation (optional): policy-gated enablement + receipt/attestation surfacing + safe defaults",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "sccache explicit activation (optional): policy-gated enablement + receipt/attestation surfacing + safe defaults",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0209",
+              "title": "sccache containment protocol: per-unit server lifecycle + refusal to attach to out-of-cgroup servers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "sccache containment protocol: per-unit server lifecycle + refusal to attach to out-of-cgroup servers",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0210",
+              "title": "RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0028 leakage budgets integration: enforce evidence/log export caps and declassification receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0211",
+              "title": "Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Node identity primitives: node_fingerprint derivation + boundary_id configuration + stable emission into LaneProfileV1",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0212",
+              "title": "Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Security regression tests: fuzz job spec parsing + adversarial queue file tests + safe_rmtree property tests",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0213",
+              "title": "Receipt Index v1: rebuildable index for fast job/receipt lookup (non-authoritative cache)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Receipt Index v1: rebuildable index for fast job/receipt lookup (non-authoritative cache)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0214",
+              "title": "Policy update + adoption protocol: broker-admitted FacPolicyHash rotation with receipts + rollback",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Policy update + adoption protocol: broker-admitted FacPolicyHash rotation with receipts + rollback",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0215",
+              "title": "Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Receipt write pipeline: emit receipt + update index + link job state atomically (avoid torn states)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0216",
+              "title": "RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0028 token binding contract: bind tokens to (job_spec_digest, FacPolicyHash, canonicalizer tuple, boundary_id) + expiry",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0217",
+              "title": "Token replay protection: broker-side one-time use (or bounded reuse) ledger + revocation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Token replay protection: broker-side one-time use (or bounded reuse) ledger + revocation",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0218",
+              "title": "RFC-0028 intent taxonomy for FAC: typed tool-intent classes and per-kind authorization policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0028 intent taxonomy for FAC: typed tool-intent classes and per-kind authorization policy",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0219",
+              "title": "Broker rate limits + quotas: bound token issuance, queue growth, and expensive operations using RFC-0029 budgets",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Broker rate limits + quotas: bound token issuance, queue growth, and expensive operations using RFC-0029 budgets",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0220",
+              "title": "Lane CORRUPT persistence + refusal semantics: marker file, reasons, and operator workflow",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lane CORRUPT persistence + refusal semantics: marker file, reasons, and operator workflow",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0221",
+              "title": "Lane log retention + quotas: per-lane max bytes + per-job retention windows; GC integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lane log retention + quotas: per-lane max bytes + per-job retention windows; GC integration",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0222",
+              "title": "Cgroup usage accounting: record cpu/mem/IO stats per job and store in receipts (feeds economics calibration)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Cgroup usage accounting: record cpu/mem/IO stats per job and store in receipts (feeds economics calibration)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0223",
+              "title": "Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Job unit sandbox hardening: NoNewPrivileges, PrivateTmp, Protect*, Restrict*, safe defaults without breaking builds",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0224",
+              "title": "Network policy for job units: default deny network for gates, allow only for explicit fetch/warm phases (policy-driven)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Network policy for job units: default deny network for gates, allow only for explicit fetch/warm phases (policy-driven)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0225",
+              "title": "Env & path hygiene completion: set HOME/TMPDIR/XDG dirs per lane; prevent writes to ambient user locations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Env & path hygiene completion: set HOME/TMPDIR/XDG dirs per lane; prevent writes to ambient user locations",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0226",
+              "title": "Signed receipts: broker/worker signature on receipts + verification tooling + gate-cache requires valid signature in default mode",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Signed receipts: broker/worker signature on receipts + verification tooling + gate-cache requires valid signature in default mode",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0227",
+              "title": "Receipt store permissions model: dedicated service user ownership + CLI writes only via broker APIs (minimize attacker write access)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Receipt store permissions model: dedicated service user ownership + CLI writes only via broker APIs (minimize attacker write access)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0228",
+              "title": "Queue bounds + backpressure: max pending jobs/bytes; denial with receipts; integrate RFC-0029 control-plane budgets",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Queue bounds + backpressure: max pending jobs/bytes; denial with receipts; integrate RFC-0029 control-plane budgets",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0229",
+              "title": "Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Strict job spec validation policy: allowed kinds/repos; size caps; patch backend allowlist; deny unknown",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0230",
+              "title": "Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Git safety hardening in lane workspaces: disable hooks, enforce safe.directory, refuse unsafe configs",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0231",
+              "title": "Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Patch injection hardening: path traversal rejection, safe apply mode, and patch provenance receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0232",
+              "title": "Repo mirror update hardening: locked updates, bounded fetch, remote URL allowlist, and receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Repo mirror update hardening: locked updates, bounded fetch, remote URL allowlist, and receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0233",
+              "title": "Receipt/index compaction + GC: prune old index buckets, rebuild deterministically, and emit compaction receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Receipt/index compaction + GC: prune old index buckets, rebuild deterministically, and emit compaction receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0234",
+              "title": "EconomicsProfile adoption protocol: broker-admitted economics_profile_hash with rollback + receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "EconomicsProfile adoption protocol: broker-admitted economics_profile_hash with rollback + receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0235",
+              "title": "Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Horizon/authority health monitoring: broker validates TP001/TP002/TP003 invariants and emits health receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0236",
+              "title": "Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Multi-worker fairness & scan efficiency: avoid stampede scanning; optional queue scan lease; deterministic behavior preserved",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0237",
+              "title": "stop_revoke semantics: guarantee cancellation progress under load while still enforcing RFC-0028/0029 (explicit policy)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "stop_revoke semantics: guarantee cancellation progress under load while still enforcing RFC-0028/0029 (explicit policy)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0238",
+              "title": "End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "End-to-end default-mode harness: spin up broker+worker, enqueue gates, verify RFC-0028/0029 receipts, and test denial paths",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0239",
+              "title": "Legacy evidence log deprecation: migrate to per-job logs, keep legacy read-only, and remove clobbering paths",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Legacy evidence log deprecation: migrate to per-job logs, keep legacy read-only, and remove clobbering paths",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0240",
+              "title": "`apm2 fac config show`: show resolved policy, boundary id, backend, lane count, admitted digests (operator correctness tool)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "`apm2 fac config show`: show resolved policy, boundary id, backend, lane count, admitted digests (operator correctness tool)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0241",
+              "title": "Explicit cache purge command: `apm2 fac caches nuke` (dangerous) with hard confirmations and receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Explicit cache purge command: `apm2 fac caches nuke` (dangerous) with hard confirmations and receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0242",
+              "title": "Schema registry + bounded deserialization enforcement for all new FAC schemas (job/lease/profile/receipts/manifests)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Schema registry + bounded deserialization enforcement for all new FAC schemas (job/lease/profile/receipts/manifests)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0243",
+              "title": "`apm2 fac services`: status/ensure + socket-activation glue for non-flaky startup",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "`apm2 fac services`: status/ensure + socket-activation glue for non-flaky startup",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0244",
+              "title": "Daemon turnkey setup: systemd user service, CLI auto-start, env-based auto-config, and health check",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Daemon turnkey setup: systemd user service, CLI auto-start, env-based auto-config, and health check",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0245",
+              "title": "Secrets & credentials management for FAC (systemd credentials + no dotfile preconditions)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Secrets & credentials management for FAC (systemd credentials + no dotfile preconditions)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0246",
+              "title": "Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Make GitHub integration non-interactive (GH_TOKEN) and lane-scoped (no ~/.config/gh dependence)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0247",
+              "title": "Headless GitHub App auth for `apm2 fac pr` (eliminate `APM2_GITHUB_APP_ID` flakiness)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Headless GitHub App auth for `apm2 fac pr` (eliminate `APM2_GITHUB_APP_ID` flakiness)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0248",
+              "title": "Broker/worker health + watchdog integration (ensure daemon is always running)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Broker/worker health + watchdog integration (ensure daemon is always running)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0249",
+              "title": "E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "E2E tests: deterministic failures (no hangs) + secrets posture (gates unaffected)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0250",
+              "title": "FAC CLI JSON parity — every fac subcommand outputs JSON by default, long-running commands stream JSONL",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC CLI JSON parity — every fac subcommand outputs JSON by default, long-running commands stream JSONL",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0251",
+              "title": "Forge admission merge decoupling: local-authoritative merge with clean worktree, PR projection, and signed receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Forge admission merge decoupling: local-authoritative merge with clean worktree, PR projection, and signed receipts",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0252",
+              "title": "Fix: lifecycle stuck at gates_failed after gate retry succeeds; fix duplicate verdict comments on second reviewer completion",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Fix: lifecycle stuck at gates_failed after gate retry succeeds; fix duplicate verdict comments on second reviewer completion",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0253",
+              "title": "Implement daemon-owned readiness controller for zero-touch gates auto-bootstrap",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement daemon-owned readiness controller for zero-touch gates auto-bootstrap",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0254",
+              "title": "Enforce network denial during EXECUTE phase; normalize supply failure; fix FAC queue reliability",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Enforce network denial during EXECUTE phase; normalize supply failure; fix FAC queue reliability",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0255",
+              "title": "FAC doctor/review state machine unification with machine-verifiable CAC contract",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC doctor/review state machine unification with machine-verifiable CAC contract",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0256",
+              "title": "Technical handoff: FAC push INV-PADOPT-004 debug, binary alignment, and verified recovery",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Technical handoff: FAC push INV-PADOPT-004 debug, binary alignment, and verified recovery",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0257",
+              "title": "Implement cache reuse explainability: hit/miss with first mismatch dimension",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement cache reuse explainability: hit/miss with first mismatch dimension",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0258",
+              "title": "Instrument and verify warm-path performance SLO for repeated identical gate runs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Instrument and verify warm-path performance SLO for repeated identical gate runs",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0259",
+              "title": "RFC-0032 Phase 0: migrate legacy `ledger_events` -> core `events` with real hash chain",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 0: migrate legacy `ledger_events` -> core `events` with real hash chain",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0260",
+              "title": "RFC-0032 Phase 0: daemon startup wiring + freeze legacy ledger writers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 0: daemon startup wiring + freeze legacy ledger writers",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0261",
+              "title": "RFC-0032 AT-0: ledger unification acceptance test (legacy DB -> canonical append)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 AT-0: ledger unification acceptance test (legacy DB -> canonical append)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0262",
+              "title": "RFC-0032 Phase 1: add FAC CAS JSON schemas + bounded decoding allowlist (WorkSpec/Context/LoopProfile/AuthorityBindings)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 1: add FAC CAS JSON schemas + bounded decoding allowlist (WorkSpec/Context/LoopProfile/AuthorityBindings)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0263",
+              "title": "RFC-0032 Phase 1: implement OpenWork RPC (WorkSpec -> CAS + `work.opened`) and CLI `apm2 work open --from-ticket`",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 1: implement OpenWork RPC (WorkSpec -> CAS + `work.opened`) and CLI `apm2 work open --from-ticket`",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0264",
+              "title": "RFC-0032 Phase 1: WorkSpec projection plumbing + ticket-alias reconciliation integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 1: WorkSpec projection plumbing + ticket-alias reconciliation integration",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0265",
+              "title": "RFC-0032 Phase 2: implement ClaimWorkV2 (claim existing work_id; lease issuance; authority bindings anchor)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 2: implement ClaimWorkV2 (claim existing work_id; lease issuance; authority bindings anchor)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0266",
+              "title": "RFC-0032 Phase 2: implement PublishWorkContextEntry (CAS + `evidence.published` anchor) + `work_context` projection",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 2: implement PublishWorkContextEntry (CAS + `evidence.published` anchor) + `work_context` projection",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0267",
+              "title": "RFC-0032 Phase 2: implement RecordWorkPrAssociation (canonical `work.pr_associated` + optional LINKOUT context entry)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 2: implement RecordWorkPrAssociation (canonical `work.pr_associated` + optional LINKOUT context entry)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0268",
+              "title": "RFC-0032 Phase 2: extend `apm2 fac push` to bind work_id + emit terminal contract markers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 2: extend `apm2 fac push` to bind work_id + emit terminal contract markers",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0269",
+              "title": "RFC-0032 Phase 3: add WorkGraphEvent protobuf + canonical event types `work_graph.edge.*` + topic-derivation tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 3: add WorkGraphEvent protobuf + canonical event types `work_graph.edge.*` + topic-derivation tests",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0270",
+              "title": "RFC-0032 Phase 4: implement PublishWorkLoopProfile (CAS + evidence anchor) + active-profile selection projection",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 4: implement PublishWorkLoopProfile (CAS + evidence anchor) + active-profile selection projection",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0271",
+              "title": "RFC-0032 Phase 5: merge completion alignment (fix merge_executor `gate_receipt_id` misuse; emit merge receipt + work.completed coherently)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032 Phase 5: merge completion alignment (fix merge_executor `gate_receipt_id` misuse; emit merge receipt + work.completed coherently)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0272",
+              "title": "RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032: pulse plane correctness completion (event_type+payload decoding + typed/dotted parity + multi-topic routing)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0273",
+              "title": "RFC-0032: FAC doctor `--wait` pulse subscription integration (replace polling loop with daemon pulse-driven reevaluation)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0032: FAC doctor `--wait` pulse subscription integration (replace polling loop with daemon pulse-driven reevaluation)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0274",
+              "title": "FAC: Normalize LaneLease.started_at to RFC3339 (fix epoch-secs bug + legacy decode)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC: Normalize LaneLease.started_at to RFC3339 (fix epoch-secs bug + legacy decode)",
+                "domain": [
+                  "fac_spine"
+                ],
+                "migrated_from": "RFC-0019"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0275",
+              "title": "FAC execution queue: migrate toward ledger-backed job lifecycle; treat filesystem queue as witnessed cache and add rehydration reconciler",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC execution queue: migrate toward ledger-backed job lifecycle; treat filesystem queue as witnessed cache and add rehydration reconciler",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0276",
+              "title": "FAC vNext: end-to-end changeset identity wiring (remove synthetic changeset_digest; gates/review/merge consume ChangeSetPublished)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC vNext: end-to-end changeset identity wiring (remove synthetic changeset_digest; gates/review/merge consume ChangeSetPublished)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "RFC-0032"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0277",
+              "title": "RFC-0009 successor ticket (superseded)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0009 successor ticket (superseded)",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0278",
+              "title": "AAT gate receipt payload",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "AAT gate receipt payload",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0279",
+              "title": "Artifact manifest",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Artifact manifest",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0280",
+              "title": "AAT reuse events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "AAT reuse events",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0281",
+              "title": "Quarantine events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Quarantine events",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0282",
+              "title": "Latency benchmarks for protocol layer",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Latency benchmarks for protocol layer",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0283",
+              "title": "FAC review foundation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC review foundation",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0284",
+              "title": "FAC review requirements assembly",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC review requirements assembly",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0285",
+              "title": "Review prompt refactor",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Review prompt refactor",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0286",
+              "title": "FAC worker foundations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC worker foundations",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0287",
+              "title": "FAC worker requirements codification",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC worker requirements codification",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0288",
+              "title": "Changeset published events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Changeset published events",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0289",
+              "title": "Adapter profile hash binding for spawn",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Adapter profile hash binding for spawn",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "These requirement nodes were migrated from deleted ticket files (TCK-NNNNN) and their associated old RFCs. Each node preserves the original ticket title as the requirement statement."
         }
       ]
     }

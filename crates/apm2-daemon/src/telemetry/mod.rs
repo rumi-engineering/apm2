@@ -102,7 +102,7 @@ pub use cgroup::{
     episode_cgroup_path, episode_cgroup_path_with_root, is_cgroup_v2_available,
     is_cgroup_v2_available_at, remove_episode_scope, remove_episode_scope_with_root,
 };
-// Re-export collector types (TCK-00169)
+// Re-export collector types (RFC-0033::REQ-0035)
 pub use collector::{TelemetryCollector, TelemetryError, TelemetryResult, new_shared_collector};
 pub use frame::{MAX_FRAME_BYTES, MAX_FRAME_NS, O11yFlags, TelemetryFrame, TelemetryFrameBuilder};
 pub use handle::{MAX_SEQUENCE, TelemetryHandle, TelemetryHandleSnapshot};

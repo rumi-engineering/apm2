@@ -1,4 +1,4 @@
-//! TCK-00407: FAC receipt identity normalization and semantic idempotency.
+//! RFC-0020::REQ-0004: FAC receipt identity normalization and semantic idempotency.
 //!
 //! Verifies that duplicate `IngestReviewReceipt` requests replay the same
 //! authoritative event identity and preserve canonical ledger bindings.
@@ -228,7 +228,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
 
     let request = IngestReviewReceiptRequest {
         lease_id: lease_id.clone(),
-        receipt_id: "RR-TCK-00407-001".to_string(),
+        receipt_id: "RR-RFC-0020::REQ-0004-001".to_string(),
         reviewer_actor_id: actor_id,
         changeset_digest,
         artifact_bundle_hash: artifact_store.hash.to_vec(),
@@ -276,7 +276,7 @@ fn tck_00407_ingest_review_receipt_semantic_replay_returns_stable_authoritative_
     let semantic_event = dispatcher
         .event_emitter()
         .get_event_by_receipt_identity(
-            "RR-TCK-00407-001",
+            "RR-RFC-0020::REQ-0004-001",
             &lease_id,
             &work_id,
             &hex::encode([0x42u8; 32]),

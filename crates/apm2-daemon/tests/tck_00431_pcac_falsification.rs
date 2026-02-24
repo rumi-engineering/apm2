@@ -1,4 +1,4 @@
-//! TCK-00431: PCAC conformance and falsification suite.
+//! RFC-0020::REQ-0050: PCAC conformance and falsification suite.
 //!
 //! Implements adversarial conformance tests covering RFC-0027 Section 16
 //! falsification criteria.

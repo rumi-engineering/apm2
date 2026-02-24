@@ -1,7 +1,7 @@
 // AGENT-AUTHORED
 //! Tool log index types for canonical ordering and audit indexing.
 //!
-//! This module implements [`ToolLogIndexV1`] per TCK-00327 and RFC-0019.
+//! This module implements [`ToolLogIndexV1`] per RFC-0032::REQ-0120 and RFC-0019.
 //! The index provides a single-pointer audit surface for tool executions
 //! within an episode.
 //!

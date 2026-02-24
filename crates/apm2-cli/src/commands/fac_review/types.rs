@@ -318,7 +318,7 @@ pub struct ReviewStateEntry {
     pub backend: ReviewBackend,
     #[serde(default)]
     pub temp_files: Vec<PathBuf>,
-    // TCK-00441: Deterministic run state fields
+    // RFC-0032::REQ-0167: Deterministic run state fields
     #[serde(default)]
     pub run_id: String,
     #[serde(default)]

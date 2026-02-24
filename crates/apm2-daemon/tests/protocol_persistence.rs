@@ -1,4 +1,4 @@
-//! Integration tests for persistent protocol state (TCK-00289).
+//! Integration tests for persistent protocol state (RFC-0032::REQ-0091).
 //!
 //! Verifies that:
 //! - `ClaimWork` persists work claims to `SQLite`
@@ -88,7 +88,7 @@ async fn test_persistence_end_to_end() {
     }
 
     // 5. SpawnEpisode (to get session_id)
-    // TCK-00289: Now that we have persistence, SpawnEpisode should validate the
+    // RFC-0032::REQ-0091: Now that we have persistence, SpawnEpisode should validate the
     // lease. For GateExecutor, it checks ledger events.
     // Our SqliteLeaseValidator queries ledger_events.
     // However, currently SqliteLeaseValidator checks for 'gate_lease_issued' event
@@ -130,7 +130,7 @@ async fn test_persistence_end_to_end() {
         _ => panic!("Expected GateLeaseMissing error"),
     }
 
-    // Now let's try IssueCapability (TCK-00289).
+    // Now let's try IssueCapability (RFC-0032::REQ-0091).
     // We need a valid session first. Let's spawn as Implementer (doesn't check gate
     // lease). But we claimed as GateExecutor. Role mismatch will occur.
 
@@ -163,7 +163,7 @@ async fn test_persistence_end_to_end() {
 
     // The default adapter profile uses command `claude`, which may not be
     // installed on the test host.  Pre-fork PATH resolution correctly returns
-    // CommandNotFound in that case.  The primary concern of TCK-00289 is
+    // CommandNotFound in that case.  The primary concern of RFC-0032::REQ-0091 is
     // persistence of work claims and ledger events (validated in steps 3-4).
     // When the adapter spawn succeeds we also validate IssueCapability, but
     // a clean command-not-found failure is acceptable in CI.
@@ -195,7 +195,7 @@ async fn test_persistence_end_to_end() {
     };
 
     // 6. IssueCapability
-    // TCK-00289: Verify that IssueCapability succeeds with persistent registry
+    // RFC-0032::REQ-0091: Verify that IssueCapability succeeds with persistent registry
     // validation. The previous steps established a valid Implementer session
     // (session_id) backed by a persistent work claim.
     //

@@ -1,7 +1,7 @@
-//! TCK-00392 Shutdown Containment Tests
+//! RFC-0032::REQ-0146 Shutdown Containment Tests
 //!
 //! These integration tests verify the cancellation-safe shutdown design
-//! introduced by the TCK-00392 BLOCKER fix. The key invariant under test:
+//! introduced by the RFC-0032::REQ-0146 BLOCKER fix. The key invariant under test:
 //!
 //! > **No child process may survive daemon exit**, even if the graceful
 //! > shutdown deadline expires and a `ProcessRunner` handle is dropped
@@ -621,7 +621,7 @@ async fn tck_00392_e2e_daemon_shutdown_cleans_processes() {
                 let ds = Arc::clone(&loop_ds);
                 tokio::spawn(async move {
                     // Use Tier1 for test backward compat; production default
-                    // is Tier2 (deny) per TCK-00348.
+                    // is Tier2 (deny) per RFC-0020::REQ-0002.
                     let hs_cfg = HandshakeConfig::default()
                         .with_risk_tier(apm2_daemon::hsi_contract::RiskTier::Tier1);
                     if perform_handshake(&mut conn, &hs_cfg).await.is_err() {

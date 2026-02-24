@@ -15,7 +15,7 @@
 //!
 //! # References
 //!
-//! - TCK-00149: Implement `CoordinationReducer` with determinism property tests
+//! - RFC-0032::REQ-0049: Implement `CoordinationReducer` with determinism property tests
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 
 // Test code uses proptest which generates patterns that trigger these lints.
@@ -69,7 +69,7 @@ fn arb_work_ids() -> impl Strategy<Value = Vec<String>> {
 /// Test tick rate: 1MHz (1 tick = 1 microsecond)
 const TEST_TICK_RATE_HZ: u64 = 1_000_000;
 
-/// Generates a valid coordination budget (TCK-00242: tick-based).
+/// Generates a valid coordination budget (RFC-0016::REQ-0003: tick-based).
 fn arb_budget() -> impl Strategy<Value = CoordinationBudget> {
     (
         1u32..100,
@@ -504,7 +504,7 @@ proptest! {
 // Determinism Integration Tests
 // ============================================================================
 
-/// TCK-00149: Test determinism across a complex event sequence.
+/// RFC-0032::REQ-0049: Test determinism across a complex event sequence.
 ///
 /// This test verifies that replaying events from genesis produces
 /// deterministic state, matching the pattern from the reducer framework tests.
@@ -619,7 +619,7 @@ fn tck_00149_determinism_complex_sequence() {
     ));
 }
 
-/// TCK-00149: Test that checkpoint + remaining events = full replay.
+/// RFC-0032::REQ-0049: Test that checkpoint + remaining events = full replay.
 ///
 /// This is the critical determinism property for crash recovery.
 #[test]
@@ -709,7 +709,7 @@ fn tck_00149_checkpoint_replay_equals_genesis_replay() {
 }
 
 // ============================================================================
-// TCK-00148 Tests (from previous ticket, required for completeness)
+// RFC-0032::REQ-0048 Tests (from previous ticket, required for completeness)
 // ============================================================================
 
 use crate::coordination::{
@@ -717,7 +717,7 @@ use crate::coordination::{
     CoordinationStatus, WorkItemOutcome, WorkItemTracking,
 };
 
-/// TCK-00148: Verify all types are Send + Sync for async runtime.
+/// RFC-0032::REQ-0048: Verify all types are Send + Sync for async runtime.
 #[test]
 fn tck_00148_types_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -748,7 +748,7 @@ fn tck_00148_types_are_send_sync() {
     assert_send_sync::<CoordinationEvent>();
 }
 
-/// TCK-00148: Verify all types derive required traits.
+/// RFC-0032::REQ-0048: Verify all types derive required traits.
 #[test]
 fn tck_00148_types_derive_required_traits() {
     // Test Debug (via format!)
@@ -833,7 +833,7 @@ fn tck_00148_types_derive_required_traits() {
     let _: CoordinationState = serde_json::from_str(&json).unwrap();
 }
 
-/// TCK-00148: Comprehensive JSON round-trip test for all types.
+/// RFC-0032::REQ-0048: Comprehensive JSON round-trip test for all types.
 #[test]
 fn tck_00148_json_roundtrip_comprehensive() {
     // Build a complete CoordinationState with all nested types

@@ -1,9 +1,9 @@
-//! Work lifecycle authority module (TCK-00415, TCK-00420).
+//! Work lifecycle authority module (RFC-0032::REQ-0159, RFC-0032::REQ-0164).
 //!
 //! Runtime authority decisions must come from ledger-backed projections only.
 //! Filesystem ticket YAML is explicitly non-authoritative.
 //!
-//! # Alias Reconciliation (TCK-00420)
+//! # Alias Reconciliation (RFC-0032::REQ-0164)
 //!
 //! The [`authority::AliasReconciliationGate`] trait and
 //! [`authority::ProjectionAliasReconciliationGate`] implementation wire the

@@ -1,4 +1,4 @@
-//! TCK-00428: PCAC policy surface implementation and fail-closed defaults.
+//! RFC-0020::REQ-0047: PCAC policy surface implementation and fail-closed defaults.
 //!
 //! Verifies:
 //! - `PcacPolicyKnobs` struct has all required fields (lifecycle, evidence
@@ -34,7 +34,7 @@ fn tck_00428_policy_knobs_structure_and_defaults() {
         policy.freshness_max_age_ticks > 0,
         "freshness_max_age_ticks must be positive"
     );
-    // TCK-00427 established strict mode as default for sovereignty
+    // RFC-0020::REQ-0046 established strict mode as default for sovereignty
     assert_eq!(
         policy.tier2_sovereignty_mode,
         SovereigntyEnforcementMode::Strict,

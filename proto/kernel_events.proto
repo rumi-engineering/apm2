@@ -2,7 +2,7 @@
 // Version: 0.11.0
 //
 // CHANGELOG (0.11.0):
-// - Added WorkGraphEvent for work dependency graph edges (RFC-0032, TCK-00642)
+// - Added WorkGraphEvent for work dependency graph edges (RFC-0032, RFC-0032::REQ-0269)
 // - Added WorkEdgeAdded, WorkEdgeRemoved, WorkEdgeWaived messages
 // - Added WorkEdgeType enum (DEPENDENCY, BLOCKS, ENABLES, SEQUENCE)
 // - Added WorkGraphEvent to KernelEvent payload (tag 35)
@@ -11,46 +11,46 @@
 // - Multi-topic derivation: emits work topics for both from_work_id and to_work_id
 //
 // CHANGELOG (0.10.0):
-// - Added role_spec_hash to ReviewReceiptRecorded (RFC-0019, TCK-00331)
+// - Added role_spec_hash to ReviewReceiptRecorded (RFC-0019, RFC-0032::REQ-0124)
 // - Binds review outcomes to RoleSpecV1 for attribution and conformance verification
 //
 // CHANGELOG (0.9.0):
-// - Added capability_manifest_hash and context_pack_hash to ReviewBlockedRecorded (RFC-0019, TCK-00326)
-// - Added capability_manifest_hash and context_pack_hash to ReviewReceiptRecorded (RFC-0019, TCK-00326)
+// - Added capability_manifest_hash and context_pack_hash to ReviewBlockedRecorded (RFC-0019, RFC-0032::REQ-0119)
+// - Added capability_manifest_hash and context_pack_hash to ReviewReceiptRecorded (RFC-0019, RFC-0032::REQ-0119)
 // - These fields bind authority hashes for audit traceability per RFC-0019 sealing requirements
 // - Added REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING and REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID
 //
 // CHANGELOG (0.8.0):
-// - Added ProjectionReceiptRecorded event for FAC projection receipts (RFC-0019, TCK-00323)
+// - Added ProjectionReceiptRecorded event for FAC projection receipts (RFC-0019, RFC-0032::REQ-0117)
 // - Added ProjectionReceiptRecorded to KernelEvent payload (tag 34)
 // - Binds changeset_digest + artifact_bundle_hash + time_envelope_ref for projection outcomes
 // - Enables work.<work_id>.projection topic derivation for successful projections
 // - Supports idempotency via receipt lookup (work_id, changeset_digest, ledger_head)
 //
 // CHANGELOG (0.7.0):
-// - Added ReviewReceiptRecorded event for FAC v0 review receipts (RFC-0018, TCK-00312)
+// - Added ReviewReceiptRecorded event for FAC v0 review receipts (RFC-0018, RFC-0032::REQ-0106)
 // - Added ReviewReceiptRecorded to KernelEvent payload (tag 33)
 // - Binds changeset_digest + artifact_bundle_hash + time_envelope_ref for review outcomes
 // - Enables work.<work_id>.review topic derivation for successful reviews
 //
 // CHANGELOG (0.6.0):
-// - Added ReviewBlockedRecorded event for FAC v0 review liveness (RFC-0018, TCK-00311)
+// - Added ReviewBlockedRecorded event for FAC v0 review liveness (RFC-0018, RFC-0032::REQ-0105)
 // - Added ReviewBlockedRecorded to KernelEvent payload (tag 32)
 // - Added ReviewBlockedReasonCode enum for failure classification
 // - Enables work.<work_id>.blocked topic derivation and durable blocked outcomes
 //
 // CHANGELOG (0.5.0):
-// - Added DefectRecorded event for HEF defect pulse derivation (RFC-0018, TCK-00307)
+// - Added DefectRecorded event for HEF defect pulse derivation (RFC-0018, RFC-0032::REQ-0103)
 // - Added DefectRecorded to KernelEvent payload (tag 31)
 // - Added DefectSource enum for defect source classification
 // - Enables defect.new pulse topic derivation from ledger events
 //
 // CHANGELOG (0.4.0):
-// - Added episode_id field to Session events for HEF topic derivation (RFC-0018, TCK-00306):
+// - Added episode_id field to Session events for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102):
 //   SessionStarted, SessionProgress, SessionTerminated, SessionQuarantined
-// - Added episode_id field to Tool events for HEF topic derivation (RFC-0018, TCK-00306):
+// - Added episode_id field to Tool events for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102):
 //   ToolRequested, ToolDecided, ToolExecuted
-// - Added IoArtifactPublished event for episode IO artifact tracking (TCK-00306)
+// - Added IoArtifactPublished event for episode IO artifact tracking (RFC-0032::REQ-0102)
 // - Added IoArtifactPublished to KernelEvent payload (tag 30)
 // - Backward compatible: episode_id defaults to empty string for existing events
 //
@@ -202,7 +202,7 @@ message SessionStarted {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds this event to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 9;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.lifecycle topic routing.
   string episode_id = 10;
@@ -213,7 +213,7 @@ message SessionProgress {
   uint64 progress_sequence = 2;
   string progress_type = 3;  // HEARTBEAT, TOOL_COMPLETE, MILESTONE
   uint64 entropy_consumed = 4;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.lifecycle topic routing.
   string episode_id = 5;
@@ -227,7 +227,7 @@ message SessionTerminated {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds this event to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 5;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.lifecycle topic routing.
   string episode_id = 6;
@@ -251,7 +251,7 @@ message SessionQuarantined {
   // Tick rate in Hz for issued_at_tick and expires_at_tick.
   // Required for interpreting tick values as durations.
   uint64 tick_rate_hz = 7;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.lifecycle topic routing.
   string episode_id = 8;
@@ -334,7 +334,7 @@ message ToolRequested {
   string tool_name = 3;
   bytes tool_args_hash = 4;  // Hash of arguments (full args stored in CAS)
   string dedupe_key = 5;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.tool topic routing.
   string episode_id = 6;
@@ -350,7 +350,7 @@ message ToolDecided {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the decision receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 7;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.tool topic routing.
   string episode_id = 8;
@@ -367,7 +367,7 @@ message ToolExecuted {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the execution receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 5;
-  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
   // Empty string for non-episode sessions; populated from episode context.
   // Enables episode.<episode_id>.tool topic routing.
   string episode_id = 6;
@@ -450,7 +450,7 @@ message LeaseConflict {
 
 // Emitted when a lease issuance is denied for security policy reasons.
 //
-// Per TCK-00258, this event is emitted when a SpawnEpisode request is
+// Per RFC-0032::REQ-0074, this event is emitted when a SpawnEpisode request is
 // rejected due to policy violations such as custody domain overlap (SoD).
 // This provides an audit trail for denied lease requests.
 //
@@ -869,9 +869,9 @@ message PolicyResolvedForChangeSet {
   string resolver_version = 10;
   // Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
   bytes resolver_signature = 11;
-  // BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, TCK-00448).
+  // BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, RFC-0032::REQ-0169).
   bytes role_spec_hash = 12;
-  // BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, TCK-00448).
+  // BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, RFC-0032::REQ-0169).
   bytes context_pack_recipe_hash = 13;
 }
 
@@ -914,7 +914,7 @@ message GateReceipt {
   // BLAKE3 digest of the sandbox hardening profile used for gate execution.
   // Present when gate execution is bound to a materialized hardening profile.
   optional string sandbox_hardening_hash = 15;
-  // BLAKE3 digest of the network policy used for gate execution (TCK-00574).
+  // BLAKE3 digest of the network policy used for gate execution (RFC-0032::REQ-0224).
   // Present when gate execution is bound to a materialized network policy.
   optional string network_policy_hash = 16;
   // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
@@ -925,12 +925,12 @@ message GateReceipt {
   // Explicit pass/fail verdict declared by the gate executor.
   // This is the authoritative verdict field - not derived from hash inspection.
   // MUST be set by the executor; ambiguous payloads without an explicit verdict
-  // are rejected at the admission boundary (TCK-00388 Quality BLOCKER 2).
+  // are rejected at the admission boundary (RFC-0032::REQ-0142 Quality BLOCKER 2).
   bool passed = 13;
 }
 
 // ============================================================
-// AAT GATE RECEIPT PAYLOAD (TCK-00218)
+// AAT GATE RECEIPT PAYLOAD (RFC-0032::REQ-0278)
 // ============================================================
 //
 // AatGateReceipt is the typed payload for AAT gate receipts with evidence binding.
@@ -1095,7 +1095,7 @@ message AatGateReceipt {
 // ============================================================
 //
 // Intervention events implement the freeze/unfreeze mechanism for the
-// Divergence Watchdog (TCK-00213). When external modifications to the
+// Divergence Watchdog (RFC-0032::REQ-0059). When external modifications to the
 // trunk are detected (divergence from MergeReceipt), the system emits
 // an InterventionFreeze to halt all new admissions until adjudication.
 //
@@ -1191,7 +1191,7 @@ message InterventionUnfreeze {
 }
 
 // ============================================================
-// ARTIFACT MANIFEST (TCK-00221)
+// ARTIFACT MANIFEST (RFC-0032::REQ-0279)
 // ============================================================
 //
 // ArtifactManifest binds evidence artifacts to gate receipts with
@@ -1271,7 +1271,7 @@ message ArtifactManifest {
 }
 
 // ============================================================
-// AAT REUSE EVENTS (TCK-00228)
+// AAT REUSE EVENTS (RFC-0032::REQ-0280)
 // ============================================================
 //
 // AATResultReused records when a previous AAT result is reused for a
@@ -1313,7 +1313,7 @@ message AATResultReused {
 }
 
 // ============================================================
-// HARNESS SANDBOX SCHEMA (TCK-00230)
+// HARNESS SANDBOX SCHEMA (RFC-0032::REQ-0063)
 // ============================================================
 //
 // Network policy profile and egress rule types for AAT harness sandboxing.
@@ -1386,7 +1386,7 @@ message NetworkPolicyProfile {
 }
 
 // ============================================================
-// QUARANTINE EVENTS (TCK-00235)
+// QUARANTINE EVENTS (RFC-0032::REQ-0281)
 // ============================================================
 //
 // Quarantine events implement the pool and spec quarantine mechanism for the
@@ -1511,7 +1511,7 @@ message MergeReceipt {
 }
 
 // ============================================================
-// CHANGESET PUBLISHED EVENTS (TCK-00310)
+// CHANGESET PUBLISHED EVENTS (RFC-0032::REQ-0288)
 // ============================================================
 //
 // ChangeSetPublished anchors a changeset before any review begins.
@@ -1556,7 +1556,7 @@ message ChangeSetPublished {
 }
 
 // ============================================================
-// IO ARTIFACT EVENTS (TCK-00306)
+// IO ARTIFACT EVENTS (RFC-0032::REQ-0102)
 // ============================================================
 //
 // IoArtifactPublished records IO artifacts produced during episode execution.
@@ -1603,7 +1603,7 @@ message IoArtifactPublished {
 }
 
 // ============================================================
-// DEFECT EVENTS (TCK-00307)
+// DEFECT EVENTS (RFC-0032::REQ-0103)
 // ============================================================
 //
 // DefectRecorded events enable the defect.new pulse topic derivation for HEF
@@ -1670,7 +1670,7 @@ message DefectRecorded {
 }
 
 // ============================================================
-// REVIEW BLOCKED EVENTS (TCK-00311)
+// REVIEW BLOCKED EVENTS (RFC-0032::REQ-0105)
 // ============================================================
 //
 // ReviewBlockedRecorded events capture workspace apply failures and tool
@@ -1704,9 +1704,9 @@ enum ReviewBlockedReasonCode {
   REVIEW_BLOCKED_REASON_POLICY_DENIED = 7;
   // Context miss detected.
   REVIEW_BLOCKED_REASON_CONTEXT_MISS = 8;
-  // Context pack not found in CAS (TCK-00326).
+  // Context pack not found in CAS (RFC-0032::REQ-0119).
   REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING = 9;
-  // Context pack seal verification failed (TCK-00326).
+  // Context pack seal verification failed (RFC-0032::REQ-0119).
   REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID = 10;
 }
 
@@ -1733,19 +1733,19 @@ message ReviewBlockedRecorded {
   string recorder_actor_id = 6;
   // Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
   bytes recorder_signature = 7;
-  // BLAKE3 hash of the CapabilityManifest in effect (32 bytes, TCK-00326).
+  // BLAKE3 hash of the CapabilityManifest in effect (32 bytes, RFC-0032::REQ-0119).
   // Binds the blocked event to the authority under which the review was attempted.
   bytes capability_manifest_hash = 8;
-  // BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, TCK-00326).
+  // BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, RFC-0032::REQ-0119).
   // Binds the blocked event to the context firewall configuration.
   bytes context_pack_hash = 9;
-  // BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, TCK-00448).
+  // BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, RFC-0032::REQ-0169).
   // Binds the blocked event to the role specification used for the attempted run.
   bytes role_spec_hash = 10;
 }
 
 // ============================================================
-// REVIEW RECEIPT EVENTS (TCK-00312)
+// REVIEW RECEIPT EVENTS (RFC-0032::REQ-0106)
 // ============================================================
 //
 // ReviewReceiptRecorded events capture successful review completion in the FAC v0
@@ -1782,19 +1782,19 @@ message ReviewReceiptRecorded {
   string reviewer_actor_id = 5;
   // Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
   bytes reviewer_signature = 6;
-  // BLAKE3 hash of the CapabilityManifest used during review (32 bytes, TCK-00326).
+  // BLAKE3 hash of the CapabilityManifest used during review (32 bytes, RFC-0032::REQ-0119).
   // Binds the review to the authority under which it was performed.
   bytes capability_manifest_hash = 7;
-  // BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, TCK-00326).
+  // BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, RFC-0032::REQ-0119).
   // Binds the review to the context firewall configuration.
   bytes context_pack_hash = 8;
-  // BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, TCK-00331).
+  // BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, RFC-0032::REQ-0124).
   // Binds the review to the role specification for attribution and conformance verification.
   bytes role_spec_hash = 9;
 }
 
 // ============================================================
-// PROJECTION RECEIPT EVENTS (TCK-00323)
+// PROJECTION RECEIPT EVENTS (RFC-0032::REQ-0117)
 // ============================================================
 //
 // ProjectionReceiptRecorded events capture successful projection completion
@@ -1835,7 +1835,7 @@ message ProjectionReceiptRecorded {
 }
 
 // ============================================================
-// WORK GRAPH EVENTS (RFC-0032, TCK-00642)
+// WORK GRAPH EVENTS (RFC-0032, RFC-0032::REQ-0269)
 // ============================================================
 //
 // WorkGraphEvent models dependency edges between work items in the

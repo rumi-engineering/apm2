@@ -7,7 +7,7 @@
 //! - policy hash
 //! - backoff epoch
 //!
-//! TCK-00400 requires deterministic weighted routing so audit and replay can
+//! RFC-0032::REQ-0152 requires deterministic weighted routing so audit and replay can
 //! reproduce profile selection decisions exactly.
 
 use std::collections::{BTreeMap, BTreeSet};

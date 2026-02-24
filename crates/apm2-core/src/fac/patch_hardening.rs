@@ -1,4 +1,4 @@
-//! Patch injection hardening (TCK-00581).
+//! Patch injection hardening (RFC-0032::REQ-0231).
 //!
 //! Path traversal rejection, safe apply mode, and patch provenance receipts.
 //!

@@ -14,7 +14,7 @@
 //! - **Gate Receipts**: Versioned envelopes for gate execution results
 //! - **Terminal Verifiers**: Machine-checkable predicates for AAT outcomes
 //! - **Policy Inheritance**: Multi-holon policy inheritance enforcement and
-//!   attestation ratcheting (TCK-00340)
+//!   attestation ratcheting (RFC-0032::REQ-0131)
 //!
 //! # Security Model
 //!
@@ -98,35 +98,35 @@ pub mod broker_rate_limits;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod canonicalizer_tuple;
-/// Read-only bounded reader for APM2 daemon CAS filesystem layout (TCK-00546).
+/// Read-only bounded reader for APM2 daemon CAS filesystem layout (RFC-0032::REQ-0201).
 pub mod cas_reader;
 /// Cgroup v2 usage accounting: cpu/mem/IO/tasks stats per job for economics
-/// calibration (TCK-00572).
+/// calibration (RFC-0032::REQ-0222).
 pub mod cgroup_stats;
 mod changeset_bundle;
 mod changeset_publication;
 mod ci_attestation;
 mod ci_import;
 /// Containment verification: cgroup membership checks for child processes
-/// (TCK-00548).
+/// (RFC-0032::REQ-0203).
 pub mod containment;
 /// Credential gate for FAC workflows: fail-fast checks for GitHub-facing
-/// commands and typed credential mount descriptors (TCK-00596).
+/// commands and typed credential mount descriptors (RFC-0032::REQ-0245).
 pub mod credential_gate;
 pub mod determinism;
 mod domain_separator;
 pub mod echo_trap;
 /// Economics profile adoption protocol: broker-admitted economics_profile_hash
-/// rotation with rollback and durable receipts (TCK-00584).
+/// rotation with rollback and durable receipts (RFC-0032::REQ-0234).
 pub mod economics_adoption;
 /// Evidence bundle export/import with RFC-0028 boundary validation and RFC-0029
-/// receipt validation (TCK-00527).
+/// receipt validation (RFC-0032::REQ-0186).
 pub mod evidence_bundle;
 /// Execution backend selection for FAC jobs (system-mode and user-mode).
 pub mod execution_backend;
 pub mod flake_class;
 mod flock_util;
-/// Gate cache v3 (TCK-00541).
+/// Gate cache v3 (RFC-0032::REQ-0197).
 ///
 /// Receipt-indexed cache store keyed by attestation+policy+toolchain.
 pub mod gate_cache_v3;
@@ -136,36 +136,36 @@ pub mod gc;
 /// Garbage-collection receipt schema and persistence helpers.
 #[allow(missing_docs)]
 pub mod gc_receipt;
-/// Non-interactive, lane-scoped GitHub CLI command builder (TCK-00597).
+/// Non-interactive, lane-scoped GitHub CLI command builder (RFC-0032::REQ-0246).
 pub mod gh_cli;
-/// Git safety hardening for lane workspaces (TCK-00580).
+/// Git safety hardening for lane workspaces (RFC-0032::REQ-0230).
 pub mod git_hardening;
 pub mod harness_sandbox;
-/// Receipt index compaction (TCK-00583).
+/// Receipt index compaction (RFC-0032::REQ-0233).
 ///
 /// Prune old time buckets, rebuild deterministically, and emit
 /// `IndexCompactionReceiptV1`.
 pub mod index_compaction;
 /// Queue lifecycle ledger event vocabulary and content-addressable job identity
-/// helpers (TCK-00669).
+/// helpers (RFC-0032::REQ-0275).
 pub mod job_lifecycle;
 pub mod job_spec;
 mod key_policy;
 pub mod lane;
 mod lease;
 /// Legacy evidence log deprecation: one-time migration from `evidence/` to
-/// `legacy/` namespace with migration receipt (TCK-00589).
+/// `legacy/` namespace with migration receipt (RFC-0032::REQ-0239).
 pub mod legacy_evidence_migration;
 pub mod merge_receipt;
-/// Receipt-derived metrics for FAC observability (TCK-00551).
+/// Receipt-derived metrics for FAC observability (RFC-0032::REQ-0206).
 pub mod metrics;
 mod node_identity;
 /// Patch injection hardening: path traversal rejection, safe apply mode,
-/// and patch provenance receipts (TCK-00581).
+/// and patch provenance receipts (RFC-0032::REQ-0231).
 pub mod patch_hardening;
 pub mod policy;
 /// Policy adoption protocol: broker-admitted `FacPolicyHash` rotation with
-/// receipts and rollback (TCK-00561).
+/// receipts and rollback (RFC-0032::REQ-0214).
 pub mod policy_adoption;
 pub mod policy_inheritance;
 mod policy_resolution;
@@ -177,18 +177,18 @@ pub mod projection_compromise;
 pub mod projection_receipt_recorded;
 pub mod quarantine;
 /// Queue bounds enforcement: max pending jobs/bytes with denial receipts
-/// (TCK-00578).
+/// (RFC-0032::REQ-0228).
 pub mod queue_bounds;
 mod receipt;
 /// Non-authoritative, rebuildable receipt index for fast job/receipt lookup.
 pub mod receipt_index;
 /// Receipt stream merge: set-union merge with deterministic ordering and
-/// conflict audit report (TCK-00543).
+/// conflict audit report (RFC-0032::REQ-0199).
 pub mod receipt_merge;
-/// Atomic receipt write pipeline for crash-safe job completion (TCK-00564).
+/// Atomic receipt write pipeline for crash-safe job completion (RFC-0032::REQ-0215).
 pub mod receipt_pipeline;
 /// Crash recovery and reconciliation for queue/lane state on worker startup
-/// (TCK-00534).
+/// (RFC-0032::REQ-0190).
 pub mod reconcile;
 mod repo_mirror;
 pub mod retry_manager;
@@ -200,13 +200,13 @@ mod role_spec;
 mod role_spec_v2;
 pub mod safe_rmtree;
 /// Queue scan lock: optional short-lived lease for scan ownership to prevent
-/// multi-worker stampede scanning (TCK-00586).
+/// multi-worker stampede scanning (RFC-0032::REQ-0236).
 pub mod scan_lock;
 pub mod scheduler_state;
 pub mod sd_notify;
 pub mod selection_policy;
 pub mod serde_helpers;
-/// Service user ownership gate for receipt and queue directories (TCK-00577).
+/// Service user ownership gate for receipt and queue directories (RFC-0032::REQ-0227).
 ///
 /// Enforces that only the FAC service user can directly write to queue and
 /// receipt directories. Non-service-user CLI processes must use broker-mediated
@@ -218,14 +218,14 @@ pub mod systemd_unit;
 pub mod taint;
 mod terminal_verifier;
 pub mod token_ledger;
-/// Toolchain fingerprint derivation, caching, and verification (TCK-00538).
+/// Toolchain fingerprint derivation, caching, and verification (RFC-0032::REQ-0194).
 pub mod toolchain_fingerprint;
 pub mod transcript_binding;
 pub mod warm;
 pub mod worker_heartbeat;
 
-// Re-export broker types (TCK-00510)
-// Re-export taint tracking types (TCK-00339)
+// Re-export broker types (RFC-0032::REQ-0178)
+// Re-export taint tracking types (RFC-0032::REQ-0130)
 // Re-export AAT receipt types
 pub use aat_receipt::{
     AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatReceiptError, AatVerdict,
@@ -243,12 +243,12 @@ pub use aat_spec::{
     AatSpec, AatSpecBuilder, AatSpecError, AatStep, AatStepBuilder, Invariant, InvariantBuilder,
     MAX_ACTION_LENGTH, MAX_INVARIANTS, MAX_STATEMENT_LENGTH, MAX_STEPS,
 };
-// Re-export adapter selection policy types (TCK-00400)
+// Re-export adapter selection policy types (RFC-0032::REQ-0152)
 pub use adapter_selection::{
     AdapterSelectionError, AdapterSelectionPolicy, AdapterSelectionStrategy, ProfileWeight,
     SelectionDecision, SelectionWeightSnapshot, monotonic_secs,
 };
-// Re-export agent adapter profile types (TCK-00328)
+// Re-export agent adapter profile types (RFC-0032::REQ-0121)
 pub use agent_adapter_profile::{
     AGENT_ADAPTER_PROFILE_V1_SCHEMA, AdapterMode, AgentAdapterProfileError, AgentAdapterProfileV1,
     AgentAdapterProfileV1Builder, BudgetDefaults, EvidencePolicy, HealthChecks, InputMode,
@@ -271,7 +271,7 @@ pub use broker::{
     MAX_ADMITTED_POLICY_DIGESTS, MAX_AUTHORITY_CLOCK_LENGTH, MAX_BOUNDARY_ID_LENGTH,
     MAX_CONVERGENCE_RECEIPTS, MAX_ENVELOPE_TTL_TICKS,
 };
-// Re-export broker health types (TCK-00585)
+// Re-export broker health types (RFC-0032::REQ-0235)
 pub use broker_health::{
     BrokerHealthChecker, BrokerHealthError, BrokerHealthStatus, HEALTH_RECEIPT_SCHEMA_ID,
     HEALTH_RECEIPT_SCHEMA_VERSION, HealthCheckInput, HealthReceiptV1, InvariantCheckResult,
@@ -279,7 +279,7 @@ pub use broker_health::{
     WorkerHealthGateError, WorkerHealthPolicy, compute_eval_window_hash,
     evaluate_worker_health_gate,
 };
-// Re-export broker rate limits types (TCK-00568)
+// Re-export broker rate limits types (RFC-0032::REQ-0219)
 pub use broker_rate_limits::{
     ControlPlaneBudget, ControlPlaneBudgetError, ControlPlaneDenialReceipt, ControlPlaneDimension,
     ControlPlaneLimits, DENY_REASON_BUNDLE_EXPORT_BYTES_EXCEEDED, DENY_REASON_COUNTER_OVERFLOW,
@@ -287,7 +287,7 @@ pub use broker_rate_limits::{
     DENY_REASON_TOKEN_ISSUANCE_EXCEEDED, MAX_BUNDLE_EXPORT_BYTES_LIMIT, MAX_QUEUE_BYTES_LIMIT,
     MAX_QUEUE_ENQUEUE_LIMIT, MAX_TOKEN_ISSUANCE_LIMIT,
 };
-// Re-export builtin profile types (TCK-00329)
+// Re-export builtin profile types (RFC-0032::REQ-0122)
 pub use builtin_profiles::{
     CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID, GEMINI_CLI_PROFILE_ID,
     LOCAL_INFERENCE_PROFILE_ID, all_builtin_profiles, claude_code_profile, codex_cli_profile,
@@ -295,7 +295,7 @@ pub use builtin_profiles::{
 };
 // Re-export canonicalizer tuple types
 pub use canonicalizer_tuple::{CANONICALIZER_TUPLE_SCHEMA, CanonicalizerTupleV1};
-// Re-export cgroup usage accounting types (TCK-00572)
+// Re-export cgroup usage accounting types (RFC-0032::REQ-0222)
 pub use cgroup_stats::{
     CgroupUsageValidationError, MAX_CPU_TIME_US, MAX_IO_BYTES, MAX_PEAK_MEMORY_BYTES,
     MAX_TASKS_COUNT, ObservedCgroupUsage, collect_cgroup_usage, collect_cgroup_usage_from_root,
@@ -321,7 +321,7 @@ pub use ci_import::{
     CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
     MAX_WORKFLOW_RUN_ID_LENGTH, can_transition_to_ready_for_review, validate_ci_import,
 };
-// Re-export containment verification types (TCK-00548, TCK-00553, TCK-00554)
+// Re-export containment verification types (RFC-0032::REQ-0203, RFC-0032::REQ-0208, RFC-0032::REQ-0209)
 pub use containment::{
     ContainmentError, ContainmentMismatch, ContainmentTrace, ContainmentVerdict,
     MAX_CHILD_PROCESSES, MAX_CONTAINMENT_MISMATCHES, MAX_PROC_READ_SIZE, MAX_PROC_SCAN_ENTRIES,
@@ -332,7 +332,7 @@ pub use containment::{
     probe_sccache_version, read_cgroup_path, read_cgroup_path_from_proc, stop_sccache_server,
     verify_containment, verify_containment_with_proc,
 };
-// Re-export credential gate types (TCK-00596)
+// Re-export credential gate types (RFC-0032::REQ-0245)
 pub use credential_gate::{
     CREDENTIAL_MOUNT_SCHEMA_ID, CredentialGateError, CredentialMountV1, CredentialPosture,
     CredentialSource, EnvMount, FileMountDescriptor, MAX_ENV_MOUNTS, MAX_ENV_NAME_LENGTH,
@@ -368,7 +368,7 @@ pub use echo_trap::{
     MAX_SIGNATURE_LENGTH, MAX_SIGNATURES as MAX_ECHO_TRAP_SIGNATURES, SessionTermination,
     TerminationRationale,
 };
-// Re-export economics adoption types (TCK-00584)
+// Re-export economics adoption types (RFC-0032::REQ-0234)
 pub use economics_adoption::{
     ADMITTED_ECONOMICS_PROFILE_SCHEMA, AdmittedEconomicsProfileRootV1,
     ECONOMICS_ADOPTION_RECEIPT_SCHEMA, EconomicsAdoptionAction, EconomicsAdoptionError,
@@ -378,7 +378,7 @@ pub use economics_adoption::{
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
-// Re-export gate cache v3 types (TCK-00541)
+// Re-export gate cache v3 types (RFC-0032::REQ-0197)
 pub use gate_cache_v3::{
     GATE_CACHE_V3_SCHEMA, GateCacheV3, GateCacheV3Error, MAX_V3_ENTRY_SIZE, MAX_V3_GATES_PER_INDEX,
     MAX_V3_STRING_FIELD_LENGTH, V3CacheEntry, V3CompoundKey, V3GateResult, is_valid_v3_index_key,
@@ -392,7 +392,7 @@ pub use gc_receipt::{
     DEFAULT_MIN_FREE_BYTES, GC_RECEIPT_SCHEMA, GcAction, GcActionKind, GcError, GcReceiptV1,
     MAX_GC_ACTIONS, MAX_GC_RECEIPT_SIZE, persist_gc_receipt,
 };
-// Re-export gh_cli (TCK-00597)
+// Re-export gh_cli (RFC-0032::REQ-0246)
 pub use gh_cli::{GhCommand, gh_command};
 pub use git_hardening::{
     GIT_HARDENING_RECEIPT_SCHEMA, GitHardeningError, GitHardeningOutcome, GitHardeningReceipt,
@@ -403,13 +403,13 @@ pub use harness_sandbox::{
     MAX_STRING_LENGTH as MAX_HARNESS_SANDBOX_STRING_LENGTH, NetworkPolicyProfile,
     NetworkPolicyProfileBuilder, Protocol,
 };
-// Re-export index compaction types (TCK-00583)
+// Re-export index compaction types (RFC-0032::REQ-0233)
 pub use index_compaction::{
     CompactionError, DEFAULT_INDEX_RETENTION_SECS, INDEX_COMPACTION_RECEIPT_SCHEMA,
     IndexCompactionReceiptV1, MAX_COMPACTION_RECEIPT_SIZE, MAX_COMPACTION_RECEIPTS, compact_index,
     persist_compaction_receipt,
 };
-// Re-export job spec types (TCK-00512, TCK-00579)
+// Re-export job spec types (RFC-0032::REQ-0179, RFC-0032::REQ-0229)
 pub use job_spec::{
     Actuation, CONTROL_LANE_EXCEPTION_AUDITED, FacJobSpecV1, FacJobSpecV1Builder,
     JOB_SPEC_SCHEMA_ID, JobConstraints, JobSource, JobSpecError, JobSpecValidationPolicy,
@@ -436,13 +436,13 @@ pub use merge_receipt::{
     MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
     MergeReceiptProto,
 };
-// Re-export metrics types (TCK-00551)
+// Re-export metrics types (RFC-0032::REQ-0206)
 pub use metrics::{
     HeaderCounts, LoadGcReceiptsResult, MAX_DENIAL_REASON_ENTRIES, MAX_GC_RECEIPT_SCAN_FILES,
     MAX_GC_RECEIPTS_LOADED, METRICS_SUMMARY_SCHEMA, MetricsInput, MetricsSummary, compute_metrics,
     load_gc_receipts,
 };
-// Re-export patch hardening types (TCK-00581)
+// Re-export patch hardening types (RFC-0032::REQ-0231)
 pub use patch_hardening::{
     MAX_PATCH_CONTENT_SIZE, MAX_PATCH_FILE_ENTRIES, MAX_REFUSALS, PATCH_APPLY_RECEIPT_SCHEMA_ID,
     PATCH_APPLY_RECEIPT_SCHEMA_VERSION, PATCH_FORMAT_GIT_DIFF_V1, PatchApplyReceiptV1,
@@ -457,14 +457,14 @@ pub use policy::{
     apply_lane_env_overrides, build_job_environment, compute_policy_hash, deserialize_policy,
     ensure_lane_env_dirs, parse_policy_hash, persist_policy,
 };
-// Re-export policy adoption types (TCK-00561)
+// Re-export policy adoption types (RFC-0032::REQ-0214)
 pub use policy_adoption::{
     ADMITTED_POLICY_ROOT_SCHEMA, AdmittedPolicyRootV1, POLICY_ADOPTION_RECEIPT_SCHEMA,
     PolicyAdoptionAction, PolicyAdoptionError, PolicyAdoptionReceiptV1, adopt_policy,
     deserialize_adoption_receipt, is_policy_hash_admitted, load_admitted_policy_root,
     rollback_policy, validate_policy_bytes,
 };
-// Re-export policy inheritance types (TCK-00340)
+// Re-export policy inheritance types (RFC-0032::REQ-0131)
 pub use policy_inheritance::{
     AttestationLevel, AttestationRequirements, MAX_ACTOR_ID_LENGTH, MAX_REASON_LENGTH,
     MAX_SUBLEASE_BATCH_SIZE, PolicyInheritanceError, PolicyInheritanceValidator,
@@ -476,7 +476,7 @@ pub use policy_resolution::{
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
 };
-// Re-export projection contract types (TCK-00452).
+// Re-export projection contract types (RFC-0020::REQ-0040).
 pub use projection::{
     AuditorLaunchProjectionV1, OrchestratorLaunchProjectionV1, ProjectionContractError,
     ProjectionDigestEnvelopeV1, ProjectionUncertainty, canonical_projection_json,
@@ -519,26 +519,26 @@ pub use receipt::{
     compute_job_receipt_content_hash_v2, deserialize_job_receipt,
     persist_content_addressed_receipt, persist_content_addressed_receipt_v2,
 };
-// Re-export receipt index types (TCK-00560)
+// Re-export receipt index types (RFC-0032::REQ-0213)
 pub use receipt_index::{
     INDEX_FILE_NAME, INDEX_SUBDIR, ListReceiptHeadersResult, MAX_INDEX_ENTRIES,
     MAX_INDEX_FILE_SIZE, MAX_JOB_INDEX_ENTRIES, MAX_REBUILD_SCAN_FILES, RECEIPT_INDEX_SCHEMA,
     ReceiptHeaderV1, ReceiptIndexError, ReceiptIndexV1, find_receipt_for_job, has_receipt_for_job,
     list_receipt_headers, lookup_job_receipt, lookup_receipt_by_hash,
 };
-// Re-export receipt merge types (TCK-00543)
+// Re-export receipt merge types (RFC-0032::REQ-0199)
 pub use receipt_merge::{
     JobIdMismatch, MAX_JOB_ID_MISMATCHES, MAX_MERGE_SCAN_FILES as MAX_RECEIPT_MERGE_SCAN_FILES,
     MAX_PARSE_FAILURES, MergeAuditReport, MergedReceiptHeader, ParseFailure, ReceiptMergeError,
     merge_receipt_dirs,
 };
-// Re-export receipt pipeline types (TCK-00564)
+// Re-export receipt pipeline types (RFC-0032::REQ-0215)
 pub use receipt_pipeline::{
     CommitResult, RECOVERY_RECEIPT_SCHEMA, ReceiptPipelineError, ReceiptWritePipeline,
     RecoveryReceiptV1, TerminalState, move_job_to_terminal, outcome_to_terminal_state,
     receipt_exists_for_job, rename_noreplace,
 };
-// Re-export reconcile types (TCK-00534)
+// Re-export reconcile types (RFC-0032::REQ-0190)
 pub use reconcile::{
     LaneRecoveryAction, MAX_CLAIMED_SCAN_ENTRIES, MAX_LANE_RECOVERY_ACTIONS,
     MAX_QUEUE_RECOVERY_ACTIONS, OrphanedJobPolicy, QueueReconcileLimits, QueueRecoveryAction,
@@ -583,7 +583,7 @@ pub use selection_policy::{
     MAX_POLICY_SIZE, MAX_WORK_ID_LENGTH, SENSITIVE_DOMAINS, SelectionContext, SelectionPolicy,
     SelectionPolicyBuilder, SelectionPolicyError, TierConfig,
 };
-// Re-export signed receipt types (TCK-00576)
+// Re-export signed receipt types (RFC-0032::REQ-0226)
 pub use signed_receipt::{
     MAX_SIGNED_ENVELOPE_SIZE, SIGNED_RECEIPT_ENVELOPE_SCHEMA, SIGNED_RECEIPT_PREFIX,
     SignedReceiptEnvelopeV1, SignedReceiptError, deserialize_signed_envelope,
@@ -602,7 +602,7 @@ pub use terminal_verifier::{
     VerifierError, VerifierKind, VerifierOutput, VerifierOutputBuilder, VerifierPolicy,
     VerifierPolicyBuilder, evaluate_predicate,
 };
-// Re-export toolchain fingerprint types (TCK-00538)
+// Re-export toolchain fingerprint types (RFC-0032::REQ-0194)
 pub use toolchain_fingerprint::{
     CACHE_FILE_NAME as TOOLCHAIN_CACHE_FILE_NAME, CachedFingerprint, FINGERPRINT_STRING_LENGTH,
     MAX_CACHE_FILE_BYTES as TOOLCHAIN_MAX_CACHE_FILE_BYTES, ToolchainFingerprintError,
@@ -623,22 +623,22 @@ pub mod tool_execution_receipt;
 pub mod tool_log_index;
 pub mod view_commitment;
 /// CAS-backed JSON schemas for work lifecycle artifacts (RFC-0032 Phase 1,
-/// TCK-00633).
+/// RFC-0032::REQ-0262).
 ///
 /// Defines `WorkSpecV1`, `WorkContextEntryV1`, `WorkLoopProfileV1`, and
 /// `WorkAuthorityBindingsV1` with bounded decoding, `deny_unknown_fields`,
 /// and per-artifact byte limits.
 pub mod work_cas_schemas;
 /// Publish and anchor `WorkLoopProfileV1` artifacts (RFC-0032 Phase 4,
-/// TCK-00645).
+/// RFC-0032::REQ-0270).
 ///
 /// Validates, canonicalizes, stores in CAS, and computes deterministic
 /// evidence IDs for work loop profiles. Publication is idempotent on
 /// `(work_id, dedupe_key)`.
 pub mod work_loop_profile_publish;
 // Re-export view commitment types
-// Re-export summary receipt types (TCK-00327)
-// Re-export builtin role types (TCK-00331)
+// Re-export summary receipt types (RFC-0032::REQ-0120)
+// Re-export builtin role types (RFC-0032::REQ-0124)
 pub use builtin_roles::{
     CODE_QUALITY_REVIEWER_ROLE_ID, FAC_WORKOBJECT_IMPLEMENTOR_V2_ROLE_ID, IMPLEMENTER_ROLE_ID,
     ORCHESTRATOR_ROLE_ID, SECURITY_REVIEWER_ROLE_ID, all_builtin_role_contracts_v2,
@@ -647,12 +647,12 @@ pub use builtin_roles::{
     implementer_role, orchestrator_role, security_reviewer_role,
     seed_builtin_role_contracts_v2_in_cas,
 };
-// Re-export role conformance harness types (TCK-00331)
+// Re-export role conformance harness types (RFC-0032::REQ-0124)
 pub use role_conformance::{
     ConformanceError, ConformanceResult, ConformanceViolation, RoleConformanceHarness,
     ViolationType,
 };
-// Re-export role spec types (TCK-00331)
+// Re-export role spec types (RFC-0032::REQ-0124)
 pub use role_spec::{
     FORBIDDEN_DIRECT_GITHUB_CAPABILITY_CLASSES,
     MAX_CAPABILITY_ID_LENGTH as MAX_ROLE_CAPABILITY_ID_LENGTH,
@@ -677,7 +677,7 @@ pub use summary_receipt::{
     SUMMARY_RECEIPT_PREFIX, SUMMARY_RECEIPT_SCHEMA, SUMMARY_RECEIPT_VERSION, SummaryReceipt,
     SummaryReceiptBuilder, SummaryReceiptError,
 };
-// Re-export tool execution receipt types (TCK-00327)
+// Re-export tool execution receipt types (RFC-0032::REQ-0120)
 pub use tool_execution_receipt::{
     MAX_CAPABILITY_ID_LENGTH as MAX_TOOL_RECEIPT_CAPABILITY_ID_LENGTH,
     MAX_EPISODE_ID_LENGTH as MAX_TOOL_RECEIPT_EPISODE_ID_LENGTH,
@@ -686,7 +686,7 @@ pub use tool_execution_receipt::{
     TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_VERSION, ToolExecutionReceipt,
     ToolExecutionReceiptBuilder, ToolExecutionReceiptError,
 };
-// Re-export tool log index types (TCK-00327)
+// Re-export tool log index types (RFC-0032::REQ-0120)
 pub use tool_log_index::{
     MAX_CONTINUATION_HASHES, MAX_EPISODE_ID_LENGTH as MAX_TOOL_LOG_INDEX_EPISODE_ID_LENGTH,
     MAX_RECEIPT_HASHES_PER_INDEX, TOOL_LOG_INDEX_V1_SCHEMA, TOOL_LOG_INDEX_V1_VERSION,
@@ -740,7 +740,7 @@ pub use role_routing::{RoutingDecision, classify_changeset};
 /// Efficiency primitives for context deltas, caching, and summary-first
 /// iteration.
 ///
-/// This module implements TCK-00335 with:
+/// This module implements RFC-0032::REQ-0127 with:
 /// - **Context Deltas**: Capture minimal state changes between iterations (N ->
 ///   N+1)
 /// - **Tool Output Caching**: CAS-backed caches for Search/FileRead outputs
@@ -785,7 +785,7 @@ pub use role_routing::{RoutingDecision, classify_changeset};
 /// assert_eq!(envelope.iterations_completed, 20);
 /// ```
 pub mod efficiency_primitives;
-// Re-export efficiency primitives for convenient access (TCK-00335)
+// Re-export efficiency primitives for convenient access (RFC-0032::REQ-0127)
 pub use efficiency_primitives::{
     CacheKey, CacheStats, ChangeType, ChangedFile, ContextBudgetEnvelope, ContextDelta,
     ContextDeltaBuilder, DEFAULT_CACHE_TTL_SECS, DEFAULT_CONTEXT_BUDGET_BYTES,
@@ -794,13 +794,13 @@ pub use efficiency_primitives::{
     MAX_CONTEXT_BUDGET_BYTES, MAX_DELTAS, MAX_FINDINGS, MAX_TOOL_OUTPUTS, MAX_ZOOM_SELECTORS,
     ToolOutputCache, ToolOutputCacheConfig, ToolOutputRef, ZoomSelector, ZoomSelectorType,
 };
-// Re-export execution backend types (TCK-00529)
+// Re-export execution backend types (RFC-0032::REQ-0187)
 pub use execution_backend::{
     DEFAULT_SERVICE_USER, EXECUTION_BACKEND_ENV_VAR, ExecutionBackend, ExecutionBackendError,
     SERVICE_USER_ENV_VAR, SystemModeConfig, SystemdRunCommand, build_systemd_run_command,
     probe_user_bus, select_and_validate_backend, select_backend,
 };
-// Re-export lane types (TCK-00515)
+// Re-export lane types (RFC-0032::REQ-0181)
 pub use lane::{
     DEFAULT_LANE_COUNT, LANE_CORRUPT_MARKER_SCHEMA, LANE_COUNT_ENV_VAR, LANE_ID_PREFIX,
     LANE_INIT_RECEIPT_SCHEMA, LANE_LEASE_V1_SCHEMA, LANE_LOCK_TIMEOUT, LANE_PROFILE_V1_SCHEMA,
@@ -813,19 +813,19 @@ pub use lane::{
     create_dir_restricted, current_time_iso8601, read_proc_start_time_ticks,
     resolve_host_test_parallelism, verify_pid_identity,
 };
-// Re-export legacy evidence migration types (TCK-00589).
+// Re-export legacy evidence migration types (RFC-0032::REQ-0239).
 pub use legacy_evidence_migration::{
     FileMigrationResult, LegacyEvidenceMigrationReceiptV1, migrate_legacy_evidence,
     run_migration_to_completion,
 };
-// Re-export node identity types (TCK-00556).
+// Re-export node identity types (RFC-0032::REQ-0211).
 pub use node_identity::{
     DEFAULT_BOUNDARY_ID, MAX_BOUNDARY_ID_LENGTH as NODE_IDENTITY_MAX_BOUNDARY_ID_LENGTH,
     NODE_IDENTITY_SCHEMA_ID, NodeIdentityError, derive_node_fingerprint,
     load_or_default_boundary_id, load_or_derive_node_fingerprint, read_boundary_id,
 };
 pub use preflight::{PreflightError, PreflightStatus, check_disk_space, run_preflight};
-// Re-export safe rmtree types (TCK-00516)
+// Re-export safe rmtree types (RFC-0032::REQ-0182)
 pub use safe_rmtree::{
     DirModeNormalizationSummary, MAX_DIR_ENTRIES, MAX_LOG_DIR_ENTRIES, MAX_TRAVERSAL_DEPTH,
     RefusedDeleteReceipt, SafeRmtreeError, SafeRmtreeOutcome,
@@ -844,7 +844,7 @@ pub use warm::{
     WARM_RECEIPT_SCHEMA, WarmContainment, WarmError, WarmPhase, WarmPhaseResult, WarmReceiptV1,
     WarmToolVersions, collect_tool_versions, execute_warm, execute_warm_phase,
 };
-// Re-export work CAS schema types (TCK-00633, RFC-0032 Phase 1)
+// Re-export work CAS schema types (RFC-0032::REQ-0262, RFC-0032 Phase 1)
 pub use work_cas_schemas::{
     MAX_AUTHORITY_BINDINGS_SIZE, MAX_BACKOFF_INTERVALS, MAX_CAPABILITY_HASHES,
     MAX_CONTEXT_ENTRY_SIZE, MAX_LABELS, MAX_LONG_STRING_LENGTH, MAX_LOOP_PROFILE_SIZE,
@@ -856,7 +856,7 @@ pub use work_cas_schemas::{
     WorkspaceConfig, bounded_decode_authority_bindings, bounded_decode_context_entry,
     bounded_decode_loop_profile, bounded_decode_work_spec, canonicalize_for_cas,
 };
-// Re-export work loop profile publish types (TCK-00645, RFC-0032 Phase 4)
+// Re-export work loop profile publish types (RFC-0032::REQ-0270, RFC-0032 Phase 4)
 pub use work_loop_profile_publish::{
     PublishWorkLoopProfileError, PublishWorkLoopProfileResult, compute_evidence_id,
     publish_work_loop_profile,

@@ -10,7 +10,7 @@
 //!
 //! # Implementation Notes
 //!
-//! Per RFC-0016 TCK-00240 implementation steps:
+//! Per RFC-0016 RFC-0016::REQ-0002 implementation steps:
 //!
 //! 1. **Monotonic source**: Uses `CLOCK_MONOTONIC_RAW` if available (Linux),
 //!    fallback to `CLOCK_MONOTONIC` via `std::time::Instant`.
@@ -469,7 +469,7 @@ impl HolonicClock {
         config: ClockConfig,
         ledger: Option<Arc<dyn LedgerBackend>>,
     ) -> Result<Self, ClockError> {
-        // Validate monotonic source (TCK-00240).
+        // Validate monotonic source (RFC-0016::REQ-0002).
         //
         // Rust's `std::time::Instant` uses the platform's default monotonic clock,
         // which is typically `CLOCK_MONOTONIC` on Linux. Alternative sources like
@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00240: Unit test with in-memory ledger backend
+    // RFC-0016::REQ-0002: Unit test with in-memory ledger backend
     // =========================================================================
 
     /// Stub in-memory ledger backend for testing.
@@ -1360,7 +1360,7 @@ mod tests {
         }
     }
 
-    /// TCK-00240 acceptance criterion: `observed_ledger_head()` returns
+    /// RFC-0016::REQ-0002 acceptance criterion: `observed_ledger_head()` returns
     /// `LedgerTime` using `LedgerBackend::head()`.
     #[tokio::test]
     async fn tck_00240_observed_ledger_head_with_in_memory_backend() {
@@ -1385,7 +1385,7 @@ mod tests {
         assert_eq!(ledger_time.seq(), 100);
     }
 
-    /// TCK-00240 acceptance criterion: Episode/tool receipts include
+    /// RFC-0016::REQ-0002 acceptance criterion: Episode/tool receipts include
     /// `time_envelope_ref`.
     #[tokio::test]
     async fn tck_00240_stamp_envelope_includes_time_envelope_ref() {
@@ -1422,7 +1422,7 @@ mod tests {
         assert_eq!(envelope.notes, Some("test receipt".to_string()));
     }
 
-    /// TCK-00240: Verify clock profile is properly hashed and pinned
+    /// RFC-0016::REQ-0002: Verify clock profile is properly hashed and pinned
     #[tokio::test]
     async fn tck_00240_clock_profile_pinned_in_envelope() {
         let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
@@ -1437,10 +1437,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00240 Security: HLC drift protection
+    // RFC-0016::REQ-0002 Security: HLC drift protection
     // =========================================================================
 
-    /// TCK-00240 security: Verify that malicious future HLC timestamps are
+    /// RFC-0016::REQ-0002 security: Verify that malicious future HLC timestamps are
     /// rejected.
     ///
     /// Per `documents/security/THREAT_MODEL.cac.json`, time is treated as an
@@ -1490,7 +1490,7 @@ mod tests {
         }
     }
 
-    /// TCK-00240 security: Verify that HLC timestamps within acceptable drift
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps within acceptable drift
     /// are accepted.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
@@ -1521,7 +1521,7 @@ mod tests {
         assert!(updated.wall_ns >= reasonable_hlc.wall_ns);
     }
 
-    /// TCK-00240 security: Verify that HLC timestamps clearly past the boundary
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps clearly past the boundary
     /// are rejected.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
@@ -1551,7 +1551,7 @@ mod tests {
         );
     }
 
-    /// TCK-00240 security: Verify that HLC timestamps in the past are always
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps in the past are always
     /// accepted (no drift concern).
     #[test]
     #[allow(clippy::cast_possible_truncation)]

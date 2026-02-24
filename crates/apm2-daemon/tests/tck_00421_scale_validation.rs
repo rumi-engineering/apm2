@@ -1,4 +1,4 @@
-//! TCK-00421: Digest-first scale validation.
+//! RFC-0032::REQ-0165: Digest-first scale validation.
 //!
 //! Validates:
 //! - Summary-first supervision with selector-first retrieval at high evidence
@@ -424,7 +424,7 @@ fn summary_first_supervision_scales_without_transcript_fanout() {
     };
 
     println!(
-        "TCK-00421 SUMMARY_EVIDENCE {}",
+        "RFC-0032::REQ-0165 SUMMARY_EVIDENCE {}",
         serde_json::to_string(&evidence).expect("evidence JSON serialization should succeed")
     );
 }
@@ -590,18 +590,18 @@ fn control_plane_growth_is_bounded_and_observable_under_stress() {
     );
 
     println!(
-        "TCK-00421 CONTROL_PLANE_EVIDENCE {}",
+        "RFC-0032::REQ-0165 CONTROL_PLANE_EVIDENCE {}",
         serde_json::to_string(&evidence).expect("evidence JSON serialization should succeed")
     );
 }
 
 #[test]
 fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
-    let work_id = "W-TCK-00421-RECOVERY";
+    let work_id = "W-RFC-0032::REQ-0165-RECOVERY";
     let actor_id = "actor:tck-00421";
 
     // A changeset_published event is required before the IN_PROGRESS -> REVIEW
-    // transition because TCK-00672 enforces fail-closed latest-changeset
+    // transition because RFC-0032::REQ-0276 enforces fail-closed latest-changeset
     // admission: the work reducer denies review-start when no
     // ChangeSetPublished has been observed for the work (CSID-004).
     let changeset_digest = blake3_hash(format!("changeset:{work_id}"));
@@ -764,7 +764,7 @@ fn replay_and_anti_entropy_recover_projection_without_duplicate_side_effects() {
     };
 
     println!(
-        "TCK-00421 REPLAY_EVIDENCE {}",
+        "RFC-0032::REQ-0165 REPLAY_EVIDENCE {}",
         serde_json::to_string(&evidence).expect("evidence JSON serialization should succeed")
     );
 }

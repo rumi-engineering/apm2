@@ -1,4 +1,4 @@
-//! TCK-00438: Umbrella rollout validation for FAC launch over subagents.
+//! RFC-0020::REQ-0037: Umbrella rollout validation for FAC launch over subagents.
 //!
 //! Cross-slice integration coverage:
 //! - Launch admission lineage (role/context hash binding)
@@ -268,7 +268,7 @@ fn persist_claim(sqlite_conn: &Arc<Mutex<Connection>>, claim: &WorkClaim) {
 
 fn seed_malformed_receipt(conn: &Arc<Mutex<Connection>>, lease_id: &str) {
     let payload = serde_json::json!({
-        "receipt_id": "RCP-TCK-00438-MALFORMED",
+        "receipt_id": "RCP-RFC-0020::REQ-0037-MALFORMED",
         "changeset_digest": "11".repeat(32),
         "lease_id": lease_id,
         // Deliberately omit role_spec_hash/context_pack_hash/identity_proof_hash/time_envelope_ref
@@ -285,9 +285,9 @@ fn seed_malformed_receipt(conn: &Arc<Mutex<Connection>>, lease_id: &str) {
                  (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                "EVT-TCK-00438-MALFORMED",
+                "EVT-RFC-0020::REQ-0037-MALFORMED",
                 "review_receipt_recorded",
-                "W-TCK-00438-MALFORMED",
+                "W-RFC-0020::REQ-0037-MALFORMED",
                 "actor:reviewer",
                 payload_bytes,
                 vec![0u8; 64],
@@ -383,7 +383,7 @@ fn tck_00438_launch_rollout_e2e_lineage_liveness_and_projection() {
     );
 
     let signer = Signer::generate();
-    let request_id = "REQ-TCK-00438-E2E";
+    let request_id = "REQ-RFC-0020::REQ-0037-E2E";
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
@@ -427,7 +427,7 @@ fn tck_00438_launch_rollout_e2e_lineage_liveness_and_projection() {
         .emit_review_receipt(
             &claim.lease_id,
             &claim.work_id,
-            "RCP-TCK-00438-001",
+            "RCP-RFC-0020::REQ-0037-001",
             &changeset_digest,
             &artifact_bundle_hash,
             &capability_manifest_hash,

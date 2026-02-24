@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00580)
+// AGENT-AUTHORED (RFC-0032::REQ-0230)
 //! Git safety hardening for FAC lane workspaces.
 //!
 //! This module ensures that lane workspaces checked out from mirrors cannot

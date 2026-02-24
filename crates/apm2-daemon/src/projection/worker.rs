@@ -1,10 +1,10 @@
-// AGENT-AUTHORED (TCK-00322, TCK-00505)
+// AGENT-AUTHORED (RFC-0032::REQ-0116, RFC-0033::REQ-0063)
 //! Projection worker for the FAC (Forge Admission Cycle).
 //!
 //! This module implements the long-running projection worker that:
 //! 1. Tails the ledger for `ReviewReceiptRecorded` events
 //! 2. Looks up PR metadata from the work index
-//! 3. Evaluates economics admission gate (TCK-00505)
+//! 3. Evaluates economics admission gate (RFC-0033::REQ-0063)
 //! 4. Projects review results to GitHub (status + comment)
 //! 5. Stores projection receipts in CAS for idempotency
 //!
@@ -17,7 +17,7 @@
 //!   projection via GitHub adapter, stores projection receipt (durable)
 //! - Is idempotent: restarts don't duplicate comments
 //!
-//! # RFC-0029: Economics Admission Gate (TCK-00505)
+//! # RFC-0029: Economics Admission Gate (RFC-0033::REQ-0063)
 //!
 //! Per RFC-0029, before any projection side effect
 //! (`adapter.project_status()`):
@@ -59,7 +59,7 @@
 //!   state
 //! - **Crash-only recovery**: Worker can restart from ledger head at any time
 //! - **Economics-gated**: Events carrying economics selectors must pass the
-//!   economics admission gate before projection (TCK-00505)
+//!   economics admission gate before projection (RFC-0033::REQ-0063)
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -126,7 +126,7 @@ pub enum ProjectionWorkerError {
         receipt_id: String,
     },
 
-    /// Economics admission denied — projection skipped (TCK-00505).
+    /// Economics admission denied — projection skipped (RFC-0033::REQ-0063).
     #[error("economics admission denied: {reason}")]
     AdmissionDenied {
         /// The structured deny reason.
@@ -134,7 +134,7 @@ pub enum ProjectionWorkerError {
     },
 
     /// Economics admission denied (subcategory) — projection skipped
-    /// (TCK-00505).
+    /// (RFC-0033::REQ-0063).
     ///
     /// Used for replay prevention (`consumed`), gate-not-wired
     /// (`missing_gate`), missing selectors (`missing_economics_selectors`),
@@ -150,7 +150,7 @@ pub enum ProjectionWorkerError {
         subcategory: String,
     },
 
-    /// Intent buffer operation failed (TCK-00505).
+    /// Intent buffer operation failed (RFC-0033::REQ-0063).
     #[error("intent buffer error: {0}")]
     IntentBufferError(String),
 
@@ -175,7 +175,7 @@ pub enum ProjectionWorkerError {
 }
 
 // =============================================================================
-// Economics Admission Telemetry (TCK-00505)
+// Economics Admission Telemetry (RFC-0033::REQ-0063)
 // =============================================================================
 
 /// Structured telemetry counters for economics admission gate decisions.
@@ -412,7 +412,7 @@ fn is_zero_hash32_field(payload: &serde_json::Value, field: &str) -> bool {
     bytes.len() == 32 && bytes.iter().all(|&b| b == 0)
 }
 
-/// Extracts a 32-byte hash field from a JSON payload (TCK-00505).
+/// Extracts a 32-byte hash field from a JSON payload (RFC-0033::REQ-0063).
 ///
 /// Returns `None` if the field is missing, not a valid hex string, not 32
 /// bytes, or is all zeros (unset authority linkage). This is a best-effort
@@ -859,7 +859,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_work_pr_work_id ON work_pr_index(work_id);
     CREATE INDEX IF NOT EXISTS idx_work_pr_created ON work_pr_index(created_at);
 
-    -- TCK-00638: Work context entry projection (RFC-0032 Phase 2)
+    -- RFC-0032::REQ-0266: Work context entry projection (RFC-0032 Phase 2)
     CREATE TABLE IF NOT EXISTS work_context (
         work_id TEXT NOT NULL,
         entry_id TEXT NOT NULL,
@@ -877,7 +877,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_work_context_work_id ON work_context(work_id);
     CREATE INDEX IF NOT EXISTS idx_work_context_created ON work_context(created_at_ns);
 
-    -- TCK-00645: Active work loop profile projection (RFC-0032 Phase 4)
+    -- RFC-0032::REQ-0270: Active work loop profile projection (RFC-0032 Phase 4)
     -- Selects the latest anchored profile per work_id as active, keyed by
     -- ledger timestamp + seq_id tie-break. Exactly one active row is stored
     -- per work_id.
@@ -898,7 +898,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_work_active_loop_profile_anchored
         ON work_active_loop_profile(anchored_at_ns);
 
-    -- TCK-00636: WorkSpec snapshot projection (RFC-0032 Phase 1)
+    -- RFC-0032::REQ-0264: WorkSpec snapshot projection (RFC-0032 Phase 1)
     -- Maps work_id -> spec_snapshot_hash derived from work.opened events.
     -- Enables CAS-backed WorkSpec field joins (ticket_alias, repo, etc.)
     -- without requiring WorkRegistry state.
@@ -1376,7 +1376,7 @@ impl WorkIndex {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        // TCK-00645: Evict expired work_active_loop_profile entries.
+        // RFC-0032::REQ-0270: Evict expired work_active_loop_profile entries.
         // Uses the same nanosecond cutoff as work_context.
         total_deleted += conn
             .execute(
@@ -1385,7 +1385,7 @@ impl WorkIndex {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        // TCK-00636: Evict expired work_spec_snapshot entries.
+        // RFC-0032::REQ-0264: Evict expired work_spec_snapshot entries.
         // Uses the same nanosecond cutoff as work_context.
         total_deleted += conn
             .execute(
@@ -1475,7 +1475,7 @@ impl WorkIndex {
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            // TCK-00645: Evict expired work_active_loop_profile entries.
+            // RFC-0032::REQ-0270: Evict expired work_active_loop_profile entries.
             total_deleted += conn_guard
                 .execute(
                     "DELETE FROM work_active_loop_profile WHERE anchored_at_ns < ?1",
@@ -1483,7 +1483,7 @@ impl WorkIndex {
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            // TCK-00636: Evict expired work_spec_snapshot entries.
+            // RFC-0032::REQ-0264: Evict expired work_spec_snapshot entries.
             total_deleted += conn_guard
                 .execute(
                     "DELETE FROM work_spec_snapshot WHERE created_at_ns < ?1",
@@ -1505,7 +1505,7 @@ impl WorkIndex {
         .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
     }
 
-    /// Registers a work context entry in the projection table (TCK-00638).
+    /// Registers a work context entry in the projection table (RFC-0032::REQ-0266).
     ///
     /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
     /// `(work_id, entry_id)` and the uniqueness constraint on
@@ -1572,7 +1572,7 @@ impl WorkIndex {
     }
 
     /// Registers or updates an active work loop profile in the projection
-    /// table (TCK-00645).
+    /// table (RFC-0032::REQ-0270).
     ///
     /// Uses latest-wins semantics per `work_id`: if a row already exists for
     /// the same `work_id`, it is replaced only when the new `anchored_at_ns`
@@ -1645,7 +1645,7 @@ impl WorkIndex {
     }
 
     /// Registers a `work_id -> spec_snapshot_hash` mapping in the projection
-    /// table (TCK-00636, RFC-0032 Phase 1).
+    /// table (RFC-0032::REQ-0264, RFC-0032 Phase 1).
     ///
     /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
     /// `work_id` ensures that duplicate entries from retries are silently
@@ -1783,7 +1783,7 @@ pub struct LedgerTailer {
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
-    /// TCK-00638 / BLOCKER fix: Whether the canonical `events` table is
+    /// RFC-0032::REQ-0266 / BLOCKER fix: Whether the canonical `events` table is
     /// active (freeze mode). Detected lazily on first poll by checking
     /// if the `events` table exists in `sqlite_master`. Once set, the
     /// tailer also queries canonical events to see freeze-mode writes.
@@ -1856,7 +1856,7 @@ impl LedgerTailer {
         }
     }
 
-    /// TCK-00638 / BLOCKER fix: Detects whether the canonical `events` table
+    /// RFC-0032::REQ-0266 / BLOCKER fix: Detects whether the canonical `events` table
     /// is active. Returns `true` if canonical mode is active (the `events`
     /// table exists and has at least one row). Result is cached in an
     /// `AtomicU8` to avoid repeated `sqlite_master` queries.
@@ -1889,7 +1889,7 @@ impl LedgerTailer {
         }
     }
 
-    /// TCK-00638 / BLOCKER fix: Polls the canonical `events` table for
+    /// RFC-0032::REQ-0266 / BLOCKER fix: Polls the canonical `events` table for
     /// events matching the given type and cursor, using the same composite
     /// cursor semantics as the legacy poll.
     ///
@@ -2134,7 +2134,7 @@ impl LedgerTailer {
             .collect::<Vec<_>>()
         };
 
-        // TCK-00638 / BLOCKER fix: When canonical mode is active, also
+        // RFC-0032::REQ-0266 / BLOCKER fix: When canonical mode is active, also
         // poll the canonical `events` table and merge results by
         // (timestamp_ns, event_id) ordering. This ensures the tailer
         // observes freeze-mode writes.
@@ -2215,7 +2215,7 @@ impl LedgerTailer {
         let event_type = event_type.to_string();
         let last_processed_ns = self.last_processed_ns;
         let last_event_id = self.last_event_id.clone();
-        // TCK-00638 / BLOCKER fix: Snapshot canonical_mode before spawning so
+        // RFC-0032::REQ-0266 / BLOCKER fix: Snapshot canonical_mode before spawning so
         // the blocking closure can detect freeze-mode writes. The probe
         // result is returned alongside events so we can cache it.
         let canonical_mode_snapshot = self
@@ -2295,7 +2295,7 @@ impl LedgerTailer {
                 .collect::<Vec<_>>()
             };
 
-            // TCK-00638 / BLOCKER fix: When canonical mode is active (or
+            // RFC-0032::REQ-0266 / BLOCKER fix: When canonical mode is active (or
             // unknown and detected by probing), also poll canonical events.
             let canonical_active = if canonical_mode_snapshot == 2 {
                 true
@@ -2504,7 +2504,7 @@ impl ProjectionWorkerConfig {
 
 /// The projection worker that tails the ledger and projects to GitHub.
 ///
-/// # Economics Admission Gate (TCK-00505)
+/// # Economics Admission Gate (RFC-0033::REQ-0063)
 ///
 /// When `intent_buffer`, `continuity_resolver`, and `gate_signer` are set,
 /// the worker enforces economics-gated admission with idempotent-insert
@@ -2540,25 +2540,25 @@ pub struct ProjectionWorker {
     /// Tailer for `review_receipt_recorded` events.
     review_tailer: LedgerTailer,
     /// Tailer for `evidence.published` events with `WORK_CONTEXT_ENTRY`
-    /// category (TCK-00638).
+    /// category (RFC-0032::REQ-0266).
     evidence_published_tailer: LedgerTailer,
     /// Tailer for `work.opened` events to populate `work_spec_snapshot`
-    /// projection table (TCK-00636, RFC-0032 Phase 1).
+    /// projection table (RFC-0032::REQ-0264, RFC-0032 Phase 1).
     work_opened_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
-    /// Durable buffer for recording admission decisions (TCK-00504/00505).
+    /// Durable buffer for recording admission decisions (RFC-0033::REQ-0062/00505).
     intent_buffer: Option<Arc<IntentBuffer>>,
     /// Continuity profile resolver for economics gate input assembly
-    /// (TCK-00507/00505).
+    /// (RFC-0033::REQ-0065/00505).
     continuity_resolver: Option<Arc<dyn ContinuityProfileResolver>>,
     /// Signer for constructing signed continuity window and profile
-    /// artifacts at gate evaluation time (TCK-00505).
+    /// artifacts at gate evaluation time (RFC-0033::REQ-0063).
     gate_signer: Option<Arc<Signer>>,
     /// Lifecycle gate enforced after economics ALLOW and before projection
     /// side effects (`join -> revalidate -> consume`).
     projection_lifecycle_gate: Option<Arc<LifecycleGate>>,
-    /// Structured telemetry for admission gate decisions (TCK-00505).
+    /// Structured telemetry for admission gate decisions (RFC-0033::REQ-0063).
     telemetry: Arc<AdmissionTelemetry>,
     /// Shutdown flag.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -2645,7 +2645,7 @@ impl ProjectionWorker {
         &self.work_index
     }
 
-    /// Returns a reference to the admission telemetry counters (TCK-00505).
+    /// Returns a reference to the admission telemetry counters (RFC-0033::REQ-0063).
     #[must_use]
     pub const fn telemetry(&self) -> &Arc<AdmissionTelemetry> {
         &self.telemetry
@@ -2675,7 +2675,7 @@ impl ProjectionWorker {
     }
 
     /// Sets the durable intent buffer for recording admission decisions
-    /// (TCK-00504/00505).
+    /// (RFC-0033::REQ-0062/00505).
     ///
     /// When set alongside `continuity_resolver`, enables the economics
     /// admission gate on the projection path. Both must be set for the
@@ -2685,7 +2685,7 @@ impl ProjectionWorker {
     }
 
     /// Sets the continuity profile resolver for economics gate input
-    /// assembly (TCK-00507/00505).
+    /// assembly (RFC-0033::REQ-0065/00505).
     ///
     /// When set alongside `intent_buffer` and `gate_signer`, enables the
     /// economics admission gate on the projection path. All three must be
@@ -2695,7 +2695,7 @@ impl ProjectionWorker {
     }
 
     /// Sets the gate signer used to construct signed continuity window
-    /// and profile artifacts at economics gate evaluation time (TCK-00505).
+    /// and profile artifacts at economics gate evaluation time (RFC-0033::REQ-0063).
     ///
     /// The signer MUST be persistent (daemon lifecycle key), NOT random
     /// per-invocation, so that signed artifacts are reproducible for
@@ -2719,7 +2719,7 @@ impl ProjectionWorker {
     }
 
     /// Returns whether the economics admission gate is fully wired
-    /// (TCK-00505).
+    /// (RFC-0033::REQ-0063).
     ///
     /// The gate requires an intent buffer, a continuity resolver, and a
     /// gate signer to be active.
@@ -2772,13 +2772,13 @@ impl ProjectionWorker {
             }
 
             // Process evidence.published events to index WORK_CONTEXT_ENTRY and
-            // WORK_LOOP_PROFILE entries (TCK-00638, TCK-00645: RFC-0032 projection)
+            // WORK_LOOP_PROFILE entries (RFC-0032::REQ-0266, RFC-0032::REQ-0270: RFC-0032 projection)
             if let Err(e) = self.process_evidence_published().await {
                 warn!(error = %e, "Error processing evidence.published events");
             }
 
             // Process work.opened events to populate work_spec_snapshot
-            // projection table (TCK-00636, RFC-0032 Phase 1)
+            // projection table (RFC-0032::REQ-0264, RFC-0032 Phase 1)
             if let Err(e) = self.process_work_opened().await {
                 warn!(error = %e, "Error processing work.opened events");
             }
@@ -2802,7 +2802,7 @@ impl ProjectionWorker {
     }
 
     /// Processes `work.opened` events to populate the `work_spec_snapshot`
-    /// projection table (TCK-00636, RFC-0032 Phase 1).
+    /// projection table (RFC-0032::REQ-0264, RFC-0032 Phase 1).
     ///
     /// Extracts `spec_snapshot_hash` from each `work.opened` event payload
     /// and registers the `work_id -> spec_snapshot_hash` mapping in the
@@ -3191,7 +3191,7 @@ impl ProjectionWorker {
                 Err(ProjectionWorkerError::AdmissionDenied { reason }) => {
                     // Economics admission denied — event was fully processed,
                     // intent recorded as denied. Acknowledge to advance
-                    // watermark (TCK-00505).
+                    // watermark (RFC-0033::REQ-0063).
                     info!(
                         event_id = %event.event_id,
                         reason = %reason,
@@ -3207,7 +3207,7 @@ impl ProjectionWorker {
                 }) => {
                     // Economics admission denied (subcategory) — event was
                     // fully processed, intent recorded. Acknowledge to
-                    // advance watermark (TCK-00505).
+                    // advance watermark (RFC-0033::REQ-0063).
                     info!(
                         event_id = %event.event_id,
                         reason = %reason,
@@ -3260,8 +3260,8 @@ impl ProjectionWorker {
     /// Processes `evidence.published` events to populate projection tables.
     ///
     /// Routes events by category:
-    /// - `WORK_CONTEXT_ENTRY` -> `work_context` table (TCK-00638)
-    /// - `WORK_LOOP_PROFILE` -> `work_active_loop_profile` table (TCK-00645)
+    /// - `WORK_CONTEXT_ENTRY` -> `work_context` table (RFC-0032::REQ-0266)
+    /// - `WORK_LOOP_PROFILE` -> `work_active_loop_profile` table (RFC-0032::REQ-0270)
     /// - All other categories are silently skipped (acknowledged without
     ///   indexing).
     ///
@@ -3330,9 +3330,9 @@ impl ProjectionWorker {
     /// protobuf, and routes by category:
     ///
     /// - `WORK_CONTEXT_ENTRY`: extracts metadata and inserts into
-    ///   `work_context` (TCK-00638).
+    ///   `work_context` (RFC-0032::REQ-0266).
     /// - `WORK_LOOP_PROFILE`: extracts metadata and upserts into
-    ///   `work_active_loop_profile` with latest-wins semantics (TCK-00645).
+    ///   `work_active_loop_profile` with latest-wins semantics (RFC-0032::REQ-0270).
     ///
     /// Unrecognized categories are silently skipped (return `Ok(())`).
     fn handle_evidence_published(
@@ -3431,7 +3431,7 @@ impl ProjectionWorker {
                 );
             },
             "WORK_LOOP_PROFILE" => {
-                // TCK-00645: Project active work loop profile.
+                // RFC-0032::REQ-0270: Project active work loop profile.
                 // Extract and validate metadata fields from the evidence
                 // metadata list. Projection identity is derived from canonical
                 // protobuf fields, not metadata labels.
@@ -3535,7 +3535,7 @@ impl ProjectionWorker {
 
     /// Handles a single `ReviewReceiptRecorded` event.
     ///
-    /// # Economics Admission Gate (TCK-00505)
+    /// # Economics Admission Gate (RFC-0033::REQ-0063)
     ///
     /// When the event payload carries economics selectors (`eval_tick`,
     /// `time_authority_ref`, `window_ref`, `boundary_id`):
@@ -3688,7 +3688,7 @@ impl ProjectionWorker {
         );
 
         // =====================================================================
-        // TCK-00505: Economics-gated admission with idempotent-insert
+        // RFC-0033::REQ-0063: Economics-gated admission with idempotent-insert
         //            replay prevention (fail-closed: no bypass path)
         // =====================================================================
         //
@@ -4271,7 +4271,7 @@ impl ProjectionWorker {
 // Economics Admission Gate (free functions for spawn_blocking)
 // =============================================================================
 
-/// Records a denied intent in the intent buffer (TCK-00505).
+/// Records a denied intent in the intent buffer (RFC-0033::REQ-0063).
 ///
 /// Inserts the intent if it does not already exist, then marks it as
 /// denied with the given reason.
@@ -6350,7 +6350,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00505: Economics Admission Gate + Replay Prevention Tests
+    // RFC-0033::REQ-0063: Economics Admission Gate + Replay Prevention Tests
     // =========================================================================
 
     /// Mock resolver for testing economics admission gate.
@@ -8867,7 +8867,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00638: work_context projection tests (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0266: work_context projection tests (RFC-0032 Phase 2)
     // ========================================================================
 
     /// BLOCKER 2a: Verify `WORK_CONTEXT_ENTRY` events are correctly indexed
@@ -9600,7 +9600,7 @@ mod tests {
         );
     }
 
-    /// TCK-00638 / BLOCKER-2 regression test: `LedgerTailer::poll_events`
+    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test: `LedgerTailer::poll_events`
     /// discovers events written to the canonical `events` table when in
     /// freeze mode.
     ///
@@ -9783,7 +9783,7 @@ mod tests {
         );
     }
 
-    /// TCK-00638 / BLOCKER-2 regression test: When no canonical `events`
+    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test: When no canonical `events`
     /// table exists, `poll_events` only returns legacy events (no error).
     #[test]
     fn test_tailer_poll_events_legacy_only_when_no_canonical_table() {
@@ -9820,7 +9820,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00638 fix regression tests:
+    // RFC-0032::REQ-0266 fix regression tests:
     //   1. Canonical cursor skip under timestamp collisions (>9 events)
     //   2. work_context eviction in evict_expired / evict_expired_async
     // =========================================================================
@@ -10044,7 +10044,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00645: work_active_loop_profile projection tests (RFC-0032 Phase 4)
+    // RFC-0032::REQ-0270: work_active_loop_profile projection tests (RFC-0032 Phase 4)
     // ========================================================================
 
     /// Verify `WORK_LOOP_PROFILE` events are correctly indexed in the
@@ -10990,7 +10990,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00636: WorkSpec Snapshot Projection Tests (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: WorkSpec Snapshot Projection Tests (RFC-0032 Phase 1)
     // ====================================================================
 
     #[test]

@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! Dual lattice taint/classification propagation and declassification receipts
-//! (TCK-00378).
+//! (RFC-0020::REQ-0032).
 //!
 //! This module enforces RFC-0020 Section 5 dual-lattice security:
 //!
@@ -2285,7 +2285,7 @@ impl DualLatticePolicy {
 ///
 /// The daemon's tool broker calls this guard before dispatching a tool
 /// request. It enforces dual-lattice policy at runtime, providing the
-/// daemon integration mandated by TCK-00378.
+/// daemon integration mandated by RFC-0020::REQ-0032.
 ///
 /// # Usage
 ///

@@ -116,7 +116,7 @@ pub const MAX_SHELL_PATTERN_LEN: usize = 1024;
 pub const MAX_TOOL_CLASS_NAME_LEN: usize = 64;
 
 // =============================================================================
-// Tool Class Enum (TCK-00254)
+// Tool Class Enum (RFC-0032::REQ-0070)
 //
 // Per REQ-DCP-0002, the context pack manifest includes a tool allowlist.
 // This is the canonical definition; apm2-daemon re-exports from here.
@@ -265,7 +265,7 @@ impl ToolClass {
 
     /// Returns `true` if this tool class can potentially modify state.
     ///
-    /// # TCK-00317: Handler-Layer Enforcement for Git and Artifact
+    /// # RFC-0032::REQ-0111: Handler-Layer Enforcement for Git and Artifact
     ///
     /// `Git` and `Artifact` return `true` because these tool classes can
     /// potentially perform write operations (e.g., git push, artifact publish).
@@ -356,7 +356,7 @@ impl ToolClassExt for ToolClass {
 }
 
 // =============================================================================
-// Shell Pattern Matching (TCK-00254)
+// Shell Pattern Matching (RFC-0032::REQ-0070)
 //
 // Per Code Quality Review [MAJOR], this function is shared between
 // ContextPackManifest and CapabilityManifest to eliminate duplication.
@@ -836,7 +836,7 @@ impl ManifestEntryBuilder {
 ///   time)
 /// - `profile_id`: Profile that generated this manifest
 /// - `entries`: List of allowed file entries
-/// - `tool_allowlist`: List of allowed tool classes (TCK-00254)
+/// - `tool_allowlist`: List of allowed tool classes (RFC-0032::REQ-0070)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackManifest {
@@ -855,14 +855,14 @@ pub struct ContextPackManifest {
 
     /// Allowlist of tool classes that can be invoked.
     ///
-    /// Per TCK-00254 and REQ-DCP-0002, tool requests are validated against
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, tool requests are validated against
     /// this allowlist. Empty means no tools allowed (fail-closed).
     #[serde(default)]
     pub tool_allowlist: Vec<ToolClass>,
 
     /// Allowlist of filesystem paths that can be written to.
     ///
-    /// Per TCK-00254 and REQ-DCP-0002, write operations are validated against
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, write operations are validated against
     /// this allowlist. Paths should be absolute and normalized. Empty means
     /// no writes allowed (fail-closed).
     #[serde(default)]
@@ -870,7 +870,7 @@ pub struct ContextPackManifest {
 
     /// Allowlist of shell command patterns that can be executed.
     ///
-    /// Per TCK-00254 and REQ-DCP-0002, shell execution requests are validated
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, shell execution requests are validated
     /// against this allowlist. Patterns may use glob syntax. Empty means no
     /// shell allowed (fail-closed).
     #[serde(default)]
@@ -985,7 +985,7 @@ impl ContextPackManifest {
 
     /// Checks if the given path is in the write allowlist.
     ///
-    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
     /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
     #[must_use]
     pub fn is_write_path_allowed(&self, path: &std::path::Path) -> bool {
@@ -1003,7 +1003,7 @@ impl ContextPackManifest {
     /// Checks if the given shell command matches a pattern in the shell
     /// allowlist.
     ///
-    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
     /// Patterns use simple glob matching with `*` as wildcard.
     #[must_use]
     pub fn is_shell_command_allowed(&self, command: &str) -> bool {
@@ -1022,7 +1022,7 @@ impl ContextPackManifest {
     /// Computes the manifest hash from the manifest fields.
     ///
     /// The hash is computed over the canonical representation of all fields
-    /// except the hash itself. Per TCK-00254, all allowlists are sorted for
+    /// except the hash itself. Per RFC-0032::REQ-0070, all allowlists are sorted for
     /// deterministic ordering.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
@@ -1067,7 +1067,7 @@ impl ContextPackManifest {
             hasher.update(&[entry.access_level as u8]);
         }
 
-        // Tool allowlist (TCK-00254) - sorted for determinism
+        // Tool allowlist (RFC-0032::REQ-0070) - sorted for determinism
         let mut sorted_tools: Vec<u8> = tool_allowlist.iter().map(ToolClass::value).collect();
         sorted_tools.sort_unstable();
         hasher.update(&(sorted_tools.len() as u32).to_be_bytes());
@@ -1075,7 +1075,7 @@ impl ContextPackManifest {
             hasher.update(&[*tool_value]);
         }
 
-        // Write allowlist (TCK-00254) - sorted for determinism
+        // Write allowlist (RFC-0032::REQ-0070) - sorted for determinism
         let mut sorted_write_paths: Vec<String> = write_allowlist
             .iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -1087,7 +1087,7 @@ impl ContextPackManifest {
             hasher.update(path.as_bytes());
         }
 
-        // Shell allowlist (TCK-00254) - sorted for determinism
+        // Shell allowlist (RFC-0032::REQ-0070) - sorted for determinism
         let mut sorted_shell_patterns: Vec<&str> =
             shell_allowlist.iter().map(String::as_str).collect();
         sorted_shell_patterns.sort_unstable();
@@ -1582,7 +1582,7 @@ impl ContextPackManifestBuilder {
 
     /// Sets the tool allowlist.
     ///
-    /// Per TCK-00254, only tools in this allowlist can be invoked.
+    /// Per RFC-0032::REQ-0070, only tools in this allowlist can be invoked.
     #[must_use]
     pub fn tool_allowlist(mut self, tools: Vec<ToolClass>) -> Self {
         self.tool_allowlist = tools;
@@ -1598,7 +1598,7 @@ impl ContextPackManifestBuilder {
 
     /// Sets the write allowlist.
     ///
-    /// Per TCK-00254, only writes to paths in this allowlist are permitted.
+    /// Per RFC-0032::REQ-0070, only writes to paths in this allowlist are permitted.
     #[must_use]
     pub fn write_allowlist(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.write_allowlist = paths;
@@ -1614,7 +1614,7 @@ impl ContextPackManifestBuilder {
 
     /// Sets the shell allowlist.
     ///
-    /// Per TCK-00254, only shell commands matching patterns in this allowlist
+    /// Per RFC-0032::REQ-0070, only shell commands matching patterns in this allowlist
     /// can be executed.
     #[must_use]
     pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
@@ -1683,7 +1683,7 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Validate tool_allowlist size (TCK-00254)
+        // Validate tool_allowlist size (RFC-0032::REQ-0070)
         if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
             return Err(ManifestError::CollectionTooLarge {
                 field: "tool_allowlist",
@@ -1692,7 +1692,7 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Validate write_allowlist size (TCK-00254)
+        // Validate write_allowlist size (RFC-0032::REQ-0070)
         if self.write_allowlist.len() > MAX_WRITE_ALLOWLIST {
             return Err(ManifestError::CollectionTooLarge {
                 field: "write_allowlist",
@@ -1701,7 +1701,7 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Validate write_allowlist paths (TCK-00254: CTR-1503, CTR-2609)
+        // Validate write_allowlist paths (RFC-0032::REQ-0070: CTR-1503, CTR-2609)
         // This ensures consistency with CapabilityManifest::validate()
         for path in &self.write_allowlist {
             let path_len = path.as_os_str().len();
@@ -1729,7 +1729,7 @@ impl ContextPackManifestBuilder {
             }
         }
 
-        // Validate shell_allowlist size (TCK-00254)
+        // Validate shell_allowlist size (RFC-0032::REQ-0070)
         if self.shell_allowlist.len() > MAX_SHELL_ALLOWLIST {
             return Err(ManifestError::CollectionTooLarge {
                 field: "shell_allowlist",
@@ -1795,7 +1795,7 @@ impl ContextPackManifestBuilder {
             }
         }
 
-        // TCK-00255: Sort entries by path for deterministic hashing.
+        // RFC-0032::REQ-0071: Sort entries by path for deterministic hashing.
         // This ensures that the same set of entries produces the same hash
         // regardless of insertion order, which is required for reliable seal
         // verification.
@@ -1804,7 +1804,7 @@ impl ContextPackManifestBuilder {
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
 
-        // Compute manifest hash (includes all allowlists per TCK-00254)
+        // Compute manifest hash (includes all allowlists per RFC-0032::REQ-0070)
         let manifest_hash = ContextPackManifest::compute_manifest_hash(
             &self.manifest_id,
             &self.profile_id,
@@ -2764,7 +2764,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00254: Tool Allowlist Tests
+    // RFC-0032::REQ-0070: Tool Allowlist Tests
     // =========================================================================
 
     #[test]
@@ -2906,10 +2906,10 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00255: Sealing Tests
+    // RFC-0032::REQ-0071: Sealing Tests
     // =========================================================================
 
-    /// TCK-00255: Verify seal returns the manifest hash.
+    /// RFC-0032::REQ-0071: Verify seal returns the manifest hash.
     #[test]
     fn tck_00255_seal_returns_manifest_hash() {
         let manifest = create_test_manifest();
@@ -2918,7 +2918,7 @@ pub mod tests {
         assert_eq!(seal_hash, manifest.manifest_hash());
     }
 
-    /// TCK-00255: Verify seal hash is deterministic (same entries produce same
+    /// RFC-0032::REQ-0071: Verify seal hash is deterministic (same entries produce same
     /// hash).
     #[test]
     fn tck_00255_seal_hash_is_deterministic() {
@@ -2957,7 +2957,7 @@ pub mod tests {
         assert_eq!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// TCK-00255: Verify modification after sealing is detected (hash mismatch
+    /// RFC-0032::REQ-0071: Verify modification after sealing is detected (hash mismatch
     /// causes rejection).
     #[test]
     fn tck_00255_modification_after_sealing_detected() {
@@ -2981,7 +2981,7 @@ pub mod tests {
         );
     }
 
-    /// TCK-00255: Verify seal works after deserialization roundtrip.
+    /// RFC-0032::REQ-0071: Verify seal works after deserialization roundtrip.
     #[test]
     fn tck_00255_seal_after_deserialization() {
         let original = create_test_manifest();
@@ -3000,7 +3000,7 @@ pub mod tests {
         assert!(recovered.verify_seal().is_ok());
     }
 
-    /// TCK-00255: Verify different entries produce different seal hashes.
+    /// RFC-0032::REQ-0071: Verify different entries produce different seal hashes.
     #[test]
     fn tck_00255_different_entries_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3023,7 +3023,7 @@ pub mod tests {
         assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// TCK-00255: Verify different content hashes produce different seal.
+    /// RFC-0032::REQ-0071: Verify different content hashes produce different seal.
     #[test]
     fn tck_00255_different_content_hash_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3046,7 +3046,7 @@ pub mod tests {
         assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// TCK-00255: Verify different access levels produce different seal.
+    /// RFC-0032::REQ-0071: Verify different access levels produce different seal.
     #[test]
     fn tck_00255_different_access_level_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3069,7 +3069,7 @@ pub mod tests {
         assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// TCK-00255: Verify seal on empty manifest works.
+    /// RFC-0032::REQ-0071: Verify seal on empty manifest works.
     #[test]
     fn tck_00255_seal_empty_manifest() {
         let manifest = ContextPackManifestBuilder::new("empty-manifest", "profile-001").build();
@@ -3082,7 +3082,7 @@ pub mod tests {
         assert!(manifest.verify_seal().is_ok());
     }
 
-    /// TCK-00255: Verify different insertion orders produce the same seal hash.
+    /// RFC-0032::REQ-0071: Verify different insertion orders produce the same seal hash.
     ///
     /// This is the critical test for deterministic hashing: entries are sorted
     /// by path before hashing, so insertion order should not affect the result.
@@ -3179,7 +3179,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00254: Write Allowlist Path Validation Tests
+    // RFC-0032::REQ-0070: Write Allowlist Path Validation Tests
     //
     // Per Code Quality Review [MAJOR], ContextPackManifestBuilder must validate
     // write_allowlist paths for absolute paths and traversal, consistent with

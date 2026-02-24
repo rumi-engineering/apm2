@@ -1,8 +1,8 @@
-// AGENT-AUTHORED (TCK-00561)
+// AGENT-AUTHORED (RFC-0032::REQ-0214)
 //! CLI commands for FAC policy management: show, validate, adopt, rollback.
 //!
 //! Implements `apm2 fac policy {show, validate, adopt, rollback}` per
-//! TCK-00561.
+//! RFC-0032::REQ-0214.
 //!
 //! # Security
 //!

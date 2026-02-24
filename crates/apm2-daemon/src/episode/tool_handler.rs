@@ -1,7 +1,7 @@
 //! Tool handler trait and types for tool execution.
 //!
 //! This module defines the `ToolHandler` trait that tool implementations must
-//! satisfy per TCK-00165. Handlers validate arguments, execute operations,
+//! satisfy per RFC-0033::REQ-0032. Handlers validate arguments, execute operations,
 //! and report resource consumption.
 //!
 //! # Architecture
@@ -26,7 +26,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00165: Tool execution and budget charging
+//! - RFC-0033::REQ-0032: Tool execution and budget charging
 //! - AD-TOOL-001: Tool execution flow
 //! - CTR-1303: Bounded collections with MAX_* constants
 
@@ -74,19 +74,19 @@ pub const GIT_STATUS_MAX_BYTES: usize = 16 * 1024; // 16 KiB
 /// Maximum output lines for `git status` (500 per REQ-HEF-0010).
 pub const GIT_STATUS_MAX_LINES: usize = 500;
 
-/// Maximum output bytes for `ListFiles`/`Search` operations (TCK-00315).
+/// Maximum output bytes for `ListFiles`/`Search` operations (RFC-0032::REQ-0109).
 ///
 /// Per RFC-0018 HEF requirements, navigation tool outputs are strictly bounded
 /// to prevent denial-of-service and ensure predictable resource consumption.
 pub const NAVIGATION_OUTPUT_MAX_BYTES: usize = 65_536; // 64 KiB
 
-/// Maximum output lines for `ListFiles`/`Search` operations (TCK-00315).
+/// Maximum output lines for `ListFiles`/`Search` operations (RFC-0032::REQ-0109).
 pub const NAVIGATION_OUTPUT_MAX_LINES: usize = 2000;
 
-/// Maximum entries for `ListFiles` operations (TCK-00315).
+/// Maximum entries for `ListFiles` operations (RFC-0032::REQ-0109).
 pub const LISTFILES_MAX_ENTRIES: usize = 10_000;
 
-/// Default entries for `ListFiles` operations (TCK-00315).
+/// Default entries for `ListFiles` operations (RFC-0032::REQ-0109).
 pub const LISTFILES_DEFAULT_ENTRIES: usize = 1000;
 
 // =============================================================================
@@ -132,10 +132,10 @@ pub enum ToolArgs {
     /// Arguments for artifact fetch operations.
     Artifact(ArtifactArgs),
 
-    /// Arguments for directory listing operations (TCK-00315).
+    /// Arguments for directory listing operations (RFC-0032::REQ-0109).
     ListFiles(ListFilesArgs),
 
-    /// Arguments for text search operations (TCK-00315).
+    /// Arguments for text search operations (RFC-0032::REQ-0109).
     Search(SearchArgs),
 
     /// Raw bytes for custom handlers.
@@ -369,7 +369,7 @@ pub struct ArtifactArgs {
     pub format: Option<String>,
 }
 
-/// Arguments for directory listing operations (TCK-00315).
+/// Arguments for directory listing operations (RFC-0032::REQ-0109).
 ///
 /// Per RFC-0018 HEF requirements, `ListFiles` provides minimal file navigation
 /// for reviewers with strict bounds and allowlist enforcement.
@@ -394,7 +394,7 @@ pub struct ListFilesArgs {
     pub max_entries: Option<u64>,
 }
 
-/// Arguments for text search operations (TCK-00315).
+/// Arguments for text search operations (RFC-0032::REQ-0109).
 ///
 /// Per RFC-0018 HEF requirements, `Search` provides minimal content search
 /// for reviewers with strict bounds and allowlist enforcement.

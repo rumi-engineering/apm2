@@ -102,8 +102,8 @@
 //!
 //! # References
 //!
-//! - TCK-00150: Implement `CoordinationController` serial execution loop
-//! - TCK-00242: Convert coordination timeouts to tick-based tracking
+//! - RFC-0032::REQ-0050: Implement `CoordinationController` serial execution loop
+//! - RFC-0016::REQ-0003: Convert coordination timeouts to tick-based tracking
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - RFC-0016: HTF Time Model (tick-based duration tracking)
 //! - AD-COORD-002: Serial execution, one session at a time
@@ -370,7 +370,7 @@ pub struct CoordinationController {
     /// Failed sessions count.
     failed_sessions: u32,
 
-    /// Start tick for duration tracking (TCK-00242).
+    /// Start tick for duration tracking (RFC-0016::REQ-0003).
     ///
     /// Uses `HtfTick` instead of `Instant` for replay-stable duration tracking.
     started_at_tick: Option<HtfTick>,
@@ -384,7 +384,7 @@ pub struct CoordinationController {
     /// Emitted events (for testing and verification).
     emitted_events: Vec<CoordinationEvent>,
 
-    /// Receipt builder for evidence generation (TCK-00154).
+    /// Receipt builder for evidence generation (RFC-0032::REQ-0054).
     ///
     /// Created when coordination starts, populated during execution,
     /// and finalized when coordination completes.
@@ -608,7 +608,7 @@ impl CoordinationController {
     /// Validates that the provided tick's rate matches the configured budget
     /// tick rate.
     ///
-    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// Per RFC-0016::REQ-0003: All tick values within a coordination must use the same
     /// tick rate as the budget to ensure replay-stable duration calculations.
     /// Using ticks with different rates would cause temporal confusion where
     /// elapsed time is computed incorrectly.
@@ -639,7 +639,7 @@ impl CoordinationController {
     ///
     /// # Arguments
     ///
-    /// * `current_tick` - The current monotonic tick (TCK-00242)
+    /// * `current_tick` - The current monotonic tick (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -653,7 +653,7 @@ impl CoordinationController {
     /// Returns [`ControllerError::InvalidTickRate`] if tick rate doesn't match
     /// budget.
     pub fn start(&mut self, current_tick: HtfTick, timestamp_ns: u64) -> ControllerResult<String> {
-        // Validate tick rate matches budget (TCK-00242)
+        // Validate tick rate matches budget (RFC-0016::REQ-0003)
         self.validate_tick_rate(&current_tick)?;
 
         if self.coordination_id.is_some() {
@@ -665,13 +665,13 @@ impl CoordinationController {
         // Generate coordination ID (UUID v4 format)
         let coordination_id = generate_uuid();
 
-        // Record start tick (TCK-00242: tick-based duration tracking)
+        // Record start tick (RFC-0016::REQ-0003: tick-based duration tracking)
         self.started_at_tick = Some(current_tick);
         self.started_at_ns = timestamp_ns;
         self.coordination_id = Some(coordination_id.clone());
         self.status = CoordinationStatus::Running;
 
-        // Initialize receipt builder (TCK-00154)
+        // Initialize receipt builder (RFC-0032::REQ-0054)
         self.receipt_builder = Some(ReceiptBuilder::new(
             coordination_id.clone(),
             self.config.budget.clone(),
@@ -906,7 +906,7 @@ impl CoordinationController {
     /// * `work_id` - The work item that was processed
     /// * `outcome` - The session outcome (Success or Failure)
     /// * `tokens_consumed` - Tokens consumed by the session
-    /// * `current_tick` - Current monotonic tick for elapsed time (TCK-00242)
+    /// * `current_tick` - Current monotonic tick for elapsed time (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -927,7 +927,7 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<TerminationResult> {
-        // Validate tick rate matches budget (TCK-00242)
+        // Validate tick rate matches budget (RFC-0016::REQ-0003)
         self.validate_tick_rate(&current_tick)?;
 
         let coordination_id =
@@ -972,14 +972,14 @@ impl CoordinationController {
             .consumed_tokens
             .saturating_add(tokens_consumed);
 
-        // Update elapsed time using tick-based tracking (TCK-00242)
+        // Update elapsed time using tick-based tracking (RFC-0016::REQ-0003)
         if let Some(started_at_tick) = self.started_at_tick {
             if let Err(e) = self.budget_usage.update_elapsed_ticks(
                 started_at_tick.value(),
                 current_tick.value(),
                 current_tick.tick_rate_hz(),
             ) {
-                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                // Auto-abort on clock regression (RFC-0016::REQ-0003: fail-closed)
                 // The controller must not remain in Running state after a clock anomaly
                 let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
@@ -1015,7 +1015,7 @@ impl CoordinationController {
         // Note: work_index hasn't been incremented yet, so it points to current work
         let tracking = &mut self.work_tracking[self.work_index];
 
-        // Record session in receipt builder (TCK-00154)
+        // Record session in receipt builder (RFC-0032::REQ-0054)
         if let Some(ref mut builder) = self.receipt_builder {
             builder.record_session(outcome);
         }
@@ -1060,7 +1060,7 @@ impl CoordinationController {
             },
         }
 
-        // Record work outcome in receipt builder if work item is complete (TCK-00154)
+        // Record work outcome in receipt builder if work item is complete (RFC-0032::REQ-0054)
         if work_complete {
             // Get the tracking again (we need to re-borrow after mutation)
             let tracking = &self.work_tracking[self.work_index.saturating_sub(1)];
@@ -1149,7 +1149,7 @@ impl CoordinationController {
     ///
     /// `Some(StopCondition)` if a stop condition is met, `None` otherwise.
     ///
-    /// # Note (TCK-00242)
+    /// # Note (RFC-0016::REQ-0003)
     ///
     /// Duration checking uses the `elapsed_ticks` stored in `budget_usage`,
     /// which must be updated via `record_session_termination()` before calling
@@ -1163,7 +1163,7 @@ impl CoordinationController {
             });
         }
 
-        // Check duration budget (TCK-00242: tick-based)
+        // Check duration budget (RFC-0016::REQ-0003: tick-based)
         if self.budget_usage.elapsed_ticks >= self.config.budget.max_duration_ticks {
             return Some(StopCondition::BudgetExhausted(
                 super::state::BudgetType::Duration,
@@ -1202,7 +1202,7 @@ impl CoordinationController {
     ///
     /// * `stop_condition` - The stop condition that caused completion
     /// * `current_tick` - Current monotonic tick for final elapsed time
-    ///   (TCK-00242)
+    ///   (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -1219,7 +1219,7 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationCompleted> {
-        // Validate tick rate matches budget (TCK-00242)
+        // Validate tick rate matches budget (RFC-0016::REQ-0003)
         self.validate_tick_rate(&current_tick)?;
 
         if self.status.is_terminal() {
@@ -1235,14 +1235,14 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time using tick-based tracking (TCK-00242)
+        // Update elapsed time using tick-based tracking (RFC-0016::REQ-0003)
         if let Some(started_at_tick) = self.started_at_tick {
             if let Err(e) = self.budget_usage.update_elapsed_ticks(
                 started_at_tick.value(),
                 current_tick.value(),
                 current_tick.tick_rate_hz(),
             ) {
-                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                // Auto-abort on clock regression (RFC-0016::REQ-0003: fail-closed)
                 let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
@@ -1294,7 +1294,7 @@ impl CoordinationController {
         Ok(completed_event)
     }
 
-    /// Completes the coordination with receipt storage (TCK-00154).
+    /// Completes the coordination with receipt storage (RFC-0032::REQ-0054).
     ///
     /// Builds the receipt, stores it in CAS, and emits `coordination.completed`
     /// with the receipt's canonical hash.
@@ -1304,7 +1304,7 @@ impl CoordinationController {
     /// * `cas` - Content-addressed store for receipt storage
     /// * `stop_condition` - The stop condition that caused completion
     /// * `current_tick` - Current monotonic tick for final elapsed time
-    ///   (TCK-00242)
+    ///   (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -1324,7 +1324,7 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<(CoordinationCompleted, Hash, Hash)> {
-        // Validate tick rate matches budget (TCK-00242)
+        // Validate tick rate matches budget (RFC-0016::REQ-0003)
         self.validate_tick_rate(&current_tick)?;
 
         if self.status.is_terminal() {
@@ -1340,14 +1340,14 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time using tick-based tracking (TCK-00242)
+        // Update elapsed time using tick-based tracking (RFC-0016::REQ-0003)
         if let Some(started_at_tick) = self.started_at_tick {
             if let Err(e) = self.budget_usage.update_elapsed_ticks(
                 started_at_tick.value(),
                 current_tick.value(),
                 current_tick.tick_rate_hz(),
             ) {
-                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                // Auto-abort on clock regression (RFC-0016::REQ-0003: fail-closed)
                 let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
@@ -1377,7 +1377,7 @@ impl CoordinationController {
             }
         }
 
-        // Build and store receipt (TCK-00154)
+        // Build and store receipt (RFC-0032::REQ-0054)
         let receipt_builder =
             self.receipt_builder
                 .take()
@@ -1423,7 +1423,7 @@ impl CoordinationController {
     ///
     /// * `reason` - The reason for abortion
     /// * `current_tick` - Current monotonic tick for final elapsed time
-    ///   (TCK-00242)
+    ///   (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -1440,7 +1440,7 @@ impl CoordinationController {
         current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationAborted> {
-        // Validate tick rate matches budget (TCK-00242)
+        // Validate tick rate matches budget (RFC-0016::REQ-0003)
         self.validate_tick_rate(&current_tick)?;
 
         if self.status.is_terminal() {
@@ -1456,7 +1456,7 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time using tick-based tracking (TCK-00242)
+        // Update elapsed time using tick-based tracking (RFC-0016::REQ-0003)
         // Note: For abort(), we don't auto-abort on clock regression since we're
         // already transitioning to Aborted state. Just map the error.
         if let Some(started_at_tick) = self.started_at_tick {
@@ -2433,10 +2433,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00151: Budget Enforcement Tests
+    // RFC-0032::REQ-0051: Budget Enforcement Tests
     // =========================================================================
 
-    /// TCK-00151: Episode budget enforced - coordination stops at
+    /// RFC-0032::REQ-0051: Episode budget enforced - coordination stops at
     /// `max_episodes`.
     ///
     /// Acceptance Criteria 1: Episode budget enforced.
@@ -2483,7 +2483,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00151: Duration budget enforced - coordination stops at
+    /// RFC-0032::REQ-0051: Duration budget enforced - coordination stops at
     /// `max_duration_ticks`.
     ///
     /// Acceptance Criteria 2: Duration budget enforced.
@@ -2512,7 +2512,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00151: Token budget enforced - coordination stops at `max_tokens`.
+    /// RFC-0032::REQ-0051: Token budget enforced - coordination stops at `max_tokens`.
     ///
     /// Acceptance Criteria 3: Token budget enforced (when set).
     #[test]
@@ -2566,7 +2566,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00151: Token budget not enforced when not set.
+    /// RFC-0032::REQ-0051: Token budget not enforced when not set.
     #[test]
     fn tck_00151_token_budget_not_set() {
         // Create config WITHOUT token budget
@@ -2598,7 +2598,7 @@ mod tests {
         assert!(stop.is_none());
     }
 
-    /// TCK-00151: Token aggregation from session outcomes.
+    /// RFC-0032::REQ-0051: Token aggregation from session outcomes.
     ///
     /// Acceptance Criteria 4: Token aggregation from session `final_entropy`.
     #[test]
@@ -2666,7 +2666,7 @@ mod tests {
         assert_eq!(controller.budget_usage.consumed_tokens, 4000);
     }
 
-    /// TCK-00151: Budget priority ordering (Duration > Tokens > Episodes).
+    /// RFC-0032::REQ-0051: Budget priority ordering (Duration > Tokens > Episodes).
     ///
     /// Per AD-COORD-013: When multiple budgets are exhausted, the highest
     /// priority one should be reported.
@@ -2711,7 +2711,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00151: Verify budget usage is included in completed event.
+    /// RFC-0032::REQ-0051: Verify budget usage is included in completed event.
     #[test]
     fn tck_00151_budget_usage_in_completed_event() {
         let budget =
@@ -2747,7 +2747,7 @@ mod tests {
         let _ = completed.budget_usage.elapsed_ticks;
     }
 
-    /// TCK-00151: Verify budget usage is included in aborted event.
+    /// RFC-0032::REQ-0051: Verify budget usage is included in aborted event.
     #[test]
     fn tck_00151_budget_usage_in_aborted_event() {
         let budget =
@@ -2780,7 +2780,7 @@ mod tests {
         assert_eq!(aborted.budget_usage.consumed_tokens, 3000);
     }
 
-    /// TCK-00151: Episode increment is monotonic.
+    /// RFC-0032::REQ-0051: Episode increment is monotonic.
     #[test]
     fn tck_00151_episode_increment_monotonic() {
         let config = test_config(vec!["work-1".to_string()]);
@@ -2817,7 +2817,7 @@ mod tests {
         assert_eq!(prev_episodes, 3);
     }
 
-    /// TCK-00151: Token consumption is monotonic.
+    /// RFC-0032::REQ-0051: Token consumption is monotonic.
     #[test]
     fn tck_00151_token_consumption_monotonic() {
         let config = test_config(vec![
@@ -2860,10 +2860,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00152: Stop Conditions and Circuit Breaker Logic Tests
+    // RFC-0032::REQ-0052: Stop Conditions and Circuit Breaker Logic Tests
     // =========================================================================
 
-    /// TCK-00152: Circuit breaker triggers on 3 consecutive work item failures.
+    /// RFC-0032::REQ-0052: Circuit breaker triggers on 3 consecutive work item failures.
     ///
     /// Acceptance Criteria 1: Circuit breaker triggers on 3 consecutive
     /// failures. Per AD-COORD-005 and AD-COORD-010: Circuit breaker tracks
@@ -2948,7 +2948,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00152: Circuit breaker resets on success.
+    /// RFC-0032::REQ-0052: Circuit breaker resets on success.
     ///
     /// Acceptance Criteria 2: Test success after 2 failures resets counter.
     /// Per AD-COORD-005: Counter resets to 0 on any successful session
@@ -3028,7 +3028,7 @@ mod tests {
         assert!(controller.check_stop_condition().is_none());
     }
 
-    /// TCK-00152: Retry vs circuit breaker distinction.
+    /// RFC-0032::REQ-0052: Retry vs circuit breaker distinction.
     ///
     /// Acceptance Criteria 3: Retry exhaustion for one work doesn't trigger
     /// circuit breaker alone. Per AD-COORD-010: Circuit breaker tracks
@@ -3098,7 +3098,7 @@ mod tests {
         assert_eq!(controller.current_work_id(), Some("B"));
     }
 
-    /// TCK-00152: Stop condition priority ordering.
+    /// RFC-0032::REQ-0052: Stop condition priority ordering.
     ///
     /// Acceptance Criteria 4: When multiple conditions met, highest priority
     /// reported. Per AD-COORD-013: `CircuitBreaker` >
@@ -3159,7 +3159,7 @@ mod tests {
         );
     }
 
-    /// TCK-00152: Integration test for circuit breaker with mock failures.
+    /// RFC-0032::REQ-0052: Integration test for circuit breaker with mock failures.
     ///
     /// IT-COORD-STOP-001: Circuit breaker trigger test.
     #[test]
@@ -3215,7 +3215,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00152: Integration test for circuit breaker reset.
+    /// RFC-0032::REQ-0052: Integration test for circuit breaker reset.
     ///
     /// IT-COORD-STOP-002: Circuit breaker reset on success.
     #[test]
@@ -3323,7 +3323,7 @@ mod tests {
         );
     }
 
-    /// TCK-00152: Integration test for retry exhaustion behavior.
+    /// RFC-0032::REQ-0052: Integration test for retry exhaustion behavior.
     ///
     /// IT-COORD-STOP-003: Retry exhaustion behavior.
     #[test]
@@ -3416,7 +3416,7 @@ mod tests {
         assert_eq!(tracking_w2.final_outcome, Some(WorkItemOutcome::Succeeded));
     }
 
-    /// TCK-00152: Property test for binding completeness.
+    /// RFC-0032::REQ-0052: Property test for binding completeness.
     ///
     /// PT-COORD-STOP-001: Binding completeness (no orphan bindings).
     /// Every `session_bound` event must have a corresponding `session_unbound`
@@ -3514,7 +3514,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00154: Receipt Integration Tests
+    // RFC-0032::REQ-0054: Receipt Integration Tests
     // =========================================================================
 
     #[test]
@@ -3707,10 +3707,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00242: Tick Rate Validation Tests
+    // RFC-0016::REQ-0003: Tick Rate Validation Tests
     // =========================================================================
 
-    /// TCK-00242: Start rejects tick with mismatched rate.
+    /// RFC-0016::REQ-0003: Start rejects tick with mismatched rate.
     ///
     /// Validates that `start()` returns `InvalidTickRate` when the provided
     /// tick has a different rate than the budget configuration.
@@ -3733,7 +3733,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: Complete rejects tick with mismatched rate.
+    /// RFC-0016::REQ-0003: Complete rejects tick with mismatched rate.
     ///
     /// Validates that `complete()` returns `InvalidTickRate` when the provided
     /// tick has a different rate than the budget configuration.
@@ -3773,7 +3773,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: Abort rejects tick with mismatched rate.
+    /// RFC-0016::REQ-0003: Abort rejects tick with mismatched rate.
     ///
     /// Validates that `abort()` returns `InvalidTickRate` when the provided
     /// tick has a different rate than the budget configuration.
@@ -3797,7 +3797,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: `record_session_termination` rejects tick with mismatched
+    /// RFC-0016::REQ-0003: `record_session_termination` rejects tick with mismatched
     /// rate.
     ///
     /// Validates that `record_session_termination()` returns `InvalidTickRate`
@@ -3833,7 +3833,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: Correct tick rate is accepted throughout coordination.
+    /// RFC-0016::REQ-0003: Correct tick rate is accepted throughout coordination.
     ///
     /// Validates that all methods accept ticks with the correct rate.
     #[test]
@@ -3866,7 +3866,7 @@ mod tests {
         assert!(controller.is_terminal());
     }
 
-    /// TCK-00242: Controller auto-aborts on clock regression.
+    /// RFC-0016::REQ-0003: Controller auto-aborts on clock regression.
     ///
     /// When `update_elapsed_ticks` detects a clock regression (`current_tick` <
     /// `start_tick`), the controller must automatically transition to Aborted
@@ -3912,7 +3912,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: Controller auto-aborts on clock regression during
+    /// RFC-0016::REQ-0003: Controller auto-aborts on clock regression during
     /// `complete()`.
     ///
     /// The fail-closed behavior applies to all methods that call

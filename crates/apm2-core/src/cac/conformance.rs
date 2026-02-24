@@ -285,7 +285,7 @@ impl ConformanceTestResult {
 /// Receipt documenting the results of export conformance testing.
 ///
 /// This struct provides auditable evidence that an export operation
-/// passed conformance tests. It follows the schema defined in TCK-00142.
+/// passed conformance tests. It follows the schema defined in RFC-0011::REQ-0013.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportReceipt {

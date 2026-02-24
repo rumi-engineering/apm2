@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! No-bypass path ratchet enforcement (TCK-00376).
+//! No-bypass path ratchet enforcement (RFC-0020::REQ-0030).
 //!
 //! This module implements the `PathRatchet` which ensures that **every** tool
 //! actuation path passes through all required enforcement components before
@@ -18,7 +18,7 @@
 //! 4. **Capsule profile admission**: The `AdmissionGate` must admit the capsule
 //!    profile (Tier3+). **Note**: Runtime capsule admission is not yet wired
 //!    into the broker; it is currently reported as `Unavailable`. The
-//!    `AdmissionGate` itself is validated in TCK-00374 unit tests. When runtime
+//!    `AdmissionGate` itself is validated in RFC-0020::REQ-0028 unit tests. When runtime
 //!    wiring lands, the broker will set this to `Checked`/`Unavailable` based
 //!    on actual capsule presence.
 //!
@@ -43,10 +43,10 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00376: No-bypass path ratchet enforcement
+//! - RFC-0020::REQ-0030: No-bypass path ratchet enforcement
 //! - REQ-0030: All actuation paths must pass through enforcement gates
-//! - TCK-00374: Capsule profile admission
-//! - TCK-00375: Context firewall TOCTOU hash enforcement
+//! - RFC-0020::REQ-0028: Capsule profile admission
+//! - RFC-0020::REQ-0029: Context firewall TOCTOU hash enforcement
 
 use std::fmt;
 

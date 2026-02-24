@@ -1,7 +1,7 @@
 // AGENT-AUTHORED
 //! Broker rate limits and quotas for control-plane actions.
 //!
-//! Implements TCK-00568: RFC-0029 budget admission applied to control-plane
+//! Implements RFC-0032::REQ-0219: RFC-0029 budget admission applied to control-plane
 //! actions — token issuance rate, queue enqueue rate + maximum queue bytes,
 //! and bundle export bytes.
 //!

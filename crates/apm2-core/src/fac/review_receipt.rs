@@ -57,9 +57,9 @@
 //!     bundle_hash,
 //!     [0x44; 32], // time_envelope_ref
 //!     "reviewer-001".to_string(),
-//!     Some([0x55; 32]), // capability_manifest_hash (TCK-00326, optional)
-//!     Some([0x66; 32]), // context_pack_hash (TCK-00326, optional)
-//!     Some([0x77; 32]), // role_spec_hash (TCK-00331, optional)
+//!     Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119, optional)
+//!     Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119, optional)
+//!     Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124, optional)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -584,7 +584,7 @@ impl ReviewArtifactBundleV1Builder {
     }
 
     /// Builds the `ReviewArtifactBundleV1` with strict holon-ready requirements
-    /// (TCK-00325).
+    /// (RFC-0032::REQ-0118).
     ///
     /// This method enforces the fail-closed requirement from SEC-CTRL-FAC-0015:
     /// review outcomes MUST bind to a verifiable view commitment and policy
@@ -691,11 +691,11 @@ pub struct ReviewReceiptRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub reviewer_signature: [u8; 64],
-    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, RFC-0032::REQ-0119).
     /// Binds the receipt to the authority under which the review was performed.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
     /// to preserve signature verification for historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
@@ -704,10 +704,10 @@ pub struct ReviewReceiptRecorded {
     )]
     pub capability_manifest_hash: Option<[u8; 32]>,
     /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
-    /// TCK-00326). Binds the receipt to the context firewall configuration.
+    /// RFC-0032::REQ-0119). Binds the receipt to the context firewall configuration.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
     /// to preserve signature verification for historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
@@ -715,12 +715,12 @@ pub struct ReviewReceiptRecorded {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_pack_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the `RoleSpecV1` in effect (32 bytes, TCK-00331).
+    /// BLAKE3 hash of the `RoleSpecV1` in effect (32 bytes, RFC-0032::REQ-0124).
     /// Binds the receipt to the role specification under which the review was
     /// performed, enabling attribution and tool-call conformance verification.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00331. When `None`, it is not included in `canonical_bytes()`
+    /// before RFC-0032::REQ-0124. When `None`, it is not included in `canonical_bytes()`
     /// to preserve signature verification for historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
@@ -745,7 +745,7 @@ impl ReviewReceiptRecorded {
     /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in
     ///   effect (optional for backward compatibility)
     /// * `role_spec_hash` - Hash of the `RoleSpecV1` in effect (optional for
-    ///   backward compatibility, TCK-00331)
+    ///   backward compatibility, RFC-0032::REQ-0124)
     /// * `signer` - Signer to authorize the event
     ///
     /// # Errors
@@ -845,16 +845,16 @@ impl ReviewReceiptRecorded {
     /// - `artifact_bundle_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `reviewer_actor_id` (len + bytes)
-    /// - `capability_manifest_hash` (32 bytes, TCK-00326, only if present)
-    /// - `context_pack_hash` (32 bytes, TCK-00326, only if present)
-    /// - `role_spec_hash` (32 bytes, TCK-00331, only if present)
+    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `context_pack_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `role_spec_hash` (32 bytes, RFC-0032::REQ-0124, only if present)
     ///
     /// # Backward Compatibility
     ///
     /// The `capability_manifest_hash`, `context_pack_hash`, and
     /// `role_spec_hash` fields are only included in the canonical encoding
     /// when they are `Some`. This preserves signature verification for
-    /// historical events created before TCK-00326/TCK-00331.
+    /// historical events created before RFC-0032::REQ-0119/RFC-0032::REQ-0124.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -877,17 +877,17 @@ impl ReviewReceiptRecorded {
         bytes.extend_from_slice(&(self.reviewer_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reviewer_actor_id.as_bytes());
 
-        // 6. capability_manifest_hash (TCK-00326, only if present for backward compat)
+        // 6. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward compat)
         if let Some(ref hash) = self.capability_manifest_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 7. context_pack_hash (TCK-00326, only if present for backward compat)
+        // 7. context_pack_hash (RFC-0032::REQ-0119, only if present for backward compat)
         if let Some(ref hash) = self.context_pack_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 8. role_spec_hash (TCK-00331, only if present for backward compat)
+        // 8. role_spec_hash (RFC-0032::REQ-0124, only if present for backward compat)
         if let Some(ref hash) = self.role_spec_hash {
             bytes.extend_from_slice(hash);
         }
@@ -982,21 +982,21 @@ impl ReviewReceiptRecordedBuilder {
         self
     }
 
-    /// Sets the capability manifest hash (TCK-00326).
+    /// Sets the capability manifest hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
         self.capability_manifest_hash = Some(hash);
         self
     }
 
-    /// Sets the context pack hash (TCK-00326).
+    /// Sets the context pack hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn context_pack_hash(mut self, hash: [u8; 32]) -> Self {
         self.context_pack_hash = Some(hash);
         self
     }
 
-    /// Sets the role spec hash (TCK-00331).
+    /// Sets the role spec hash (RFC-0032::REQ-0124).
     #[must_use]
     pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
         self.role_spec_hash = Some(hash);
@@ -1013,7 +1013,7 @@ impl ReviewReceiptRecordedBuilder {
     ///
     /// The `capability_manifest_hash`, `context_pack_hash`, and
     /// `role_spec_hash` fields are optional for backward compatibility with
-    /// events created before TCK-00326/TCK-00331.
+    /// events created before RFC-0032::REQ-0119/RFC-0032::REQ-0124.
     pub fn build_and_sign(
         self,
         signer: &Signer,
@@ -1033,7 +1033,7 @@ impl ReviewReceiptRecordedBuilder {
         let reviewer_actor_id = self
             .reviewer_actor_id
             .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
-        // These are optional for backward compatibility (TCK-00326/TCK-00331)
+        // These are optional for backward compatibility (RFC-0032::REQ-0119/RFC-0032::REQ-0124)
         let capability_manifest_hash = self.capability_manifest_hash;
         let context_pack_hash = self.context_pack_hash;
         let role_spec_hash = self.role_spec_hash;
@@ -1105,7 +1105,7 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
             ReviewReceiptError::InvalidData("reviewer_signature must be 64 bytes".into())
         })?;
 
-        // TCK-00326: Parse capability_manifest_hash and context_pack_hash
+        // RFC-0032::REQ-0119: Parse capability_manifest_hash and context_pack_hash
         // Map empty or all-zero fields to None for backward compatibility.
         // This ensures signature verification succeeds for historical events.
         let capability_manifest_hash: Option<[u8; 32]> = if proto
@@ -1131,7 +1131,7 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
             if hash == [0u8; 32] { None } else { Some(hash) }
         };
 
-        // TCK-00331: Parse role_spec_hash
+        // RFC-0032::REQ-0124: Parse role_spec_hash
         let role_spec_hash: Option<[u8; 32]> = if proto.role_spec_hash.is_empty() {
             None
         } else {
@@ -1170,14 +1170,14 @@ impl From<ReviewReceiptRecorded> for ReviewReceiptRecordedProto {
             }),
             reviewer_actor_id: event.reviewer_actor_id,
             reviewer_signature: event.reviewer_signature.to_vec(),
-            // TCK-00326: Authority binding fields (empty Vec if None)
+            // RFC-0032::REQ-0119: Authority binding fields (empty Vec if None)
             capability_manifest_hash: event
                 .capability_manifest_hash
                 .map_or_else(Vec::new, |h| h.to_vec()),
             context_pack_hash: event
                 .context_pack_hash
                 .map_or_else(Vec::new, |h| h.to_vec()),
-            // TCK-00331: Role spec binding (empty Vec if None)
+            // RFC-0032::REQ-0124: Role spec binding (empty Vec if None)
             role_spec_hash: event.role_spec_hash.map_or_else(Vec::new, |h| h.to_vec()),
         }
     }
@@ -1327,9 +1327,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1347,9 +1347,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1370,8 +1370,8 @@ mod tests {
             .artifact_bundle_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .reviewer_actor_id("reviewer-002")
-            .capability_manifest_hash([0x55; 32]) // TCK-00326
-            .context_pack_hash([0x66; 32])        // TCK-00326
+            .capability_manifest_hash([0x55; 32]) // RFC-0032::REQ-0119
+            .context_pack_hash([0x66; 32])        // RFC-0032::REQ-0119
             .build_and_sign(&signer)
             .expect("valid event");
 
@@ -1440,9 +1440,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         );
 
@@ -1464,9 +1464,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1477,9 +1477,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1501,9 +1501,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_authority_binding_fields_in_receipt_signature() {
-        // TCK-00326: Verify that capability_manifest_hash and context_pack_hash
+        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and context_pack_hash
         // are included in the signature
         let signer = Signer::generate();
         let event1 = ReviewReceiptRecorded::create(
@@ -1529,7 +1529,7 @@ mod tests {
             "reviewer-001".to_string(),
             Some([0x55; 32]), // capability_manifest_hash
             Some([0x66; 32]), // context_pack_hash
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1542,7 +1542,7 @@ mod tests {
             "reviewer-001".to_string(),
             Some([0xAA; 32]), // Different capability_manifest_hash
             Some([0x66; 32]), // Same context_pack_hash
-            Some([0x77; 32]), // role_spec_hash (TCK-00331)
+            Some([0x77; 32]), // role_spec_hash (RFC-0032::REQ-0124)
             &signer,
         )
         .expect("valid event");
@@ -1554,7 +1554,7 @@ mod tests {
 
     #[test]
     fn test_backward_compat_none_fields() {
-        // TCK-00326/TCK-00331: Events without optional hash fields
+        // RFC-0032::REQ-0119/RFC-0032::REQ-0124: Events without optional hash fields
         // should have shorter canonical bytes and verify correctly
         let signer = Signer::generate();
         let event_with = ReviewReceiptRecorded::create(
@@ -1628,7 +1628,7 @@ mod tests {
     }
 
     // ==========================================================================
-    // TCK-00325: build_strict and holon-ready bindings tests
+    // RFC-0032::REQ-0118: build_strict and holon-ready bindings tests
     // ==========================================================================
 
     #[test]
@@ -1758,12 +1758,12 @@ mod tests {
     }
 
     // ==========================================================================
-    // TCK-00331: role_spec_hash binding tests
+    // RFC-0032::REQ-0124: role_spec_hash binding tests
     // ==========================================================================
 
     #[test]
     fn test_role_spec_hash_in_receipt_signature() {
-        // TCK-00331: Verify that role_spec_hash is included in the signature
+        // RFC-0032::REQ-0124: Verify that role_spec_hash is included in the signature
         let signer = Signer::generate();
         let event1 = ReviewReceiptRecorded::create(
             "RR-001".to_string(),
@@ -1807,7 +1807,7 @@ mod tests {
             .reviewer_actor_id("reviewer-003")
             .capability_manifest_hash([0x55; 32])
             .context_pack_hash([0x66; 32])
-            .role_spec_hash([0x77; 32]) // TCK-00331
+            .role_spec_hash([0x77; 32]) // RFC-0032::REQ-0124
             .build_and_sign(&signer)
             .expect("valid event");
 

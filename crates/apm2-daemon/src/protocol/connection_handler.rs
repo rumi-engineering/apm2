@@ -1,7 +1,7 @@
 //! Connection handler for dual-socket `ProtocolServer` control plane.
 //!
 //! This module implements the connection handling logic for the daemon's
-//! `ProtocolServer`-only control plane (TCK-00279/TCK-00281). It performs the
+//! `ProtocolServer`-only control plane (RFC-0032::REQ-0085/RFC-0032::REQ-0086). It performs the
 //! mandatory Hello/HelloAck handshake as specified in DD-001/DD-008 before
 //! processing any protobuf messages.
 //!
@@ -24,7 +24,7 @@
 //! - Invalid handshake terminates the connection
 //! - Privilege checks are performed based on socket type before dispatching
 //!
-//! # TCK-00281: Legacy JSON IPC Removal
+//! # RFC-0032::REQ-0086: Legacy JSON IPC Removal
 //!
 //! Per DD-009, legacy JSON IPC (apm2_core::ipc) has been removed. The daemon
 //! now only accepts protobuf-encoded messages via PrivilegedDispatcher and
@@ -44,10 +44,10 @@ use crate::hsi_contract::{MismatchOutcome, RiskTier};
 use crate::metrics::DaemonMetrics;
 
 // ============================================================================
-// TCK-00349: Session-Typed Connection Phase State Machine
+// RFC-0020::REQ-0003: Session-Typed Connection Phase State Machine
 // ============================================================================
 
-/// Connection phase for the session-typed state machine (TCK-00349).
+/// Connection phase for the session-typed state machine (RFC-0020::REQ-0003).
 ///
 /// Per REQ-0003, authority-bearing operations MUST require valid session-state
 /// progression. This enum enforces a strict, forward-only progression:
@@ -146,7 +146,7 @@ impl std::fmt::Display for ConnectionPhase {
     }
 }
 
-/// Error type for illegal connection phase transitions (TCK-00349).
+/// Error type for illegal connection phase transitions (RFC-0020::REQ-0003).
 ///
 /// This is a structured defect — callers can log the exact illegal
 /// transition without truncation or coercion to a default.
@@ -177,7 +177,7 @@ fn server_info() -> String {
     format!("apm2-daemon/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Default canonicalizer declared by the daemon (TCK-00348).
+/// Default canonicalizer declared by the daemon (RFC-0020::REQ-0002).
 ///
 /// This is the canonical encoding version the daemon uses for deterministic
 /// serialization. Clients must declare compatible canonicalizers.
@@ -186,7 +186,7 @@ pub const DAEMON_CANONICALIZER_ID: &str = "apm2.canonical.v1";
 /// Default canonicalizer version.
 pub const DAEMON_CANONICALIZER_VERSION: u32 = 1;
 
-/// Configuration for contract binding in the handshake (TCK-00348).
+/// Configuration for contract binding in the handshake (RFC-0020::REQ-0002).
 ///
 /// Provides the server's contract hash, canonicalizers, risk tier, and
 /// optional metrics handle so `perform_handshake` can wire production
@@ -316,7 +316,7 @@ impl HandshakeConfig {
 pub enum HandshakeResult {
     /// Handshake succeeded, connection is ready for message exchange.
     Success {
-        /// Contract binding metadata for this session (TCK-00348).
+        /// Contract binding metadata for this session (RFC-0020::REQ-0002).
         ///
         /// Persisted in `SessionStarted` events for audit trail.
         contract_binding: SessionContractBinding,
@@ -390,7 +390,7 @@ pub async fn perform_handshake(
     connection: &mut Connection,
     config: &HandshakeConfig,
 ) -> Result<HandshakeResult> {
-    // TCK-00348 BLOCKER-1: Wire real contract binding into ServerHandshake.
+    // RFC-0020::REQ-0002 BLOCKER-1: Wire real contract binding into ServerHandshake.
     // Use the server's manifest hash, canonicalizers, and risk tier from config.
     let mut handshake = ServerHandshake::new(server_info())
         .with_server_contract_hash(&config.server_contract_hash)
@@ -431,7 +431,7 @@ pub async fn perform_handshake(
         .process_hello(&hello)
         .context("failed to process Hello")?;
 
-    // TCK-00348 MAJOR-1: Emit metrics from production handshake path.
+    // RFC-0020::REQ-0002 MAJOR-1: Emit metrics from production handshake path.
     // After mismatch evaluation, emit `contract_mismatch_total` counter
     // with risk-tier and outcome labels.
     if let Some(ref metrics) = config.metrics {
@@ -475,7 +475,7 @@ pub async fn perform_handshake(
         .upgrade_to_full_frame_size()
         .context("failed to upgrade frame size")?;
 
-    // TCK-00348 BLOCKER-4: Build SessionContractBinding for persistence
+    // RFC-0020::REQ-0002 BLOCKER-4: Build SessionContractBinding for persistence
     // in SessionStarted events.
     let mismatch_waived = handshake
         .mismatch_outcome()
@@ -618,7 +618,7 @@ mod tests {
         assert!(matches!(result, HandshakeResult::Failed));
     }
 
-    /// TCK-00348: Test Tier2 denial through `perform_handshake` integration
+    /// RFC-0020::REQ-0002: Test Tier2 denial through `perform_handshake` integration
     /// path.
     #[tokio::test]
     async fn test_perform_handshake_tier2_contract_mismatch_denied() {
@@ -692,7 +692,7 @@ mod tests {
         assert!(matches!(result, HandshakeResult::Failed));
     }
 
-    /// TCK-00348: Test that the DEFAULT config (Tier2) denies contract
+    /// RFC-0020::REQ-0002: Test that the DEFAULT config (Tier2) denies contract
     /// mismatch without any manual tier override. This proves the
     /// fail-closed default is reachable in production.
     #[tokio::test]
@@ -777,7 +777,7 @@ mod tests {
         );
     }
 
-    /// TCK-00348: Test that successful handshake returns contract binding.
+    /// RFC-0020::REQ-0002: Test that successful handshake returns contract binding.
     #[tokio::test]
     async fn test_perform_handshake_returns_contract_binding() {
         use crate::protocol::handshake::Hello;
@@ -850,7 +850,7 @@ mod tests {
         }
     }
 
-    /// TCK-00348: Test metrics emission on contract mismatch.
+    /// RFC-0020::REQ-0002: Test metrics emission on contract mismatch.
     #[tokio::test]
     async fn test_perform_handshake_emits_mismatch_metrics() {
         use crate::protocol::handshake::Hello;
@@ -911,7 +911,7 @@ mod tests {
         );
     }
 
-    /// TCK-00348: Test that over-limit contract hash is rejected.
+    /// RFC-0020::REQ-0002: Test that over-limit contract hash is rejected.
     #[tokio::test]
     async fn test_perform_handshake_rejects_oversized_contract_hash() {
         use crate::protocol::handshake::Hello;
@@ -963,7 +963,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00349: Session-typed state machine tests
+    // RFC-0020::REQ-0003: Session-typed state machine tests
     // =========================================================================
 
     #[test]
@@ -1048,7 +1048,7 @@ mod tests {
         assert!(msg.contains("not SessionOpen"));
     }
 
-    /// TCK-00349: Verify that privileged dispatch is rejected before
+    /// RFC-0020::REQ-0003: Verify that privileged dispatch is rejected before
     /// `SessionOpen` phase.
     #[test]
     fn test_privileged_dispatch_rejected_before_session_open() {
@@ -1076,7 +1076,7 @@ mod tests {
         );
     }
 
-    /// TCK-00349: Verify that session dispatch is rejected before
+    /// RFC-0020::REQ-0003: Verify that session dispatch is rejected before
     /// `SessionOpen` phase.
     #[test]
     fn test_session_dispatch_rejected_before_session_open() {
@@ -1111,7 +1111,7 @@ mod tests {
         );
     }
 
-    /// TCK-00349: Verify that dispatch succeeds after full phase progression.
+    /// RFC-0020::REQ-0003: Verify that dispatch succeeds after full phase progression.
     #[test]
     fn test_privileged_dispatch_succeeds_after_session_open() {
         use super::super::dispatch::{
@@ -1152,10 +1152,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00349: Fail-closed enum decoding tests
+    // RFC-0020::REQ-0003: Fail-closed enum decoding tests
     // =========================================================================
 
-    /// TCK-00349: Verify that unknown message type tags are rejected
+    /// RFC-0020::REQ-0003: Verify that unknown message type tags are rejected
     /// (fail-closed, no default coercion).
     #[test]
     fn test_unknown_privileged_message_type_returns_none() {
@@ -1180,7 +1180,7 @@ mod tests {
         }
     }
 
-    /// TCK-00349: Verify that unknown session message type tags are rejected.
+    /// RFC-0020::REQ-0003: Verify that unknown session message type tags are rejected.
     #[test]
     fn test_unknown_session_message_type_returns_none() {
         use super::super::session_dispatch::SessionMessageType;
@@ -1204,7 +1204,7 @@ mod tests {
         }
     }
 
-    /// TCK-00349: Verify that unknown `HandshakeErrorCode` variants are
+    /// RFC-0020::REQ-0003: Verify that unknown `HandshakeErrorCode` variants are
     /// rejected during deserialization (fail-closed).
     #[test]
     fn test_unknown_handshake_error_code_fails_closed() {
@@ -1232,10 +1232,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00349: Bounded decode enforcement tests
+    // RFC-0020::REQ-0003: Bounded decode enforcement tests
     // =========================================================================
 
-    /// TCK-00349: Verify that oversized payloads are rejected BEFORE
+    /// RFC-0020::REQ-0003: Verify that oversized payloads are rejected BEFORE
     /// deserialization (bounded decode).
     #[test]
     fn test_bounded_decode_rejects_oversized_payload() {
@@ -1256,7 +1256,7 @@ mod tests {
         );
     }
 
-    /// TCK-00349: Verify that payloads within bounds are accepted.
+    /// RFC-0020::REQ-0003: Verify that payloads within bounds are accepted.
     #[test]
     fn test_bounded_decode_accepts_within_bounds() {
         use prost::Message;
@@ -1276,7 +1276,7 @@ mod tests {
         assert!(result.is_ok(), "Valid payload within bounds must decode");
     }
 
-    /// TCK-00349: Verify that unknown fields in `HelloNack` JSON are rejected
+    /// RFC-0020::REQ-0003: Verify that unknown fields in `HelloNack` JSON are rejected
     /// (`deny_unknown_fields`).
     #[test]
     fn test_signed_json_rejects_unknown_fields_hello_nack() {
@@ -1291,7 +1291,7 @@ mod tests {
         );
     }
 
-    /// TCK-00349: Verify that default `DecodeConfig` constants are reasonable.
+    /// RFC-0020::REQ-0003: Verify that default `DecodeConfig` constants are reasonable.
     #[test]
     fn test_decode_config_defaults_are_bounded() {
         use super::super::messages::{

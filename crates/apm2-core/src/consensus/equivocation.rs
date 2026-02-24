@@ -23,7 +23,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00196: Byzantine Equivocation Detection
+//! - RFC-0033::REQ-0056: Byzantine Equivocation Detection
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -902,7 +902,7 @@ mod tck_00196_tests {
         proposal
     }
 
-    /// TCK-00196: Test that equivocation is detected for same `seq_id` with
+    /// RFC-0033::REQ-0056: Test that equivocation is detected for same `seq_id` with
     /// different hash.
     #[test]
     fn tck_00196_detect_double_signing() {
@@ -928,7 +928,7 @@ mod tck_00196_tests {
         );
     }
 
-    /// TCK-00196: Test that evidence contains all required fields.
+    /// RFC-0033::REQ-0056: Test that evidence contains all required fields.
     #[test]
     fn tck_00196_evidence_contains_required_fields() {
         let mut detector = EquivocationDetector::new();
@@ -988,7 +988,7 @@ mod tck_00196_tests {
         }
     }
 
-    /// TCK-00196: Test that valid proposals don't trigger false positives.
+    /// RFC-0033::REQ-0056: Test that valid proposals don't trigger false positives.
     #[test]
     fn tck_00196_no_false_positives() {
         let mut detector = EquivocationDetector::new();
@@ -1027,7 +1027,7 @@ mod tck_00196_tests {
         ));
     }
 
-    /// TCK-00196: Test bounded collection eviction.
+    /// RFC-0033::REQ-0056: Test bounded collection eviction.
     #[test]
     fn tck_00196_bounded_collection_eviction() {
         let max_size = 5;
@@ -1058,7 +1058,7 @@ mod tck_00196_tests {
         );
     }
 
-    /// TCK-00196: Test that evidence is independently verifiable.
+    /// RFC-0033::REQ-0056: Test that evidence is independently verifiable.
     #[test]
     fn tck_00196_evidence_independently_verifiable() {
         let mut detector = EquivocationDetector::new();
@@ -1095,7 +1095,7 @@ mod tck_00196_tests {
         }
     }
 
-    /// TCK-00196: Test constants are within acceptable bounds.
+    /// RFC-0033::REQ-0056: Test constants are within acceptable bounds.
     ///
     /// This test verifies that the constants are set to appropriate values
     /// at runtime by checking they meet expected bounds.

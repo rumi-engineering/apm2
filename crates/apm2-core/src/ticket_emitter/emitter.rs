@@ -1224,7 +1224,7 @@ mod tests {
         }
 
         // Verify valid IDs are accepted
-        let valid_ids = ["TCK-00001", "TCK-00100", "TCK-99999", "TCK-12345"];
+        let valid_ids = ["TCK-00001", "RFC-0032::REQ-0047", "TCK-99999", "TCK-12345"];
         for valid_id in valid_ids {
             let result = validate_ticket_id(valid_id);
             assert!(result.is_ok(), "Should accept valid ticket ID '{valid_id}'");

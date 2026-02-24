@@ -14,10 +14,10 @@
 //!
 //! Runtime wiring into the daemon episode spawn path:
 //!
-//! - **TCK-00375**: Context firewall -- implements symlink-safe runtime path
+//! - **RFC-0020::REQ-0029**: Context firewall -- implements symlink-safe runtime path
 //!   resolution with filesystem-level TOCTOU checks in the daemon actuation
 //!   path.
-//! - **TCK-00376**: No-bypass path ratchet -- the `PathRatchet` in the daemon
+//! - **RFC-0020::REQ-0030**: No-bypass path ratchet -- the `PathRatchet` in the daemon
 //!   broker enforces that all enforcement components (broker, capability,
 //!   context firewall, capsule admission) are checked before tool actuation.
 //!   Broker/capability/context-firewall are mandatory at Tier2+; capsule
@@ -36,14 +36,14 @@
 //! - **Resource limits**: cgroup controls for CPU, memory, PIDs, I/O
 //! - **Network isolation**: deny-by-default egress with explicit route grants
 //! - **Workspace confinement**: lexical path traversal rejection (symlink-safe
-//!   runtime path resolution is deferred to TCK-00375)
+//!   runtime path resolution is deferred to RFC-0020::REQ-0029)
 //! - **Environment scrubbing**: no inherited credentials or host secrets
 //!
 //! # Tier Enforcement
 //!
 //! - **Tier3+**: MUST execute inside an admitted capsule profile (hard fail).
 //!   Note: enforcement is currently validated in unit tests only; runtime
-//!   integration is deferred to TCK-00375/TCK-00376.
+//!   integration is deferred to RFC-0020::REQ-0029/RFC-0020::REQ-0030.
 //! - **Tier1-Tier2**: Capsule profile is optional but recommended
 //! - **Tier0**: Development mode; capsule is informational only
 //!

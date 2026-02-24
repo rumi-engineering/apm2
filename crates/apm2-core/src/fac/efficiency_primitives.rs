@@ -2,7 +2,7 @@
 //! Efficiency primitives for context deltas, caching, and summary-first
 //! iteration.
 //!
-//! This module implements TCK-00335: efficiency primitives that enable 20+
+//! This module implements RFC-0032::REQ-0127: efficiency primitives that enable 20+
 //! iteration loops to stay within fixed context budget envelopes through:
 //!
 //! - **Context Deltas**: Capture minimal state changes between iterations (N ->
@@ -14,7 +14,7 @@
 //!
 //! # Design Overview
 //!
-//! Per RFC-0019 and the orchestration revision loop from TCK-00332, iteration
+//! Per RFC-0019 and the orchestration revision loop from RFC-0032::REQ-0125, iteration
 //! N+1 default context uses deltas + summary receipts instead of full history
 //! injection. This bounded growth pattern ensures long-running revision loops
 //! stay within memory constraints.

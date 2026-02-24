@@ -1,7 +1,7 @@
 //! FAC Broker service: local authority for actuation tokens and economics
 //! envelopes.
 //!
-//! Implements TCK-00510: a local broker authority responsible for FAC actuation
+//! Implements RFC-0032::REQ-0178: a local broker authority responsible for FAC actuation
 //! authorization and economics/time authority.
 //!
 //! The broker is the **sole** issuer of:
@@ -214,7 +214,7 @@ pub enum BrokerError {
     )]
     AdmissionHealthGateNotSatisfied,
 
-    /// Control-plane rate limit or quota exceeded (TCK-00568).
+    /// Control-plane rate limit or quota exceeded (RFC-0032::REQ-0219).
     #[error("control-plane budget denied: {0}")]
     ControlPlaneBudgetDenied(#[from] ControlPlaneBudgetError),
 
@@ -237,7 +237,7 @@ pub enum BrokerError {
     #[error("policy digest cannot be zero")]
     ZeroPolicyDigest,
 
-    /// The requested intent is not in the policy-allowed set (TCK-00567).
+    /// The requested intent is not in the policy-allowed set (RFC-0032::REQ-0218).
     #[error("intent not allowed by policy: {intent}")]
     IntentNotAllowed {
         /// The rejected intent string.
@@ -245,7 +245,7 @@ pub enum BrokerError {
     },
 
     /// Policy specifies an intent allowlist but no intent was provided
-    /// (TCK-00567).  Fail-closed: intent-less tokens are not issued when
+    /// (RFC-0032::REQ-0218).  Fail-closed: intent-less tokens are not issued when
     /// the policy requires intent binding.
     #[error("intent required by policy but none provided")]
     IntentRequiredByPolicy,
@@ -257,7 +257,7 @@ pub enum BrokerError {
         field: &'static str,
     },
 
-    /// TCK-00566: Token ledger error (replay detected, revoked, etc.).
+    /// RFC-0032::REQ-0217: Token ledger error (replay detected, revoked, etc.).
     #[error("token ledger: {0}")]
     TokenLedger(#[from] crate::fac::token_ledger::TokenLedgerError),
 }
@@ -288,14 +288,14 @@ pub struct BrokerState {
     pub convergence_horizon_hash: Hash,
     /// Convergence receipts for TP-EIO29-003 (bounded).
     pub convergence_receipts: Vec<ConvergenceReceipt>,
-    /// Monotonic health check sequence counter (INV-BH-013, TCK-00585).
+    /// Monotonic health check sequence counter (INV-BH-013, RFC-0032::REQ-0235).
     ///
     /// Persisted so that `BrokerHealthChecker` can resume from the last
     /// known sequence after a daemon restart, preventing replay of old
     /// health receipts from a previous daemon lifetime.
     ///
     /// Defaults to 0 for backwards compatibility with state files that
-    /// predate TCK-00585.
+    /// predate RFC-0032::REQ-0235.
     #[serde(default)]
     pub health_seq: u64,
 }
@@ -470,13 +470,13 @@ pub struct FacBroker {
     /// Synchronization: protected by the same external lock that guards
     /// `&mut self` / `&self` access. No interior mutability.
     admission_health_gate_passed: bool,
-    /// Control-plane rate limits budget (TCK-00568).
+    /// Control-plane rate limits budget (RFC-0032::REQ-0219).
     ///
     /// Tracks cumulative usage for token issuance, queue enqueue, and
     /// bundle export operations. Admission is checked BEFORE mutation
     /// (INV-CPRL-002). Protected by the same external lock as `&mut self`.
     control_plane_budget: ControlPlaneBudget,
-    /// TCK-00566: Token use ledger for replay protection.
+    /// RFC-0032::REQ-0217: Token use ledger for replay protection.
     ///
     /// Records nonces for issued tokens. A second issuance or use of the
     /// same nonce is denied. Bounded by `MAX_LEDGER_ENTRIES` with
@@ -631,11 +631,11 @@ impl FacBroker {
     /// Advances the broker tick by 1 (monotonic) and resets the
     /// control-plane budget for the new window.
     ///
-    /// TCK-00568: Each tick boundary starts a fresh budget window so that
+    /// RFC-0032::REQ-0219: Each tick boundary starts a fresh budget window so that
     /// rate limits are per-tick, not per-process-lifetime. Without this
     /// reset, one burst permanently exhausts the budget (Security MAJOR).
     ///
-    /// TCK-00566: Also evicts expired entries from the token-use ledger
+    /// RFC-0032::REQ-0217: Also evicts expired entries from the token-use ledger
     /// to prevent unbounded growth.
     ///
     /// Returns the new tick value.
@@ -644,7 +644,7 @@ impl FacBroker {
         self.state.current_tick = self.state.current_tick.saturating_add(1);
         // Reset control-plane budget counters for the new tick window.
         self.control_plane_budget.reset();
-        // TCK-00566: Evict expired token ledger entries.
+        // RFC-0032::REQ-0217: Evict expired token ledger entries.
         self.token_ledger.evict_expired(self.state.current_tick);
         self.state.current_tick
     }
@@ -783,7 +783,7 @@ impl FacBroker {
     ///
     /// The token encodes a fully-populated `ChannelBoundaryCheck` with
     /// `broker_verified = true` and all verification flags set, signed by
-    /// the broker's Ed25519 key. The token also includes a TCK-00565
+    /// the broker's Ed25519 key. The token also includes a RFC-0032::REQ-0216
     /// `TokenBindingV1` that binds the token to the current FAC policy hash,
     /// canonicalizer tuple digest, `boundary_id`, and tick-based expiry.
     ///
@@ -809,7 +809,7 @@ impl FacBroker {
     /// - `intent` is not in the policy-allowed set (when configured)
     /// - Token serialization or signing fails
     ///
-    /// # Intent binding (TCK-00567)
+    /// # Intent binding (RFC-0032::REQ-0218)
     ///
     /// When `intent` is `Some`, the token binding will include the intent
     /// string.  If `allowed_intents` is configured on the broker, the
@@ -834,7 +834,7 @@ impl FacBroker {
             return Err(BrokerError::AdmissionHealthGateNotSatisfied);
         }
 
-        // TCK-00568: Enforce control-plane token issuance rate limit.
+        // RFC-0032::REQ-0219: Enforce control-plane token issuance rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE any state mutation.
         self.control_plane_budget.admit_token_issuance()?;
 
@@ -850,7 +850,7 @@ impl FacBroker {
         }
         validate_boundary_id(boundary_id)?;
 
-        // TCK-00567: Validate intent against allowed_intents policy.
+        // RFC-0032::REQ-0218: Validate intent against allowed_intents policy.
         // When allowed_intents is configured, the intent MUST be present
         // and MUST be in the allowed set (fail-closed).  A missing intent
         // when the policy has an allowlist is a hard deny — prevents
@@ -940,7 +940,7 @@ impl FacBroker {
             token_binding: None, // Set during token issuance below.
         };
 
-        // TCK-00566: Generate a single-use nonce for replay protection.
+        // RFC-0032::REQ-0217: Generate a single-use nonce for replay protection.
         // The nonce is registered in the ledger at issuance time in `Issued`
         // state (INV-TL-008). This allows pre-use revocation: if the token
         // is leaked, the broker can revoke the nonce before any worker
@@ -959,11 +959,11 @@ impl FacBroker {
         let wal_bytes = crate::fac::token_ledger::TokenUseLedger::serialize_wal_entry(&wal_entry)
             .map_err(BrokerError::TokenLedger)?;
 
-        // TCK-00565: Bind the token to policy, canonicalizer, boundary, and
+        // RFC-0032::REQ-0216: Bind the token to policy, canonicalizer, boundary, and
         // tick-based expiry so the worker can fail-closed on any drift.
-        // TCK-00567: Embed intent in the token binding for worker-side
+        // RFC-0032::REQ-0218: Embed intent in the token binding for worker-side
         // kind/intent authorization enforcement.
-        // TCK-00566: Include nonce for replay protection.
+        // RFC-0032::REQ-0217: Include nonce for replay protection.
         let token_binding = TokenBindingV1 {
             fac_policy_hash: policy_root_digest,
             canonicalizer_tuple_digest,
@@ -990,7 +990,7 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00568: Control-plane rate limits
+    // RFC-0032::REQ-0219: Control-plane rate limits
     // -----------------------------------------------------------------------
 
     /// Checks queue enqueue admission against the control-plane budget.
@@ -1195,7 +1195,7 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00566: Token replay protection
+    // RFC-0032::REQ-0217: Token replay protection
     // -----------------------------------------------------------------------
 
     /// Returns a reference to the token use ledger for observability.
@@ -1464,7 +1464,7 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
-    // Health monitoring (TCK-00585)
+    // Health monitoring (RFC-0032::REQ-0235)
     // -----------------------------------------------------------------------
 
     /// Performs a self-health check validating TP001/TP002/TP003 invariants
@@ -1557,7 +1557,7 @@ impl FacBroker {
     }
 
     // -----------------------------------------------------------------------
-    // Worker admission gate (TCK-00585)
+    // Worker admission gate (RFC-0032::REQ-0235)
     // -----------------------------------------------------------------------
 
     /// Evaluates the worker admission health gate against the broker's current
@@ -1813,7 +1813,7 @@ fn current_time_secs() -> u64 {
     // because `ChannelContextToken` encodes a Unix-epoch `issued_at`
     // timestamp that recipients compare against their own wall clock for
     // expiry checks. Adding an HTF dependency in broker-local issuance
-    // logic is out of scope (see TCK-00594 scope.out_of_scope).
+    // logic is out of scope (see RFC-0032::REQ-0243 scope.out_of_scope).
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1833,7 +1833,7 @@ fn compute_disclosure_policy_digest(policy_root_digest: &Hash) -> Hash {
 
 /// Computes a BLAKE3 digest of a `request_id` string for ledger keying.
 ///
-/// Used by the token-use ledger (TCK-00566) to store a fixed-size key
+/// Used by the token-use ledger (RFC-0032::REQ-0217) to store a fixed-size key
 /// derived from the variable-length `request_id`.
 fn compute_request_id_digest(request_id: &str) -> Hash {
     let mut hasher = blake3::Hasher::new();
@@ -3025,7 +3025,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00567: Intent taxonomy — broker-side policy enforcement
+    // RFC-0032::REQ-0218: Intent taxonomy — broker-side policy enforcement
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3163,7 +3163,7 @@ mod tests {
     #[test]
     fn tck_00567_broker_allows_none_intent_when_no_allowlist() {
         // No allowed_intents configured and no intent provided — accepted.
-        // Pre-TCK-00567 backward compatibility path.
+        // Pre-RFC-0032::REQ-0218 backward compatibility path.
         let mut broker = FacBroker::new();
         broker.set_admission_health_gate_for_test(true);
         let policy_digest = [0x42; 32];
@@ -3185,7 +3185,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00566: Token replay protection integration tests
+    // RFC-0032::REQ-0217: Token replay protection integration tests
     // -----------------------------------------------------------------------
 
     /// Helper: create a broker with health gate passed and a policy admitted,

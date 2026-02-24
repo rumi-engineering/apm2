@@ -1,4 +1,4 @@
-//! Integration tests for episode event persistence (TCK-00321).
+//! Integration tests for episode event persistence (RFC-0032::REQ-0115).
 //!
 //! Verifies that:
 //! - Episode events are streamed directly to ledger when emitter is configured
@@ -6,7 +6,7 @@
 //! - CAS-before-event ordering is maintained
 //! - Events survive daemon restart (ledger-backed durability)
 
-// TCK-00336: This test uses deprecated methods for backward compatibility
+// RFC-0032::REQ-0128: This test uses deprecated methods for backward compatibility
 #![allow(deprecated)]
 
 use std::sync::Arc;

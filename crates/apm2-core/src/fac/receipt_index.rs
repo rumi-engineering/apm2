@@ -32,7 +32,7 @@
 //! rebuild evicts oldest entries by timestamp. Overflow during incremental
 //! update returns an error.
 //!
-//! # Consumer Wiring (TCK-00560)
+//! # Consumer Wiring (RFC-0032::REQ-0213)
 //!
 //! The ticket requires: "Common operations do not require full receipt
 //! directory scans (job show, wait, metrics, list)." All production
@@ -716,7 +716,7 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> ListReceiptHeadersResult {
     }
 }
 
-/// Load a `FacJobReceiptV1` from the receipt store by content hash (TCK-00551).
+/// Load a `FacJobReceiptV1` from the receipt store by content hash (RFC-0032::REQ-0206).
 ///
 /// Reads the receipt file at `receipts_dir/{content_hash}.json` with bounded
 /// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
@@ -805,7 +805,7 @@ pub fn has_receipt_for_job(receipts_dir: &Path, job_id: &str) -> bool {
 /// [`has_receipt_for_job`], but returns the full receipt rather than just a
 /// boolean. This is used by reconciliation to recover torn states where a
 /// receipt was persisted but the job was not moved to its terminal directory
-/// (TCK-00564 BLOCKER-2).
+/// (RFC-0032::REQ-0215 BLOCKER-2).
 ///
 /// The receipt's `content_hash` is verified against the recomputed hash to
 /// prevent tampered receipts from driving recovery actions.
@@ -897,7 +897,7 @@ fn load_receipt_bounded(path: &Path) -> Option<FacJobReceiptV1> {
 /// from the filename, which is the content hash). Receipts that fail
 /// integrity verification are skipped — this prevents unverified data from
 /// driving terminal routing in worker duplicate handling and reconcile
-/// torn-state repair (MAJOR-1 fix, TCK-00564 round 8).
+/// torn-state repair (MAJOR-1 fix, RFC-0032::REQ-0215 round 8).
 fn scan_receipt_for_job(receipts_dir: &Path, job_id: &str) -> Option<FacJobReceiptV1> {
     let entries = std::fs::read_dir(receipts_dir).ok()?;
     let mut visited: usize = 0;
@@ -1809,7 +1809,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00564 MAJOR-1 regression: is_valid_digest must accept b3-256: prefix
+    // RFC-0032::REQ-0215 MAJOR-1 regression: is_valid_digest must accept b3-256: prefix
     // =========================================================================
 
     #[test]
@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_lookup_job_receipt_succeeds_with_b3_256_prefixed_content_hash() {
-        // Regression test for MAJOR-1 (TCK-00564): index lookup must succeed
+        // Regression test for MAJOR-1 (RFC-0032::REQ-0215): index lookup must succeed
         // when receipt content_hash uses the canonical b3-256: prefix format.
         use crate::fac::receipt::compute_job_receipt_content_hash;
 
@@ -1887,7 +1887,7 @@ mod tests {
 
     #[test]
     fn test_has_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
-        // Regression test for MAJOR-1 (TCK-00564): has_receipt_for_job must
+        // Regression test for MAJOR-1 (RFC-0032::REQ-0215): has_receipt_for_job must
         // succeed when receipt content_hash uses the canonical b3-256: prefix.
         use crate::fac::receipt::compute_job_receipt_content_hash;
 
@@ -1915,7 +1915,7 @@ mod tests {
 
     #[test]
     fn test_find_receipt_for_job_succeeds_with_b3_256_prefixed_content_hash() {
-        // Regression test for MAJOR-1 (TCK-00564): find_receipt_for_job must
+        // Regression test for MAJOR-1 (RFC-0032::REQ-0215): find_receipt_for_job must
         // succeed when receipt content_hash uses the canonical b3-256: prefix.
         use crate::fac::receipt::compute_job_receipt_content_hash;
 
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[test]
     fn test_fallback_scan_rejects_tampered_receipt() {
-        // Regression test for MAJOR-1 (TCK-00564 round 8): the fallback scan
+        // Regression test for MAJOR-1 (RFC-0032::REQ-0215 round 8): the fallback scan
         // path in find_receipt_for_job and has_receipt_for_job must verify
         // receipt integrity against the filename-derived digest. A tampered
         // receipt whose content does not match its filename hash must be
@@ -2206,7 +2206,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00551 round 9: Timestamp poisoning regression test
+    // RFC-0032::REQ-0206 round 9: Timestamp poisoning regression test
     //
     // Proves that a poisoned index header with a tampered timestamp_secs
     // does NOT affect the verified receipt's timestamp returned by

@@ -231,7 +231,7 @@ pub(super) fn check_process_identity(lease: &LaneLeaseV1) -> ProcessIdentity {
 
 /// Emit a structured reset recommendation for a corrupt lane to **stderr**.
 ///
-/// Channel contract (TCK-00570 scope):
+/// Channel contract (RFC-0032::REQ-0220 scope):
 /// - **stderr** carries machine-readable NDJSON recommendations (this fn) as
 ///   `apm2.fac.lane_reset_recommendation.v1` JSON lines.
 /// - All other diagnostics in `acquire_worker_lane` use `tracing::warn!` /
@@ -259,7 +259,7 @@ pub(super) fn emit_lane_reset_recommendation(lane_id: &str, reason: &str) {
     match serde_json::to_string(&rec) {
         Ok(json) => {
             // Write to stderr — the machine-readable NDJSON recommendation
-            // channel (TCK-00570 scope: "JSON to stderr").  All other
+            // channel (RFC-0032::REQ-0220 scope: "JSON to stderr").  All other
             // diagnostics in acquire_worker_lane use tracing::* macros,
             // keeping the only eprintln! output as this JSON line.
             eprintln!("{json}");
@@ -334,7 +334,7 @@ pub(super) fn acquire_worker_lane(
                     reason = marker.reason.as_str(),
                     "skipping corrupt lane"
                 );
-                // TCK-00570: Emit structured reset recommendation for corrupt lane.
+                // RFC-0032::REQ-0220: Emit structured reset recommendation for corrupt lane.
                 emit_lane_reset_recommendation(lane_id, &marker.reason);
             },
             Ok(None) => {
@@ -347,7 +347,7 @@ pub(super) fn acquire_worker_lane(
                                 state = %lease.state,
                                 "skipping corrupt lease lane"
                             );
-                            // TCK-00570: Emit structured reset recommendation for
+                            // RFC-0032::REQ-0220: Emit structured reset recommendation for
                             // corrupt lease state.
                             emit_lane_reset_recommendation(
                                 lane_id,
@@ -427,7 +427,7 @@ pub(super) fn acquire_worker_lane(
                                             "failed to persist corrupt marker for lane"
                                         );
                                     }
-                                    // TCK-00570: Emit structured reset recommendation
+                                    // RFC-0032::REQ-0220: Emit structured reset recommendation
                                     // after marking lane corrupt.
                                     emit_lane_reset_recommendation(lane_id, &reason);
                                 },
@@ -474,7 +474,7 @@ pub(super) fn acquire_worker_lane(
     None
 }
 
-/// Build a `LogRetentionConfig` from `FacPolicyV1` fields (TCK-00571).
+/// Build a `LogRetentionConfig` from `FacPolicyV1` fields (RFC-0032::REQ-0221).
 ///
 /// This is the single conversion point ensuring post-job cleanup and GC
 /// derive their retention config from the same policy fields.
@@ -489,7 +489,7 @@ pub(super) fn log_retention_from_policy(policy: &FacPolicyV1) -> LogRetentionCon
 /// Run lane cleanup and emit cleanup receipts.
 /// On failure, mark the lane as corrupt.
 ///
-/// TCK-00571 (CQ-BLOCKER-1 fix): Accepts a `LogRetentionConfig` to ensure
+/// RFC-0032::REQ-0221 (CQ-BLOCKER-1 fix): Accepts a `LogRetentionConfig` to ensure
 /// post-job cleanup enforces the same retention policy as GC. The config
 /// is derived from `FacPolicyV1` fields (`per_lane_log_max_bytes`,
 /// `per_job_log_ttl_days`, `keep_last_n_jobs_per_lane`).

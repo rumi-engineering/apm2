@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! VDF delay profile for adversarial federation links (TCK-00366, RFC-0020
+//! VDF delay profile for adversarial federation links (RFC-0020::REQ-0020, RFC-0020
 //! §1.9).
 //!
 //! This module provides a bounded, fail-closed VDF profile contract used by

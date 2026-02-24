@@ -1,7 +1,7 @@
 //! Work management CLI commands.
 //!
 //! This module implements `apm2 work` subcommands for work queue operations
-//! using the protocol-based operator socket (TCK-00288).
+//! using the protocol-based operator socket (RFC-0032::REQ-0090).
 //!
 //! # Commands
 //!
@@ -58,13 +58,13 @@ pub enum WorkSubcommand {
     /// The daemon validates the credential signature and returns work details.
     Claim(ClaimArgs),
 
-    /// Query work status (TCK-00288).
+    /// Query work status (RFC-0032::REQ-0090).
     ///
     /// Returns the current status of a work item including assigned
     /// actor, role, and associated session information.
     Status(StatusArgs),
 
-    /// Open a new work item from a ticket document file (TCK-00635).
+    /// Open a new work item from a ticket document file (RFC-0032::REQ-0263).
     ///
     /// Imports a ticket document, converts it to a `WorkSpec`, canonicalizes
     /// the JSON, and sends to the daemon via the `OpenWork` RPC.
@@ -137,7 +137,7 @@ pub struct StatusArgs {
     pub work_id: String,
 }
 
-/// Arguments for `apm2 work open` (TCK-00635).
+/// Arguments for `apm2 work open` (RFC-0032::REQ-0263).
 #[derive(Debug, Args)]
 pub struct OpenArgs {
     /// Path to the ticket document file to import as a `WorkSpec`.
@@ -190,7 +190,7 @@ pub struct StatusResponse {
     pub lease_id: Option<String>,
 }
 
-/// Response for work open command (TCK-00635).
+/// Response for work open command (RFC-0032::REQ-0263).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenResponse {
@@ -335,7 +335,7 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
     }
 }
 
-/// Execute the status command (TCK-00344).
+/// Execute the status command (RFC-0032::REQ-0134).
 ///
 /// Queries the daemon for work status via the operator socket.
 fn run_status(args: &StatusArgs, socket_path: &Path, json_output: bool) -> u8 {
@@ -417,7 +417,7 @@ fn run_status(args: &StatusArgs, socket_path: &Path, json_output: bool) -> u8 {
     }
 }
 
-/// Execute the open command (TCK-00635).
+/// Execute the open command (RFC-0032::REQ-0263).
 ///
 /// Reads a ticket document file, converts it to a `WorkSpec` JSON,
 /// canonicalizes it, and sends to the daemon via the `OpenWork` RPC.
@@ -854,7 +854,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Work Status Command Tests (TCK-00344)
+    // Work Status Command Tests (RFC-0032::REQ-0134)
     // =========================================================================
 
     /// Tests that work status validates empty work ID.
@@ -911,7 +911,7 @@ mod tests {
     }
 
     // =========================================================================
-    // OpenWork Command Tests (TCK-00635)
+    // OpenWork Command Tests (RFC-0032::REQ-0263)
     // =========================================================================
 
     /// Tests `OpenResponse` serialization roundtrip.

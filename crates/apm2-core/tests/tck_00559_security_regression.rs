@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00559)
+// AGENT-AUTHORED (RFC-0032::REQ-0212)
 //! Security regression tests: fuzz job spec parsing + adversarial queue file
 //! tests + `safe_rmtree` property tests.
 //!

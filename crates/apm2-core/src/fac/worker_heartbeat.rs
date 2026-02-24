@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00600)
+// AGENT-AUTHORED (RFC-0032::REQ-0248)
 //! Worker heartbeat file for liveness monitoring.
 //!
 //! The FAC worker writes a small JSON heartbeat file after each poll cycle.

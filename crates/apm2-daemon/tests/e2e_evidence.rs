@@ -1,4 +1,4 @@
-//! E2E evidence integrity tests for TCK-00177.
+//! E2E evidence integrity tests for RFC-0033::REQ-0043.
 //!
 //! This module tests the full evidence integrity verification flow including:
 //! - Content hash matches stored content
@@ -15,7 +15,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00177: E2E evidence and receipt verification tests
+//! - RFC-0033::REQ-0043: E2E evidence and receipt verification tests
 //! - REQ-EVID-001: Evidence integrity requirements
 //! - AD-EVID-002: Evidence retention and TTL
 //!

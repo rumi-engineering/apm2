@@ -1,4 +1,4 @@
-//! TCK-00416: Lifecycle authority bindings integration tests.
+//! RFC-0032::REQ-0160: Lifecycle authority bindings integration tests.
 //!
 //! Validates that authoritative lifecycle transitions carry explicit
 //! delegated authority and boundary bindings per `REQ-HEF-0013`.
@@ -1167,7 +1167,7 @@ fn test_emit_work_claimed_includes_authority_fields() {
         assert!(
             payload_json.get(field).is_some(),
             "signed event payload must contain authority field '{field}' \
-             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+             (RFC-0032::REQ-0160 BLOCKER 3). Payload: {payload_str}"
         );
     }
 }
@@ -1220,7 +1220,7 @@ fn test_emit_review_receipt_includes_outcome_fields() {
         assert!(
             payload_json.get(field).is_some(),
             "signed review receipt payload must contain outcome field '{field}' \
-             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+             (RFC-0032::REQ-0160 BLOCKER 3). Payload: {payload_str}"
         );
     }
 
@@ -1287,7 +1287,7 @@ fn test_emit_review_blocked_receipt_includes_outcome_fields() {
         assert!(
             payload_json.get(field).is_some(),
             "signed blocked receipt payload must contain outcome field '{field}' \
-             (TCK-00416 BLOCKER 3). Payload: {payload_str}"
+             (RFC-0032::REQ-0160 BLOCKER 3). Payload: {payload_str}"
         );
     }
 }

@@ -1532,7 +1532,7 @@ mod tests {
             head_sha,
             &MergeProjectionPendingSaveRequest {
                 merge_sha: head_sha,
-                source_branch: "ticket/RFC-0019/TCK-00617",
+                source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251",
                 merge_receipt_hash: &format!("b3-256:{}", "cc".repeat(32)),
                 merged_at_iso: "2026-02-17T00:00:00Z",
                 gate_job_id: "job-123",
@@ -1577,7 +1577,7 @@ mod tests {
             first_sha,
             &MergeProjectionPendingSaveRequest {
                 merge_sha: first_sha,
-                source_branch: "ticket/RFC-0019/TCK-00617-a",
+                source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251-a",
                 merge_receipt_hash: &format!("b3-256:{}", "33".repeat(32)),
                 merged_at_iso: "2026-02-17T00:00:00Z",
                 gate_job_id: "job-a",
@@ -1597,7 +1597,7 @@ mod tests {
             second_sha,
             &MergeProjectionPendingSaveRequest {
                 merge_sha: second_sha,
-                source_branch: "ticket/RFC-0019/TCK-00617-b",
+                source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251-b",
                 merge_receipt_hash: &format!("b3-256:{}", "55".repeat(32)),
                 merged_at_iso: "2026-02-17T00:01:00Z",
                 gate_job_id: "job-b",
@@ -1633,7 +1633,7 @@ mod tests {
             head_sha,
             &MergeProjectionPendingSaveRequest {
                 merge_sha: head_sha,
-                source_branch: "ticket/RFC-0019/TCK-00617-c",
+                source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251-c",
                 merge_receipt_hash: &format!("b3-256:{}", "33".repeat(32)),
                 merged_at_iso: "2026-02-17T00:02:00Z",
                 gate_job_id: "job-c",
@@ -1712,7 +1712,7 @@ mod tests {
             &owner_repo,
             640,
             head_sha,
-            Some("ticket/TCK-00640"),
+            Some("ticket/RFC-0032::REQ-0268"),
             None,
             "test",
         )
@@ -1733,7 +1733,7 @@ mod tests {
             &owner_repo,
             640,
             head_sha,
-            Some("ticket/TCK-00640-a"),
+            Some("ticket/RFC-0032::REQ-0268-a"),
             None,
             "test",
         )
@@ -1742,7 +1742,7 @@ mod tests {
             &owner_repo,
             641,
             head_sha,
-            Some("ticket/TCK-00640-b"),
+            Some("ticket/RFC-0032::REQ-0268-b"),
             None,
             "test",
         )

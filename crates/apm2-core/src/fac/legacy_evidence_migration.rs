@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00589)
+// AGENT-AUTHORED (RFC-0032::REQ-0239)
 //! Legacy evidence log deprecation: one-time migration helper.
 //!
 //! Moves files from the deprecated `private/fac/evidence/` directory into

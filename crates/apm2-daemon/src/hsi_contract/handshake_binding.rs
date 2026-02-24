@@ -1,4 +1,4 @@
-//! Handshake contract-hash binding and tiered mismatch gates (TCK-00348).
+//! Handshake contract-hash binding and tiered mismatch gates (RFC-0020::REQ-0002).
 //!
 //! This module implements the RFC-0020 section 3.1.2 and 3.1.3 requirements:
 //!
@@ -285,7 +285,7 @@ pub fn evaluate_mismatch_policy(
 ) -> MismatchOutcome {
     let mut mismatches = Vec::new();
 
-    // TCK-00348 BLOCKER 2: If the server hash is empty/unavailable at Tier2+,
+    // RFC-0020::REQ-0002 BLOCKER 2: If the server hash is empty/unavailable at Tier2+,
     // treat it as a hard gate failure (fail-closed). The daemon cannot verify
     // contract compatibility without a valid manifest.
     if server_hash.is_empty() && risk_tier.requires_deny_on_mismatch() {
@@ -312,7 +312,7 @@ pub fn evaluate_mismatch_policy(
         }
     }
 
-    // TCK-00348 BLOCKER-5: For Tier2+, empty/missing client canonicalizers
+    // RFC-0020::REQ-0002 BLOCKER-5: For Tier2+, empty/missing client canonicalizers
     // are treated as a mismatch (fail-closed). A client that omits
     // canonicalizer metadata cannot prove encoding compatibility.
     if client_canonicalizers.is_empty()
@@ -722,7 +722,7 @@ mod tests {
         assert!(outcome.is_match());
     }
 
-    /// TCK-00348 BLOCKER-5: Missing client canonicalizers at Tier2+ must be
+    /// RFC-0020::REQ-0002 BLOCKER-5: Missing client canonicalizers at Tier2+ must be
     /// treated as mismatch (fail-closed). A client that omits canonicalizer
     /// metadata cannot prove encoding compatibility.
     #[test]
@@ -749,7 +749,7 @@ mod tests {
         }
     }
 
-    /// TCK-00348 BLOCKER-5: Missing client canonicalizers at Tier0 should
+    /// RFC-0020::REQ-0002 BLOCKER-5: Missing client canonicalizers at Tier0 should
     /// be allowed (backward compat, not treated as a mismatch at Tier0).
     #[test]
     fn missing_client_canonicalizers_tier0_allowed() {
@@ -770,7 +770,7 @@ mod tests {
         );
     }
 
-    /// TCK-00348 BLOCKER 2: Empty server hash at Tier2+ is denied
+    /// RFC-0020::REQ-0002 BLOCKER 2: Empty server hash at Tier2+ is denied
     /// (fail-closed). If the daemon cannot build its manifest, it MUST NOT
     /// admit Tier2+ sessions.
     #[test]
@@ -788,7 +788,7 @@ mod tests {
         }
     }
 
-    /// TCK-00348 BLOCKER 2: Empty server hash at Tier0 is allowed (degraded
+    /// RFC-0020::REQ-0002 BLOCKER 2: Empty server hash at Tier0 is allowed (degraded
     /// mode). Tier0/Tier1 sessions can still proceed when the manifest is
     /// unavailable.
     #[test]
@@ -800,7 +800,7 @@ mod tests {
         );
     }
 
-    /// TCK-00348 BLOCKER 2: Both hashes empty at Tier2+ is denied
+    /// RFC-0020::REQ-0002 BLOCKER 2: Both hashes empty at Tier2+ is denied
     /// (fail-closed). Even if both sides have empty hashes, the server
     /// cannot verify contract compatibility.
     #[test]
@@ -812,7 +812,7 @@ mod tests {
         );
     }
 
-    /// TCK-00348 BLOCKER 2: Both hashes empty at Tier0 is allowed
+    /// RFC-0020::REQ-0002 BLOCKER 2: Both hashes empty at Tier0 is allowed
     /// (backward compat, degraded mode).
     #[test]
     fn both_hashes_empty_tier0_allowed() {

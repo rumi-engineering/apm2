@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00590)
+// AGENT-AUTHORED (RFC-0032::REQ-0240)
 //! CLI command for FAC configuration introspection: `apm2 fac config show`.
 //!
 //! Aggregates resolved policy, boundary identity, execution backend, lane
@@ -100,7 +100,7 @@ struct ConfigShowResponse {
     /// Queue bounds from broker rate-limit constants.
     pub queue_bounds: QueueBoundsInfo,
 
-    /// Pending queue bounds (TCK-00578): instantaneous job/byte caps.
+    /// Pending queue bounds (RFC-0032::REQ-0228): instantaneous job/byte caps.
     pub pending_queue_bounds: PendingQueueBoundsInfo,
 
     /// Errors encountered during introspection (non-fatal; included for
@@ -131,7 +131,7 @@ struct QueueBoundsInfo {
     pub queue_bytes_limit: u64,
 }
 
-/// Pending queue bounds from queue bounds policy (TCK-00578).
+/// Pending queue bounds from queue bounds policy (RFC-0032::REQ-0228).
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingQueueBoundsInfo {
@@ -282,7 +282,7 @@ fn build_config_show_response() -> ConfigShowResponse {
         queue_bytes_limit: MAX_QUEUE_BYTES_LIMIT,
     };
 
-    // -- Pending queue bounds (instantaneous caps, TCK-00578) --
+    // -- Pending queue bounds (instantaneous caps, RFC-0032::REQ-0228) --
     // Load from persisted FAC policy when available; fall back to defaults.
     let qb_policy = fac_root
         .as_ref()
@@ -411,7 +411,7 @@ fn print_human_readable(response: &ConfigShowResponse) {
         response.queue_bounds.queue_bytes_limit as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    // Pending queue bounds (TCK-00578)
+    // Pending queue bounds (RFC-0032::REQ-0228)
     println!();
     println!("  Pending Queue Bounds:");
     println!(
@@ -621,7 +621,7 @@ mod tests {
     /// Regression: `read_boundary_id` (used by config show) must NOT create
     /// the `boundary_id` file or its parent directories when run against an
     /// empty APM2 home directory. This proves the read-only introspection
-    /// invariant required by TCK-00590 (`out_of_scope: "Editing config"`).
+    /// invariant required by RFC-0032::REQ-0240 (`out_of_scope: "Editing config"`).
     #[test]
     fn config_show_boundary_id_does_not_create_files_or_directories() {
         let home = tempfile::tempdir().expect("tempdir");

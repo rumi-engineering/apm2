@@ -93,7 +93,7 @@ pub use projection_continuity::{
     SinkIdentityEntry, evaluate_projection_continuity, validate_deferred_replay_boundedness,
     validate_projection_continuity_tp005,
 };
-// NoOpVerifier is only available in test or with feature = "unsafe_no_verify" (TCK-00550).
+// NoOpVerifier is only available in test or with feature = "unsafe_no_verify" (RFC-0032::REQ-0205).
 #[cfg(any(test, feature = "unsafe_no_verify"))]
 pub use queue_admission::NoOpVerifier;
 pub use queue_admission::{

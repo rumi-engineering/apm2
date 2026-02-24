@@ -212,7 +212,7 @@ pub struct WorkSpecV1 {
     /// Canonical work identifier (e.g., `W-<uuid>`).
     pub work_id: String,
 
-    /// Optional ticket alias (e.g., `TCK-00606`). Not the canonical ID.
+    /// Optional ticket alias (e.g., `RFC-0032::REQ-0250`). Not the canonical ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_alias: Option<String>,
 
@@ -914,7 +914,7 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({
             "schema": WORK_SPEC_V1_SCHEMA,
             "work_id": "W-550e8400-e29b-41d4-a716-446655440000",
-            "ticket_alias": "TCK-00633",
+            "ticket_alias": "RFC-0032::REQ-0262",
             "title": "RFC-0032 Phase 1: CAS schemas",
             "summary": "Add WorkSpec, ContextEntry, LoopProfile, AuthorityBindings schemas.",
             "work_type": "TICKET",
@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(spec.work_id, "W-550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(spec.title, "RFC-0032 Phase 1: CAS schemas");
         assert_eq!(spec.work_type, WorkSpecType::Ticket);
-        assert_eq!(spec.ticket_alias.as_deref(), Some("TCK-00633"));
+        assert_eq!(spec.ticket_alias.as_deref(), Some("RFC-0032::REQ-0262"));
         assert_eq!(spec.labels.len(), 2);
     }
 

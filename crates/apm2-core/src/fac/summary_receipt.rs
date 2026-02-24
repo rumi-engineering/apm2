@@ -1,7 +1,7 @@
 // AGENT-AUTHORED
 //! Summary receipt types for lossy-but-verifiable review outcomes.
 //!
-//! This module implements [`SummaryReceipt`] per TCK-00327 and RFC-0019.
+//! This module implements [`SummaryReceipt`] per RFC-0032::REQ-0120 and RFC-0019.
 //! The summary receipt provides a "front page" for review outcomes with
 //! loss profile and selectors enabling efficient queries without full
 //! artifact retrieval.

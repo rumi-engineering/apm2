@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! `FactRootV1` composition with RFC-0014 quorum checkpoints (TCK-00370).
+//! `FactRootV1` composition with RFC-0014 quorum checkpoints (RFC-0020::REQ-0024).
 //!
 //! This module provides:
 //! - [`FactRootV1`]: binds batch Merkle roots into QC-certified checkpoints so
@@ -25,7 +25,7 @@
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
 //! - RFC-0020 §9.5.5: Compact multiproof wire shape
-//! - TCK-00363: `ReceiptPointerV1` and `ReceiptMultiProofV1` (deferred compact
+//! - RFC-0020::REQ-0017: `ReceiptPointerV1` and `ReceiptMultiProofV1` (deferred compact
 //!   multiproof to this ticket)
 //! - REQ-0024: `FactRoot` composition requirement
 

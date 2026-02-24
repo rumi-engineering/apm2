@@ -1,4 +1,4 @@
-//! Protocol-based daemon clients for dual-socket IPC (TCK-00288).
+//! Protocol-based daemon clients for dual-socket IPC (RFC-0032::REQ-0090).
 //!
 //! This module implements protocol clients for the operator and session sockets
 //! using tag-based protobuf frames per DD-009 and RFC-0017.
@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use apm2_daemon::protocol::{
-    // Credential management types (CTR-PROTO-011, TCK-00343)
+    // Credential management types (CTR-PROTO-011, RFC-0032::REQ-0133)
     AddCredentialRequest,
     AddCredentialResponse,
     // Message decoding
@@ -48,7 +48,7 @@ use apm2_daemon::protocol::{
     ClaimWorkV2Response,
     // Handshake
     ClientHandshake,
-    // TCK-00345: Consensus query messages
+    // RFC-0032::REQ-0135: Consensus query messages
     ConsensusByzantineEvidenceRequest,
     ConsensusByzantineEvidenceResponse,
     ConsensusError,
@@ -65,19 +65,19 @@ use apm2_daemon::protocol::{
     // Framing
     FrameCodec,
     HandshakeMessage,
-    // TCK-00389: Review receipt ingestion
+    // RFC-0032::REQ-0143: Review receipt ingestion
     IngestReviewReceiptRequest,
     IngestReviewReceiptResponse,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
     ListCredentialsRequest,
     ListCredentialsResponse,
-    // TCK-00342: Process management types
+    // RFC-0032::REQ-0132: Process management types
     ListProcessesRequest,
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
-    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
     OpenWorkRequest,
     OpenWorkResponse,
     PrivilegedError,
@@ -87,7 +87,7 @@ use apm2_daemon::protocol::{
     ProcessStatusResponse,
     // Error types
     ProtocolError,
-    // TCK-00394: ChangeSet publishing
+    // RFC-0032::REQ-0148: ChangeSet publishing
     PublishChangeSetRequest,
     PublishChangeSetResponse,
     // Evidence publishing
@@ -107,7 +107,7 @@ use apm2_daemon::protocol::{
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
-    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: Ticket alias resolution (RFC-0032 Phase 1)
     ResolveTicketAliasRequest,
     ResolveTicketAliasResponse,
     RestartProcessRequest,
@@ -115,7 +115,7 @@ use apm2_daemon::protocol::{
     SessionError,
     SessionErrorCode,
     SessionMessageType,
-    // TCK-00344: Status query messages
+    // RFC-0032::REQ-0134: Status query messages
     SessionStatusRequest,
     SessionStatusResponse,
     ShutdownRequest,
@@ -126,7 +126,7 @@ use apm2_daemon::protocol::{
     StartProcessResponse,
     StopProcessRequest,
     StopProcessResponse,
-    // TCK-00342: Log streaming types
+    // RFC-0032::REQ-0132: Log streaming types
     StreamLogsRequest,
     StreamLogsResponse,
     SubscribePulseRequest,
@@ -139,27 +139,27 @@ use apm2_daemon::protocol::{
     WorkListResponse,
     // Work types
     WorkRole,
-    // TCK-00344: Work status messages
+    // RFC-0032::REQ-0134: Work status messages
     WorkStatusRequest,
     WorkStatusResponse,
     // Encoding helpers
     encode_add_credential_request,
     encode_claim_work_request,
     encode_claim_work_v2_request,
-    // TCK-00345: Consensus query encoding
+    // RFC-0032::REQ-0135: Consensus query encoding
     encode_consensus_byzantine_evidence_request,
     encode_consensus_metrics_request,
     encode_consensus_status_request,
     encode_consensus_validators_request,
     encode_emit_event_request,
-    // TCK-00389: Review receipt ingestion encoding
+    // RFC-0032::REQ-0143: Review receipt ingestion encoding
     encode_ingest_review_receipt_request,
     encode_issue_capability_request,
     encode_list_credentials_request,
-    // TCK-00342: Process management encoding
+    // RFC-0032::REQ-0132: Process management encoding
     encode_list_processes_request,
     encode_login_credential_request,
-    // TCK-00635: OpenWork encoding
+    // RFC-0032::REQ-0263: OpenWork encoding
     encode_open_work_request,
     encode_process_status_request,
     encode_publish_changeset_request,
@@ -172,13 +172,13 @@ use apm2_daemon::protocol::{
     encode_request_tool_request,
     encode_resolve_ticket_alias_request,
     encode_restart_process_request,
-    // TCK-00344: Status query encoding
+    // RFC-0032::REQ-0134: Status query encoding
     encode_session_status_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
     encode_start_process_request,
     encode_stop_process_request,
-    // TCK-00342: Log streaming encoding
+    // RFC-0032::REQ-0132: Log streaming encoding
     encode_stream_logs_request,
     encode_switch_credential_request,
     encode_work_list_request,
@@ -389,7 +389,7 @@ impl OperatorClient {
         })
     }
 
-    /// Computes the client's HSI contract manifest hash (TCK-00348).
+    /// Computes the client's HSI contract manifest hash (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.2, the client MUST include its contract hash
     /// in the Hello message. This is derived from the same dispatch registry
@@ -412,7 +412,7 @@ impl OperatorClient {
     ) -> Result<HandshakeInfo, ProtocolClientError> {
         let mut client_handshake = ClientHandshake::new(CLIENT_INFO);
 
-        // TCK-00348 BLOCKER-3: Populate Hello with client contract hash
+        // RFC-0020::REQ-0002 BLOCKER-3: Populate Hello with client contract hash
         // and canonicalizer metadata per RFC-0020 section 3.1.2.
         let hello = client_handshake
             .create_hello()
@@ -568,7 +568,7 @@ impl OperatorClient {
     /// * `lease_id` - Required for `GATE_EXECUTOR` role; must reference valid
     ///   `GateLeaseIssued`
     /// * `workspace_root` - Workspace root directory for this episode. All file
-    ///   operations will be confined to this directory (TCK-00319).
+    ///   operations will be confined to this directory (RFC-0032::REQ-0113).
     /// * `adapter_profile_hash` - Optional adapter profile CAS hash (32 bytes)
     pub async fn spawn_episode(
         &mut self,
@@ -755,7 +755,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00345: Consensus Query Methods (RFC-0014)
+    // RFC-0032::REQ-0135: Consensus Query Methods (RFC-0014)
     // =========================================================================
 
     /// Queries consensus status from the daemon.
@@ -947,7 +947,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00342: Process Management Operations
+    // RFC-0032::REQ-0132: Process Management Operations
     // =========================================================================
 
     /// Lists all managed processes.
@@ -1163,7 +1163,7 @@ impl OperatorClient {
         Self::decode_reload_process_response(&response_frame)
     }
 
-    /// Queries the status of a work item (TCK-00344).
+    /// Queries the status of a work item (RFC-0032::REQ-0134).
     ///
     /// # Arguments
     ///
@@ -1200,7 +1200,7 @@ impl OperatorClient {
         Self::decode_work_status_response(&response_frame)
     }
 
-    /// Lists projection-known work items (TCK-00415).
+    /// Lists projection-known work items (RFC-0032::REQ-0159).
     ///
     /// # Arguments
     ///
@@ -1240,15 +1240,15 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
     // =========================================================================
 
     /// Resolves a ticket alias to a canonical `work_id` via daemon projection
-    /// state (TCK-00636).
+    /// state (RFC-0032::REQ-0264).
     ///
     /// # Arguments
     ///
-    /// * `ticket_alias` - Ticket alias to resolve (e.g. "TCK-00636")
+    /// * `ticket_alias` - Ticket alias to resolve (e.g. "RFC-0032::REQ-0264")
     ///
     /// # Returns
     ///
@@ -1284,11 +1284,11 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
     // =========================================================================
 
     /// Opens a new work item by sending a validated `WorkSpec` to the daemon
-    /// (TCK-00635).
+    /// (RFC-0032::REQ-0263).
     ///
     /// The daemon validates the `WorkSpec`, canonicalizes it, stores to CAS,
     /// and emits a `work.opened` event. Idempotent: same `work_id` + same
@@ -1331,7 +1331,7 @@ impl OperatorClient {
         Self::decode_open_work_response(&response_frame)
     }
 
-    /// Claims an existing work item via RFC-0032 `ClaimWorkV2` (TCK-00637).
+    /// Claims an existing work item via RFC-0032 `ClaimWorkV2` (RFC-0032::REQ-0265).
     ///
     /// `ClaimWorkV2` claims an already opened work item and returns a
     /// role-scoped issued claim lease.
@@ -1365,7 +1365,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00654: HEF Pulse Wait Integration (RFC-0032 section 12.5)
+    // RFC-0032::REQ-0273: HEF Pulse Wait Integration (RFC-0032 section 12.5)
     // =========================================================================
 
     fn enqueue_pending_pulse(pending_pulses: &mut VecDeque<PulseEvent>, event: PulseEvent) {
@@ -1561,7 +1561,7 @@ impl OperatorClient {
         )))
     }
 
-    /// Decodes an `OpenWork` response (TCK-00635).
+    /// Decodes an `OpenWork` response (RFC-0032::REQ-0263).
     fn decode_open_work_response(frame: &Bytes) -> Result<OpenWorkResponse, ProtocolClientError> {
         if frame.is_empty() {
             return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
@@ -1593,7 +1593,7 @@ impl OperatorClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
-    /// Decodes a `ClaimWorkV2` response (TCK-00637).
+    /// Decodes a `ClaimWorkV2` response (RFC-0032::REQ-0265).
     fn decode_claim_work_v2_response(
         frame: &Bytes,
     ) -> Result<ClaimWorkV2Response, ProtocolClientError> {
@@ -1627,10 +1627,10 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00389: IngestReviewReceipt
+    // RFC-0032::REQ-0143: IngestReviewReceipt
     // =========================================================================
 
-    /// Ingests a review receipt from an external reviewer (TCK-00389).
+    /// Ingests a review receipt from an external reviewer (RFC-0032::REQ-0143).
     ///
     /// Sends the review receipt to the daemon for ledger ingestion. The daemon
     /// validates the reviewer identity against the gate lease and emits either
@@ -1653,7 +1653,7 @@ impl OperatorClient {
     /// - Reviewer identity validation fails
     /// - Lease is not found
     /// - Event emission fails
-    #[allow(dead_code)] // Scaffolding for TCK-00389 review receipt ingestion
+    #[allow(dead_code)] // Scaffolding for RFC-0032::REQ-0143 review receipt ingestion
     pub async fn ingest_review_receipt(
         &mut self,
         request: &IngestReviewReceiptRequest,
@@ -1680,7 +1680,7 @@ impl OperatorClient {
     }
 
     /// Decodes an `IngestReviewReceipt` response.
-    #[allow(dead_code)] // Scaffolding for TCK-00389 review receipt ingestion
+    #[allow(dead_code)] // Scaffolding for RFC-0032::REQ-0143 review receipt ingestion
     fn decode_ingest_review_receipt_response(
         frame: &Bytes,
     ) -> Result<IngestReviewReceiptResponse, ProtocolClientError> {
@@ -1715,7 +1715,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00342: Process Management Response Decoders
+    // RFC-0032::REQ-0132: Process Management Response Decoders
     // =========================================================================
 
     /// Decodes a `ListProcesses` response.
@@ -1918,7 +1918,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00345: Consensus Response Decoders
+    // RFC-0032::REQ-0135: Consensus Response Decoders
     // =========================================================================
 
     /// Decodes a `ConsensusStatus` response.
@@ -2093,7 +2093,7 @@ impl OperatorClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
-    /// Decodes a `WorkStatus` response (TCK-00344).
+    /// Decodes a `WorkStatus` response (RFC-0032::REQ-0134).
     fn decode_work_status_response(
         frame: &Bytes,
     ) -> Result<WorkStatusResponse, ProtocolClientError> {
@@ -2126,7 +2126,7 @@ impl OperatorClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
-    /// Decodes a `WorkList` response (TCK-00415).
+    /// Decodes a `WorkList` response (RFC-0032::REQ-0159).
     fn decode_work_list_response(frame: &Bytes) -> Result<WorkListResponse, ProtocolClientError> {
         if frame.is_empty() {
             return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
@@ -2157,7 +2157,7 @@ impl OperatorClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
-    /// Decodes a `ResolveTicketAlias` response (TCK-00636).
+    /// Decodes a `ResolveTicketAlias` response (RFC-0032::REQ-0264).
     fn decode_resolve_ticket_alias_response(
         frame: &Bytes,
     ) -> Result<ResolveTicketAliasResponse, ProtocolClientError> {
@@ -2191,7 +2191,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // TCK-00394: ChangeSet Publishing
+    // RFC-0032::REQ-0148: ChangeSet Publishing
     // =========================================================================
 
     /// Publishes a `ChangeSetBundleV1` to the daemon.
@@ -2414,7 +2414,7 @@ impl OperatorClient {
     }
 
     // =========================================================================
-    // Credential Management Methods (CTR-PROTO-012, TCK-00343)
+    // Credential Management Methods (CTR-PROTO-012, RFC-0032::REQ-0133)
     // =========================================================================
 
     /// Lists all credential profiles.
@@ -3110,7 +3110,7 @@ impl SessionClient {
     }
 
     // =========================================================================
-    // TCK-00342: Process Log Streaming
+    // RFC-0032::REQ-0132: Process Log Streaming
     // =========================================================================
 
     /// Streams process logs from a managed process.
@@ -3160,7 +3160,7 @@ impl SessionClient {
         Self::decode_stream_logs_response(&response_frame)
     }
 
-    /// Queries the status of a session (TCK-00344).
+    /// Queries the status of a session (RFC-0032::REQ-0134).
     ///
     /// # Arguments
     ///
@@ -3197,7 +3197,7 @@ impl SessionClient {
         Self::decode_session_status_response(&response_frame)
     }
 
-    /// Queries the status of a session with termination details (TCK-00385).
+    /// Queries the status of a session with termination details (RFC-0032::REQ-0139).
     ///
     /// This is equivalent to [`session_status`](Self::session_status) but
     /// clarifies that the response may include termination information when
@@ -3261,7 +3261,7 @@ impl SessionClient {
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 
-    /// Decodes a `SessionStatus` response (TCK-00344).
+    /// Decodes a `SessionStatus` response (RFC-0032::REQ-0134).
     fn decode_session_status_response(
         frame: &Bytes,
     ) -> Result<SessionStatusResponse, ProtocolClientError> {
@@ -3410,7 +3410,7 @@ mod tests {
     #[test]
     fn test_operator_claim_work_v2_routing() {
         let request = ClaimWorkV2Request {
-            work_id: "W-TCK-00640".to_string(),
+            work_id: "W-RFC-0032::REQ-0268".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: "L-governing-001".to_string(),
         };
@@ -3428,7 +3428,7 @@ mod tests {
     #[test]
     fn test_decode_claim_work_v2_response_success() {
         let response = ClaimWorkV2Response {
-            work_id: "W-TCK-00640".to_string(),
+            work_id: "W-RFC-0032::REQ-0268".to_string(),
             issued_lease_id: "L-issued-001".to_string(),
             authority_bindings_hash: "b3-256:abcd".to_string(),
             evidence_id: "WAB-001".to_string(),
@@ -3440,14 +3440,14 @@ mod tests {
             .expect("encode ClaimWorkV2Response");
         let decoded = OperatorClient::decode_claim_work_v2_response(&Bytes::from(frame))
             .expect("decode ClaimWorkV2 response");
-        assert_eq!(decoded.work_id, "W-TCK-00640");
+        assert_eq!(decoded.work_id, "W-RFC-0032::REQ-0268");
         assert_eq!(decoded.issued_lease_id, "L-issued-001");
     }
 
     #[test]
     fn test_decode_claim_work_v2_response_wrong_tag() {
         let response = ClaimWorkV2Response {
-            work_id: "W-TCK-00640".to_string(),
+            work_id: "W-RFC-0032::REQ-0268".to_string(),
             issued_lease_id: "L-issued-001".to_string(),
             authority_bindings_hash: "b3-256:abcd".to_string(),
             evidence_id: "WAB-001".to_string(),

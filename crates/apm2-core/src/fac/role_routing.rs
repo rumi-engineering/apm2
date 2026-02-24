@@ -1,7 +1,7 @@
 //! Role routing and classification logic for FAC.
 //!
 //! This module implements the heuristics for routing work to specialist roles
-//! based on diff analysis and issue labels, per TCK-00334.
+//! based on diff analysis and issue labels, per RFC-0032::REQ-0126.
 //!
 //! # Integration Point
 //!

@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00496)
+// AGENT-AUTHORED (RFC-0020::REQ-0057)
 //! Core quarantine store with priority-aware eviction, per-session quota,
 //! saturation-safe insertion, and `SQLite` persistence.
 

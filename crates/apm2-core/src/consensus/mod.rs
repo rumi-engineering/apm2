@@ -89,9 +89,9 @@ pub mod relay;
 pub mod replication;
 pub mod tunnel;
 
-// Bisimulation gate for recursive holon composition (TCK-00367)
+// Bisimulation gate for recursive holon composition (RFC-0020::REQ-0021)
 // BFT consensus (Chained HotStuff)
-// Anti-entropy and Merkle tree (TCK-00191)
+// Anti-entropy and Merkle tree (RFC-0033::REQ-0052)
 pub use anti_entropy::{
     AntiEntropyEngine, AntiEntropyError, CompareRequest, CompareResponse, DEFAULT_SYNC_INTERVAL,
     DigestRequest, DigestResponse, EventRequest, EventResponse, MAX_COMPARISON_DEPTH,
@@ -105,7 +105,7 @@ pub use attestation_overhead::{
     AttestationScaleMeasurement, DEFAULT_MAX_P99_OVERHEAD_RATIO, SCALE_EFFECTS_10E6,
     SCALE_EFFECTS_10E8, SCALE_EFFECTS_10E12,
 };
-// BatchEpochRootV1 hierarchical batch forests (TCK-00371)
+// BatchEpochRootV1 hierarchical batch forests (RFC-0020::REQ-0025)
 pub use batch_epoch::{
     BatchEpochError, BatchEpochRootV1, EpochAntiEntropyPointer, EpochRootBuilder, EpochTraverser,
     MAX_EPOCH_BATCH_ROOTS, MAX_TRAVERSAL_EPOCHS,
@@ -133,8 +133,8 @@ pub use convergence::{
     MAX_CELL_ID_LEN as MAX_CONVERGENCE_CELL_ID_LEN, MAX_CONVERGENCE_ROUNDS, MAX_EVENTS_PER_PULL,
     MAX_IDENTITIES_PER_CELL, MAX_LEDGER_EVENTS_PER_CELL, MAX_SIM_CELLS,
 };
-// HLC-based CRDT merge operators (TCK-00197)
-// Revocation-wins signed CRDT merge law (TCK-00360)
+// HLC-based CRDT merge operators (RFC-0033::REQ-0057)
+// Revocation-wins signed CRDT merge law (RFC-0020::REQ-0014)
 pub use crdt::{
     AuthorizationProof, ConflictRecord, CrdtDelta, CrdtMergeError, DirectoryStatus, GCounter, Hlc,
     HlcWithNodeId, LwwRegister, MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN,
@@ -145,13 +145,13 @@ pub use crdt::{
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
 };
-// Byzantine equivocation detection (TCK-00196)
+// Byzantine equivocation detection (RFC-0033::REQ-0056)
 pub use equivocation::{
     ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
     EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
     MAX_PROPOSAL_AGE_SECS,
 };
-// FactRootV1 composition with RFC-0014 quorum checkpoints (TCK-00370)
+// FactRootV1 composition with RFC-0014 quorum checkpoints (RFC-0020::REQ-0024)
 pub use fact_root::{
     CompactMultiProof, FactRootError, FactRootV1, FactRootVerificationResult, FactRootVerifier,
     MAX_BATCH_ROOTS, MAX_COMPACT_MULTIPROOF_LEAVES, MAX_COMPACT_PROOF_NODES,
@@ -162,7 +162,7 @@ pub use formal_artifacts::{
     FormalGateArtifactError, FormalGateArtifactResult, FormalGateArtifactSet, FormalGateClass,
     ModelCheckedInvariantReport,
 };
-// Functorial observation law checks for admitted rewrites (TCK-00368)
+// Functorial observation law checks for admitted rewrites (RFC-0020::REQ-0022)
 pub use functor::{
     AdmittedRewriteCatalog, FunctorError, FunctorLawChecker, FunctorLawResult, MAX_CATALOG_RULES,
     MAX_DESCRIPTION_LEN, MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_PROOF_STATUS_REASON_LEN,
@@ -193,7 +193,7 @@ pub use merkle::{
     DivergentRange, EMPTY_HASH, MAX_PROOF_NODES, MAX_TREE_DEPTH, MAX_TREE_LEAVES, MerkleError,
     MerkleNode, MerkleProof, MerkleTree, RangeDigest, hash_internal, hash_leaf,
 };
-// Prometheus metrics for consensus health (TCK-00193)
+// Prometheus metrics for consensus health (RFC-0033::REQ-0053)
 pub use metrics::{
     ByzantineFaultType, ClusterHealth, ClusterStatus, ConflictResolution, ConsensusMetrics,
     DEFAULT_LATENCY_BUCKETS, Histogram, LeaderElectionReason, ProposalOutcome, SyncDirection,
@@ -202,7 +202,7 @@ pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
     NetworkError, PooledConnection, TlsConfig, TlsConfigBuilder, apply_dispatch_jitter,
 };
-// QC aggregation and verification (TCK-00190)
+// QC aggregation and verification (RFC-0033::REQ-0051)
 pub use qc_aggregator::{
     MAX_TRACKED_ROUNDS, MAX_VOTES_PER_ROUND, QcAggregator, QcVerificationContext,
     QcVerificationResult, build_vote_message, compute_quorum_threshold, is_quorum, verify_qc,
@@ -212,7 +212,7 @@ pub use relay::{
     CLEANUP_INTERVAL, MAX_PENDING_MESSAGES, MAX_RELAY_ID_LEN, ROUTE_TIMEOUT, RelayConfig,
     RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry,
 };
-// Leader-based replication (TCK-00195)
+// Leader-based replication (RFC-0033::REQ-0055)
 pub use replication::{
     DEFAULT_ACK_TIMEOUT, MAX_ACKS_PER_PROPOSAL, MAX_PENDING_PROPOSALS,
     MAX_REPLICATION_PAYLOAD_SIZE, MAX_TRACKED_PROPOSALS, MSG_REPLICATION_ACK, MSG_REPLICATION_NACK,

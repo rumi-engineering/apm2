@@ -1,4 +1,4 @@
-//! TCK-00382: Business continuity, formal gates, and federation stop/rotation
+//! RFC-0020::REQ-0036: Business continuity, formal gates, and federation stop/rotation
 //! governance.
 //!
 //! Evidence artifacts:

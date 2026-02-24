@@ -2578,7 +2578,7 @@
           ],
           "coverage_status": "PARTIAL",
           "residual_risk": "Language-model side channels are not fully modelled and require dedicated red-team scenarios.",
-          "required_follow_up_ticket": "TCK-00622"
+          "required_follow_up_ticket": "RFC-0032::REQ-0254"
         },
         {
           "threat_class": "TM-CLASS-06",
@@ -2618,7 +2618,7 @@
           ],
           "coverage_status": "PARTIAL",
           "residual_risk": "Registry-level and transitive dependency poisoning attempts remain high-churn and require continuous policy updates.",
-          "required_follow_up_ticket": "TCK-00624"
+          "required_follow_up_ticket": "RFC-0032::REQ-0255"
         },
         {
           "threat_class": "TM-CLASS-08",
@@ -2638,7 +2638,7 @@
           ],
           "coverage_status": "PARTIAL",
           "residual_risk": "Privileged insider behavior may still bypass intent unless anomaly models and dual-approval controls stay continuously tuned.",
-          "required_follow_up_ticket": "TCK-00621"
+          "required_follow_up_ticket": "RFC-0020::REQ-0059"
         }
       ],
       "explicit_gaps": [
@@ -2648,7 +2648,7 @@
           "status": "IN_PROGRESS",
           "priority": "HIGH",
           "owner": "platform-security",
-          "ticket_ref": "TCK-00621",
+          "ticket_ref": "RFC-0020::REQ-0059",
           "due_date": "2026-03-15",
           "required_follow_up": "Deploy PolicyRootDualApprovalV1 and anomaly detection for policy root operations across all production cells.",
           "acceptance_evidence": [
@@ -2662,7 +2662,7 @@
           "status": "OPEN",
           "priority": "HIGH",
           "owner": "runtime-security",
-          "ticket_ref": "TCK-00622",
+          "ticket_ref": "RFC-0032::REQ-0254",
           "due_date": "2026-03-22",
           "required_follow_up": "Add adversarial prompt and token-level leakage tests tied to SEC-DEFECT-10 and SEC-DEFECT-18.",
           "acceptance_evidence": [
@@ -2676,7 +2676,7 @@
           "status": "OPEN",
           "priority": "MEDIUM",
           "owner": "release-security",
-          "ticket_ref": "TCK-00623",
+          "ticket_ref": "RFC-0020::REQ-0060",
           "due_date": "2026-04-05",
           "required_follow_up": "Add dataset attestation and provenance checks to release admission contracts.",
           "acceptance_evidence": [
@@ -2690,7 +2690,7 @@
           "status": "OPEN",
           "priority": "HIGH",
           "owner": "release-security",
-          "ticket_ref": "TCK-00624",
+          "ticket_ref": "RFC-0032::REQ-0255",
           "due_date": "2026-03-18",
           "required_follow_up": "Enforce dependency source pinning, transitive provenance checks, and deny-on-untrusted-registry policy.",
           "acceptance_evidence": [

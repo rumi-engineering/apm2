@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Session-open identity proof and freshness enforcement (TCK-00361).
+//! Session-open identity proof and freshness enforcement (RFC-0020::REQ-0015).
 //!
 //! This module implements proof-carrying session-open semantics that bind
 //! identity freshness to risk-tier authority decisions. Every session-open
@@ -530,7 +530,7 @@ pub enum FreshnessDecision {
 
 /// Evaluates identity proof freshness against a configured policy.
 ///
-/// This is the core enforcement logic for TCK-00361. It is deterministic
+/// This is the core enforcement logic for RFC-0020::REQ-0015. It is deterministic
 /// and side-effect-free; defect/receipt emission is handled by the caller
 /// using the returned [`FreshnessOutcome`].
 #[derive(Debug, Clone)]

@@ -1,4 +1,4 @@
-//! TCK-00406 runtime-closure integration tests.
+//! RFC-0020::REQ-0030 runtime-closure integration tests.
 //!
 //! These tests exercise authoritative runtime wiring paths:
 //! - Spawn path envelope gate fail-closed behavior

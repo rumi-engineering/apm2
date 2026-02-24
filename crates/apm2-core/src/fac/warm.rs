@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00525)
+// AGENT-AUTHORED (RFC-0032::REQ-0184)
 //! `WarmReceiptV1` and warm-phase execution primitives for lane-scoped
 //! prewarming.
 //!

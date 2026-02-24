@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! PCAC lifecycle gate for `RequestTool` authority control (TCK-00423).
+//! PCAC lifecycle gate for `RequestTool` authority control (RFC-0020::REQ-0042).
 //!
 //! This module wires the `AuthorityJoinKernel` lifecycle into the daemon's
 //! session dispatch path. Every authoritative side effect (tool execution)

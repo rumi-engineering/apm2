@@ -1,5 +1,5 @@
 # APM2 Consensus Layer Alert Rules
-# Per RFC-0014 TCK-00193 - Operational Monitoring and Alerting
+# Per RFC-0014 RFC-0033::REQ-0053 - Operational Monitoring and Alerting
 #
 # These alerts should be loaded by Prometheus AlertManager.
 # See docs/operations/consensus-runbook.md for incident response procedures.

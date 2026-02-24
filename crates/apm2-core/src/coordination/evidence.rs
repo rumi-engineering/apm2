@@ -57,7 +57,7 @@
 //!
 //! # References
 //!
-//! - TCK-00154: Implement `CoordinationReceipt` and CAS storage
+//! - RFC-0032::REQ-0054: Implement `CoordinationReceipt` and CAS storage
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - CTR-COORD-006: `CoordinationReceipt` contract
 
@@ -361,7 +361,7 @@ impl CoordinationReceipt {
         let mut buf = Vec::with_capacity(1024);
 
         // Magic bytes for versioning (allows future format changes)
-        // CRv2: TCK-00242 - replaced elapsed_ms/max_duration_ms with tick-based fields
+        // CRv2: RFC-0016::REQ-0003 - replaced elapsed_ms/max_duration_ms with tick-based fields
         buf.extend_from_slice(b"CRv2");
 
         // Coordination ID
@@ -375,13 +375,13 @@ impl CoordinationReceipt {
             wo.write_canonical(&mut buf);
         }
 
-        // Budget usage (TCK-00242: tick-based elapsed time)
+        // Budget usage (RFC-0016::REQ-0003: tick-based elapsed time)
         write_u32(&mut buf, self.budget_usage.consumed_episodes);
         write_u64(&mut buf, self.budget_usage.elapsed_ticks);
         write_u64(&mut buf, self.budget_usage.tick_rate_hz);
         write_u64(&mut buf, self.budget_usage.consumed_tokens);
 
-        // Budget ceiling (TCK-00242: tick-based duration)
+        // Budget ceiling (RFC-0016::REQ-0003: tick-based duration)
         write_u32(&mut buf, self.budget_ceiling.max_episodes);
         write_u64(&mut buf, self.budget_ceiling.max_duration_ticks);
         write_u64(&mut buf, self.budget_ceiling.tick_rate_hz);

@@ -1,6 +1,6 @@
 //! Credential management commands.
 //!
-//! # TCK-00343: Protocol Migration Complete
+//! # RFC-0032::REQ-0133: Protocol Migration Complete
 //!
 //! Per RFC-0018 and DD-009, all credential management commands now use
 //! `OperatorClient` with protobuf-based IPC via operator.sock.
@@ -75,7 +75,7 @@ fn format_auth_method(auth_method: i32) -> &'static str {
 
 /// List credential profiles.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.list_credentials()` via operator.sock.
 pub fn list(socket_path: &Path) -> Result<()> {
@@ -126,7 +126,7 @@ pub fn list(socket_path: &Path) -> Result<()> {
 
 /// Add a new credential profile.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.add_credential()` via operator.sock.
 ///
@@ -185,7 +185,7 @@ pub fn add(socket_path: &Path, profile_id: &str, provider: &str, auth_method: &s
 
 /// Remove a credential profile.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.remove_credential()` via operator.sock.
 pub fn remove(socket_path: &Path, profile_id: &str) -> Result<()> {
@@ -213,7 +213,7 @@ pub fn remove(socket_path: &Path, profile_id: &str) -> Result<()> {
 
 /// Refresh a credential profile.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.refresh_credential()` via operator.sock.
 /// Only applicable for OAuth credentials that support token refresh.
@@ -248,7 +248,7 @@ pub fn refresh(socket_path: &Path, profile_id: &str) -> Result<()> {
 
 /// Switch credentials for a running process.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.switch_credential()` via operator.sock.
 pub fn switch(socket_path: &Path, process_name: &str, profile_id: &str) -> Result<()> {
@@ -279,7 +279,7 @@ pub fn switch(socket_path: &Path, process_name: &str, profile_id: &str) -> Resul
 
 /// Show credential details.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.list_credentials()` and filters by `profile_id`.
 /// Secrets are never shown.
@@ -330,7 +330,7 @@ pub fn show(socket_path: &Path, profile_id: &str) -> Result<()> {
 
 /// Interactive login for a provider.
 ///
-/// # TCK-00343: `OperatorClient` Implementation
+/// # RFC-0032::REQ-0133: `OperatorClient` Implementation
 ///
 /// Uses `OperatorClient.login_credential()` via operator.sock.
 /// For OAuth providers, this may return a URL to open in a browser.

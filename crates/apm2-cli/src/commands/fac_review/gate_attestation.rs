@@ -21,7 +21,7 @@ use super::gate_checks;
 /// V2 attestation schema: uses file-content hashing instead of HEAD:path git
 /// blob hashing for input bindings.  This version bump invalidates all pre-v2
 /// cache entries, closing the dirty-state cache poisoning vector where
-/// HEAD:path ignored uncommitted file content (TCK-00544).
+/// HEAD:path ignored uncommitted file content (RFC-0032::REQ-0200).
 const ATTESTATION_SCHEMA: &str = "apm2.fac.gate_attestation.v2";
 const ATTESTATION_DOMAIN: &str = "apm2.fac.gate.attestation/v2";
 const POLICY_SCHEMA: &str = "apm2.fac.gate_reuse_policy.v2";
@@ -44,12 +44,12 @@ pub struct GateResourcePolicy {
     pub test_parallelism: Option<u32>,
     pub bounded_runner: bool,
     /// BLAKE3 hash of the `SandboxHardeningProfile` used for gate execution
-    /// (TCK-00573 MAJOR-3). Ensures the attestation digest changes when the
+    /// (RFC-0032::REQ-0223 MAJOR-3). Ensures the attestation digest changes when the
     /// hardening profile is modified, preventing stale gate result reuse
     /// from insecure environments.
     pub sandbox_hardening: Option<String>,
     /// BLAKE3 hash of the `NetworkPolicy` used for gate execution
-    /// (TCK-00574 MAJOR-1). Ensures the attestation digest changes when the
+    /// (RFC-0032::REQ-0224 MAJOR-1). Ensures the attestation digest changes when the
     /// network policy toggles between allow and deny, preventing cache
     /// reuse across policy drift.
     pub network_policy_hash: Option<String>,
@@ -361,7 +361,7 @@ fn input_digest(workspace_root: &Path, gate_name: &str) -> Result<String, String
             continue;
         }
 
-        // TCK-00544: Always hash the actual file content instead of using
+        // RFC-0032::REQ-0200: Always hash the actual file content instead of using
         // HEAD:{path} git blob references.  HEAD:path ignores uncommitted
         // file modifications, which allows dirty-workspace cache entries to
         // hash-collide with clean committed state.  Using file_sha256
@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(left_bytes, right_bytes);
     }
 
-    // --- TCK-00523: .cargo/config.toml in gate input paths ---
+    // --- RFC-0032::REQ-0183: .cargo/config.toml in gate input paths ---
 
     #[test]
     fn cargo_config_included_in_rustfmt_gate_inputs() {
@@ -645,7 +645,7 @@ mod tests {
         );
     }
 
-    // --- TCK-00523: rustfmt + sccache version in environment facts ---
+    // --- RFC-0032::REQ-0183: rustfmt + sccache version in environment facts ---
 
     #[test]
     fn environment_facts_includes_rustfmt_version() {
@@ -668,7 +668,7 @@ mod tests {
         );
     }
 
-    // --- TCK-00523: extended env allowlist ---
+    // --- RFC-0032::REQ-0183: extended env allowlist ---
 
     #[test]
     fn allowlist_contains_required_exact_vars() {
@@ -745,11 +745,11 @@ mod tests {
         );
     }
 
-    // --- TCK-00544: attestation schema version bump + file-content binding ---
+    // --- RFC-0032::REQ-0200: attestation schema version bump + file-content binding ---
 
     #[test]
     fn attestation_schema_is_v2() {
-        // TCK-00544: Schema must be v2 to invalidate pre-fix cache entries
+        // RFC-0032::REQ-0200: Schema must be v2 to invalidate pre-fix cache entries
         // that were created using HEAD:path git blob references which ignored
         // dirty workspace content.
         assert_eq!(
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn attestation_uses_file_content_not_git_blob() {
-        // TCK-00544 regression: input_digest must use file_sha256 (actual
+        // RFC-0032::REQ-0200 regression: input_digest must use file_sha256 (actual
         // file content) for existing files, never HEAD:path git blob
         // references. This test verifies the attestation digest for a known
         // workspace file uses file_sha256 binding.
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn v1_attestation_digest_not_equal_to_v2() {
-        // TCK-00544 regression: a cache entry created under v1 semantics
+        // RFC-0032::REQ-0200 regression: a cache entry created under v1 semantics
         // (using git_blob binding + v1 schema) will have a different
         // attestation_digest than a v2 entry for the same SHA and gate,
         // because the schema version and domain are included in the root
@@ -863,7 +863,7 @@ mod tests {
         );
     }
 
-    // --- TCK-00573 MAJOR-1: sandbox hardening hash binds attestation ---
+    // --- RFC-0032::REQ-0223 MAJOR-1: sandbox hardening hash binds attestation ---
 
     #[test]
     fn resource_digest_changes_when_sandbox_hardening_hash_changes() {
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn sandbox_hardening_none_vs_some_produces_different_digest() {
         // Gate attestation with sandbox_hardening=None (legacy) must differ
-        // from one with sandbox_hardening=Some (post-TCK-00573).
+        // from one with sandbox_hardening=Some (post-RFC-0032::REQ-0223).
         use apm2_core::fac::SandboxHardeningProfile;
 
         let default_hash = SandboxHardeningProfile::default().content_hash_hex();
@@ -1009,7 +1009,7 @@ mod tests {
         );
     }
 
-    // --- TCK-00574 MAJOR-1: network policy hash binds attestation ---
+    // --- RFC-0032::REQ-0224 MAJOR-1: network policy hash binds attestation ---
 
     #[test]
     fn resource_digest_changes_when_network_policy_hash_changes() {
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn network_policy_none_vs_some_produces_different_digest() {
         // Gate attestation with network_policy_hash=None (legacy) must differ
-        // from one with network_policy_hash=Some (post-TCK-00574).
+        // from one with network_policy_hash=Some (post-RFC-0032::REQ-0224).
         use apm2_core::fac::NetworkPolicy;
 
         let deny_hash = NetworkPolicy::deny().content_hash_hex();

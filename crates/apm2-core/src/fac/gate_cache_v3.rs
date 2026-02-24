@@ -1,4 +1,4 @@
-//! Gate Cache V3: receipt-indexed cache store (TCK-00541).
+//! Gate Cache V3: receipt-indexed cache store (RFC-0032::REQ-0197).
 //!
 //! Keyed by attestation+policy+toolchain compound key.
 //! V3 stores one file per gate under:
@@ -19,7 +19,7 @@
 //! chain and cannot be forged by simple file writes. The compound key binds
 //! each cache entry to the full admission context that produced it.
 //!
-//! # Fail-Closed Design (TCK-00541)
+//! # Fail-Closed Design (RFC-0032::REQ-0197)
 //!
 //! - Missing or empty compound key components always deny cache hit.
 //! - Signature verification is mandatory for reuse in default mode.
@@ -400,7 +400,7 @@ impl V3CacheEntry {
 }
 
 // =============================================================================
-// Cache Reason Code (TCK-00626)
+// Cache Reason Code (RFC-0032::REQ-0257)
 // =============================================================================
 
 /// Stable reason code for cache reuse decisions (REQ-0037).
@@ -477,7 +477,7 @@ impl fmt::Display for CacheReasonCode {
 }
 
 // =============================================================================
-// Cache Decision (TCK-00626)
+// Cache Decision (RFC-0032::REQ-0257)
 // =============================================================================
 
 /// Structured cache reuse decision record (REQ-0037).
@@ -536,7 +536,7 @@ impl CacheDecision {
 /// validated at construction time. Writing to disk stores one file per gate
 /// under the index key directory.
 ///
-/// # Security Invariant (TCK-00541 MAJOR fix)
+/// # Security Invariant (RFC-0032::REQ-0197 MAJOR fix)
 ///
 /// [INV-GCV3-001] Entries loaded from v2 fallback (`load_from_v2_dir`) are
 /// marked `v2_sourced = true` and are **never reusable** for gate verdict
@@ -631,12 +631,12 @@ impl GateCacheV3 {
 
     /// Evaluate whether a v3 cache entry is safe to reuse, returning a
     /// structured [`CacheDecision`] with first-mismatch attribution
-    /// (TCK-00626 S2).
+    /// (RFC-0032::REQ-0257 S2).
     ///
     /// This is the sole API for cache reuse decisions. It returns a
     /// [`CacheDecision`] directly with the correct [`CacheReasonCode`] and
     /// `first_mismatch_dimension`, following the ordered check sequence
-    /// defined in TCK-00626 S2:
+    /// defined in RFC-0032::REQ-0257 S2:
     ///
     /// 1. `sha_miss` / `gate_miss` -- no cache entry found
     /// 2. `signature_invalid` -- entry exists but signature fails
@@ -662,7 +662,7 @@ impl GateCacheV3 {
     /// The compound key match is implicit: the caller looked up this cache
     /// by compound key, so if the entry exists, the compound key matched.
     ///
-    /// # Security: V2-Sourced Deny (TCK-00541 MAJOR fix)
+    /// # Security: V2-Sourced Deny (RFC-0032::REQ-0197 MAJOR fix)
     ///
     /// V2-sourced entries are unconditionally denied. V2 entries do not
     /// carry RFC-0028/0029 binding proof and were signed under the v2
@@ -730,7 +730,7 @@ impl GateCacheV3 {
         // 10. TTL check: LAST in the ordered evaluation.
         // Only runs if all earlier dimension checks pass. This ensures that
         // integrity failures (signature, receipt binding) are surfaced before
-        // timing-based reasons, per TCK-00626 S2 check order.
+        // timing-based reasons, per RFC-0032::REQ-0257 S2 check order.
         let ttl_secs = std::env::var("APM2_FAC_CACHE_TTL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -1545,7 +1545,7 @@ pub fn sanitize_gate_name(gate: &str) -> String {
 }
 
 // =============================================================================
-// Compound-Key Drift Diagnosis (TCK-00626)
+// Compound-Key Drift Diagnosis (RFC-0032::REQ-0257)
 // =============================================================================
 
 /// Compute the age in seconds of an RFC 3339 timestamp relative to the
@@ -1908,7 +1908,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Receipt Binding Tests (TCK-00541 round 2)
+    // Receipt Binding Tests (RFC-0032::REQ-0197 round 2)
     // =========================================================================
 
     /// `check_reuse` denies entries missing RFC-0028 receipt binding.
@@ -2356,7 +2356,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00541 MAJOR Security Fix: V2 Binding Continuity Regression Tests
+    // RFC-0032::REQ-0197 MAJOR Security Fix: V2 Binding Continuity Regression Tests
     // =========================================================================
 
     /// [INV-GCV3-001] V2-sourced cache entries MUST be denied by `check_reuse`.
@@ -2584,7 +2584,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Receipt Rebind Tests (TCK-00541 round-3 MAJOR fix)
+    // Receipt Rebind Tests (RFC-0032::REQ-0197 round-3 MAJOR fix)
     // =========================================================================
 
     /// Verify that `check_reuse` returns a hit after
@@ -2752,7 +2752,7 @@ mod tests {
     }
 
     // =========================================================================
-    // CacheDecision and CacheReasonCode Tests (TCK-00626, S4)
+    // CacheDecision and CacheReasonCode Tests (RFC-0032::REQ-0257, S4)
     // =========================================================================
 
     #[test]
@@ -3069,7 +3069,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Compound-Key Drift Diagnosis Tests (TCK-00626)
+    // Compound-Key Drift Diagnosis Tests (RFC-0032::REQ-0257)
     // =========================================================================
 
     #[test]

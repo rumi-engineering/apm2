@@ -44,7 +44,7 @@ use super::timeout_policy::{
 use super::types::now_iso8601;
 
 /// Env var keys unconditionally stripped from ALL gate phases as
-/// defense-in-depth against wrapper injection (TCK-00526, TCK-00548). These are
+/// defense-in-depth against wrapper injection (RFC-0032::REQ-0185, RFC-0032::REQ-0203). These are
 /// stripped by `build_job_environment` at the policy level AND by
 /// `env_remove()` on the spawned `Command` for belt-and-suspenders containment.
 const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
@@ -113,7 +113,7 @@ pub enum GateProgressEvent {
         passed: bool,
         duration_secs: u64,
         error_hint: Option<String>,
-        /// Structured cache reuse decision (TCK-00626, REQ-0037).
+        /// Structured cache reuse decision (RFC-0032::REQ-0257, REQ-0037).
         /// Present when a cache lookup was performed for this gate.
         /// Used by the gates.rs callback handler in non-test builds.
         #[cfg_attr(test, allow(dead_code))]
@@ -131,7 +131,7 @@ pub struct EvidenceGateOptions {
     pub test_command_environment: Vec<(String, String)>,
     /// Env var keys to remove from the spawned test process environment.
     /// Prevents parent process env inheritance of `sccache`/`RUSTC_WRAPPER`
-    /// keys that could bypass cgroup containment (TCK-00548).
+    /// keys that could bypass cgroup containment (RFC-0032::REQ-0203).
     pub env_remove_keys: Vec<String>,
     /// Optional base unit name used for deterministic bounded gate units.
     /// When set, non-test bounded units are named `<base>-<gate_name>`.
@@ -152,7 +152,7 @@ pub struct EvidenceGateOptions {
     /// progress instead of buffering all events until `run_evidence_gates`
     /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
-    /// TCK-00540 fix round 3: Gate resource policy for attestation digest
+    /// RFC-0032::REQ-0196 fix round 3: Gate resource policy for attestation digest
     /// computation during cache-reuse decisions. When `Some`, enables
     /// cache-reuse in `run_evidence_gates_with_lane_context` so that the
     /// fail-closed receipt-binding policy is evaluated against attested cache
@@ -171,7 +171,7 @@ pub struct EvidenceGateResult {
     pub bytes_total: Option<u64>,
     pub was_truncated: Option<bool>,
     pub log_bundle_hash: Option<String>,
-    /// Structured cache reuse decision (TCK-00626, REQ-0037).
+    /// Structured cache reuse decision (RFC-0032::REQ-0257, REQ-0037).
     /// Present when a cache lookup was performed for this gate.
     pub cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
 }
@@ -317,13 +317,13 @@ fn gate_attestation_digest(
 }
 
 // NOTE: `reuse_decision_for_gate` (v2-only reuse path) was removed as part
-// of the TCK-00541 MAJOR security fix. V2 entries lack RFC-0028/0029
+// of the RFC-0032::REQ-0197 MAJOR security fix. V2 entries lack RFC-0028/0029
 // binding proof and cannot satisfy v3 compound-key continuity. All reuse
 // decisions now flow through `reuse_decision_with_v3_fallback` which
 // only allows v3-native entries to satisfy reuse.
 
 // =============================================================================
-// Gate Cache V3 helpers (TCK-00541)
+// Gate Cache V3 helpers (RFC-0032::REQ-0197)
 // =============================================================================
 
 /// Compute a toolchain fingerprint from `rustc --version --verbose` output.
@@ -397,7 +397,7 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 }
 
 // cache_v2_root removed: v2 fallback loading disabled in evidence pipeline
-// ([INV-GCV3-001] TCK-00541 MAJOR security fix round 4). V2 entries lack
+// ([INV-GCV3-001] RFC-0032::REQ-0197 MAJOR security fix round 4). V2 entries lack
 // RFC-0028/0029 binding proof and cannot satisfy v3 compound-key continuity.
 
 /// Try to reuse from v3 cache; v2 is structurally excluded.
@@ -405,7 +405,7 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 /// Returns a unified `ReuseDecision` that can be used by the evidence flow.
 /// When v3 hits, the v3 decision reason is used.
 ///
-/// # Security: V2 structurally excluded (TCK-00541 MAJOR fix round 4)
+/// # Security: V2 structurally excluded (RFC-0032::REQ-0197 MAJOR fix round 4)
 ///
 /// [INV-GCV3-001] V2 entries lack RFC-0028/0029 binding proof and cannot
 /// satisfy v3 compound-key continuity requirements. As of round 4, v2
@@ -432,9 +432,9 @@ fn reuse_decision_with_v3_fallback(
 ) {
     // Try v3 first.
     //
-    // TCK-00626 round 5: check_reuse now returns CacheDecision directly
+    // RFC-0032::REQ-0257 round 5: check_reuse now returns CacheDecision directly
     // (the old check_reuse_decision wrapper was eliminated). The single
-    // check_reuse method performs all checks in the correct TCK-00626 S2
+    // check_reuse method performs all checks in the correct RFC-0032::REQ-0257 S2
     // order (gate_miss -> signature -> receipt_binding -> drift -> TTL)
     // and returns a structured CacheDecision with first_mismatch_dimension.
     if let Some(v3) = v3_cache {
@@ -599,7 +599,7 @@ fn run_gate_command_with_heartbeat(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // TCK-00526: When a policy-filtered environment is provided, clear
+    // RFC-0032::REQ-0185: When a policy-filtered environment is provided, clear
     // the inherited environment first (default-deny) and then apply only
     // the policy-approved variables. Without env_clear(), Command::env()
     // adds to the inherited environment, leaking ambient secrets into
@@ -612,7 +612,7 @@ fn run_gate_command_with_heartbeat(
     }
 
     // Strip env vars that must not be inherited by the bounded test
-    // process (e.g. RUSTC_WRAPPER, SCCACHE_* — TCK-00548).
+    // process (e.g. RUSTC_WRAPPER, SCCACHE_* — RFC-0032::REQ-0203).
     // When env_clear() is active this is defense-in-depth; when extra_env
     // is None (legacy callers) it prevents specific keys from leaking.
     if let Some(keys) = env_remove_keys {
@@ -1214,16 +1214,16 @@ struct PipelineTestCommand {
     test_env: Vec<(String, String)>,
     /// Env var keys to remove from the spawned process environment.
     /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
-    /// that could bypass the bounded test's cgroup containment (TCK-00548).
+    /// that could bypass the bounded test's cgroup containment (RFC-0032::REQ-0203).
     env_remove_keys: Vec<String>,
     /// BLAKE3 hex hash of the effective `SandboxHardeningProfile` used for
     /// bounded test execution. Carried through so attestation binds to the
-    /// actual policy-driven profile, not a default (TCK-00573 MAJOR-1 fix).
+    /// actual policy-driven profile, not a default (RFC-0032::REQ-0223 MAJOR-1 fix).
     sandbox_hardening_hash: String,
     /// BLAKE3 hex hash of the effective `NetworkPolicy` used for gate
     /// execution. Carried through so attestation binds to the actual
     /// policy-driven network posture, preventing cache reuse across
-    /// policy drift (TCK-00574 MAJOR-1 fix).
+    /// policy drift (RFC-0032::REQ-0224 MAJOR-1 fix).
     network_policy_hash: String,
 }
 
@@ -1269,11 +1269,11 @@ fn build_pipeline_test_command(
     let effective_cpu_quota = format!("{}%", execution_profile.cpu_quota_percent);
     let lane_env = compute_test_env_for_parallelism(execution_profile.test_parallelism);
 
-    // TCK-00526: Build policy-filtered environment.
+    // RFC-0032::REQ-0185: Build policy-filtered environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
+    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
     // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
     // to maintain lock/env coupling (round 2 fix: was previously hardcoded
     // to lane-00).
@@ -1290,12 +1290,12 @@ fn build_pipeline_test_command(
     }
     let mut test_env: Vec<(String, String)> = policy_env.into_iter().collect();
 
-    // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
+    // RFC-0032::REQ-0223 MAJOR-1 fix: compute the effective sandbox hardening hash
     // BEFORE the profile is moved into build_systemd_bounded_test_command,
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // TCK-00574: Resolve network policy for evidence gates with operator override.
+    // RFC-0032::REQ-0224: Resolve network policy for evidence gates with operator override.
     // Compute the hash BEFORE the policy is moved into the bounded test command
     // builder, so attestation binds to the actual policy-driven network posture
     // (MAJOR-1 fix: attestation digest must change when network policy changes).
@@ -1793,12 +1793,12 @@ fn resolve_evidence_gate_progress_callback(
 /// environment and inheriting only allowlisted variables per
 /// `FacPolicyV1`.
 ///
-/// TCK-00526: Previously only the test gate received a policy-filtered
+/// RFC-0032::REQ-0185: Previously only the test gate received a policy-filtered
 /// environment. This function is used by `run_evidence_gates` and
 /// `run_evidence_gates_with_status` to apply the same policy to
 /// fmt/clippy/doc and script gates.
 ///
-/// TCK-00575: Applies per-lane env isolation (`HOME`, `TMPDIR`,
+/// RFC-0032::REQ-0225: Applies per-lane env isolation (`HOME`, `TMPDIR`,
 /// `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`) so every FAC gate phase runs with
 /// deterministic lane-local values, preventing writes to ambient user
 /// locations.
@@ -1826,7 +1826,7 @@ fn build_gate_policy_env(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
+    // RFC-0032::REQ-0225: Apply per-lane env isolation for all evidence gate phases.
     // Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
     super::policy_loader::apply_review_lane_environment(
@@ -1841,13 +1841,13 @@ fn build_gate_policy_env(
 }
 
 /// Load or create FAC policy. Delegates to the shared `policy_loader` module
-/// for bounded I/O and deduplication (TCK-00526).
+/// for bounded I/O and deduplication (RFC-0032::REQ-0185).
 fn load_or_create_pipeline_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
     super::policy_loader::load_or_create_fac_policy(fac_root)
 }
 
 /// Ensure managed `CARGO_HOME` directory exists. Delegates to the shared
-/// `policy_loader` module (TCK-00526).
+/// `policy_loader` module (RFC-0032::REQ-0185).
 fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
@@ -2019,7 +2019,7 @@ fn finalize_status_gate_run(
     // Force a final update to ensure all gate results are posted.
     updater.force_update(status);
 
-    // TCK-00541: Persist v3 gate cache as the primary (receipt-indexed) store.
+    // RFC-0032::REQ-0197: Persist v3 gate cache as the primary (receipt-indexed) store.
     // V3 is written first and treated as the authoritative cache. V2 follows
     // as backward-compatible fallback for push.rs / gates.rs callers that
     // have not yet been migrated to v3.
@@ -2040,7 +2040,7 @@ fn finalize_status_gate_run(
                 log_path: result.log_path.clone(),
                 signature_hex: None, // Will be signed below.
                 signer_id: None,
-                // TCK-00541: Inherit receipt binding flags from v2 cache.
+                // RFC-0032::REQ-0197: Inherit receipt binding flags from v2 cache.
                 // These are fail-closed (false) unless promoted by a durable
                 // receipt lookup. The v3 check_reuse enforces both must be true.
                 rfc0028_receipt_bound: result.rfc0028_receipt_bound,
@@ -2059,7 +2059,7 @@ fn finalize_status_gate_run(
         }
     }
 
-    // TCK-00541: V2 writes removed from default evidence pipeline path.
+    // RFC-0032::REQ-0197: V2 writes removed from default evidence pipeline path.
     // The ticket requires "write only v3 in default mode". V2 read
     // compatibility is preserved (load_from_v2_dir exists for diagnostic/
     // migration tooling), but new gate results are only persisted to v3.
@@ -2075,7 +2075,7 @@ fn finalize_status_gate_run(
     Ok(())
 }
 
-/// Post-receipt v3 gate cache rebinding (TCK-00541 round-3 MAJOR fix).
+/// Post-receipt v3 gate cache rebinding (RFC-0032::REQ-0197 round-3 MAJOR fix).
 ///
 /// After a receipt is committed, loads the persisted v3 cache from disk,
 /// promotes `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags based
@@ -2238,14 +2238,14 @@ pub(super) fn run_evidence_gates_with_lane_context(
     let on_gate_progress = resolve_evidence_gate_progress_callback(opts);
     let logs_dir = lane_context.logs_dir;
 
-    // TCK-00526: Build policy-filtered environment for ALL gates (not just
+    // RFC-0032::REQ-0185: Build policy-filtered environment for ALL gates (not just
     // the test gate). This enforces default-deny on fmt, clippy, doc, and
     // native gate checks, preventing ambient secret leakage.
-    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // RFC-0032::REQ-0225 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
     let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
-    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    // RFC-0032::REQ-0185: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
     // env_remove on the spawned Command provides defense-in-depth against
     // parent process env inheritance. Pass the policy-filtered environment
@@ -2257,7 +2257,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         Some(&gate_wrapper_strip)
     };
 
-    // TCK-00540 fix round 3: Load the gate cache and signing material for
+    // RFC-0032::REQ-0196 fix round 3: Load the gate cache and signing material for
     // cache-reuse decisions in the `fac gates` path.
     //
     // Cache reuse is only active in full (non-quick) mode because quick mode
@@ -2283,7 +2283,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     } else {
         (None, None)
     };
-    // TCK-00541: Non-status path now loads native v3 cache for reuse.
+    // RFC-0032::REQ-0197: Non-status path now loads native v3 cache for reuse.
     // This closes the structural throughput gap where v3 persisted entries
     // were never considered and every gate re-executed.
     //
@@ -2481,9 +2481,9 @@ pub(super) fn run_evidence_gates_with_lane_context(
     }
 
     // Phase 2: cargo fmt/doc/clippy — all receive the policy-filtered env
-    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
+    // and wrapper-stripping keys (RFC-0032::REQ-0185: defense-in-depth for all gates).
     //
-    // TCK-00574 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
+    // RFC-0032::REQ-0224 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
     // in systemd-run with network policy isolation directives to enforce
     // default-deny network posture for ALL evidence gate phases (not just test).
     // Quick mode skips network isolation (development shortcut, same as test skip).
@@ -2493,7 +2493,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             None
         } else {
             // Load the policy to resolve network policy and sandbox hardening
-            // for non-test gate phases (TCK-00574 BLOCKER fix).
+            // for non-test gate phases (RFC-0032::REQ-0224 BLOCKER fix).
             let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
                 "cannot resolve APM2_HOME for gate network policy enforcement".to_string()
             })?;
@@ -2567,11 +2567,11 @@ pub(super) fn run_evidence_gates_with_lane_context(
             continue;
         }
 
-        // TCK-00626 round 4: Hoist cache_decision so it is available on both
+        // RFC-0032::REQ-0257 round 4: Hoist cache_decision so it is available on both
         // hit and miss paths — gate_finished must always carry the decision.
         let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
 
-        // TCK-00540 fix round 3: Check gate cache for reuse before execution.
+        // RFC-0032::REQ-0196 fix round 3: Check gate cache for reuse before execution.
         if cache_reuse_active {
             // SAFETY: `cache_reuse_policy` is guaranteed `Some` here because
             // `cache_reuse_active` is gated on `cache_reuse_policy.is_some()`.
@@ -2590,7 +2590,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
-            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope so
             // both hit and miss paths include it in gate_finished.
             gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
@@ -2644,7 +2644,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
 
-        // TCK-00574: Use bounded gate command (with network isolation) in
+        // RFC-0032::REQ-0224: Use bounded gate command (with network isolation) in
         // full mode; fall back to bare command in quick mode.
         let (passed, stream_stats) = if let Some(ref specs) = bounded_gate_specs {
             if let Some((_, bounded_cmd, bounded_env)) =
@@ -2776,13 +2776,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         emit_gate_completed(opts, &test_result);
         gate_results.push(test_result);
     } else {
-        // TCK-00540 fix round 3: Cache reuse for the test gate.
+        // RFC-0032::REQ-0196 fix round 3: Cache reuse for the test gate.
         let test_command_override = resolve_evidence_test_command_with_scope(
             opts.and_then(|o| o.test_command.as_deref()),
             &cargo_scope,
         );
         let mut test_cache_hit = false;
-        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        // RFC-0032::REQ-0257 round 4: Hoist cache_decision for miss path.
         let mut test_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -2805,7 +2805,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
-            // TCK-00626 round 4: propagate cache decision to outer scope.
+            // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope.
             test_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2858,12 +2858,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
         if !test_cache_hit {
             emit_gate_started(opts, "test");
             let test_started = Instant::now();
-            // TCK-00526: Use caller-provided test env if available (gates.rs
+            // RFC-0032::REQ-0185: Use caller-provided test env if available (gates.rs
             // pre-computes policy env + bounded runner env), otherwise fall
             // back to the policy-filtered gate env.
             let caller_test_env = resolve_evidence_test_command_environment(opts);
             let test_env: Option<&[(String, String)]> = caller_test_env.or(Some(&gate_env));
-            // TCK-00526: Use caller-provided env_remove_keys if available
+            // RFC-0032::REQ-0185: Use caller-provided env_remove_keys if available
             // (bounded test runner computes these), otherwise fall back to the
             // gate-level wrapper strip keys for defense-in-depth.
             let env_remove = resolve_evidence_env_remove_keys(opts).or(gate_wrapper_strip_ref);
@@ -2913,7 +2913,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let mut wi_cache_hit = false;
-    // TCK-00626 round 4: Hoist cache_decision for miss path.
+    // RFC-0032::REQ-0257 round 4: Hoist cache_decision for miss path.
     let mut wi_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
     if cache_reuse_active {
         let reuse_grp = cache_reuse_policy
@@ -2931,7 +2931,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             v3_compound_key_ns.as_ref(),
             Some(sha),
         );
-        // TCK-00626 round 4: propagate cache decision to outer scope.
+        // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope.
         wi_cache_decision.clone_from(&cache_decision_local);
         if reuse.reusable {
             if let Some(cached) = resolve_cached_payload(
@@ -3062,12 +3062,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let logs_dir = lane_context.logs_dir;
     // Pipeline path enforces fail-closed cache reuse decisions.
 
-    // TCK-00526: Build policy-filtered environment for ALL gates.
-    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // RFC-0032::REQ-0185: Build policy-filtered environment for ALL gates.
+    // RFC-0032::REQ-0225 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
     let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
-    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    // RFC-0032::REQ-0185: Compute wrapper-stripping keys once for ALL gate phases.
     // Pass the policy-filtered environment so policy-introduced SCCACHE_*
     // variables are also discovered for defense-in-depth stripping.
     let gate_wrapper_strip = compute_gate_env_remove_keys(Some(&gate_env));
@@ -3080,7 +3080,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut status = CiStatus::new(sha, pr_number);
     let updater = PrBodyStatusUpdater::new(owner_repo, pr_number);
 
-    // TCK-00576: Load the persistent signer for gate cache signature
+    // RFC-0032::REQ-0226: Load the persistent signer for gate cache signature
     // verification (reuse decisions) and signing (new cache entries).
     let fac_signer = {
         let apm2_home = apm2_core::github::resolve_apm2_home()
@@ -3097,7 +3097,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
 
-    // TCK-00541: Build v3 compound key and load v3 cache (with v2 fallback).
+    // RFC-0032::REQ-0197: Build v3 compound key and load v3 cache (with v2 fallback).
     let v3_compound_key = compute_v3_compound_key(
         workspace_root,
         sha,
@@ -3124,12 +3124,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut v3_gate_cache = v3_compound_key
         .as_ref()
         .and_then(|ck| GateCacheV3::new(sha, ck.clone()).ok());
-    // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation
+    // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate attestation
     // to prevent stale gate results from insecure environments being reused.
     // Uses the effective policy-driven profile carried through
     // PipelineTestCommand (MAJOR-1 fix: was previously default()).
     let sandbox_hardening_hash = &pipeline_test_command.sandbox_hardening_hash;
-    // TCK-00574 MAJOR-1: Include network policy hash in gate attestation
+    // RFC-0032::REQ-0224 MAJOR-1: Include network policy hash in gate attestation
     // to prevent cache reuse across network policy drift.
     let network_policy_hash = &pipeline_test_command.network_policy_hash;
     let policy = GateResourcePolicy::from_cli(
@@ -3399,7 +3399,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
-    // TCK-00574 BLOCKER fix: Build bounded gate commands for non-test gates
+    // RFC-0032::REQ-0224 BLOCKER fix: Build bounded gate commands for non-test gates
     // to enforce network-deny in the pipeline path (always full mode).
     #[allow(clippy::type_complexity)]
     let pipeline_bounded_gate_specs: Vec<(String, Vec<String>, Vec<(String, String)>)> = {
@@ -3564,7 +3564,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        // TCK-00574: Use bounded gate command with network isolation.
+        // RFC-0032::REQ-0224: Use bounded gate command with network isolation.
         let (_bounded_name, bounded_cmd, bounded_env) = &pipeline_bounded_gate_specs[idx];
         let (bcmd, bargs) = bounded_cmd
             .split_first()
@@ -4454,7 +4454,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00541 BLOCKER regression: v3-only cache hits must succeed without v2
+    // RFC-0032::REQ-0197 BLOCKER regression: v3-only cache hits must succeed without v2
     // =========================================================================
 
     /// Prove that when v3 has a valid signed entry but v2 is absent,
@@ -4640,7 +4640,7 @@ mod tests {
     /// [INV-GCV3-001] Prove that when v3 misses and v2 has a signed entry,
     /// v2 fallback is denied for reuse (security: no binding continuity proof).
     ///
-    /// TCK-00541 MAJOR fix: v2 entries lack RFC-0028/0029 binding proof and
+    /// RFC-0032::REQ-0197 MAJOR fix: v2 entries lack RFC-0028/0029 binding proof and
     /// cannot satisfy v3 compound-key continuity requirements. The gate
     /// must be re-executed under v3 with full bindings.
     #[test]

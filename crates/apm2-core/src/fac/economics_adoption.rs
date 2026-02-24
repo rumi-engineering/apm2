@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00584)
+// AGENT-AUTHORED (RFC-0032::REQ-0234)
 //! Economics profile adoption protocol.
 //!
 //! Broker-admitted `economics_profile_hash` rotation with rollback.
@@ -1960,7 +1960,7 @@ mod tests {
     }
 
     // =================================================================
-    // Digest validation tests (TCK-00584 fix round 3)
+    // Digest validation tests (RFC-0032::REQ-0234 fix round 3)
     // =================================================================
 
     #[test]
@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     // =================================================================
-    // Hash-only adoption tests (TCK-00584 fix round 3)
+    // Hash-only adoption tests (RFC-0032::REQ-0234 fix round 3)
     // =================================================================
 
     #[test]

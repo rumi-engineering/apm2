@@ -147,12 +147,12 @@ pub use events::{
     EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
     MAX_MISSED_PATH_LENGTH,
 };
-// Re-export evidence types (TCK-00154)
+// Re-export evidence types (RFC-0032::REQ-0054)
 pub use evidence::{
     CoordinationReceipt, MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, ReceiptBuilder,
     ReceiptError, WorkOutcome,
 };
-// Re-export planner types (TCK-00369, REQ-0023)
+// Re-export planner types (RFC-0020::REQ-0023, REQ-0023)
 pub use planner::{
     AdvisoryPlannerScore, CoordinationObjectiveReceiptV1, EfeComponents, EfeObjective, EfeWeights,
     MAX_PLANNER_COORDINATION_ID_LEN, MAX_PLANNER_WORK_ID_LEN, MAX_TRACKED_OBJECTIVES, PlannerError,

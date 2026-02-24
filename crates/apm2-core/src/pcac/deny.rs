@@ -195,7 +195,7 @@ pub enum AuthorityDenyClass {
         consume_intent_class: BoundaryIntentClass,
     },
 
-    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6, TCK-00427) ----
+    // ---- Tier2+ sovereignty failures (RFC-0027 §6.6, RFC-0020::REQ-0046) ----
     /// Sovereignty epoch evidence is stale for Tier2+ operations.
     StaleSovereigntyEpoch {
         /// The epoch that was checked.

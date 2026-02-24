@@ -1,5 +1,5 @@
-// AGENT-AUTHORED (TCK-00388)
-//! TCK-00388: Gate execution orchestrator integration tests.
+// AGENT-AUTHORED (RFC-0032::REQ-0142)
+//! RFC-0032::REQ-0142: Gate execution orchestrator integration tests.
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by
 //! exercising the real `GateOrchestrator` entrypoints, including:

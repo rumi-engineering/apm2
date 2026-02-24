@@ -11,7 +11,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00175: E2E lifecycle and budget tests
+//! - RFC-0033::REQ-0041: E2E lifecycle and budget tests
 //! - REQ-EPISODE-001: Episode envelope requirements
 //! - REQ-DAEMON-001: Daemon requirements
 //! - AD-EPISODE-002: Episode state machine

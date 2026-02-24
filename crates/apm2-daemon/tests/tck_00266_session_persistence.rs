@@ -1,4 +1,4 @@
-//! TCK-00266: Session registry with persistent state file
+//! RFC-0032::REQ-0082: Session registry with persistent state file
 //!
 //! This test module verifies that the session registry correctly persists
 //! session state to a file and recovers from crashes.
@@ -38,12 +38,12 @@ fn make_session(id: &str, handle: &str) -> SessionState {
 }
 
 // =============================================================================
-// TCK-00266: AC1 - State file contains active sessions
+// RFC-0032::REQ-0082: AC1 - State file contains active sessions
 // =============================================================================
 
 /// Verify that sessions are written to the state file in human-readable JSON.
 ///
-/// Per TCK-00266 AC1: State file contains active sessions
+/// Per RFC-0032::REQ-0082 AC1: State file contains active sessions
 /// Verification: `cat state_file` shows session entries
 #[test]
 fn tck_00266_ac1_state_file_contains_sessions() {
@@ -132,12 +132,12 @@ fn tck_00266_state_file_is_human_readable() {
 }
 
 // =============================================================================
-// TCK-00266: AC2 - State survives daemon restart
+// RFC-0032::REQ-0082: AC2 - State survives daemon restart
 // =============================================================================
 
 /// Verify that sessions survive a simulated daemon restart.
 ///
-/// Per TCK-00266 AC2: State survives daemon restart
+/// Per RFC-0032::REQ-0082 AC2: State survives daemon restart
 /// Verification: Restart preserves session knowledge
 #[test]
 fn tck_00266_ac2_state_survives_restart() {

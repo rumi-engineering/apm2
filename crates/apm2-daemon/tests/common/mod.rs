@@ -10,8 +10,8 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00175: E2E lifecycle and budget tests
-//! - TCK-00176: E2E tool and telemetry tests
+//! - RFC-0033::REQ-0041: E2E lifecycle and budget tests
+//! - RFC-0033::REQ-0042: E2E tool and telemetry tests
 //! - REQ-EPISODE-001: Episode envelope requirements
 //! - REQ-DAEMON-001: Daemon requirements
 //! - REQ-TOOL-001: Tool mediation requirements

@@ -1,4 +1,4 @@
-//! View commitment types (TCK-00325).
+//! View commitment types (RFC-0032::REQ-0118).
 //!
 //! This module defines the `ViewCommitmentV1` structure used to bind the
 //! materialized workspace state to the policy resolution.

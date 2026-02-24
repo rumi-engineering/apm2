@@ -14,7 +14,7 @@
 //!
 //! # References
 //!
-//! - TCK-00150: Implement `CoordinationController` serial execution loop
+//! - RFC-0032::REQ-0050: Implement `CoordinationController` serial execution loop
 //! - AD-COORD-006: Work freshness validation before spawn
 
 use std::fmt;
@@ -154,7 +154,7 @@ pub enum ControllerError {
     /// budget. This would cause temporal confusion where duration calculations
     /// produce incorrect results.
     ///
-    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// Per RFC-0016::REQ-0003: All tick values within a coordination must use the same
     /// tick rate as the budget for replay-stable duration tracking.
     InvalidTickRate {
         /// The expected tick rate from the budget configuration.
@@ -169,7 +169,7 @@ pub enum ControllerError {
     /// clock regression or discontinuity. Per fail-closed policy, this
     /// error must be handled rather than silently ignored.
     ///
-    /// Per TCK-00242: Clock regressions are detected and reported as errors
+    /// Per RFC-0016::REQ-0003: Clock regressions are detected and reported as errors
     /// to prevent coordination from continuing indefinitely.
     ClockRegression {
         /// The tick value when coordination started.

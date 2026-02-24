@@ -1,4 +1,4 @@
-//! TCK-00418: HTF authority hardening for FAC lifecycle transitions.
+//! RFC-0032::REQ-0162: HTF authority hardening for FAC lifecycle transitions.
 //!
 //! Integration tests verifying:
 //!
@@ -805,7 +805,7 @@ fn store_envelope_with_wall_ns(
 
 /// End-to-end proof that orchestrator-issued gate leases resolve correctly
 /// through the dispatcher's `validate_lease_time_authority` when both
-/// components share the SAME CAS instance (TCK-00418 BLOCKER fix).
+/// components share the SAME CAS instance (RFC-0032::REQ-0162 BLOCKER fix).
 ///
 /// This test:
 /// 1. Creates a single shared `MemoryCas`.

@@ -16,7 +16,7 @@
 //! - [`firewall::FirewallMode`]: Enforcement mode (Warn, `SoftFail`,
 //!   `HardFail`)
 //!
-//! # Sealing (TCK-00255)
+//! # Sealing (RFC-0032::REQ-0071)
 //!
 //! Context packs are sealed after construction to ensure integrity. The seal
 //! is a BLAKE3 hash over all manifest content that:

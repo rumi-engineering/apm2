@@ -79,7 +79,7 @@ pub struct EconomicsProfile {
     pub input_state: EconomicsProfileInputState,
     /// Budget matrix keyed by `(RiskTier, BoundaryIntentClass)`.
     pub budget_matrix: BTreeMap<(RiskTier, BoundaryIntentClass), BudgetEntry>,
-    /// Control-plane rate limits (TCK-00568).
+    /// Control-plane rate limits (RFC-0032::REQ-0219).
     ///
     /// CAS-addressed alongside other economics data so that distributed
     /// quota configuration is hash-bound to the profile. When `None`,
@@ -157,7 +157,7 @@ pub enum EconomicsProfileError {
         actual: String,
     },
 
-    /// Control-plane limits are invalid (TCK-00568).
+    /// Control-plane limits are invalid (RFC-0032::REQ-0219).
     ///
     /// The `control_plane_limits` field contains values that exceed hard caps
     /// or are otherwise invalid per `ControlPlaneLimits::validate()`.
@@ -176,8 +176,8 @@ struct EconomicsProfileWire {
     lifecycle_cost_vector: LifecycleCostVector,
     input_state: EconomicsProfileInputState,
     budget_entries: Vec<BudgetCell>,
-    /// Control-plane rate limits (TCK-00568). Optional for backwards
-    /// compatibility with profiles serialized before TCK-00568.
+    /// Control-plane rate limits (RFC-0032::REQ-0219). Optional for backwards
+    /// compatibility with profiles serialized before RFC-0032::REQ-0219.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_plane_limits: Option<ControlPlaneLimits>,
 }
@@ -470,7 +470,7 @@ impl EconomicsProfileWire {
                 actual: self.schema_version.clone(),
             });
         }
-        // TCK-00568: Validate control-plane limits if present.
+        // RFC-0032::REQ-0219: Validate control-plane limits if present.
         // Prevents CAS-addressed profiles from carrying over-cap values
         // that would be silently rejected at runtime.
         if let Some(ref limits) = self.control_plane_limits {
@@ -628,7 +628,7 @@ mod tests {
         ));
     }
 
-    // TCK-00568: EconomicsProfile validation rejects invalid control-plane limits.
+    // RFC-0032::REQ-0219: EconomicsProfile validation rejects invalid control-plane limits.
     #[test]
     fn with_control_plane_limits_rejects_over_cap_token_issuance() {
         use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_TOKEN_ISSUANCE_LIMIT};

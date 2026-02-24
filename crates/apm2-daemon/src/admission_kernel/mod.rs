@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! `AdmissionKernel`: plan/execute API with capability-gated effect surfaces
-//! (RFC-0019 REQ-0023, TCK-00492).
+//! (RFC-0019 REQ-0023, RFC-0032::REQ-0170).
 //!
 //! This module owns the canonical lifecycle ordering for authoritative
 //! request admission: `join -> revalidate -> consume -> effect`.
@@ -73,7 +73,7 @@ use types::{
 /// before executing effects. If capacity cannot be reserved, the kernel
 /// denies admission (fail-closed).
 ///
-/// Implementations are provided by TCK-00496. This module defines only
+/// Implementations are provided by RFC-0020::REQ-0057. This module defines only
 /// the trait interface.
 ///
 /// # Fail-Closed Contract
@@ -127,7 +127,7 @@ impl WitnessProviderConfig {
                 ),
             });
         }
-        // QUALITY MAJOR 2 (TCK-00492): Non-zero provider_build_digest.
+        // QUALITY MAJOR 2 (RFC-0032::REQ-0170): Non-zero provider_build_digest.
         // A zero build digest means the provider measurement is unbound,
         // which would allow any binary to impersonate this witness provider.
         if self.provider_build_digest == [0u8; 32] {
@@ -144,7 +144,7 @@ impl WitnessProviderConfig {
 // =============================================================================
 
 /// `AdmissionKernel`: plan/execute API with capability-gated effect surfaces
-/// (RFC-0019 REQ-0023, TCK-00492).
+/// (RFC-0019 REQ-0023, RFC-0032::REQ-0170).
 ///
 /// This is the authoritative kernel for all admission decisions. All
 /// handler code MUST route through this kernel to obtain capability tokens
@@ -181,7 +181,7 @@ pub struct AdmissionKernelV1 {
     anti_rollback: Option<Arc<dyn AntiRollbackAnchor>>,
     /// Quarantine capacity guard (fail-closed on error for fail-closed tiers).
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
-    /// Effect execution journal for crash-safe state tracking (TCK-00501).
+    /// Effect execution journal for crash-safe state tracking (RFC-0032::REQ-0176).
     ///
     /// When wired, the kernel records effect execution transitions
     /// (`Started` before effect dispatch, `Completed` after success)
@@ -191,7 +191,7 @@ pub struct AdmissionKernelV1 {
     ///
     /// `pub(crate)` to allow the post-effect witness evidence
     /// construction path in `SessionDispatcher::handle_request_tool`
-    /// to access provider identity and build digest (TCK-00497).
+    /// to access provider identity and build digest (RFC-0020::REQ-0058).
     pub(crate) witness_provider: WitnessProviderConfig,
 }
 
@@ -262,7 +262,7 @@ impl AdmissionKernelV1 {
     }
 
     /// Set the effect execution journal for crash-safe state tracking
-    /// (TCK-00501, REQ-0029).
+    /// (RFC-0032::REQ-0176, REQ-0029).
     ///
     /// When wired, the kernel integrates journal transitions into the
     /// execute phase:
@@ -343,7 +343,7 @@ impl AdmissionKernelV1 {
             provider_build_digest: self.witness_provider.provider_build_digest,
         };
 
-        // Phase E.1: Validate witness seeds at join (TCK-00497 QUALITY BLOCKER 1).
+        // Phase E.1: Validate witness seeds at join (RFC-0020::REQ-0058 QUALITY BLOCKER 1).
         //
         // For fail-closed tiers: deny if seeds are zero, unbound, or have
         // reused nonces. This is the critical gate that prevents requests
@@ -495,7 +495,7 @@ impl AdmissionKernelV1 {
             self.verify_anti_rollback(plan.enforcement_tier, &fresh_ledger.anchor)?;
 
             // Detect policy root drift between plan and execute.
-            // SECURITY BLOCKER 1 (TCK-00492): Use constant-time comparison
+            // SECURITY BLOCKER 1 (RFC-0032::REQ-0170): Use constant-time comparison
             // for digest equality to prevent timing side-channels that could
             // leak the expected policy root digest byte-by-byte.
             if !bool::from(fresh_policy.digest.ct_eq(&plan.policy_root_digest)) {
@@ -563,7 +563,7 @@ impl AdmissionKernelV1 {
         // See: finalize_anti_rollback() method below.
 
         // Phase P.2: Derive idempotency key and build journal binding
-        // (TCK-00501).
+        // (RFC-0032::REQ-0176).
         //
         // After durable consume and before capability minting, derive
         // the idempotency key and prepare the journal binding data.
@@ -619,7 +619,7 @@ impl AdmissionKernelV1 {
             enforcement_tier: plan.enforcement_tier,
         };
 
-        // Phase S: Construct and seal AdmissionBundleV1 (TCK-00493).
+        // Phase S: Construct and seal AdmissionBundleV1 (RFC-0032::REQ-0171).
         //
         // The bundle is sealed BEFORE any receipts/events reference it.
         // The bundle digest IS the v1.1 AdmissionBindingHash.
@@ -667,7 +667,7 @@ impl AdmissionKernelV1 {
         // Validate bundle before sealing (fail-closed).
         bundle.validate()?;
 
-        // Phase P.1 (TCK-00501 SEC-MAJOR-1 fix): Build journal binding
+        // Phase P.1 (RFC-0032::REQ-0176 SEC-MAJOR-1 fix): Build journal binding
         // but do NOT call record_started here. The binding is exposed in
         // AdmissionResultV1 so the CALLER can call record_started at the
         // true pre-dispatch boundary (just before broker.execute() in
@@ -704,7 +704,7 @@ impl AdmissionKernelV1 {
         // are still accessible. The runtime post-effect path needs the
         // actual seeds (not just hashes) to call
         // `finalize_post_effect_witness` with full seed/provider binding
-        // validation (TCK-00497 QUALITY MAJOR 1).
+        // validation (RFC-0020::REQ-0058 QUALITY MAJOR 1).
         let leakage_witness_seed = plan.leakage_witness_seed.clone();
         let timing_witness_seed = plan.timing_witness_seed.clone();
 
@@ -726,7 +726,7 @@ impl AdmissionKernelV1 {
     }
 
     // =========================================================================
-    // Witness closure: seed validation at join (TCK-00497)
+    // Witness closure: seed validation at join (RFC-0020::REQ-0058)
     // =========================================================================
 
     /// Validate that witness seeds are present and non-zero for fail-closed
@@ -819,7 +819,7 @@ impl AdmissionKernelV1 {
     }
 
     // =========================================================================
-    // Witness closure: post-effect evidence finalization (TCK-00497)
+    // Witness closure: post-effect evidence finalization (RFC-0020::REQ-0058)
     // =========================================================================
 
     /// Finalize post-effect witness evidence and validate for output release.
@@ -957,7 +957,7 @@ impl AdmissionKernelV1 {
     }
 
     // =========================================================================
-    // Anti-rollback anchor finalization (TCK-00502 BLOCKER-2)
+    // Anti-rollback anchor finalization (RFC-0032::REQ-0177 BLOCKER-2)
     // =========================================================================
 
     /// Finalize anti-rollback anchor after successful effect execution.
@@ -993,7 +993,7 @@ impl AdmissionKernelV1 {
     }
 
     /// Non-mutating health probe for anti-rollback anchor state
-    /// (TCK-00502 MINOR fix: circuit probe must not mutate state).
+    /// (RFC-0032::REQ-0177 MINOR fix: circuit probe must not mutate state).
     ///
     /// Used by the fail-closed circuit breaker to test whether the anchor
     /// subsystem is healthy without advancing the anchor watermark. Unlike
@@ -1020,7 +1020,7 @@ impl AdmissionKernelV1 {
     }
 
     /// Resolve the current ledger trust anchor for post-effect anti-rollback
-    /// commit (TCK-00502 MAJOR fix: post-effect anchor).
+    /// commit (RFC-0032::REQ-0177 MAJOR fix: post-effect anchor).
     ///
     /// On authoritative write paths (e.g., `EmitEvent`), the caller SHOULD
     /// use the post-effect anchor (from the ledger trust verifier) rather
@@ -1251,7 +1251,7 @@ fn generate_nonce() -> Hash {
 ///
 /// This digest covers ALL request fields in deterministic order with
 /// length-prefixed variable-length fields, including `risk_tier` and
-/// `pcac_policy` (QUALITY MINOR 1, TCK-00492).
+/// `pcac_policy` (QUALITY MINOR 1, RFC-0032::REQ-0170).
 #[allow(clippy::cast_possible_truncation)] // String fields are bounded by MAX_* constants (<=256), safe for u32.
 fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
     let mut hasher = blake3::Hasher::new();
@@ -1295,7 +1295,7 @@ fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
             hasher.update(&[0x00]); // absence tag
         },
     }
-    // QUALITY MINOR 1 (TCK-00492): Include risk_tier and pcac_policy
+    // QUALITY MINOR 1 (RFC-0032::REQ-0170): Include risk_tier and pcac_policy
     // in canonical digest. These fields influence admission decisions
     // (enforcement tier derivation, lifecycle enforcement mode) and
     // must be bound to prevent request substitution attacks.
@@ -1337,7 +1337,7 @@ fn compute_canonical_request_digest(request: &KernelRequestV1) -> Hash {
 
 /// Build the PCAC `AuthorityJoinInputV1` from kernel request bindings.
 ///
-/// # Canonical Builder Equivalence (SECURITY MAJOR 1, TCK-00492)
+/// # Canonical Builder Equivalence (SECURITY MAJOR 1, RFC-0032::REQ-0170)
 ///
 /// This function is the admission kernel's module-equivalent of
 /// `PrivilegedPcacInputBuilder` (defined in `protocol::dispatch`).

@@ -1,6 +1,6 @@
 //! Budget tracking for episode resource management.
 //!
-//! This module implements the `BudgetTracker` per TCK-00165. The tracker
+//! This module implements the `BudgetTracker` per RFC-0033::REQ-0032. The tracker
 //! manages resource consumption during episode execution, enforcing limits
 //! from the episode envelope.
 //!
@@ -31,7 +31,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00165: Tool execution and budget charging
+//! - RFC-0033::REQ-0032: Tool execution and budget charging
 //! - AD-EPISODE-001: Immutable episode envelope with budget
 //! - CTR-2504: Defensive time handling
 
@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Budget reconciliation tests (TCK-00165 Security Fix)
+    // Budget reconciliation tests (RFC-0033::REQ-0032 Security Fix)
     // =========================================================================
 
     #[test]
@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Counter overflow tests (TCK-00165 Security Fix)
+    // Counter overflow tests (RFC-0033::REQ-0032 Security Fix)
     // =========================================================================
 
     #[test]
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Concurrent access tests (TCK-00165 Security Fix)
+    // Concurrent access tests (RFC-0033::REQ-0032 Security Fix)
     // =========================================================================
 
     #[test]

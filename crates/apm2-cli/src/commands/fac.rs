@@ -94,7 +94,7 @@ pub struct FacCommand {
     /// Bypass the service-user ownership gate for direct queue/receipt writes.
     ///
     /// By default, non-service-user processes are denied direct filesystem
-    /// writes to FAC queue and receipt directories (TCK-00577). This flag
+    /// writes to FAC queue and receipt directories (RFC-0032::REQ-0227). This flag
     /// disables that check for backward compatibility and development.
     ///
     /// **NOT recommended for production deployments.** Use broker-mediated
@@ -114,7 +114,7 @@ impl FacCommand {
     /// otherwise `QueueWriteMode::ServiceUserOnly` (the secure default).
     ///
     /// Note: `ServiceUserOnly` may still auto-bypass in user-mode inside
-    /// `check_queue_write_permission` (TCK-00657).
+    /// `check_queue_write_permission` (RFC-0032::REQ-0274).
     #[must_use]
     pub const fn queue_write_mode(&self) -> QueueWriteMode {
         if self.unsafe_local_write {
@@ -316,7 +316,7 @@ pub enum FacSubcommand {
     /// and filesystem state.
     Config(crate::commands::fac_config::ConfigArgs),
     /// Receipt-derived metrics: throughput, queue latency, denial/quarantine
-    /// rates, GC freed bytes, and disk preflight failures (TCK-00551).
+    /// rates, GC freed bytes, and disk preflight failures (RFC-0032::REQ-0206).
     ///
     /// Scans the receipt index and GC receipt store for the observation
     /// window and computes aggregate metrics. Output is JSON by default.
@@ -712,7 +712,7 @@ pub struct WorkCurrentArgs {
     #[arg(long)]
     pub branch: Option<String>,
 
-    /// Optional ticket alias override (for example `TCK-00640`).
+    /// Optional ticket alias override (for example `RFC-0032::REQ-0268`).
     #[arg(long = "ticket-alias")]
     pub ticket_alias: Option<String>,
 
@@ -784,7 +784,7 @@ pub struct WorkClaimArgs {
 /// Arguments for `apm2 fac work resolve-alias`.
 #[derive(Debug, Args)]
 pub struct ResolveAliasArgs {
-    /// Ticket alias to resolve (e.g. "TCK-00636").
+    /// Ticket alias to resolve (e.g. "RFC-0032::REQ-0264").
     #[arg(long = "ticket-alias")]
     pub ticket_alias: String,
 }
@@ -848,13 +848,13 @@ pub enum ReceiptSubcommand {
     /// non-authoritative index used for fast job/receipt lookup.
     /// The index is a cache — this command is safe to run at any time.
     Reindex(ReceiptReindexArgs),
-    /// Verify a receipt's signed envelope (TCK-00576).
+    /// Verify a receipt's signed envelope (RFC-0032::REQ-0226).
     ///
     /// Loads the signed receipt envelope for the given content hash and
     /// verifies the Ed25519 signature against the persistent broker key.
     /// Exits with 0 on success, non-zero on verification failure.
     Verify(ReceiptVerifyArgs),
-    /// Merge receipts from one directory into another (TCK-00543).
+    /// Merge receipts from one directory into another (RFC-0032::REQ-0199).
     ///
     /// Performs set-union merge on receipt digests: copies receipts from
     /// the source directory into the target directory only if they do not
@@ -898,7 +898,7 @@ pub struct ReceiptStatusArgs {
 #[derive(Debug, Args)]
 pub struct ReceiptReindexArgs {}
 
-/// Arguments for `apm2 fac receipts verify` (TCK-00576).
+/// Arguments for `apm2 fac receipts verify` (RFC-0032::REQ-0226).
 #[derive(Debug, Args)]
 pub struct ReceiptVerifyArgs {
     /// Receipt content hash (BLAKE3 hex, with or without `b3-256:` prefix)
@@ -906,7 +906,7 @@ pub struct ReceiptVerifyArgs {
     pub digest_or_path: String,
 }
 
-/// Arguments for `apm2 fac receipts merge` (TCK-00543).
+/// Arguments for `apm2 fac receipts merge` (RFC-0032::REQ-0199).
 #[derive(Debug, Args)]
 pub struct ReceiptMergeArgs {
     /// Source receipt directory to merge from.
@@ -993,11 +993,11 @@ pub struct LaneStatusArgs {
     pub state: Option<String>,
 }
 
-/// Arguments for `apm2 fac lane init` (TCK-00539).
+/// Arguments for `apm2 fac lane init` (RFC-0032::REQ-0195).
 #[derive(Debug, Args)]
 pub struct LaneInitArgs {}
 
-/// Arguments for `apm2 fac lane mark-corrupt` (TCK-00570).
+/// Arguments for `apm2 fac lane mark-corrupt` (RFC-0032::REQ-0220).
 #[derive(Debug, Args)]
 pub struct LaneMarkCorruptArgs {
     /// Lane identifier to mark as corrupt (e.g., `lane-00`).
@@ -1204,7 +1204,7 @@ pub struct PushArgs {
     #[arg(long = "work-id")]
     pub work_id: Option<String>,
 
-    /// Optional ticket alias (for example `TCK-00640`) used to resolve
+    /// Optional ticket alias (for example `RFC-0032::REQ-0268`) used to resolve
     /// canonical `work_id` via daemon projection authority.
     /// If omitted, branch/worktree TCK derivation applies.
     /// Unresolved aliases fail closed to prevent cross-ticket misbinding.
@@ -1728,7 +1728,7 @@ struct ServicesStatusResponse {
     pub worker_heartbeat: Option<apm2_core::fac::worker_heartbeat::HeartbeatStatus>,
     /// Broker health IPC status (if available).
     ///
-    /// TCK-00600: Exposes broker version, readiness, and health independently
+    /// RFC-0032::REQ-0248: Exposes broker version, readiness, and health independently
     /// of systemd unit state. This is the source of truth for whether the
     /// daemon's internal health checks are passing.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3210,14 +3210,14 @@ fn run_services_status(_json_output: bool) -> u8 {
         services.push(status);
     }
 
-    // TCK-00600: Read worker heartbeat for liveness assessment.
+    // RFC-0032::REQ-0248: Read worker heartbeat for liveness assessment.
     let fac_root =
         apm2_core::github::resolve_apm2_home().map(|home| home.join("private").join("fac"));
     let worker_heartbeat = fac_root
         .as_ref()
         .map(|root| apm2_core::fac::worker_heartbeat::read_heartbeat(root));
 
-    // TCK-00600: If the worker service is active but heartbeat is stale OR
+    // RFC-0032::REQ-0248: If the worker service is active but heartbeat is stale OR
     // read failed, mark as degraded. This covers both staleness (found=true,
     // fresh=false) and read failures (found=false or error=Some).
     let worker_active = services
@@ -3233,14 +3233,14 @@ fn run_services_status(_json_output: bool) -> u8 {
         }
     }
 
-    // TCK-00600: Read broker health IPC for version + readiness assessment.
+    // RFC-0032::REQ-0248: Read broker health IPC for version + readiness assessment.
     // This is the source of truth for whether the daemon's internal health
     // checks are passing, independent of systemd unit state.
     let broker_health = fac_root
         .as_ref()
         .map(|root| apm2_core::fac::broker_health_ipc::read_broker_health(root));
 
-    // TCK-00600: If broker health is available and reports unhealthy/degraded
+    // RFC-0032::REQ-0248: If broker health is available and reports unhealthy/degraded
     // or is stale, mark overall status as degraded.
     if let Some(ref bh) = broker_health {
         if bh.found && (!bh.fresh || bh.health_status != "healthy") {
@@ -3381,13 +3381,13 @@ fn parse_systemctl_show_output(
     };
     let uptime_seconds = compute_service_uptime(current_boot_micros, active_enter);
 
-    // TCK-00600: Parse watchdog timeout from usec to seconds.
+    // RFC-0032::REQ-0248: Parse watchdog timeout from usec to seconds.
     let watchdog_timeout_secs = watchdog_usec
         .parse::<u64>()
         .ok()
         .map_or(0, |usec| usec / 1_000_000);
 
-    // TCK-00600: Compute deterministic health verdict.
+    // RFC-0032::REQ-0248: Compute deterministic health verdict.
     // healthy = loaded + active + enabled
     // degraded = loaded but not active (e.g., activating, reloading)
     // unhealthy = not loaded, failed, or errored
@@ -3461,7 +3461,7 @@ fn parse_uptime_microseconds(raw_seconds: &str) -> Option<u128> {
 
 /// Runs the FAC command, returning an appropriate exit code.
 ///
-/// TCK-00595 MAJOR-2 FIX: `config_path` is threaded through so the
+/// RFC-0032::REQ-0244 MAJOR-2 FIX: `config_path` is threaded through so the
 /// `ensure_daemon_running` fallback spawn uses the same config the caller
 /// specified via `--config`.
 pub fn run_fac(
@@ -3470,21 +3470,21 @@ pub fn run_fac(
     session_socket: &Path,
     config_path: &Path,
 ) -> u8 {
-    // TCK-00606 S12 invariant: FAC commands are machine-output only.
+    // RFC-0032::REQ-0250 S12 invariant: FAC commands are machine-output only.
     let machine_output = subcommand_requests_machine_output(&cmd.subcommand);
     let json_output = machine_output;
 
-    // TCK-00577 round 3: Enqueue-class commands (push, gates, warm) may be
+    // RFC-0032::REQ-0227 round 3: Enqueue-class commands (push, gates, warm) may be
     // invoked by non-service-user callers in a service-user-owned deployment.
     // These callers cannot satisfy the strict ownership check on FAC roots
     // (directories are owned by the service user). Use a relaxed validation
     // that checks mode bits and symlink safety but NOT ownership, so the
     // caller can reach enqueue_job → broker fallback → broker_requests/.
     // All other commands require strict ownership validation.
-    // TCK-00577 round 6: Bench spawns gate measurements as child processes
+    // RFC-0032::REQ-0227 round 6: Bench spawns gate measurements as child processes
     // that need the relaxed permission validation path (same as enqueue-class
     // commands), so include it here.
-    // TCK-00577 round 9 MAJOR fix: Worker and Broker subcommands must also
+    // RFC-0032::REQ-0227 round 9 MAJOR fix: Worker and Broker subcommands must also
     // use relaxed validation. The worker itself sets queue/ to 0711 and
     // broker_requests/ to 01733 via ensure_queue_dirs(). The strict validator
     // (0700-only) rejects these intentional modes, causing worker restart to
@@ -4716,7 +4716,7 @@ fn run_work_claim(args: &WorkClaimArgs, operator_socket: &Path, json_output: boo
     }
 }
 
-/// Execute the work resolve-alias command (TCK-00636).
+/// Execute the work resolve-alias command (RFC-0032::REQ-0264).
 ///
 /// Resolves a ticket alias to a canonical `work_id` via daemon
 /// `AliasReconciliationGate::resolve_ticket_alias`.
@@ -5378,7 +5378,7 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
 }
 
 // =============================================================================
-// Receipt List Command (TCK-00560)
+// Receipt List Command (RFC-0032::REQ-0213)
 // =============================================================================
 
 /// List receipt headers from the index.
@@ -5386,7 +5386,7 @@ fn detect_receipt_type(json: &serde_json::Value) -> String {
 /// Uses the receipt index for O(1) access instead of scanning the receipt
 /// directory. Common operations no longer require full directory scans.
 ///
-/// # Deterministic Ordering (TCK-00535)
+/// # Deterministic Ordering (RFC-0032::REQ-0191)
 ///
 /// Receipts are sorted by `timestamp_secs` descending (most recent first).
 /// For equal timestamps, receipts are sorted by `content_hash` ascending
@@ -5499,7 +5499,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 }
 
 // =============================================================================
-// Receipt Status Command (TCK-00560)
+// Receipt Status Command (RFC-0032::REQ-0213)
 // =============================================================================
 
 /// Look up the latest receipt for a job ID using the index.
@@ -5570,7 +5570,7 @@ fn run_receipt_status(args: &ReceiptStatusArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Receipt Reindex Command (TCK-00560)
+// Receipt Reindex Command (RFC-0032::REQ-0213)
 // =============================================================================
 
 /// Execute the receipt reindex command.
@@ -5656,7 +5656,7 @@ fn run_receipt_reindex(json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Receipt Verify Command (TCK-00576)
+// Receipt Verify Command (RFC-0032::REQ-0226)
 // =============================================================================
 
 /// Verify a receipt's signed envelope.
@@ -5774,7 +5774,7 @@ fn run_receipt_verify(args: &ReceiptVerifyArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Receipt Merge Command (TCK-00543)
+// Receipt Merge Command (RFC-0032::REQ-0199)
 // =============================================================================
 
 /// Execute the receipt merge command: set-union merge with audit report.
@@ -6132,7 +6132,7 @@ fn retrieve_artifact_to_dir(
 }
 
 // =============================================================================
-// Lane Status Command (TCK-00515)
+// Lane Status Command (RFC-0032::REQ-0181)
 // =============================================================================
 
 /// JSON response for `apm2 fac lane status`.
@@ -6269,7 +6269,7 @@ fn run_lane_status(args: &LaneStatusArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Lane Mark-Corrupt Command (TCK-00570)
+// Lane Mark-Corrupt Command (RFC-0032::REQ-0220)
 // =============================================================================
 
 /// Execute `apm2 fac lane mark-corrupt <lane_id> --reason ...`.
@@ -6441,7 +6441,7 @@ fn run_lane_mark_corrupt_with_manager(
 }
 
 // =============================================================================
-// Lane Init Command (TCK-00539)
+// Lane Init Command (RFC-0032::REQ-0195)
 // =============================================================================
 
 /// Execute `apm2 fac lane init`.
@@ -6597,7 +6597,7 @@ fn derive_fac_repo_or_exit(json_output: bool) -> Result<String, u8> {
 
 /// Output an error as pretty-printed JSON to stdout.
 ///
-/// TCK-00606 S12: FAC commands are JSON-only.
+/// RFC-0032::REQ-0250 S12: FAC commands are JSON-only.
 fn output_error(_json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
     let error = ErrorResponse {
         error: code.to_string(),
@@ -6639,7 +6639,7 @@ fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
 }
 
 // =============================================================================
-// Verify Containment (TCK-00548)
+// Verify Containment (RFC-0032::REQ-0203)
 // =============================================================================
 
 /// Runs the `apm2 fac verify containment` command.
@@ -6734,7 +6734,7 @@ fn run_verify_containment(args: &ContainmentArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Bundle Export/Import (TCK-00527)
+// Bundle Export/Import (RFC-0032::REQ-0186)
 // =============================================================================
 
 /// Maximum envelope file size for bounded reads during import (256 KiB).
@@ -6835,7 +6835,7 @@ fn build_export_config_from_receipt(
         leakage_budget_receipt,
         timing_channel_budget,
         disclosure_policy_binding,
-        // TCK-00555: Leakage budget policy defaults to Tier2 (fail-closed).
+        // RFC-0032::REQ-0210: Leakage budget policy defaults to Tier2 (fail-closed).
         // Tier0 requires explicit opt-in configuration. The secure default
         // bounds evidence export to 4 MiB / 16 classes / 64 leakage bits.
         leakage_budget_policy: Some(
@@ -7411,7 +7411,7 @@ fn run_bundle_import(args: &BundleImportArgs, json_output: bool) -> u8 {
 }
 
 // =============================================================================
-// Metrics (TCK-00551)
+// Metrics (RFC-0032::REQ-0206)
 // =============================================================================
 
 /// Default observation window: 24 hours (in seconds).
@@ -7634,7 +7634,7 @@ fn run_metrics(args: &MetricsArgs, json_output: bool) -> u8 {
     summary.unverified_headers_skipped = unverified_headers_skipped;
     summary.timestamp_mismatches = timestamp_mismatches;
 
-    // TCK-00606 S12: FAC commands are machine-output only.
+    // RFC-0032::REQ-0250 S12: FAC commands are machine-output only.
     match serde_json::to_string_pretty(&summary) {
         Ok(json) => println!("{json}"),
         Err(e) => {
@@ -7695,9 +7695,9 @@ mod tests {
 
     #[test]
     fn derive_adhoc_session_id_is_deterministic() {
-        let first = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
-        let second = derive_adhoc_session_id("W-TCK-00640", "L-issued-001");
-        let third = derive_adhoc_session_id("W-TCK-00640", "L-issued-002");
+        let first = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-001");
+        let second = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-001");
+        let third = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-issued-002");
 
         assert_eq!(first, second);
         assert_ne!(first, third);
@@ -7711,7 +7711,7 @@ mod tests {
             "work",
             "open",
             "--from-ticket",
-            "documents/work/tickets/TCK-00640.json",
+            "documents/work/tickets/RFC-0032::REQ-0268.json",
             "--lease-id",
             "L-governing-001",
         ]);
@@ -7724,7 +7724,7 @@ mod tests {
             "work",
             "claim",
             "--work-id",
-            "W-TCK-00640",
+            "W-RFC-0032::REQ-0268",
             "--lease-id",
             "L-governing-001",
             "--role",
@@ -8691,8 +8691,8 @@ mod tests {
     #[test]
     fn extract_tck_from_text_accepts_valid_pattern() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0018/TCK-00640"),
-            Some("TCK-00640".to_string())
+            extract_tck_from_text("ticket/RFC-0018/RFC-0032::REQ-0268"),
+            Some("RFC-0032::REQ-0268".to_string())
         );
     }
 
@@ -8700,7 +8700,7 @@ mod tests {
     fn extract_tck_from_text_rejects_invalid_pattern() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
-        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-006400"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/RFC-0032::REQ-02680"), None);
     }
 
     #[test]
@@ -8787,8 +8787,8 @@ mod tests {
 
     #[test]
     fn unresolved_work_current_alias_message_includes_fail_closed_guidance() {
-        let msg = unresolved_work_current_alias_message("TCK-00640");
-        assert!(msg.contains("TCK-00640"));
+        let msg = unresolved_work_current_alias_message("RFC-0032::REQ-0268");
+        assert!(msg.contains("RFC-0032::REQ-0268"));
         assert!(msg.contains("Refusing projection fallback"));
         assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
@@ -9816,7 +9816,7 @@ mod tests {
         // CAS (plain BLAKE3), used by the export function to retrieve the blob.
         // The receipt *file* is named by `compute_job_receipt_content_hash`
         // (domain-separated BLAKE3 of canonical bytes), which the fallback
-        // scan verifies for integrity (MAJOR-1 fix, TCK-00564 round 8).
+        // scan verifies for integrity (MAJOR-1 fix, RFC-0032::REQ-0215 round 8).
         // These two hashes are intentionally different: `content_hash` is a
         // CAS reference, while the filename is the integrity digest.
         let receipt = FacJobReceiptV1 {
@@ -10040,7 +10040,7 @@ mod tests {
     // MAJOR security fix: job_id path traversal prevention tests
     // =========================================================================
 
-    /// TCK-00527: Empty `job_id` must be rejected.
+    /// RFC-0032::REQ-0186: Empty `job_id` must be rejected.
     #[test]
     fn test_validate_job_id_rejects_empty() {
         let result = validate_job_id_for_path("");
@@ -10051,7 +10051,7 @@ mod tests {
         );
     }
 
-    /// TCK-00527: Absolute path `job_id` must be rejected.
+    /// RFC-0032::REQ-0186: Absolute path `job_id` must be rejected.
     #[test]
     fn test_validate_job_id_rejects_absolute_path() {
         let result = validate_job_id_for_path("/tmp/evil");
@@ -10062,7 +10062,7 @@ mod tests {
         );
     }
 
-    /// TCK-00527: Backslash absolute path must be rejected.
+    /// RFC-0032::REQ-0186: Backslash absolute path must be rejected.
     #[test]
     fn test_validate_job_id_rejects_backslash_absolute() {
         let result = validate_job_id_for_path("\\tmp\\evil");
@@ -10072,7 +10072,7 @@ mod tests {
         );
     }
 
-    /// TCK-00527: Path traversal via `..` must be rejected.
+    /// RFC-0032::REQ-0186: Path traversal via `..` must be rejected.
     #[test]
     fn test_validate_job_id_rejects_dotdot_traversal() {
         for traversal in &["../../../etc/passwd", "..%2F..%2Fetc", "foo/../bar", ".."] {
@@ -10084,7 +10084,7 @@ mod tests {
         }
     }
 
-    /// TCK-00527: Job IDs containing path separators must be rejected.
+    /// RFC-0032::REQ-0186: Job IDs containing path separators must be rejected.
     #[test]
     fn test_validate_job_id_rejects_path_separators() {
         for bad in &["a/b", "a\\b", "foo/bar/baz"] {
@@ -10096,7 +10096,7 @@ mod tests {
         }
     }
 
-    /// TCK-00527: Job IDs with special characters must be rejected.
+    /// RFC-0032::REQ-0186: Job IDs with special characters must be rejected.
     #[test]
     fn test_validate_job_id_rejects_special_chars() {
         for bad in &["a;b", "a b", "a\x00b", "a*b", "a?b", "$HOME"] {
@@ -10108,7 +10108,7 @@ mod tests {
         }
     }
 
-    /// TCK-00527: Valid job IDs must be accepted.
+    /// RFC-0032::REQ-0186: Valid job IDs must be accepted.
     #[test]
     fn test_validate_job_id_accepts_valid_ids() {
         for valid in &[
@@ -10221,7 +10221,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Lane Mark-Corrupt Command Tests (TCK-00570)
+    // Lane Mark-Corrupt Command Tests (RFC-0032::REQ-0220)
     // =========================================================================
 
     #[test]

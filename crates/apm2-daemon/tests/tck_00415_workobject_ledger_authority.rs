@@ -1,4 +1,4 @@
-//! TCK-00415: `WorkObject` ledger-authority cutover integration tests.
+//! RFC-0032::REQ-0159: `WorkObject` ledger-authority cutover integration tests.
 //!
 //! Validates that runtime work lifecycle authority is derived from
 //! projection rebuilds of ledger events (no filesystem ticket authority).

@@ -195,7 +195,7 @@ pub enum PersistTrigger {
         code: Option<String>,
     },
 
-    /// Taint flow policy denied an untrusted content flow (TCK-00339).
+    /// Taint flow policy denied an untrusted content flow (RFC-0032::REQ-0130).
     ///
     /// Emitted when untrusted or adversarial content attempts to flow into
     /// a restricted target context (receipt, high-authority prompt, etc.)
@@ -311,7 +311,7 @@ impl PersistTrigger {
         }
     }
 
-    /// Creates a taint flow denied trigger from a `TaintViolation` (TCK-00339).
+    /// Creates a taint flow denied trigger from a `TaintViolation` (RFC-0032::REQ-0130).
     #[must_use]
     pub fn taint_flow_denied(
         source: impl Into<String>,

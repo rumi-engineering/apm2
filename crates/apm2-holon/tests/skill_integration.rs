@@ -1,7 +1,7 @@
 //! Integration tests for skill frontmatter parsing and holon execution.
 //!
 //! These tests verify the complete flow from skill parsing through holon
-//! execution, as specified in TCK-00047.
+//! execution, as specified in RFC-0032::REQ-0043.
 //!
 //! # Test Coverage
 //!
@@ -10,7 +10,7 @@
 //! - Stop conditions work as documented
 //! - Pattern is clear from documentation
 //!
-//! # Definition of Done (TCK-00047)
+//! # Definition of Done (RFC-0032::REQ-0043)
 //!
 //! 1. example-holon skill loads correctly
 //! 2. Skill executes through episode loop
@@ -235,7 +235,7 @@ fn spawn_config_from_holon_config(
 // Integration Tests
 // ============================================================================
 
-/// TCK-00047 Criterion 1: example-holon skill loads correctly.
+/// RFC-0032::REQ-0043 Criterion 1: example-holon skill loads correctly.
 ///
 /// Verifies that the SKILL.md file parses successfully and contains
 /// valid holon configuration.
@@ -310,7 +310,7 @@ fn test_example_holon_skill_loads_correctly() {
     assert!(body.contains("Tool Permissions"));
 }
 
-/// TCK-00047 Criterion 2: Skill executes through episode loop.
+/// RFC-0032::REQ-0043 Criterion 2: Skill executes through episode loop.
 ///
 /// Verifies that a holon configured from the skill executes episodes
 /// correctly until completion.
@@ -343,7 +343,7 @@ fn test_skill_executes_through_episode_loop() {
     assert!(holon.state.tokens_used > 0);
 }
 
-/// TCK-00047 Criterion 3: Stop conditions work as documented.
+/// RFC-0032::REQ-0043 Criterion 3: Stop conditions work as documented.
 ///
 /// Verifies that all configured stop conditions trigger correctly.
 #[test]
@@ -462,7 +462,7 @@ fn test_stop_conditions_work_as_documented() {
     }
 }
 
-/// TCK-00047 Criterion 4: Pattern is clear from documentation.
+/// RFC-0032::REQ-0043 Criterion 4: Pattern is clear from documentation.
 ///
 /// Verifies that the skill documentation contains all required sections
 /// and explains the holon pattern clearly.
@@ -520,7 +520,7 @@ fn test_pattern_is_clear_from_documentation() {
     );
 }
 
-/// TCK-00047 Criterion 5: Integration test passes.
+/// RFC-0032::REQ-0043 Criterion 5: Integration test passes.
 ///
 /// This test is the comprehensive integration test that exercises the
 /// full skill loading and execution flow.
@@ -565,7 +565,7 @@ fn test_full_skill_integration() {
     assert!(body.contains("tokens"));
 
     // Test complete!
-    println!("TCK-00047 Integration test passed:");
+    println!("RFC-0032::REQ-0043 Integration test passed:");
     println!("  - Skill loaded: {}", frontmatter.name);
     println!("  - Episodes executed: {}", result.episodes_executed);
     println!("  - Output: {:?}", result.output);
@@ -735,7 +735,7 @@ fn test_episode_controller_respects_skill_config() {
 }
 
 // ============================================================================
-// TCK-00048: rfc-council Skill Holon Configuration Tests
+// RFC-0032::REQ-0044: rfc-council Skill Holon Configuration Tests
 // ============================================================================
 
 /// Returns the path to the rfc-council SKILL.md file.
@@ -760,7 +760,7 @@ fn rfc_council_assets_index_path() -> PathBuf {
         .join("documents/skills/rfc-council/assets/index.json")
 }
 
-/// TCK-00048 Criterion 1: rfc-council skill has holon: configuration.
+/// RFC-0032::REQ-0044 Criterion 1: rfc-council skill has holon: configuration.
 ///
 /// Verifies that the SKILL.md file parses successfully and contains
 /// valid holon configuration.
@@ -822,7 +822,7 @@ fn test_rfc_council_skill_has_holon_config() {
     );
 }
 
-/// TCK-00048 Criterion 2: Stop conditions appropriate for RFC work.
+/// RFC-0032::REQ-0044 Criterion 2: Stop conditions appropriate for RFC work.
 ///
 /// Verifies that the configured stop conditions are suitable for
 /// RFC generation work (multi-phase, longer-running).
@@ -864,7 +864,7 @@ fn test_rfc_council_stop_conditions_appropriate() {
     );
 }
 
-/// TCK-00048 Criterion 3: Budget limits prevent runaway execution.
+/// RFC-0032::REQ-0044 Criterion 3: Budget limits prevent runaway execution.
 ///
 /// Verifies that budget limits are set and will prevent unbounded
 /// resource consumption.
@@ -911,7 +911,7 @@ fn test_rfc_council_budget_limits_prevent_runaway() {
     );
 }
 
-/// TCK-00048 Criterion 4: rfc-council executes correctly as holon.
+/// RFC-0032::REQ-0044 Criterion 4: rfc-council executes correctly as holon.
 ///
 /// Verifies that a spawn configuration can be built from the skill
 /// and a holon can be executed with it.
@@ -942,7 +942,7 @@ fn test_rfc_council_executes_as_holon() {
     );
 }
 
-/// TCK-00048 Criterion 5: No regression in existing behavior.
+/// RFC-0032::REQ-0044 Criterion 5: No regression in existing behavior.
 ///
 /// Verifies that the skill's CAC assets index contains all required
 /// instruction specs for complete RFC council functionality.

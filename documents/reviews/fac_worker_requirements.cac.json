@@ -17,7 +17,7 @@
     "last_aligned_rfc": "RFC-0019",
     "provenance": {
       "actor_id": "HOLON-PLATFORM-GOVERNANCE",
-      "work_id": "TCK-00664-REQUIREMENTS-CODIFICATION",
+      "work_id": "RFC-0032::REQ-0287-REQUIREMENTS-CODIFICATION",
       "source_receipts": [],
       "incident_refs": [
         {
@@ -275,9 +275,9 @@
     },
     "cross_references": {
       "tickets": [
-        "TCK-00664",
-        "TCK-00660",
-        "TCK-00577"
+        "RFC-0032::REQ-0287",
+        "RFC-0032::REQ-0286",
+        "RFC-0032::REQ-0227"
       ],
       "rfcs": [
         "RFC-0019"

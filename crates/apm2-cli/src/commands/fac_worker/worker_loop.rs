@@ -400,7 +400,7 @@ pub(super) fn run_fac_worker_impl(
         );
     }
 
-    // FU-003 (TCK-00625): Emit binary identity event at startup for
+    // FU-003 (RFC-0032::REQ-0256): Emit binary identity event at startup for
     // postmortem correlation. Includes resolved exe path, SHA-256 digest,
     // PID, and timestamp. This aids diagnosis of INV-PADOPT-004-class
     // binary drift incidents.
@@ -422,7 +422,7 @@ pub(super) fn run_fac_worker_impl(
         },
     };
 
-    // TCK-00565 MAJOR-1 fix: Load the actual boundary_id from FAC node identity
+    // RFC-0032::REQ-0216 MAJOR-1 fix: Load the actual boundary_id from FAC node identity
     // instead of using a hardcoded constant. Falls back to FALLBACK_BOUNDARY_ID
     // only when APM2 home cannot be resolved (no-home edge case).
     let boundary_id = resolve_apm2_home()
@@ -496,7 +496,7 @@ pub(super) fn run_fac_worker_impl(
         },
     );
 
-    // TCK-00566: Load persisted token ledger if available. The ledger
+    // RFC-0032::REQ-0217: Load persisted token ledger if available. The ledger
     // survives restarts so replay protection is not lost on daemon restart.
     // INV-TL-009: Load errors from an existing file are hard security faults.
     match load_token_ledger(broker.current_tick()) {
@@ -626,7 +626,7 @@ pub(super) fn run_fac_worker_impl(
         },
     };
 
-    // TCK-00579: Derive job spec validation policy from FAC policy.
+    // RFC-0032::REQ-0229: Derive job spec validation policy from FAC policy.
     // This enables repo_id allowlist, bytes_backend allowlist, and
     // filesystem-path rejection at worker pre-claim time.
     let job_spec_policy = match policy.job_spec_validation_policy() {
@@ -716,7 +716,7 @@ pub(super) fn run_fac_worker_impl(
 
     let verifying_key = broker.verifying_key();
 
-    // TCK-00534: Crash recovery — reconcile queue/claimed and lane leases on
+    // RFC-0032::REQ-0190: Crash recovery — reconcile queue/claimed and lane leases on
     // worker startup. Detects stale leases (PID dead, lock released) and
     // orphaned claimed jobs, then recovers them deterministically with receipts.
     {
@@ -774,7 +774,7 @@ pub(super) fn run_fac_worker_impl(
         }
     }
 
-    // TCK-00538: Resolve toolchain fingerprint with cache-first strategy.
+    // RFC-0032::REQ-0194: Resolve toolchain fingerprint with cache-first strategy.
     // Fail-closed: if fingerprint resolution fails, the worker refuses to
     // start. The fingerprint is required for receipt integrity and lane
     // target namespacing.
@@ -873,7 +873,7 @@ pub(super) fn run_fac_worker_impl(
     // threads or inotify instances.
     let continuous_runtime = should_start_background_runtime(once);
 
-    // TCK-00600: Notify systemd that the worker is ready for continuous mode.
+    // RFC-0032::REQ-0248: Notify systemd that the worker is ready for continuous mode.
     // In one-shot mode we still emit a status message but skip long-lived
     // background runtime primitives.
     let _ = apm2_core::fac::sd_notify::notify_ready();
@@ -1066,7 +1066,7 @@ pub(super) fn run_fac_worker_impl(
             "healthy"
         };
 
-        // TCK-00600: Write worker heartbeat file for `services status`.
+        // RFC-0032::REQ-0248: Write worker heartbeat file for `services status`.
         if let Err(e) = apm2_core::fac::worker_heartbeat::write_heartbeat(
             &fac_root,
             cycle_count,
@@ -1084,7 +1084,7 @@ pub(super) fn run_fac_worker_impl(
         // S10: Proactively reap orphaned LEASED lanes on each wake cycle.
         reap_orphaned_leases_on_tick(&fac_root, json_output);
 
-        // TCK-00586: Multi-worker fairness — try scan lock before scanning.
+        // RFC-0032::REQ-0236: Multi-worker fairness — try scan lock before scanning.
         //
         // When multiple workers poll the same queue, redundant directory scans
         // cause a CPU/IO stampede. The optional scan lock ensures at most one
@@ -1148,7 +1148,7 @@ pub(super) fn run_fac_worker_impl(
             },
         };
 
-        // TCK-00577: Promote broker requests from non-service-user
+        // RFC-0032::REQ-0227: Promote broker requests from non-service-user
         // callers into pending/ before scanning. The loaded FAC policy's
         // queue_bounds_policy is threaded through to ensure broker
         // promotion enforces the same configured limits as enqueue_direct.
@@ -1277,7 +1277,7 @@ pub(super) fn run_fac_worker_impl(
             continue;
         }
 
-        // TCK-00587: Anti-starvation two-pass semantics. Candidates are
+        // RFC-0032::REQ-0237: Anti-starvation two-pass semantics. Candidates are
         // sorted by (priority ASC, enqueue_time ASC, job_id ASC) where
         // StopRevoke priority = 0 (highest). This ordering guarantees all
         // stop_revoke jobs in the cycle are processed before any lower-

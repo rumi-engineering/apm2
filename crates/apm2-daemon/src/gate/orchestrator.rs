@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00388, TCK-00672)
+// AGENT-AUTHORED (RFC-0032::REQ-0142, RFC-0032::REQ-0276)
 //! Gate execution orchestrator implementation.
 //!
 //! Gate orchestration is publication-driven: the single authoritative
@@ -450,7 +450,7 @@ pub enum GateOrchestratorError {
         changeset_digest: String,
     },
 
-    /// Sublease validation failed during delegated lease issuance (TCK-00340).
+    /// Sublease validation failed during delegated lease issuance (RFC-0032::REQ-0131).
     ///
     /// A newly issued gate lease failed strict-subset validation against its
     /// parent lease. This prevents scope escalation via gate switching or
@@ -652,7 +652,7 @@ struct OrchestrationEntry {
     /// Collected receipts indexed by gate type.
     receipts: HashMap<GateType, GateReceipt>,
     /// When the orchestration started (ms since epoch).
-    /// Used by downstream merge automation (TCK-00390) for stale detection.
+    /// Used by downstream merge automation (RFC-0032::REQ-0144) for stale detection.
     /// This is metadata/informational only - NOT used for timeout decisions.
     _started_at_ms: u64,
     /// Monotonic instant when the orchestration started (Security BLOCKER 1).
@@ -4438,7 +4438,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00340: Sublease delegation validation tests (production wiring)
+    // RFC-0032::REQ-0131: Sublease delegation validation tests (production wiring)
     // =========================================================================
 
     #[test]
@@ -4535,7 +4535,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00340: Delegated sublease issuance integration tests
+    // RFC-0032::REQ-0131: Delegated sublease issuance integration tests
     // (production path through issue_delegated_sublease)
     // =========================================================================
 
@@ -4694,7 +4694,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00418: CAS-backed time_envelope_ref integration tests
+    // RFC-0032::REQ-0162: CAS-backed time_envelope_ref integration tests
     // =========================================================================
 
     /// Verifies that when a CAS is configured, `issue_gate_lease` produces a

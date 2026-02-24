@@ -1,4 +1,4 @@
-//! Integration tests for TCK-00291 real tool handlers.
+//! Integration tests for RFC-0032::REQ-0093 real tool handlers.
 //!
 //! Verifies:
 //! - `ReadFileHandler`: real FS reads, offsets, limits, root confinement

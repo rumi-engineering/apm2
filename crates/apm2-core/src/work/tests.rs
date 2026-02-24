@@ -647,7 +647,7 @@ fn test_work_completed_without_evidence_errors() {
 }
 
 // =============================================================================
-// TCK-00650: merge_receipt_id / gate_receipt_id field semantics
+// RFC-0032::REQ-0271: merge_receipt_id / gate_receipt_id field semantics
 // =============================================================================
 
 #[test]
@@ -744,7 +744,7 @@ fn test_work_completed_stores_both_gate_and_merge_receipt_ids() {
     );
 }
 
-// TCK-00650 Round 2: Bidirectional domain separation (INV-0113 + INV-0114)
+// RFC-0032::REQ-0271 Round 2: Bidirectional domain separation (INV-0113 + INV-0114)
 
 #[test]
 fn test_work_completed_rejects_invalid_merge_receipt_id_prefix() {
@@ -2502,7 +2502,7 @@ fn test_pr_number_rebinds_from_legacy_to_canonical_ticket_work() {
     let ctx = ReducerContext::new(1);
 
     let legacy_work_id = "W-439f2df5-4650-4632-9889-a39af6dae839";
-    let canonical_work_id = "W-TCK-00640";
+    let canonical_work_id = "W-RFC-0032::REQ-0268";
 
     setup_in_progress_work(&mut reducer, &ctx, legacy_work_id);
     setup_in_progress_work(&mut reducer, &ctx, canonical_work_id);

@@ -2,7 +2,7 @@
 //!
 //! This is the main daemon binary that manages AI CLI processes.
 //!
-//! # `ProtocolServer`-Only Control Plane (TCK-00279)
+//! # `ProtocolServer`-Only Control Plane (RFC-0032::REQ-0085)
 //!
 //! Per DD-009 (RFC-0017), the daemon uses a dual-socket `ProtocolServer`
 //! architecture:
@@ -12,7 +12,7 @@
 //! Legacy JSON IPC has been removed. `ProtocolServer` is the only control-plane
 //! IPC.
 //!
-//! # Prometheus Metrics (TCK-00268)
+//! # Prometheus Metrics (RFC-0032::REQ-0084)
 //!
 //! The daemon exposes Prometheus metrics at `/metrics` (default port 9100).
 //! Per REQ-DCP-0012, the following metrics are exposed:
@@ -25,7 +25,7 @@
 //!
 //! See RFC-0017 for architecture details.
 //!
-//! # Fork Safety (TCK-00282)
+//! # Fork Safety (RFC-0032::REQ-0087)
 //!
 //! Daemonization via `fork()` MUST occur BEFORE the Tokio runtime starts.
 //! The `#[tokio::main]` macro expands to code that initializes a multi-threaded
@@ -112,7 +112,7 @@ struct Args {
     #[arg(long)]
     session_socket: Option<PathBuf>,
 
-    /// Path to state file for persistent session registry (TCK-00266)
+    /// Path to state file for persistent session registry (RFC-0032::REQ-0082)
     #[arg(long)]
     state_file: Option<PathBuf>,
 
@@ -120,7 +120,7 @@ struct Args {
     #[arg(long)]
     ledger_db: Option<PathBuf>,
 
-    /// Path to durable content-addressed storage (CAS) directory (TCK-00383)
+    /// Path to durable content-addressed storage (CAS) directory (RFC-0032::REQ-0137)
     ///
     /// When provided with `--ledger-db`, enables full session dispatcher wiring
     /// via `with_persistence_and_cas()`. The directory is created with mode
@@ -136,7 +136,7 @@ struct Args {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
-    /// Port for Prometheus metrics HTTP endpoint (TCK-00268)
+    /// Port for Prometheus metrics HTTP endpoint (RFC-0032::REQ-0084)
     /// Default: 9100
     #[arg(long, default_value = "9100")]
     metrics_port: u16,
@@ -146,7 +146,7 @@ struct Args {
     no_metrics: bool,
 }
 
-/// Default port for Prometheus metrics HTTP endpoint (TCK-00268).
+/// Default port for Prometheus metrics HTTP endpoint (RFC-0032::REQ-0084).
 pub const DEFAULT_METRICS_PORT: u16 = 9100;
 
 /// Daemon configuration derived from args and config file.
@@ -155,13 +155,13 @@ struct DaemonConfig {
     operator_socket_path: PathBuf,
     session_socket_path: PathBuf,
     pid_path: PathBuf,
-    /// State file path for persistent session registry (TCK-00266).
+    /// State file path for persistent session registry (RFC-0032::REQ-0082).
     state_file_path: PathBuf,
     /// Ledger database path (`SQLite`).
     ledger_db_path: Option<PathBuf>,
-    /// CAS directory path for durable content-addressed storage (TCK-00383).
+    /// CAS directory path for durable content-addressed storage (RFC-0032::REQ-0137).
     cas_path: Option<PathBuf>,
-    /// Port for Prometheus metrics HTTP endpoint (TCK-00268).
+    /// Port for Prometheus metrics HTTP endpoint (RFC-0032::REQ-0084).
     metrics_port: u16,
     /// Whether to disable the metrics endpoint.
     metrics_disabled: bool,
@@ -205,7 +205,7 @@ impl DaemonConfig {
             .clone()
             .or_else(|| config.daemon.ledger_db.clone());
 
-        // TCK-00383: CAS path from CLI args, falling back to config file
+        // RFC-0032::REQ-0137: CAS path from CLI args, falling back to config file
         let cas_path = args
             .cas_path
             .clone()
@@ -362,7 +362,7 @@ mod daemon_config_tests {
 
 /// Write PID file atomically.
 ///
-/// TCK-00537: Uses [`apm2_daemon::fs_safe::atomic_write`] for crash-safe
+/// RFC-0032::REQ-0193: Uses [`apm2_daemon::fs_safe::atomic_write`] for crash-safe
 /// PID file creation (temp + fsync + rename). Parent directory is created
 /// with mode 0700 (restrictive permissions).
 fn write_pid_file(pid_path: &PathBuf) -> Result<()> {
@@ -383,7 +383,7 @@ fn remove_pid_file(pid_path: &PathBuf) {
 
 /// Load or create a persistent signer key for projection receipts.
 ///
-/// TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
+/// RFC-0032::REQ-0116 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
 ///
 /// The projection worker requires a persistent signing key to ensure receipt
 /// signatures remain valid across daemon restarts. This function:
@@ -411,7 +411,7 @@ fn load_or_create_persistent_signer(
 
     match apm2_daemon::fs_safe::bounded_read(key_path, 4096) {
         Ok(key_bytes) => {
-            // TCK-00537: Load uses safe_open (symlink refusal + bounded read).
+            // RFC-0032::REQ-0193: Load uses safe_open (symlink refusal + bounded read).
             if key_bytes.len() != 32 {
                 anyhow::bail!(
                     "invalid signer key file: expected 32 bytes, got {}",
@@ -429,7 +429,7 @@ fn load_or_create_persistent_signer(
             let signer = Signer::generate();
             let key_bytes = signer.secret_key_bytes();
 
-            // TCK-00537: Use atomic_write for crash-safe key persistence.
+            // RFC-0032::REQ-0193: Use atomic_write for crash-safe key persistence.
             // atomic_write creates temp file with 0600 permissions
             // (NamedTempFile default), fsync, then rename.
             apm2_daemon::fs_safe::atomic_write(key_path, &*key_bytes)
@@ -494,7 +494,7 @@ fn load_or_create_ledger_signing_key(
         }
     }
 
-    // TCK-00537: Use fs_safe primitives for symlink refusal (O_NOFOLLOW),
+    // RFC-0032::REQ-0193: Use fs_safe primitives for symlink refusal (O_NOFOLLOW),
     // bounded reads, and regular-file verification.
     match apm2_daemon::fs_safe::bounded_read(&key_path, 4096) {
         Ok(key_bytes) => {
@@ -538,7 +538,7 @@ fn load_or_create_ledger_signing_key(
             let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
             let key_bytes = signing_key.to_bytes();
 
-            // TCK-00537: Use atomic_write for crash-safe key persistence.
+            // RFC-0032::REQ-0193: Use atomic_write for crash-safe key persistence.
             // atomic_write creates parent dir with 0700 and temp file with
             // 0600 permissions, fsync, then atomic rename.
             apm2_daemon::fs_safe::atomic_write(&key_path, &key_bytes)
@@ -664,7 +664,7 @@ async fn collect_tracked_pids(state: &SharedState) -> std::collections::HashMap<
 /// Graceful shutdown: stop all running processes using a deadline-driven
 /// loop.
 ///
-/// **Cancellation safety (TCK-00392 BLOCKER fix):**
+/// **Cancellation safety (RFC-0032::REQ-0146 BLOCKER fix):**
 ///
 /// Unlike the previous implementation, this function is NOT wrapped in an
 /// outer `tokio::time::timeout`. Instead it uses an internal deadline: each
@@ -753,7 +753,7 @@ async fn shutdown_all_processes(state: &SharedState, deadline: tokio::time::Inst
 /// phase (whether that phase completed or the deadline was exceeded) to
 /// guarantee that no managed child process survives daemon exit.
 ///
-/// **PID-tracking safety (TCK-00392 BLOCKER fix):**
+/// **PID-tracking safety (RFC-0032::REQ-0146 BLOCKER fix):**
 ///
 /// In addition to iterating runners still present in daemon state, this
 /// function also accepts a map of `PID -> starttime` that was recorded
@@ -943,7 +943,7 @@ fn daemonize() -> Result<bool> {
 
 /// Synchronous entry point - handles daemonization BEFORE async runtime starts.
 ///
-/// # Fork Safety (TCK-00282)
+/// # Fork Safety (RFC-0032::REQ-0087)
 ///
 /// This function exists to ensure `fork()` is called in a truly single-threaded
 /// context. The previous implementation used `#[tokio::main]` which expands to:
@@ -971,7 +971,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // TCK-00595 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
+    // RFC-0032::REQ-0244 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
     //
     // The daemon is a user-singleton (fixed XDG socket path). Binding it to
     // the CWD at startup causes cross-context pollution: if the user starts
@@ -985,7 +985,7 @@ fn main() -> Result<()> {
 
     // Daemonize if requested - MUST happen before any async runtime!
     //
-    // This is the critical fix for TCK-00282. By daemonizing here, we ensure
+    // This is the critical fix for RFC-0032::REQ-0087. By daemonizing here, we ensure
     // fork() is called when only the main thread exists.
     if !args.no_daemon {
         match daemonize() {
@@ -1116,7 +1116,7 @@ async fn async_main(args: Args) -> Result<()> {
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
-    // Register core kernel schemas on startup (TCK-00181).
+    // Register core kernel schemas on startup (RFC-0033::REQ-0045).
     // This establishes the schema registry with all kernel event types
     // before any event processing can occur.
     let registry = InMemorySchemaRegistry::new();
@@ -1152,7 +1152,7 @@ async fn async_main(args: Args) -> Result<()> {
 
     let supervisor = init_supervisor(&daemon_config.config);
 
-    // TCK-00268: Initialize Prometheus metrics registry early so we can pass it
+    // RFC-0032::REQ-0084: Initialize Prometheus metrics registry early so we can pass it
     // to DaemonStateHandle. This allows handlers to record IPC metrics.
     let metrics_registry = if daemon_config.metrics_disabled {
         None
@@ -1161,9 +1161,9 @@ async fn async_main(args: Args) -> Result<()> {
     };
 
     // Create shared state with schema registry and session registry
-    // The registries persist for the daemon's lifetime (TCK-00181, TCK-00266)
+    // The registries persist for the daemon's lifetime (RFC-0033::REQ-0045, RFC-0032::REQ-0082)
     //
-    // TCK-00266: Use persistent session registry for crash recovery.
+    // RFC-0032::REQ-0082: Use persistent session registry for crash recovery.
     // The state file path is configured via CLI or ecosystem config.
     let state: SharedState = Arc::new(
         DaemonStateHandle::new_with_persistent_sessions(
@@ -1171,7 +1171,7 @@ async fn async_main(args: Args) -> Result<()> {
             supervisor,
             registry, // Pass the registry created during bootstrap
             &daemon_config.state_file_path,
-            metrics_registry.clone(), // TCK-00268: Pass metrics registry for handler access
+            metrics_registry.clone(), // RFC-0032::REQ-0084: Pass metrics registry for handler access
         )
         .context("failed to initialize persistent session registry")?,
     );
@@ -1191,8 +1191,8 @@ async fn async_main(args: Args) -> Result<()> {
         .context("failed to load ledger signing key")?;
     let lifecycle_signing_key_bytes = ledger_signing_key.to_bytes();
 
-    // Initialize persistent ledger if configured (TCK-00289)
-    // TCK-00387: Moved BEFORE crash recovery so that LEASE_REVOKED events can
+    // Initialize persistent ledger if configured (RFC-0032::REQ-0091)
+    // RFC-0032::REQ-0141: Moved BEFORE crash recovery so that LEASE_REVOKED events can
     // be emitted to the ledger during recovery.
     let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
         info!("Opening ledger database at {:?}", path);
@@ -1204,7 +1204,7 @@ async fn async_main(args: Args) -> Result<()> {
             .context("failed to init ledger events schema")?;
         SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
 
-        // TCK-00630: RFC-0032 Phase 0 — migrate legacy `ledger_events` to
+        // RFC-0032::REQ-0259: RFC-0032 Phase 0 — migrate legacy `ledger_events` to
         // canonical `events` table before any consumers initialize.
         // Fail-closed: if migration fails, the daemon must not start.
         apm2_core::ledger::init_canonical_schema(&conn)
@@ -1220,7 +1220,7 @@ async fn async_main(args: Args) -> Result<()> {
             );
         }
 
-        // TCK-00631: Post-migration invariant check — after migration, the
+        // RFC-0032::REQ-0260: Post-migration invariant check — after migration, the
         // ledger MUST be in canonical events mode. If it is still in legacy
         // mode, something went wrong and the daemon must not start.
         let is_canonical = apm2_core::ledger::is_canonical_events_mode(&conn)
@@ -1232,7 +1232,7 @@ async fn async_main(args: Args) -> Result<()> {
             );
         }
 
-        // TCK-00631: Check whether the frozen legacy table exists and log
+        // RFC-0032::REQ-0260: Check whether the frozen legacy table exists and log
         // the current ledger mode.
         let frozen_table_exists: bool = conn
             .query_row(
@@ -1249,7 +1249,7 @@ async fn async_main(args: Args) -> Result<()> {
             ledger_mode = "canonical_events",
             frozen_table_exists = frozen_table_exists,
             legacy_writes_frozen = frozen_table_exists,
-            "TCK-00631: Ledger mode after startup migration"
+            "RFC-0032::REQ-0260: Ledger mode after startup migration"
         );
 
         Some(Arc::new(Mutex::new(conn)))
@@ -1257,7 +1257,7 @@ async fn async_main(args: Args) -> Result<()> {
         None
     };
 
-    // TCK-00387: Crash recovery on startup
+    // RFC-0032::REQ-0141: Crash recovery on startup
     // Before accepting new connections, recover any sessions from persistent state,
     // emit LEASE_REVOKED events to the ledger, clean up stale work claims, and
     // clear the persistent session registry.
@@ -1275,7 +1275,7 @@ async fn async_main(args: Args) -> Result<()> {
         "Metrics registry initialized"
     );
 
-    // Initialize dual-socket manager (TCK-00249)
+    // Initialize dual-socket manager (RFC-0032::REQ-0065)
     let socket_manager_config = SocketManagerConfig::new(
         &daemon_config.operator_socket_path,
         &daemon_config.session_socket_path,
@@ -1290,7 +1290,7 @@ async fn async_main(args: Args) -> Result<()> {
         daemon_config.session_socket_path
     );
 
-    // TCK-00600: Notify systemd that the daemon is ready.
+    // RFC-0032::REQ-0248: Notify systemd that the daemon is ready.
     // This must happen after socket bind so that clients can connect
     // immediately after systemd considers the service started.
     let _ = apm2_core::fac::sd_notify::notify_ready();
@@ -1301,7 +1301,7 @@ async fn async_main(args: Args) -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
-    // TCK-00287: Create shared dispatcher state at daemon startup.
+    // RFC-0032::REQ-0089: Create shared dispatcher state at daemon startup.
     // Per security review:
     // - Item 1: Dispatchers persist across connections (no state loss)
     // - Item 2: TokenMinter uses stable secret (tokens valid across connections)
@@ -1311,13 +1311,13 @@ async fn async_main(args: Args) -> Result<()> {
     // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
     // spawned via IPC are visible to daemon's persistent state.
     //
-    // TCK-00289: Use with_persistence to wire real governance/ledger components if
+    // RFC-0032::REQ-0091: Use with_persistence to wire real governance/ledger components if
     // available.
-    // TCK-00342: Wire daemon state into dispatcher for process management.
+    // RFC-0032::REQ-0132: Wire daemon state into dispatcher for process management.
     // This enables ListProcesses, ProcessStatus, StartProcess, StopProcess,
     // RestartProcess, and ReloadProcess handlers to query the Supervisor.
     //
-    // TCK-00383: When both ledger and CAS are configured, use
+    // RFC-0032::REQ-0137: When both ledger and CAS are configured, use
     // with_persistence_and_cas() to wire the session dispatcher with ToolBroker,
     // DurableCas, ledger event emitter, and holonic clock. This enables session-
     // scoped operations: tool execution, event emission, and evidence publishing.
@@ -1361,13 +1361,13 @@ async fn async_main(args: Args) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("adapter rotation initialization failed: {e}"))?
         }
         .with_daemon_state(Arc::clone(&state))
-        // TCK-00565: Wire boundary_id from node identity into the dispatcher
+        // RFC-0032::REQ-0216: Wire boundary_id from node identity into the dispatcher
         // so that tokens issued through the daemon dispatch path include the
         // correct boundary_id in their TokenBindingV1.
         .with_token_binding_config(boundary_id.clone(), [0u8; 32]),
     );
 
-    // TCK-00631: Freeze legacy `ledger_events` writes on both the event emitter
+    // RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the event emitter
     // and lease validator. After this, all new appends route to canonical `events`.
     // This MUST happen after init_canonical_schema + migrate_legacy_ledger_events
     // (above) to ensure the `events` table exists.
@@ -1375,10 +1375,10 @@ async fn async_main(args: Args) -> Result<()> {
         if let Err(e) = dispatcher_state.freeze_legacy_writes() {
             warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
         }
-        info!("TCK-00631: Legacy ledger writes frozen; new appends route to canonical events");
+        info!("RFC-0032::REQ-0260: Legacy ledger writes frozen; new appends route to canonical events");
     }
 
-    // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
+    // RFC-0032::REQ-0142: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
     // and wired into the DispatcherState for lifecycle timeout polling.
@@ -1388,7 +1388,7 @@ async fn async_main(args: Args) -> Result<()> {
         Signer::from_bytes(&lifecycle_signing_key_bytes)
             .map_err(|e| anyhow::anyhow!("failed to derive gate signer from lifecycle key: {e}"))?,
     );
-    // TCK-00418: Share the dispatcher's evidence CAS with the gate
+    // RFC-0032::REQ-0162: Share the dispatcher's evidence CAS with the gate
     // orchestrator so that time_envelope_ref hashes stored during
     // `issue_gate_lease` are resolvable by `validate_lease_time_authority`
     // in the same PrivilegedDispatcher. Falls back to an in-memory CAS
@@ -1449,7 +1449,7 @@ async fn async_main(args: Args) -> Result<()> {
             sqlite_conn.as_ref().map(|conn| {
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&timeout_signing_key_bytes);
                 let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key);
-                // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+                // RFC-0032::REQ-0260: Freeze legacy writes after RFC-0032 migration.
                 // Fail-closed: if freeze check fails, writes are blocked anyway.
                 if let Err(e) = emitter.freeze_legacy_writes_self() {
                     warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
@@ -1498,7 +1498,7 @@ async fn async_main(args: Args) -> Result<()> {
         .expect("default BrokerState is always valid");
         let mut health_checker = apm2_core::fac::BrokerHealthChecker::new();
         let boundary_id = boundary_id.clone();
-        // TCK-00600: Clone fac_root into the poller task so we can write
+        // RFC-0032::REQ-0248: Clone fac_root into the poller task so we can write
         // broker_health.json after each health evaluation.
         let fac_root_for_poller = fac_root.clone();
         let daemon_start = std::time::Instant::now();
@@ -1507,13 +1507,13 @@ async fn async_main(args: Args) -> Result<()> {
             let mut gate_start_kernel = gate_start_kernel;
             let mut timeout_kernel = timeout_kernel;
             let mut interval = tokio::time::interval(Duration::from_secs(10));
-            // TCK-00600: Watchdog ticker sends WATCHDOG=1 to systemd at half
+            // RFC-0032::REQ-0248: Watchdog ticker sends WATCHDOG=1 to systemd at half
             // the WatchdogSec interval. Runs in the same poller task because
             // it already ticks every 10 seconds.
             let mut watchdog = apm2_core::fac::sd_notify::WatchdogTicker::new();
             loop {
                 interval.tick().await;
-                // TCK-00600: Ping systemd watchdog if due.
+                // RFC-0032::REQ-0248: Ping systemd watchdog if due.
                 watchdog.ping_if_due();
                 match gate_start_kernel.tick().await {
                     Ok(report) => {
@@ -1622,7 +1622,7 @@ async fn async_main(args: Args) -> Result<()> {
                     },
                 };
 
-                // TCK-00568: Reset control-plane budget counters at each tick
+                // RFC-0032::REQ-0219: Reset control-plane budget counters at each tick
                 // boundary. This is the ONLY call site for
                 // `reset_control_plane_counters()` — without it, per-tick
                 // rate limits become permanent process-lifetime quotas.
@@ -1642,7 +1642,7 @@ async fn async_main(args: Args) -> Result<()> {
                     );
                 }
 
-                // TCK-00600: Write broker health IPC file after each health
+                // RFC-0032::REQ-0248: Write broker health IPC file after each health
                 // evaluation. This file is read by `apm2 fac services status`
                 // to report broker readiness and version independently of
                 // systemd unit state. Fail-open: a write failure is logged but
@@ -1667,7 +1667,7 @@ async fn async_main(args: Args) -> Result<()> {
                     );
                 }
 
-                // TCK-00600: Read worker heartbeat and incorporate its
+                // RFC-0032::REQ-0248: Read worker heartbeat and incorporate its
                 // staleness state into daemon health reporting. The worker
                 // writes `worker_heartbeat.json` after each poll cycle;
                 // the daemon reads it here to surface worker health
@@ -1700,7 +1700,7 @@ async fn async_main(args: Args) -> Result<()> {
         });
     }
 
-    // TCK-00322: Start projection worker if ledger and projection are configured.
+    // RFC-0032::REQ-0116: Start projection worker if ledger and projection are configured.
     // The projection worker:
     // - Tails the ledger for ReviewReceiptRecorded events
     // - Maintains work index (changeset -> work_id -> PR)
@@ -1713,7 +1713,7 @@ async fn async_main(args: Args) -> Result<()> {
         let projection_conn = Arc::clone(conn);
         let projection_config = &daemon_config.config.daemon.projection;
 
-        // TCK-00595 MAJOR-1 FIX: The daemon MUST NOT auto-detect owner/repo
+        // RFC-0032::REQ-0244 MAJOR-1 FIX: The daemon MUST NOT auto-detect owner/repo
         // from CWD. The daemon is a user-singleton with a fixed socket path;
         // binding it to the startup CWD's git remote would cause cross-context
         // pollution if the user switches repositories. Only explicit config
@@ -1749,14 +1749,14 @@ async fn async_main(args: Args) -> Result<()> {
                 &github_repo,
             ) {
                 Ok(mut github_config) => {
-                    // TCK-00322 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
+                    // RFC-0032::REQ-0116 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
                     // When `enabled = true`, missing token env var is now a FATAL error.
                     // Previously, this would silently fall back to mock mode, which could
                     // cause production systems to think they're projecting to GitHub when
                     // they're not. Now we fail-closed: missing mandatory config = startup
                     // failure.
                     let Some(ref token_env) = projection_config.github_token_env else {
-                        // TCK-00322 MAJOR FIX: Missing token_env is fatal when enabled
+                        // RFC-0032::REQ-0116 MAJOR FIX: Missing token_env is fatal when enabled
                         error!(
                             "projection.enabled=true but github_token_env is not configured. \
                              A GitHub token is required for production projection."
@@ -1768,11 +1768,11 @@ async fn async_main(args: Args) -> Result<()> {
 
                     // Strip leading $ if present
                     let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
-                    // TCK-00595 MAJOR FIX: Use unified token resolution that
+                    // RFC-0032::REQ-0244 MAJOR FIX: Use unified token resolution that
                     // checks env var, then $CREDENTIALS_DIRECTORY/gh-token
                     // (systemd LoadCredential), then $APM2_HOME/private/creds/gh-token.
                     let Some(token) = apm2_core::config::resolve_github_token(env_var) else {
-                        // TCK-00322 MAJOR FIX: Missing token is fatal when enabled
+                        // RFC-0032::REQ-0116 MAJOR FIX: Missing token is fatal when enabled
                         error!(
                             env_var = %env_var,
                             "GitHub token not found. Checked: ${env_var} env var, \
@@ -1803,7 +1803,7 @@ async fn async_main(args: Args) -> Result<()> {
 
                     config = config.with_github(github_config.clone());
 
-                    // TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
+                    // RFC-0032::REQ-0116 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
                     // Load or generate a persistent signer key from file. The key file path
                     // is configurable via projection.signer_key_file, defaulting to
                     // {state_file_dir}/projection_signer.key.
@@ -1827,7 +1827,7 @@ async fn async_main(args: Args) -> Result<()> {
                     );
 
                     // Determine cache path for idempotency
-                    // TCK-00322 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path
+                    // RFC-0032::REQ-0116 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path
                     let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
                         || {
                             daemon_config.state_file_path.parent().map_or_else(
@@ -1862,7 +1862,7 @@ async fn async_main(args: Args) -> Result<()> {
                 },
             }
         } else if projection_config.enabled {
-            // TCK-00322 MAJOR FIX: Missing owner/repo is fatal when enabled
+            // RFC-0032::REQ-0116 MAJOR FIX: Missing owner/repo is fatal when enabled
             return Err(anyhow::anyhow!(
                 "projection.enabled=true but github_owner or github_repo is not configured"
             ));
@@ -1891,7 +1891,7 @@ async fn async_main(args: Args) -> Result<()> {
                     info!("Projection worker started without adapter (projection disabled)");
                 }
 
-                // TCK-00505 MAJOR FIX: Wire economics admission gate dependencies.
+                // RFC-0033::REQ-0063 MAJOR FIX: Wire economics admission gate dependencies.
                 //
                 // The economics gate requires three components:
                 // 1. IntentBuffer for durable admission decisions
@@ -2049,7 +2049,7 @@ async fn async_main(args: Args) -> Result<()> {
         None
     };
 
-    // TCK-00393: Wire divergence watchdog into daemon main loop.
+    // RFC-0032::REQ-0147: Wire divergence watchdog into daemon main loop.
     //
     // The watchdog monitors for divergence between the ledger's MergeReceipt
     // HEAD and the external trunk HEAD (fetched via GitHub API). When
@@ -2064,14 +2064,14 @@ async fn async_main(args: Args) -> Result<()> {
     //   - Divergence watchdog must be enabled in ecosystem config
     //   - GitHub token must be available via environment variable
     //
-    // TCK-00469: The watchdog is wrapped in Arc so both the background polling
+    // RFC-0020::REQ-0051: The watchdog is wrapped in Arc so both the background polling
     // task and the DispatcherState share the same instance, enabling IPC
     // handlers to call register_durable_recovery_evidence / create_unfreeze /
     // apply_unfreeze.
     let watchdog_arc_for_dispatcher: Option<Arc<DivergenceWatchdog<SystemTimeSource>>> = {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
-            // TCK-00408: Fail closed when mandatory persistence dependencies
+            // RFC-0032::REQ-0156: Fail closed when mandatory persistence dependencies
             // are missing. Validation is in DivergenceWatchdogSection so the
             // check is testable outside of the binary.
             dw_config
@@ -2085,7 +2085,7 @@ async fn async_main(args: Args) -> Result<()> {
                 ));
             }
 
-            // Resolve GitHub token via unified resolution chain (TCK-00595 MAJOR FIX):
+            // Resolve GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR FIX):
             // env var -> $CREDENTIALS_DIRECTORY/gh-token ->
             // $APM2_HOME/private/creds/gh-token
             let token_env_raw = dw_config
@@ -2132,7 +2132,7 @@ async fn async_main(args: Args) -> Result<()> {
                     let signing_key =
                         ed25519_dalek::SigningKey::from_bytes(&watchdog_signing_key_bytes);
                     let emitter = SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key);
-                    // TCK-00631: Freeze legacy writes after RFC-0032 migration.
+                    // RFC-0032::REQ-0260: Freeze legacy writes after RFC-0032 migration.
                     if let Err(e) = emitter.freeze_legacy_writes_self() {
                         warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
                     }
@@ -2147,7 +2147,7 @@ async fn async_main(args: Args) -> Result<()> {
             let watchdog_state = state.clone();
             let watchdog_repo_id = repo_id;
 
-            // TCK-00469: Clone the Arc for the background task; the original
+            // RFC-0020::REQ-0051: Clone the Arc for the background task; the original
             // is returned from this block for dispatcher wiring.
             let watchdog_task_ref = Arc::clone(&watchdog);
             tokio::spawn(async move {
@@ -2386,7 +2386,7 @@ async fn async_main(args: Args) -> Result<()> {
         }
     };
 
-    // TCK-00469: Wire divergence watchdog Arc into dispatcher state so IPC
+    // RFC-0020::REQ-0051: Wire divergence watchdog Arc into dispatcher state so IPC
     // handlers can call register_durable_recovery_evidence / create_unfreeze /
     // apply_unfreeze.
     // Safety: dispatcher_state has not yet been cloned at this point in startup.
@@ -2412,7 +2412,7 @@ async fn async_main(args: Args) -> Result<()> {
          background poller will evaluate and open on first healthy check"
     );
 
-    // TCK-00279: Start ProtocolServer-only control plane
+    // RFC-0032::REQ-0085: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
     // DD-009.
     let socket_manager = Arc::new(socket_manager);
@@ -2427,7 +2427,7 @@ async fn async_main(args: Args) -> Result<()> {
         }
     });
 
-    // TCK-00268: Start Prometheus metrics HTTP server
+    // RFC-0032::REQ-0084: Start Prometheus metrics HTTP server
     let metrics_task = if let Some(ref metrics_reg) = metrics_registry {
         let metrics_addr: SocketAddr = ([127, 0, 0, 1], daemon_config.metrics_port).into();
         let metrics_reg = Arc::clone(metrics_reg);
@@ -2471,7 +2471,7 @@ async fn async_main(args: Args) -> Result<()> {
         _ = signal_task => {
             info!("Signal handler triggered shutdown");
         }
-        // TCK-00268: Monitor metrics server if enabled
+        // RFC-0032::REQ-0084: Monitor metrics server if enabled
         result = async {
             if let Some(task) = metrics_task {
                 task.await
@@ -2485,7 +2485,7 @@ async fn async_main(args: Args) -> Result<()> {
             }
             info!("Metrics server exited");
         }
-        // TCK-00322: Monitor projection worker if enabled
+        // RFC-0032::REQ-0116: Monitor projection worker if enabled
         result = async {
             if let Some((worker_task, _)) = projection_worker_handle {
                 worker_task.await
@@ -2500,7 +2500,7 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
-    // Graceful shutdown with deadline-driven loop (TCK-00392).
+    // Graceful shutdown with deadline-driven loop (RFC-0032::REQ-0146).
     //
     // **Cancellation-safe design:**
     //
@@ -2516,7 +2516,7 @@ async fn async_main(args: Args) -> Result<()> {
     // containment even for processes whose runner was dropped mid-stop.
     info!("Shutting down daemon...");
 
-    // TCK-00600: Notify systemd that the daemon is stopping.
+    // RFC-0032::REQ-0248: Notify systemd that the daemon is stopping.
     let _ = apm2_core::fac::sd_notify::notify_stopping();
 
     // Record all tracked PIDs BEFORE the graceful phase so we can always
@@ -2561,7 +2561,7 @@ fn sha_to_32_bytes(hex_sha: &str) -> [u8; 32] {
     *blake3::hash(hex_sha.as_bytes()).as_bytes()
 }
 
-// TCK-00595 MAJOR-1: detect_github_owner_repo_from_remote() removed.
+// RFC-0032::REQ-0244 MAJOR-1: detect_github_owner_repo_from_remote() removed.
 // The daemon must not auto-detect owner/repo from CWD git remote.
 // Use explicit [daemon.projection] config in ecosystem.toml instead.
 
@@ -2733,7 +2733,7 @@ async fn fetch_external_trunk_head(
     Ok(sha_to_32_bytes(sha))
 }
 
-/// Perform crash recovery on daemon startup (TCK-00387).
+/// Perform crash recovery on daemon startup (RFC-0032::REQ-0141).
 ///
 /// This function:
 /// 1. Loads persistent session state from the `DaemonStateHandle`'s session
@@ -2783,7 +2783,7 @@ async fn perform_crash_recovery(
 
     let timeout = Duration::from_millis(u64::from(DEFAULT_RECOVERY_TIMEOUT_MS));
 
-    // TCK-00387: Load persisted sessions from the DaemonStateHandle's session
+    // RFC-0032::REQ-0141: Load persisted sessions from the DaemonStateHandle's session
     // registry. The PersistentSessionRegistry was populated from the state file
     // during `DaemonStateHandle::new_with_persistent_sessions`.
     let session_registry = state.session_registry();
@@ -2806,7 +2806,7 @@ async fn perform_crash_recovery(
         "Found stale sessions from previous daemon instance"
     );
 
-    // TCK-00387: Create a ledger event emitter for emitting LEASE_REVOKED events.
+    // RFC-0032::REQ-0141: Create a ledger event emitter for emitting LEASE_REVOKED events.
     // If no SQLite connection is available, we log but do not persist events.
     //
     // Security Review v5 MAJOR 2: Use the daemon-lifecycle signing key (passed
@@ -2833,7 +2833,7 @@ async fn perform_crash_recovery(
                 )
             })?;
 
-    // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
+    // RFC-0032::REQ-0141: Perform crash recovery -- emit LEASE_REVOKED events and clean
     // up work claims for each stale session.
     let result = apm2_daemon::episode::crash_recovery::recover_stale_sessions(
         &collected.sessions,
@@ -2957,7 +2957,7 @@ async fn perform_crash_recovery(
     Ok(())
 }
 
-/// Run the `ProtocolServer`-only control plane (TCK-00279).
+/// Run the `ProtocolServer`-only control plane (RFC-0032::REQ-0085).
 ///
 /// This is the ONLY control-plane IPC listener. Per DD-009 (RFC-0017),
 /// legacy JSON IPC has been removed and `ProtocolServer` is the sole
@@ -2965,7 +2965,7 @@ async fn perform_crash_recovery(
 /// - `operator.sock` (mode 0600): Privileged operations
 /// - `session.sock` (mode 0660): Session-scoped operations
 ///
-/// # TCK-00287 Security Fixes
+/// # RFC-0032::REQ-0089 Security Fixes
 ///
 /// Per the security review, this function now passes shared dispatcher state
 /// to connection handlers, ensuring:
@@ -2973,7 +2973,7 @@ async fn perform_crash_recovery(
 /// - Token secrets are stable (Item 2)
 /// - Fail-closed defaults are enforced (Item 3)
 ///
-/// # Acceptance Criteria (TCK-00279)
+/// # Acceptance Criteria (RFC-0032::REQ-0085)
 ///
 /// - No `ipc_server::run` invocation in default build
 /// - Startup logs show only operator.sock + session.sock listeners
@@ -3029,13 +3029,13 @@ async fn run_socket_manager_server(
 ///
 /// Routes requests based on socket type (privilege level).
 ///
-/// # Protocol Compliance (TCK-00279/TCK-00281/TCK-00287)
+/// # Protocol Compliance (RFC-0032::REQ-0085/RFC-0032::REQ-0086/RFC-0032::REQ-0089)
 ///
 /// This function performs the mandatory Hello/HelloAck handshake as specified
 /// in DD-001/DD-008, then processes protobuf messages via tag-based
 /// dispatchers. Legacy JSON IPC has been removed per DD-009.
 ///
-/// # TCK-00287 Security Fixes
+/// # RFC-0032::REQ-0089 Security Fixes
 ///
 /// Per the security review, this function now:
 /// - **Item 1**: Uses shared dispatchers from `DispatcherState` (no state loss)
@@ -3047,7 +3047,7 @@ async fn run_socket_manager_server(
 ///
 /// # JSON Downgrade Rejection (DD-009)
 ///
-/// Per TCK-00287 and DD-009, JSON frames are rejected before reaching handlers.
+/// Per RFC-0032::REQ-0089 and DD-009, JSON frames are rejected before reaching handlers.
 /// The tag-based routing validates that the first byte is a valid message type
 /// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
 /// (0x7B = 123) are rejected as unknown message types. Protocol errors
@@ -3069,11 +3069,11 @@ async fn handle_dual_socket_connection(
         "New ProtocolServer connection"
     );
 
-    // TCK-00348: Build handshake config from real HSI contract manifest.
+    // RFC-0020::REQ-0002: Build handshake config from real HSI contract manifest.
     // The server contract hash is computed from the dispatch registry so
     // that real connections enforce the tiered mismatch policy.
     //
-    // TCK-00348 MAJOR: Wire DaemonMetrics into HandshakeConfig so the
+    // RFC-0020::REQ-0002 MAJOR: Wire DaemonMetrics into HandshakeConfig so the
     // contract_mismatch_total counter is emitted from the production path.
     let handshake_config = {
         let mut config = HandshakeConfig::from_manifest();
@@ -3116,9 +3116,9 @@ async fn handle_dual_socket_connection(
         },
     };
 
-    // TCK-00287: Wire up tag-based ProtocolServer dispatchers
+    // RFC-0032::REQ-0089: Wire up tag-based ProtocolServer dispatchers
     // Create connection context based on socket type.
-    // TCK-00348: Attach contract binding to connection context so it is
+    // RFC-0020::REQ-0002: Attach contract binding to connection context so it is
     // threaded into SessionStarted events during SpawnEpisode (authoritative
     // record with real session_id, not a surrogate connection_id).
     let mut ctx = match socket_type {
@@ -3131,7 +3131,7 @@ async fn handle_dual_socket_connection(
     };
     ctx.set_contract_binding(contract_binding.clone());
 
-    // TCK-00358: Wire identity proof profile hash at session-open time.
+    // RFC-0020::REQ-0012: Wire identity proof profile hash at session-open time.
     // The active identity proof profile is resolved from the risk tier
     // established during handshake. For baseline deployments this is the
     // SMT-256 10^12 profile. Setting the hash here (on the production
@@ -3158,7 +3158,7 @@ async fn handle_dual_socket_connection(
         }
     }
 
-    // TCK-00349: Advance connection phase through the session-typed state
+    // RFC-0020::REQ-0003: Advance connection phase through the session-typed state
     // machine. The handshake has succeeded at this point, so we advance
     // from Connected -> HandshakeComplete -> SessionOpen before entering
     // the dispatch loop. This ensures no IPC dispatch is possible until
@@ -3168,18 +3168,18 @@ async fn handle_dual_socket_connection(
     ctx.advance_to_session_open()
         .context("connection phase transition to SessionOpen failed")?;
 
-    // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
+    // RFC-0032::REQ-0089 Item 1 & 2: Use shared dispatchers from DispatcherState.
     // These dispatchers persist across connections and use stable secrets.
     let privileged_dispatcher = dispatcher_state.privileged_dispatcher();
     let session_dispatcher = dispatcher_state.session_dispatcher();
 
-    // TCK-00303: Get subscription registry for connection cleanup on close.
+    // RFC-0032::REQ-0099: Get subscription registry for connection cleanup on close.
     // When the connection closes, we MUST call unregister_connection to free
     // the connection slot and prevent DoS via connection slot exhaustion.
     let subscription_registry = dispatcher_state.subscription_registry();
     let connection_id = ctx.connection_id().to_string();
 
-    // TCK-00287: Message dispatch loop
+    // RFC-0032::REQ-0089: Message dispatch loop
     // Process incoming frames until connection closes or error
     info!(
         socket_type = %socket_type,
@@ -3196,7 +3196,7 @@ async fn handle_dual_socket_connection(
             },
         };
 
-        // TCK-00287 Item 5: JSON downgrade rejection (DD-009 fail-closed)
+        // RFC-0032::REQ-0089 Item 5: JSON downgrade rejection (DD-009 fail-closed)
         // Validate frame before dispatch. JSON frames start with '{' (0x7B = 123)
         // or '[' (0x5B = 91) which are not valid message type tags.
         // Per security review: protocol errors MUST terminate connection (DoS
@@ -3207,7 +3207,7 @@ async fn handle_dual_socket_connection(
                 first_byte = frame[0],
                 "JSON downgrade attempt rejected - terminating connection"
             );
-            // TCK-00287 Item 5: Terminate connection on protocol violation
+            // RFC-0032::REQ-0089 Item 5: Terminate connection on protocol violation
             break;
         }
 
@@ -3219,7 +3219,7 @@ async fn handle_dual_socket_connection(
                 match privileged_dispatcher.dispatch(&frame_bytes, &ctx) {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Privileged request dispatched successfully");
-                        // TCK-00287 Item 4: Send response back to client
+                        // RFC-0032::REQ-0089 Item 4: Send response back to client
                         let response_bytes = response.encode();
                         if let Err(e) = connection.framed().send(response_bytes).await {
                             warn!(socket_type = %socket_type, error = %e, "Failed to send response");
@@ -3227,7 +3227,7 @@ async fn handle_dual_socket_connection(
                         }
                     },
                     Err(e) => {
-                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        // RFC-0032::REQ-0089 Item 5: Protocol errors terminate connection
                         warn!(socket_type = %socket_type, error = %e, "Privileged dispatch error - terminating connection");
                         break;
                     },
@@ -3237,7 +3237,7 @@ async fn handle_dual_socket_connection(
                 match session_dispatcher.dispatch(&frame_bytes, &ctx) {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Session request dispatched successfully");
-                        // TCK-00287 Item 4: Send response back to client
+                        // RFC-0032::REQ-0089 Item 4: Send response back to client
                         let response_bytes = response.encode();
                         if let Err(e) = connection.framed().send(response_bytes).await {
                             warn!(socket_type = %socket_type, error = %e, "Failed to send response");
@@ -3245,7 +3245,7 @@ async fn handle_dual_socket_connection(
                         }
                     },
                     Err(e) => {
-                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        // RFC-0032::REQ-0089 Item 5: Protocol errors terminate connection
                         warn!(socket_type = %socket_type, error = %e, "Session dispatch error - terminating connection");
                         break;
                     },
@@ -3254,7 +3254,7 @@ async fn handle_dual_socket_connection(
         }
     }
 
-    // TCK-00303: CRITICAL - Unregister connection to prevent DoS via slot
+    // RFC-0032::REQ-0099: CRITICAL - Unregister connection to prevent DoS via slot
     // exhaustion. Without this cleanup, connection slots leak and after
     // max_connections (100) connections, the daemon will permanently reject all
     // new SubscribePulse requests.
@@ -3289,7 +3289,7 @@ fn is_json_frame(frame: &[u8]) -> bool {
     matches!(frame[0], b'{' | b'[')
 }
 
-/// Run the Prometheus metrics HTTP server (TCK-00268).
+/// Run the Prometheus metrics HTTP server (RFC-0032::REQ-0084).
 ///
 /// This server exposes a `/metrics` endpoint that returns all daemon metrics
 /// in Prometheus text format. Per REQ-DCP-0012, the following metrics are

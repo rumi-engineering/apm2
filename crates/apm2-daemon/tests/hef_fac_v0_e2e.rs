@@ -1,7 +1,7 @@
 #![cfg(feature = "e2e-agent-tests")]
 #![allow(missing_docs)]
 
-//! TCK-00313: FAC v0 E2E Harness - Full End-to-End Verification
+//! RFC-0032::REQ-0107: FAC v0 E2E Harness - Full End-to-End Verification
 //!
 //! This test module provides comprehensive end-to-end verification of the FAC
 //! v0 reviewer harness against the acceptance criteria for:
@@ -330,10 +330,10 @@ impl FacV0TestHarness {
             time_envelope_ref: None,
             reviewer_actor_id: self.actor_id(),
             reviewer_signature: vec![], // Set below
-            // TCK-00326: Authority binding fields
+            // RFC-0032::REQ-0119: Authority binding fields
             capability_manifest_hash: vec![0x55; 32],
             context_pack_hash: vec![0x66; 32],
-            // TCK-00331: Role spec binding
+            // RFC-0032::REQ-0124: Role spec binding
             role_spec_hash: vec![0x77; 32],
         };
 
@@ -375,7 +375,7 @@ impl FacV0TestHarness {
             time_envelope_ref: None,
             recorder_actor_id: self.actor_id(),
             recorder_signature: vec![], // Set below
-            // TCK-00326: Authority binding fields
+            // RFC-0032::REQ-0119: Authority binding fields
             capability_manifest_hash: vec![0x55; 32],
             context_pack_hash: vec![0x66; 32],
             role_spec_hash: vec![0x77; 32],
@@ -1290,10 +1290,10 @@ async fn test_domain_separation_rejects_fac_prefix() {
         time_envelope_ref: None,
         reviewer_actor_id: harness.actor_id(),
         reviewer_signature: vec![],
-        // TCK-00326: Authority binding fields
+        // RFC-0032::REQ-0119: Authority binding fields
         capability_manifest_hash: vec![0x55; 32],
         context_pack_hash: vec![0x66; 32],
-        // TCK-00331: Role spec binding
+        // RFC-0032::REQ-0124: Role spec binding
         role_spec_hash: vec![0x77; 32],
     };
     let payload = event_proto.encode_to_vec();

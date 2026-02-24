@@ -1035,7 +1035,7 @@
           "guard_kind": "always",
           "guard_predicate": "github_api_confirmed_merge",
           "requirement_refs": [
-            "TCK-00626-BF002"
+            "RFC-0032::REQ-0257-BF002"
           ],
           "to": "merged",
           "to_states": [
@@ -1815,7 +1815,7 @@
             "from": "pushed|gates_running|gates_passed|gates_failed|reviews_dispatched|review_in_progress|verdict_pending|verdict_approve|verdict_deny|stuck|stale|recovering",
             "guard_predicate": "github_api_confirmed_merge",
             "requirement_refs": [
-              "TCK-00626-BF002"
+              "RFC-0032::REQ-0257-BF002"
             ],
             "to": "merged"
           },
@@ -2132,7 +2132,7 @@
           "in_machine_traceability": false,
           "in_ticket_scope": false,
           "regression_tests": [],
-          "requirement_id": "TCK-00626-BF002",
+          "requirement_id": "RFC-0032::REQ-0257-BF002",
           "rule_links": [
             "lifecycle_transitions:LC-T-012b"
           ]

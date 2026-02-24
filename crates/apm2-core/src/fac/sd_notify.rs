@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00600)
+// AGENT-AUTHORED (RFC-0032::REQ-0248)
 //! Minimal systemd `sd_notify` protocol implementation.
 //!
 //! Implements the `sd_notify(3)` protocol for communicating service readiness

@@ -418,14 +418,14 @@ pub(super) fn execute_queued_gates_job(
     heartbeat_jobs_completed: u64,
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
-    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    // RFC-0032::REQ-0194: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
         Ok(options) => options,
         Err(reason) => {
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -469,7 +469,7 @@ pub(super) fn execute_queued_gates_job(
                 "cannot resolve workspace HEAD for {}: {err}",
                 options.workspace_root.display()
             );
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -510,7 +510,7 @@ pub(super) fn execute_queued_gates_job(
             "gates job head mismatch: worker workspace HEAD {current_head} does not match job head {}",
             spec.source.head_sha
         );
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -563,7 +563,7 @@ pub(super) fn execute_queued_gates_job(
         Ok(code) => code,
         Err(err) => {
             let reason = format!("failed to execute gates in workspace: {err}");
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -642,7 +642,7 @@ pub(super) fn execute_queued_gates_job(
         }
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -676,7 +676,7 @@ pub(super) fn execute_queued_gates_job(
             );
         }
 
-        // TCK-00540 BLOCKER fix: After the receipt is committed, rebind
+        // RFC-0032::REQ-0196 BLOCKER fix: After the receipt is committed, rebind
         // the gate cache with real RFC-0028/0029 receipt evidence. This
         // promotes the fail-closed default (`false`) to `true` only when
         // the durable receipt contains the required bindings.
@@ -688,7 +688,7 @@ pub(super) fn execute_queued_gates_job(
                 &spec.job_id,
                 &signer,
             );
-            // TCK-00541 round-3 MAJOR fix: Also rebind the v3 gate cache.
+            // RFC-0032::REQ-0197 round-3 MAJOR fix: Also rebind the v3 gate cache.
             // Without this, v3 entries persist with `rfc0028_receipt_bound =
             // false` and `rfc0029_receipt_bound = false`, causing
             // `check_reuse` to deny all hits and defeating v3 cache reuse.
@@ -723,7 +723,7 @@ pub(super) fn execute_queued_gates_job(
         },
         _ => truncate_receipt_reason(&base_reason),
     };
-    // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
         fac_root,
         queue_root,
@@ -782,9 +782,9 @@ pub(super) fn handle_stop_revoke(
     sbx_hash: &str,
     net_hash: &str,
     job_wall_start: Instant,
-    // TCK-00587: Stop/revoke admission trace for receipt binding.
+    // RFC-0032::REQ-0237: Stop/revoke admission trace for receipt binding.
     sr_trace: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
-    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    // RFC-0032::REQ-0194: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
     let target_job_id = match &spec.cancel_target_job_id {
@@ -795,7 +795,7 @@ pub(super) fn handle_stop_revoke(
                 "worker: stop_revoke job {} missing cancel_target_job_id",
                 spec.job_id
             );
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -854,7 +854,7 @@ pub(super) fn handle_stop_revoke(
             eprintln!(
                 "worker: stop_revoke: target {target_job_id} already in {terminal_state}/, treating as success"
             );
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
@@ -898,7 +898,7 @@ pub(super) fn handle_stop_revoke(
             "stop_revoke: target job {target_job_id} not found in claimed/ or any terminal directory"
         );
         eprintln!("worker: {reason}");
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -957,7 +957,7 @@ pub(super) fn handle_stop_revoke(
         // MAJOR 3 fail-closed: if systemctl stop fails, emit failure receipt.
         let reason =
             format!("stop_revoke failed: systemctl stop failed for target {target_job_id}: {e}");
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -1032,7 +1032,7 @@ pub(super) fn handle_stop_revoke(
         .denial_reason(DenialReasonCode::Cancelled)
         .reason(&bounded_reason)
         .timestamp_secs(current_timestamp_epoch_secs());
-        // TCK-00538: Bind toolchain fingerprint to cancellation receipt.
+        // RFC-0032::REQ-0194: Bind toolchain fingerprint to cancellation receipt.
         if let Some(fp) = toolchain_fingerprint {
             builder = builder.toolchain_fingerprint(fp);
         }
@@ -1045,7 +1045,7 @@ pub(super) fn handle_stop_revoke(
                     "stop_revoke failed: cannot build cancellation receipt for target {target_job_id}: {e}"
                 );
                 eprintln!("worker: {deny_reason}");
-                // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
                 if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
@@ -1091,7 +1091,7 @@ pub(super) fn handle_stop_revoke(
                 "stop_revoke failed: cannot persist cancellation receipt for target {target_job_id}: {e}"
             );
             eprintln!("worker: {deny_reason}");
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -1128,7 +1128,7 @@ pub(super) fn handle_stop_revoke(
                 reason: deny_reason,
             };
         }
-        // TCK-00576: Best-effort signed envelope alongside cancellation receipt.
+        // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation receipt.
         if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
             let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
             let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
@@ -1150,7 +1150,7 @@ pub(super) fn handle_stop_revoke(
         let reason =
             format!("stop_revoke failed: cannot move target {target_job_id} to cancelled: {e}");
         eprintln!("worker: {reason}");
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -1187,7 +1187,7 @@ pub(super) fn handle_stop_revoke(
     }
     eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/");
 
-    // Step 4: TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // Step 4: RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     // Receipt persistence, index update, and job move happen in a crash-safe
     // order via a single ReceiptWritePipeline::commit() call.
     let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
@@ -1272,9 +1272,9 @@ pub(super) fn execute_warm_job(
     heartbeat_jobs_denied: u64,
     heartbeat_jobs_quarantined: u64,
     job_wall_start: Instant,
-    // TCK-00538: Toolchain fingerprint computed at worker startup.
+    // RFC-0032::REQ-0194: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
-    // TCK-00554 BLOCKER-1 fix: Effective sccache enablement derived from
+    // RFC-0032::REQ-0209 BLOCKER-1 fix: Effective sccache enablement derived from
     // server containment protocol. When false, RUSTC_WRAPPER/SCCACHE_* are
     // stripped from the warm execution environment even if
     // `policy.sccache_enabled` is true. This prevents builds from using an
@@ -1298,7 +1298,7 @@ pub(super) fn execute_warm_job(
                         let reason = format!("invalid warm phase '{name}': {e}");
                         eprintln!("worker: warm job {}: {reason}", spec.job_id);
                         let _ = LaneLeaseV1::remove(lane_dir);
-                        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                        // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                         // (claimed/ -> denied/ transition).
                         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                             fac_root,
@@ -1342,7 +1342,7 @@ pub(super) fn execute_warm_job(
     };
 
     // Set up CARGO_HOME and CARGO_TARGET_DIR within the lane.
-    // TCK-00538: Namespace CARGO_TARGET_DIR by toolchain fingerprint so that
+    // RFC-0032::REQ-0194: Namespace CARGO_TARGET_DIR by toolchain fingerprint so that
     // toolchain changes get a fresh build directory, preventing stale artifacts
     // from a different compiler version from corrupting incremental builds.
     let cargo_home = lane_dir.join("cargo_home");
@@ -1355,7 +1355,7 @@ pub(super) fn execute_warm_job(
     if let Err(e) = std::fs::create_dir_all(&cargo_home) {
         let reason = format!("cannot create lane CARGO_HOME: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+        // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
         // (claimed/ -> denied/ transition).
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
@@ -1394,7 +1394,7 @@ pub(super) fn execute_warm_job(
     if let Err(e) = std::fs::create_dir_all(&cargo_target_dir) {
         let reason = format!("cannot create lane CARGO_TARGET_DIR: {e}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+        // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
         // (claimed/ -> denied/ transition).
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
@@ -1467,7 +1467,7 @@ pub(super) fn execute_warm_job(
         );
     }
 
-    // TCK-00554 BLOCKER-1 fix: If the server containment protocol auto-disabled
+    // RFC-0032::REQ-0209 BLOCKER-1 fix: If the server containment protocol auto-disabled
     // sccache, strip RUSTC_WRAPPER and SCCACHE_* from the hardened environment.
     // `build_job_environment` injects these when `policy.sccache_enabled` is true,
     // but the containment protocol may have determined that the server is
@@ -1483,7 +1483,7 @@ pub(super) fn execute_warm_job(
         hardened_env.retain(|key, _| !key.starts_with("SCCACHE_"));
     }
 
-    // TCK-00596: Plumb credential mount metadata into execution environment.
+    // RFC-0032::REQ-0245: Plumb credential mount metadata into execution environment.
     // This selectively re-introduces credential env vars (for example
     // GITHUB_TOKEN) after policy default-deny filtering when a validated
     // credential mount is available. Secret values are resolved at runtime and
@@ -1495,7 +1495,7 @@ pub(super) fn execute_warm_job(
             let reason = format!("credential mount injection failed: {error}");
             eprintln!("worker: warm job {}: {reason}", spec.job_id);
             let _ = LaneLeaseV1::remove(lane_dir);
-            // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+            // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
             // (claimed/ -> denied/ transition).
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
@@ -1562,7 +1562,7 @@ pub(super) fn execute_warm_job(
                         );
                         eprintln!("worker: warm job {}: {reason}", spec.job_id);
                         let _ = LaneLeaseV1::remove(lane_dir);
-                        // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                        // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                         // (claimed/ -> denied/ transition).
                         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                             fac_root,
@@ -1627,7 +1627,7 @@ pub(super) fn execute_warm_job(
                 );
                 eprintln!("worker: warm job {}: {reason}", spec.job_id);
                 let _ = LaneLeaseV1::remove(lane_dir);
-                // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+                // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
                 // (claimed/ -> denied/ transition).
                 if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
@@ -1732,7 +1732,7 @@ pub(super) fn execute_warm_job(
             // just some may have failed). But structural errors (too many phases,
             // field too long) are denials.
             let _ = LaneLeaseV1::remove(lane_dir);
-            // TCK-00564 MAJOR-1: Use ReceiptWritePipeline for atomic commit
+            // RFC-0032::REQ-0215 MAJOR-1: Use ReceiptWritePipeline for atomic commit
             // (claimed/ -> denied/ transition).
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
@@ -1819,7 +1819,7 @@ pub(super) fn execute_warm_job(
     // Persist the gate receipt alongside the completed job (before atomic commit).
     write_gate_receipt(queue_root, claimed_file_name, &gate_receipt);
 
-    // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+    // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
     // Receipt persistence, index update, and job move happen in a crash-safe
     // order via a single ReceiptWritePipeline::commit() call.
     if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(

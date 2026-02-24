@@ -41,9 +41,9 @@
 //!     "unevaluatedProperties": false
 //! });
 //!
-//! let artifact = json!({"id": "TCK-00132"});
+//! let artifact = json!({"id": "RFC-0011::REQ-0002"});
 //! let request = AdmissionRequest::new_artifact(
-//!     "dcp://org/project/ticket/TCK-00132",
+//!     "dcp://org/project/ticket/RFC-0011::REQ-0002",
 //!     ArtifactKind::Ticket,
 //!     artifact,
 //!     &schema,
@@ -807,8 +807,8 @@ impl<C: ContentAddressedStore, F: FreezeCheck> AdmissionGate<C, F> {
     /// # Examples
     ///
     /// - `dcp://org/repo/artifact/id` -> `org/repo`
-    /// - `dcp://myorg/myrepo/ticket/TCK-00213` -> `myorg/myrepo`
-    /// - `org:ticket:TCK-00213` -> `org:ticket`
+    /// - `dcp://myorg/myrepo/ticket/RFC-0032::REQ-0059` -> `myorg/myrepo`
+    /// - `org:ticket:RFC-0032::REQ-0059` -> `org:ticket`
     ///
     /// # Security Note
     ///
@@ -1302,10 +1302,10 @@ mod tests {
     fn test_admit_create_success() {
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00132", "version": 1});
+        let artifact = json!({"id": "RFC-0011::REQ-0002", "version": 1});
 
         let request = AdmissionRequest::new_artifact(
-            "dcp://org/project/ticket/TCK-00132",
+            "dcp://org/project/ticket/RFC-0011::REQ-0002",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -1313,7 +1313,7 @@ mod tests {
 
         let result = gate.admit(request).unwrap();
 
-        assert_eq!(result.receipt.dcp_id, "dcp://org/project/ticket/TCK-00132");
+        assert_eq!(result.receipt.dcp_id, "dcp://org/project/ticket/RFC-0011::REQ-0002");
         assert_eq!(result.receipt.artifact_kind, ArtifactKind::Ticket);
         assert!(!result.receipt.new_hash.is_empty());
         assert_eq!(result.receipt.new_hash.len(), 64); // BLAKE3 hex
@@ -1328,7 +1328,7 @@ mod tests {
     fn test_admit_create_stored_in_cas() {
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00132"});
+        let artifact = json!({"id": "RFC-0011::REQ-0002"});
 
         let request =
             AdmissionRequest::new_artifact("dcp://test", ArtifactKind::Ticket, artifact, &schema);
@@ -1363,7 +1363,7 @@ mod tests {
         let gate = make_gate();
         let schema = sample_schema();
         // Extra field "extra" not allowed
-        let artifact = json!({"id": "TCK-00132", "extra": "field"});
+        let artifact = json!({"id": "RFC-0011::REQ-0002", "extra": "field"});
 
         let request =
             AdmissionRequest::new_artifact("dcp://test", ArtifactKind::Ticket, artifact, &schema);
@@ -1388,7 +1388,7 @@ mod tests {
     fn test_admit_create_deduplication() {
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00132"});
+        let artifact = json!({"id": "RFC-0011::REQ-0002"});
 
         let request1 = AdmissionRequest::new_artifact(
             "dcp://test1",
@@ -1415,7 +1415,7 @@ mod tests {
     fn test_admit_json_patch_success() {
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00132", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let patch = json!([{"op": "replace", "path": "/version", "value": 2}]);
 
         // Get base hash
@@ -1448,7 +1448,7 @@ mod tests {
     fn test_admit_json_patch_replay_violation() {
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00132", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let patch = json!([{"op": "replace", "path": "/version", "value": 2}]);
 
         // Wrong base hash
@@ -1471,7 +1471,7 @@ mod tests {
     fn test_admit_json_patch_validation_after_patch() {
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00132", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         // Patch adds unknown field
         let patch = json!([{"op": "add", "path": "/extra", "value": "field"}]);
 
@@ -1500,7 +1500,7 @@ mod tests {
     fn test_admit_merge_patch_success() {
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00132", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let patch = json!({"version": 2});
 
         let base_str = serde_json::to_string(&base).unwrap();
@@ -1541,7 +1541,7 @@ mod tests {
             "required": ["id"],
             "unevaluatedProperties": false
         });
-        let base = json!({"id": "TCK-00132", "optional": "value"});
+        let base = json!({"id": "RFC-0011::REQ-0002", "optional": "value"});
         let patch = json!({"optional": null});
 
         let base_str = serde_json::to_string(&base).unwrap();
@@ -1572,7 +1572,7 @@ mod tests {
     fn test_receipt_serialization() {
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00132"});
+        let artifact = json!({"id": "RFC-0011::REQ-0002"});
 
         let request =
             AdmissionRequest::new_artifact("dcp://test", ArtifactKind::Ticket, artifact, &schema);
@@ -1595,7 +1595,7 @@ mod tests {
     fn test_receipt_metadata() {
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00132", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let patch = json!([{"op": "replace", "path": "/version", "value": 2}]);
 
         let base_str = serde_json::to_string(&base).unwrap();
@@ -1700,7 +1700,7 @@ mod tests {
         let schema = sample_schema();
 
         // Create initial artifact
-        let artifact = json!({"id": "TCK-00132", "version": 1});
+        let artifact = json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let create_request = AdmissionRequest::new_artifact(
             "dcp://test",
             ArtifactKind::Ticket,
@@ -1747,7 +1747,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Security Negative Tests (TCK-00132)
+    // Security Negative Tests (RFC-0011::REQ-0002)
     // =========================================================================
 
     #[test]
@@ -2026,7 +2026,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Security Verification Tests (TCK-00134)
+    // Security Verification Tests (RFC-0011::REQ-0001)
     // =========================================================================
 
     #[test]
@@ -2130,7 +2130,7 @@ mod tests {
 
         // These should all succeed (not reserved prefixes)
         let valid_prefixes = [
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             "company:project:artifact",
             "myorg:schema:test-v1",
             "acme:rfc:RFC-0001",
@@ -2157,11 +2157,11 @@ mod tests {
         // SECURITY TEST: Verify schema_id is properly tracked in receipts
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00134"});
+        let artifact = json!({"id": "RFC-0011::REQ-0001"});
 
         let schema_id = "org:schema:ticket-v1";
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2181,10 +2181,10 @@ mod tests {
         // Verify schema_id is empty when not explicitly set
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00134"});
+        let artifact = json!({"id": "RFC-0011::REQ-0001"});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2204,7 +2204,7 @@ mod tests {
         // Verify schema_id is tracked in patch operation receipts
         let gate = make_gate();
         let schema = sample_schema();
-        let base = json!({"id": "TCK-00134", "version": 1});
+        let base = json!({"id": "RFC-0011::REQ-0001", "version": 1});
         let patch = json!([{"op": "replace", "path": "/version", "value": 2}]);
 
         let base_str = serde_json::to_string(&base).unwrap();
@@ -2213,7 +2213,7 @@ mod tests {
 
         let schema_id = "org:schema:ticket-v1";
         let request = AdmissionRequest::new_json_patch(
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             ArtifactKind::Ticket,
             base,
             patch,
@@ -2235,11 +2235,11 @@ mod tests {
         // Verify schema_id is properly serialized/deserialized in receipts
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00134"});
+        let artifact = json!({"id": "RFC-0011::REQ-0001"});
 
         let schema_id = "org:schema:ticket-v1";
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2263,10 +2263,10 @@ mod tests {
         // Verify empty schema_id is not included in JSON output
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00134"});
+        let artifact = json!({"id": "RFC-0011::REQ-0001"});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00134",
+            "org:ticket:RFC-0011::REQ-0001",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2284,7 +2284,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Freeze Check Tests (TCK-00213)
+    // Freeze Check Tests (RFC-0032::REQ-0059)
     // =========================================================================
 
     /// A mock freeze checker that always returns frozen for specific scopes.
@@ -2325,7 +2325,7 @@ mod tests {
     fn test_freeze_check_extract_scope_value() {
         // Test scope extraction from various DCP ID formats
         assert_eq!(
-            AdmissionGate::<MemoryCas>::extract_scope_value("org:ticket:TCK-00213"),
+            AdmissionGate::<MemoryCas>::extract_scope_value("org:ticket:RFC-0032::REQ-0059"),
             "org:ticket"
         );
         assert_eq!(
@@ -2350,10 +2350,10 @@ mod tests {
         let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
 
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00213"});
+        let artifact = json!({"id": "RFC-0032::REQ-0059"});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00213",
+            "org:ticket:RFC-0032::REQ-0059",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2376,10 +2376,10 @@ mod tests {
         let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
 
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00213"});
+        let artifact = json!({"id": "RFC-0032::REQ-0059"});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00213",
+            "org:ticket:RFC-0032::REQ-0059",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2405,9 +2405,9 @@ mod tests {
 
         // Request to frozen scope should fail
         let request1 = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00213",
+            "org:ticket:RFC-0032::REQ-0059",
             ArtifactKind::Ticket,
-            json!({"id": "TCK-00213"}),
+            json!({"id": "RFC-0032::REQ-0059"}),
             &schema,
         );
         assert!(gate.admit(request1).is_err(), "org:ticket should be frozen");
@@ -2427,10 +2427,10 @@ mod tests {
         // Test that NoOpFreezeCheck allows all admissions (backwards compatible)
         let gate = make_gate();
         let schema = sample_schema();
-        let artifact = json!({"id": "TCK-00213"});
+        let artifact = json!({"id": "RFC-0032::REQ-0059"});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00213",
+            "org:ticket:RFC-0032::REQ-0059",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2475,7 +2475,7 @@ mod tests {
         let artifact = json!({"version": 1});
 
         let request = AdmissionRequest::new_artifact(
-            "org:ticket:TCK-00213",
+            "org:ticket:RFC-0032::REQ-0059",
             ArtifactKind::Ticket,
             artifact,
             &schema,
@@ -2497,7 +2497,7 @@ mod tests {
     fn test_extract_scope_value_dcp_uri() {
         // Standard DCP URI format: dcp://org/repo/artifact/id
         let scope =
-            AdmissionGate::<MemoryCas>::extract_scope_value("dcp://myorg/myrepo/ticket/TCK-00213");
+            AdmissionGate::<MemoryCas>::extract_scope_value("dcp://myorg/myrepo/ticket/RFC-0032::REQ-0059");
         assert_eq!(scope, "myorg/myrepo");
     }
 
@@ -2527,7 +2527,7 @@ mod tests {
     #[test]
     fn test_extract_scope_value_colon_separated() {
         // Colon-separated format: org:kind:id
-        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("myorg:ticket:TCK-00213");
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("myorg:ticket:RFC-0032::REQ-0059");
         assert_eq!(scope, "myorg:ticket");
     }
 

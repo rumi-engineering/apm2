@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00588)
+// AGENT-AUTHORED (RFC-0032::REQ-0238)
 //! End-to-end default-mode harness: spin up broker+worker (in-process),
 //! enqueue gates, verify RFC-0028/0029 receipts, and test denial paths.
 //!
@@ -791,7 +791,7 @@ fn e2e_forged_token_is_denied() {
 // Test 6: Verifier=None denies fail-closed (proves NoOpVerifier cfg-gate).
 //
 // `NoOpVerifier` is gated behind `#[cfg(any(test, feature =
-// "unsafe_no_verify"))]` (TCK-00550), so integration tests (separate
+// "unsafe_no_verify"))]` (RFC-0032::REQ-0205), so integration tests (separate
 // crate context) cannot import it under default features. Instead, we
 // prove the equivalent fail-closed behavior: when no verifier is
 // injected (`None`), `evaluate_queue_admission` denies with

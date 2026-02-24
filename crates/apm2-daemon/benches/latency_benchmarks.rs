@@ -28,7 +28,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
-#![allow(deprecated)] // TCK-00336: Benchmarks use deprecated methods for backward compatibility
+#![allow(deprecated)] // RFC-0032::REQ-0128: Benchmarks use deprecated methods for backward compatibility
 
 use std::path::PathBuf;
 use std::sync::Arc;

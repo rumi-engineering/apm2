@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00561)
+// AGENT-AUTHORED (RFC-0032::REQ-0214)
 //! Policy adoption protocol: broker-admitted `FacPolicyHash` rotation.
 //!
 //! This module implements the full lifecycle for adopting and rolling back

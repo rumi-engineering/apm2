@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00211)
+// AGENT-AUTHORED (RFC-0032::REQ-0057)
 //! Session handling for the APM2 daemon.
 //!
 //! This module provides session management functionality for the daemon,
@@ -68,10 +68,10 @@ impl AsRef<str> for EphemeralHandle {
 
 /// Session state for a spawned episode.
 ///
-/// Per TCK-00256, the session state is persisted when `SpawnEpisode` succeeds
+/// Per RFC-0032::REQ-0072, the session state is persisted when `SpawnEpisode` succeeds
 /// to enable subsequent session-scoped IPC calls.
 ///
-/// # Persistence (TCK-00266)
+/// # Persistence (RFC-0032::REQ-0082)
 ///
 /// This struct implements `Serialize` and `Deserialize` to support persistent
 /// session registry state files for crash recovery.
@@ -103,10 +103,10 @@ pub struct SessionState {
     pub capability_manifest_hash: Vec<u8>,
     /// Episode ID in the runtime (if created).
     pub episode_id: Option<String>,
-    /// PCAC policy configuration (TCK-00428).
+    /// PCAC policy configuration (RFC-0020::REQ-0047).
     #[serde(default)]
     pub pcac_policy: Option<PcacPolicyKnobs>,
-    /// Active waiver for `PointerOnly` identity (TCK-00428).
+    /// Active waiver for `PointerOnly` identity (RFC-0020::REQ-0047).
     #[serde(default)]
     pub pointer_only_waiver: Option<PointerOnlyWaiver>,
 }
@@ -133,10 +133,10 @@ impl std::fmt::Debug for SessionState {
 
 /// Trait for persisting and querying session state.
 ///
-/// Per TCK-00256, sessions must be persisted to enable subsequent
+/// Per RFC-0032::REQ-0072, sessions must be persisted to enable subsequent
 /// session-scoped IPC calls.
 ///
-/// # TCK-00385: Termination Tracking
+/// # RFC-0032::REQ-0139: Termination Tracking
 ///
 /// The registry now supports marking sessions as terminated via
 /// [`mark_terminated`](Self::mark_terminated) and querying termination info
@@ -150,10 +150,10 @@ pub trait SessionRegistry: Send + Sync {
     /// Returns the full [`SessionState`] of any sessions that were evicted to
     /// make room for the new session (may be empty if no eviction was
     /// necessary). Callers MUST clean up telemetry for evicted sessions to
-    /// prevent orphaned entries (TCK-00384 security fix). Returning full
+    /// prevent orphaned entries (RFC-0032::REQ-0138 security fix). Returning full
     /// state (rather than just IDs) enables callers to restore evicted
     /// sessions on transactional rollback, preventing capacity loss when a
-    /// spawn fails after eviction (TCK-00384 quality fix).
+    /// spawn fails after eviction (RFC-0032::REQ-0138 quality fix).
     fn register_session(
         &self,
         session: SessionState,
@@ -163,14 +163,14 @@ pub trait SessionRegistry: Send + Sync {
     ///
     /// Returns the removed session state, or `None` if the session was not
     /// found. Used for transactional rollback when post-registration steps
-    /// fail (TCK-00384 security fix).
+    /// fail (RFC-0032::REQ-0138 security fix).
     ///
     /// # Errors
     ///
     /// Returns [`SessionRegistryError::PersistenceFailed`] if the removal
     /// succeeds in-memory but fails to persist to durable storage.
     /// Persistent backends MUST propagate persistence errors so callers
-    /// know the on-disk state may be stale (TCK-00384 security BLOCKER 2).
+    /// know the on-disk state may be stale (RFC-0032::REQ-0138 security BLOCKER 2).
     fn remove_session(
         &self,
         session_id: &str,
@@ -182,7 +182,7 @@ pub trait SessionRegistry: Send + Sync {
     /// Queries a session by ephemeral handle.
     fn get_session_by_handle(&self, handle: &str) -> Option<SessionState>;
 
-    /// Queries a session by work ID (TCK-00344).
+    /// Queries a session by work ID (RFC-0032::REQ-0134).
     ///
     /// Returns the first session associated with the given `work_id`, or `None`
     /// if no session matches. This is an O(n) scan; a production implementation
@@ -190,7 +190,7 @@ pub trait SessionRegistry: Send + Sync {
     fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState>;
 
     /// Marks a session as terminated with the given termination info
-    /// (TCK-00385).
+    /// (RFC-0032::REQ-0139).
     ///
     /// The session entry is preserved in the registry so that subsequent
     /// `SessionStatus` queries return TERMINATED state with exit details.
@@ -206,7 +206,7 @@ pub trait SessionRegistry: Send + Sync {
         info: SessionTerminationInfo,
     ) -> Result<bool, SessionRegistryError>;
 
-    /// Queries termination info for a session (TCK-00385).
+    /// Queries termination info for a session (RFC-0032::REQ-0139).
     ///
     /// Returns `Some(info)` if the session has been terminated and the
     /// termination entry has not yet expired (TTL). Returns `None` if the
@@ -214,7 +214,7 @@ pub trait SessionRegistry: Send + Sync {
     fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo>;
 
     /// Queries a terminated session's preserved state and termination info
-    /// (TCK-00385).
+    /// (RFC-0032::REQ-0139).
     ///
     /// Returns `Some((session, info))` if the session has been terminated
     /// and the entry has not yet expired. Returns `None` otherwise.
@@ -226,7 +226,7 @@ pub trait SessionRegistry: Send + Sync {
         session_id: &str,
     ) -> Option<(SessionState, SessionTerminationInfo)>;
 
-    /// Updates the `episode_id` for an existing session (TCK-00395 Security
+    /// Updates the `episode_id` for an existing session (RFC-0032::REQ-0149 Security
     /// BLOCKER 1).
     ///
     /// After `SpawnEpisode` creates and starts an episode via
@@ -245,7 +245,7 @@ pub trait SessionRegistry: Send + Sync {
         episode_id: String,
     ) -> Result<(), SessionRegistryError>;
 
-    /// Returns all active sessions for crash recovery (TCK-00387).
+    /// Returns all active sessions for crash recovery (RFC-0032::REQ-0141).
     ///
     /// Default implementation returns an empty vec (suitable for in-memory
     /// registries that don't persist across restarts).
@@ -253,7 +253,7 @@ pub trait SessionRegistry: Send + Sync {
         Vec::new()
     }
 
-    /// Clears all sessions and persists the empty state (TCK-00387).
+    /// Clears all sessions and persists the empty state (RFC-0032::REQ-0141).
     ///
     /// Used after crash recovery to make recovery idempotent. A second
     /// startup with the same state file will see no sessions to recover.
@@ -302,7 +302,7 @@ pub enum SessionRegistryError {
 
     /// Persistence failed after an in-memory mutation.
     ///
-    /// TCK-00384 security BLOCKER 2: persistent backends MUST propagate
+    /// RFC-0032::REQ-0138 security BLOCKER 2: persistent backends MUST propagate
     /// persistence errors instead of silently swallowing them.  When this
     /// error is returned from `remove_session`, the in-memory state has
     /// already been updated but the on-disk state is stale.  Callers
@@ -316,7 +316,7 @@ pub enum SessionRegistryError {
 }
 
 // =============================================================================
-// Session Telemetry (TCK-00384)
+// Session Telemetry (RFC-0032::REQ-0138)
 // =============================================================================
 
 /// Maximum number of sessions tracked in the telemetry store.
@@ -328,7 +328,7 @@ pub const MAX_TELEMETRY_SESSIONS: usize = 10_000;
 
 /// Per-session telemetry counters.
 ///
-/// Per TCK-00384, tracks tool call and event emission counts as well as
+/// Per RFC-0032::REQ-0138, tracks tool call and event emission counts as well as
 /// session start time. Counters are thread-safe using atomic operations.
 ///
 /// This is stored separately from [`SessionState`] because `SessionState` must
@@ -345,7 +345,7 @@ pub struct SessionTelemetry {
     pub tool_calls: AtomicU64,
     /// Number of `EmitEvent` calls dispatched for this session.
     pub events_emitted: AtomicU64,
-    /// Number of completed episodes for this session (TCK-00351 BLOCKER-2).
+    /// Number of completed episodes for this session (RFC-0020::REQ-0005 BLOCKER-2).
     ///
     /// This counter tracks completed/terminated episodes for the session,
     /// which is semantically distinct from `tool_calls`.
@@ -428,7 +428,7 @@ impl SessionTelemetry {
         self.episode_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Returns the current episode count (TCK-00351 MAJOR 1 FIX).
+    /// Returns the current episode count (RFC-0020::REQ-0005 MAJOR 1 FIX).
     ///
     /// Semantically distinct from `get_tool_calls()`: episodes are
     /// lifecycle units (one per `SpawnEpisode`), while tool calls count
@@ -464,7 +464,7 @@ pub struct TelemetrySnapshot {
     pub tool_calls: u64,
     /// Number of events emitted.
     pub events_emitted: u64,
-    /// Number of episodes spawned (TCK-00351 MAJOR 1 FIX).
+    /// Number of episodes spawned (RFC-0020::REQ-0005 MAJOR 1 FIX).
     pub episode_count: u64,
     /// Session start timestamp (nanoseconds since epoch).
     /// Wall-clock metadata for display/audit only.
@@ -491,7 +491,7 @@ pub enum TelemetryStoreError {
     },
 }
 
-/// Thread-safe store for per-session telemetry data (TCK-00384).
+/// Thread-safe store for per-session telemetry data (RFC-0032::REQ-0138).
 ///
 /// This store is separate from the session registry because telemetry
 /// counters use atomic operations that are incompatible with the `Clone +
@@ -595,7 +595,7 @@ impl SessionTelemetryStore {
 
     /// Removes telemetry for a session and returns the entry.
     ///
-    /// TCK-00384 security BLOCKER 1: Used during spawn eviction to capture
+    /// RFC-0032::REQ-0138 security BLOCKER 1: Used during spawn eviction to capture
     /// the evicted telemetry entry BEFORE removal.  If a later spawn step
     /// fails, the caller can pass this entry to [`Self::restore`] alongside
     /// the re-registered session to make the rollback complete.
@@ -607,7 +607,7 @@ impl SessionTelemetryStore {
 
     /// Restores a previously removed telemetry entry.
     ///
-    /// TCK-00384 security BLOCKER 1: Complements [`Self::remove_and_return`].
+    /// RFC-0032::REQ-0138 security BLOCKER 1: Complements [`Self::remove_and_return`].
     /// On rollback, callers pass back the `Arc<SessionTelemetry>` obtained
     /// during eviction so counters and timestamps are preserved exactly.
     ///
@@ -653,7 +653,7 @@ impl SessionTelemetryStore {
     /// Removes all telemetry entries.
     ///
     /// Used during crash recovery to clear telemetry state alongside the
-    /// session registry (TCK-00384 security fix: complete lifecycle cleanup).
+    /// session registry (RFC-0032::REQ-0138 security fix: complete lifecycle cleanup).
     pub fn clear(&self) {
         let mut entries = self.entries.write().expect("lock poisoned");
         entries.clear();
@@ -667,12 +667,12 @@ impl SessionTelemetryStore {
 }
 
 // =============================================================================
-// TCK-00351 v3: Per-Session Stop Conditions Store
+// RFC-0020::REQ-0005 v3: Per-Session Stop Conditions Store
 // =============================================================================
 
 /// Per-session stop conditions store for pre-actuation gate enforcement.
 ///
-/// TCK-00351 v3 FIX: The pre-actuation gate was called with
+/// RFC-0020::REQ-0005 v3 FIX: The pre-actuation gate was called with
 /// `StopConditions::default()` and `current_episode_count=0`, meaning
 /// `max_episodes` and `escalation_predicate` were never checked.  This
 /// store associates real stop conditions with each session so the gate can
@@ -775,7 +775,7 @@ impl SessionStopConditionsStore {
 
     /// Removes stop conditions for a session.
     ///
-    /// TCK-00351 BLOCKER 3 FIX: Must be called from the same termination
+    /// RFC-0020::REQ-0005 BLOCKER 3 FIX: Must be called from the same termination
     /// and eviction paths that clean up telemetry entries.  Without this,
     /// stop condition entries accumulate on every spawn/end cycle, causing
     /// the store to reach capacity and reject new registrations (`DoS`).
@@ -799,7 +799,7 @@ impl SessionStopConditionsStore {
 }
 
 // =============================================================================
-// TCK-00384: Session Telemetry Tests
+// RFC-0032::REQ-0138: Session Telemetry Tests
 // =============================================================================
 
 #[cfg(test)]
@@ -1025,7 +1025,7 @@ mod telemetry_tests {
         assert_eq!(snap3.events_emitted, 0);
     }
 
-    /// TCK-00384: Verify counters are thread-safe using concurrent
+    /// RFC-0032::REQ-0138: Verify counters are thread-safe using concurrent
     /// increments from multiple threads.
     #[test]
     fn test_telemetry_thread_safety() {
@@ -1165,7 +1165,7 @@ mod telemetry_tests {
     }
 
     // =========================================================================
-    // TCK-00351 BLOCKER 3: SessionStopConditionsStore lifecycle tests
+    // RFC-0020::REQ-0005 BLOCKER 3: SessionStopConditionsStore lifecycle tests
     // =========================================================================
 
     #[test]
@@ -1231,7 +1231,7 @@ mod telemetry_tests {
         assert!(store.is_empty());
     }
 
-    /// TCK-00351 BLOCKER 3: Churn regression test.
+    /// RFC-0020::REQ-0005 BLOCKER 3: Churn regression test.
     ///
     /// Simulates repeated spawn/terminate cycles and verifies that
     /// `remove()` keeps the store size stable.  Without the fix,
@@ -1269,7 +1269,7 @@ mod telemetry_tests {
         );
     }
 
-    /// TCK-00351 BLOCKER 3: Capacity regression test.
+    /// RFC-0020::REQ-0005 BLOCKER 3: Capacity regression test.
     ///
     /// Fills the store to capacity, removes entries, and verifies that
     /// new registrations succeed after removal.  Proves that `remove()`

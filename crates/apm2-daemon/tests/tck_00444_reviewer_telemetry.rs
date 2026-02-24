@@ -1,4 +1,4 @@
-//! TCK-00444: Reviewer telemetry contract and bounded projection visibility.
+//! RFC-0032::REQ-0168: Reviewer telemetry contract and bounded projection visibility.
 //!
 //! Coverage:
 //! - Versioned lifecycle schema normalization

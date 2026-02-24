@@ -47,8 +47,8 @@ pub struct SchedulerStateV1 {
     pub last_evaluation_tick: u64,
     /// Epoch seconds of persistence.
     pub persisted_at_secs: u64,
-    /// TCK-00532: Per-job-kind cost model for queue admission.
-    /// Optional for backward compatibility with pre-TCK-00532 state files.
+    /// RFC-0032::REQ-0188: Per-job-kind cost model for queue admission.
+    /// Optional for backward compatibility with pre-RFC-0032::REQ-0188 state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_model: Option<CostModelV1>,
     /// BLAKE3 content hash for integrity.
@@ -156,7 +156,7 @@ pub fn load_scheduler_state(fac_root: &Path) -> Result<Option<SchedulerStateV1>,
         }
     }
 
-    // TCK-00532: Validate cost model if present.
+    // RFC-0032::REQ-0188: Validate cost model if present.
     if let Some(ref cost_model) = state.cost_model {
         cost_model
             .validate()

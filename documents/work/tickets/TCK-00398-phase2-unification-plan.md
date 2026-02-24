@@ -1,4 +1,4 @@
-# TCK-00398 Phase 2 Canonical Ledger Unification Plan
+# RFC-0032::REQ-0150 Phase 2 Canonical Ledger Unification Plan
 
 ## Goal
 Converge daemon write-path and core/CLI read-path on the canonical `events` table, then retire compatibility bridging without data loss.

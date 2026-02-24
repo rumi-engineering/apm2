@@ -49,7 +49,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00197: HLC-Based CRDT Merge Operators
+//! - RFC-0033::REQ-0057: HLC-Based CRDT Merge Operators
 //! - DD-0005: Event Classification by Ordering Guarantee
 
 use std::cmp::Ordering;
@@ -103,7 +103,7 @@ pub const MAX_READMISSION_ANCHORS: usize = 64;
 pub const READMISSION_ANCHOR_DOMAIN: &[u8] = b"apm2:readmission_anchor:v1\0";
 
 // =============================================================================
-// AuthorizationVerifier trait (TCK-00360 BLOCKER 1 fix)
+// AuthorizationVerifier trait (RFC-0020::REQ-0014 BLOCKER 1 fix)
 // =============================================================================
 
 /// Trait for verifying cryptographic signatures on authorization proofs.
@@ -1563,7 +1563,7 @@ impl ReAdmissionAnchor {
 }
 
 // =============================================================================
-// Authorization Proof (TCK-00360 BLOCKER fix)
+// Authorization Proof (RFC-0020::REQ-0014 BLOCKER fix)
 // =============================================================================
 
 /// Proof of policy-root authorization for re-admission of a revoked entry.
@@ -1782,7 +1782,7 @@ impl AuthorizationProof {
 }
 
 // =============================================================================
-// Signed CRDT Delta (TCK-00360 BLOCKER fix)
+// Signed CRDT Delta (RFC-0020::REQ-0014 BLOCKER fix)
 // =============================================================================
 
 /// A signed, replay-protected CRDT delta for merge boundaries.
@@ -2003,7 +2003,7 @@ impl<T> CrdtDelta<T> {
 }
 
 // =============================================================================
-// Revocation-Wins Register (TCK-00360)
+// Revocation-Wins Register (RFC-0020::REQ-0014)
 // =============================================================================
 
 /// A CRDT register with revocation-wins merge semantics.
@@ -2035,7 +2035,7 @@ impl<T> CrdtDelta<T> {
 /// # References
 ///
 /// - RFC-0020: Identity Directory and Revocation
-/// - TCK-00360: Revocation-wins signed CRDT merge law
+/// - RFC-0020::REQ-0014: Revocation-wins signed CRDT merge law
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationWinsRegister<T> {
@@ -2562,7 +2562,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00197: HLC-Based CRDT Merge Operators
+    // RFC-0033::REQ-0057: HLC-Based CRDT Merge Operators
     // =========================================================================
 
     /// AC1: HLC comparison is deterministic.
@@ -3234,7 +3234,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00197: SetUnion CRDT Tests
+    // RFC-0033::REQ-0057: SetUnion CRDT Tests
     // =========================================================================
 
     /// `SetUnion`: basic insertion and containment.
@@ -3472,7 +3472,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00197 Security Fixes
+    // RFC-0033::REQ-0057 Security Fixes
     // =========================================================================
 
     /// CRITICAL: LWW merge must be commutative when HLCs are equal but
@@ -3628,7 +3628,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00360: Revocation-Wins Signed CRDT Merge Law
+    // RFC-0020::REQ-0014: Revocation-Wins Signed CRDT Merge Law
     // =========================================================================
 
     /// Helper: create a `RevocationWinsRegister` with Active status.
@@ -4157,7 +4157,7 @@ mod tests {
         }
     }
 
-    /// Error display for new TCK-00360 error variants.
+    /// Error display for new RFC-0020::REQ-0014 error variants.
     #[test]
     fn tck_00360_error_display() {
         let errors: Vec<CrdtMergeError> = vec![
@@ -4202,7 +4202,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00360 BLOCKER/MAJOR fix tests
+    // RFC-0020::REQ-0014 BLOCKER/MAJOR fix tests
     // =========================================================================
 
     /// BLOCKER fix: `readmit()` requires authorization proof.
@@ -4912,7 +4912,7 @@ mod tests {
 }
 
 // =============================================================================
-// Property-Based Tests (TCK-00360)
+// Property-Based Tests (RFC-0020::REQ-0014)
 // =============================================================================
 
 #[cfg(test)]

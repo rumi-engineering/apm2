@@ -343,7 +343,7 @@
       "Decode and collection bounds are enforced before trust decisions.",
       "Digest-first boundaries are maintained to avoid raw payload fanout at multi-exabyte scale.",
       "REQ-0035 and REQ-0036 controls are codified in the consensus runbook and Security Policy with explicit ticket and requirement references.",
-      "RFC-0020 requirement closure is tracked in primary artifacts; unresolved gaps: REQ-0007 (TCK-00371), REQ-0009 (TCK-00373), REQ-0014 (TCK-00378), REQ-0021 (TCK-00376), REQ-0022 (TCK-00377), REQ-0026 (TCK-00380).",
+      "RFC-0020 requirement closure is tracked in primary artifacts; unresolved gaps: REQ-0007 (RFC-0020::REQ-0025), REQ-0009 (RFC-0020::REQ-0027), REQ-0014 (RFC-0020::REQ-0032), REQ-0021 (RFC-0020::REQ-0030), REQ-0022 (RFC-0020::REQ-0031), REQ-0026 (RFC-0020::REQ-0034).",
       "Verification paths preserve logarithmic proof economics for identity and receipt checks."
     ],
     "cryptography_posture": {

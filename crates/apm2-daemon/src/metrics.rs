@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00268)
+// AGENT-AUTHORED (RFC-0032::REQ-0084)
 //! Prometheus metrics for daemon health observability.
 //!
 //! This module provides Prometheus metrics for the APM2 daemon as specified
@@ -103,7 +103,7 @@ pub struct DaemonMetrics {
     session_terminations_total: CounterVec,
 
     /// Total contract mismatches during handshake, labeled by `risk_tier`
-    /// and `outcome` (TCK-00348).
+    /// and `outcome` (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 11.4, this counter tracks:
     /// - `outcome="waived"`: mismatch detected but session allowed
@@ -180,7 +180,7 @@ impl DaemonMetrics {
         )?;
         registry.register(Box::new(session_terminations_total.clone()))?;
 
-        // TCK-00348: Contract mismatch counter per RFC-0020 section 11.4
+        // RFC-0020::REQ-0002: Contract mismatch counter per RFC-0020 section 11.4
         let contract_mismatch_total = CounterVec::new(
             Opts::new(
                 "apm2_daemon_contract_mismatch_total",
@@ -355,7 +355,7 @@ impl DaemonMetrics {
     }
 
     // ========================================================================
-    // Contract Mismatch Metrics (TCK-00348)
+    // Contract Mismatch Metrics (RFC-0020::REQ-0002)
     // ========================================================================
 
     /// Records a contract mismatch event during handshake.

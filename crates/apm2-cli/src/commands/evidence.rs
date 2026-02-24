@@ -1,7 +1,7 @@
 //! Evidence management CLI commands.
 //!
 //! This module implements `apm2 evidence` subcommands for evidence publishing
-//! using the protocol-based session socket (TCK-00288).
+//! using the protocol-based session socket (RFC-0032::REQ-0090).
 //!
 //! # Commands
 //!

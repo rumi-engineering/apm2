@@ -9,7 +9,7 @@
     "owners": ["engineering"],
     "provenance": {
       "actor_id": "HOLON-ENGINEERING-GOVERNANCE",
-      "work_id": "TCK-00605-REVIEW-PROMPT-REFACTOR",
+      "work_id": "RFC-0032::REQ-0285-REVIEW-PROMPT-REFACTOR",
       "source_receipts": []
     }
   },

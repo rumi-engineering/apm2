@@ -1,4 +1,4 @@
-//! TCK-00392: Wire IPC shutdown handler to daemon graceful shutdown signal.
+//! RFC-0032::REQ-0146: Wire IPC shutdown handler to daemon graceful shutdown signal.
 //!
 //! This test module verifies that the `handle_shutdown` method in
 //! `PrivilegedDispatcher` correctly wires to the daemon's `SharedState`

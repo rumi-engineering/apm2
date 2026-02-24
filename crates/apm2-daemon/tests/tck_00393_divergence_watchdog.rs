@@ -1,5 +1,5 @@
-// AGENT-AUTHORED (TCK-00393)
-//! Integration tests for the divergence watchdog wiring (TCK-00393).
+// AGENT-AUTHORED (RFC-0032::REQ-0147)
+//! Integration tests for the divergence watchdog wiring (RFC-0032::REQ-0147).
 //!
 //! These tests verify the divergence watchdog integration:
 //! 1. Watchdog instantiation with daemon signer and config
@@ -451,7 +451,7 @@ fn ecosystem_config_divergence_watchdog_defaults() {
 
 /// UT-00408-01: Fail-closed startup when watchdog enabled without ledger DB.
 ///
-/// TCK-00408 regression test: when `divergence_watchdog.enabled=true` but no
+/// RFC-0032::REQ-0156 regression test: when `divergence_watchdog.enabled=true` but no
 /// ledger database is configured, `validate_startup_prerequisites` must
 /// return an error. This ensures the daemon refuses to start in a
 /// configuration that would silently disable divergence detection.
@@ -496,7 +496,7 @@ fn watchdog_enabled_without_ledger_db_fails_startup() {
 
 /// UT-00408-02: Startup succeeds when watchdog enabled WITH ledger DB.
 ///
-/// Complementary positive test for TCK-00408: when the watchdog is enabled
+/// Complementary positive test for RFC-0032::REQ-0156: when the watchdog is enabled
 /// and a ledger database IS configured, validation passes.
 #[test]
 fn watchdog_enabled_with_ledger_db_passes_startup() {

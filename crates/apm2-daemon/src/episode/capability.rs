@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
 // =============================================================================
-// Allowlist Resource Limits (TCK-00254, TCK-00314)
+// Allowlist Resource Limits (RFC-0032::REQ-0070, RFC-0032::REQ-0108)
 //
 // Per CTR-1303, all Vec fields must have bounded sizes to prevent DoS.
 // All MAX_*_ALLOWLIST constants are defined in apm2-core and re-exported via
@@ -58,7 +58,7 @@ pub use super::tool_class::{
 };
 
 // =============================================================================
-// TCK-00314: HEF Capability Allowlist Limits
+// RFC-0032::REQ-0108: HEF Capability Allowlist Limits
 //
 // Per RFC-0018, pulse topic and CAS hash allowlists for session access control.
 // =============================================================================
@@ -262,7 +262,7 @@ pub enum CapabilityError {
     },
 
     // =========================================================================
-    // TCK-00314: HEF Capability Allowlist Errors
+    // RFC-0032::REQ-0108: HEF Capability Allowlist Errors
     // =========================================================================
     /// Topic allowlist exceeds maximum size.
     TooManyTopicAllowlistEntries {
@@ -351,7 +351,7 @@ impl std::fmt::Display for CapabilityError {
             Self::WriteAllowlistPathTraversal { path } => {
                 write!(f, "write allowlist path contains traversal (..): {path}")
             },
-            // TCK-00314: HEF Capability Allowlist Errors
+            // RFC-0032::REQ-0108: HEF Capability Allowlist Errors
             Self::TooManyTopicAllowlistEntries { count, max } => {
                 write!(f, "too many topic allowlist entries: {count} (max {max})")
             },
@@ -473,7 +473,7 @@ pub enum DenyReason {
 
     /// Tool class is not in the manifest's tool allowlist.
     ///
-    /// Per TCK-00254, tools must be explicitly allowed in the manifest.
+    /// Per RFC-0032::REQ-0070, tools must be explicitly allowed in the manifest.
     /// Empty `tool_allowlist` means no tools allowed (fail-closed).
     ToolNotInAllowlist {
         /// The tool class that was denied.
@@ -482,7 +482,7 @@ pub enum DenyReason {
 
     /// Write path is not in the manifest's write allowlist.
     ///
-    /// Per TCK-00254, write operations must target paths in the allowlist.
+    /// Per RFC-0032::REQ-0070, write operations must target paths in the allowlist.
     /// Empty `write_allowlist` means no writes allowed (fail-closed).
     WritePathNotInAllowlist {
         /// The path that was denied.
@@ -491,7 +491,7 @@ pub enum DenyReason {
 
     /// Shell command is not in the manifest's shell allowlist.
     ///
-    /// Per TCK-00254, shell commands must match patterns in the allowlist.
+    /// Per RFC-0032::REQ-0070, shell commands must match patterns in the allowlist.
     /// Empty `shell_allowlist` means no shell commands allowed (fail-closed).
     ShellCommandNotInAllowlist {
         /// The shell command that was denied.
@@ -500,14 +500,14 @@ pub enum DenyReason {
 
     /// Write path is required but not provided.
     ///
-    /// Per TCK-00254, when `write_allowlist` is configured, the request MUST
+    /// Per RFC-0032::REQ-0070, when `write_allowlist` is configured, the request MUST
     /// include a path for validation. Fail-closed semantics: missing field =
     /// deny.
     WritePathRequired,
 
     /// Shell command is required but not provided.
     ///
-    /// Per TCK-00254, when `shell_allowlist` is configured, the request MUST
+    /// Per RFC-0032::REQ-0070, when `shell_allowlist` is configured, the request MUST
     /// include a shell command for validation. Fail-closed semantics: missing
     /// field = deny.
     ShellCommandRequired,
@@ -734,14 +734,14 @@ impl CapabilityBuilder {
 /// - Is referenced by hash in the episode envelope
 /// - Expires at a specified time (optional)
 ///
-/// # TCK-00254 Extensions
+/// # RFC-0032::REQ-0070 Extensions
 ///
 /// Per RFC-0017, the manifest includes allowlists for tool mediation:
 /// - `tool_allowlist`: Allowed tool classes
 /// - `write_allowlist`: Allowed filesystem write paths
 /// - `shell_allowlist`: Allowed shell command patterns
 ///
-/// # TCK-00314 Extensions
+/// # RFC-0032::REQ-0108 Extensions
 ///
 /// Per RFC-0018, the manifest includes HEF allowlists:
 /// - `topic_allowlist`: Allowed pulse topics for session subscriptions
@@ -792,7 +792,7 @@ pub struct CapabilityManifest {
     pub shell_allowlist: Vec<String>,
 
     // =========================================================================
-    // TCK-00314: HEF Capability Allowlists
+    // RFC-0032::REQ-0108: HEF Capability Allowlists
     // =========================================================================
     /// Allowlist of pulse topics that this session can subscribe to.
     ///
@@ -826,7 +826,7 @@ pub struct CapabilityManifest {
     /// # Note
     ///
     /// CAS writes are not allowlisted (write allowlists are out of scope
-    /// per TCK-00314). Operator.sock has full CAS access.
+    /// per RFC-0032::REQ-0108). Operator.sock has full CAS access.
     #[serde(default)]
     pub cas_hash_allowlist: Vec<[u8; 32]>,
 }
@@ -840,7 +840,7 @@ impl CapabilityManifest {
 
     /// Creates a stub manifest from a capability manifest hash.
     ///
-    /// # TCK-00287
+    /// # RFC-0032::REQ-0089
     ///
     /// This method creates a minimal manifest with the given hash as the ID and
     /// a default permissive tool allowlist for stub/testing purposes. In
@@ -862,7 +862,7 @@ impl CapabilityManifest {
         capability_manifest_hash: &[u8; 32],
         tool_allowlist: Vec<ToolClass>,
     ) -> Self {
-        // TCK-00352 BLOCKER 2 fix: V1 minting requires non-zero expiry.
+        // RFC-0020::REQ-0006 BLOCKER 2 fix: V1 minting requires non-zero expiry.
         // Default to 24 hours from now for stub/fallback manifests so
         // that V1 enforcement is active. Without this, stub manifests
         // cause V1 minting to fail, leaving sessions without V1 scope
@@ -885,7 +885,7 @@ impl CapabilityManifest {
             tool_allowlist,
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists default to empty (fail-closed)
+            // RFC-0032::REQ-0108: HEF allowlists default to empty (fail-closed)
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         }
@@ -894,7 +894,7 @@ impl CapabilityManifest {
     /// Creates a stub manifest from a capability manifest hash with default
     /// tool allowlist.
     ///
-    /// # TCK-00287
+    /// # RFC-0032::REQ-0089
     ///
     /// This method creates a minimal manifest with an empty tool allowlist
     /// by default (fail-closed).
@@ -962,7 +962,7 @@ impl CapabilityManifest {
             }
         }
 
-        // Validate allowlists (TCK-00254: CTR-1303 bounded collections)
+        // Validate allowlists (RFC-0032::REQ-0070: CTR-1303 bounded collections)
         if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
             return Err(CapabilityError::TooManyToolAllowlistEntries {
                 count: self.tool_allowlist.len(),
@@ -977,7 +977,7 @@ impl CapabilityManifest {
             });
         }
 
-        // Validate write allowlist paths (TCK-00254: CTR-1503, CTR-2609)
+        // Validate write allowlist paths (RFC-0032::REQ-0070: CTR-1503, CTR-2609)
         for path in &self.write_allowlist {
             let path_len = path.as_os_str().len();
             if path_len > super::scope::MAX_PATH_LEN {
@@ -1022,14 +1022,14 @@ impl CapabilityManifest {
             }
         }
 
-        // TCK-00314: Validate HEF allowlists
+        // RFC-0032::REQ-0108: Validate HEF allowlists
         self.validate_topic_allowlist()?;
         self.validate_cas_hash_allowlist()?;
 
         Ok(())
     }
 
-    /// Validates the topic allowlist (TCK-00314).
+    /// Validates the topic allowlist (RFC-0032::REQ-0108).
     ///
     /// # Phase 1 Restrictions
     ///
@@ -1093,7 +1093,7 @@ impl CapabilityManifest {
         Ok(())
     }
 
-    /// Validates the CAS hash allowlist (TCK-00314).
+    /// Validates the CAS hash allowlist (RFC-0032::REQ-0108).
     fn validate_cas_hash_allowlist(&self) -> Result<(), CapabilityError> {
         if self.cas_hash_allowlist.len() > MAX_CAS_HASH_ALLOWLIST {
             return Err(CapabilityError::TooManyCasHashAllowlistEntries {
@@ -1165,7 +1165,7 @@ impl CapabilityManifest {
     }
 
     // =========================================================================
-    // TCK-00254: Allowlist Enforcement Methods
+    // RFC-0032::REQ-0070: Allowlist Enforcement Methods
     // =========================================================================
 
     /// Returns a reference to the tool allowlist.
@@ -1176,7 +1176,7 @@ impl CapabilityManifest {
 
     /// Checks if the given tool class is in the tool allowlist.
     ///
-    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
     #[must_use]
     pub fn is_tool_allowed(&self, tool_class: ToolClass) -> bool {
         if self.tool_allowlist.is_empty() {
@@ -1188,7 +1188,7 @@ impl CapabilityManifest {
 
     /// Checks if the given path is in the write allowlist.
     ///
-    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
     /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
     #[must_use]
     pub fn is_write_path_allowed(&self, path: &Path) -> bool {
@@ -1207,7 +1207,7 @@ impl CapabilityManifest {
     /// Checks if the given shell command matches a pattern in the shell
     /// allowlist.
     ///
-    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
     /// Patterns use simple glob matching with `*` as wildcard.
     #[must_use]
     pub fn is_shell_command_allowed(&self, command: &str) -> bool {
@@ -1225,7 +1225,7 @@ impl CapabilityManifest {
     }
 
     // =========================================================================
-    // TCK-00314: HEF Allowlist Enforcement Methods
+    // RFC-0032::REQ-0108: HEF Allowlist Enforcement Methods
     // =========================================================================
 
     /// Returns a reference to the topic allowlist.
@@ -1242,7 +1242,7 @@ impl CapabilityManifest {
 
     /// Checks if the given topic is in the topic allowlist.
     ///
-    /// Per TCK-00314, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty (fail-closed).
     /// Only exact matches are allowed (Phase 1: no wildcard patterns).
     #[must_use]
     pub fn is_topic_allowed(&self, topic: &str) -> bool {
@@ -1255,7 +1255,7 @@ impl CapabilityManifest {
 
     /// Checks if the given CAS hash is in the CAS hash allowlist.
     ///
-    /// Per TCK-00314, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty (fail-closed).
     #[must_use]
     pub fn is_cas_hash_allowed(&self, hash: &[u8; 32]) -> bool {
         if self.cas_hash_allowlist.is_empty() {
@@ -1267,7 +1267,7 @@ impl CapabilityManifest {
 
     /// Converts the topic allowlist to a `TopicAllowlist` for ACL evaluation.
     ///
-    /// Per TCK-00314, this method creates a `TopicAllowlist` from the
+    /// Per RFC-0032::REQ-0108, this method creates a `TopicAllowlist` from the
     /// manifest's `topic_allowlist` field for use with `PulseAclEvaluator`.
     ///
     /// # Returns
@@ -1292,9 +1292,9 @@ impl CapabilityManifest {
     ///
     /// This is the main entry point for capability validation. It checks:
     /// 1. Manifest expiration
-    /// 2. TCK-00254: Tool allowlist enforcement
-    /// 3. TCK-00254: Write allowlist enforcement (for Write operations)
-    /// 4. TCK-00254: Shell allowlist enforcement (for Execute operations)
+    /// 2. RFC-0032::REQ-0070: Tool allowlist enforcement
+    /// 3. RFC-0032::REQ-0070: Write allowlist enforcement (for Write operations)
+    /// 4. RFC-0032::REQ-0070: Shell allowlist enforcement (for Execute operations)
     /// 5. Matching tool class
     /// 6. Path containment (for filesystem operations)
     /// 7. Size limits
@@ -1343,7 +1343,7 @@ impl CapabilityManifest {
 
     /// Internal validation logic without expiration check.
     fn validate_request_internal(&self, request: &ToolRequest) -> CapabilityDecision {
-        // TCK-00254: Check tool allowlist (fail-closed)
+        // RFC-0032::REQ-0070: Check tool allowlist (fail-closed)
         if !self.is_tool_allowed(request.tool_class) {
             return CapabilityDecision::Deny {
                 reason: DenyReason::ToolNotInAllowlist {
@@ -1352,7 +1352,7 @@ impl CapabilityManifest {
             };
         }
 
-        // TCK-00254: Check write allowlist for Write operations (fail-closed)
+        // RFC-0032::REQ-0070: Check write allowlist for Write operations (fail-closed)
         // SECURITY (SEC-SCP-FAC-0020): Always enforce write allowlist check for Write
         // operations. If the allowlist is empty, is_write_path_allowed returns false,
         // correctly implementing fail-closed semantics per DD-004.
@@ -1376,7 +1376,7 @@ impl CapabilityManifest {
             }
         }
 
-        // TCK-00254: Check shell allowlist for Execute operations (fail-closed)
+        // RFC-0032::REQ-0070: Check shell allowlist for Execute operations (fail-closed)
         // SECURITY (SEC-SCP-FAC-0020): Always enforce shell allowlist check for Execute
         // operations. If the allowlist is empty, is_shell_command_allowed returns
         // false, correctly implementing fail-closed semantics per DD-004.
@@ -1515,7 +1515,7 @@ struct CapabilityManifestProto {
     /// Sorted shell patterns for deterministic serialization.
     #[prost(string, repeated, tag = "8")]
     shell_allowlist: Vec<String>,
-    // TCK-00314: HEF allowlists
+    // RFC-0032::REQ-0108: HEF allowlists
     /// Sorted topic allowlist for deterministic serialization.
     #[prost(string, repeated, tag = "9")]
     topic_allowlist: Vec<String>,
@@ -1555,7 +1555,7 @@ impl CapabilityManifest {
         let mut sorted_shell_patterns: Vec<String> = self.shell_allowlist.clone();
         sorted_shell_patterns.sort_unstable();
 
-        // TCK-00314: Sort HEF allowlists for determinism
+        // RFC-0032::REQ-0108: Sort HEF allowlists for determinism
         let mut sorted_topics: Vec<String> = self.topic_allowlist.clone();
         sorted_topics.sort_unstable();
 
@@ -1591,7 +1591,7 @@ pub struct CapabilityManifestBuilder {
     tool_allowlist: Vec<ToolClass>,
     write_allowlist: Vec<PathBuf>,
     shell_allowlist: Vec<String>,
-    // TCK-00314: HEF allowlists
+    // RFC-0032::REQ-0108: HEF allowlists
     topic_allowlist: Vec<String>,
     cas_hash_allowlist: Vec<[u8; 32]>,
 }
@@ -1614,7 +1614,7 @@ impl CapabilityManifestBuilder {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         }
@@ -1716,7 +1716,7 @@ impl CapabilityManifestBuilder {
     }
 
     // =========================================================================
-    // TCK-00314: HEF Allowlist Builder Methods
+    // RFC-0032::REQ-0108: HEF Allowlist Builder Methods
     // =========================================================================
 
     /// Sets the topic allowlist for pulse subscriptions.
@@ -1768,7 +1768,7 @@ impl CapabilityManifestBuilder {
         self.tool_allowlist.sort_by_key(ToolClass::value);
         self.write_allowlist.sort();
         self.shell_allowlist.sort();
-        // TCK-00314: Sort HEF allowlists
+        // RFC-0032::REQ-0108: Sort HEF allowlists
         self.topic_allowlist.sort();
         self.cas_hash_allowlist.sort_unstable();
 
@@ -1781,7 +1781,7 @@ impl CapabilityManifestBuilder {
             tool_allowlist: self.tool_allowlist,
             write_allowlist: self.write_allowlist,
             shell_allowlist: self.shell_allowlist,
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: self.topic_allowlist,
             cas_hash_allowlist: self.cas_hash_allowlist,
         };
@@ -1811,7 +1811,7 @@ pub struct ToolRequest {
 
     /// Optional shell command for Execute operations.
     ///
-    /// Per TCK-00254, this enables shell allowlist matching.
+    /// Per RFC-0032::REQ-0070, this enables shell allowlist matching.
     /// When `tool_class` is Execute and `shell_allowlist` is configured,
     /// this command must match one of the allowed patterns.
     pub shell_command: Option<String>,
@@ -1857,7 +1857,7 @@ impl ToolRequest {
 
     /// Sets the shell command for Execute operations.
     ///
-    /// Per TCK-00254, when `tool_class` is Execute, this command will be
+    /// Per RFC-0032::REQ-0070, when `tool_class` is Execute, this command will be
     /// validated against the manifest's `shell_allowlist`.
     #[must_use]
     pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
@@ -2261,7 +2261,7 @@ impl ManifestLoader for StubManifestLoader {
 /// It implements the full `ManifestLoader` trait with proper hash
 /// verification and validation.
 ///
-/// # TCK-00317 Implementation
+/// # RFC-0032::REQ-0111 Implementation
 ///
 /// Per DOD item 1 (CAS Storage & Hash Loading), this loader:
 /// - Stores manifests as CAS artifacts (hash-addressed)
@@ -2296,7 +2296,7 @@ impl InMemoryCasManifestLoader {
     /// This is the recommended constructor for production use, ensuring the
     /// canonical manifest is always available.
     ///
-    /// # TCK-00317
+    /// # RFC-0032::REQ-0111
     ///
     /// Per DOD item 1, the reviewer v0 manifest must be stored in CAS and
     /// referenced by hash. This constructor pre-seeds the store with the
@@ -2374,9 +2374,9 @@ pub type BasicValidator = PolicyIntegratedValidator<StubManifestLoader>;
 pub type CasValidator = PolicyIntegratedValidator<InMemoryCasManifestLoader>;
 
 // =============================================================================
-// TCK-00352: CapabilityManifestV1 — Policy-Only Capability Minting
+// RFC-0020::REQ-0006: CapabilityManifestV1 — Policy-Only Capability Minting
 //
-// Per TCK-00352, CapabilityManifestV1 can ONLY be minted by the policy
+// Per RFC-0020::REQ-0006, CapabilityManifestV1 can ONLY be minted by the policy
 // resolver. Requester surfaces cannot construct this type. The type wraps
 // a validated CapabilityManifest with additional security properties:
 // - Host restrictions (allowed hosts for network operations)
@@ -2489,7 +2489,7 @@ impl From<CapabilityError> for ManifestV1Error {
 
 /// Sealed proof token that can only be constructed by the policy resolver.
 ///
-/// Per TCK-00352, this type prevents requester surfaces from constructing
+/// Per RFC-0020::REQ-0006, this type prevents requester surfaces from constructing
 /// `CapabilityManifestV1` directly. Only code paths that hold a
 /// `PolicyMintToken` can call `CapabilityManifestV1::mint()`.
 ///
@@ -2526,7 +2526,7 @@ impl PolicyMintToken {
 
 /// V1 capability manifest with policy-resolver-only minting.
 ///
-/// Per TCK-00352:
+/// Per RFC-0020::REQ-0006:
 /// - Can ONLY be constructed via [`CapabilityManifestV1::mint()`] which
 ///   requires a [`PolicyMintToken`] (only obtainable by the policy resolver).
 /// - Enforces mandatory expiry (fail-closed: zero expiry is rejected).
@@ -2545,7 +2545,7 @@ impl PolicyMintToken {
 ///
 /// # Contract References
 ///
-/// - TCK-00352: Policy-only capability minting and broker scope enforcement
+/// - RFC-0020::REQ-0006: Policy-only capability minting and broker scope enforcement
 /// - AD-TOOL-002: Capability manifests as sealed references
 /// - CTR-1303: Bounded collections with `MAX_*` constants
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2561,7 +2561,7 @@ pub struct CapabilityManifestV1 {
 
     /// Allowed hosts for network operations.
     ///
-    /// Per TCK-00352, host restrictions are enforced by the broker before
+    /// Per RFC-0020::REQ-0006, host restrictions are enforced by the broker before
     /// dispatching network tool requests. Empty means no hosts allowed
     /// (fail-closed).
     host_restrictions: Vec<String>,
@@ -2697,7 +2697,7 @@ impl CapabilityManifestV1 {
     /// broker scope checks including the risk tier ceiling and host
     /// restrictions.
     ///
-    /// # Broker Scope Enforcement (TCK-00352)
+    /// # Broker Scope Enforcement (RFC-0020::REQ-0006)
     ///
     /// Before dispatching a tool request, the broker MUST call this method.
     /// It enforces:
@@ -2769,7 +2769,7 @@ impl CapabilityManifestV1 {
     /// Validates that an envelope's `capability_manifest_hash` matches
     /// this manifest's digest.
     ///
-    /// Per TCK-00352, if the hash in the envelope does not match the
+    /// Per RFC-0020::REQ-0006, if the hash in the envelope does not match the
     /// actual manifest's BLAKE3 digest, actuation MUST be denied.
     ///
     /// # Arguments
@@ -2814,7 +2814,7 @@ pub struct ScopeBaseline {
 /// Validates that a `CapabilityManifest` does not have overbroad scope
 /// relative to a policy-resolved baseline.
 ///
-/// Per TCK-00352 Security Review MAJOR 1, this function enforces both
+/// Per RFC-0020::REQ-0006 Security Review MAJOR 1, this function enforces both
 /// cardinality bounds AND strict-subset membership. A manifest that
 /// substitutes unauthorized entries while keeping the count within bounds
 /// is rejected.
@@ -2869,7 +2869,7 @@ pub fn validate_manifest_scope_bounds(
 /// Validates that a `CapabilityManifest` scope is a strict subset of a
 /// policy-resolved [`ScopeBaseline`].
 ///
-/// Per TCK-00352 Security Review MAJOR 1, cardinality-only checks allow
+/// Per RFC-0020::REQ-0006 Security Review MAJOR 1, cardinality-only checks allow
 /// scope laundering via same-cardinality substitution. This function
 /// enforces:
 ///
@@ -3090,7 +3090,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3118,7 +3118,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3135,7 +3135,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3262,7 +3262,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3289,7 +3289,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3316,7 +3316,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3343,7 +3343,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3379,7 +3379,7 @@ mod tests {
             tool_allowlist: vec![ToolClass::Read],
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3430,7 +3430,7 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
-            // TCK-00314: HEF allowlists
+            // RFC-0032::REQ-0108: HEF allowlists
             topic_allowlist: Vec::new(),
             cas_hash_allowlist: Vec::new(),
         };
@@ -3467,7 +3467,7 @@ mod tests {
     }
 
     // ==========================================================================
-    // TCK-00254: Allowlist Tests
+    // RFC-0032::REQ-0070: Allowlist Tests
     //
     // Per REQ-DCP-0002, these tests verify the tool, write, and shell
     // allowlists for capability manifests.
@@ -3723,7 +3723,7 @@ mod tests {
     }
 
     // ==========================================================================
-    // TCK-00254: Allowlist Enforcement Tests
+    // RFC-0032::REQ-0070: Allowlist Enforcement Tests
     //
     // Per Security Review, these tests verify the enforcement of
     // tool_allowlist, write_allowlist, and shell_allowlist.
@@ -4016,7 +4016,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00254: Fail-Closed Semantics Tests
+    // RFC-0032::REQ-0070: Fail-Closed Semantics Tests
     // =========================================================================
 
     #[test]
@@ -4151,7 +4151,7 @@ mod tests {
 }
 
 // =============================================================================
-// TCK-00258: Custody Domain Validation (SoD Enforcement)
+// RFC-0032::REQ-0074: Custody Domain Validation (SoD Enforcement)
 // =============================================================================
 
 /// Maximum number of custody domains per validation request.
@@ -4522,7 +4522,7 @@ mod custody_domain_tests {
 }
 
 // ============================================================================
-// TCK-00314: HEF Capability Allowlist Tests
+// RFC-0032::REQ-0108: HEF Capability Allowlist Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -4865,7 +4865,7 @@ mod hef_allowlist_tests {
 }
 
 // ============================================================================
-// InMemoryCasManifestLoader Tests (TCK-00317)
+// InMemoryCasManifestLoader Tests (RFC-0032::REQ-0111)
 // ============================================================================
 
 #[cfg(test)]
@@ -4980,7 +4980,7 @@ mod cas_loader_tests {
 }
 
 // ============================================================================
-// TCK-00352: CapabilityManifestV1 Tests
+// RFC-0020::REQ-0006: CapabilityManifestV1 Tests
 //
 // Policy-only capability minting, broker scope enforcement, laundering
 // negatives, and envelope-manifest hash mismatch denial.
@@ -5653,7 +5653,7 @@ mod manifest_v1_tests {
     }
 
     // ========================================================================
-    // TCK-00352 Security Review MAJOR 1: Strict-subset counterexample tests
+    // RFC-0020::REQ-0006 Security Review MAJOR 1: Strict-subset counterexample tests
     //
     // Verify that same-cardinality substitutions are rejected by
     // validate_manifest_scope_subset.
@@ -5762,7 +5762,7 @@ mod manifest_v1_tests {
     }
 
     // ========================================================================
-    // TCK-00352 Security Review MAJOR 2: V1 wiring integration tests
+    // RFC-0020::REQ-0006 Security Review MAJOR 2: V1 wiring integration tests
     //
     // Prove that V1 validation is exercised through real request flow:
     // deny on envelope mismatch, scope widening, and unauthorized hosts.

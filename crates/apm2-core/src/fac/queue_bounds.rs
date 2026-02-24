@@ -1,8 +1,8 @@
-// AGENT-AUTHORED (TCK-00578)
+// AGENT-AUTHORED (RFC-0032::REQ-0228)
 //! Queue bounds enforcement: `max_pending_jobs`, `max_pending_bytes`,
 //! and optional `per_lane_max_pending_jobs`.
 //!
-//! Implements TCK-00578: enqueue-time bounds checks that prevent the
+//! Implements RFC-0032::REQ-0228: enqueue-time bounds checks that prevent the
 //! pending queue from growing unbounded and exhausting disk. Excess
 //! enqueue attempts are denied with structured denial receipts.
 //!

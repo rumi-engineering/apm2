@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00388, TCK-00390, TCK-00672)
+// AGENT-AUTHORED (RFC-0032::REQ-0142, RFC-0032::REQ-0144, RFC-0032::REQ-0276)
 //! Gate execution orchestrator and merge executor for autonomous gate
 //! lifecycle.
 //!
@@ -8,7 +8,7 @@
 //! spawning, and receipt collection. Session termination is a lifecycle-
 //! only signal for timeout polling (CSID-003).
 //!
-//! It also implements the [`MergeExecutor`] (TCK-00390) which watches for
+//! It also implements the [`MergeExecutor`] (RFC-0032::REQ-0144) which watches for
 //! all required gate receipts reaching PASS verdict and autonomously
 //! executes the merge via GitHub API, creates a signed `MergeReceipt`,
 //! and transitions work state to Completed.

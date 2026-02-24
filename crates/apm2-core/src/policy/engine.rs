@@ -749,9 +749,9 @@ impl EvaluationResult {
             rationale_code: self.rationale_code.clone(),
             budget_consumed: self.budget_consumed,
             // HTF time envelope reference (RFC-0016): not yet populated by this method.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
-            // Episode ID (RFC-0018, TCK-00306): not populated by policy engine.
+            // Episode ID (RFC-0018, RFC-0032::REQ-0102): not populated by policy engine.
             // The daemon episode runtime will populate this from episode context.
             episode_id: String::new(),
         }

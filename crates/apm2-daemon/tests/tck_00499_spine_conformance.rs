@@ -1,4 +1,4 @@
-//! TCK-00499: Spine conformance suite (RFC-0019 REQ-0027).
+//! RFC-0032::REQ-0174: Spine conformance suite (RFC-0019 REQ-0027).
 //!
 //! Coverage:
 //! 1. No-bypass: capability tokens not constructible outside `admission_kernel`

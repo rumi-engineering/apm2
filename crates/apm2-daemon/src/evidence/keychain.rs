@@ -63,12 +63,12 @@ use crate::fs_safe;
 /// Service name for keychain entries.
 pub const KEYCHAIN_SERVICE_NAME: &str = "apm2-receipt-signing";
 
-/// Service name for GitHub tokens (TCK-00262).
+/// Service name for GitHub tokens (RFC-0032::REQ-0078).
 ///
 /// Uses a dedicated service name to avoid collisions with signing keys.
 pub const GITHUB_KEYCHAIN_SERVICE: &str = "apm2-github-tokens";
 
-/// Service name for SSH agent socket path (TCK-00263).
+/// Service name for SSH agent socket path (RFC-0032::REQ-0079).
 ///
 /// Uses a dedicated service name to avoid collisions with signing keys and
 /// GitHub tokens.
@@ -77,18 +77,18 @@ pub const SSH_KEYCHAIN_SERVICE: &str = "apm2-ssh-agent";
 /// Maximum number of keys to store (CTR-1303).
 pub const MAX_STORED_KEYS: usize = 100;
 
-/// Maximum number of GitHub tokens to store (CTR-1303, TCK-00262).
+/// Maximum number of GitHub tokens to store (CTR-1303, RFC-0032::REQ-0078).
 ///
 /// This bounds the in-memory token store to prevent memory exhaustion attacks.
 pub const MAX_STORED_TOKENS: usize = 100;
 
-/// Maximum size for a single GitHub token in bytes (CTR-1303, TCK-00262).
+/// Maximum size for a single GitHub token in bytes (CTR-1303, RFC-0032::REQ-0078).
 ///
 /// GitHub tokens are typically under 100 bytes. 4KB is generous while
 /// preventing unbounded allocation from malicious input.
 pub const MAX_TOKEN_SIZE: usize = 4096;
 
-/// Maximum length for `SSH_AUTH_SOCK` path (CTR-1303, TCK-00263).
+/// Maximum length for `SSH_AUTH_SOCK` path (CTR-1303, RFC-0032::REQ-0079).
 ///
 /// Unix socket paths are limited to 108 bytes on most systems
 /// (`UNIX_PATH_MAX`). We use 256 to be generous while preventing unbounded
@@ -173,7 +173,7 @@ pub enum KeychainError {
     #[error("could not determine home directory")]
     NoHomeDirectory,
 
-    /// Token exceeds maximum size (CTR-1303, TCK-00262).
+    /// Token exceeds maximum size (CTR-1303, RFC-0032::REQ-0078).
     #[error("token too large: {size} bytes (max {max})")]
     TokenTooLarge {
         /// Actual size.
@@ -182,14 +182,14 @@ pub enum KeychainError {
         max: usize,
     },
 
-    /// Token store is full (CTR-1303, TCK-00262).
+    /// Token store is full (CTR-1303, RFC-0032::REQ-0078).
     #[error("token store full: maximum {max} tokens")]
     StoreFull {
         /// Maximum number of tokens.
         max: usize,
     },
 
-    /// `SSH_AUTH_SOCK` path too long (CTR-1303, TCK-00263).
+    /// `SSH_AUTH_SOCK` path too long (CTR-1303, RFC-0032::REQ-0079).
     #[error("SSH_AUTH_SOCK path too long: {len} bytes (max {max})")]
     SshAuthSockTooLong {
         /// Actual length.
@@ -198,7 +198,7 @@ pub enum KeychainError {
         max: usize,
     },
 
-    /// SSH agent not available (TCK-00263).
+    /// SSH agent not available (RFC-0032::REQ-0079).
     #[error("SSH agent not available")]
     SshAgentNotAvailable,
 }
@@ -306,7 +306,7 @@ pub trait SigningKeyStore: Send + Sync {
 }
 
 // =============================================================================
-// GitHubCredentialStore Trait (TCK-00262)
+// GitHubCredentialStore Trait (RFC-0032::REQ-0078)
 // =============================================================================
 
 /// Trait for GitHub credential storage backends.
@@ -361,7 +361,7 @@ pub trait GitHubCredentialStore: Send + Sync {
 }
 
 // =============================================================================
-// SshCredentialStore Trait (TCK-00263)
+// SshCredentialStore Trait (RFC-0032::REQ-0079)
 // =============================================================================
 
 /// Trait for SSH credential storage backends.
@@ -471,7 +471,7 @@ impl KeyManifest {
     /// Returns an empty manifest if the file doesn't exist. Fails closed
     /// on parse errors per CTR-2003.
     ///
-    /// TCK-00537: Uses [`fs_safe::bounded_read_json`] for symlink refusal
+    /// RFC-0032::REQ-0193: Uses [`fs_safe::bounded_read_json`] for symlink refusal
     /// (`O_NOFOLLOW`), bounded reads (size cap), and regular-file verification.
     fn load() -> Result<Self, KeychainError> {
         let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
@@ -480,7 +480,7 @@ impl KeyManifest {
 
     /// Saves the manifest to disk.
     ///
-    /// TCK-00537: Uses [`fs_safe::atomic_write_json`] for crash-safe
+    /// RFC-0032::REQ-0193: Uses [`fs_safe::atomic_write_json`] for crash-safe
     /// persistence with fsync + atomic rename. Parent directory is created
     /// with mode 0700 (restrictive permissions).
     fn save(&self) -> Result<(), KeychainError> {
@@ -596,7 +596,7 @@ impl OsKeychain {
 
     /// Loads manifest from a specific path.
     ///
-    /// TCK-00537: Delegates to [`KeyManifest::load_from_path`] which uses
+    /// RFC-0032::REQ-0193: Delegates to [`KeyManifest::load_from_path`] which uses
     /// safe I/O primitives (symlink refusal, bounded reads).
     fn load_manifest_from_path(path: &Path) -> Result<KeyManifest, KeychainError> {
         KeyManifest::load_from_path(path)
@@ -604,7 +604,7 @@ impl OsKeychain {
 
     /// Saves the current cache to the manifest file.
     ///
-    /// TCK-00537: Uses [`fs_safe::atomic_write_json`] for crash-safe
+    /// RFC-0032::REQ-0193: Uses [`fs_safe::atomic_write_json`] for crash-safe
     /// persistence. Parent directories are created with mode 0700.
     fn save_manifest(&self, cache: &HashMap<String, KeyInfo>) -> Result<(), KeychainError> {
         let manifest = KeyManifest {
@@ -900,7 +900,7 @@ impl SshCredentialStore for OsKeychain {
         session_id: &str,
         auth_sock_path: &str,
     ) -> Result<(), KeychainError> {
-        // CTR-1303, TCK-00263: Enforce path length limit
+        // CTR-1303, RFC-0032::REQ-0079: Enforce path length limit
         if auth_sock_path.len() > MAX_SSH_AUTH_SOCK_LEN {
             return Err(KeychainError::SshAuthSockTooLong {
                 len: auth_sock_path.len(),
@@ -1066,10 +1066,10 @@ impl SigningKeyStore for InMemoryKeyStore {
 }
 
 // =============================================================================
-// InMemoryGitHubCredentialStore (TCK-00262)
+// InMemoryGitHubCredentialStore (RFC-0032::REQ-0078)
 //
 // NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
-// Per TCK-00262 security review, in-memory credential stores must not be
+// Per RFC-0032::REQ-0078 security review, in-memory credential stores must not be
 // available in production builds. Production code MUST use OsKeychain.
 // =============================================================================
 
@@ -1115,7 +1115,7 @@ impl Default for InMemoryGitHubCredentialStore {
 #[cfg(test)]
 impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
     fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
-        // CTR-1303, TCK-00262: Enforce token size limit to prevent DoS
+        // CTR-1303, RFC-0032::REQ-0078: Enforce token size limit to prevent DoS
         if token.len() > MAX_TOKEN_SIZE {
             return Err(KeychainError::TokenTooLarge {
                 size: token.len(),
@@ -1128,7 +1128,7 @@ impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
             .write()
             .map_err(|_| KeychainError::LockPoisoned)?;
 
-        // CTR-1303, TCK-00262: Enforce store capacity limit to prevent memory
+        // CTR-1303, RFC-0032::REQ-0078: Enforce store capacity limit to prevent memory
         // exhaustion Note: We check if the key already exists to allow
         // overwrites without counting against the limit (common pattern for
         // token refresh)
@@ -1166,10 +1166,10 @@ impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
 }
 
 // =============================================================================
-// InMemorySshCredentialStore (TCK-00263)
+// InMemorySshCredentialStore (RFC-0032::REQ-0079)
 //
 // NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
-// Per TCK-00263 security review, in-memory credential stores must not be
+// Per RFC-0032::REQ-0079 security review, in-memory credential stores must not be
 // available in production builds. Production code MUST use OsKeychain.
 // =============================================================================
 
@@ -1240,7 +1240,7 @@ impl SshCredentialStore for InMemorySshCredentialStore {
         session_id: &str,
         auth_sock_path: &str,
     ) -> Result<(), KeychainError> {
-        // CTR-1303, TCK-00263: Enforce path length limit
+        // CTR-1303, RFC-0032::REQ-0079: Enforce path length limit
         if auth_sock_path.len() > MAX_SSH_AUTH_SOCK_LEN {
             return Err(KeychainError::SshAuthSockTooLong {
                 len: auth_sock_path.len(),
@@ -1577,7 +1577,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00537: Safe I/O primitive migration tests
+    // RFC-0032::REQ-0193: Safe I/O primitive migration tests
     // =========================================================================
 
     #[test]
@@ -1612,7 +1612,7 @@ mod tests {
 
     #[test]
     fn test_manifest_load_rejects_symlink() {
-        // TCK-00537: Symlink refusal via safe_open (O_NOFOLLOW).
+        // RFC-0032::REQ-0193: Symlink refusal via safe_open (O_NOFOLLOW).
         let temp_dir = tempfile::tempdir().unwrap();
         let real_path = temp_dir.path().join("real_manifest.json");
         let link_path = temp_dir.path().join("symlink_manifest.json");
@@ -1639,7 +1639,7 @@ mod tests {
 
     #[test]
     fn test_manifest_atomic_overwrite_consistency() {
-        // TCK-00537: Verify that atomic_write_json overwrites produce
+        // RFC-0032::REQ-0193: Verify that atomic_write_json overwrites produce
         // consistent state (no partial writes).
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("overwrite_manifest.json");
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     // =========================================================================
-    // InMemoryGitHubCredentialStore Tests (TCK-00262)
+    // InMemoryGitHubCredentialStore Tests (RFC-0032::REQ-0078)
     // =========================================================================
 
     #[test]
@@ -1738,7 +1738,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Security Bounds Tests (TCK-00262)
+    // Security Bounds Tests (RFC-0032::REQ-0078)
     // =========================================================================
 
     #[test]
@@ -1802,7 +1802,7 @@ mod tests {
     }
 
     // =========================================================================
-    // InMemorySshCredentialStore Tests (TCK-00263)
+    // InMemorySshCredentialStore Tests (RFC-0032::REQ-0079)
     // =========================================================================
 
     #[test]

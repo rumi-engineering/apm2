@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! `FreshnessPolicyV1`: HTF authority integration for risk-tier-specific
-//! staleness enforcement (TCK-00364).
+//! staleness enforcement (RFC-0020::REQ-0018).
 //!
 //! This module implements freshness evaluation that uses only
 //! ledger-anchor lag and local HTF ticks as the authority source.

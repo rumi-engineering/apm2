@@ -1,5 +1,5 @@
 // Allow large stack arrays in tests: HashMap monomorphization triggers spanless
-// false positives that cannot be scoped to specific modules (TCK-00388).
+// false positives that cannot be scoped to specific modules (RFC-0032::REQ-0142).
 #![cfg_attr(test, allow(clippy::large_stack_arrays))]
 
 //! apm2-daemon - AI CLI Process Manager Daemon Library
@@ -30,11 +30,11 @@
 //! # Modules
 //!
 //! - [`admission_kernel`]: `AdmissionKernel` plan/execute API with
-//!   capability-gated effect surfaces (RFC-0019 REQ-0023, TCK-00492)
+//!   capability-gated effect surfaces (RFC-0019 REQ-0023, RFC-0032::REQ-0170)
 //! - [`episode`]: Episode runtime for bounded execution management
 //! - [`evidence`]: Flight recording and evidence retention
 //! - [`gate`]: Gate execution orchestrator for autonomous gate lifecycle
-//!   (TCK-00388)
+//!   (RFC-0032::REQ-0142)
 //! - [`htf`]: Holonic Time Framework clock service and envelope stamping
 //! - [`metrics`]: Prometheus metrics for daemon health observability
 //!   (REQ-DCP-0012)
@@ -42,8 +42,8 @@
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
 //! - [`hmp`]: Holonic Message Protocol (HMP) — digest-first channels and
-//!   admission receipt semantics for RFC-0020 (TCK-00380)
-//! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (TCK-00347)
+//!   admission receipt semantics for RFC-0020 (RFC-0020::REQ-0034)
+//! - [`hsi_contract`]: HSI Contract Manifest V1 for RFC-0020 (RFC-0020::REQ-0001)
 //! - [`identity`]: Canonical identity identifiers (`PublicKeyIdV1`,
 //!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
 //! - [`fs_safe`]: Safe atomic file I/O primitives (atomic write, symlink

@@ -1,4 +1,4 @@
-//! TCK-00293: CAS persistence across daemon restarts
+//! RFC-0032::REQ-0095: CAS persistence across daemon restarts
 //!
 //! This test module verifies that the durable CAS correctly persists
 //! evidence artifacts across daemon restarts.
@@ -22,12 +22,12 @@ use apm2_daemon::episode::executor::ContentAddressedStore;
 use tempfile::TempDir;
 
 // =============================================================================
-// TCK-00293: AC1 - Durable CAS persists artifacts across daemon restarts
+// RFC-0032::REQ-0095: AC1 - Durable CAS persists artifacts across daemon restarts
 // =============================================================================
 
 /// Verify that content stored in the CAS survives a simulated daemon restart.
 ///
-/// Per TCK-00293 AC1: Durable CAS persists artifacts across daemon restarts
+/// Per RFC-0032::REQ-0095 AC1: Durable CAS persists artifacts across daemon restarts
 /// Verification: `cargo test -p apm2-daemon cas_persistence_restart`
 #[test]
 fn cas_persistence_restart_basic() {
@@ -131,7 +131,7 @@ fn cas_persistence_restart_total_size() {
 }
 
 // =============================================================================
-// TCK-00293: AC3 - CAS size limits and hash verification are enforced
+// RFC-0032::REQ-0095: AC3 - CAS size limits and hash verification are enforced
 // =============================================================================
 
 /// Verify per-artifact size limit is enforced.
@@ -241,7 +241,7 @@ fn cas_deduplication() {
 }
 
 // =============================================================================
-// TCK-00293: Integration with ContentAddressedStore trait
+// RFC-0032::REQ-0095: Integration with ContentAddressedStore trait
 // =============================================================================
 
 /// Verify `DurableCas` implements `ContentAddressedStore` trait correctly.
@@ -299,7 +299,7 @@ fn cas_deterministic_hash() {
 }
 
 // =============================================================================
-// TCK-00293: Crash recovery scenarios
+// RFC-0032::REQ-0095: Crash recovery scenarios
 // =============================================================================
 
 /// Verify CAS can recover from metadata file corruption.

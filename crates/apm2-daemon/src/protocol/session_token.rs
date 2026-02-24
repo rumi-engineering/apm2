@@ -1,4 +1,4 @@
-//! Per-connection session token issuance and validation (TCK-00250).
+//! Per-connection session token issuance and validation (RFC-0032::REQ-0066).
 //!
 //! This module implements session tokens for authenticating session-scoped IPC
 //! connections. Tokens bind a session to its authorization context and prevent

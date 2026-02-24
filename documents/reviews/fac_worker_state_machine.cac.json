@@ -462,9 +462,9 @@
     ],
     "machine_traceability": {
       "tickets": [
-        "TCK-00664",
-        "TCK-00660",
-        "TCK-00577"
+        "RFC-0032::REQ-0287",
+        "RFC-0032::REQ-0286",
+        "RFC-0032::REQ-0227"
       ],
       "files": [
         "crates/apm2-cli/src/commands/fac_worker/orchestrator.rs",

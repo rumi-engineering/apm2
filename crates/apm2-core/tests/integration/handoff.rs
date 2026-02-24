@@ -1,4 +1,4 @@
-//! Integration tests for the agent handoff flow (TCK-00089).
+//! Integration tests for the agent handoff flow (RFC-0032::REQ-0046).
 //!
 //! This module verifies the complete handoff flow from webhook reception to
 //! agent claiming, implementing requirements from RFC-0008.

@@ -1,7 +1,7 @@
 #![cfg(feature = "e2e-agent-tests")]
 #![allow(missing_docs)]
-// AGENT-AUTHORED (TCK-00391)
-//! TCK-00391: Autonomous FAC end-to-end integration test: full lifecycle
+// AGENT-AUTHORED (RFC-0032::REQ-0145)
+//! RFC-0032::REQ-0145: Autonomous FAC end-to-end integration test: full lifecycle
 //! without external tooling.
 //!
 //! This test module exercises the complete FAC lifecycle through daemon

@@ -270,7 +270,7 @@ pub struct ContainmentVerdict {
     pub sccache_disabled_reason: Option<String>,
 }
 
-/// Outcome of the sccache server containment protocol (TCK-00554).
+/// Outcome of the sccache server containment protocol (RFC-0032::REQ-0209).
 ///
 /// Records whether the sccache server was started inside the job unit
 /// cgroup, whether a pre-existing out-of-cgroup server was refused,
@@ -353,20 +353,20 @@ pub struct ContainmentTrace {
     pub mismatch_count: u32,
     /// Whether sccache was auto-disabled.
     pub sccache_auto_disabled: bool,
-    /// Whether sccache was explicitly enabled by policy (TCK-00553).
+    /// Whether sccache was explicitly enabled by policy (RFC-0032::REQ-0208).
     ///
     /// `true` when the policy `sccache_enabled` knob is set AND containment
     /// passed (sccache is actually active in the job environment).
     /// `false` when sccache is disabled by default or was auto-disabled.
     #[serde(default)]
     pub sccache_enabled: bool,
-    /// sccache version string if detected and sccache is enabled (TCK-00553).
+    /// sccache version string if detected and sccache is enabled (RFC-0032::REQ-0208).
     ///
     /// Populated by probing `sccache --version` when the policy enables
     /// sccache. Included in attestation for auditability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sccache_version: Option<String>,
-    /// sccache server containment protocol result (TCK-00554).
+    /// sccache server containment protocol result (RFC-0032::REQ-0209).
     ///
     /// Records the full outcome of the per-unit server lifecycle protocol:
     /// whether a pre-existing server was detected, whether it was in the
@@ -377,7 +377,7 @@ pub struct ContainmentTrace {
 }
 
 /// Maximum length for sccache version string to prevent denial-of-service
-/// (TCK-00553).
+/// (RFC-0032::REQ-0208).
 pub const MAX_SCCACHE_VERSION_LENGTH: usize = 256;
 
 impl ContainmentTrace {
@@ -398,7 +398,7 @@ impl ContainmentTrace {
     }
 
     /// Creates a trace from a verdict with sccache activation info
-    /// (TCK-00553).
+    /// (RFC-0032::REQ-0208).
     ///
     /// When the policy enables sccache and containment passes, this records
     /// `sccache_enabled = true` and captures the sccache version for
@@ -431,7 +431,7 @@ impl ContainmentTrace {
     }
 
     /// Creates a trace from a verdict with full sccache server containment
-    /// protocol result (TCK-00554).
+    /// protocol result (RFC-0032::REQ-0209).
     ///
     /// Extends `from_verdict_with_sccache` by attaching the server
     /// containment protocol outcome. If the server containment protocol
@@ -1081,7 +1081,7 @@ pub fn check_sccache_containment_with_proc(
     }
 }
 
-/// Probes the sccache version by running `sccache --version` (TCK-00553).
+/// Probes the sccache version by running `sccache --version` (RFC-0032::REQ-0208).
 ///
 /// Returns `Some(version_string)` if sccache is installed and responds
 /// within `SCCACHE_PROBE_TIMEOUT` (5 s), `None` if the probe fails
@@ -1268,7 +1268,7 @@ fn sccache_bounded_reap(child: &mut std::process::Child) -> Option<std::process:
 }
 
 // =============================================================================
-// Sccache Server Containment Protocol (TCK-00554)
+// Sccache Server Containment Protocol (RFC-0032::REQ-0209)
 // =============================================================================
 
 /// Discovers ALL PIDs of running sccache servers by scanning `/proc`.
@@ -1409,7 +1409,7 @@ fn run_sccache_command(
     .ok_or_else(|| "command timed out or failed".to_string())
 }
 
-/// Executes the sccache server containment protocol (TCK-00554).
+/// Executes the sccache server containment protocol (RFC-0032::REQ-0209).
 ///
 /// This function implements the per-unit server lifecycle:
 ///
@@ -1744,7 +1744,7 @@ fn verify_started_server(
     }
 }
 
-/// Stops the sccache server at job unit end (TCK-00554).
+/// Stops the sccache server at job unit end (RFC-0032::REQ-0209).
 ///
 /// Best-effort: logs but does not fail on errors. The returned
 /// boolean indicates whether the stop succeeded.
@@ -2898,7 +2898,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Sccache server containment protocol tests (TCK-00554)
+    // Sccache server containment protocol tests (RFC-0032::REQ-0209)
     // ========================================================================
 
     #[test]

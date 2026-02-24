@@ -1,11 +1,11 @@
-// AGENT-AUTHORED (TCK-00212, TCK-00322)
+// AGENT-AUTHORED (RFC-0032::REQ-0058, RFC-0032::REQ-0116)
 //! Projection adapters for the FAC (Forge Admission Cycle).
 //!
 //! This module implements write-only projection adapters that synchronize
 //! ledger state to external systems. The key design principle is that the
 //! ledger is always the source of truth - projections are one-way writes.
 //!
-//! # RFC-0019: Projection Worker (TCK-00322)
+//! # RFC-0019: Projection Worker (RFC-0032::REQ-0116)
 //!
 //! Per RFC-0019 Workstream F, this module now includes a long-running
 //! projection worker that:
@@ -43,21 +43,21 @@
 //! - [`ProjectionReceipt`]: Signed proof of projection
 //! - [`ProjectedStatus`]: Status values that can be projected
 //! - [`IdempotencyKey`]: Key for idempotent projection operations
-//! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence (TCK-00213)
+//! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence (RFC-0032::REQ-0059)
 //! - [`FreezeRegistry`]: Tracks active intervention freezes
-//! - [`TamperEvent`]: Event emitted when tamper is detected (TCK-00214)
+//! - [`TamperEvent`]: Event emitted when tamper is detected (RFC-0032::REQ-0060)
 //! - [`TamperResult`]: Result of handling a tamper event
 //! - [`IntentBuffer`]: Durable SQLite-backed buffer for projection intents and
-//!   deferred replay backlog (TCK-00504)
+//!   deferred replay backlog (RFC-0033::REQ-0062)
 //! - [`ConfigBackedResolver`]: Config-backed continuity profile resolver for
-//!   economics gate input assembly (TCK-00507)
+//!   economics gate input assembly (RFC-0033::REQ-0065)
 //! - [`ContinuityProfileResolver`]: Trait for resolving continuity profiles,
 //!   sink snapshots, and continuity windows
 //! - [`DeferredReplayWorker`]: Worker that drains the deferred replay backlog
 //!   after sink recovery, re-evaluating economics gate AND PCAC lifecycle
-//!   enforcement for each replayed intent (TCK-00508)
+//!   enforcement for each replayed intent (RFC-0033::REQ-0066)
 //!
-//! # Divergence Watchdog (TCK-00213)
+//! # Divergence Watchdog (RFC-0032::REQ-0059)
 //!
 //! The divergence watchdog monitors for discrepancies between the ledger's
 //! `MergeReceipt` and the external trunk HEAD. When divergence is detected:
@@ -66,7 +66,7 @@
 //! 2. Creates `InterventionFreeze` to halt admissions
 //! 3. Requires adjudication-based `InterventionUnfreeze` to resume
 //!
-//! # Tamper Detection (TCK-00214)
+//! # Tamper Detection (RFC-0032::REQ-0060)
 //!
 //! Tamper detection identifies when GitHub status has been modified by a
 //! non-adapter identity. Unlike divergence (trunk HEAD mismatch), tamper

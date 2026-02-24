@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00576)
+// AGENT-AUTHORED (RFC-0032::REQ-0226)
 //! Signed receipt envelope: Ed25519 signature over receipt payload digest.
 //!
 //! This module implements [`SignedReceiptEnvelopeV1`], a signed container

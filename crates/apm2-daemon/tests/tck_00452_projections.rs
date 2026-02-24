@@ -1,4 +1,4 @@
-//! TCK-00452: Auditor/Orchestrator launch projection integration tests.
+//! RFC-0020::REQ-0040: Auditor/Orchestrator launch projection integration tests.
 //!
 //! Validates digest-first determinism, replay-consistent projection payloads,
 //! and fail-closed uncertainty semantics when lineage/liveness evidence is
@@ -72,7 +72,7 @@ fn emit_review_receipt_with_tick(
     dispatcher
         .event_emitter()
         .emit_review_receipt(
-            "LEASE-TCK-00452",
+            "LEASE-RFC-0020::REQ-0040",
             "W-00452",
             receipt_id,
             &hash32(0x11),
@@ -311,7 +311,7 @@ fn test_orchestrator_projection_reports_liveness_tick_restart_and_is_determinist
         .emit_session_started(
             "sess-00452-A",
             "W-00452",
-            "LEASE-TCK-00452",
+            "LEASE-RFC-0020::REQ-0040",
             "actor:orchestrator",
             &hash32(0x45),
             Some(&role_spec_hash),
@@ -326,7 +326,7 @@ fn test_orchestrator_projection_reports_liveness_tick_restart_and_is_determinist
         .emit_session_started(
             "sess-00452-B",
             "W-00452",
-            "LEASE-TCK-00452",
+            "LEASE-RFC-0020::REQ-0040",
             "actor:orchestrator",
             &hash32(0x47),
             Some(&role_spec_hash),

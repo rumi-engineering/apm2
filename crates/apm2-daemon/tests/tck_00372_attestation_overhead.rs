@@ -1,4 +1,4 @@
-//! TCK-00372: Attestation overhead contract and fallback safety.
+//! RFC-0020::REQ-0026: Attestation overhead contract and fallback safety.
 //!
 //! This harness measures direct vs batched receipt verification envelopes,
 //! evaluates the `<1%` overhead gate at directly measured `10^3`/`10^4`/`10^5`,
@@ -538,7 +538,7 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         pooled_batched_batch_samples_us.extend_from_slice(&run.batched_batch_samples_us);
 
         println!(
-            "TCK-00372 scale={} methodology=sampled_measurement sampled_batches={} total_batches={} direct_elapsed_us_estimate={} batched_elapsed_us_estimate={} direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+            "RFC-0020::REQ-0026 scale={} methodology=sampled_measurement sampled_batches={} total_batches={} direct_elapsed_us_estimate={} batched_elapsed_us_estimate={} direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
             run.effects,
             run.sampled_batches,
             run.total_batches,
@@ -596,7 +596,7 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         .expect("10^8 statistical model must satisfy <1% gate");
 
     println!(
-        "TCK-00372 scale=1000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+        "RFC-0020::REQ-0026 scale=1000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
         modeled_10e6_direct.point_p99,
         modeled_10e6_direct.ci95_lower,
         modeled_10e6_direct.ci95_upper,
@@ -607,7 +607,7 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
         modeled_10e6.network_overhead_ratio(),
     );
     println!(
-        "TCK-00372 scale=100000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+        "RFC-0020::REQ-0026 scale=100000000 methodology=statistical_model direct_p99_model_us={:.3} direct_ci95=[{:.3},{:.3}] batched_p99_model_us={:.3} batched_ci95=[{:.3},{:.3}] cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
         modeled_10e8_direct.point_p99,
         modeled_10e8_direct.ci95_lower,
         modeled_10e8_direct.ci95_upper,
@@ -624,7 +624,7 @@ fn tck_00372_attestation_overhead_contract_scales_and_projection() {
     gate.enforce(&projected_10e12)
         .expect("10^12 projection must satisfy <1% gate");
     println!(
-        "TCK-00372 scale=1000000000000 methodology=statistical_model_projection cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
+        "RFC-0020::REQ-0026 scale=1000000000000 methodology=statistical_model_projection cpu_overhead_ratio={:.6} network_overhead_ratio={:.6}",
         projected_10e12.cpu_overhead_ratio(),
         projected_10e12.network_overhead_ratio()
     );

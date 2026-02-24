@@ -1,4 +1,4 @@
-//! Dual-socket manager for privilege separation (TCK-00249).
+//! Dual-socket manager for privilege separation (RFC-0032::REQ-0065).
 //!
 //! This module implements the dual-socket topology required by RFC-0017 for
 //! privilege separation between operator and session connections.
@@ -533,7 +533,7 @@ impl SocketManager {
         use nix::unistd::{getgid, getuid};
         use subtle::ConstantTimeEq;
 
-        // Extract peer credentials (TCK-00248)
+        // Extract peer credentials (RFC-0032::REQ-0064)
         let creds = PeerCredentials::from_stream(&stream).map_err(|e| {
             ProtocolError::Io(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -542,7 +542,7 @@ impl SocketManager {
         })?;
 
         // Validate UID/GID based on socket type
-        // TCK-00249: Privilege Separation Logic
+        // RFC-0032::REQ-0065: Privilege Separation Logic
         // - Operator: Strict UID match (Owner only)
         // - Session: UID match (Owner) OR GID match (Group)
         let owner_uid = getuid().as_raw();

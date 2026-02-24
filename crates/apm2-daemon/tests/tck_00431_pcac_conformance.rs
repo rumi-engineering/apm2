@@ -1,4 +1,4 @@
-//! TCK-00431: PCAC conformance and falsification suite (RFC-0027 §16).
+//! RFC-0020::REQ-0050: PCAC conformance and falsification suite (RFC-0027 §16).
 //!
 //! Coverage focus:
 //! - Section 16 falsification criteria hit mapping to non-admissible outcomes

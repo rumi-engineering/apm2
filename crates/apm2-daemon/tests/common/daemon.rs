@@ -15,7 +15,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00175: E2E lifecycle and budget tests
+//! - RFC-0033::REQ-0041: E2E lifecycle and budget tests
 //! - AD-EPISODE-002: Episode state machine
 //! - AD-LAYER-001: `EpisodeRuntime` as plant controller
 
@@ -182,7 +182,7 @@ impl TestDaemon {
     ///
     /// Returns the session handle on success.
     ///
-    /// # TCK-00336: Deprecated Method Usage
+    /// # RFC-0032::REQ-0128: Deprecated Method Usage
     ///
     /// This test helper uses the deprecated `start` method intentionally.
     /// Production code should use `start_with_workspace` for proper isolation.
@@ -200,7 +200,7 @@ impl TestDaemon {
     ///
     /// Advances the timestamp by 1ms before starting.
     ///
-    /// # TCK-00336: Deprecated Method Usage
+    /// # RFC-0032::REQ-0128: Deprecated Method Usage
     ///
     /// This test helper uses the deprecated `start` method intentionally.
     /// Production code should use `start_with_workspace` for proper isolation.

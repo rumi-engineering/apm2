@@ -1,4 +1,4 @@
-//! TCK-00392: `OperatorClient` shutdown reaches daemon graceful-stop signal.
+//! RFC-0032::REQ-0146: `OperatorClient` shutdown reaches daemon graceful-stop signal.
 //!
 //! IT-00392-09 validates that the CLI-side `OperatorClient` can connect to an
 //! in-process daemon control plane over the operator socket, send `Shutdown`,

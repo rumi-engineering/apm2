@@ -1,4 +1,4 @@
-//! Integration tests for TCK-00399: `AdapterRegistry` wiring into
+//! Integration tests for RFC-0032::REQ-0151: `AdapterRegistry` wiring into
 //! `SpawnEpisode`.
 //!
 //! These tests verify that [`EpisodeRuntime::spawn_adapter()`] correctly wires

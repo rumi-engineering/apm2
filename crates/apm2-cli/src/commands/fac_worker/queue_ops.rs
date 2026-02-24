@@ -266,7 +266,7 @@ pub(super) fn release_claimed_job_to_pending(
 }
 
 /// Promote valid job specs from `queue/broker_requests/` into `queue/pending/`
-/// (TCK-00577).
+/// (RFC-0032::REQ-0227).
 ///
 /// Called by the worker (running as service user) before scanning pending.
 /// Each `.json` file in `broker_requests/` is validated (bounded read +
@@ -340,7 +340,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
     // the caller (run_fac_worker). This ensures broker-mediated
     // promotion enforces the same configured limits as enqueue_direct.
 
-    // MAJOR fix (TCK-00577 round 16): Separate candidate counting from junk
+    // MAJOR fix (RFC-0032::REQ-0227 round 16): Separate candidate counting from junk
     // draining. Only CANDIDATE entries (regular files with .json extension that
     // pass filename validation) count toward MAX_BROKER_REQUESTS_PROMOTE.
     // Non-candidate entries (wrong extension, non-regular files, unreadable
@@ -356,7 +356,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
     let mut junk_skipped: usize = 0;
 
     for entry in entries {
-        // CODE-QUALITY fix (TCK-00577 round 17): Hard total per-cycle
+        // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Hard total per-cycle
         // entry budget. Stop iterating directory entries once the budget
         // is exhausted, regardless of individual cap states. This bounds
         // work under adversarial directory flood.
@@ -385,7 +385,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                 if let Some(ref name) = file_name {
                     tracing::debug!(
                         path = %path.display(),
-                        "TCK-00577: draining non-.json entry from broker_requests/"
+                        "RFC-0032::REQ-0227: draining non-.json entry from broker_requests/"
                     );
                     let _ = move_to_dir_safe(&path, &quarantine_dir, name);
                 } else {
@@ -393,7 +393,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                     // construct a quarantine name).
                     tracing::debug!(
                         path = %path.display(),
-                        "TCK-00577: removing non-UTF-8 entry from broker_requests/"
+                        "RFC-0032::REQ-0227: removing non-UTF-8 entry from broker_requests/"
                     );
                     let _ = fs::remove_file(&path);
                 }
@@ -407,7 +407,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         let file_name = file_name.unwrap();
 
         // ── Pre-open file type check (lstat) ──
-        // BLOCKER fix (TCK-00577 round 9): Prevent FIFO poisoning.
+        // BLOCKER fix (RFC-0032::REQ-0227 round 9): Prevent FIFO poisoning.
         // An attacker with write access to broker_requests/ (mode 01733)
         // can create a FIFO named *.json. Opening a FIFO without O_NONBLOCK
         // blocks indefinitely. Use symlink_metadata (lstat) to check file
@@ -428,7 +428,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                         tracing::warn!(
                             path = %path.display(),
                             file_type = kind,
-                            "TCK-00577: quarantining non-regular-file broker request \
+                            "RFC-0032::REQ-0227: quarantining non-regular-file broker request \
                              (FIFO poisoning defense)"
                         );
                         let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
@@ -445,7 +445,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "TCK-00577: quarantining broker request with unreadable metadata"
+                        "RFC-0032::REQ-0227: quarantining broker request with unreadable metadata"
                     );
                     let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
                     junk_drained += 1;
@@ -458,7 +458,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
 
         // ── This is a valid candidate: count toward promotion cap ──
         if candidates_processed >= MAX_BROKER_REQUESTS_PROMOTE {
-            // CODE-QUALITY fix (TCK-00577 round 17): Track skipped
+            // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Track skipped
             // candidates for ONE aggregate warning after the loop,
             // instead of emitting a warning per skipped entry.
             candidates_skipped += 1;
@@ -478,7 +478,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         let bytes = match read_bounded(&path, apm2_core::fac::job_spec::MAX_JOB_SPEC_SIZE) {
             Ok(b) => b,
             Err(e) => {
-                // TCK-00577 round 17: Broker request files are now
+                // RFC-0032::REQ-0227 round 17: Broker request files are now
                 // written with mode 0640 + fchown(gid=service_user).
                 // The submitter MUST resolve the service user and
                 // fchown must succeed (fail-closed, no 0644 fallback).
@@ -491,7 +491,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "TCK-00577: broker request file is not readable by the worker \
+                        "RFC-0032::REQ-0227: broker request file is not readable by the worker \
                          (EACCES). In cross-user deployments, configure a shared group \
                          between the submitter and service user, or use POSIX ACLs. \
                          Quarantining file (fail-closed)."
@@ -500,7 +500,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "TCK-00577: quarantining unreadable broker request"
+                        "RFC-0032::REQ-0227: quarantining unreadable broker request"
                     );
                 }
                 let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
@@ -512,7 +512,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         let Ok(spec) = deserialize_job_spec(&bytes) else {
             tracing::warn!(
                 path = %path.display(),
-                "TCK-00577: quarantining malformed broker request"
+                "RFC-0032::REQ-0227: quarantining malformed broker request"
             );
             let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             continue;
@@ -528,7 +528,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "TCK-00577: cannot acquire enqueue lock, deferring broker request promotion"
+                    "RFC-0032::REQ-0227: cannot acquire enqueue lock, deferring broker request promotion"
                 );
                 continue;
             },
@@ -542,14 +542,14 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
             tracing::warn!(
                 path = %path.display(),
                 error = %bounds_err,
-                "TCK-00577: queue bounds exceeded, quarantining broker request"
+                "RFC-0032::REQ-0227: queue bounds exceeded, quarantining broker request"
             );
             drop(lock_file);
             let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             continue;
         }
 
-        // BLOCKER fix (TCK-00577 round 12): Do NOT rename the attacker-owned
+        // BLOCKER fix (RFC-0032::REQ-0227 round 12): Do NOT rename the attacker-owned
         // inode into pending/. The original file is owned by the non-service-user
         // submitter with mode 0600, and rename() preserves ownership+mode across
         // filesystems. This means the submitter retains write authority over the
@@ -588,12 +588,12 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
-                        "TCK-00577: could not remove original broker request after promotion"
+                        "RFC-0032::REQ-0227: could not remove original broker request after promotion"
                     );
                 }
                 tracing::info!(
                     file = %file_name,
-                    "TCK-00577: promoted broker request to pending/ (service-user-owned rewrite)"
+                    "RFC-0032::REQ-0227: promoted broker request to pending/ (service-user-owned rewrite)"
                 );
             },
             Err(e) => {
@@ -601,7 +601,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "TCK-00577: failed to promote broker request to pending via rewrite, quarantining"
+                    "RFC-0032::REQ-0227: failed to promote broker request to pending via rewrite, quarantining"
                 );
                 let _ = move_to_dir_safe(&path, &quarantine_dir, &file_name);
             },
@@ -609,7 +609,7 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
         // ---- End enqueue lock critical section ----
     }
 
-    // CODE-QUALITY fix (TCK-00577 round 17): Emit ONE aggregate warning
+    // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Emit ONE aggregate warning
     // per cycle instead of per-entry warnings. This bounds log output
     // under adversarial flood.
     let total_skipped = candidates_skipped + junk_skipped;
@@ -622,14 +622,14 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
             junk_drained = junk_drained,
             junk_skipped = junk_skipped,
             budget_exhausted = entries_scanned >= MAX_BROKER_SCAN_BUDGET,
-            "TCK-00577: broker promotion cycle summary — \
+            "RFC-0032::REQ-0227: broker promotion cycle summary — \
              {total_skipped} entries deferred to next cycle"
         );
     }
 }
 
 /// Promote validated broker request content into `pending/` by creating a NEW
-/// service-user-owned file (BLOCKER fix, TCK-00577 round 12).
+/// service-user-owned file (BLOCKER fix, RFC-0032::REQ-0227 round 12).
 ///
 /// Instead of renaming the attacker-owned inode (which preserves submitter
 /// ownership and mode across `rename()`), this function:
@@ -921,7 +921,7 @@ pub(super) fn scan_pending(
     queue_root: &Path,
     fac_root: &Path,
     canonicalizer_tuple_digest: &str,
-    // TCK-00538: Optional toolchain fingerprint for scan receipt provenance.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint for scan receipt provenance.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<Vec<PendingCandidate>, String> {
     let pending_dir = queue_root.join(PENDING_DIR);
@@ -1348,17 +1348,17 @@ pub(super) fn resolve_fac_root() -> Result<PathBuf, String> {
 /// Ensures all required queue subdirectories exist with deterministic
 /// secure permissions, regardless of the process umask.
 ///
-/// TCK-00577 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
+/// RFC-0032::REQ-0227 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
 /// group/other execute-only) so non-service-user callers can traverse to
 /// reach `broker_requests/`. The `private/fac/` parent remains 0700.
 ///
-/// TCK-00577 round 11 BLOCKER fix: After `create_dir_all` for each queue
+/// RFC-0032::REQ-0227 round 11 BLOCKER fix: After `create_dir_all` for each queue
 /// subdir, explicitly calls `set_permissions` to set mode 0711
 /// (traverse-only). This prevents umask-derived default modes (e.g.,
 /// 0775 from umask 0o002) from causing `validate_directory_mode_only`
 /// failures during the relaxed preflight path.
 ///
-/// TCK-00577 round 11 MAJOR fix: `broker_requests/` permissions are now
+/// RFC-0032::REQ-0227 round 11 MAJOR fix: `broker_requests/` permissions are now
 /// enforced unconditionally at every startup, not just when newly
 /// created. Pre-existing `broker_requests/` with unsafe modes (e.g.,
 /// 0333 — world-writable without sticky) are hardened to 01733.
@@ -1477,7 +1477,7 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         CONSUME_RECEIPTS_DIR,
     ] {
         let path = queue_root.join(dir);
-        // TCK-00577 round 11 BLOCKER fix: Set deterministic mode 0711 on
+        // RFC-0032::REQ-0227 round 11 BLOCKER fix: Set deterministic mode 0711 on
         // every queue subdir, regardless of the process umask. Without
         // this, create_dir_all inherits the umask which may produce
         // 0775 or 0777, causing validate_directory_mode_only to reject
@@ -1488,7 +1488,7 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         fs::create_dir_all(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     }
 
-    // TCK-00577 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
+    // RFC-0032::REQ-0227 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
     // (sticky bit + world-writable). Non-service-user callers use the broker
     // fallback to drop job specs into this directory. The sticky bit prevents
     // callers from deleting each other's files while still allowing writes.
@@ -1497,7 +1497,7 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
     // DirBuilder::mode() is subject to the process umask, so we must
     // explicitly chmod after creation to ensure the exact mode is applied.
     //
-    // TCK-00577 round 11 MAJOR fix: Permissions are now enforced
+    // RFC-0032::REQ-0227 round 11 MAJOR fix: Permissions are now enforced
     // unconditionally — both for newly created AND pre-existing
     // broker_requests/ directories. A pre-existing directory with an
     // unsafe mode (e.g., 0333 — world-writable without sticky) is
@@ -1614,7 +1614,7 @@ pub(super) fn validate_worker_service_user_ownership(
     if backend == ExecutionBackend::UserMode {
         tracing::info!(
             backend = %backend,
-            "TCK-00657: user-mode backend selected — skipping service-user ownership checks"
+            "RFC-0032::REQ-0274: user-mode backend selected — skipping service-user ownership checks"
         );
         return Ok(());
     }

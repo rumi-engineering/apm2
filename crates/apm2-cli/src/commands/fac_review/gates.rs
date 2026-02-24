@@ -255,7 +255,7 @@ pub(super) struct QueuedGatesRequest {
     pub(super) gate_profile: GateThroughputProfile,
     pub(super) wait_timeout_secs: u64,
     pub(super) require_external_worker: bool,
-    /// TCK-00577: Controls whether the service user ownership gate is
+    /// RFC-0032::REQ-0227: Controls whether the service user ownership gate is
     /// enforced or bypassed for direct queue writes.
     pub(super) write_mode: QueueWriteMode,
     /// Optional canonical work identifier to bind queue lifecycle identity.
@@ -713,7 +713,7 @@ fn prepare_queued_gates_job(
         }
     })?;
 
-    // TCK-00579: Derive job spec validation policy from FAC policy for
+    // RFC-0032::REQ-0229: Derive job spec validation policy from FAC policy for
     // enqueue-time enforcement of repo_id allowlist, bytes_backend
     // allowlist, and filesystem-path rejection.
     let job_spec_policy = fac_policy.job_spec_validation_policy().map_err(|err| {
@@ -2156,7 +2156,7 @@ fn build_gates_job_spec(
     // Bind policy fields to the admitted FAC policy digest and bind the
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
-    // TCK-00567: Derive intent from job kind for intent-bound token issuance.
+    // RFC-0032::REQ-0218: Derive intent from job kind for intent-bound token issuance.
     // Thread FacPolicyV1.allowed_intents so the broker enforces the allowlist
     // at issuance (fail-closed).
     let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind).ok_or_else(|| {
@@ -3306,7 +3306,7 @@ fn run_summary_event(run_id: &str, summary: &GatesSummary) -> serde_json::Value 
         })
         .collect::<Vec<_>>();
 
-    // TCK-00627 S2: Emit SLO violation as a WARNING to stderr when set.
+    // RFC-0032::REQ-0258 S2: Emit SLO violation as a WARNING to stderr when set.
     // SLO violation is informational only — never causes a non-zero exit
     // code (INV-SLO-002).
     if let Some(ref violation) = summary.slo_violation {
@@ -3805,9 +3805,9 @@ fn run_gates_inner_detailed(
         Ok((prep_duration_ms, execute_duration_ms, mut summary)) => {
             summary.prep_duration_ms = prep_duration_ms;
             summary.execute_duration_ms = execute_duration_ms;
-            // TCK-00627 S1: total_duration_ms = prep + execute (monotonic).
+            // RFC-0032::REQ-0258 S1: total_duration_ms = prep + execute (monotonic).
             summary.total_duration_ms = prep_duration_ms.saturating_add(execute_duration_ms);
-            // TCK-00627 S2: Compute warm-path SLO after durations are finalized.
+            // RFC-0032::REQ-0258 S2: Compute warm-path SLO after durations are finalized.
             // Uses total_gate_count (not cache_miss_count) to detect uncacheable
             // gates that would otherwise be silently ignored.
             let (is_warm_run, slo_violation) = compute_warm_path_slo(
@@ -3853,20 +3853,20 @@ fn run_execute_phase(
 ) -> Result<GatesSummary, String> {
     let timeout_decision = resolve_bounded_test_timeout(workspace_root, timeout_seconds);
 
-    // TCK-00526: Load FAC policy for environment enforcement.
+    // RFC-0032::REQ-0185: Load FAC policy for environment enforcement.
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for env policy enforcement".to_string())?;
     let fac_root = apm2_home.join("private/fac");
     let policy = load_or_create_gate_policy(&fac_root)?;
 
-    // TCK-00526: Ensure the managed CARGO_HOME directory exists when the
+    // RFC-0032::REQ-0185: Ensure the managed CARGO_HOME directory exists when the
     // policy denies ambient cargo home. Created with restrictive permissions
     // (0o700) to prevent cross-user contamination (CTR-2611).
     if let Some(cargo_home) = policy.resolve_cargo_home(&apm2_home) {
         ensure_managed_cargo_home(&cargo_home)?;
     }
 
-    // TCK-00575: Acquire exclusive lane lock on lane-00 before any lane
+    // RFC-0032::REQ-0225: Acquire exclusive lane lock on lane-00 before any lane
     // operations. This prevents concurrent `apm2 fac gates` invocations
     // from colliding on the shared synthetic lane directory.
     let lane_manager = LaneManager::from_default_home()
@@ -3876,7 +3876,7 @@ fn run_execute_phase(
         .map_err(|e| format!("failed to ensure lane directories: {e}"))?;
     let lane_guard = acquire_gates_lane_lock(&lane_manager)?;
 
-    // TCK-00575: Check for CORRUPT state before executing gates.
+    // RFC-0032::REQ-0225: Check for CORRUPT state before executing gates.
     // If lane-00 is corrupt (from a previous failed run), refuse to
     // run gates in a dirty environment. The user must reset first.
     check_lane_not_corrupt(&lane_manager)?;
@@ -3958,19 +3958,19 @@ fn run_execute_phase(
     }
 
     // 4. Build test command override for test execution.
-    // TCK-00526: Environment is now built from policy (default-deny with
+    // RFC-0032::REQ-0185: Environment is now built from policy (default-deny with
     // allowlist), replacing the previous ambient-inherit approach.
     let default_nextest_command = build_nextest_command();
     let mut test_command_environment =
         compute_nextest_test_environment(workspace_root, &policy, &apm2_home, test_parallelism)?;
     let mut bounded = false;
 
-    // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
+    // RFC-0032::REQ-0223 MAJOR-1 fix: compute the effective sandbox hardening hash
     // BEFORE the profile is moved into build_systemd_bounded_test_command,
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // TCK-00574: Resolve network policy for gates with operator override.
+    // RFC-0032::REQ-0224: Resolve network policy for gates with operator override.
     // Computed before the conditional branch so the hash is available for
     // gate attestation (MAJOR-1: attestation digest must bind network policy).
     let gate_network_policy =
@@ -4000,13 +4000,13 @@ fn run_execute_phase(
         bounded = true;
         test_command_environment.extend(spec.environment);
 
-        // TCK-00549: The policy-computed environment from
+        // RFC-0032::REQ-0204: The policy-computed environment from
         // compute_nextest_test_environment() is passed directly to
         // build_bounded_test_command(). The bounded executor uses
         // FacPolicyV1-driven env filtering (no ad-hoc allowlists).
         // Defense-in-depth: RUSTC_WRAPPER and SCCACHE_* are stripped
         // both inside build_policy_setenv_pairs() and via env_remove_keys
-        // on the spawned process (TCK-00548, INV-ENV-008).
+        // on the spawned process (RFC-0032::REQ-0203, INV-ENV-008).
         test_command_environment.extend(spec.setenv_pairs);
 
         // Log if sccache env vars were found and stripped.
@@ -4025,7 +4025,7 @@ fn run_execute_phase(
     let lane_context =
         super::evidence::allocate_evidence_lane_context(&lane_manager, "lane-00", lane_guard)?;
 
-    // TCK-00540 fix round 3: Build the gate resource policy BEFORE the
+    // RFC-0032::REQ-0196 fix round 3: Build the gate resource policy BEFORE the
     // evidence call so it can be passed through EvidenceGateOptions for
     // attestation digest computation during cache-reuse decisions.
     // The same policy is reused below for the cache-write phase.
@@ -4066,7 +4066,7 @@ fn run_execute_phase(
     bind_merge_gate_log_bundle_hash(&mut merge_gate, &gate_results)?;
     let total_secs = started.elapsed().as_secs();
 
-    // TCK-00624 S8: close the merge-conflict TOCTOU window. The early
+    // RFC-0032::REQ-0255 S8: close the merge-conflict TOCTOU window. The early
     // merge gate above is a fast-fail; this post-evidence recheck catches
     // conflicts introduced while long-running evidence gates were executing.
     passed = apply_merge_conflict_bookend_guard(
@@ -4078,12 +4078,12 @@ fn run_execute_phase(
 
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
-        // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation.
-        // TCK-00574 MAJOR-1: Include network policy hash in gate attestation
+        // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate attestation.
+        // RFC-0032::REQ-0224 MAJOR-1: Include network policy hash in gate attestation
         // to prevent cache reuse across network policy drift.
         // Uses the effective policy-driven hashes computed above (before the
         // profile was moved into the bounded test command builder).
-        // TCK-00540: `policy` is now computed before the evidence call so it
+        // RFC-0032::REQ-0196: `policy` is now computed before the evidence call so it
         // can also be used for cache-reuse attestation digest matching.
         let mut cache = GateCache::new(&sha);
         let merge_command = gate_command_for_attestation(
@@ -4158,7 +4158,7 @@ fn run_execute_phase(
             );
         }
 
-        // TCK-00576: Sign all gate cache entries before persisting.
+        // RFC-0032::REQ-0226: Sign all gate cache entries before persisting.
         // The persistent signer is loaded (or generated on first use) from
         // the FAC root.  Signing ensures unsigned or forged cache entries
         // are rejected on reuse (fail-closed).
@@ -4167,14 +4167,14 @@ fn run_execute_phase(
                 .map_err(|e| format!("cannot load signing key for gate cache: {e}"))?;
         cache.sign_all(&signer);
 
-        // TCK-00541 BLOCKER fix (round 5): v2 cache write removed.
+        // RFC-0032::REQ-0197 BLOCKER fix (round 5): v2 cache write removed.
         // Ticket scope requires "read v2 but only write v3 in default mode".
         // The v2 GateCache is still constructed in-memory (above) to compute
         // attestation digests and evidence metadata consumed by the v3 path
         // below, but is NOT persisted to disk.
         // (Previously: `cache.save()?;`)
 
-        // TCK-00541: Persist v3 gate cache (the ONLY write path) for the manual
+        // RFC-0032::REQ-0197: Persist v3 gate cache (the ONLY write path) for the manual
         // `fac gates` path. This ensures consistent cache behavior across
         // all execution entry points (pipeline and manual).
         let v3_compound_key = compute_v3_compound_key(
@@ -4198,7 +4198,7 @@ fn run_execute_phase(
                         log_path: result.log_path.clone(),
                         signature_hex: None, // Will be signed below.
                         signer_id: None,
-                        // TCK-00541: Inherit receipt binding flags from v2.
+                        // RFC-0032::REQ-0197: Inherit receipt binding flags from v2.
                         rfc0028_receipt_bound: result.rfc0028_receipt_bound,
                         rfc0029_receipt_bound: result.rfc0029_receipt_bound,
                     };
@@ -4255,9 +4255,9 @@ fn run_execute_phase(
 
     assert_execute_ambient_mutation_invariant(workspace_root, &execute_workspace_fingerprint)?;
 
-    // TCK-00627 S1: Compute cache hit/miss counts from evidence gate results.
+    // RFC-0032::REQ-0258 S1: Compute cache hit/miss counts from evidence gate results.
     let (cache_hit_count, cache_miss_count) = compute_cache_counts(&gate_results);
-    // TCK-00627 MAJOR fix: track total evidence gate count for is_warm_run.
+    // RFC-0032::REQ-0258 MAJOR fix: track total evidence gate count for is_warm_run.
     // Truncation is safe: LANE_EVIDENCE_GATES.len() is a small constant (< 10).
     #[allow(clippy::cast_possible_truncation)]
     let total_gate_count = gate_results.len() as u32;
@@ -4427,7 +4427,7 @@ fn compute_nextest_test_environment(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(policy, &ambient, apm2_home);
 
-    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
+    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
     // XDG_CONFIG_HOME). For CLI gates, use the synthetic lane-00 directory
     // under $APM2_HOME/private/fac/lanes/lane-00.
     let fac_root = apm2_home.join("private/fac");
@@ -4532,13 +4532,13 @@ fn render_dirty_tree_status_hint(workspace_root: &Path) -> String {
 }
 
 /// Load or create the FAC policy. Delegates to the shared `policy_loader`
-/// module for bounded I/O and deduplication (TCK-00526).
+/// module for bounded I/O and deduplication (RFC-0032::REQ-0185).
 fn load_or_create_gate_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
     super::policy_loader::load_or_create_fac_policy(fac_root)
 }
 
 /// Ensure the managed `CARGO_HOME` directory exists. Delegates to the shared
-/// `policy_loader` module (TCK-00526).
+/// `policy_loader` module (RFC-0032::REQ-0185).
 fn ensure_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
@@ -5424,7 +5424,7 @@ mod tests {
     }
 
     /// Table-driven regression test for all 11 miss reason codes + hit in
-    /// `gate_finished` event serialization (TCK-00626 S4).
+    /// `gate_finished` event serialization (RFC-0032::REQ-0257 S4).
     ///
     /// Each entry verifies that `gate_finished_event` correctly serializes
     /// the `cache_decision` field with the expected `reason_code` and
@@ -7634,7 +7634,7 @@ time.sleep(20)\n",
     }
 
     // =========================================================================
-    // TCK-00541 round-5 BLOCKER fix: default full runs must NOT write v2 cache
+    // RFC-0032::REQ-0197 round-5 BLOCKER fix: default full runs must NOT write v2 cache
     // =========================================================================
 
     /// Regression test: a `GateCache` constructed in-memory but never saved
@@ -7668,7 +7668,7 @@ time.sleep(20)\n",
             assert!(
                 !v2_dir.exists(),
                 "v2 gate cache must not be written in default full mode — \
-                 TCK-00541 requires write-only v3"
+                 RFC-0032::REQ-0197 requires write-only v3"
             );
 
             // Also verify GateCache::load returns None.
@@ -7680,7 +7680,7 @@ time.sleep(20)\n",
     }
 
     // ========================================================================
-    // TCK-00627 S4: Unit regression tests for is_warm_run and slo_violation
+    // RFC-0032::REQ-0258 S4: Unit regression tests for is_warm_run and slo_violation
     // ========================================================================
 
     #[test]
@@ -7791,7 +7791,7 @@ time.sleep(20)\n",
 
     #[test]
     fn slo_violation_does_not_affect_exit_code() {
-        // TCK-00627 S4: SLO violation does NOT cause non-zero exit code.
+        // RFC-0032::REQ-0258 S4: SLO violation does NOT cause non-zero exit code.
         // The run_summary_event function emits a warning but does not change
         // the summary.passed flag or return an error.
         let mut summary = sample_phase_summary(true);
@@ -7960,7 +7960,7 @@ time.sleep(20)\n",
     }
 
     // ========================================================================
-    // TCK-00627 S3: CI benchmark — warm-path SLO verification
+    // RFC-0032::REQ-0258 S3: CI benchmark — warm-path SLO verification
     //
     // This integration test invokes `run_gates_inner` end-to-end against a
     // hermetic git workspace (prep → execute → summary) and then verifies the

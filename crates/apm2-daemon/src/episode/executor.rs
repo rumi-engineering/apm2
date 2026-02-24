@@ -1,6 +1,6 @@
 //! Tool executor for budget-enforced tool execution.
 //!
-//! This module implements the `ToolExecutor` per TCK-00165. The executor
+//! This module implements the `ToolExecutor` per RFC-0033::REQ-0032. The executor
 //! charges budget before execution, dispatches to tool handlers, stores
 //! results in CAS, and tracks execution duration.
 //!
@@ -29,7 +29,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00165: Tool execution and budget charging
+//! - RFC-0033::REQ-0032: Tool execution and budget charging
 //! - AD-TOOL-001: Tool execution flow
 //! - CTR-1303: Bounded collections with MAX_* constants
 
@@ -232,13 +232,13 @@ pub struct ExecutionContext {
     /// Timestamp when execution started (nanoseconds since epoch).
     pub started_at_ns: u64,
 
-    /// TOCTOU-verified file content bound to this request (TCK-00375).
+    /// TOCTOU-verified file content bound to this request (RFC-0020::REQ-0029).
     pub verified_content: VerifiedToolContent,
 
     /// Whether handlers must fail-closed to TOCTOU-verified bytes.
     pub toctou_verification_required: bool,
 
-    /// Idempotency key for external deduplication (TCK-00501).
+    /// Idempotency key for external deduplication (RFC-0032::REQ-0176).
     ///
     /// When present, tool handlers that interact with external systems
     /// supporting idempotency keys SHOULD propagate this value to
@@ -277,7 +277,7 @@ impl ExecutionContext {
         self
     }
 
-    /// Attaches an idempotency key for external deduplication (TCK-00501).
+    /// Attaches an idempotency key for external deduplication (RFC-0032::REQ-0176).
     #[must_use]
     pub fn with_idempotency_key(mut self, key: Option<String>) -> Self {
         self.idempotency_key = key;
@@ -293,7 +293,7 @@ impl ExecutionContext {
 ///
 /// The executor manages tool handler registration, budget charging,
 /// execution dispatch, and result storage. Per RFC-0016 (HTF) and
-/// TCK-00240, tool executions are stamped with `TimeEnvelope` references
+/// RFC-0016::REQ-0002, tool executions are stamped with `TimeEnvelope` references
 /// for temporal ordering and causality tracking.
 ///
 /// # Lifecycle
@@ -350,7 +350,7 @@ pub struct ToolExecutor {
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
 
-    /// Optional tool output cache (TCK-00335).
+    /// Optional tool output cache (RFC-0032::REQ-0127).
     output_cache: Option<ToolOutputCache>,
 
     /// Isolation key for session-scoped caching (SEC-CTRL-FAC-0017).
@@ -383,7 +383,7 @@ impl ToolExecutor {
     ///
     /// When a clock is configured, all tool executions will be stamped with
     /// a `TimeEnvelopeRef` for temporal ordering and causality tracking per
-    /// RFC-0016 (HTF) and TCK-00240.
+    /// RFC-0016 (HTF) and RFC-0016::REQ-0002.
     ///
     /// # Security (SEC-CTRL-FAC-0015 Fail-Closed)
     ///
@@ -396,7 +396,7 @@ impl ToolExecutor {
         self
     }
 
-    /// Sets the tool output cache (TCK-00335).
+    /// Sets the tool output cache (RFC-0032::REQ-0127).
     #[must_use]
     pub fn with_output_cache(mut self, cache: ToolOutputCache) -> Self {
         self.output_cache = Some(cache);
@@ -522,7 +522,7 @@ impl ToolExecutor {
         let tool_class = args.tool_class();
         let start_time = Instant::now();
 
-        // TCK-00335: Check cache for Read/Search
+        // RFC-0032::REQ-0127: Check cache for Read/Search
         // SEC-CTRL-FAC-0017: Cache keys include isolation_key when set
         let cache_key = self
             .output_cache
@@ -582,7 +582,7 @@ impl ToolExecutor {
             "budget charged"
         );
 
-        // Step 4: Pre-invalidate cache for state-modifying tools (TCK-00335 fix)
+        // Step 4: Pre-invalidate cache for state-modifying tools (RFC-0032::REQ-0127 fix)
         //
         // State-modifying tools (Write, Execute, Git, Artifact) may modify the
         // workspace even if they return an error. For example, a partial `git pull`
@@ -633,7 +633,7 @@ impl ToolExecutor {
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
-        // TCK-00335: Update cache for read-only tools (cache_key is only set for
+        // RFC-0032::REQ-0127: Update cache for read-only tools (cache_key is only set for
         // Read/Search) Note: State-modifying tools (Write, Execute, Git)
         // already invalidated the cache before execution (Step 4), so we don't
         // need to invalidate again here.
@@ -803,7 +803,7 @@ impl ToolExecutor {
             completed_at_ns,
         );
 
-        // Stamp time envelope (RFC-0016 HTF, TCK-00240)
+        // Stamp time envelope (RFC-0016 HTF, RFC-0016::REQ-0002)
         // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
         if let Some(ref clock) = self.clock {
             let notes = format!("tool.failed:{}", ctx.request_id);
@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Budget reconciliation tests (TCK-00165 Security Fix)
+    // Budget reconciliation tests (RFC-0033::REQ-0032 Security Fix)
     // =========================================================================
 
     #[tokio::test]
@@ -1263,12 +1263,12 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00320: Tool Result Hash Propagation Tests
+    // RFC-0032::REQ-0114: Tool Result Hash Propagation Tests
     // =========================================================================
 
     #[tokio::test]
     async fn test_executor_sets_result_hash() {
-        // TCK-00320: Verify that executor sets result_hash after CAS store
+        // RFC-0032::REQ-0114: Verify that executor sets result_hash after CAS store
         let mut executor = test_executor();
         executor
             .register_handler(Box::new(MockReadHandler::new()))
@@ -1288,7 +1288,7 @@ mod tests {
         assert!(result.success);
         assert!(
             result.result_hash.is_some(),
-            "ToolResult must have result_hash set by executor (TCK-00320)"
+            "ToolResult must have result_hash set by executor (RFC-0032::REQ-0114)"
         );
 
         // Verify the hash is 32 bytes (BLAKE3)
@@ -1298,7 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_result_hash_is_deterministic() {
-        // TCK-00320: Same inputs should produce the same result_hash
+        // RFC-0032::REQ-0114: Same inputs should produce the same result_hash
         let tracker1 = Arc::new(BudgetTracker::from_envelope(test_budget()));
         let cas1 = Arc::new(StubContentAddressedStore::new());
         let mut executor1 = ToolExecutor::new(tracker1, cas1);
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_failure_result_can_have_result_hash() {
-        // TCK-00320: Failure results may not have result_hash (handled by
+        // RFC-0032::REQ-0114: Failure results may not have result_hash (handled by
         // build_failure_result_with_stamp which doesn't store in CAS)
         let mut executor = test_executor();
         executor
@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00335 Fix: Cache Invalidation on Handler Failure
+    // RFC-0032::REQ-0127 Fix: Cache Invalidation on Handler Failure
     // =========================================================================
 
     // Mock Execute handler that always fails (simulates failed command)
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_invalidated_on_state_modifying_tool_failure() {
-        // TCK-00335 Fix: Verify that cache is invalidated BEFORE execution
+        // RFC-0032::REQ-0127 Fix: Verify that cache is invalidated BEFORE execution
         // for state-modifying tools, so even failed executions clear stale data.
         use apm2_core::evidence::MemoryCas;
         use apm2_core::fac::{ToolOutputCache, ToolOutputCacheConfig};

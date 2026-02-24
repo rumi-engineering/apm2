@@ -613,7 +613,7 @@ impl Reducer for LeaseReducer {
                 self.handle_conflict(e);
                 Ok(())
             },
-            // TCK-00258: LeaseIssueDenied is an audit/diagnostic event.
+            // RFC-0032::REQ-0074: LeaseIssueDenied is an audit/diagnostic event.
             // It does not modify lease state, only records that a lease was
             // denied. The reducer acknowledges but takes no state action.
             Some(lease_event::Event::IssueDenied(_)) | None => Ok(()),
@@ -669,7 +669,7 @@ pub mod helpers {
             expires_at,
             registrar_signature,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
             issued_at_tick: issued_at_tick.value(),
             expires_at_tick: expires_at_tick.value(),
@@ -707,7 +707,7 @@ pub mod helpers {
             expires_at,
             registrar_signature,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
             // Legacy: tick fields set to 0 (fail-closed per SEC-CTRL-FAC-0015)
             issued_at_tick: 0,
@@ -738,7 +738,7 @@ pub mod helpers {
             new_expires_at,
             registrar_signature,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
             new_expires_at_tick: new_expires_at_tick.value(),
             tick_rate_hz: new_expires_at_tick.tick_rate_hz(),
@@ -787,7 +787,7 @@ pub mod helpers {
             lease_id: lease_id.to_string(),
             release_reason: release_reason.to_string(),
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
         };
         let event = LeaseEvent {

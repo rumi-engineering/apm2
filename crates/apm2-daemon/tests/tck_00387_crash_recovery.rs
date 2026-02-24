@@ -1,4 +1,4 @@
-//! TCK-00387: Crash recovery startup-path integration tests.
+//! RFC-0032::REQ-0141: Crash recovery startup-path integration tests.
 //!
 //! This test module verifies the primary `DoD` claim: "daemon startup with
 //! stale sessions emits `LEASE_REVOKED` events". It exercises the startup

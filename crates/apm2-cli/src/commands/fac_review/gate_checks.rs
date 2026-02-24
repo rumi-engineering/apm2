@@ -403,7 +403,7 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
     let targets = collect_test_safety_targets(workspace_root)?;
 
     let mut output = String::new();
-    writeln!(output, "INFO: === Test Safety Guard (TCK-00410) ===").ok();
+    writeln!(output, "INFO: === Test Safety Guard (RFC-0032::REQ-0157) ===").ok();
     writeln!(output, "INFO: Scanning {} file(s)", targets.len()).ok();
     writeln!(
         output,
@@ -805,7 +805,7 @@ pub fn run_review_artifact_lint(workspace_root: &Path) -> Result<CheckExecution,
     let mut output = String::new();
     writeln!(
         output,
-        "INFO: === Review Artifact Integrity Lint (TCK-00409) ==="
+        "INFO: === Review Artifact Integrity Lint (RFC-0020::REQ-0003) ==="
     )
     .ok();
     writeln!(output).ok();
@@ -954,7 +954,7 @@ pub fn run_fac_review_machine_spec_guard(workspace_root: &Path) -> Result<CheckE
     let mut output = String::new();
     writeln!(
         output,
-        "INFO: === FAC Review Machine Spec Snapshot Guard (TCK-00640) ==="
+        "INFO: === FAC Review Machine Spec Snapshot Guard (RFC-0032::REQ-0268) ==="
     )
     .ok();
     writeln!(output, "INFO: snapshot_path={}", expected_path.display()).ok();

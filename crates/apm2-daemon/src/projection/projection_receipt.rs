@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00212, TCK-00506)
+// AGENT-AUTHORED (RFC-0032::REQ-0058, RFC-0033::REQ-0064)
 //! Projection receipt types for the FAC GitHub projection adapter.
 //!
 //! This module defines [`ProjectionReceipt`] which provides cryptographic proof

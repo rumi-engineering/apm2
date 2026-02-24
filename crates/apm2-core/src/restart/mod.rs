@@ -643,7 +643,7 @@ mod tests {
     }
 }
 
-/// TCK-00243: Tick-based restart window tests (RFC-0016 HTF).
+/// RFC-0016::REQ-0003: Tick-based restart window tests (RFC-0016 HTF).
 #[cfg(test)]
 mod tck_00243 {
     use super::*;
@@ -654,7 +654,7 @@ mod tck_00243 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// TCK-00243: Tick-based restart manager construction.
+    /// RFC-0016::REQ-0003: Tick-based restart manager construction.
     #[test]
     fn tick_based_manager_construction() {
         let config = RestartConfig {
@@ -671,7 +671,7 @@ mod tck_00243 {
         assert_eq!(manager.tick_rate_hz, Some(TICK_RATE_HZ));
     }
 
-    /// TCK-00243: Legacy manager is not tick-based.
+    /// RFC-0016::REQ-0003: Legacy manager is not tick-based.
     #[test]
     fn legacy_manager_not_tick_based() {
         let config = RestartConfig::default();
@@ -680,7 +680,7 @@ mod tck_00243 {
         assert!(!manager.is_tick_based());
     }
 
-    /// TCK-00243: Tick-based restart window counting.
+    /// RFC-0016::REQ-0003: Tick-based restart window counting.
     #[test]
     fn tick_based_restart_window() {
         let config = RestartConfig {
@@ -710,7 +710,7 @@ mod tck_00243 {
         assert!(manager.is_circuit_open());
     }
 
-    /// TCK-00243: Restarts outside window are not counted.
+    /// RFC-0016::REQ-0003: Restarts outside window are not counted.
     #[test]
     fn restarts_outside_window_not_counted() {
         let config = RestartConfig {
@@ -736,7 +736,7 @@ mod tck_00243 {
         assert!(manager.should_restart_at_tick(Some(1), &tick(1200)));
     }
 
-    /// TCK-00243: Tick rate mismatch fails closed.
+    /// RFC-0016::REQ-0003: Tick rate mismatch fails closed.
     #[test]
     fn tick_rate_mismatch_fails_closed() {
         let config = RestartConfig {
@@ -755,7 +755,7 @@ mod tck_00243 {
         assert!(!manager.should_restart_at_tick(Some(1), &wrong_rate_tick));
     }
 
-    /// TCK-00243: Reset clears tick-based state.
+    /// RFC-0016::REQ-0003: Reset clears tick-based state.
     #[test]
     fn reset_clears_tick_state() {
         let config = RestartConfig {
@@ -779,7 +779,7 @@ mod tck_00243 {
         assert!(manager.should_restart_at_tick(Some(1), &tick(300)));
     }
 
-    /// TCK-00243: Record success resets state.
+    /// RFC-0016::REQ-0003: Record success resets state.
     #[test]
     fn record_success_resets_state() {
         let config = RestartConfig {
@@ -801,7 +801,7 @@ mod tck_00243 {
         assert!(!manager.is_circuit_open());
     }
 
-    /// TCK-00243: `with_ticks` panics on zero tick rate.
+    /// RFC-0016::REQ-0003: `with_ticks` panics on zero tick rate.
     #[test]
     #[should_panic(expected = "tick_rate_hz must be > 0")]
     fn with_ticks_panics_on_zero_rate() {

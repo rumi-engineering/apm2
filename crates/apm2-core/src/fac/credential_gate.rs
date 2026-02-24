@@ -1,4 +1,4 @@
-//! Credential gate for FAC workflows (TCK-00596).
+//! Credential gate for FAC workflows (RFC-0032::REQ-0245).
 //!
 //! This module provides a fail-fast credential posture check and a typed
 //! credential mount descriptor for FAC execution paths. The gate ensures:

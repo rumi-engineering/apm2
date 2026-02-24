@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00390)
+// AGENT-AUTHORED (RFC-0032::REQ-0144)
 //! Daemon-side merge executor for autonomous merge after gate approval.
 //!
 //! This module implements the [`MergeExecutor`] which watches for all required
@@ -580,7 +580,7 @@ impl MergeExecutor {
             });
         }
 
-        // RFC-0020 TCK-00382:
+        // RFC-0020 RFC-0020::REQ-0036:
         // For S1+ promotion stages, fail closed unless formal artifacts and
         // business-continuity signals are explicitly present and passing.
         Self::verify_formal_artifacts_for_stage(input)?;
@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00650 regression tests: merge_receipt_id / gate_receipt_id separation
+    // RFC-0032::REQ-0271 regression tests: merge_receipt_id / gate_receipt_id separation
     // =========================================================================
 
     #[test]

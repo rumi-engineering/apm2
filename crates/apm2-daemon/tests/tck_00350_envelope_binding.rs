@@ -1,5 +1,5 @@
 //! Integration tests for `EpisodeEnvelopeV1` and receipt binding enforcement
-//! (TCK-00350).
+//! (RFC-0020::REQ-0004).
 //!
 //! Verifies:
 //! - Tool receipts always carry envelope/capability/view bindings

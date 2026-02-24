@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! TCK-00330: Ledger attribution integration tests.
+//! RFC-0032::REQ-0123: Ledger attribution integration tests.
 //!
 //! This module tests:
 //! 1. `emit_episode_run_attributed` emits events with `adapter_profile_hash`

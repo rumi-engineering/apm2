@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00213)
+// AGENT-AUTHORED (RFC-0032::REQ-0059)
 //! Divergence watchdog for the FAC (Forge Admission Cycle).
 //!
 //! The watchdog is wired into the daemon runtime via `main.rs`, where a
@@ -921,7 +921,7 @@ impl From<&InterventionFreeze> for ProtoInterventionFreeze {
         // Empty string maps to None; non-empty string stores raw UTF-8 bytes
         // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // RFC-0020::REQ-0051 FIX: Store original string as UTF-8 bytes (lossless).
         // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
         // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
@@ -990,7 +990,7 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
         // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
         // the original UTF-8 string from the proto `hash` bytes (lossless).
         //
-        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
+        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -1033,7 +1033,7 @@ impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
         // Empty string maps to None; non-empty string stores raw UTF-8 bytes
         // in the proto `hash` field for lossless roundtrip.
         //
-        // TCK-00469 FIX: Store original string as UTF-8 bytes (lossless).
+        // RFC-0020::REQ-0051 FIX: Store original string as UTF-8 bytes (lossless).
         // Previous implementation hashed non-hex strings (e.g. "htf:tick:*"),
         // breaking canonical bytes and signature verification after roundtrip.
         let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
@@ -1088,7 +1088,7 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
         // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
         // the original UTF-8 string from the proto `hash` bytes (lossless).
         //
-        // TCK-00469 FIX: Recover original UTF-8 string instead of hex-encoding.
+        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -2988,7 +2988,7 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         self.registry
             .register(&freeze, &self.signer.verifying_key())?;
 
-        // TCK-00307: Create DefectRecorded event
+        // RFC-0032::REQ-0103: Create DefectRecorded event
         // We compute the CAS hash by hashing the serialized DefectRecord.
         // In a real system, this would happen after storing in CAS, but for
         // divergence detection, we are the producer.
@@ -3646,7 +3646,7 @@ pub mod tests {
     #[test]
     fn test_intervention_freeze_proto_conversion() {
         let signer = Signer::generate();
-        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        // RFC-0020::REQ-0051: Use runtime htf:tick format to prove lossless roundtrip.
         let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
@@ -3673,7 +3673,7 @@ pub mod tests {
         assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
         assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
         assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
-        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
+        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -3686,7 +3686,7 @@ pub mod tests {
         assert_eq!(recovered, freeze);
     }
 
-    /// TCK-00469: Verify that freeze with htf:tick format survives proto
+    /// RFC-0020::REQ-0051: Verify that freeze with htf:tick format survives proto
     /// roundtrip and signature verification still passes.
     #[test]
     fn test_intervention_freeze_proto_roundtrip_htf_tick_signature() {
@@ -3734,7 +3734,7 @@ pub mod tests {
     #[test]
     fn test_intervention_unfreeze_proto_conversion() {
         let signer = Signer::generate();
-        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        // RFC-0020::REQ-0051: Use runtime htf:tick format to prove lossless roundtrip.
         let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Adjudication)
@@ -3752,7 +3752,7 @@ pub mod tests {
         assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
         assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
         assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
-        // TCK-00469: proto hash field stores raw UTF-8 bytes of the original string.
+        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -3765,7 +3765,7 @@ pub mod tests {
         assert_eq!(recovered, unfreeze);
     }
 
-    /// TCK-00469: Verify that unfreeze with htf:tick format survives proto
+    /// RFC-0020::REQ-0051: Verify that unfreeze with htf:tick format survives proto
     /// roundtrip and signature verification still passes.
     #[test]
     fn test_intervention_unfreeze_proto_roundtrip_htf_tick_signature() {
@@ -3810,7 +3810,7 @@ pub mod tests {
     #[test]
     fn test_intervention_unfreeze_proto_conversion_none_adjudication() {
         let signer = Signer::generate();
-        // TCK-00469: Use runtime htf:tick format to prove lossless roundtrip.
+        // RFC-0020::REQ-0051: Use runtime htf:tick format to prove lossless roundtrip.
         let time_envelope_ref_str = "htf:tick:1707123456789000000";
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Manual)
@@ -4479,7 +4479,7 @@ pub mod tests {
         // Child scopes under the namespace should also be frozen (hierarchical)
         assert!(registry.is_frozen("myorg:ticket").is_some());
         assert!(registry.is_frozen("myorg:rfc").is_some());
-        assert!(registry.is_frozen("myorg:ticket:TCK-00213").is_some());
+        assert!(registry.is_frozen("myorg:ticket:RFC-0032::REQ-0059").is_some());
 
         // Other namespaces should not be frozen
         assert!(registry.is_frozen("otherorg").is_none());
@@ -4510,7 +4510,7 @@ pub mod tests {
         // Child paths under the repo should be frozen
         assert!(
             registry
-                .is_frozen("myorg/myrepo/ticket/TCK-00213")
+                .is_frozen("myorg/myrepo/ticket/RFC-0032::REQ-0059")
                 .is_some()
         );
         assert!(registry.is_frozen("myorg/myrepo/artifact/id").is_some());
@@ -5222,7 +5222,7 @@ pub mod tests {
         // Verify the freeze references the defect
         assert_eq!(result.freeze.trigger_defect_id, result.defect.defect_id());
 
-        // TCK-00307: Verify DefectRecorded event is created
+        // RFC-0032::REQ-0103: Verify DefectRecorded event is created
         assert_eq!(result.defect_event.defect_id, result.defect.defect_id());
         assert_eq!(result.defect_event.defect_type, "PROJECTION_DIVERGENCE");
         assert_eq!(

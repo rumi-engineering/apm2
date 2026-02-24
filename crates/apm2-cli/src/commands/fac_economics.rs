@@ -1,7 +1,7 @@
-// AGENT-AUTHORED (TCK-00584)
+// AGENT-AUTHORED (RFC-0032::REQ-0234)
 //! CLI commands for FAC economics profile management: show, adopt, rollback.
 //!
-//! Implements `apm2 fac economics {show, adopt, rollback}` per TCK-00584.
+//! Implements `apm2 fac economics {show, adopt, rollback}` per RFC-0032::REQ-0234.
 //!
 //! # Security
 //!

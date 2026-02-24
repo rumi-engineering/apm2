@@ -1,4 +1,4 @@
-//! TCK-00471: RFC-0029 REQ-0002 integration tests for selector closure
+//! RFC-0033::REQ-0060: RFC-0029 REQ-0002 integration tests for selector closure
 //! completeness and deterministic replay zoom-in.
 
 use std::collections::{BTreeMap, BTreeSet};

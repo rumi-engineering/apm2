@@ -480,7 +480,7 @@ mod tests {
 }
 
 // =============================================================================
-// TCK-00267: Crash Recovery Session State Tests
+// RFC-0032::REQ-0083: Crash Recovery Session State Tests
 // =============================================================================
 
 #[cfg(test)]
@@ -497,7 +497,7 @@ mod tck_00267 {
             .with_seq_id(seq_id)
     }
 
-    /// TCK-00267: Active sessions can be identified for recovery.
+    /// RFC-0032::REQ-0083: Active sessions can be identified for recovery.
     #[test]
     fn active_sessions_identified_for_recovery() {
         let events = vec![
@@ -521,7 +521,7 @@ mod tck_00267 {
         assert!(!state3.is_active(), "Session-3 should not be active");
     }
 
-    /// TCK-00267: Recovery state tracks last progress for resume cursor.
+    /// RFC-0032::REQ-0083: Recovery state tracks last progress for resume cursor.
     #[test]
     fn recovery_state_tracks_resume_cursor() {
         let events = vec![
@@ -539,7 +539,7 @@ mod tck_00267 {
         assert_eq!(state.last_progress_seq_id, Some(4));
     }
 
-    /// TCK-00267: Sessions grouped by ID for batch recovery.
+    /// RFC-0032::REQ-0083: Sessions grouped by ID for batch recovery.
     #[test]
     fn sessions_grouped_for_batch_recovery() {
         let events = vec![
@@ -558,7 +558,7 @@ mod tck_00267 {
         assert_eq!(groups.get("session-3").unwrap().len(), 1);
     }
 
-    /// TCK-00267: Session cursors collected for recovery point calculation.
+    /// RFC-0032::REQ-0083: Session cursors collected for recovery point calculation.
     #[test]
     fn session_cursors_collected_for_recovery() {
         let events = vec![
@@ -589,7 +589,7 @@ mod tck_00267 {
         );
     }
 
-    /// TCK-00267: Quarantined sessions are not active.
+    /// RFC-0032::REQ-0083: Quarantined sessions are not active.
     #[test]
     fn quarantined_sessions_not_active() {
         let events = vec![
@@ -603,7 +603,7 @@ mod tck_00267 {
         assert!(!state.is_active());
     }
 
-    /// TCK-00267: Recovery state counts progress events correctly.
+    /// RFC-0032::REQ-0083: Recovery state counts progress events correctly.
     #[test]
     fn recovery_state_counts_progress() {
         let events = vec![
@@ -619,7 +619,7 @@ mod tck_00267 {
         assert_eq!(state.event_count, 4);
     }
 
-    /// TCK-00267: Events since a cursor can be counted for recovery assessment.
+    /// RFC-0032::REQ-0083: Events since a cursor can be counted for recovery assessment.
     #[test]
     fn count_events_since_cursor() {
         let events = vec![
@@ -638,7 +638,7 @@ mod tck_00267 {
         assert_eq!(all_count, 4);
     }
 
-    /// TCK-00267: Partial replay up to specific `seq_id`.
+    /// RFC-0032::REQ-0083: Partial replay up to specific `seq_id`.
     #[test]
     fn partial_replay_for_recovery_point() {
         let events = vec![

@@ -847,7 +847,7 @@ fn test_fac_worker_e2e_once_mode_processes_job() {
     let previous_apm2_home = std::env::var_os("APM2_HOME");
     set_env_var_for_test("APM2_HOME", &apm2_home);
 
-    // TCK-00577: Set APM2_FAC_SERVICE_USER to the current user so the
+    // RFC-0032::REQ-0227: Set APM2_FAC_SERVICE_USER to the current user so the
     // ownership gate resolves the service user and we go through the
     // direct enqueue path (not broker-mediated fallback).
     let previous_service_user = std::env::var_os("APM2_FAC_SERVICE_USER");
@@ -1068,7 +1068,7 @@ fn test_gate_receipt_construction() {
     assert_eq!(receipt.executor_actor_id, "fac-worker");
     assert!(receipt.passed, "receipt should pass");
 
-    // TCK-00573: Verify sandbox_hardening_hash is bound in the GateReceipt.
+    // RFC-0032::REQ-0223: Verify sandbox_hardening_hash is bound in the GateReceipt.
     assert_eq!(
         receipt.sandbox_hardening_hash.as_deref(),
         Some(sbx_hash),
@@ -1083,7 +1083,7 @@ fn test_gate_receipt_construction() {
 }
 
 // =============================================================================
-// Economics admission tests (TCK-00584)
+// Economics admission tests (RFC-0032::REQ-0234)
 // =============================================================================
 
 /// Test 14: Economics admission denies mismatched hash (INV-EADOPT-004).

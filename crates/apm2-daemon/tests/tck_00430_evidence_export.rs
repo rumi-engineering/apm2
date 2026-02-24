@@ -1,4 +1,4 @@
-//! TCK-00430: RFC-0027 objective and gate evidence exporters.
+//! RFC-0020::REQ-0049: RFC-0027 objective and gate evidence exporters.
 //!
 //! Verifies:
 //! - Objective/gate summaries export to declared RFC-0027 evidence paths

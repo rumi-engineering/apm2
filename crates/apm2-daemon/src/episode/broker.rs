@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! ToolBroker
-//!     ├── capabilities: CapabilityValidator (from TCK-00163)
+//!     ├── capabilities: CapabilityValidator (from RFC-0033::REQ-0030)
 //!     ├── dedupe_cache: DedupeCache
 //!     ├── policy: PolicyEngine (stub - future ticket)
 //!     └── cas: ContentAddressedStore (stub - future ticket)
@@ -126,7 +126,7 @@ pub enum BrokerError {
         message: String,
     },
 
-    /// Context pack not found in CAS (TCK-00326).
+    /// Context pack not found in CAS (RFC-0032::REQ-0119).
     ///
     /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
     /// with `reason_code` `MISSING_ARTIFACT`.
@@ -136,7 +136,7 @@ pub enum BrokerError {
         hash: String,
     },
 
-    /// Context pack seal verification failed (TCK-00326).
+    /// Context pack seal verification failed (RFC-0032::REQ-0119).
     ///
     /// Per RFC-0019, this triggers `ReviewBlockedRecorded` emission
     /// with `reason_code` `INVALID_BUNDLE`.
@@ -146,14 +146,14 @@ pub enum BrokerError {
         reason: String,
     },
 
-    /// Context pack deserialization failed (TCK-00326).
+    /// Context pack deserialization failed (RFC-0032::REQ-0119).
     #[error("context pack deserialization failed: {reason}")]
     ContextPackDeserializationFailed {
         /// Reason for deserialization failure.
         reason: String,
     },
 
-    /// Context pack integrity check failed (TCK-00326).
+    /// Context pack integrity check failed (RFC-0032::REQ-0119).
     ///
     /// The blake3 hash of the retrieved content does not match the expected
     /// `context_pack_hash`. This could indicate CAS corruption or tampering.
@@ -165,7 +165,7 @@ pub enum BrokerError {
         computed: String,
     },
 
-    /// Epoch seal verification failed (TCK-00365).
+    /// Epoch seal verification failed (RFC-0020::REQ-0019).
     ///
     /// Per REQ-0019, Tier2+ authority claims require a valid epoch seal.
     /// This error is returned when the epoch seal is missing, invalid,
@@ -176,7 +176,7 @@ pub enum BrokerError {
         reason: String,
     },
 
-    /// Idempotency precondition failed (TCK-00377).
+    /// Idempotency precondition failed (RFC-0020::REQ-0031).
     ///
     /// Per RFC-0020 Section 6.1.2, a side-effectful operation declared a
     /// precondition that was not satisfied at evaluation time.  The
@@ -223,7 +223,7 @@ impl BrokerError {
     }
 
     /// Returns `true` if this error should trigger `ReviewBlockedRecorded`
-    /// (TCK-00326).
+    /// (RFC-0032::REQ-0119).
     ///
     /// Per RFC-0019, context pack errors should emit a `ReviewBlockedRecorded`
     /// event to the ledger for audit and fail-closed behavior.
@@ -240,7 +240,7 @@ impl BrokerError {
 }
 
 // =============================================================================
-// PolicyEngine Integration (TCK-00292)
+// PolicyEngine Integration (RFC-0032::REQ-0094)
 //
 // Real policy engine integration with deny-by-default behavior.
 // Per RFC-0018 HEF requirements, policy evaluation is fail-closed.
@@ -291,7 +291,7 @@ enum ToctouVerificationStatus {
     NotInManifest,
 }
 
-/// Policy engine wrapper for the tool broker (TCK-00292).
+/// Policy engine wrapper for the tool broker (RFC-0032::REQ-0094).
 ///
 /// Integrates the real `PolicyEngine` from `apm2-core` and implements
 /// deny-by-default when policy is missing or invalid.
@@ -318,7 +318,7 @@ impl Default for BrokerPolicyEngine {
 impl BrokerPolicyEngine {
     /// Creates a new broker policy engine with no policy configured.
     ///
-    /// Per TCK-00292, requests will be denied by default when no policy
+    /// Per RFC-0032::REQ-0094, requests will be denied by default when no policy
     /// is configured (fail-closed behavior).
     #[must_use]
     pub const fn new() -> Self {
@@ -401,7 +401,7 @@ impl BrokerPolicyEngine {
 
     /// Evaluates a request against policy.
     ///
-    /// Per TCK-00292, implements deny-by-default:
+    /// Per RFC-0032::REQ-0094, implements deny-by-default:
     /// - If no policy is configured, the request is denied
     /// - If policy evaluation fails, the request is denied
     /// - Only explicit allow rules permit requests
@@ -490,14 +490,14 @@ impl StubPolicyEngine {
 }
 
 // =============================================================================
-// ContentAddressedStore Stub (TCK-00293: TEST ONLY)
+// ContentAddressedStore Stub (RFC-0032::REQ-0095: TEST ONLY)
 //
-// Per TCK-00293, the stub is retained ONLY for tests. Production code MUST
+// Per RFC-0032::REQ-0095, the stub is retained ONLY for tests. Production code MUST
 // use `DurableCas` via `new_shared_broker_with_cas()` or `.with_cas()`.
 // =============================================================================
 
 // =============================================================================
-// RiskTier <-> ContextRiskTier Conversion (TCK-00375)
+// RiskTier <-> ContextRiskTier Conversion (RFC-0020::REQ-0029)
 // =============================================================================
 
 /// Converts the daemon's `RiskTier` to the firewall's `ContextRiskTier`.
@@ -537,7 +537,7 @@ impl From<super::envelope::RiskTier> for apm2_core::fac::RiskTier {
 /// Stub content-addressed store for testing.
 ///
 /// **WARNING**: This stub does NOT persist artifacts across daemon restarts.
-/// Per TCK-00293 and RFC-0018 HEF requirements, production code MUST use
+/// Per RFC-0032::REQ-0095 and RFC-0018 HEF requirements, production code MUST use
 /// [`crate::cas::DurableCas`] instead.
 ///
 /// # When to Use
@@ -595,7 +595,7 @@ pub struct ToolBrokerConfig {
     /// Whether to use dedupe cache (default: true).
     pub use_dedupe_cache: bool,
 
-    /// Optional shell bridge policy for runtime configuration (TCK-00377).
+    /// Optional shell bridge policy for runtime configuration (RFC-0020::REQ-0031).
     ///
     /// When `Some`, the broker uses this policy for shell bridge allowlist
     /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
@@ -640,7 +640,7 @@ impl ToolBrokerConfig {
         self
     }
 
-    /// Sets the shell bridge policy for runtime configuration (TCK-00377).
+    /// Sets the shell bridge policy for runtime configuration (RFC-0020::REQ-0031).
     ///
     /// When set, the broker uses this policy for shell bridge allowlist
     /// enforcement instead of the default `ShellBridgePolicy::deny_all()`.
@@ -864,14 +864,14 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Dedupe cache for idempotent replay.
     dedupe_cache: SharedDedupeCache,
 
-    /// Policy engine (TCK-00292).
+    /// Policy engine (RFC-0032::REQ-0094).
     ///
     /// Uses `BrokerPolicyEngine` with deny-by-default behavior.
     /// Set via `set_policy()` or `with_policy()` before processing requests
     /// when `check_policy` is enabled.
     policy: BrokerPolicyEngine,
 
-    /// Content-addressed store for evidence artifacts (TCK-00293).
+    /// Content-addressed store for evidence artifacts (RFC-0032::REQ-0095).
     ///
     /// Per RFC-0018 HEF requirements, the CAS stores artifacts durably with
     /// content addressing. In production, this should be a `DurableCas`
@@ -884,24 +884,24 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     #[allow(dead_code)]
     loader: Option<Arc<L>>,
 
-    /// Context pack manifest for firewall enforcement (TCK-00261).
+    /// Context pack manifest for firewall enforcement (RFC-0032::REQ-0077).
     context_manifest: tokio::sync::RwLock<Option<Arc<ContextPackManifest>>>,
 
-    /// GitHub credential store for broker-mediated access (TCK-00262).
+    /// GitHub credential store for broker-mediated access (RFC-0032::REQ-0078).
     ///
     /// Per RFC-0017 TB-003, credentials are held by the daemon and never
     /// exposed to session processes. The broker fetches credentials from
     /// this store when processing Git/Network tool requests.
     github_store: Option<Arc<dyn GitHubCredentialStore>>,
 
-    /// SSH credential store for broker-mediated access (TCK-00263).
+    /// SSH credential store for broker-mediated access (RFC-0032::REQ-0079).
     ///
     /// Per RFC-0017 TB-003, SSH credentials (`SSH_AUTH_SOCK`) are held by the
     /// daemon and never exposed to session processes. The broker uses this
     /// store to provide SSH agent access for Git SSH operations.
     ssh_store: Option<Arc<dyn SshCredentialStore>>,
 
-    /// Prometheus metrics registry for daemon health observability (TCK-00268).
+    /// Prometheus metrics registry for daemon health observability (RFC-0032::REQ-0084).
     ///
     /// When present, the broker emits metrics for:
     /// - `tool_mediation_latency`: After each tool mediation decision
@@ -922,13 +922,13 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// `PrivilegedDispatcher` to enable tool mediation metrics.
     metrics: Option<SharedMetricsRegistry>,
 
-    /// Risk-tier-aware firewall enforcement policy (TCK-00375).
+    /// Risk-tier-aware firewall enforcement policy (RFC-0020::REQ-0029).
     ///
     /// Maps risk tiers to firewall enforcement modes. Tier3+ violations
     /// ALWAYS use `HardFail` (mandatory session termination) per REQ-0029.
     firewall_policy: RiskTierFirewallPolicy,
 
-    /// Epoch seal verifier for Tier2+ authority claim admission (TCK-00365).
+    /// Epoch seal verifier for Tier2+ authority claim admission (RFC-0020::REQ-0019).
     ///
     /// Per REQ-0019, Tier2+ authority claims must present a valid epoch seal.
     /// The verifier enforces strict monotonicity, anti-equivocation, and
@@ -939,7 +939,7 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// mutates internal monotonicity state. Access is serialized per-request.
     epoch_seal_verifier: tokio::sync::Mutex<EpochSealVerifier>,
 
-    /// Shell bridge policy for `ToolKinds` typed enforcement (TCK-00377).
+    /// Shell bridge policy for `ToolKinds` typed enforcement (RFC-0020::REQ-0031).
     ///
     /// Per REQ-0031, authoritative routes must not accept raw untyped
     /// command strings. This policy gates shell execution through an
@@ -949,7 +949,7 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Default: `ShellBridgePolicy::deny_all()` (fail-closed).
     shell_bridge_policy: ShellBridgePolicy,
 
-    /// Precondition evaluator for idempotency enforcement (TCK-00377).
+    /// Precondition evaluator for idempotency enforcement (RFC-0020::REQ-0031).
     ///
     /// Per RFC-0020 Section 6.1.2, side-effectful `ToolKind` operations
     /// declare preconditions that must be evaluated **before** execution.
@@ -962,7 +962,7 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// `RuntimePreconditionEvaluator`).
     precondition_evaluator: Option<Arc<dyn PreconditionEvaluator>>,
 
-    /// No-bypass path ratchet enforcement (TCK-00376).
+    /// No-bypass path ratchet enforcement (RFC-0020::REQ-0030).
     ///
     /// Ensures every actuation path passes through all required enforcement
     /// components (broker, capability, context firewall, capsule admission).
@@ -1063,7 +1063,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Creates a new tool broker with an SSH credential store.
     ///
-    /// Per RFC-0017 TB-003 and TCK-00263, SSH credentials (`SSH_AUTH_SOCK`) are
+    /// Per RFC-0017 TB-003 and RFC-0032::REQ-0079, SSH credentials (`SSH_AUTH_SOCK`) are
     /// held by the daemon only. This constructor enables credential mediation
     /// for Git SSH operations.
     #[must_use]
@@ -1132,7 +1132,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
     }
 
-    /// Adds a metrics registry to the broker (TCK-00268).
+    /// Adds a metrics registry to the broker (RFC-0032::REQ-0084).
     ///
     /// When set, the broker will emit metrics for:
     /// - `tool_mediation_latency`: After each tool mediation decision
@@ -1150,7 +1150,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
-    /// Sets the risk-tier-aware firewall policy (TCK-00375).
+    /// Sets the risk-tier-aware firewall policy (RFC-0020::REQ-0029).
     ///
     /// Per REQ-0029, Tier3+ violations always use `HardFail` regardless of
     /// this policy. This method controls the mode for lower tiers.
@@ -1194,7 +1194,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
-    /// Configures the epoch seal signature verifier (TCK-00365).
+    /// Configures the epoch seal signature verifier (RFC-0020::REQ-0019).
     ///
     /// Per REQ-0019, Tier2+ authority claims require cryptographic
     /// signature verification on epoch seals. Without a signature
@@ -1227,7 +1227,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             .set_vdf_policy_resolver(resolver);
     }
 
-    /// Verifies an epoch seal against the broker's verifier (TCK-00365).
+    /// Verifies an epoch seal against the broker's verifier (RFC-0020::REQ-0019).
     ///
     /// This is the production admission path for epoch seal verification.
     /// For Tier2+ requests, a valid epoch seal is required. Missing or
@@ -1256,7 +1256,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             })
     }
 
-    /// Sets the shell bridge policy for Execute-class requests (TCK-00377).
+    /// Sets the shell bridge policy for Execute-class requests (RFC-0020::REQ-0031).
     ///
     /// Per REQ-0031, Execute-class tool requests are checked against this
     /// policy's allowlist. If the executable basename is not in the
@@ -1270,7 +1270,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     }
 
     /// Sets the precondition evaluator for idempotency enforcement
-    /// (TCK-00377).
+    /// (RFC-0020::REQ-0031).
     ///
     /// Per RFC-0020 Section 6.1.2, the evaluator checks declared
     /// preconditions on side-effectful `ToolKind` operations before
@@ -1287,7 +1287,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self
     }
 
-    /// Verifies TOCTOU hash consistency for file content (TCK-00375).
+    /// Verifies TOCTOU hash consistency for file content (RFC-0020::REQ-0029).
     ///
     /// This method verifies that runtime content matches the hash recorded in
     /// the manifest. Callers should invoke this at the read boundary before
@@ -1687,9 +1687,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         Ok(())
     }
 
-    /// Sets the content-addressed store for evidence artifacts (TCK-00293).
+    /// Sets the content-addressed store for evidence artifacts (RFC-0032::REQ-0095).
     ///
-    /// Per RFC-0018 HEF requirements and TCK-00293, the CAS stores artifacts
+    /// Per RFC-0018 HEF requirements and RFC-0032::REQ-0095, the CAS stores artifacts
     /// durably with content addressing. In production, this should be a
     /// `DurableCas` instance. The default `StubContentAddressedStore` is only
     /// for tests and will not persist artifacts across restarts.
@@ -1723,18 +1723,18 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         self.ssh_store.is_some()
     }
 
-    /// Returns `true` if a policy is configured (TCK-00292).
+    /// Returns `true` if a policy is configured (RFC-0032::REQ-0094).
     #[must_use]
     pub const fn has_policy(&self) -> bool {
         self.policy.has_policy()
     }
 
-    /// Sets the policy engine from a loaded policy (TCK-00292).
+    /// Sets the policy engine from a loaded policy (RFC-0032::REQ-0094).
     pub fn set_policy(&mut self, policy: &LoadedPolicy) {
         self.policy = BrokerPolicyEngine::from_policy(policy);
     }
 
-    /// Sets the policy engine from an Arc-wrapped loaded policy (TCK-00292).
+    /// Sets the policy engine from an Arc-wrapped loaded policy (RFC-0032::REQ-0094).
     pub fn set_policy_arc(&mut self, policy: Arc<LoadedPolicy>) {
         self.policy = BrokerPolicyEngine::from_arc(policy);
     }
@@ -1756,14 +1756,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         Ok(())
     }
 
-    /// Creates a builder-style broker with a policy configured (TCK-00292).
+    /// Creates a builder-style broker with a policy configured (RFC-0032::REQ-0094).
     #[must_use]
     pub fn with_policy(mut self, policy: &LoadedPolicy) -> Self {
         self.policy = BrokerPolicyEngine::from_policy(policy);
         self
     }
 
-    /// Creates a builder-style broker with an Arc-wrapped policy (TCK-00292).
+    /// Creates a builder-style broker with an Arc-wrapped policy (RFC-0032::REQ-0094).
     #[must_use]
     pub fn with_policy_arc(mut self, policy: Arc<LoadedPolicy>) -> Self {
         self.policy = BrokerPolicyEngine::from_arc(policy);
@@ -1777,7 +1777,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     }
 
     /// Returns `true` if SSH agent is available for broker-mediated operations
-    /// (TCK-00263).
+    /// (RFC-0032::REQ-0079).
     ///
     /// This checks if an SSH agent is available, either via a per-session
     /// socket stored in the keychain, or via the daemon-wide `SSH_AUTH_SOCK`.
@@ -1820,13 +1820,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     }
 
     /// Gets the `SSH_AUTH_SOCK` path for broker-mediated Git SSH operations
-    /// (TCK-00263).
+    /// (RFC-0032::REQ-0079).
     ///
     /// Per RFC-0017 TB-003, this returns the `SSH_AUTH_SOCK` path for use in
     /// subprocess environment. The session process NEVER has direct access to
     /// this path - it's only used by the broker when executing git commands.
     ///
-    /// # Priority Order (TCK-00263)
+    /// # Priority Order (RFC-0032::REQ-0079)
     ///
     /// 1. Per-session SSH agent socket (if `session_context` is provided and
     ///    has `ssh_session_id` with a stored socket path)
@@ -1845,7 +1845,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ) -> Option<String> {
         let store = self.ssh_store.as_ref()?;
 
-        // Only use per-session SSH agent socket (TCK-00263)
+        // Only use per-session SSH agent socket (RFC-0032::REQ-0079)
         // Per security review, we must NOT fall back to the daemon's SSH agent
         // as that would leak operator credentials to sessions.
         if let Some(ctx) = session_context {
@@ -1879,7 +1879,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// 1. A GitHub credential store is configured with an installation ID, OR
     /// 2. An SSH credential store is configured with an available SSH agent
     ///
-    /// # Credential Priority (TCK-00263)
+    /// # Credential Priority (RFC-0032::REQ-0079)
     ///
     /// For Git tool class:
     /// 1. First try GitHub token (for HTTPS remotes)
@@ -1917,7 +1917,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             return Some(cred);
         }
 
-        // For Git tool class, also try SSH credentials (TCK-00263)
+        // For Git tool class, also try SSH credentials (RFC-0032::REQ-0079)
         if tool_class == ToolClass::Git {
             if let Some(cred) = self.fetch_ssh_credential_for_request(session_context).await {
                 return Some(cred);
@@ -1929,7 +1929,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Fetches GitHub credentials for a tool request.
     ///
-    /// Per TCK-00262, this checks for GitHub installation ID from the session
+    /// Per RFC-0032::REQ-0078, this checks for GitHub installation ID from the session
     /// context and fetches the corresponding token from the GitHub credential
     /// store.
     ///
@@ -1983,13 +1983,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
     }
 
-    /// Fetches SSH credentials for a tool request (TCK-00263).
+    /// Fetches SSH credentials for a tool request (RFC-0032::REQ-0079).
     ///
     /// Per RFC-0017 TB-003, this returns the `SSH_AUTH_SOCK` path as a
     /// credential. The session process NEVER has direct access to this path -
     /// it's only used by the broker when executing git commands in subprocess.
     ///
-    /// # Priority Order (TCK-00263)
+    /// # Priority Order (RFC-0032::REQ-0079)
     ///
     /// 1. Per-session SSH agent socket (if `session_context` is provided and
     ///    has `ssh_session_id` with a stored socket path)
@@ -2059,7 +2059,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Initializes the broker with a context pack manifest for firewalling.
     ///
-    /// Per TCK-00261, this enables the context firewall which terminates
+    /// Per RFC-0032::REQ-0077, this enables the context firewall which terminates
     /// the session on any access violation.
     #[instrument(skip(self, manifest), fields(manifest_id = %manifest.manifest_id))]
     pub async fn initialize_with_context_manifest(
@@ -2073,7 +2073,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     }
 
     /// Initializes the broker's context firewall from a CAS-stored context pack
-    /// (TCK-00326).
+    /// (RFC-0032::REQ-0119).
     ///
     /// This method:
     /// 1. Loads the sealed `ContextPackManifest` from CAS using its hash
@@ -2112,7 +2112,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         })?;
 
-        // TCK-00326: Verify content integrity - compute blake3(content) and assert
+        // RFC-0032::REQ-0119: Verify content integrity - compute blake3(content) and assert
         // it matches context_pack_hash before processing. This prevents CAS poisoning
         // attacks where a malicious actor could substitute content.
         let computed_hash = blake3::hash(&content);
@@ -2150,7 +2150,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         Ok(())
     }
 
-    /// Seals a `ContextPackManifest` and stores it in CAS (TCK-00326).
+    /// Seals a `ContextPackManifest` and stores it in CAS (RFC-0032::REQ-0119).
     ///
     /// This method:
     /// 1. Verifies the manifest's seal
@@ -2233,7 +2233,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// This is the main entry point for tool request validation. It:
     /// 1. Validates the request structure
-    /// 2. Validates against context firewall (if configured) [TCK-00261]
+    /// 2. Validates against context firewall (if configured) [RFC-0032::REQ-0077]
     /// 3. Validates against capability manifests (OCAP check)
     /// 4. Evaluates policy rules
     /// 5. Checks dedupe cache (only for authorized requests)
@@ -2244,7 +2244,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// to prevent authorization bypass. An attacker cannot use cache hits to
     /// circumvent capability checks.
     ///
-    /// Per TCK-00263, session-specific state (like `github_installation_id` and
+    /// Per RFC-0032::REQ-0079, session-specific state (like `github_installation_id` and
     /// `ssh_session_id`) MUST be passed via `session_context` rather than
     /// stored on the broker to prevent cross-session credential leaks.
     ///
@@ -2288,12 +2288,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         timestamp_ns: u64,
         session_context: Option<&super::decision::SessionContext>,
     ) -> Result<BrokerResponse, BrokerError> {
-        // TCK-00268: Record start time for latency metrics
+        // RFC-0032::REQ-0084: Record start time for latency metrics
         let start_time = std::time::Instant::now();
         let mut defects = Vec::new();
         let mut verified_content = VerifiedToolContent::default();
         let mut toctou_verification_required = false;
-        // TCK-00376: Track whether a per-request context firewall check actually
+        // RFC-0020::REQ-0030: Track whether a per-request context firewall check actually
         // executed. This is `true` only when the firewall validated the request
         // (Read/ListFiles/Search always validate; Write/Execute validate only if
         // their allowlists are non-empty). Manifest presence alone is NOT
@@ -2314,7 +2314,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 1: Validate request structure
         request.validate()?;
 
-        // Step 1b: ToolKind typed safety guard (TCK-00377).
+        // Step 1b: ToolKind typed safety guard (RFC-0020::REQ-0031).
         //
         // Enforce shell metacharacter rejection, unconditional Tier2+
         // raw-shell denial, and shell-bridge allowlist enforcement at the
@@ -2335,7 +2335,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 warn!(
                     request_id = %request.request_id,
                     risk_tier = request.risk_tier.tier(),
-                    "TCK-00377: Tier2+ raw shell execution unconditionally denied"
+                    "RFC-0020::REQ-0031: Tier2+ raw shell execution unconditionally denied"
                 );
                 respond!(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
@@ -2356,7 +2356,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     warn!(
                         request_id = %request.request_id,
                         error = %e,
-                        "TCK-00377: shell metacharacter injection rejected"
+                        "RFC-0020::REQ-0031: shell metacharacter injection rejected"
                     );
                     respond!(ToolDecision::Deny {
                         request_id: request.request_id.clone(),
@@ -2370,7 +2370,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 }
             }
 
-            // Step 1c: Shell bridge allowlist enforcement (TCK-00377).
+            // Step 1c: Shell bridge allowlist enforcement (RFC-0020::REQ-0031).
             //
             // Every Execute-class request MUST have its executable checked
             // against `self.shell_bridge_policy`.  Fail-closed: if
@@ -2386,7 +2386,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     warn!(
                         request_id = %request.request_id,
                         error = %e,
-                        "TCK-00377: shell bridge allowlist denied"
+                        "RFC-0020::REQ-0031: shell bridge allowlist denied"
                     );
                     respond!(ToolDecision::Deny {
                         request_id: request.request_id.clone(),
@@ -2403,7 +2403,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 // check against the allowlist.  Deny unconditionally.
                 warn!(
                     request_id = %request.request_id,
-                    "TCK-00377: Execute request missing shell_command, denied by shell bridge policy"
+                    "RFC-0020::REQ-0031: Execute request missing shell_command, denied by shell bridge policy"
                 );
                 respond!(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
@@ -2419,7 +2419,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 1d: Idempotency precondition enforcement (TCK-00377 BLOCKER).
+        // Step 1d: Idempotency precondition enforcement (RFC-0020::REQ-0031 BLOCKER).
         //
         // If the request carries a typed `ToolKind` with a precondition, evaluate
         // it **before** capability/policy checks.  This ensures that stale or
@@ -2432,17 +2432,17 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 warn!(
                     request_id = %request.request_id,
                     error = %e,
-                    "TCK-00377: idempotency precondition evaluation failed"
+                    "RFC-0020::REQ-0031: idempotency precondition evaluation failed"
                 );
                 e
             })?;
         }
 
-        // Step 2: Validate against context firewall (TCK-00261, TCK-00286)
+        // Step 2: Validate against context firewall (RFC-0032::REQ-0077, RFC-0032::REQ-0088)
         // This must happen before capability checks because a firewall violation
         // triggers session termination, which is more severe than a capability denial.
         //
-        // Per TCK-00286 security review:
+        // Per RFC-0032::REQ-0088 security review:
         // - Read operations: Check path against manifest entries (fail if path is None)
         // - Write operations: Check path against write_allowlist (if configured)
         // - Execute operations: Check command against shell_allowlist (if configured)
@@ -2450,7 +2450,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // NOTE: DefaultContextFirewall::new() is instantiated per-request. This is
         // acceptable overhead since the struct is lightweight (borrows manifest
         // reference) and avoids storing additional state in the broker.
-        // TCK-00268: Helper for tool class label
+        // RFC-0032::REQ-0084: Helper for tool class label
         let tool_id = match request.tool_class {
             super::tool_class::ToolClass::Read => "read",
             super::tool_class::ToolClass::Write => "write",
@@ -2465,7 +2465,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         };
 
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
-            // TCK-00375: Determine firewall mode based on risk tier
+            // RFC-0020::REQ-0029: Determine firewall mode based on risk tier
             let ctx_risk_tier: ContextRiskTier = request.risk_tier.into();
             let tier_mode = self.firewall_policy.mode_for_tier(ctx_risk_tier);
             let terminate_on_toctou = ctx_risk_tier.is_high_risk()
@@ -2477,7 +2477,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // this point in the call stack. The episode_id provides sufficient
             // traceability for audit purposes.
             let make_terminate = |rationale: &str| {
-                // TCK-00268: Emit context firewall denial, session termination, and tool
+                // RFC-0032::REQ-0084: Emit context firewall denial, session termination, and tool
                 // mediation metrics
                 if let Some(ref metrics) = self.metrics {
                     let latency = start_time.elapsed().as_secs_f64();
@@ -2504,10 +2504,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 super::tool_class::ToolClass::Read
                 | super::tool_class::ToolClass::ListFiles
                 | super::tool_class::ToolClass::Search => {
-                    // TCK-00376: Read/ListFiles/Search always traverse firewall.
+                    // RFC-0020::REQ-0030: Read/ListFiles/Search always traverse firewall.
                     context_firewall_checked = true;
                     toctou_verification_required = true;
-                    // TCK-00286 [MEDIUM]: Fail-closed if path is None
+                    // RFC-0032::REQ-0088 [MEDIUM]: Fail-closed if path is None
                     let Some(ref path) = request.path else {
                         warn!(
                             request_id = %request.request_id,
@@ -2522,7 +2522,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                         respond!(make_terminate("CONTEXT_READ_NO_PATH"));
                     };
 
-                    // TCK-00375: Use risk-tier-aware firewall mode
+                    // RFC-0020::REQ-0029: Use risk-tier-aware firewall mode
                     let firewall = DefaultContextFirewall::new(context_manifest, tier_mode);
                     let path_str = path.to_string_lossy();
 
@@ -2650,7 +2650,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             }
                         },
                         Ok(ValidationResult::Warned { event }) => {
-                            // TCK-00375 BLOCKER 3 FIX: Warn mode returned a
+                            // RFC-0020::REQ-0029 BLOCKER 3 FIX: Warn mode returned a
                             // warning for a path that would have been denied.
                             // Per REQ-0029, out-of-pack reads MUST always be
                             // denied regardless of tier mode.  The Warn mode
@@ -2731,7 +2731,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             };
                             defects.push(defect);
 
-                            // TCK-00375: Tier3+ always terminates
+                            // RFC-0020::REQ-0029: Tier3+ always terminates
                             if e.should_terminate_session() || ctx_risk_tier.is_high_risk() {
                                 respond!(make_terminate("CONTEXT_MISS"));
                             }
@@ -2751,9 +2751,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     }
                 },
                 super::tool_class::ToolClass::Write => {
-                    // TCK-00286 [HIGH]: Check write_allowlist if configured
+                    // RFC-0032::REQ-0088 [HIGH]: Check write_allowlist if configured
                     if !context_manifest.write_allowlist.is_empty() {
-                        // TCK-00376: Write traverses firewall when allowlist configured.
+                        // RFC-0020::REQ-0030: Write traverses firewall when allowlist configured.
                         context_firewall_checked = true;
                         // Fail-closed if path is None when write_allowlist is configured
                         let Some(ref path) = request.path else {
@@ -2786,9 +2786,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     }
                 },
                 super::tool_class::ToolClass::Execute => {
-                    // TCK-00286 [HIGH]: Check shell_allowlist if configured
+                    // RFC-0032::REQ-0088 [HIGH]: Check shell_allowlist if configured
                     if !context_manifest.shell_allowlist.is_empty() {
-                        // TCK-00376: Execute traverses firewall when allowlist configured.
+                        // RFC-0020::REQ-0030: Execute traverses firewall when allowlist configured.
                         context_firewall_checked = true;
                         // Fail-closed if shell_command is None when shell_allowlist is configured
                         let Some(ref command) = request.shell_command else {
@@ -2839,7 +2839,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             CapabilityDecision::Allow { capability_id } => capability_id,
             CapabilityDecision::Deny { reason } => {
                 debug!(reason = %reason, "capability denied");
-                // TCK-00268: Emit tool mediation latency metric for deny
+                // RFC-0032::REQ-0084: Emit tool mediation latency metric for deny
                 if let Some(ref metrics) = self.metrics {
                     let latency = start_time.elapsed().as_secs_f64();
                     metrics
@@ -2860,7 +2860,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         if self.config.check_policy {
             if let PolicyDecision::Deny { rule_id, reason } = self.policy.evaluate(request) {
                 warn!(rule_id = %rule_id, reason = %reason, "policy denied");
-                // TCK-00268: Emit tool mediation latency metric for policy deny
+                // RFC-0032::REQ-0084: Emit tool mediation latency metric for policy deny
                 if let Some(ref metrics) = self.metrics {
                     let latency = start_time.elapsed().as_secs_f64();
                     metrics
@@ -2880,7 +2880,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 5: Path ratchet enforcement (TCK-00376)
+        // Step 5: Path ratchet enforcement (RFC-0020::REQ-0030)
         //
         // SECURITY: The path ratchet MUST run before the dedupe cache lookup.
         // If ratchet enforcement ran after the cache, a cache hit would return
@@ -2893,7 +2893,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         {
             use super::path_ratchet::{EnforcementStatus, PathRatchetInput, PathRatchetOutcome};
 
-            // TCK-00376 BLOCKER FIX: Derive context_firewall_status from
+            // RFC-0020::REQ-0030 BLOCKER FIX: Derive context_firewall_status from
             // actual per-request enforcement execution, NOT mere manifest presence.
             //
             // - Checked: a firewall validation ran for this request (Read/ListFiles/ Search
@@ -2911,12 +2911,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             };
 
             // Capsule admission: not yet wired into the broker at runtime
-            // (library-only in AdmissionGate, validated in TCK-00374 unit tests).
+            // (library-only in AdmissionGate, validated in RFC-0020::REQ-0028 unit tests).
             // Marked as Unavailable because no runtime capsule admission gate
             // check is performed here. At Tier0-2 this produces a warning; at
             // Tier3+ the ratchet will deny (fail-closed, per REQ-0028).
             //
-            // TODO(TCK-00374): When capsule runtime wiring lands, replace this
+            // TODO(RFC-0020::REQ-0028): When capsule runtime wiring lands, replace this
             // with an actual capsule presence check on the request.
             let capsule_status = EnforcementStatus::Unavailable;
 
@@ -3019,7 +3019,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 5b: Epoch seal verification for Tier2+ admission (TCK-00365).
+        // Step 5b: Epoch seal verification for Tier2+ admission (RFC-0020::REQ-0019).
         //
         // SECURITY: This check runs AFTER path-ratchet (Step 5) so that
         // path-ratchet's terminate+defect semantics for Tier3+ remain
@@ -3048,7 +3048,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     error = %e,
                     "epoch seal verification failed (fail-closed)"
                 );
-                // TCK-00268: Emit tool mediation latency metric for epoch seal deny
+                // RFC-0032::REQ-0084: Emit tool mediation latency metric for epoch seal deny
                 if let Some(ref metrics) = self.metrics {
                     let latency = start_time.elapsed().as_secs_f64();
                     metrics
@@ -3076,7 +3076,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 .await
             {
                 debug!(dedupe_key = %request.dedupe_key, "dedupe cache hit");
-                // TCK-00268: Emit tool mediation latency metric for cache hit
+                // RFC-0032::REQ-0084: Emit tool mediation latency metric for cache hit
                 if let Some(ref metrics) = self.metrics {
                     let latency = start_time.elapsed().as_secs_f64();
                     metrics.daemon_metrics().record_tool_mediation_latency(
@@ -3094,7 +3094,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         // Request is authorized - return Allow decision
-        // Step 6: Fetch credentials for Git/Network tools (TCK-00262, TCK-00263)
+        // Step 6: Fetch credentials for Git/Network tools (RFC-0032::REQ-0078, RFC-0032::REQ-0079)
         // Per RFC-0017 TB-003, credentials are attached by the broker, never
         // exposed to session processes directly. Session context is used to
         // look up session-specific credentials without storing them on the broker.
@@ -3104,7 +3104,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
         debug!(capability_id = %capability_id, has_credential = credential.is_some(), "request allowed");
 
-        // TCK-00268: Emit tool mediation latency metric for allow
+        // RFC-0032::REQ-0084: Emit tool mediation latency metric for allow
         if let Some(ref metrics) = self.metrics {
             let latency = start_time.elapsed().as_secs_f64();
             metrics
@@ -3182,7 +3182,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     }
 
     /// Evaluates idempotency preconditions for a typed tool operation
-    /// (TCK-00377).
+    /// (RFC-0020::REQ-0031).
     ///
     /// This method MUST be called after `request()` returns
     /// `ToolDecision::Allow` and before the tool is actually executed.
@@ -3216,7 +3216,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 precondition: Some(_),
                 ..
             } => true,
-            // TCK-00377 MAJOR FIX: GitOp now carries preconditions for
+            // RFC-0020::REQ-0031 MAJOR FIX: GitOp now carries preconditions for
             // side-effectful operations.
             apm2_core::tool::ToolKind::GitOp { preconditions, .. } => !preconditions.is_empty(),
             _ => false,
@@ -3233,7 +3233,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             // the `RuntimePreconditionEvaluator` stub). A missing evaluator
             // indicates a configuration error that must be surfaced as a hard denial.
             warn!(
-                "TCK-00377: precondition declared but no evaluator configured; \
+                "RFC-0020::REQ-0031: precondition declared but no evaluator configured; \
                  denying request (fail-closed)"
             );
             return Err(BrokerError::PreconditionFailed {
@@ -3410,9 +3410,9 @@ pub fn new_shared_broker<L: ManifestLoader + Send + Sync>(
     Arc::new(ToolBroker::new(config))
 }
 
-/// Creates a new shared tool broker with a durable CAS backend (TCK-00293).
+/// Creates a new shared tool broker with a durable CAS backend (RFC-0032::REQ-0095).
 ///
-/// Per RFC-0018 HEF requirements and TCK-00293, evidence artifacts must be
+/// Per RFC-0018 HEF requirements and RFC-0032::REQ-0095, evidence artifacts must be
 /// durable and content-addressed for FAC v0. This constructor requires a CAS
 /// implementation to be provided, ensuring production paths use durable
 /// storage.
@@ -3532,7 +3532,7 @@ mod tests {
 
     /// Creates a test config with policy checking disabled.
     ///
-    /// Per TCK-00292, existing tests that focus on capability validation,
+    /// Per RFC-0032::REQ-0094, existing tests that focus on capability validation,
     /// dedupe cache, credentials, etc. should disable policy checking.
     fn test_config_without_policy() -> ToolBrokerConfig {
         ToolBrokerConfig::default().without_policy_check()
@@ -3909,7 +3909,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00293: DurableCas wiring tests
+    // RFC-0032::REQ-0095: DurableCas wiring tests
     // =========================================================================
 
     #[tokio::test]
@@ -4161,7 +4161,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Context Firewall Tests (TCK-00286)
+    // Context Firewall Tests (RFC-0032::REQ-0088)
     //
     // These tests verify the context firewall integration in the broker,
     // including fail-closed behavior for Read, Write, and Execute operations.
@@ -4227,7 +4227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_with_context_manifest() {
-        // TCK-00286: Basic initialization test
+        // RFC-0032::REQ-0088: Basic initialization test
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let context_manifest = make_context_manifest(
@@ -4244,7 +4244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_read() {
-        // TCK-00286: Read request for allowed path proceeds to capability checks
+        // RFC-0032::REQ-0088: Read request for allowed path proceeds to capability checks
         use tempfile::tempdir;
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
@@ -4291,7 +4291,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_read() {
-        // TCK-00286: Read request for path NOT in manifest returns Terminate
+        // RFC-0032::REQ-0088: Read request for path NOT in manifest returns Terminate
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing reads from /workspace
@@ -4333,7 +4333,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_terminates_on_read_without_path() {
-        // TCK-00286 [MEDIUM]: Read request with path: None when context firewall
+        // RFC-0032::REQ-0088 [MEDIUM]: Read request with path: None when context firewall
         // active returns Terminate (fail-closed)
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
@@ -4376,7 +4376,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_write() {
-        // TCK-00286 [HIGH]: Write request outside write_allowlist returns Terminate
+        // RFC-0032::REQ-0088 [HIGH]: Write request outside write_allowlist returns Terminate
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes to /workspace
@@ -4433,7 +4433,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_write() {
-        // TCK-00286: Write request within write_allowlist proceeds
+        // RFC-0032::REQ-0088: Write request within write_allowlist proceeds
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes to /workspace
@@ -4482,7 +4482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_execute() {
-        // TCK-00286 [HIGH]: Execute request outside shell_allowlist returns Terminate
+        // RFC-0032::REQ-0088 [HIGH]: Execute request outside shell_allowlist returns Terminate
         // NOTE: shell_bridge_policy is set to allow "rm" so we can test the
         // context firewall (which is more restrictive and only allows cargo).
         let shell_policy =
@@ -4533,7 +4533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_execute() {
-        // TCK-00286: Execute request matching shell_allowlist proceeds
+        // RFC-0032::REQ-0088: Execute request matching shell_allowlist proceeds
         // NOTE: shell_bridge_policy allows "cargo" so the context firewall test
         // exercises its own allowlist enforcement.
         let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
@@ -4576,7 +4576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_execute_no_command() {
-        // TCK-00286 / TCK-00377: Execute request without shell_command is
+        // RFC-0032::REQ-0088 / RFC-0020::REQ-0031: Execute request without shell_command is
         // now caught by the shell bridge policy (Step 1c) before the
         // context firewall (Step 2).  The shell bridge policy denies
         // requests missing shell_command (fail-closed).
@@ -4622,7 +4622,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_write_no_path() {
-        // TCK-00286: Write request without path when write_allowlist
+        // RFC-0032::REQ-0088: Write request without path when write_allowlist
         // configured returns Terminate (fail-closed)
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
@@ -4674,7 +4674,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_firewall_empty_allowlist_tier0_allowed() {
-        // TCK-00286 / TCK-00376 / TCK-00377: When context's
+        // RFC-0032::REQ-0088 / RFC-0020::REQ-0030 / RFC-0020::REQ-0031: When context's
         // write_allowlist/shell_allowlist are empty, no per-request firewall
         // check runs. At Tier0 this is allowed because enforcement components
         // are optional at Tier0-1. NOTE: shell_bridge_policy allows "any" so
@@ -4739,7 +4739,7 @@ mod tests {
         );
     }
 
-    /// TCK-00376 regression: Tier2 write request with context manifest loaded
+    /// RFC-0020::REQ-0030 regression: Tier2 write request with context manifest loaded
     /// but empty `write_allowlist` MUST be denied because the context firewall
     /// check did not execute (status = Available, not Checked).
     #[tokio::test]
@@ -4795,9 +4795,9 @@ mod tests {
         }
     }
 
-    /// TCK-00376 / TCK-00377 regression: Tier2 execute request with context
+    /// RFC-0020::REQ-0030 / RFC-0020::REQ-0031 regression: Tier2 execute request with context
     /// manifest loaded but empty `shell_allowlist` MUST be denied. With
-    /// TCK-00377, the `TOOL_KIND_GUARD` denies raw Execute at Tier2+ before
+    /// RFC-0020::REQ-0031, the `TOOL_KIND_GUARD` denies raw Execute at Tier2+ before
     /// the path ratchet runs (defense-in-depth).
     #[tokio::test]
     async fn test_context_firewall_empty_shell_allowlist_tier2_denied() {
@@ -4824,7 +4824,7 @@ mod tests {
             .unwrap();
 
         // Tier2 execute: TOOL_KIND_GUARD denies raw shell at Tier2+
-        // (TCK-00377 defense-in-depth, runs before path ratchet)
+        // (RFC-0020::REQ-0031 defense-in-depth, runs before path ratchet)
         let mut request = make_tiered_request(
             "req-exec-empty-t2",
             ToolClass::Execute,
@@ -4844,12 +4844,12 @@ mod tests {
             assert_eq!(
                 rule_id.as_deref(),
                 Some("TOOL_KIND_GUARD"),
-                "denial must come from TOOL_KIND_GUARD (TCK-00377 Tier2+ raw-shell denial)"
+                "denial must come from TOOL_KIND_GUARD (RFC-0020::REQ-0031 Tier2+ raw-shell denial)"
             );
         }
     }
 
-    /// TCK-00376 regression: Tier3 request for a tool class not covered by
+    /// RFC-0020::REQ-0030 regression: Tier3 request for a tool class not covered by
     /// context firewall (e.g., Network) MUST be terminated because no per-
     /// request firewall check executed. Per REQ-0029, Tier3+ context-firewall
     /// violations produce Terminate + defect.
@@ -4897,7 +4897,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Credential Broker Tests (TCK-00262)
+    // Credential Broker Tests (RFC-0032::REQ-0078)
     //
     // These tests verify the credential broker functionality per RFC-0017 TB-003
     // (Credential Isolation Boundary). Credentials are held by the daemon and
@@ -4936,7 +4936,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_has_github_store() {
-        // TCK-00262: Test has_github_store() method
+        // RFC-0032::REQ-0078: Test has_github_store() method
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         // Without store
@@ -4953,7 +4953,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_context_creation() {
-        // TCK-00263: Test SessionContext builder pattern
+        // RFC-0032::REQ-0079: Test SessionContext builder pattern
         use super::super::decision::SessionContext;
 
         // Empty context
@@ -4983,7 +4983,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_attaches_credential_for_git() {
-        // TCK-00262: Git tool requests should have credentials attached
+        // RFC-0032::REQ-0078: Git tool requests should have credentials attached
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
@@ -5034,7 +5034,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_attaches_credential_for_network() {
-        // TCK-00262: Network tool requests should have credentials attached
+        // RFC-0032::REQ-0078: Network tool requests should have credentials attached
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
@@ -5086,7 +5086,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_no_credential_for_read() {
-        // TCK-00262: Read tool requests should NOT have credentials attached
+        // RFC-0032::REQ-0078: Read tool requests should NOT have credentials attached
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
@@ -5125,7 +5125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_no_credential_without_store() {
-        // TCK-00262: Without a credential store, Git requests have no credential
+        // RFC-0032::REQ-0078: Without a credential store, Git requests have no credential
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up manifest with Git capability
@@ -5162,7 +5162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_no_credential_without_installation_id() {
-        // TCK-00262: With store but no installation ID, Git requests have no credential
+        // RFC-0032::REQ-0078: With store but no installation ID, Git requests have no credential
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
 
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
@@ -5207,7 +5207,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_broker_missing_token_returns_none() {
-        // TCK-00262: If token lookup fails, request still succeeds but without
+        // RFC-0032::REQ-0078: If token lookup fails, request still succeeds but without
         // credential
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemoryGitHubCredentialStore;
@@ -5256,7 +5256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_is_redacted_in_debug() {
-        // TCK-00262: Verify Credential debug output is redacted
+        // RFC-0032::REQ-0078: Verify Credential debug output is redacted
         let credential = Credential::new("super_secret_token");
         let debug_output = format!("{credential:?}");
 
@@ -5271,7 +5271,7 @@ mod tests {
     }
 
     // =========================================================================
-    // SSH Credential Broker Tests (TCK-00263)
+    // SSH Credential Broker Tests (RFC-0032::REQ-0079)
     //
     // These tests verify the SSH credential broker functionality per RFC-0017
     // TB-003 (Credential Isolation Boundary). SSH_AUTH_SOCK is held by the
@@ -5280,7 +5280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_has_ssh_store() {
-        // TCK-00263: Test has_ssh_store() method
+        // RFC-0032::REQ-0079: Test has_ssh_store() method
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
         // Without store
@@ -5297,7 +5297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_context_for_ssh() {
-        // TCK-00263: Test SessionContext with SSH session ID
+        // RFC-0032::REQ-0079: Test SessionContext with SSH session ID
         use super::super::decision::SessionContext;
 
         // Create session context with SSH session ID
@@ -5315,7 +5315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_agent_availability() {
-        // TCK-00263: Test SSH agent availability detection
+        // RFC-0032::REQ-0079: Test SSH agent availability detection
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
@@ -5367,7 +5367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_attaches_credential_for_git() {
-        // TCK-00263: Git tool requests should have SSH credentials attached when
+        // RFC-0032::REQ-0079: Git tool requests should have SSH credentials attached when
         // GitHub credentials are not available
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
@@ -5424,7 +5424,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_no_credential_without_store() {
-        // TCK-00263: Without SSH store, Git requests have no SSH credential
+        // RFC-0032::REQ-0079: Without SSH store, Git requests have no SSH credential
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up manifest with Git capability
@@ -5461,7 +5461,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_no_credential_without_agent() {
-        // TCK-00263: With SSH store but no agent, Git requests have no credential
+        // RFC-0032::REQ-0079: With SSH store but no agent, Git requests have no credential
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
         let store = Arc::new(InMemorySshCredentialStore::new());
@@ -5504,7 +5504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_github_takes_priority() {
-        // TCK-00263: GitHub credentials take priority over SSH credentials
+        // RFC-0032::REQ-0079: GitHub credentials take priority over SSH credentials
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::{
             InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
@@ -5564,7 +5564,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_fallback_to_ssh() {
-        // TCK-00263: When GitHub credential fails, fall back to SSH
+        // RFC-0032::REQ-0079: When GitHub credential fails, fall back to SSH
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::{
             InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
@@ -5633,7 +5633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_no_credential_for_read() {
-        // TCK-00263: Read tool requests should NOT have SSH credentials
+        // RFC-0032::REQ-0079: Read tool requests should NOT have SSH credentials
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
@@ -5674,7 +5674,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_broker_no_credential_for_network() {
-        // TCK-00263: Network tool requests should NOT have SSH credentials
+        // RFC-0032::REQ-0079: Network tool requests should NOT have SSH credentials
         // (SSH is only for Git operations)
         use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
@@ -5726,7 +5726,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssh_credential_is_redacted_in_debug() {
-        // TCK-00263: Verify SSH credential (SSH_AUTH_SOCK path) is redacted in debug
+        // RFC-0032::REQ-0079: Verify SSH credential (SSH_AUTH_SOCK path) is redacted in debug
         let credential = Credential::new("/run/user/1000/ssh-agent.sock");
         let debug_output = format!("{credential:?}");
 
@@ -5741,12 +5741,12 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00292: Policy Engine Integration Tests
+    // RFC-0032::REQ-0094: Policy Engine Integration Tests
     // =========================================================================
 
     #[tokio::test]
     async fn tool_broker_policy_engine_deny_when_no_policy() {
-        // TCK-00292: Broker denies requests when no policy is configured
+        // RFC-0032::REQ-0094: Broker denies requests when no policy is configured
         let policy = BrokerPolicyEngine::new();
 
         assert!(!policy.has_policy());
@@ -5980,7 +5980,7 @@ policy:
 
     #[tokio::test]
     async fn tool_broker_policy_engine_deny_no_policy_with_check_enabled() {
-        // TCK-00292: Broker denies when check_policy is enabled but no policy is set
+        // RFC-0032::REQ-0094: Broker denies when check_policy is enabled but no policy is set
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
 
         let manifest = make_manifest(vec![make_read_capability(
@@ -6211,7 +6211,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00326: Context Pack Storage Tests
+    // RFC-0032::REQ-0119: Context Pack Storage Tests
     //
     // Tests for `seal_and_store_context_pack` and `initialize_context_from_hash`
     // methods that enable context pack persistence via CAS.
@@ -6543,7 +6543,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00375 BLOCKER 3: Warn mode MUST deny out-of-pack reads
+    // RFC-0020::REQ-0029 BLOCKER 3: Warn mode MUST deny out-of-pack reads
     //
     // Per REQ-0029, out-of-pack reads must ALWAYS be denied regardless of
     // the firewall mode.  Even Warn mode must not permit out-of-pack access.
@@ -6551,7 +6551,7 @@ policy:
 
     #[tokio::test]
     async fn test_warn_mode_denies_out_of_pack_reads() {
-        // TCK-00375 BLOCKER 3: Even with Warn firewall policy for low tiers,
+        // RFC-0020::REQ-0029 BLOCKER 3: Even with Warn firewall policy for low tiers,
         // out-of-pack reads MUST be denied (not just warned).
         use apm2_core::context::firewall::FirewallMode;
 
@@ -6594,7 +6594,7 @@ policy:
 
     #[tokio::test]
     async fn test_warn_mode_allows_in_pack_reads() {
-        // TCK-00375: Warn mode for in-pack allowed paths should still succeed
+        // RFC-0020::REQ-0029: Warn mode for in-pack allowed paths should still succeed
         use apm2_core::context::firewall::FirewallMode;
         use tempfile::tempdir;
 
@@ -6798,7 +6798,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00375 BLOCKER 2: Defect emission for Tier3+ violations
+    // RFC-0020::REQ-0029 BLOCKER 2: Defect emission for Tier3+ violations
     //
     // Per REQ-0029, Tier3+ violations MUST emit FirewallViolationDefect.
     // Verify that defects are accumulated and drainable.
@@ -6806,7 +6806,7 @@ policy:
 
     #[tokio::test]
     async fn test_tier3_violation_emits_defect() {
-        // TCK-00375 BLOCKER 2: Tier3+ firewall violations MUST produce
+        // RFC-0020::REQ-0029 BLOCKER 2: Tier3+ firewall violations MUST produce
         // drainable defects.
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
@@ -6867,14 +6867,14 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00375 BLOCKER 1: TOCTOU verification is callable and functional
+    // RFC-0020::REQ-0029 BLOCKER 1: TOCTOU verification is callable and functional
     //
     // verify_toctou() must detect content hash mismatches.
     // =========================================================================
 
     #[tokio::test]
     async fn test_verify_toctou_detects_mismatch() {
-        // TCK-00375 BLOCKER 1: verify_toctou must fail when content differs
+        // RFC-0020::REQ-0029 BLOCKER 1: verify_toctou must fail when content differs
         // from the manifest hash.
         let content = b"fn main() { println!(\"hello\"); }";
         let correct_hash = *blake3::hash(content).as_bytes();
@@ -6908,7 +6908,7 @@ policy:
 
     #[tokio::test]
     async fn test_verify_toctou_emits_defect_for_tier3() {
-        // TCK-00375 BLOCKER 1+2: verify_toctou at Tier3 must emit a defect
+        // RFC-0020::REQ-0029 BLOCKER 1+2: verify_toctou at Tier3 must emit a defect
         let content = b"fn main() {}";
         let correct_hash = *blake3::hash(content).as_bytes();
 
@@ -6948,7 +6948,7 @@ policy:
     }
 
     // =========================================================================
-    // Epoch seal admission tests (TCK-00365)
+    // Epoch seal admission tests (RFC-0020::REQ-0019)
     // =========================================================================
 
     /// Helper: builds a valid `EpochSealV1` whose `content_hash` matches
@@ -7478,7 +7478,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00377 BLOCKER 1: Shell bridge allowlist enforcement tests
+    // RFC-0020::REQ-0031 BLOCKER 1: Shell bridge allowlist enforcement tests
     //
     // These tests verify that `ToolBroker::request()` enforces the
     // `shell_bridge_policy` allowlist for Execute-class requests.
@@ -7486,7 +7486,7 @@ policy:
 
     #[tokio::test]
     async fn test_shell_bridge_deny_all_rejects_execute() {
-        // TCK-00377 BLOCKER 1: Default deny-all policy must reject
+        // RFC-0020::REQ-0031 BLOCKER 1: Default deny-all policy must reject
         // Execute-class requests even when no context firewall is active.
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
@@ -7527,7 +7527,7 @@ policy:
 
     #[tokio::test]
     async fn test_shell_bridge_rejects_non_allowlisted_executable() {
-        // TCK-00377 BLOCKER 1: Allowlisted policy must reject executables
+        // RFC-0020::REQ-0031 BLOCKER 1: Allowlisted policy must reject executables
         // not in the list.
         let shell_policy =
             ShellBridgePolicy::new(vec!["cargo".to_string(), "rustfmt".to_string()], false)
@@ -7565,7 +7565,7 @@ policy:
 
     #[tokio::test]
     async fn test_shell_bridge_allows_allowlisted_executable() {
-        // TCK-00377 BLOCKER 1: When executable is in the allowlist at
+        // RFC-0020::REQ-0031 BLOCKER 1: When executable is in the allowlist at
         // Tier0, the request should proceed past the shell bridge check.
         let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
         let broker: ToolBroker<StubManifestLoader> =
@@ -7598,7 +7598,7 @@ policy:
 
     #[tokio::test]
     async fn test_shell_bridge_denies_missing_command() {
-        // TCK-00377 BLOCKER 1: Execute request without shell_command must
+        // RFC-0020::REQ-0031 BLOCKER 1: Execute request without shell_command must
         // be denied by the shell bridge policy (fail-closed).
         let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
         let broker: ToolBroker<StubManifestLoader> =
@@ -7631,7 +7631,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00377 BLOCKER 2: Precondition evaluation tests
+    // RFC-0020::REQ-0031 BLOCKER 2: Precondition evaluation tests
     //
     // These tests verify that `ToolBroker::evaluate_precondition()` enforces
     // `IdempotencyPrecondition` before side-effectful tool execution.
@@ -7671,7 +7671,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_satisfied_allows_execution() {
-        // TCK-00377 BLOCKER 2: When the evaluator reports satisfied,
+        // RFC-0020::REQ-0031 BLOCKER 2: When the evaluator reports satisfied,
         // evaluate_precondition returns Ok.
         let evaluator = Arc::new(AlwaysSatisfiedEvaluator);
         let broker: ToolBroker<StubManifestLoader> =
@@ -7695,7 +7695,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_failed_denies_execution() {
-        // TCK-00377 BLOCKER 2: When the evaluator reports failure,
+        // RFC-0020::REQ-0031 BLOCKER 2: When the evaluator reports failure,
         // evaluate_precondition returns Err.
         let evaluator = Arc::new(AlwaysFailedEvaluator);
         let broker: ToolBroker<StubManifestLoader> =
@@ -7719,7 +7719,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_no_evaluator_denies_execution_fail_closed() {
-        // TCK-00377: When no evaluator is configured and a precondition is
+        // RFC-0020::REQ-0031: When no evaluator is configured and a precondition is
         // declared, the request is DENIED (fail-closed). Production brokers
         // must always wire an evaluator (at minimum RuntimePreconditionEvaluator).
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
@@ -7742,7 +7742,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_default_evaluator_allows_execution() {
-        // TCK-00377: When the RuntimePreconditionEvaluator stub is wired,
+        // RFC-0020::REQ-0031: When the RuntimePreconditionEvaluator stub is wired,
         // preconditions are evaluated (and always satisfied by the stub).
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy())
             .with_precondition_evaluator(Arc::new(RuntimePreconditionEvaluator));
@@ -7764,7 +7764,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_none_allows_execution() {
-        // TCK-00377: Tool operations without preconditions should succeed
+        // RFC-0020::REQ-0031: Tool operations without preconditions should succeed
         // even when no evaluator is configured.
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
@@ -7786,7 +7786,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_stale_hash_denies_execution() {
-        // TCK-00377 BLOCKER 2: Stale precondition (e.g., FileHashMatch
+        // RFC-0020::REQ-0031 BLOCKER 2: Stale precondition (e.g., FileHashMatch
         // with wrong hash) must produce a deny receipt.
         let evaluator = Arc::new(AlwaysFailedEvaluator);
         let broker: ToolBroker<StubManifestLoader> =
@@ -7817,7 +7817,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_read_file_skipped() {
-        // TCK-00377: ReadFile never has preconditions, should always pass.
+        // RFC-0020::REQ-0031: ReadFile never has preconditions, should always pass.
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let tool_kind = apm2_core::tool::ToolKind::ReadFile {
@@ -7834,13 +7834,13 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00377 BLOCKER: Integration test — precondition-fail rejects in the
+    // RFC-0020::REQ-0031 BLOCKER: Integration test — precondition-fail rejects in the
     // production `request_with_response` pipeline.
     // =========================================================================
 
     #[tokio::test]
     async fn test_precondition_fail_rejects_in_request_pipeline() {
-        // TCK-00377 BLOCKER: Build a full BrokerToolRequest with a ToolKind
+        // RFC-0020::REQ-0031 BLOCKER: Build a full BrokerToolRequest with a ToolKind
         // carrying a precondition that fails.  The request pipeline must
         // reject it before reaching capability or firewall checks.
         let evaluator = Arc::new(AlwaysFailedEvaluator);
@@ -7891,7 +7891,7 @@ policy:
 
     #[tokio::test]
     async fn test_precondition_pass_allows_through_pipeline() {
-        // TCK-00377: When precondition passes, the request should proceed
+        // RFC-0020::REQ-0031: When precondition passes, the request should proceed
         // through the normal pipeline (not be blocked by precondition check).
         let evaluator = Arc::new(AlwaysSatisfiedEvaluator);
         let broker: ToolBroker<StubManifestLoader> =
@@ -7935,7 +7935,7 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00377 BLOCKER 1 FIX: RuntimePreconditionEvaluator tests with real
+    // RFC-0020::REQ-0031 BLOCKER 1 FIX: RuntimePreconditionEvaluator tests with real
     // filesystem state.  These prove the production evaluator actually blocks
     // on failure (not just the stub test doubles).
     // =========================================================================
@@ -8278,7 +8278,7 @@ policy:
 
     #[tokio::test]
     async fn test_runtime_evaluator_file_exists_fails_on_production_broker_path() {
-        // TCK-00377: Prove that precondition FAILURE actually blocks execution
+        // RFC-0020::REQ-0031: Prove that precondition FAILURE actually blocks execution
         // on the production broker construction path (RuntimePreconditionEvaluator
         // wired the same way as dispatch.rs).
         let dir = tempfile::tempdir().unwrap();
@@ -8323,12 +8323,12 @@ policy:
     }
 
     // =========================================================================
-    // TCK-00377 MAJOR 2: Shell bridge policy from config test
+    // RFC-0020::REQ-0031 MAJOR 2: Shell bridge policy from config test
     // =========================================================================
 
     #[tokio::test]
     async fn test_shell_bridge_policy_from_config() {
-        // TCK-00377: ToolBrokerConfig can carry a shell_bridge_policy that
+        // RFC-0020::REQ-0031: ToolBrokerConfig can carry a shell_bridge_policy that
         // the broker uses at construction time. This proves the allowlist
         // is runtime-configurable via config.
         let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
@@ -8366,7 +8366,7 @@ policy:
 
     #[tokio::test]
     async fn test_shell_bridge_policy_from_config_denies_unlisted() {
-        // TCK-00377: Config policy that allows only "cargo" must deny "rm".
+        // RFC-0020::REQ-0031: Config policy that allows only "cargo" must deny "rm".
         let shell_policy = ShellBridgePolicy::new(vec!["cargo".to_string()], false).unwrap();
         let config = ToolBrokerConfig::default()
             .without_policy_check()
@@ -8400,7 +8400,7 @@ policy:
     }
 
     // =========================================================================
-    // Path Ratchet Integration Tests (TCK-00376)
+    // Path Ratchet Integration Tests (RFC-0020::REQ-0030)
     //
     // These tests verify that the path ratchet is integrated into the broker
     // request flow and enforces deny-default at Tier2+ when enforcement
@@ -8429,7 +8429,7 @@ policy:
         req
     }
 
-    /// TCK-00376 regression: Tier2 write request without context manifest
+    /// RFC-0020::REQ-0030 regression: Tier2 write request without context manifest
     /// MUST be denied by the path ratchet. This prevents bypass via missing
     /// context pack.
     #[tokio::test]
@@ -8479,7 +8479,7 @@ policy:
         }
     }
 
-    /// TCK-00376 regression: Tier3 read request without context manifest
+    /// RFC-0020::REQ-0030 regression: Tier3 read request without context manifest
     /// MUST be TERMINATED (not just denied) per REQ-0029.
     #[tokio::test]
     async fn test_path_ratchet_tier3_no_context_manifest_terminates() {
@@ -8522,9 +8522,9 @@ policy:
         );
     }
 
-    /// TCK-00376 / TCK-00377 regression: Tier4 write request without context
+    /// RFC-0020::REQ-0030 / RFC-0020::REQ-0031 regression: Tier4 write request without context
     /// manifest MUST be TERMINATED (not just denied) per REQ-0029.
-    /// NOTE: Originally tested Execute, but TCK-00377 unconditionally denies
+    /// NOTE: Originally tested Execute, but RFC-0020::REQ-0031 unconditionally denies
     /// raw Execute at Tier2+ via `TOOL_KIND_GUARD` before the path ratchet
     /// runs. Using Write to exercise the path ratchet directly.
     #[tokio::test]
@@ -8564,7 +8564,7 @@ policy:
         );
     }
 
-    /// TCK-00376 regression: Tier0 request without context manifest
+    /// RFC-0020::REQ-0030 regression: Tier0 request without context manifest
     /// MUST be allowed (ratchet warnings only, not denied).
     #[tokio::test]
     async fn test_path_ratchet_tier0_no_context_manifest_allowed() {
@@ -8599,7 +8599,7 @@ policy:
         );
     }
 
-    /// TCK-00376 regression: Tier1 request without context manifest
+    /// RFC-0020::REQ-0030 regression: Tier1 request without context manifest
     /// MUST be allowed (ratchet warnings only, not denied).
     #[tokio::test]
     async fn test_path_ratchet_tier1_no_context_manifest_allowed() {
@@ -8633,7 +8633,7 @@ policy:
         );
     }
 
-    /// TCK-00376 regression: Tier2 request WITH context manifest loaded
+    /// RFC-0020::REQ-0030 regression: Tier2 request WITH context manifest loaded
     /// but without runtime capsule wiring is ALLOWED (with warnings).
     /// Per REQ-0028, capsule containment is mandatory at Tier3+, not Tier2.
     /// Capsule admission is reported as Unavailable (not yet wired), but
@@ -8695,7 +8695,7 @@ policy:
         );
     }
 
-    /// TCK-00376 regression: Tier3 request WITH context manifest loaded
+    /// RFC-0020::REQ-0030 regression: Tier3 request WITH context manifest loaded
     /// but without runtime capsule wiring MUST be denied (capsule fail-closed).
     /// Per REQ-0028, capsule containment is mandatory at Tier3+.
     #[tokio::test]
@@ -8754,7 +8754,7 @@ policy:
         }
     }
 
-    /// TCK-00376 regression: Dedupe cache hit must NOT bypass path ratchet.
+    /// RFC-0020::REQ-0030 regression: Dedupe cache hit must NOT bypass path ratchet.
     ///
     /// Scenario: Prime the dedupe cache at Tier0 (allowed with warnings), then
     /// issue a Tier2 request with the same dedupe key. The Tier2 request must
@@ -8834,7 +8834,7 @@ policy:
         }
     }
 
-    /// TCK-00376 regression: Comprehensive bypass prevention test.
+    /// RFC-0020::REQ-0030 regression: Comprehensive bypass prevention test.
     /// Tests that EVERY combination of (Tier2, Tier3, Tier4) without context
     /// manifest is blocked. Tier2 is denied; Tier3+ is terminated (REQ-0029).
     /// Prevents accidental bypass reintroduction.

@@ -820,6 +820,31 @@
             "heading_level": 2
           },
           "body": "Legacy RFC directories using the YAML frame template (`00_meta.yaml`, `01_problem_and_imports.yaml`, etc.) are permitted only as HISTORICAL artifacts.\nThe migration policy is:\n\n* Convert each spine RFC to a single-file `cac.rfc_doc.v1` JSON document.\n* Add explicit supersedence relationships for every RFC removed from the spine.\n* Delete (or archive under a non-normative path) legacy templates after cutover; do not keep parallel truth.\n\nThis RFC does not prescribe the sequencing for system migrations; each system RFC includes its own migration plan.\n"
+        },
+        {
+          "type": "section",
+          "title": "Migrated Requirements (from deleted ticket/RFC traceability)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0016",
+              "title": "Documentation overhaul and RFC spine governance",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Documentation overhaul and RFC spine governance",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "These requirement nodes were migrated from deleted ticket files (TCK-NNNNN) and their associated old RFCs."
         }
       ]
     }

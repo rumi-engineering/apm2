@@ -1,5 +1,5 @@
 //! Resource governance and backpressure/drop policy for HEF Pulse Plane
-//! (RFC-0018, TCK-00303).
+//! (RFC-0018, RFC-0032::REQ-0099).
 //!
 //! This module implements resource governance for the Holonic Event Fabric
 //! (HEF) pulse subscription system. It enforces limits on subscriptions,
@@ -748,13 +748,13 @@ impl ConnectionState {
     /// preventing race conditions where multiple threads could pass the check
     /// simultaneously before any increment occurs.
     ///
-    /// # TCK-00304: Wiring Note
+    /// # RFC-0032::REQ-0100: Wiring Note
     ///
-    /// This method is called by the pulse publisher (TCK-00304) when delivering
+    /// This method is called by the pulse publisher (RFC-0032::REQ-0100) when delivering
     /// pulses to subscribers. It enforces rate limits, queue depth, and bytes
     /// in-flight limits per subscriber. Currently implemented but wiring into
-    /// the pulse delivery path is out of scope for TCK-00303 (registry only)
-    /// and will be completed in TCK-00304 (outbox + pulse publisher).
+    /// the pulse delivery path is out of scope for RFC-0032::REQ-0099 (registry only)
+    /// and will be completed in RFC-0032::REQ-0100 (outbox + pulse publisher).
     pub fn try_reserve_enqueue(&self, payload_size: usize) -> Result<(), ResourceError> {
         // Check payload size first (stateless check, no reservation needed)
         if payload_size > self.config.max_pulse_payload_bytes {

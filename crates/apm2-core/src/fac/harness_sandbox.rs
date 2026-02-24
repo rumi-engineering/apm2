@@ -7,7 +7,7 @@
 //!
 //! # Phase 1 - Schema Only
 //!
-//! This ticket (TCK-00230) defines only the schema types:
+//! This ticket (RFC-0032::REQ-0063) defines only the schema types:
 //! - [`NetworkPolicyProfile`]: Network policy profile for AAT harness
 //!   sandboxing
 //! - [`EgressRule`]: Individual egress rule defining allowed network access

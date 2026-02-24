@@ -596,40 +596,40 @@ pub enum DenialReasonCode {
     /// Fail-closed: unparseable digest cannot be used for token binding
     /// validation.
     InvalidCanonicalizerDigest,
-    /// Control-plane rate limit or quota exceeded (TCK-00568).
+    /// Control-plane rate limit or quota exceeded (RFC-0032::REQ-0219).
     ControlPlaneBudgetDenied,
     /// Job spec policy violation: disallowed `repo_id`, `bytes_backend`, or
-    /// filesystem path detected (TCK-00579).
+    /// filesystem path detected (RFC-0032::REQ-0229).
     PolicyViolation,
     /// The actuation token's policy binding does not match the admitted
-    /// policy digest (INV-PADOPT-004, TCK-00561). Workers fail-closed
+    /// policy digest (INV-PADOPT-004, RFC-0032::REQ-0214). Workers fail-closed
     /// when the policy hash is not admitted.
     PolicyAdmissionDenied,
     /// The economics profile hash from the FAC policy does not match the
     /// broker-admitted economics profile digest (INV-EADOPT-004,
-    /// TCK-00584). Workers fail-closed when the economics profile hash is
+    /// RFC-0032::REQ-0234). Workers fail-closed when the economics profile hash is
     /// not admitted.
     EconomicsAdmissionDenied,
     /// Patch content was denied by hardening validation (INV-PH-001
-    /// through INV-PH-010, TCK-00581). Path traversal, absolute paths,
+    /// through INV-PH-010, RFC-0032::REQ-0231). Path traversal, absolute paths,
     /// unsupported format, or other patch content violation detected.
     PatchHardeningDenied,
-    /// Job kind does not map to any known RFC-0028 intent (TCK-00567).
+    /// Job kind does not map to any known RFC-0028 intent (RFC-0032::REQ-0218).
     /// Fail-closed: workers deny execution when the intent cannot be
     /// derived, preventing unknown job kinds from bypassing intent-binding
     /// verification.
     UnknownJobKindIntent,
     /// Token replay detected: the nonce in the token has already been
-    /// consumed by a prior job execution (TCK-00566).
+    /// consumed by a prior job execution (RFC-0032::REQ-0217).
     TokenReplayDetected,
-    /// Token has been explicitly revoked before expiry (TCK-00566).
+    /// Token has been explicitly revoked before expiry (RFC-0032::REQ-0217).
     TokenRevoked,
     /// Queue bounds exceeded: pending job count or pending bytes would
-    /// exceed the configured `QueueBoundsPolicy` limits (TCK-00578).
+    /// exceed the configured `QueueBoundsPolicy` limits (RFC-0032::REQ-0228).
     /// Denial reason code: `queue/quota_exceeded`.
     QueueQuotaExceeded,
     /// Duplicate gates submission for a repo/SHA that already has a
-    /// completed receipt in the same push freshness window (TCK-00622 S8).
+    /// completed receipt in the same push freshness window (RFC-0032::REQ-0254 S8).
     AlreadyCompleted,
 }
 
@@ -643,20 +643,20 @@ pub struct ChannelBoundaryTrace {
     pub defect_count: u32,
     /// Bound and stringified defect classes.
     pub defect_classes: Vec<String>,
-    /// TCK-00565: Hex-encoded FAC policy hash from decoded token binding.
+    /// RFC-0032::REQ-0216: Hex-encoded FAC policy hash from decoded token binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_fac_policy_hash: Option<String>,
-    /// TCK-00565: Hex-encoded canonicalizer tuple digest from decoded token
+    /// RFC-0032::REQ-0216: Hex-encoded canonicalizer tuple digest from decoded token
     /// binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_canonicalizer_tuple_digest: Option<String>,
-    /// TCK-00565: Boundary identifier from decoded token binding.
+    /// RFC-0032::REQ-0216: Boundary identifier from decoded token binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_boundary_id: Option<String>,
-    /// TCK-00565: Issued-at tick from decoded token binding.
+    /// RFC-0032::REQ-0216: Issued-at tick from decoded token binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_issued_at_tick: Option<u64>,
-    /// TCK-00565: Expiry tick from decoded token binding.
+    /// RFC-0032::REQ-0216: Expiry tick from decoded token binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_expiry_tick: Option<u64>,
 }
@@ -671,7 +671,7 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
-    /// TCK-00532: Cost estimate (in ticks) used for this admission decision.
+    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission decision.
     /// Present when the cost model provided the estimate; absent for legacy
     /// receipts created before cost model integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -735,7 +735,7 @@ pub struct FacJobReceiptV1 {
     /// It is intentionally optional and currently not populated by the worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eio29_budget_admission: Option<BudgetAdmissionTrace>,
-    /// Stop/revoke admission trace (TCK-00587).
+    /// Stop/revoke admission trace (RFC-0032::REQ-0237).
     ///
     /// Records the explicit `stop_revoke` admission decision including which
     /// policy provisions were exercised (lane reservation, tp001 emergency
@@ -743,35 +743,35 @@ pub struct FacJobReceiptV1 {
     /// Only populated for `stop_revoke` jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_revoke_admission: Option<crate::economics::queue_admission::StopRevokeAdmissionTrace>,
-    /// Containment verification trace (TCK-00548).
+    /// Containment verification trace (RFC-0032::REQ-0203).
     ///
     /// Records whether child processes (rustc, nextest, etc.) were verified
     /// to share the same cgroup as the job unit, and whether sccache was
     /// auto-disabled due to containment failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containment: Option<super::containment::ContainmentTrace>,
-    /// RFC-0029 observed runtime cost metrics (TCK-00532).
+    /// RFC-0029 observed runtime cost metrics (RFC-0032::REQ-0188).
     ///
     /// Best-effort measurement of actual job resource consumption for
     /// post-run cost model calibration. Workers populate this from
     /// wall-clock timers and I/O accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_cost: Option<crate::economics::cost_model::ObservedJobCost>,
-    /// Sandbox hardening hash for audit (TCK-00573).
+    /// Sandbox hardening hash for audit (RFC-0032::REQ-0223).
     ///
     /// BLAKE3 hash of the `SandboxHardeningProfile` used for the job unit,
     /// formatted as `b3-256:<64hex>`. Enables audit verification that the
     /// expected hardening profile was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_hardening_hash: Option<String>,
-    /// Network policy hash for audit (TCK-00574).
+    /// Network policy hash for audit (RFC-0032::REQ-0224).
     ///
     /// BLAKE3 hash of the `NetworkPolicy` used for the job unit,
     /// formatted as `b3-256:<64hex>`. Enables audit verification that the
     /// expected network isolation posture was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_policy_hash: Option<String>,
-    /// Patch bytes backend identifier (TCK-00546).
+    /// Patch bytes backend identifier (RFC-0032::REQ-0201).
     ///
     /// Records which storage backend was used to resolve patch bytes for
     /// this job (e.g., `"apm2_cas"`, `"fac_blobs_v1"`). `None` when patch
@@ -779,45 +779,45 @@ pub struct FacJobReceiptV1 {
     /// Used by GC to route blob references to the correct pruning logic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_backend: Option<String>,
-    /// HTF time envelope stamp in nanoseconds (RFC-0016, TCK-00543).
+    /// HTF time envelope stamp in nanoseconds (RFC-0016, RFC-0032::REQ-0199).
     ///
     /// When present, this is the primary sort key for deterministic
     /// receipt ordering per RFC-0019 section 8.4. Populated by the
     /// daemon clock service when HTF is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub htf_time_envelope_ns: Option<u64>,
-    /// Node fingerprint for deterministic ordering fallback (TCK-00543).
+    /// Node fingerprint for deterministic ordering fallback (RFC-0032::REQ-0199).
     ///
     /// Same semantics as `LaneProfileV1.node_fingerprint`. Used as the
     /// second component of the fallback ordering tuple per RFC-0019
     /// section 8.4: `(monotonic_time_ns, node_fingerprint, receipt_digest)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_fingerprint: Option<String>,
-    /// Toolchain fingerprint at job execution time (TCK-00538).
+    /// Toolchain fingerprint at job execution time (RFC-0032::REQ-0194).
     ///
     /// A `b3-256:<hex>` BLAKE3 digest of the build toolchain (rustc, cargo,
     /// nextest, systemd-run versions). Changes when the underlying toolchain
     /// changes on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_fingerprint: Option<String>,
-    /// Observed cgroup usage stats for economics calibration (TCK-00572).
+    /// Observed cgroup usage stats for economics calibration (RFC-0032::REQ-0222).
     ///
     /// Best-effort measurement of actual job resource consumption from the
     /// cgroup v2 hierarchy. Individual fields may be `None` if the
     /// corresponding stat could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
-    /// CLCK continuity attestation bit for terminal commit paths (TCK-00640).
+    /// CLCK continuity attestation bit for terminal commit paths (RFC-0032::REQ-0268).
     ///
     /// When present, this must be `true` and indicates that terminal commit
     /// executed under a continuous claimed-file lock (no release/reacquire
     /// gap between claim and terminal transition).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_lock_continuity_v1: Option<bool>,
-    /// Epoch timestamp when claimed-file lock was first acquired (TCK-00640).
+    /// Epoch timestamp when claimed-file lock was first acquired (RFC-0032::REQ-0268).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_lock_acquired_at_epoch_ms: Option<u64>,
-    /// Phase where the claimed lock is released (TCK-00640).
+    /// Phase where the claimed lock is released (RFC-0032::REQ-0268).
     ///
     /// Allowed values:
     /// - `post_terminal_commit`
@@ -933,7 +933,7 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180 receipts.
         // A `0u8` presence marker is intentionally omitted when `moved_job_path`
         // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
         // because older receipts encoded without this optional field at all and
@@ -944,7 +944,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. V1 canonical bytes must remain
+        // RFC-0032::REQ-0203: Containment trace. V1 canonical bytes must remain
         // bit-for-bit compatible with historical receipts, so this keeps
         // the legacy `1u8` marker when present and omits absence markers.
         if let Some(trace) = &self.containment {
@@ -955,7 +955,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
-            // TCK-00553: sccache explicit activation attestation.
+            // RFC-0032::REQ-0208: sccache explicit activation attestation.
             bytes.push(u8::from(trace.sccache_enabled));
             if let Some(ref version) = trace.sccache_version {
                 bytes.push(1u8);
@@ -964,7 +964,7 @@ impl FacJobReceiptV1 {
             } else {
                 bytes.push(0u8);
             }
-            // TCK-00554: sccache server containment protocol attestation.
+            // RFC-0032::REQ-0209: sccache server containment protocol attestation.
             //
             // BLOCKER fix (round 4): The V1 encoding previously used `1u8`
             // as the presence marker for this sub-field, which collides with
@@ -1014,11 +1014,11 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00532: Observed job cost. V1 trailing optionals omit absence
+        // RFC-0032::REQ-0188: Observed job cost. V1 trailing optionals omit absence
         // markers for backwards compatibility with existing persisted hashes.
         Self::append_observed_cost_marker_v1(&mut bytes, self.observed_cost.as_ref());
 
-        // TCK-00573: Sandbox hardening hash. Added as an append-only trailing
+        // RFC-0032::REQ-0223: Sandbox hardening hash. Added as an append-only trailing
         // optional for V1; absence marker is omitted for hash stability.
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(3u8);
@@ -1026,7 +1026,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
-        // TCK-00574: Network policy hash. Added as an append-only trailing
+        // RFC-0032::REQ-0224: Network policy hash. Added as an append-only trailing
         // optional for V1; uses type-specific marker `5u8` for injective encoding.
         if let Some(hash) = &self.network_policy_hash {
             bytes.push(5u8);
@@ -1034,7 +1034,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
-        // TCK-00587: Stop/revoke admission trace. Added as an append-only
+        // RFC-0032::REQ-0237: Stop/revoke admission trace. Added as an append-only
         // trailing optional for V1; uses type-specific marker `7u8` for
         // injective encoding. Uses canonical JSON (JCS) via
         // `trace.canonical_bytes()` to ensure deterministic hashing
@@ -1053,7 +1053,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&canonical);
         }
 
-        // TCK-00546: Patch bytes backend identifier. Added as an append-only
+        // RFC-0032::REQ-0201: Patch bytes backend identifier. Added as an append-only
         // trailing optional for V1; uses type-specific marker `9u8` for
         // injective encoding.
         if let Some(backend) = &self.bytes_backend {
@@ -1062,8 +1062,8 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(backend.as_bytes());
         }
 
-        // TCK-00538: Toolchain fingerprint. Appended at end for backward
-        // compatibility with pre-TCK-00538 receipts. Uses type-specific
+        // RFC-0032::REQ-0194: Toolchain fingerprint. Appended at end for backward
+        // compatibility with pre-RFC-0032::REQ-0194 receipts. Uses type-specific
         // marker `10u8` for injective encoding (9u8 is taken by bytes_backend).
         if let Some(fp) = &self.toolchain_fingerprint {
             bytes.push(10u8);
@@ -1071,7 +1071,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(fp.as_bytes());
         }
 
-        // TCK-00572: Observed cgroup usage stats. Uses type-specific marker
+        // RFC-0032::REQ-0222: Observed cgroup usage stats. Uses type-specific marker
         // `11u8` for injective encoding (10u8 is taken by toolchain_fingerprint).
         // V1 trailing optional: absence is encoded by omitting bytes entirely
         // (no marker) for hash stability with historical receipts.
@@ -1089,7 +1089,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&payload);
         }
 
-        // TCK-00640: Claimed lock continuity attestation fields.
+        // RFC-0032::REQ-0268: Claimed lock continuity attestation fields.
         if let Some(flag) = self.claimed_lock_continuity_v1 {
             bytes.push(12u8);
             bytes.push(u8::from(flag));
@@ -1175,7 +1175,7 @@ impl FacJobReceiptV1 {
     /// New receipts should use v2. Existing v1 receipts remain verifiable
     /// via `canonical_bytes()`.
     ///
-    /// # V2 Schema Break (TCK-00573)
+    /// # V2 Schema Break (RFC-0032::REQ-0223)
     ///
     /// The V2 canonical format was intentionally changed from positional
     /// `0u8`/`1u8` presence markers to type-specific tagged markers
@@ -1285,7 +1285,7 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-TCK-00514 receipts.
+        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180 receipts.
         // A `0u8` presence marker is intentionally omitted when `moved_job_path`
         // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
         // because older receipts encoded without this optional field at all and
@@ -1296,7 +1296,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(path.as_bytes());
         }
 
-        // TCK-00548: Containment trace. Uses type-specific marker `2u8`
+        // RFC-0032::REQ-0203: Containment trace. Uses type-specific marker `2u8`
         // to ensure injective encoding (MAJOR-1 fix).
         if let Some(trace) = &self.containment {
             bytes.push(2u8);
@@ -1306,7 +1306,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&trace.processes_checked.to_be_bytes());
             bytes.extend_from_slice(&trace.mismatch_count.to_be_bytes());
             bytes.push(u8::from(trace.sccache_auto_disabled));
-            // TCK-00553: sccache explicit activation attestation.
+            // RFC-0032::REQ-0208: sccache explicit activation attestation.
             bytes.push(u8::from(trace.sccache_enabled));
             if let Some(ref version) = trace.sccache_version {
                 bytes.push(1u8);
@@ -1315,7 +1315,7 @@ impl FacJobReceiptV1 {
             } else {
                 bytes.push(0u8);
             }
-            // TCK-00554: sccache server containment protocol attestation.
+            // RFC-0032::REQ-0209: sccache server containment protocol attestation.
             // V2 uses the same tagged-length encoding (`0xFE + len + payload`)
             // as V1 for consistency and defense-in-depth. Although V2's outer
             // containment marker (`2u8`) already differs from observed_cost's
@@ -1349,10 +1349,10 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00532: Observed job cost with a type-specific marker in v2.
+        // RFC-0032::REQ-0188: Observed job cost with a type-specific marker in v2.
         Self::append_observed_cost_marker_v2(&mut bytes, self.observed_cost.as_ref());
 
-        // TCK-00573: Sandbox hardening hash. Uses type-specific marker
+        // RFC-0032::REQ-0223: Sandbox hardening hash. Uses type-specific marker
         // `3u8` to ensure injective encoding (MAJOR-1 fix).
         if let Some(hash) = &self.sandbox_hardening_hash {
             bytes.push(3u8);
@@ -1360,7 +1360,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
-        // TCK-00574: Network policy hash. Uses type-specific marker
+        // RFC-0032::REQ-0224: Network policy hash. Uses type-specific marker
         // `5u8` to ensure injective encoding.
         if let Some(hash) = &self.network_policy_hash {
             bytes.push(5u8);
@@ -1368,7 +1368,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
-        // TCK-00543: HTF time envelope stamp. Uses type-specific marker
+        // RFC-0032::REQ-0199: HTF time envelope stamp. Uses type-specific marker
         // `6u8` to ensure injective encoding. Absence is omitted for
         // backwards compatibility with existing V2 receipts.
         if let Some(ns) = self.htf_time_envelope_ns {
@@ -1376,7 +1376,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&ns.to_be_bytes());
         }
 
-        // TCK-00543: Node fingerprint. Uses type-specific marker `7u8`
+        // RFC-0032::REQ-0199: Node fingerprint. Uses type-specific marker `7u8`
         // to ensure injective encoding.
         if let Some(fp) = &self.node_fingerprint {
             bytes.push(7u8);
@@ -1384,7 +1384,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(fp.as_bytes());
         }
 
-        // TCK-00587: Stop/revoke admission trace. Uses type-specific
+        // RFC-0032::REQ-0237: Stop/revoke admission trace. Uses type-specific
         // marker `8u8` for injective encoding (V2 only -- `7u8` is
         // already allocated to node_fingerprint in V2). Uses canonical
         // JSON (JCS) via `trace.canonical_bytes()` to ensure deterministic
@@ -1398,7 +1398,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&canonical);
         }
 
-        // TCK-00546: Patch bytes backend identifier. Uses type-specific
+        // RFC-0032::REQ-0201: Patch bytes backend identifier. Uses type-specific
         // marker `9u8` for injective encoding. Absence is omitted for
         // backwards compatibility with existing V2 receipts.
         if let Some(backend) = &self.bytes_backend {
@@ -1407,7 +1407,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(backend.as_bytes());
         }
 
-        // TCK-00538: Toolchain fingerprint. Uses type-specific marker
+        // RFC-0032::REQ-0194: Toolchain fingerprint. Uses type-specific marker
         // `10u8` for injective encoding (9u8 is taken by bytes_backend).
         if let Some(fp) = &self.toolchain_fingerprint {
             bytes.push(10u8);
@@ -1415,7 +1415,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(fp.as_bytes());
         }
 
-        // TCK-00572: Observed cgroup usage stats. Uses type-specific marker
+        // RFC-0032::REQ-0222: Observed cgroup usage stats. Uses type-specific marker
         // `11u8` for injective encoding (10u8 is taken by toolchain_fingerprint).
         // Absence is omitted for backwards compatibility with existing V2 receipts.
         if let Some(ref usage) = self.observed_usage {
@@ -1431,7 +1431,7 @@ impl FacJobReceiptV1 {
             bytes.extend_from_slice(&payload);
         }
 
-        // TCK-00640: Claimed lock continuity attestation fields.
+        // RFC-0032::REQ-0268: Claimed lock continuity attestation fields.
         if let Some(flag) = self.claimed_lock_continuity_v1 {
             bytes.push(12u8);
             bytes.push(u8::from(flag));
@@ -1558,7 +1558,7 @@ impl FacJobReceiptV1 {
                 "content_hash must be 'b3-256:<64 hex>'".to_string(),
             ));
         }
-        // TCK-00543: Validate node_fingerprint length bound.
+        // RFC-0032::REQ-0199: Validate node_fingerprint length bound.
         if let Some(fp) = &self.node_fingerprint {
             if fp.len() > MAX_STRING_LENGTH {
                 return Err(FacJobReceiptError::StringTooLong {
@@ -1568,7 +1568,7 @@ impl FacJobReceiptV1 {
                 });
             }
         }
-        // TCK-00546: Validate bytes_backend length bound.
+        // RFC-0032::REQ-0201: Validate bytes_backend length bound.
         if let Some(backend) = &self.bytes_backend {
             if backend.len() > MAX_STRING_LENGTH {
                 return Err(FacJobReceiptError::StringTooLong {
@@ -1660,7 +1660,7 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00548: Validate containment trace bounds to prevent
+        // RFC-0032::REQ-0203: Validate containment trace bounds to prevent
         // memory exhaustion via oversized cgroup_path (MAJOR-1).
         if let Some(trace) = &self.containment {
             if trace.cgroup_path.len() > super::containment::MAX_CGROUP_PATH_LENGTH {
@@ -1671,7 +1671,7 @@ impl FacJobReceiptV1 {
                 });
             }
 
-            // TCK-00554 fix-round-4 MINOR: Defense-in-depth validation for
+            // RFC-0032::REQ-0209 fix-round-4 MINOR: Defense-in-depth validation for
             // sccache containment fields. These are truncated at creation time,
             // but we validate again during deserialization to catch tampering or
             // corruption.
@@ -1715,7 +1715,7 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00587: Validate stop_revoke_admission trace bounds.
+        // RFC-0032::REQ-0237: Validate stop_revoke_admission trace bounds.
         // The verdict field is bounded at deserialization by deser_deny_reason,
         // but validate here for defensive consistency with other trace fields.
         if let Some(trace) = &self.stop_revoke_admission {
@@ -1728,7 +1728,7 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00573: Validate sandbox hardening hash format if present.
+        // RFC-0032::REQ-0223: Validate sandbox hardening hash format if present.
         if let Some(hash) = &self.sandbox_hardening_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(FacJobReceiptError::InvalidData(
@@ -1738,7 +1738,7 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00574: Validate network policy hash format if present.
+        // RFC-0032::REQ-0224: Validate network policy hash format if present.
         if let Some(hash) = &self.network_policy_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(FacJobReceiptError::InvalidData(
@@ -1748,7 +1748,7 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00538: Validate toolchain fingerprint format and length.
+        // RFC-0032::REQ-0194: Validate toolchain fingerprint format and length.
         if let Some(ref fp) = self.toolchain_fingerprint {
             if fp.len() > MAX_STRING_LENGTH {
                 return Err(FacJobReceiptError::StringTooLong {
@@ -1764,14 +1764,14 @@ impl FacJobReceiptV1 {
             }
         }
 
-        // TCK-00572: Validate observed_usage bounds (fail-closed).
+        // RFC-0032::REQ-0222: Validate observed_usage bounds (fail-closed).
         if let Some(ref usage) = self.observed_usage {
             if let Err(e) = usage.validate() {
                 return Err(FacJobReceiptError::InvalidData(e.to_string()));
             }
         }
 
-        // TCK-00640: Validate claimed-lock continuity attestation fields.
+        // RFC-0032::REQ-0268: Validate claimed-lock continuity attestation fields.
         if let Some(flag) = self.claimed_lock_continuity_v1 {
             if !flag {
                 return Err(FacJobReceiptError::InvalidData(
@@ -1944,7 +1944,7 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets the stop/revoke admission trace (TCK-00587).
+    /// Sets the stop/revoke admission trace (RFC-0032::REQ-0237).
     #[must_use]
     pub fn stop_revoke_admission(
         mut self,
@@ -1954,14 +1954,14 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets the containment verification trace (TCK-00548).
+    /// Sets the containment verification trace (RFC-0032::REQ-0203).
     #[must_use]
     pub fn containment(mut self, trace: super::containment::ContainmentTrace) -> Self {
         self.containment = Some(trace);
         self
     }
 
-    /// Sets observed runtime cost metrics (TCK-00532).
+    /// Sets observed runtime cost metrics (RFC-0032::REQ-0188).
     #[must_use]
     pub const fn observed_cost(
         mut self,
@@ -1971,70 +1971,70 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets the sandbox hardening hash for audit (TCK-00573).
+    /// Sets the sandbox hardening hash for audit (RFC-0032::REQ-0223).
     #[must_use]
     pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
         self.sandbox_hardening_hash = Some(hash.into());
         self
     }
 
-    /// Sets the network policy hash for audit (TCK-00574).
+    /// Sets the network policy hash for audit (RFC-0032::REQ-0224).
     #[must_use]
     pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
         self.network_policy_hash = Some(hash.into());
         self
     }
 
-    /// Sets the patch bytes backend identifier (TCK-00546).
+    /// Sets the patch bytes backend identifier (RFC-0032::REQ-0201).
     #[must_use]
     pub fn bytes_backend(mut self, backend: impl Into<String>) -> Self {
         self.bytes_backend = Some(backend.into());
         self
     }
 
-    /// Sets the HTF time envelope stamp in nanoseconds (TCK-00543).
+    /// Sets the HTF time envelope stamp in nanoseconds (RFC-0032::REQ-0199).
     #[must_use]
     pub const fn htf_time_envelope_ns(mut self, ns: u64) -> Self {
         self.htf_time_envelope_ns = Some(ns);
         self
     }
 
-    /// Sets the node fingerprint for deterministic ordering (TCK-00543).
+    /// Sets the node fingerprint for deterministic ordering (RFC-0032::REQ-0199).
     #[must_use]
     pub fn node_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.node_fingerprint = Some(fingerprint.into());
         self
     }
 
-    /// Sets the toolchain fingerprint (TCK-00538).
+    /// Sets the toolchain fingerprint (RFC-0032::REQ-0194).
     #[must_use]
     pub fn toolchain_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.toolchain_fingerprint = Some(fingerprint.into());
         self
     }
 
-    /// Sets observed cgroup usage stats (TCK-00572).
+    /// Sets observed cgroup usage stats (RFC-0032::REQ-0222).
     #[must_use]
     pub const fn observed_usage(mut self, usage: super::cgroup_stats::ObservedCgroupUsage) -> Self {
         self.observed_usage = Some(usage);
         self
     }
 
-    /// Sets claimed-lock continuity attestation flag (TCK-00640).
+    /// Sets claimed-lock continuity attestation flag (RFC-0032::REQ-0268).
     #[must_use]
     pub const fn claimed_lock_continuity_v1(mut self, continuity: bool) -> Self {
         self.claimed_lock_continuity_v1 = Some(continuity);
         self
     }
 
-    /// Sets claim-lock acquisition timestamp in epoch milliseconds (TCK-00640).
+    /// Sets claim-lock acquisition timestamp in epoch milliseconds (RFC-0032::REQ-0268).
     #[must_use]
     pub const fn claimed_lock_acquired_at_epoch_ms(mut self, epoch_ms: u64) -> Self {
         self.claimed_lock_acquired_at_epoch_ms = Some(epoch_ms);
         self
     }
 
-    /// Sets claim-lock release phase marker (TCK-00640).
+    /// Sets claim-lock release phase marker (RFC-0032::REQ-0268).
     #[must_use]
     pub fn claimed_lock_release_phase(mut self, phase: impl Into<String>) -> Self {
         self.claimed_lock_release_phase = Some(phase.into());
@@ -2231,7 +2231,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00573: Validate sandbox hardening hash format.
+        // RFC-0032::REQ-0223: Validate sandbox hardening hash format.
         if let Some(hash) = &self.sandbox_hardening_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(FacJobReceiptError::InvalidData(
@@ -2241,7 +2241,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00574: Validate network policy hash format.
+        // RFC-0032::REQ-0224: Validate network policy hash format.
         if let Some(hash) = &self.network_policy_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(FacJobReceiptError::InvalidData(
@@ -2251,7 +2251,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00543: Validate node_fingerprint length bound.
+        // RFC-0032::REQ-0199: Validate node_fingerprint length bound.
         if let Some(fp) = &self.node_fingerprint {
             if fp.len() > MAX_STRING_LENGTH {
                 return Err(FacJobReceiptError::StringTooLong {
@@ -2262,7 +2262,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00538: Validate toolchain_fingerprint format if present.
+        // RFC-0032::REQ-0194: Validate toolchain_fingerprint format if present.
         if let Some(ref fp) = self.toolchain_fingerprint {
             if fp.len() > MAX_STRING_LENGTH {
                 return Err(FacJobReceiptError::StringTooLong {
@@ -2278,7 +2278,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00572: Validate observed_usage bounds on the builder path
+        // RFC-0032::REQ-0222: Validate observed_usage bounds on the builder path
         // (INV-CGSTAT-004 fail-closed). This prevents constructing receipts
         // with out-of-bounds cgroup usage values via the builder API.
         if let Some(ref usage) = self.observed_usage {
@@ -2287,7 +2287,7 @@ impl FacJobReceiptV1Builder {
             }
         }
 
-        // TCK-00640: Validate claimed-lock continuity attestation fields.
+        // RFC-0032::REQ-0268: Validate claimed-lock continuity attestation fields.
         if let Some(flag) = self.claimed_lock_continuity_v1 {
             if !flag {
                 return Err(FacJobReceiptError::InvalidData(
@@ -2483,7 +2483,7 @@ pub fn persist_content_addressed_receipt(
     fs::rename(&temp_path, &final_path)
         .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
 
-    // Best-effort incremental index update (TCK-00560).
+    // Best-effort incremental index update (RFC-0032::REQ-0213).
     // Index is non-authoritative cache; failure here does not affect
     // receipt persistence correctness. On failure, delete the stale index
     // to force a rebuild on next read, ensuring consistency.
@@ -2529,7 +2529,7 @@ pub fn persist_content_addressed_receipt_v2(
     fs::rename(&temp_path, &final_path)
         .map_err(|e| format!("cannot move receipt to {}: {e}", final_path.display()))?;
 
-    // Best-effort incremental index update (TCK-00560).
+    // Best-effort incremental index update (RFC-0032::REQ-0213).
     // On failure, delete the stale index to force a rebuild on next read.
     if let Err(e) = super::receipt_index::ReceiptIndexV1::incremental_update(
         fac_receipts_dir,
@@ -2610,7 +2610,7 @@ pub struct GateReceipt {
     pub evidence_bundle_hash: [u8; 32],
 
     /// BLAKE3 digest of the job spec that authorized this gate execution
-    /// (TCK-00512). Present when the gate was triggered from a
+    /// (RFC-0032::REQ-0179). Present when the gate was triggered from a
     /// `FacJobSpecV1` queue item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_spec_digest: Option<String>,
@@ -2620,10 +2620,10 @@ pub struct GateReceipt {
     /// This is the authoritative verdict field. The orchestrator uses this
     /// field directly rather than deriving the verdict from hash inspection.
     /// Receipts without an explicit verdict are rejected at the admission
-    /// boundary (TCK-00388 Quality BLOCKER 2).
+    /// boundary (RFC-0032::REQ-0142 Quality BLOCKER 2).
     pub passed: bool,
 
-    /// Sandbox hardening hash for audit (TCK-00573, MAJOR-2).
+    /// Sandbox hardening hash for audit (RFC-0032::REQ-0223, MAJOR-2).
     ///
     /// BLAKE3 hash of the `SandboxHardeningProfile` used for the gate
     /// execution environment, formatted as `b3-256:<64hex>`. Enables audit
@@ -2631,7 +2631,7 @@ pub struct GateReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_hardening_hash: Option<String>,
 
-    /// Network policy hash for audit (TCK-00574).
+    /// Network policy hash for audit (RFC-0032::REQ-0224).
     ///
     /// BLAKE3 hash of the `NetworkPolicy` used for the gate execution
     /// environment, formatted as `b3-256:<64hex>`. Enables audit verification
@@ -2722,7 +2722,7 @@ impl GateReceipt {
         // 12. passed (1 byte: 0 = false, 1 = true)
         bytes.push(u8::from(self.passed));
 
-        // 13. sandbox_hardening_hash (optional, TCK-00573 MAJOR-2)
+        // 13. sandbox_hardening_hash (optional, RFC-0032::REQ-0223 MAJOR-2)
         // Uses type-specific marker `4u8` to ensure injective encoding
         // across all optional trailing fields in GateReceipt.
         if let Some(hash) = self.sandbox_hardening_hash.as_ref() {
@@ -2731,7 +2731,7 @@ impl GateReceipt {
             bytes.extend_from_slice(hash.as_bytes());
         }
 
-        // 14. network_policy_hash (optional, TCK-00574)
+        // 14. network_policy_hash (optional, RFC-0032::REQ-0224)
         // Uses type-specific marker `6u8` to ensure injective encoding
         // across all optional trailing fields in GateReceipt.
         if let Some(hash) = self.network_policy_hash.as_ref() {
@@ -2960,21 +2960,21 @@ impl GateReceiptBuilder {
     ///
     /// This is the authoritative verdict field that the orchestrator reads
     /// directly. Receipts MUST declare their verdict explicitly rather than
-    /// relying on hash-based inference (TCK-00388 Quality BLOCKER 2).
+    /// relying on hash-based inference (RFC-0032::REQ-0142 Quality BLOCKER 2).
     #[must_use]
     pub const fn passed(mut self, passed: bool) -> Self {
         self.passed = Some(passed);
         self
     }
 
-    /// Sets the sandbox hardening hash for audit (TCK-00573 MAJOR-2).
+    /// Sets the sandbox hardening hash for audit (RFC-0032::REQ-0223 MAJOR-2).
     #[must_use]
     pub fn sandbox_hardening_hash(mut self, hash: impl Into<String>) -> Self {
         self.sandbox_hardening_hash = Some(hash.into());
         self
     }
 
-    /// Sets the network policy hash for audit (TCK-00574).
+    /// Sets the network policy hash for audit (RFC-0032::REQ-0224).
     #[must_use]
     pub fn network_policy_hash(mut self, hash: impl Into<String>) -> Self {
         self.network_policy_hash = Some(hash.into());
@@ -3074,7 +3074,7 @@ impl GateReceiptBuilder {
             });
         }
 
-        // TCK-00573 MAJOR-2: Validate sandbox_hardening_hash format if set.
+        // RFC-0032::REQ-0223 MAJOR-2: Validate sandbox_hardening_hash format if set.
         if let Some(ref hash) = self.sandbox_hardening_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(ReceiptError::InvalidData(format!(
@@ -3084,7 +3084,7 @@ impl GateReceiptBuilder {
             }
         }
 
-        // TCK-00574: Validate network_policy_hash format if set.
+        // RFC-0032::REQ-0224: Validate network_policy_hash format if set.
         if let Some(ref hash) = self.network_policy_hash {
             if !is_strict_b3_256_digest(hash) {
                 return Err(ReceiptError::InvalidData(format!(
@@ -3255,7 +3255,7 @@ impl From<GateReceipt> for GateReceiptProto {
             network_policy_hash: receipt.network_policy_hash,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
             passed: receipt.passed,
         }
@@ -4482,7 +4482,7 @@ pub mod tests {
         assert!(receipt.validate().is_ok());
     }
 
-    // ── TCK-00554 fix-round-4: defense-in-depth validation tests ──
+    // ── RFC-0032::REQ-0209 fix-round-4: defense-in-depth validation tests ──
 
     #[test]
     fn test_validate_rejects_oversized_sccache_version() {
@@ -4734,7 +4734,7 @@ pub mod tests {
     #[test]
     fn test_canonical_bytes_v1_backward_compatible_without_containment() {
         // Verify that a receipt without containment produces the same
-        // canonical bytes as before the TCK-00548 change.
+        // canonical bytes as before the RFC-0032::REQ-0203 change.
         let r1 = make_valid_receipt();
         assert!(r1.containment.is_none());
         let bytes1 = r1.canonical_bytes();
@@ -4748,7 +4748,7 @@ pub mod tests {
         );
     }
 
-    /// TCK-00554 MAJOR-1 fix: V1 canonical bytes must NOT emit an absence
+    /// RFC-0032::REQ-0209 MAJOR-1 fix: V1 canonical bytes must NOT emit an absence
     /// marker (0u8) when `sccache_server_containment` is `None`. Historical
     /// receipts signed before this field was added do not contain it, so
     /// adding a trailing `0u8` would change their content hash and break
@@ -4812,7 +4812,7 @@ pub mod tests {
         // containment data).
     }
 
-    /// TCK-00554 MAJOR-1 fix (round 2): Option<bool> injectivity —
+    /// RFC-0032::REQ-0209 MAJOR-1 fix (round 2): Option<bool> injectivity —
     /// `preexisting_server_in_cgroup` must produce distinct canonical bytes
     /// for None, Some(false), and Some(true).
     #[test]
@@ -4874,7 +4874,7 @@ pub mod tests {
         );
     }
 
-    /// TCK-00554 MAJOR-1 fix (round 2): PID fields must be hash-bound.
+    /// RFC-0032::REQ-0209 MAJOR-1 fix (round 2): PID fields must be hash-bound.
     /// Changing `preexisting_server_pid` or `started_server_pid` must
     /// produce distinct canonical bytes.
     #[test]
@@ -4938,7 +4938,7 @@ pub mod tests {
         );
     }
 
-    /// TCK-00554 MAJOR-1 fix (round 2): `reason` field must be
+    /// RFC-0032::REQ-0209 MAJOR-1 fix (round 2): `reason` field must be
     /// hash-bound. Changing the reason string must produce distinct
     /// canonical bytes.
     #[test]
@@ -5021,7 +5021,7 @@ pub mod tests {
         );
     }
 
-    // ── Sandbox hardening hash receipt binding (TCK-00573) ──
+    // ── Sandbox hardening hash receipt binding (RFC-0032::REQ-0223) ──
 
     #[test]
     fn test_sandbox_hardening_hash_included_in_persisted_receipt() {
@@ -5454,7 +5454,7 @@ pub mod tests {
 
     #[test]
     fn queue_admission_trace_cost_estimate_ticks_round_trip() {
-        // TCK-00532: Verify that cost_estimate_ticks is preserved through
+        // RFC-0032::REQ-0188: Verify that cost_estimate_ticks is preserved through
         // serde round-trip for audit trail completeness.
         let trace_with = QueueAdmissionTrace {
             verdict: "allow".to_string(),
@@ -5476,7 +5476,7 @@ pub mod tests {
         );
     }
 
-    // ── TCK-00581: PatchHardeningDenied denial reason code ──
+    // ── RFC-0032::REQ-0231: PatchHardeningDenied denial reason code ──
 
     #[test]
     fn patch_hardening_denied_reason_builds_valid_receipt() {
@@ -5516,7 +5516,7 @@ pub mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TCK-00572 regression: observed_usage bounds enforced on builder path
+    // RFC-0032::REQ-0222 regression: observed_usage bounds enforced on builder path
     // -------------------------------------------------------------------------
 
     #[test]
@@ -5656,7 +5656,7 @@ pub mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TCK-00571: observed_usage bounds enforced on deserialization path
+    // RFC-0032::REQ-0221: observed_usage bounds enforced on deserialization path
     // -------------------------------------------------------------------------
 
     #[test]

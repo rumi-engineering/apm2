@@ -4,7 +4,7 @@
 //! inputs into systemd-style execution guardrails (resource limits + timeouts +
 //! kill mode + sandbox hardening + network policy).
 //!
-//! ## Sandbox Hardening (TCK-00573)
+//! ## Sandbox Hardening (RFC-0032::REQ-0223)
 //!
 //! `SandboxHardeningProfile` defines systemd security directives that reduce
 //! the attack surface of transient units used for FAC job execution. The
@@ -23,7 +23,7 @@
 //! - `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` — restrict socket types
 //! - `SystemCallArchitectures=native` — deny non-native syscall ABIs
 //!
-//! ## Network Policy (TCK-00574)
+//! ## Network Policy (RFC-0032::REQ-0224)
 //!
 //! `NetworkPolicy` controls network access for FAC job units. The default
 //! posture is **deny** (`PrivateNetwork=yes`), which isolates the unit in
@@ -46,7 +46,7 @@ use crate::fac::lane::LaneProfileV1;
 /// bound).
 const MAX_ADDRESS_FAMILIES: usize = 16;
 
-/// Sandbox hardening profile for systemd transient units (TCK-00573).
+/// Sandbox hardening profile for systemd transient units (RFC-0032::REQ-0223).
 ///
 /// Each field corresponds to a systemd security directive. The default
 /// profile enables all hardening directives with safe defaults that
@@ -334,7 +334,7 @@ impl SandboxHardeningProfile {
     }
 }
 
-/// Network access policy for FAC job units (TCK-00574).
+/// Network access policy for FAC job units (RFC-0032::REQ-0224).
 ///
 /// Controls whether a transient systemd unit can access the network.
 /// The default posture is **deny** (`PrivateNetwork=yes`), which isolates
@@ -474,7 +474,7 @@ impl NetworkPolicy {
     }
 }
 
-/// Resolve the network policy for a given job kind (TCK-00574).
+/// Resolve the network policy for a given job kind (RFC-0032::REQ-0224).
 ///
 /// # Default Posture
 ///
@@ -524,9 +524,9 @@ pub struct SystemdUnitProperties {
     pub runtime_max_sec: u64,
     /// How systemd stops children (`KillMode`).
     pub kill_mode: String,
-    /// Sandbox hardening profile (TCK-00573).
+    /// Sandbox hardening profile (RFC-0032::REQ-0223).
     pub sandbox_hardening: SandboxHardeningProfile,
-    /// Network access policy (TCK-00574).
+    /// Network access policy (RFC-0032::REQ-0224).
     pub network_policy: NetworkPolicy,
 }
 
@@ -665,7 +665,7 @@ impl SystemdUnitProperties {
                 props.push((key.to_string(), value.to_string()));
             }
         }
-        // Append network policy directives as key=value pairs (TCK-00574).
+        // Append network policy directives as key=value pairs (RFC-0032::REQ-0224).
         for prop_str in self.network_policy.to_property_strings() {
             if let Some((key, value)) = prop_str.split_once('=') {
                 props.push((key.to_string(), value.to_string()));
@@ -762,7 +762,7 @@ mod tests {
         assert!(directives.contains("MemoryMax=51539607552"));
         assert!(directives.contains("TasksMax=1536"));
         assert!(directives.contains("KillMode=control-group"));
-        // Sandbox hardening directives (TCK-00573).
+        // Sandbox hardening directives (RFC-0032::REQ-0223).
         assert!(directives.contains("NoNewPrivileges=yes"));
         assert!(directives.contains("PrivateTmp=yes"));
         assert!(directives.contains("ProtectControlGroups=yes"));
@@ -773,7 +773,7 @@ mod tests {
         assert!(directives.contains("RestrictRealtime=yes"));
         assert!(directives.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"));
         assert!(directives.contains("SystemCallArchitectures=native"));
-        // Network policy directives (TCK-00574) — deny posture.
+        // Network policy directives (RFC-0032::REQ-0224) — deny posture.
         assert!(
             directives.contains("PrivateNetwork=yes"),
             "PrivateNetwork=yes must be present when network is denied"
@@ -803,7 +803,7 @@ mod tests {
         // Core resource properties.
         assert!(dbus_props.contains(&("CPUQuota".to_string(), "200%".to_string())));
         assert!(dbus_props.contains(&("KillMode".to_string(), "control-group".to_string())));
-        // Sandbox hardening (TCK-00573).
+        // Sandbox hardening (RFC-0032::REQ-0223).
         assert!(
             dbus_props.contains(&("NoNewPrivileges".to_string(), "yes".to_string())),
             "NoNewPrivileges missing from D-Bus properties"
@@ -820,7 +820,7 @@ mod tests {
             dbus_props.contains(&("SystemCallArchitectures".to_string(), "native".to_string())),
             "SystemCallArchitectures missing from D-Bus properties"
         );
-        // Network policy (TCK-00574) — deny posture.
+        // Network policy (RFC-0032::REQ-0224) — deny posture.
         assert!(
             dbus_props.contains(&("PrivateNetwork".to_string(), "yes".to_string())),
             "PrivateNetwork missing from D-Bus properties when network denied"
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(max_properties.runtime_max_sec, u64::MAX);
     }
 
-    // ── Sandbox hardening profile tests (TCK-00573) ──
+    // ── Sandbox hardening profile tests (RFC-0032::REQ-0223) ──
 
     #[test]
     fn default_hardening_profile_enables_all_directives() {
@@ -1123,7 +1123,7 @@ mod tests {
         assert_eq!(properties.cpu_quota_percent, 200);
     }
 
-    // ── Network policy tests (TCK-00574) ──
+    // ── Network policy tests (RFC-0032::REQ-0224) ──
 
     #[test]
     fn network_policy_default_is_deny() {
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn network_policy_user_mode_deny_emits_restrict_address_families() {
-        // TCK-00574: deny policy emits RestrictAddressFamilies=AF_UNIX as
+        // RFC-0032::REQ-0224: deny policy emits RestrictAddressFamilies=AF_UNIX as
         // partial mitigation when running without root (user-mode). This
         // blocks AF_INET/AF_INET6 socket creation even without
         // PrivateNetwork, providing defence-in-depth.
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(NetworkPolicy::allow().enabled_directive_count(), 0);
     }
 
-    // ── resolve_network_policy tests (TCK-00574) ──
+    // ── resolve_network_policy tests (RFC-0032::REQ-0224) ──
 
     #[test]
     fn resolve_network_policy_gates_deny() {

@@ -886,6 +886,661 @@
             "heading_level": 2
           },
           "body": "Primary implementation surfaces:\n\n* CAS: `crates/apm2-daemon/src/cas/*`\n* Filesystem hardening: `crates/apm2-daemon/src/fs_safe.rs`\n* Ledger schema + storage: `crates/apm2-core/src/ledger/schema.sql`, `crates/apm2-core/src/ledger/storage.rs`\n* Daemon migration + freeze guard: `crates/apm2-daemon/src/ledger.rs`\n* Cryptographic primitives: `crates/apm2-core/src/crypto/*`\n"
+        },
+        {
+          "type": "section",
+          "title": "Migrated Requirements (from deleted ticket/RFC traceability)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0026",
+              "title": "Implement EpisodeEnvelope type with canonicalization",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement EpisodeEnvelope type with canonicalization",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0027",
+              "title": "Implement EpisodeRuntime with state machine",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement EpisodeRuntime with state machine",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0028",
+              "title": "Implement PTY spawning and output capture",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement PTY spawning and output capture",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0029",
+              "title": "Implement basic HarnessAdapter trait and registry",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement basic HarnessAdapter trait and registry",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0030",
+              "title": "Implement capability manifest and validation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement capability manifest and validation",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0031",
+              "title": "Implement ToolBroker with dedupe cache",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement ToolBroker with dedupe cache",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0032",
+              "title": "Implement tool execution and budget charging",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement tool execution and budget charging",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0033",
+              "title": "Implement tool receipt generation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement tool receipt generation",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0034",
+              "title": "Implement receipt signing and verification",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement receipt signing and verification",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0035",
+              "title": "Implement TelemetryCollector and frame streaming",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement TelemetryCollector and frame streaming",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0036",
+              "title": "Implement flight recorder with ring buffers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement flight recorder with ring buffers",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0037",
+              "title": "Implement evidence TTL and pinning",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement evidence TTL and pinning",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0038",
+              "title": "Implement evidence compaction",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement evidence compaction",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0039",
+              "title": "Implement Claude Code harness adapter",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement Claude Code harness adapter",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0040",
+              "title": "Implement apm2 episode CLI commands",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement apm2 episode CLI commands",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0041",
+              "title": "Implement E2E lifecycle and budget tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement E2E lifecycle and budget tests",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0042",
+              "title": "Implement E2E tool and telemetry tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement E2E tool and telemetry tests",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0043",
+              "title": "Implement E2E evidence and receipt verification tests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement E2E evidence and receipt verification tests",
+                "domain": [
+                  "episode_daemon"
+                ],
+                "migrated_from": "RFC-0013"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0044",
+              "title": "Extract LedgerBackend Trait from Existing Ledger",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Extract LedgerBackend Trait from Existing Ledger",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0045",
+              "title": "Define SchemaRegistry Trait and InMemory Implementation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Define SchemaRegistry Trait and InMemory Implementation",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0046",
+              "title": "Schema Extension for Consensus Columns",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Schema Extension for Consensus Columns",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0047",
+              "title": "BFT Library Evaluation Spike",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BFT Library Evaluation Spike",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0048",
+              "title": "BFT State Machine Core",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BFT State Machine Core",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0049",
+              "title": "BFT Network Message Handlers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BFT Network Message Handlers",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0050",
+              "title": "BFT LedgerBackend Integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BFT LedgerBackend Integration",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0051",
+              "title": "Quorum Certificate Generation and Verification",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Quorum Certificate Generation and Verification",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0052",
+              "title": "Anti-Entropy Gossip with Merkle Trees",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Anti-Entropy Gossip with Merkle Trees",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0053",
+              "title": "Operational Monitoring and Alerting",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Operational Monitoring and Alerting",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0054",
+              "title": "Integrate Schema Validation into Append Path",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Integrate Schema Validation into Append Path",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0055",
+              "title": "Leader-Based Replication (Basic)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Leader-Based Replication (Basic)",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0056",
+              "title": "Byzantine Equivocation Detection",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Byzantine Equivocation Detection",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0057",
+              "title": "HLC-Based CRDT Merge Operators",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HLC-Based CRDT Merge Operators",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0058",
+              "title": "StrictlyOrderedEvidence and Gate Predicates",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "StrictlyOrderedEvidence and Gate Predicates",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0059",
+              "title": "Cross-Node Capability Verification Integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Cross-Node Capability Verification Integration",
+                "domain": [
+                  "bft_consensus"
+                ],
+                "migrated_from": "RFC-0014"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0060",
+              "title": "RFC-0029 REQ-0002 digest-first selector closure and deterministic replay zoom-in",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0029 REQ-0002 digest-first selector closure and deterministic replay zoom-in",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0061",
+              "title": "RFC-0029 REQ-0003 verification amortization and proof-cache discipline",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC-0029 REQ-0003 verification amortization and proof-cache discipline",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0062",
+              "title": "Projection intent schema and durable buffer for economics-gated admission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Projection intent schema and durable buffer for economics-gated admission",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0063",
+              "title": "Wire economics admission gate into projection worker pre-projection path",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Wire economics admission gate into projection worker pre-projection path",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0064",
+              "title": "Projection receipt format bridge for economics gate compatibility",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Projection receipt format bridge for economics gate compatibility",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0065",
+              "title": "Continuity profile and sink snapshot resolution for economics gate input assembly",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Continuity profile and sink snapshot resolution for economics gate input assembly",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0066",
+              "title": "Deferred replay worker for projection intent buffer drain after outage recovery",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Deferred replay worker for projection intent buffer drain after outage recovery",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0067",
+              "title": "End-to-end integration tests for economics-gated projection pipeline",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "End-to-end integration tests for economics-gated projection pipeline",
+                "domain": [
+                  "projection_economics"
+                ],
+                "migrated_from": "RFC-0029"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0068",
+              "title": "Consensus runbook delivery",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Consensus runbook delivery",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "These requirement nodes were migrated from deleted ticket files (TCK-NNNNN) and their associated old RFCs. Each node preserves the original ticket title as the requirement statement."
         }
       ]
     }

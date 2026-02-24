@@ -36,9 +36,9 @@
 //!     [0x33; 32], // blocked_log_hash
 //!     [0x44; 32], // time_envelope_ref hash
 //!     "recorder-001".to_string(),
-//!     Some([0x55; 32]), // capability_manifest_hash (TCK-00326, optional)
-//!     Some([0x66; 32]), // context_pack_hash (TCK-00326, optional)
-//!     vec![0x77; 32],   // role_spec_hash (TCK-00448, optional for backward compatibility)
+//!     Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119, optional)
+//!     Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119, optional)
+//!     vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169, optional for backward compatibility)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -134,31 +134,31 @@ pub enum ReasonCode {
     PolicyDenied,
     /// Context miss detected.
     ContextMiss,
-    /// View commitment missing or invalid (TCK-00325).
+    /// View commitment missing or invalid (RFC-0032::REQ-0118).
     ///
     /// This code is emitted when the view commitment hash is missing from the
     /// review artifacts. Per SEC-CTRL-FAC-0015, review outcomes MUST bind to
     /// a verifiable view commitment. Missing this binding is a hard failure.
     MissingViewCommitment,
-    /// Context pack not found in CAS (TCK-00326).
+    /// Context pack not found in CAS (RFC-0032::REQ-0119).
     ContextPackMissing,
-    /// Context pack seal verification failed (TCK-00326).
+    /// Context pack seal verification failed (RFC-0032::REQ-0119).
     ContextPackInvalid,
-    /// Agent adapter profile is misconfigured (TCK-00328).
+    /// Agent adapter profile is misconfigured (RFC-0032::REQ-0121).
     ///
     /// This code is emitted when the agent adapter profile fails validation,
     /// cannot be loaded from CAS, or the adapter fails to start due to
     /// configuration issues. Per RFC-0019 Addendum, profiles must be explicitly
     /// selected by hash; ambient defaults are forbidden.
     AdapterMisconfigured,
-    /// Taint flow policy denied the operation (TCK-00339).
+    /// Taint flow policy denied the operation (RFC-0032::REQ-0130).
     ///
     /// This code is emitted when untrusted or adversarial content attempts to
     /// flow into a high-authority context (receipt, prompt, policy input) and
     /// the taint policy denies the flow. Per REQ-0016, taint tracking prevents
     /// untrusted content from silently influencing high-risk decisions.
     TaintFlowDenied,
-    /// Merge conflict detected during autonomous merge execution (TCK-00390).
+    /// Merge conflict detected during autonomous merge execution (RFC-0032::REQ-0144).
     ///
     /// This code is emitted when the merge executor attempts a squash merge
     /// via the GitHub API and the merge fails due to a merge conflict.
@@ -220,11 +220,11 @@ impl ReasonCode {
     /// - 1 = `APPLY_FAILED`
     /// - 2 = `TOOL_FAILED`
     /// - etc.
-    /// - 9 = `MISSING_VIEW_COMMITMENT` (TCK-00325)
-    /// - 10 = `CONTEXT_PACK_MISSING` (TCK-00326)
-    /// - 11 = `CONTEXT_PACK_INVALID` (TCK-00326)
-    /// - 12 = `ADAPTER_MISCONFIGURED` (TCK-00328)
-    /// - 13 = `TAINT_FLOW_DENIED` (TCK-00339)
+    /// - 9 = `MISSING_VIEW_COMMITMENT` (RFC-0032::REQ-0118)
+    /// - 10 = `CONTEXT_PACK_MISSING` (RFC-0032::REQ-0119)
+    /// - 11 = `CONTEXT_PACK_INVALID` (RFC-0032::REQ-0119)
+    /// - 12 = `ADAPTER_MISCONFIGURED` (RFC-0032::REQ-0121)
+    /// - 13 = `TAINT_FLOW_DENIED` (RFC-0032::REQ-0130)
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
@@ -319,12 +319,12 @@ pub struct ReviewBlockedRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub recorder_signature: [u8; 64],
-    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, RFC-0032::REQ-0119).
     /// Binds the blocked event to the authority under which the review was
     /// attempted.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
     /// to preserve signature verification for historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
@@ -333,11 +333,11 @@ pub struct ReviewBlockedRecorded {
     )]
     pub capability_manifest_hash: Option<[u8; 32]>,
     /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
-    /// TCK-00326). Binds the blocked event to the context firewall
+    /// RFC-0032::REQ-0119). Binds the blocked event to the context firewall
     /// configuration.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
     /// to preserve signature verification for historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
@@ -345,10 +345,10 @@ pub struct ReviewBlockedRecorded {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_pack_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the `RoleSpecV2` in effect (32 bytes, TCK-00448).
+    /// BLAKE3 hash of the `RoleSpecV2` in effect (32 bytes, RFC-0032::REQ-0169).
     ///
     /// This field defaults to empty for backward compatibility with events
-    /// created before TCK-00448.
+    /// created before RFC-0032::REQ-0169.
     #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub role_spec_hash: Vec<u8>,
 }
@@ -489,15 +489,15 @@ impl ReviewBlockedRecorded {
     /// - `blocked_log_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `recorder_actor_id` (len + bytes)
-    /// - `capability_manifest_hash` (32 bytes, TCK-00326, only if present)
-    /// - `context_pack_hash` (32 bytes, TCK-00326, only if present)
-    /// - `role_spec_hash` (bytes, TCK-00448)
+    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `context_pack_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `role_spec_hash` (bytes, RFC-0032::REQ-0169)
     ///
     /// # Backward Compatibility
     ///
     /// The `capability_manifest_hash` and `context_pack_hash` fields are only
     /// included in the canonical encoding when they are `Some`. This preserves
-    /// signature verification for historical events created before TCK-00326.
+    /// signature verification for historical events created before RFC-0032::REQ-0119.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -523,17 +523,17 @@ impl ReviewBlockedRecorded {
         bytes.extend_from_slice(&(self.recorder_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.recorder_actor_id.as_bytes());
 
-        // 7. capability_manifest_hash (TCK-00326, only if present for backward compat)
+        // 7. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward compat)
         if let Some(ref hash) = self.capability_manifest_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 8. context_pack_hash (TCK-00326, only if present for backward compat)
+        // 8. context_pack_hash (RFC-0032::REQ-0119, only if present for backward compat)
         if let Some(ref hash) = self.context_pack_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 9. role_spec_hash (TCK-00448)
+        // 9. role_spec_hash (RFC-0032::REQ-0169)
         bytes.extend_from_slice(&self.role_spec_hash);
 
         bytes
@@ -634,21 +634,21 @@ impl ReviewBlockedRecordedBuilder {
         self
     }
 
-    /// Sets the capability manifest hash (TCK-00326).
+    /// Sets the capability manifest hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
         self.capability_manifest_hash = Some(hash);
         self
     }
 
-    /// Sets the context pack hash (TCK-00326).
+    /// Sets the context pack hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn context_pack_hash(mut self, hash: [u8; 32]) -> Self {
         self.context_pack_hash = Some(hash);
         self
     }
 
-    /// Sets the role spec hash (TCK-00448).
+    /// Sets the role spec hash (RFC-0032::REQ-0169).
     #[must_use]
     pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
         self.role_spec_hash = hash.to_vec();
@@ -665,7 +665,7 @@ impl ReviewBlockedRecordedBuilder {
     ///
     /// The `capability_manifest_hash` and `context_pack_hash` fields are
     /// optional for backward compatibility with events created before
-    /// TCK-00326.
+    /// RFC-0032::REQ-0119.
     pub fn build_and_sign(
         self,
         signer: &Signer,
@@ -688,7 +688,7 @@ impl ReviewBlockedRecordedBuilder {
         let recorder_actor_id = self
             .recorder_actor_id
             .ok_or(ReviewBlockedError::MissingField("recorder_actor_id"))?;
-        // These are optional for backward compatibility (TCK-00326)
+        // These are optional for backward compatibility (RFC-0032::REQ-0119)
         let capability_manifest_hash = self.capability_manifest_hash;
         let context_pack_hash = self.context_pack_hash;
         let role_spec_hash = self.role_spec_hash;
@@ -767,7 +767,7 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
                 ReviewBlockedError::InvalidData("reason_code must fit in u8".into())
             })?)?;
 
-        // TCK-00326: Parse capability_manifest_hash and context_pack_hash
+        // RFC-0032::REQ-0119: Parse capability_manifest_hash and context_pack_hash
         // Map empty or all-zero fields to None for backward compatibility.
         // This ensures signature verification succeeds for historical events.
         let capability_manifest_hash: Option<[u8; 32]> = if proto
@@ -825,7 +825,7 @@ impl From<ReviewBlockedRecorded> for ReviewBlockedRecordedProto {
             }),
             recorder_actor_id: event.recorder_actor_id,
             recorder_signature: event.recorder_signature.to_vec(),
-            // TCK-00326: Authority binding fields (empty Vec if None)
+            // RFC-0032::REQ-0119: Authority binding fields (empty Vec if None)
             capability_manifest_hash: event
                 .capability_manifest_hash
                 .map_or_else(Vec::new, |h| h.to_vec()),
@@ -896,9 +896,9 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-14 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
-        // TCK-00326 added 10-11, TCK-00328 added 12, TCK-00339 added 13,
-        // TCK-00390 added 14)
+        // Values 1-14 are valid (0 is UNSPECIFIED per protobuf, RFC-0032::REQ-0118 added 9,
+        // RFC-0032::REQ-0119 added 10-11, RFC-0032::REQ-0121 added 12, RFC-0032::REQ-0130 added 13,
+        // RFC-0032::REQ-0144 added 14)
         for code in 1..=14u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
@@ -945,9 +945,9 @@ mod tests {
         // MissingViewCommitment is NOT retryable - it indicates a structural issue
         assert!(!ReasonCode::MissingViewCommitment.is_retryable());
         // AdapterMisconfigured is NOT retryable - requires operator intervention
-        // (TCK-00328)
+        // (RFC-0032::REQ-0121)
         assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
-        // TaintFlowDenied is NOT retryable - requires policy change (TCK-00339)
+        // TaintFlowDenied is NOT retryable - requires policy change (RFC-0032::REQ-0130)
         assert!(!ReasonCode::TaintFlowDenied.is_retryable());
     }
 
@@ -961,9 +961,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -982,9 +982,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -1006,9 +1006,9 @@ mod tests {
             .blocked_log_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
-            .capability_manifest_hash([0x55; 32]) // TCK-00326
-            .context_pack_hash([0x66; 32])        // TCK-00326
-            .role_spec_hash([0x77; 32])           // TCK-00448
+            .capability_manifest_hash([0x55; 32]) // RFC-0032::REQ-0119
+            .context_pack_hash([0x66; 32])        // RFC-0032::REQ-0119
+            .role_spec_hash([0x77; 32])           // RFC-0032::REQ-0169
             .build_and_sign(&signer)
             .expect("valid event");
 
@@ -1129,9 +1129,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            Vec::new(),       // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            Vec::new(),       // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         );
 
@@ -1154,9 +1154,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -1168,9 +1168,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -1191,9 +1191,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -1205,9 +1205,9 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
-            vec![0x77; 32],   // role_spec_hash (TCK-00448)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
+            vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169)
             &signer,
         )
         .expect("valid event");
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn test_backward_compat_none_fields() {
-        // TCK-00326: Events without capability_manifest_hash/context_pack_hash
+        // RFC-0032::REQ-0119: Events without capability_manifest_hash/context_pack_hash
         // should have shorter canonical bytes and verify correctly
         let signer = Signer::generate();
         let event_with = ReviewBlockedRecorded::create(
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_context_pack_reason_codes() {
-        // TCK-00326: Test the new context pack reason codes
+        // RFC-0032::REQ-0119: Test the new context pack reason codes
         assert_eq!(
             "CONTEXT_PACK_MISSING".parse::<ReasonCode>().unwrap(),
             ReasonCode::ContextPackMissing
@@ -1279,7 +1279,7 @@ mod tests {
             ReasonCode::ContextPackInvalid.to_string(),
             "CONTEXT_PACK_INVALID"
         );
-        // TCK-00325 reserved code 9 for MissingViewCommitment, so ContextPack codes are
+        // RFC-0032::REQ-0118 reserved code 9 for MissingViewCommitment, so ContextPack codes are
         // 10-11
         assert_eq!(ReasonCode::ContextPackMissing.to_code(), 10);
         assert_eq!(ReasonCode::ContextPackInvalid.to_code(), 11);
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn test_adapter_misconfigured_reason_code() {
-        // TCK-00328: Test the new adapter misconfigured reason code
+        // RFC-0032::REQ-0121: Test the new adapter misconfigured reason code
         assert_eq!(
             "ADAPTER_MISCONFIGURED".parse::<ReasonCode>().unwrap(),
             ReasonCode::AdapterMisconfigured
@@ -1299,7 +1299,7 @@ mod tests {
             ReasonCode::AdapterMisconfigured.to_string(),
             "ADAPTER_MISCONFIGURED"
         );
-        // TCK-00328 reserved code 12 for AdapterMisconfigured
+        // RFC-0032::REQ-0121 reserved code 12 for AdapterMisconfigured
         assert_eq!(ReasonCode::AdapterMisconfigured.to_code(), 12);
         // Adapter misconfigured is NOT retryable - requires operator intervention
         assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
@@ -1307,13 +1307,13 @@ mod tests {
 
     #[test]
     fn test_taint_flow_denied_reason_code() {
-        // TCK-00339: Test the new taint flow denied reason code
+        // RFC-0032::REQ-0130: Test the new taint flow denied reason code
         assert_eq!(
             "TAINT_FLOW_DENIED".parse::<ReasonCode>().unwrap(),
             ReasonCode::TaintFlowDenied
         );
         assert_eq!(ReasonCode::TaintFlowDenied.to_string(), "TAINT_FLOW_DENIED");
-        // TCK-00339 reserved code 13 for TaintFlowDenied
+        // RFC-0032::REQ-0130 reserved code 13 for TaintFlowDenied
         assert_eq!(ReasonCode::TaintFlowDenied.to_code(), 13);
         // Taint flow denied is NOT retryable - requires policy change
         assert!(!ReasonCode::TaintFlowDenied.is_retryable());
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[test]
     fn test_authority_binding_fields_in_signature() {
-        // TCK-00326: Verify that capability_manifest_hash and context_pack_hash
+        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and context_pack_hash
         // are included in the signature
         let signer = Signer::generate();
         let event1 = ReviewBlockedRecorded::create(

@@ -1,6 +1,6 @@
 //! Daemon management commands.
 //!
-//! # TCK-00288: Protocol-Based IPC
+//! # RFC-0032::REQ-0090: Protocol-Based IPC
 //!
 //! Per DD-009 (RFC-0017), the CLI uses tag-based protobuf communication via
 //! the operator socket. The `kill` command sends a Shutdown request using
@@ -44,13 +44,13 @@ const FAC_RUNTIME_SUBDIRS: [&str; 14] = [
 
 const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
 
-/// TCK-00595: Systemd user service template for `apm2 daemon install`.
+/// RFC-0032::REQ-0244: Systemd user service template for `apm2 daemon install`.
 ///
 /// `%exe_path%` is replaced at install-time with the resolved binary path.
 /// Uses `Restart=always` + `WatchdogSec=300` for crash resilience.
 /// `LoadCredential` reads the GH token from the systemd credential store,
 /// ensuring tokens are never persisted in unit files (security policy).
-/// TCK-00600: Type=notify so systemd waits for READY=1 before considering
+/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before considering
 /// the daemon started. The daemon calls `sd_notify::notify_ready()` after
 /// socket bind. `WatchdogSec=300` restarts the daemon if it fails to send
 /// `WATCHDOG=1` within 5 minutes (the daemon pings every ~150s).
@@ -85,7 +85,7 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
-/// TCK-00600: Type=notify so systemd waits for READY=1 before considering
+/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before considering
 /// the worker started. The worker calls `sd_notify::notify_ready()` after
 /// broker connection. `WatchdogSec=300` restarts the worker if it fails to
 /// send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
@@ -120,7 +120,7 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
-/// TCK-00600: Type=notify for template-instance workers too.
+/// RFC-0032::REQ-0248: Type=notify for template-instance workers too.
 const WORKER_TEMPLATE_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
 Description=APM2 FAC Worker (%i)\n\
@@ -281,7 +281,7 @@ pub fn run(config: &Path, no_daemon: bool) -> Result<()> {
     Ok(())
 }
 
-/// Install the systemd user service for apm2-daemon (TCK-00595).
+/// Install the systemd user service for apm2-daemon (RFC-0032::REQ-0244).
 ///
 /// Writes four unit files to `~/.config/systemd/user/`:
 /// - `apm2-daemon.service` — main broker with Restart=always + `WatchdogSec`
@@ -424,7 +424,7 @@ fn run_user_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the daemon is running, starting it when necessary (TCK-00595).
+/// Ensure the daemon is running, starting it when necessary (RFC-0032::REQ-0244).
 ///
 /// Called by all `apm2 fac` subcommands so the daemon auto-starts without
 /// manual intervention. Resolution order:
@@ -459,7 +459,7 @@ pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Resu
     if !launched_by_systemctl {
         let self_exe =
             std::env::current_exe().context("failed to determine current executable path")?;
-        // TCK-00595 MAJOR-2 FIX: Forward the caller's --config path so the
+        // RFC-0032::REQ-0244 MAJOR-2 FIX: Forward the caller's --config path so the
         // daemon binds to the same sockets the CLI client expects.
         Command::new(&self_exe)
             .arg("--config")
@@ -486,10 +486,10 @@ pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Resu
 
 /// Report health and prerequisite checks for daemon runtime.
 ///
-/// TCK-00547: Enhanced with host capability, toolchain, security posture,
+/// RFC-0032::REQ-0202: Enhanced with host capability, toolchain, security posture,
 /// and credentials posture checks.
 ///
-/// TCK-00595 MAJOR-3 FIX: Includes a projection-worker liveness probe.
+/// RFC-0032::REQ-0244 MAJOR-3 FIX: Includes a projection-worker liveness probe.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DaemonDoctorCheck {
     pub name: String,
@@ -882,7 +882,7 @@ pub fn collect_doctor_checks(
     checks.push(lane_check);
 
     // ── Credentials Posture ────────────────────────────────────────────
-    // TCK-00547: Credentials are WARN by default, but upgraded to ERROR
+    // RFC-0032::REQ-0202: Credentials are WARN by default, but upgraded to ERROR
     // when --full is set (for GitHub-facing workflows like push/review).
     //
     // BLOCKER FIX: Compute credential readiness holistically. Check ALL
@@ -892,7 +892,7 @@ pub fn collect_doctor_checks(
     let cred_fail_status: &str = if full { "ERROR" } else { "WARN" };
 
     // Probe all credential sources before determining status.
-    // TCK-00595 MAJOR FIX: Use unified token resolution chain that checks
+    // RFC-0032::REQ-0244 MAJOR FIX: Use unified token resolution chain that checks
     // env vars, $CREDENTIALS_DIRECTORY/gh-token (systemd LoadCredential),
     // and $APM2_HOME/private/creds/gh-token.
     let github_token_set = matches!(std::env::var("GITHUB_TOKEN"), Ok(ref v) if !v.is_empty());
@@ -965,7 +965,7 @@ pub fn collect_doctor_checks(
         has_error = true;
     }
 
-    // TCK-00598: When --full/--include-secrets is set and App config exists,
+    // RFC-0032::REQ-0247: When --full/--include-secrets is set and App config exists,
     // verify the private key is actually resolvable. A config file that
     // references an inaccessible key should not report OK.
     if full {
@@ -1462,7 +1462,7 @@ fn resolve_service_binary(unit_name: &str) -> Result<PathBuf, String> {
     parse_execstart_binary(&stdout)
 }
 
-/// FU-001 (TCK-00625): Check binary alignment between interactive CLI
+/// FU-001 (RFC-0032::REQ-0256): Check binary alignment between interactive CLI
 /// (`which apm2`) and systemd service `ExecStart` binaries.
 ///
 /// Computes SHA-256 digests of all resolved binary paths and enforces
@@ -1931,7 +1931,7 @@ fn check_lane_directory_safety_at(lanes_dir: &Path) -> DaemonDoctorCheck {
 
 /// Kill the daemon via protocol-based Shutdown request.
 ///
-/// # TCK-00288: Protocol-Based IPC
+/// # RFC-0032::REQ-0090: Protocol-Based IPC
 ///
 /// Sends a Shutdown request to the daemon via the operator socket using
 /// tag-based protobuf framing per DD-009 and RFC-0017.
@@ -2049,7 +2049,7 @@ fn socket_permission_check(path: &Path) -> Result<bool> {
 mod tests {
     use super::*;
 
-    /// TCK-00595 MAJOR-2 regression: `ensure_daemon_running` accepts
+    /// RFC-0032::REQ-0244 MAJOR-2 regression: `ensure_daemon_running` accepts
     /// `config_path` and the function signature is correct. We cannot test
     /// the actual daemon spawn in unit tests, but we verify the function
     /// compiles with the new signature and fails gracefully on a
@@ -2105,7 +2105,7 @@ mod tests {
         );
     }
 
-    /// TCK-00595 MAJOR-3: projection worker health check returns OK when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK when
     /// projection is disabled in config.
     #[test]
     fn projection_health_disabled_returns_ok() {
@@ -2123,7 +2123,7 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// TCK-00595 MAJOR-3: projection worker health check returns ERROR when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR when
     /// enabled but daemon not running.
     #[test]
     fn projection_health_enabled_daemon_down_returns_error() {
@@ -2142,7 +2142,7 @@ mod tests {
         assert!(result.message.contains("daemon is not running"));
     }
 
-    /// TCK-00595 MAJOR-3: projection worker health check returns ERROR when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR when
     /// enabled but cache file missing.
     #[test]
     fn projection_health_enabled_no_cache_returns_error() {
@@ -2166,7 +2166,7 @@ mod tests {
         assert!(result.message.contains("projection cache not found"));
     }
 
-    /// TCK-00595 MAJOR-3: projection worker health check returns OK when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK when
     /// enabled, daemon running, and cache exists.
     #[test]
     fn projection_health_enabled_with_cache_returns_ok() {
@@ -2283,7 +2283,7 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// TCK-00595 MAJOR-3: projection health check returns ERROR when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection health check returns ERROR when
     /// enabled but `github_owner` is missing.
     #[test]
     fn projection_health_enabled_missing_owner_returns_error() {
@@ -2302,7 +2302,7 @@ mod tests {
         assert!(result.message.contains("github_owner or github_repo"));
     }
 
-    /// TCK-00595 MAJOR-3: projection health check returns WARN when
+    /// RFC-0032::REQ-0244 MAJOR-3: projection health check returns WARN when
     /// no config file exists.
     #[test]
     fn projection_health_no_config_returns_warn() {
@@ -2314,14 +2314,14 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// TCK-00547: `check_binary_available` returns true for a known binary.
+    /// RFC-0032::REQ-0202: `check_binary_available` returns true for a known binary.
     #[test]
     fn check_binary_available_true_for_known_binary() {
         // `true` is a shell built-in / binary available on all unix systems
         assert!(check_binary_available("true", &[]));
     }
 
-    /// TCK-00547: `check_binary_available` returns false for a non-existent
+    /// RFC-0032::REQ-0202: `check_binary_available` returns false for a non-existent
     /// binary.
     #[test]
     fn check_binary_available_false_for_missing_binary() {
@@ -2331,7 +2331,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00547 MAJOR-3: `check_binary_available` returns false when the
+    /// RFC-0032::REQ-0202 MAJOR-3: `check_binary_available` returns false when the
     /// binary spawns but exits with a non-zero status (e.g. missing
     /// subcommand).
     #[test]
@@ -2340,7 +2340,7 @@ mod tests {
         assert!(!check_binary_available("false", &[]));
     }
 
-    /// TCK-00547: lane safety check returns OK when lane dir does not exist.
+    /// RFC-0032::REQ-0202: lane safety check returns OK when lane dir does not exist.
     #[test]
     fn lane_safety_ok_when_no_lane_dir() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2350,7 +2350,7 @@ mod tests {
         assert!(result.message.contains("does not exist"));
     }
 
-    /// TCK-00547: lane safety detects symlinks in lane directory.
+    /// RFC-0032::REQ-0202: lane safety detects symlinks in lane directory.
     #[cfg(unix)]
     #[test]
     fn lane_safety_detects_symlink() {
@@ -2371,7 +2371,7 @@ mod tests {
         assert!(result.message.contains("symlink"));
     }
 
-    /// TCK-00547: lane safety returns OK when no symlinks present.
+    /// RFC-0032::REQ-0202: lane safety returns OK when no symlinks present.
     #[cfg(unix)]
     #[test]
     fn lane_safety_ok_when_clean() {
@@ -2391,7 +2391,7 @@ mod tests {
         assert!(result.message.contains("no symlinks"));
     }
 
-    /// TCK-00547 MAJOR-2: lane safety detects `lanes_dir` itself being a
+    /// RFC-0032::REQ-0202 MAJOR-2: lane safety detects `lanes_dir` itself being a
     /// symlink.
     #[cfg(unix)]
     #[test]
@@ -2408,7 +2408,7 @@ mod tests {
         assert!(result.message.contains("is a symlink"));
     }
 
-    /// TCK-00547 MAJOR-4: lane safety detects unsafe permissions (group/world
+    /// RFC-0032::REQ-0202 MAJOR-4: lane safety detects unsafe permissions (group/world
     /// writable).
     #[cfg(unix)]
     #[test]
@@ -2427,7 +2427,7 @@ mod tests {
         assert!(result.message.contains("unsafe permissions"));
     }
 
-    /// TCK-00547 MAJOR-1: lane safety returns ERROR when scan limit is reached
+    /// RFC-0032::REQ-0202 MAJOR-1: lane safety returns ERROR when scan limit is reached
     /// (fail-closed).
     #[cfg(unix)]
     #[test]
@@ -2450,7 +2450,7 @@ mod tests {
         assert!(result.message.contains("too many entries"));
     }
 
-    /// TCK-00547 R2 MINOR (security): dangling symlink on lanes root is
+    /// RFC-0032::REQ-0202 R2 MINOR (security): dangling symlink on lanes root is
     /// detected as ERROR, not silently treated as absent.
     #[cfg(unix)]
     #[test]
@@ -2466,7 +2466,7 @@ mod tests {
         assert!(result.message.contains("is a symlink"));
     }
 
-    /// TCK-00547 R2 MAJOR: lane scan is deterministic — sorting by name
+    /// RFC-0032::REQ-0202 R2 MAJOR: lane scan is deterministic — sorting by name
     /// ensures the same entries are always checked regardless of filesystem
     /// iteration order. Here we verify that a symlink placed at a
     /// lexicographically early name is always detected, even with many entries.
@@ -2499,9 +2499,9 @@ mod tests {
         }
     }
 
-    // ── Binary alignment doctor check tests (TCK-00625 MAJOR-2) ────────
+    // ── Binary alignment doctor check tests (RFC-0032::REQ-0256 MAJOR-2) ────────
 
-    /// TCK-00625 MAJOR-2: Digest mismatch must produce ERROR status
+    /// RFC-0032::REQ-0256 MAJOR-2: Digest mismatch must produce ERROR status
     /// (fail-closed), not WARN.
     #[test]
     fn binary_alignment_digest_mismatch_is_error() {
@@ -2533,7 +2533,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-2: No service binaries resolvable must produce
+    /// RFC-0032::REQ-0256 MAJOR-2: No service binaries resolvable must produce
     /// ERROR status (fail-closed), not WARN.
     #[test]
     fn binary_alignment_no_service_resolvable_is_error() {
@@ -2567,7 +2567,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-2: Partial resolution (at least one matched, others
+    /// RFC-0032::REQ-0256 MAJOR-2: Partial resolution (at least one matched, others
     /// failed to resolve) produces WARN — degraded but not fatal.
     #[test]
     fn binary_alignment_partial_resolution_is_warn() {
@@ -2601,7 +2601,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-2: All service binaries resolved and all digests
+    /// RFC-0032::REQ-0256 MAJOR-2: All service binaries resolved and all digests
     /// match produces OK status.
     #[test]
     fn binary_alignment_all_match_is_ok() {
@@ -2627,7 +2627,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-2: Mismatch + resolve failure is still ERROR
+    /// RFC-0032::REQ-0256 MAJOR-2: Mismatch + resolve failure is still ERROR
     /// (mismatch takes precedence over partial resolution).
     #[test]
     fn binary_alignment_mismatch_plus_resolve_failure_is_error() {

@@ -1,4 +1,4 @@
-//! HEF Red-Team and Resilience Test Suite (TCK-00308).
+//! HEF Red-Team and Resilience Test Suite (RFC-0032::REQ-0104).
 //!
 //! This suite validates the security invariants and resilience of the
 //! Holonic Evidence Framework (HEF) pulse plane.
@@ -66,7 +66,7 @@ async fn test_pulse_only_admission_fail_closed() {
             if let Ok((mut conn, _permit, _type)) = manager_clone.accept().await {
                 // Perform handshake
                 // Use Tier1 for test backward compat; production default
-                // is Tier2 (deny) per TCK-00348.
+                // is Tier2 (deny) per RFC-0020::REQ-0002.
                 let hs_config =
                     apm2_daemon::protocol::connection_handler::HandshakeConfig::default()
                         .with_risk_tier(apm2_daemon::hsi_contract::RiskTier::Tier1);

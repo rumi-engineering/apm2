@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00211)
+// AGENT-AUTHORED (RFC-0032::REQ-0057)
 //! CONSUME mode session handler with context firewall integration.
 //!
 //! This module provides session handling for CONSUME mode sessions, which are
@@ -111,7 +111,7 @@ pub enum ConsumeSessionError {
 
     /// Tool class not allowed in manifest.
     ///
-    /// Per TCK-00254, tool requests are validated against the manifest's
+    /// Per RFC-0032::REQ-0070, tool requests are validated against the manifest's
     /// `tool_allowlist`. This error is returned when the requested tool class
     /// is not in the allowlist (fail-closed semantics).
     #[error("tool class '{tool_class}' not in manifest allowlist for '{manifest_id}'")]
@@ -124,7 +124,7 @@ pub enum ConsumeSessionError {
 
     /// Write path not allowed in manifest.
     ///
-    /// Per TCK-00254, write operations are validated against the manifest's
+    /// Per RFC-0032::REQ-0070, write operations are validated against the manifest's
     /// `write_allowlist`. This error is returned when the write path is not
     /// in the allowlist (fail-closed semantics).
     #[error("write path '{path}' not in manifest allowlist for '{manifest_id}'")]
@@ -137,7 +137,7 @@ pub enum ConsumeSessionError {
 
     /// Shell command not allowed in manifest.
     ///
-    /// Per TCK-00254, shell execution requests are validated against the
+    /// Per RFC-0032::REQ-0070, shell execution requests are validated against the
     /// manifest's `shell_allowlist`. This error is returned when the command
     /// does not match any allowed pattern (fail-closed semantics).
     #[error("shell command '{command}' not in manifest allowlist for '{manifest_id}'")]
@@ -460,7 +460,7 @@ pub fn validate_tool_request(
         return Ok(()); // No tool, nothing to validate
     };
 
-    // TCK-00254: Check tool allowlist (fail-closed semantics)
+    // RFC-0032::REQ-0070: Check tool allowlist (fail-closed semantics)
     // Map the tool variant to a ToolClass and check against the allowlist.
     let tool_class = tool_to_tool_class(tool);
     if !manifest.tool_allowlist.contains(&tool_class) {
@@ -513,7 +513,7 @@ pub fn validate_tool_request(
             }
         },
         tool_request::Tool::FileWrite(write) => {
-            // TCK-00254: Validate write path against write_allowlist (fail-closed)
+            // RFC-0032::REQ-0070: Validate write path against write_allowlist (fail-closed)
             let path = std::path::Path::new(&write.path);
             if !manifest.is_write_path_allowed(path) {
                 return Err(ConsumeSessionError::WritePathNotAllowed {
@@ -524,7 +524,7 @@ pub fn validate_tool_request(
             Ok(())
         },
         tool_request::Tool::FileEdit(edit) => {
-            // TCK-00254: Validate edit path against write_allowlist (fail-closed)
+            // RFC-0032::REQ-0070: Validate edit path against write_allowlist (fail-closed)
             let path = std::path::Path::new(&edit.path);
             if !manifest.is_write_path_allowed(path) {
                 return Err(ConsumeSessionError::WritePathNotAllowed {
@@ -535,7 +535,7 @@ pub fn validate_tool_request(
             Ok(())
         },
         tool_request::Tool::ShellExec(exec) => {
-            // TCK-00254: Validate shell command against shell_allowlist (fail-closed)
+            // RFC-0032::REQ-0070: Validate shell command against shell_allowlist (fail-closed)
             if !manifest.is_shell_command_allowed(&exec.command) {
                 // SECURITY: Truncate command to prevent oversized error variants
                 let truncated_command = if exec.command.len() > 256 {
@@ -558,7 +558,7 @@ pub fn validate_tool_request(
 /// Maps a `tool_request::Tool` variant to its corresponding `ToolClass`.
 ///
 /// This helper function enables tool allowlist validation in CONSUME mode
-/// per TCK-00254.
+/// per RFC-0032::REQ-0070.
 const fn tool_to_tool_class(tool: &tool_request::Tool) -> ToolClass {
     match tool {
         tool_request::Tool::FileRead(_) => ToolClass::Read,
@@ -598,7 +598,7 @@ mod tests {
                     .access_level(AccessLevel::Read)
                     .build(),
             )
-            // TCK-00254: Include allowlists for test compatibility
+            // RFC-0032::REQ-0070: Include allowlists for test compatibility
             .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
             // Allow "ls" command for shell execution tests
             .shell_allowlist(vec!["ls".to_string()])

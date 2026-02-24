@@ -62,15 +62,15 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // advisory to authoritative with receipt_required per RFC-0020 section 1.3
     // (they perform real side effects). SubscribePulse and UnsubscribePulse
     // added to SessionMessageType::all_request_variants() (deduplicated).
-    // TCK-00635: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
-    // TCK-00638: PublishWorkContextEntry (hsi.work_context.publish) added as
+    // RFC-0032::REQ-0263: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
+    // RFC-0032::REQ-0266: PublishWorkContextEntry (hsi.work_context.publish) added as
     // authoritative+idempotent+receipt.
-    // TCK-00637: ClaimWorkV2 (hsi.work.claim_v2) added as authoritative+idempotent+receipt.
-    // TCK-00639: RecordWorkPrAssociation (hsi.work.record_pr_association) added as
+    // RFC-0032::REQ-0265: ClaimWorkV2 (hsi.work.claim_v2) added as authoritative+idempotent+receipt.
+    // RFC-0032::REQ-0267: RecordWorkPrAssociation (hsi.work.record_pr_association) added as
     // authoritative+idempotent+receipt.
-    // TCK-00645: PublishWorkLoopProfile (hsi.work_loop_profile.publish) added as
+    // RFC-0032::REQ-0270: PublishWorkLoopProfile (hsi.work_loop_profile.publish) added as
     // authoritative+idempotent+receipt.
-    // TCK-00636: ResolveTicketAlias (hsi.work.resolve_ticket_alias) added as advisory.
+    // RFC-0032::REQ-0264: ResolveTicketAlias (hsi.work.resolve_ticket_alias) added as advisory.
     expected_hash: "ebd43e06929e5398fb5f3177afe5cf090a079e8bdd844a9ba87002eb9f770f18",
 };
 

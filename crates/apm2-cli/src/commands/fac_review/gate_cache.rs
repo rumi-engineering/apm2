@@ -3,7 +3,7 @@
 //! Stores one file per gate under:
 //! `~/.apm2/private/fac/gate_cache_v2/{sha}/{gate}.yaml`.
 //!
-//! # Signed Receipts (TCK-00576)
+//! # Signed Receipts (RFC-0032::REQ-0226)
 //!
 //! Each `CachedGateResult` carries an optional Ed25519 signature over the
 //! canonical bytes of the receipt entry (domain-separated with
@@ -11,7 +11,7 @@
 //! valid signature — unsigned or forged entries are rejected for cache
 //! reuse (fail-closed).
 //!
-//! # Cache Reuse Policy (TCK-00540)
+//! # Cache Reuse Policy (RFC-0032::REQ-0196)
 //!
 //! Gate cache entries are treated as **untrusted** unless they carry
 //! RFC-0028 authorization and RFC-0029 admission receipt bindings
@@ -45,7 +45,7 @@ use crate::commands::fac_permissions;
 const CACHE_SCHEMA_V2: &str = "apm2.fac.gate_result_receipt.v2";
 const MAX_CACHE_READ_BYTES: usize = 1_048_576;
 
-/// Maximum length of `signature_hex` and `signer_id` fields (TCK-00576).
+/// Maximum length of `signature_hex` and `signer_id` fields (RFC-0032::REQ-0226).
 /// Ed25519 signature = 64 bytes = 128 hex chars; public key = 32 bytes = 64
 /// hex chars.  256 is generous but bounded.
 #[cfg(test)]
@@ -78,10 +78,10 @@ pub struct CachedGateResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     /// Hex-encoded Ed25519 signature over the canonical bytes of this entry
-    /// (TCK-00576).  Domain-separated with `GATE_CACHE_RECEIPT:`.
+    /// (RFC-0032::REQ-0226).  Domain-separated with `GATE_CACHE_RECEIPT:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_hex: Option<String>,
-    /// Hex-encoded Ed25519 public key of the signer (TCK-00576).
+    /// Hex-encoded Ed25519 public key of the signer (RFC-0032::REQ-0226).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_id: Option<String>,
     /// Whether this cache entry is bound to an RFC-0028 authorization receipt.
@@ -274,7 +274,7 @@ pub enum CacheSource {
     V3,
     /// Hit came from gate cache v2 (SHA-indexed, attestation-only).
     ///
-    /// [INV-GCV3-001] V2 reuse is disabled (TCK-00541 MAJOR fix). This
+    /// [INV-GCV3-001] V2 reuse is disabled (RFC-0032::REQ-0197 MAJOR fix). This
     /// variant is retained for match exhaustiveness in `resolve_cached_payload`
     /// but is no longer constructable from production reuse decisions.
     #[cfg(test)]
@@ -294,7 +294,7 @@ pub struct ReuseDecision {
 impl ReuseDecision {
     /// V2 attestation-match hit.
     ///
-    /// [INV-GCV3-001] V2 reuse is disabled (TCK-00541 MAJOR fix). This
+    /// [INV-GCV3-001] V2 reuse is disabled (RFC-0032::REQ-0197 MAJOR fix). This
     /// constructor is retained for test compatibility but is no longer
     /// called from production reuse decision paths.
     #[must_use]
@@ -548,7 +548,7 @@ impl GateCache {
         Ok(())
     }
 
-    /// Sign all gate entries in this cache with the given signer (TCK-00576).
+    /// Sign all gate entries in this cache with the given signer (RFC-0032::REQ-0226).
     pub fn sign_all(&mut self, signer: &Signer) {
         let sha = self.sha.clone();
         for (gate_name, result) in &mut self.gates {
@@ -598,7 +598,7 @@ impl GateCache {
                 log_path,
                 signature_hex: None,
                 signer_id: None,
-                // TCK-00540 BLOCKER fix: fail-closed defaults. Receipt
+                // RFC-0032::REQ-0196 BLOCKER fix: fail-closed defaults. Receipt
                 // bindings are only promoted to `true` by an explicit
                 // `bind_receipt_evidence` or `try_bind_receipt_from_store`
                 // call after verifying receipt existence.
@@ -701,12 +701,12 @@ impl GateCache {
     /// Evaluate whether a cached gate result is safe to reuse (v2 path).
     ///
     /// [INV-GCV3-001] This v2 reuse check is no longer called from
-    /// production reuse decision paths (TCK-00541 MAJOR fix). All reuse
+    /// production reuse decision paths (RFC-0032::REQ-0197 MAJOR fix). All reuse
     /// decisions flow through v3 `check_reuse` which requires compound-key
     /// binding proof. Retained for test compatibility.
     ///
     /// In default mode, signature verification is mandatory: unsigned or
-    /// forged receipts are rejected (fail-closed, TCK-00576).
+    /// forged receipts are rejected (fail-closed, RFC-0032::REQ-0226).
     ///
     /// `verifying_key` is the expected signer's public key.  Pass `None`
     /// to skip signature verification (developer/test mode only).
@@ -747,7 +747,7 @@ impl GateCache {
             return ReuseDecision::miss("evidence_digest_missing");
         }
 
-        // TCK-00576: Signature verification gate (fail-closed in default mode).
+        // RFC-0032::REQ-0226: Signature verification gate (fail-closed in default mode).
         if let Some(key) = verifying_key {
             match cached.verify(key, &self.sha, gate) {
                 Ok(()) => {},
@@ -763,7 +763,7 @@ impl GateCache {
             }
         }
 
-        // TCK-00540: RFC-0028/0029 receipt binding gate (fail-closed).
+        // RFC-0032::REQ-0196: RFC-0028/0029 receipt binding gate (fail-closed).
         if !cached.rfc0028_receipt_bound || !cached.rfc0029_receipt_bound {
             return ReuseDecision::miss("receipt_binding_missing");
         }
@@ -784,7 +784,7 @@ impl GateCache {
     }
 }
 
-/// Post-receipt gate cache rebinding (TCK-00540 BLOCKER fix).
+/// Post-receipt gate cache rebinding (RFC-0032::REQ-0196 BLOCKER fix).
 ///
 /// After a worker creates a job receipt with RFC-0028/0029 bindings, this
 /// function reloads the gate cache for the given SHA, promotes the receipt

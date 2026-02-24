@@ -1201,6 +1201,46 @@
             "heading_level": 2
           },
           "body": "Primary implementation surfaces:\n\n* Admission pipeline + receipts: `crates/apm2-core/src/cac/admission.rs`\n* Validator + CAC profile limits: `crates/apm2-core/src/cac/validator.rs`\n* Patch engine: `crates/apm2-core/src/cac/patch_engine.rs`\n* DCP index: `crates/apm2-core/src/cac/dcp_index.rs`\n* Context pack compiler: `crates/apm2-core/src/cac/compiler.rs`\n* Target profiles + exports: `crates/apm2-core/src/cac/target_profile.rs`, `crates/apm2-core/src/cac/export.rs`\n"
+        },
+        {
+          "type": "section",
+          "title": "Migrated Requirements (from deleted ticket/RFC traceability)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0029",
+              "title": "Implement determinism module with YAML canonicalization",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implement determinism module with YAML canonicalization",
+                "domain": [
+                  "determinism"
+                ],
+                "migrated_from": "RFC-0010"
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0030",
+              "title": "Budget system policy layer integration",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Budget system policy layer integration",
+                "domain": [
+                  "migrated"
+                ],
+                "migrated_from": "extra_tck"
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "These requirement nodes were migrated from deleted ticket files (TCK-NNNNN) and their associated old RFCs. Each node preserves the original ticket title as the requirement statement."
         }
       ]
     }

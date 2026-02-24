@@ -93,7 +93,7 @@ pub const CTX_ALLOWLIST_RULE_ID: &str = "CTX-ALLOWLIST-001";
 /// Rule ID for content hash mismatch denials.
 pub const CTX_HASH_MISMATCH_RULE_ID: &str = "CTX-HASH-MISMATCH-001";
 
-/// Rule ID for TOCTOU hash verification failures (TCK-00375).
+/// Rule ID for TOCTOU hash verification failures (RFC-0020::REQ-0029).
 pub const CTX_TOCTOU_MISMATCH_RULE_ID: &str = "CTX-TOCTOU-001";
 
 /// Reason text for allowlist denial.
@@ -102,7 +102,7 @@ pub const ALLOWLIST_DENIAL_REASON: &str = "Not in allowlist";
 /// Reason text for hash mismatch denial.
 pub const HASH_MISMATCH_DENIAL_REASON: &str = "Content hash mismatch";
 
-/// Reason text for TOCTOU hash verification failure (TCK-00375).
+/// Reason text for TOCTOU hash verification failure (RFC-0020::REQ-0029).
 pub const TOCTOU_MISMATCH_DENIAL_REASON: &str =
     "TOCTOU: runtime content hash differs from manifest";
 
@@ -276,7 +276,7 @@ impl FirewallDecision {
         }
     }
 
-    /// Creates a new DENY event for a TOCTOU hash mismatch (TCK-00375).
+    /// Creates a new DENY event for a TOCTOU hash mismatch (RFC-0020::REQ-0029).
     #[must_use]
     pub fn deny_toctou_mismatch(manifest_id: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
@@ -356,9 +356,9 @@ impl FirewallDecision {
             rationale_code: rationale_with_path,
             budget_consumed,
             // HTF time envelope reference (RFC-0016): not yet populated by this method.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
-            // Episode ID (RFC-0018, TCK-00306): not populated by firewall validation.
+            // Episode ID (RFC-0018, RFC-0032::REQ-0102): not populated by firewall validation.
             // The daemon episode runtime will populate this from episode context.
             episode_id: String::new(),
         }
@@ -470,7 +470,7 @@ pub enum ContextFirewallError {
         max: usize,
     },
 
-    /// TOCTOU hash mismatch: runtime content differs from manifest (TCK-00375).
+    /// TOCTOU hash mismatch: runtime content differs from manifest (RFC-0020::REQ-0029).
     ///
     /// This indicates that the file content has been modified between manifest
     /// creation and the runtime read, which may indicate a TOCTOU attack.
@@ -525,7 +525,7 @@ impl ContextFirewallError {
         }
     }
 
-    /// Returns `true` if this is a TOCTOU mismatch error (TCK-00375).
+    /// Returns `true` if this is a TOCTOU mismatch error (RFC-0020::REQ-0029).
     #[must_use]
     pub const fn is_toctou_mismatch(&self) -> bool {
         matches!(self, Self::ToctouMismatch { .. })
@@ -733,7 +733,7 @@ impl ContextAwareValidator for DefaultContextFirewall<'_> {
 }
 
 // =============================================================================
-// RiskTierFirewallPolicy (TCK-00375)
+// RiskTierFirewallPolicy (RFC-0020::REQ-0029)
 // =============================================================================
 
 /// Risk tier classification for firewall mode determination.
@@ -783,7 +783,7 @@ impl ContextRiskTier {
     }
 }
 
-/// Policy for mapping risk tiers to firewall enforcement modes (TCK-00375).
+/// Policy for mapping risk tiers to firewall enforcement modes (RFC-0020::REQ-0029).
 ///
 /// Per REQ-0029:
 /// - Tier3+ violations MUST terminate with mandatory defect emission
@@ -846,7 +846,7 @@ impl RiskTierFirewallPolicy {
 }
 
 // =============================================================================
-// ToctouVerifier (TCK-00375)
+// ToctouVerifier (RFC-0020::REQ-0029)
 // =============================================================================
 
 /// TOCTOU (time-of-check-to-time-of-use) hash verifier for context artifacts.
@@ -987,10 +987,10 @@ impl std::fmt::Display for ToctouMismatch {
 }
 
 // =============================================================================
-// FirewallViolationDefect (TCK-00375)
+// FirewallViolationDefect (RFC-0020::REQ-0029)
 // =============================================================================
 
-/// Mandatory defect emission for Tier3+ firewall violations (TCK-00375).
+/// Mandatory defect emission for Tier3+ firewall violations (RFC-0020::REQ-0029).
 ///
 /// Per REQ-0029, Tier3+ violations MUST terminate with mandatory defect
 /// emission. This struct captures the defect details for audit and event
@@ -1969,7 +1969,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00375: RiskTierFirewallPolicy Tests
+    // RFC-0020::REQ-0029: RiskTierFirewallPolicy Tests
     // =========================================================================
 
     #[test]
@@ -2057,7 +2057,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00375: ToctouVerifier Tests
+    // RFC-0020::REQ-0029: ToctouVerifier Tests
     // =========================================================================
 
     #[test]
@@ -2191,7 +2191,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00375: FirewallViolationDefect Tests
+    // RFC-0020::REQ-0029: FirewallViolationDefect Tests
     // =========================================================================
 
     #[test]
@@ -2258,7 +2258,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00375: FirewallDecision TOCTOU Tests
+    // RFC-0020::REQ-0029: FirewallDecision TOCTOU Tests
     // =========================================================================
 
     #[test]
@@ -2272,7 +2272,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00375: ToctouMismatch Error Variant Tests
+    // RFC-0020::REQ-0029: ToctouMismatch Error Variant Tests
     // =========================================================================
 
     #[test]

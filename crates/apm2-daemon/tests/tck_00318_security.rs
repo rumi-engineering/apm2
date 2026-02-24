@@ -1,4 +1,4 @@
-//! TCK-00318 Security Integration Tests
+//! RFC-0032::REQ-0112 Security Integration Tests
 //!
 //! Tests for workspace security including argument injection prevention
 //! and path traversal prevention.

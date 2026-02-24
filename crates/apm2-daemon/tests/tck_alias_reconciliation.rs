@@ -1,4 +1,4 @@
-//! TCK-00420: Alias reconciliation and snapshot-emitter sunset integration
+//! RFC-0032::REQ-0164: Alias reconciliation and snapshot-emitter sunset integration
 //! tests.
 //!
 //! Validates that:
@@ -213,7 +213,7 @@ fn tck_alias_reconciliation_authority_remains_work_id_centric() {
     assert_eq!(status.transition_count, 1);
 
     // Non-existent work_id must fail (authority is work_id-centric)
-    let err = authority.get_work_status("TCK-00420-alias");
+    let err = authority.get_work_status("RFC-0032::REQ-0164-alias");
     assert!(
         err.is_err(),
         "ticket alias must not resolve in work authority"
@@ -704,7 +704,7 @@ fn tck_alias_reconciliation_dispatcher_gate_blocks_mismatch() {
 }
 
 // ============================================================================
-// TCK-00636: ResolveTicketAlias handler tests (IPC-PRIV-080)
+// RFC-0032::REQ-0264: ResolveTicketAlias handler tests (IPC-PRIV-080)
 // ============================================================================
 
 #[test]

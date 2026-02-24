@@ -407,7 +407,7 @@ impl RetryContext {
 ///
 /// # Security
 ///
-/// Per TCK-00318 security requirements:
+/// Per RFC-0032::REQ-0112 security requirements:
 /// - Rejects empty paths
 /// - Rejects paths containing `..` components (directory traversal)
 /// - Rejects absolute paths (paths starting with `/` or `\`)
@@ -679,7 +679,7 @@ pub fn validate_path_filesystem_aware(
 ///
 /// # Security
 ///
-/// Per TCK-00318 security requirements:
+/// Per RFC-0032::REQ-0112 security requirements:
 /// - Rejects bundles with binary files (v0 limitation)
 /// - Validates all paths in the file manifest for traversal attacks
 /// - Validates `old_path` for rename operations
@@ -770,7 +770,7 @@ pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
     }
 
     // Security: Reject references starting with '-' to prevent flag injection
-    // This is the primary security check per TCK-00318
+    // This is the primary security check per RFC-0032::REQ-0112
     if commit_ref.starts_with('-') {
         return Err(WorkspaceError::InvalidCommitRef(format!(
             "commit ref cannot start with '-': {commit_ref}"
@@ -825,11 +825,11 @@ pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
 /// * `time_envelope_ref` - HTF time envelope reference hash
 /// * `recorder_actor_id` - ID of the recording actor
 /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in effect
-///   (TCK-00326, optional for backward compatibility)
+///   (RFC-0032::REQ-0119, optional for backward compatibility)
 /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in effect
-///   (TCK-00326, optional for backward compatibility)
+///   (RFC-0032::REQ-0119, optional for backward compatibility)
 /// * `role_spec_hash` - Hash of the authoritative `RoleSpecV2` in effect
-///   (TCK-00448, optional for backward compatibility)
+///   (RFC-0032::REQ-0169, optional for backward compatibility)
 /// * `signer` - Signer to authorize the event
 ///
 /// # Errors
@@ -886,9 +886,9 @@ pub fn create_blocked_event(
 /// * `time_envelope_ref` - HTF time envelope reference for temporal authority
 /// * `reviewer_actor_id` - Actor ID of the reviewer
 /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in effect
-///   (TCK-00326, optional for backward compatibility)
+///   (RFC-0032::REQ-0119, optional for backward compatibility)
 /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in effect
-///   (TCK-00326, optional for backward compatibility)
+///   (RFC-0032::REQ-0119, optional for backward compatibility)
 /// * `signer` - Signer to authorize the event
 ///
 /// # Errors
@@ -990,13 +990,13 @@ pub struct ReviewCompletionResult {
     pub time_envelope_ref: [u8; 32],
     /// Reviewer actor ID.
     pub reviewer_actor_id: String,
-    /// BLAKE3 hash of the `CapabilityManifest` in effect (TCK-00326).
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (RFC-0032::REQ-0119).
     /// Optional for backward compatibility with events created before
-    /// TCK-00326.
+    /// RFC-0032::REQ-0119.
     pub capability_manifest_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (TCK-00326).
+    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (RFC-0032::REQ-0119).
     /// Optional for backward compatibility with events created before
-    /// TCK-00326.
+    /// RFC-0032::REQ-0119.
     pub context_pack_hash: Option<[u8; 32]>,
 }
 
@@ -1118,14 +1118,14 @@ impl ReviewCompletionResultBuilder {
         self
     }
 
-    /// Sets the capability manifest hash (TCK-00326).
+    /// Sets the capability manifest hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn capability_manifest_hash(mut self, hash: [u8; 32]) -> Self {
         self.capability_manifest_hash = Some(hash);
         self
     }
 
-    /// Sets the context pack hash (TCK-00326).
+    /// Sets the context pack hash (RFC-0032::REQ-0119).
     #[must_use]
     pub fn context_pack_hash(mut self, hash: [u8; 32]) -> Self {
         self.context_pack_hash = Some(hash);
@@ -1160,7 +1160,7 @@ impl ReviewCompletionResultBuilder {
         let reviewer_actor_id = self
             .reviewer_actor_id
             .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
-        // These are optional for backward compatibility (TCK-00326)
+        // These are optional for backward compatibility (RFC-0032::REQ-0119)
         let capability_manifest_hash = self.capability_manifest_hash;
         let context_pack_hash = self.context_pack_hash;
 
@@ -1229,7 +1229,7 @@ impl WorkspaceConfig {
 /// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not
 ///   crashes
 ///
-/// # Security Model (TCK-00318)
+/// # Security Model (RFC-0032::REQ-0112)
 ///
 /// - **Containment Boundary**: Workspace is a containment boundary; default
 ///   deny on suspicious paths
@@ -1380,7 +1380,7 @@ impl WorkspaceManager {
     /// Applies a changeset bundle to the workspace.
     ///
     /// This is the main entry point for workspace materialization per
-    /// TCK-00318. The implementation:
+    /// RFC-0032::REQ-0112. The implementation:
     ///
     /// 1. Validates all file paths in the changeset (security checks)
     /// 2. If CAS is configured, retrieves diff bytes and applies via `git
@@ -2295,7 +2295,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00312: Review receipt tests
+    // RFC-0032::REQ-0106: Review receipt tests
     // =========================================================================
 
     #[test]
@@ -2358,8 +2358,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
-            Some([0x66; 32]), // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119)
+            Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119)
             &signer,
         )
         .expect("should create receipt");
@@ -2388,8 +2388,8 @@ mod tests {
             .tool_log_hashes(vec![[0x22; 32]])
             .time_envelope_ref([0x44; 32])
             .reviewer_actor_id("reviewer-001")
-            .capability_manifest_hash([0x55; 32]) // TCK-00326
-            .context_pack_hash([0x66; 32])        // TCK-00326
+            .capability_manifest_hash([0x55; 32]) // RFC-0032::REQ-0119
+            .context_pack_hash([0x66; 32])        // RFC-0032::REQ-0119
             .build()
             .expect("should create result");
 
@@ -2429,8 +2429,8 @@ mod tests {
             .review_text_hash([0x66; 32])
             .time_envelope_ref([0x77; 32])
             .reviewer_actor_id("reviewer-002")
-            .capability_manifest_hash([0x88; 32]) // TCK-00326
-            .context_pack_hash([0x99; 32])        // TCK-00326
+            .capability_manifest_hash([0x88; 32]) // RFC-0032::REQ-0119
+            .context_pack_hash([0x99; 32])        // RFC-0032::REQ-0119
             .metadata(metadata)
             .build()
             .expect("should create result");
@@ -2447,7 +2447,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00318: Workspace apply implementation tests
+    // RFC-0032::REQ-0112: Workspace apply implementation tests
     // =========================================================================
 
     #[test]
@@ -2756,7 +2756,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00318: Security validation tests for commit_ref injection
+    // RFC-0032::REQ-0112: Security validation tests for commit_ref injection
     // =========================================================================
 
     #[test]
@@ -2830,7 +2830,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00318: Security validation tests for diff/manifest mismatch
+    // RFC-0032::REQ-0112: Security validation tests for diff/manifest mismatch
     // =========================================================================
 
     #[test]
@@ -2876,7 +2876,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00318: New security validation tests for PR #399 fixes
+    // RFC-0032::REQ-0112: New security validation tests for PR #399 fixes
     // =========================================================================
 
     /// BLOCKER FIX #1: Test symlink escape detection for Add operations via

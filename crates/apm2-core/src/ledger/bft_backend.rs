@@ -48,7 +48,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00189: BFT `LedgerBackend` Integration
+//! - RFC-0033::REQ-0050: BFT `LedgerBackend` Integration
 //! - DD-0002: `LedgerBackend` Trait Abstraction
 
 use std::collections::HashMap;
@@ -392,7 +392,7 @@ pub enum BftLedgerError {
     /// This error is returned when an event's `schema_digest` is not registered
     /// in the schema registry. This is a fail-closed security posture: events
     /// with unknown schemas are rejected to prevent data corruption from schema
-    /// drift (DD-0004, TCK-00194).
+    /// drift (DD-0004, RFC-0033::REQ-0054).
     #[error("schema mismatch: digest {digest} is not registered")]
     SchemaMismatch {
         /// The hex-encoded schema digest that was not found.
@@ -442,13 +442,13 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// Whether consensus is enabled.
     consensus_enabled: Arc<RwLock<bool>>,
 
-    /// Optional schema registry for `schema_digest` validation (TCK-00194).
+    /// Optional schema registry for `schema_digest` validation (RFC-0033::REQ-0054).
     ///
     /// When present, events with `schema_digest` are validated against this
     /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
     schema_registry: Option<Arc<R>>,
 
-    /// Optional commit notification sender (TCK-00304: HEF Outbox).
+    /// Optional commit notification sender (RFC-0032::REQ-0100: HEF Outbox).
     ///
     /// When present, `on_commit()` sends a [`CommitNotification`] after each
     /// successful `tx.commit()` using `try_send()` for non-blocking delivery.
@@ -457,7 +457,7 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// Per DD-HEF-0007: Ledger append MUST NOT block on pulse fanout.
     commit_notification_sender: Option<super::CommitNotificationSender>,
 
-    /// Optional consensus metrics for recording notification drops (TCK-00304).
+    /// Optional consensus metrics for recording notification drops (RFC-0032::REQ-0100).
     ///
     /// When present, `on_commit()` and `append_eventual()` will increment the
     /// `hef_notification_drops` counter when notifications are dropped due to
@@ -481,7 +481,7 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
     }
 
     /// Creates a new BFT ledger backend with commit notification sender
-    /// (TCK-00304).
+    /// (RFC-0032::REQ-0100).
     ///
     /// Per DOD: "Accept sender at construction." This constructor accepts the
     /// optional sender at construction time for proper initialization.
@@ -524,7 +524,7 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
 }
 
 impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
-    /// Creates a new BFT ledger backend with schema validation (TCK-00194).
+    /// Creates a new BFT ledger backend with schema validation (RFC-0033::REQ-0054).
     ///
     /// Events with `schema_digest` set will be validated against the provided
     /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
@@ -544,7 +544,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     }
 
     /// Creates a new BFT ledger backend with schema validation and notification
-    /// sender (TCK-00194, TCK-00304).
+    /// sender (RFC-0033::REQ-0054, RFC-0032::REQ-0100).
     ///
     /// Per DOD: "Accept sender at construction." This constructor accepts both
     /// the schema registry and optional notification sender at construction
@@ -578,7 +578,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     }
 
     /// Sets the commit notification sender for HEF outbox integration
-    /// (TCK-00304).
+    /// (RFC-0032::REQ-0100).
     ///
     /// When set, `on_commit()` will send a [`super::CommitNotification`] via
     /// `try_send()` after each successful commit. This is non-blocking
@@ -591,7 +591,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         self.commit_notification_sender = Some(sender);
     }
 
-    /// Sets the consensus metrics for recording notification drops (TCK-00304).
+    /// Sets the consensus metrics for recording notification drops (RFC-0032::REQ-0100).
     ///
     /// When set, the `hef_notification_drops` counter will be incremented when
     /// notifications are dropped due to channel full.
@@ -643,7 +643,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     /// and waits for finalization. For `Eventual` events, this method writes
     /// directly to storage.
     ///
-    /// # Schema Validation (TCK-00194)
+    /// # Schema Validation (RFC-0033::REQ-0054)
     ///
     /// If the event has a `schema_digest` and a schema registry is configured,
     /// the digest is validated against the registry. Unknown schemas cause
@@ -671,7 +671,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         event: &EventRecord,
         metadata: &EventMetadata,
     ) -> Result<AppendResult, BftLedgerError> {
-        // TCK-00194: Schema validation (fail-closed for unknown schemas)
+        // RFC-0033::REQ-0054: Schema validation (fail-closed for unknown schemas)
         // This MUST happen before any storage operations to prevent events
         // with unknown schemas from entering the ledger.
         self.validate_schema_digest(event).await?;
@@ -693,7 +693,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         self.append_with_consensus(namespace, event, metadata).await
     }
 
-    /// Validates an event's `schema_digest` against the registry (TCK-00194).
+    /// Validates an event's `schema_digest` against the registry (RFC-0033::REQ-0054).
     ///
     /// # Fail-Closed Behavior
     ///
@@ -765,7 +765,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         // Compute event hash
         let event_hash = Self::compute_event_hash(&event_with_meta);
 
-        // TCK-00304: Send post-commit notification for HEF outbox
+        // RFC-0032::REQ-0100: Send post-commit notification for HEF outbox
         // This MUST happen AFTER storage.append() succeeds
         // Notification failure MUST NOT fail the ledger commit (best-effort)
         if let Some(sender) = &self.commit_notification_sender {
@@ -782,7 +782,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                     // Notification sent successfully
                 },
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Channel full: increment hef_notification_drops metric (TCK-00304)
+                    // Channel full: increment hef_notification_drops metric (RFC-0032::REQ-0100)
                     if let Some(metrics) = &self.metrics {
                         metrics.record_notification_drop();
                     }
@@ -997,7 +997,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                     index, // Actual index within block, not hardcoded 0
                 };
 
-                // TCK-00304: Send post-commit notification for HEF outbox
+                // RFC-0032::REQ-0100: Send post-commit notification for HEF outbox
                 // This MUST happen AFTER tx.commit() succeeds (storage.append is sync)
                 // Notification failure MUST NOT fail the ledger commit (best-effort)
                 if let Some(sender) = &self.commit_notification_sender {
@@ -1016,7 +1016,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                             // Notification sent successfully
                         },
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            // Channel full: increment hef_notification_drops metric (TCK-00304)
+                            // Channel full: increment hef_notification_drops metric (RFC-0032::REQ-0100)
                             if let Some(metrics) = &self.metrics {
                                 metrics.record_notification_drop();
                             }
@@ -1479,7 +1479,7 @@ mod tests {
     }
 }
 
-/// Tests for TCK-00189 acceptance criteria.
+/// Tests for RFC-0033::REQ-0050 acceptance criteria.
 #[cfg(test)]
 mod tck_00189_tests {
     use super::*;
@@ -1840,7 +1840,7 @@ mod security_fix_tests {
     }
 }
 
-/// Tests for TCK-00194: Schema validation in append path.
+/// Tests for RFC-0033::REQ-0054: Schema validation in append path.
 #[cfg(test)]
 mod tck_00194_schema_validation_tests {
     use bytes::Bytes;
@@ -2176,7 +2176,7 @@ mod tck_00194_schema_validation_tests {
     }
 }
 
-/// Tests for TCK-00304: Commit notification channel for HEF outbox.
+/// Tests for RFC-0032::REQ-0100: Commit notification channel for HEF outbox.
 #[cfg(test)]
 mod tck_00304_commit_notification_tests {
     use super::*;
@@ -2358,7 +2358,7 @@ mod tck_00304_commit_notification_tests {
         assert_eq!(
             super::super::COMMIT_NOTIFICATION_CHANNEL_CAPACITY,
             1024,
-            "Channel capacity should be 1024 per TCK-00304 spec"
+            "Channel capacity should be 1024 per RFC-0032::REQ-0100 spec"
         );
     }
 }

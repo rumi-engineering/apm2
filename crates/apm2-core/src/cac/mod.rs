@@ -67,9 +67,9 @@
 //!     "unevaluatedProperties": false
 //! });
 //!
-//! let artifact = json!({"id": "TCK-00132"});
+//! let artifact = json!({"id": "RFC-0011::REQ-0002"});
 //! let request = AdmissionRequest::new_artifact(
-//!     "dcp://org/project/ticket/TCK-00132",
+//!     "dcp://org/project/ticket/RFC-0011::REQ-0002",
 //!     ArtifactKind::Ticket,
 //!     artifact,
 //!     &schema,
@@ -112,14 +112,14 @@
 //!
 //! // Now register an artifact with a valid 64-character hex hash
 //! let entry = DcpEntry::new(
-//!     "org:ticket:TCK-00134",
+//!     "org:ticket:RFC-0011::REQ-0001",
 //!     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 //!     "org:schema:ticket-v1",
 //! );
 //! index.register(entry).unwrap();
 //!
 //! // Resolve returns the content hash
-//! let hash = index.resolve("org:ticket:TCK-00134");
+//! let hash = index.resolve("org:ticket:RFC-0011::REQ-0001");
 //! assert!(hash.is_some());
 //! ```
 //!

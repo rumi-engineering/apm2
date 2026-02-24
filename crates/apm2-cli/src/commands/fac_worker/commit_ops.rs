@@ -66,7 +66,7 @@ pub(super) fn save_broker_state(broker: &FacBroker) -> Result<(), String> {
     fs::write(&state_path, bytes).map_err(|e| format!("cannot write broker state: {e}"))
 }
 
-/// TCK-00566: Loads persisted token ledger from
+/// RFC-0032::REQ-0217: Loads persisted token ledger from
 /// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
 ///
 /// Returns `Ok(None)` if the file doesn't exist (first run).
@@ -117,7 +117,7 @@ pub(super) fn load_token_ledger(
     Ok(Some(ledger))
 }
 
-/// TCK-00566: Saves token ledger snapshot to
+/// RFC-0032::REQ-0217: Saves token ledger snapshot to
 /// `$APM2_HOME/private/fac/broker/token_ledger/state.json`.
 ///
 /// Uses `write_atomic` (`temp+fsync+dir_fsync+rename`) for crash safety
@@ -178,7 +178,7 @@ pub(super) fn save_token_ledger(broker: &mut FacBroker) -> Result<(), String> {
     Ok(())
 }
 
-/// TCK-00566: Appends a WAL entry to
+/// RFC-0032::REQ-0217: Appends a WAL entry to
 /// `$APM2_HOME/private/fac/broker/token_ledger/wal.jsonl`.
 ///
 /// Uses append mode with fsync for crash durability (INV-TL-010).
@@ -229,7 +229,7 @@ pub(super) fn emit_scan_receipt(
     moved_job_path: Option<&str>,
     reason: &str,
     canonicalizer_tuple_digest: &str,
-    // TCK-00538: Optional toolchain fingerprint for receipt provenance.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint for receipt provenance.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut builder = FacJobReceiptV1Builder::new(
@@ -246,7 +246,7 @@ pub(super) fn emit_scan_receipt(
     if let Some(path) = moved_job_path {
         builder = builder.moved_job_path(path);
     }
-    // TCK-00538: Bind toolchain fingerprint to scan receipt.
+    // RFC-0032::REQ-0194: Bind toolchain fingerprint to scan receipt.
     if let Some(fp) = toolchain_fingerprint {
         builder = builder.toolchain_fingerprint(fp);
     }
@@ -258,7 +258,7 @@ pub(super) fn emit_scan_receipt(
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
 
-    // TCK-00576: Best-effort signed envelope alongside scan receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside scan receipt.
     if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
         let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
         let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
@@ -316,9 +316,9 @@ pub(super) fn emit_job_receipt(
     containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
-    // TCK-00546 MAJOR-2: bytes_backend for GC tracking in non-pipeline paths.
+    // RFC-0032::REQ-0201 MAJOR-2: bytes_backend for GC tracking in non-pipeline paths.
     bytes_backend: Option<&str>,
-    // TCK-00538: Optional toolchain fingerprint.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
@@ -346,7 +346,7 @@ pub(super) fn emit_job_receipt(
 /// Emit a unified `FacJobReceiptV1` with observed runtime cost metrics.
 ///
 /// Note: Most callers have been migrated to `commit_claimed_job_via_pipeline`
-/// (TCK-00564 BLOCKER-1). This function is retained for future non-pipeline
+/// (RFC-0032::REQ-0215 BLOCKER-1). This function is retained for future non-pipeline
 /// receipt emission paths.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
@@ -367,9 +367,9 @@ pub(super) fn emit_job_receipt_with_observed_cost(
     observed_cost: apm2_core::economics::cost_model::ObservedJobCost,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
-    // TCK-00546 MAJOR-2: bytes_backend for GC tracking.
+    // RFC-0032::REQ-0201 MAJOR-2: bytes_backend for GC tracking.
     bytes_backend: Option<&str>,
-    // TCK-00538: Optional toolchain fingerprint.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     emit_job_receipt_internal(
@@ -397,7 +397,7 @@ pub(super) fn emit_job_receipt_with_observed_cost(
 /// Build a `FacJobReceiptV1` from the given parameters without persisting.
 ///
 /// This is the shared receipt construction logic used by both the direct
-/// persist path and the `ReceiptWritePipeline` commit path (TCK-00564).
+/// persist path and the `ReceiptWritePipeline` commit path (RFC-0032::REQ-0215).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_job_receipt(
     spec: &FacJobSpecV1,
@@ -415,13 +415,13 @@ pub(super) fn build_job_receipt(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
-    // TCK-00587: Optional stop/revoke admission trace for receipt binding.
+    // RFC-0032::REQ-0237: Optional stop/revoke admission trace for receipt binding.
     stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
-    // TCK-00546: Optional patch bytes backend identifier for GC tracking.
+    // RFC-0032::REQ-0201: Optional patch bytes backend identifier for GC tracking.
     bytes_backend: Option<&str>,
-    // TCK-00538: Optional toolchain fingerprint.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint.
     toolchain_fingerprint: Option<&str>,
-    // TCK-00640: Claimed lock continuity evidence markers.
+    // RFC-0032::REQ-0268: Claimed lock continuity evidence markers.
     claimed_lock_continuity_v1: Option<bool>,
     claimed_lock_acquired_at_epoch_ms: Option<u64>,
     claimed_lock_release_phase: Option<&str>,
@@ -463,7 +463,7 @@ pub(super) fn build_job_receipt(
     }
     if let Some(trace) = containment {
         builder = builder.containment(trace.clone());
-        // TCK-00572: Collect cgroup usage stats from the containment cgroup path.
+        // RFC-0032::REQ-0222: Collect cgroup usage stats from the containment cgroup path.
         // Best-effort: if stats cannot be read, observed_usage is None.
         if !trace.cgroup_path.is_empty() {
             let usage = apm2_core::fac::cgroup_stats::collect_cgroup_usage(&trace.cgroup_path);
@@ -475,19 +475,19 @@ pub(super) fn build_job_receipt(
     if let Some(cost) = observed_cost {
         builder = builder.observed_cost(cost);
     }
-    // TCK-00573: Bind sandbox hardening hash to receipt for audit.
+    // RFC-0032::REQ-0223: Bind sandbox hardening hash to receipt for audit.
     if let Some(hash) = sandbox_hardening_hash {
         builder = builder.sandbox_hardening_hash(hash);
     }
-    // TCK-00574: Bind network policy hash to receipt for audit.
+    // RFC-0032::REQ-0224: Bind network policy hash to receipt for audit.
     if let Some(hash) = network_policy_hash {
         builder = builder.network_policy_hash(hash);
     }
-    // TCK-00587: Bind stop/revoke admission trace to receipt for audit.
+    // RFC-0032::REQ-0237: Bind stop/revoke admission trace to receipt for audit.
     if let Some(trace) = stop_revoke_admission {
         builder = builder.stop_revoke_admission(trace.clone());
     }
-    // TCK-00546: Bind bytes_backend to receipt for GC tracking.
+    // RFC-0032::REQ-0201: Bind bytes_backend to receipt for GC tracking.
     if let Some(backend) = bytes_backend {
         builder = builder.bytes_backend(backend);
     }
@@ -524,9 +524,9 @@ pub(super) fn emit_job_receipt_internal(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
-    // TCK-00546 MAJOR-2: bytes_backend threaded through for GC tracking.
+    // RFC-0032::REQ-0201 MAJOR-2: bytes_backend threaded through for GC tracking.
     bytes_backend: Option<&str>,
-    // TCK-00538: Optional toolchain fingerprint.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, String> {
     let receipt = build_job_receipt(
@@ -546,8 +546,8 @@ pub(super) fn emit_job_receipt_internal(
         sandbox_hardening_hash,
         network_policy_hash,
         None,                  // stop_revoke_admission
-        bytes_backend,         // TCK-00546: bytes_backend
-        toolchain_fingerprint, // TCK-00538: toolchain fingerprint
+        bytes_backend,         // RFC-0032::REQ-0201: bytes_backend
+        toolchain_fingerprint, // RFC-0032::REQ-0194: toolchain fingerprint
         None,                  // claimed_lock_continuity_v1
         None,                  // claimed_lock_acquired_at_epoch_ms
         None,                  // claimed_lock_release_phase
@@ -573,7 +573,7 @@ pub(super) fn emit_job_receipt_internal(
         err
     })?;
 
-    // TCK-00576: Best-effort signed envelope alongside receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside receipt.
     if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
         let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
         let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
@@ -620,7 +620,7 @@ fn restore_terminal_job_to_pending_after_receipt_failure(
 }
 
 /// Commit a claimed job through the `ReceiptWritePipeline`: persist receipt,
-/// update index, move job atomically (TCK-00564 BLOCKER-1).
+/// update index, move job atomically (RFC-0032::REQ-0215 BLOCKER-1).
 ///
 /// Returns the terminal path of the moved job file, or a structured
 /// [`ReceiptPipelineError`] that preserves error specificity (including
@@ -646,11 +646,11 @@ pub(super) fn commit_claimed_job_via_pipeline(
     observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
     sandbox_hardening_hash: Option<&str>,
     network_policy_hash: Option<&str>,
-    // TCK-00587: Optional stop/revoke admission trace for receipt binding.
+    // RFC-0032::REQ-0237: Optional stop/revoke admission trace for receipt binding.
     stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
-    // TCK-00546: Optional patch bytes backend identifier for GC tracking.
+    // RFC-0032::REQ-0201: Optional patch bytes backend identifier for GC tracking.
     bytes_backend: Option<&str>,
-    // TCK-00538: Optional toolchain fingerprint for receipt binding.
+    // RFC-0032::REQ-0194: Optional toolchain fingerprint for receipt binding.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, ReceiptPipelineError> {
     commit_claimed_job_via_pipeline_impl(
@@ -815,7 +815,7 @@ fn commit_claimed_job_via_pipeline_impl(
     let pipeline =
         ReceiptWritePipeline::new(fac_root.join(FAC_RECEIPTS_DIR), queue_root.to_path_buf());
 
-    // TCK-00576: Attempt signed commit using the persistent broker key.
+    // RFC-0032::REQ-0226: Attempt signed commit using the persistent broker key.
     // If the signing key is available, persist a signed receipt envelope
     // alongside the receipt. If key loading fails, fall back to unsigned
     // commit (the receipt is still valid but will be treated as unsigned
@@ -871,7 +871,7 @@ fn commit_claimed_job_via_pipeline_impl(
         );
     }
 
-    // TCK-00669 fix (f-798-code_quality-1771810793166416-0): Dual-write
+    // RFC-0032::REQ-0275 fix (f-798-code_quality-1771810793166416-0): Dual-write
     // lifecycle emission is best-effort / advisory.  The filesystem pipeline
     // commit above is authoritative — a lifecycle emit failure must never
     // abort the terminal commit.  Warn-and-continue on any error.
@@ -969,7 +969,7 @@ fn lifecycle_failed_reason_class(
 /// `recover_torn_state`. If the receipt was not persisted, the orphan policy
 /// applies. Moving to `pending/` would cause the outcome-blind duplicate
 /// detection in `process_job` to route all receipted jobs to `completed/`,
-/// masking denied outcomes (TCK-00564 MAJOR-1 fix round 4).
+/// masking denied outcomes (RFC-0032::REQ-0215 MAJOR-1 fix round 4).
 pub(super) fn handle_pipeline_commit_failure(
     commit_err: &ReceiptPipelineError,
     context: &str,

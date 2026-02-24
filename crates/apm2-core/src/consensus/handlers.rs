@@ -42,7 +42,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00188: BFT Network Message Handlers
+//! - RFC-0033::REQ-0049: BFT Network Message Handlers
 //! - INV-0017: Control plane frames use fixed-size frames
 //! - INV-0018: Consensus messages are signed by sender
 //! - INV-0020: Control plane dispatch uses bounded jitter

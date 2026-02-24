@@ -2,7 +2,7 @@
 //! and emit `IndexCompactionReceiptV1`.
 //!
 //! This module implements bounded index retention policies for the receipt
-//! index (TCK-00583). The receipt index is a non-authoritative cache;
+//! index (RFC-0032::REQ-0233). The receipt index is a non-authoritative cache;
 //! compaction removes stale entries to keep disk and memory usage bounded while
 //! preserving the ability to rebuild from the authoritative receipt store.
 //!
@@ -26,7 +26,7 @@
 //! # Out of Scope
 //!
 //! Deleting receipts from the content-addressed store is forbidden by default
-//! (TCK-00583 out_of_scope).
+//! (RFC-0032::REQ-0233 out_of_scope).
 
 use std::collections::HashMap;
 use std::io::Write as _;

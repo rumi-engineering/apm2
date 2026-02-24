@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Attestation floor tightening by risk tier (TCK-00379).
+//! Attestation floor tightening by risk tier (RFC-0020::REQ-0033).
 //!
 //! This module enforces RFC-0020 Section 6.5 attestation tightening:
 //!

@@ -22,7 +22,7 @@
 //!
 //! # Time Model (RFC-0016 HTF Compliance Review)
 //!
-//! **TCK-00243 Review**: This module was reviewed for wall-clock time usage as
+//! **RFC-0016::REQ-0003 Review**: This module was reviewed for wall-clock time usage as
 //! part of RFC-0016 HTF compliance. **No wall-clock timing is used** in this
 //! module. All operations are purely deterministic transformations:
 //!
@@ -225,7 +225,7 @@ description: Description
         let doc = r"
 schema_version: '2024-01'
 ticket:
-  id: TCK-00110
+  id: RFC-0011::REQ-0029
   title: Implement determinism module
   status: READY
   implementation:

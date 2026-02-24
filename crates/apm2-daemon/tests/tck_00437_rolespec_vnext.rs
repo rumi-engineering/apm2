@@ -1,4 +1,4 @@
-//! TCK-00437: FAC RoleSpec vNext rollout validation for WorkObject execution.
+//! RFC-0032::REQ-0166: FAC RoleSpec vNext rollout validation for WorkObject execution.
 //!
 //! Cross-slice integration coverage:
 //! - RoleSpec vNext selected by authoritative hash.
@@ -452,7 +452,7 @@ fn tck_00437_rolespec_vnext_spawn_fails_closed_on_role_context_ambiguity() {
     let durable_cas = DurableCas::new(DurableCasConfig::new(cas_path))
         .expect("durable CAS should open for stale recipe injection");
     let stale_recipe = build_policy_context_pack_recipe(
-        "W-TCK-00437-LEGACY",
+        "W-RFC-0032::REQ-0166-LEGACY",
         "actor:legacy",
         stored_claim_b.policy_resolution.role_spec_hash,
         stored_claim_b.policy_resolution.context_pack_hash,
