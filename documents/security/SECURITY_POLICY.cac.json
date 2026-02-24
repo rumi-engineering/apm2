@@ -496,7 +496,7 @@
       "dependency_policies": [
         {
           "control_id": "SP-DEP-001",
-          "statement": "No known RustSec vulnerabilities are allowed without explicit mitigation or waiver workflow.",
+          "statement": "No known RustSec vulnerabilities are allowed without explicit mitigation.",
           "normative_level": "MUST",
           "surfaces": [
             "CI",
