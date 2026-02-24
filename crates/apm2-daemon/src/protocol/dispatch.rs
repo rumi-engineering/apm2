@@ -8727,6 +8727,10 @@ enum WorkIdResolutionMode {
     /// Require authoritative lease->work mapping and enforce hint equality
     /// when a `work_id_hint` is supplied.
     StrictLeaseMapping,
+    /// Require authoritative lease->work mapping and enforce hint equality,
+    /// but allow claim recovery by authoritative `work_id` when the specific
+    /// lease-scoped claim is unavailable.
+    StrictLeaseMappingAllowClaimFallback,
     /// Require authoritative lease->work mapping but ignore `work_id_hint`
     /// equality. Used for governance flows where a governing lease authorizes
     /// mutation of a different target work item (for example `OpenWork` and
@@ -10899,7 +10903,7 @@ impl PrivilegedDispatcher {
     ///
     /// If `work_id_hint` is provided, it must exactly match the authoritative
     /// lease->work mapping (constant-time comparison) when mode is
-    /// `StrictLeaseMapping`.
+    /// `StrictLeaseMapping` or `StrictLeaseMappingAllowClaimFallback`.
     ///
     /// Fail-closed behavior:
     /// - Missing lease->work mapping (and no valid hint) => Tier4, fallback
@@ -10996,7 +11000,7 @@ impl PrivilegedDispatcher {
                 "[{INV_FAC_WORK_BIND_001}] work_id missing for lease '{lease_id}'"
             ));
         };
-        if work_id_resolution_mode == WorkIdResolutionMode::StrictLeaseMapping
+        if work_id_resolution_mode != WorkIdResolutionMode::LeaseMappingOnly
             && let Some(hint) = work_id_hint
         {
             let hint_matches = hint.len() == work_id.len()
@@ -11008,12 +11012,24 @@ impl PrivilegedDispatcher {
                 ));
             }
         }
-        let Some(claim) = self.work_registry.get_claim_by_lease_id(&work_id, lease_id) else {
-            return Err(format!(
-                "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
+        let claim =
+            if let Some(claim) = self.work_registry.get_claim_by_lease_id(&work_id, lease_id) {
+                claim
+            } else if work_id_resolution_mode
+                == WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback
+            {
+                self.work_registry.get_claim(&work_id).ok_or_else(|| {
+                format!(
+                    "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
+                     '{work_id}'"
+                )
+            })?
+            } else {
+                return Err(format!(
+                    "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
                  '{work_id}'"
-            ));
-        };
+                ));
+            };
         let claim_work_matches = claim.work_id.len() == work_id.len()
             && bool::from(claim.work_id.as_bytes().ct_eq(work_id.as_bytes()));
         if !claim_work_matches {
@@ -18475,7 +18491,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
             changeset_digest,
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
         );
         if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
             warn!(
@@ -18493,7 +18509,7 @@ impl PrivilegedDispatcher {
         let claim_for_receipt = match self.resolve_authoritative_claim_binding(
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
         ) {
             Ok((_work_id, claim)) => claim,
             Err(error) => {
@@ -18761,7 +18777,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(authoritative_work_id.as_str()),
-                WorkIdResolutionMode::StrictLeaseMapping,
+                WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -18881,7 +18897,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
