@@ -16,9 +16,11 @@
 //! - Event chain: Verifies event sequence integrity
 
 use apm2_holon::episode::{EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome};
-use apm2_holon::ledger::{EpisodeCompletionReason, EpisodeEvent};
 use apm2_holon::resource::{Budget, Lease, LeaseScope};
-use apm2_holon::{Artifact, EpisodeContext, EpisodeResult, Holon, HolonError, StopCondition};
+use apm2_holon::{
+    Artifact, EpisodeCompletionReason, EpisodeContext, EpisodeEvent, EpisodeResult, Holon,
+    HolonError, StopCondition,
+};
 
 // ============================================================================
 // Test Holons
@@ -735,7 +737,7 @@ fn test_run_episode_loop_rejects_empty_work_id() {
 /// SECURITY TEST: Verify `run_episode_loop` rejects overly long `goal_spec`.
 #[test]
 fn test_run_episode_loop_rejects_long_goal_spec() {
-    use apm2_holon::ledger::MAX_GOAL_SPEC_LENGTH;
+    use apm2_holon::MAX_GOAL_SPEC_LENGTH;
 
     let controller =
         EpisodeController::new(EpisodeControllerConfig::default().with_emit_events(true));

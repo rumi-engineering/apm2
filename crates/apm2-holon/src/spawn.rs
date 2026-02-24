@@ -46,9 +46,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::episode::{EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome};
 use crate::error::HolonError;
-use crate::ledger::{
-    EpisodeEvent, EventHash, EventType, LedgerEvent, validate_goal_spec, validate_id,
-};
+use crate::ledger::{EpisodeEvent, validate_goal_spec, validate_id};
+#[cfg(feature = "legacy_holon_ledger")]
+use crate::ledger::{EventHash, EventType, LedgerEvent};
 use crate::resource::{Budget, Lease, LeaseScope};
 use crate::traits::Holon;
 use crate::work::WorkObject;
@@ -234,6 +234,11 @@ impl SpawnConfigBuilder {
 ///
 /// Contains the final work object state, outcome, emitted events, and
 /// any output produced.
+///
+/// **Legacy ledger events** (`events` field) are populated only when the
+/// `legacy_holon_ledger` feature is enabled. When disabled, `events` is
+/// always empty. New code should use `CoreLedgerWriter` for persistence
+/// and consume episode-level events via `episode_events`.
 #[derive(Debug, Clone)]
 pub struct SpawnResult<T> {
     /// The final work object state.
@@ -242,8 +247,12 @@ pub struct SpawnResult<T> {
     /// The outcome of the episode loop.
     pub outcome: SpawnOutcome,
 
-    /// Ledger events emitted during execution.
-    pub events: Vec<LedgerEvent>,
+    /// Legacy ledger events emitted during execution.
+    ///
+    /// **Populated only when the `legacy_holon_ledger` feature is enabled.**
+    /// When disabled, this is always an empty `Vec`. New code should use
+    /// `CoreLedgerWriter` for event persistence.
+    pub events: Vec<crate::ledger::LedgerEvent>,
 
     /// Episode events emitted during execution.
     pub episode_events: Vec<EpisodeEvent>,
@@ -388,6 +397,7 @@ const DEFAULT_LEASE_DURATION_NS: u64 = 3_600_000_000_000;
 /// SECURITY: This function MUST fail if serialization fails. Silently skipping
 /// events would violate the commitment property of the hash chain, allowing
 /// malformed or corrupted events to be excluded without detection.
+#[cfg(feature = "legacy_holon_ledger")]
 fn compute_episode_aggregate_hash(
     episode_events: &[EpisodeEvent],
 ) -> Result<EventHash, HolonError> {
@@ -420,6 +430,7 @@ fn compute_episode_aggregate_hash(
 /// # Algorithm
 ///
 /// `result = BLAKE3(chain_hash || episode_hash)`
+#[cfg(feature = "legacy_holon_ledger")]
 fn combine_hashes(chain_hash: EventHash, episode_hash: EventHash) -> EventHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(chain_hash.as_bytes());
@@ -531,42 +542,52 @@ where
     // Step 3: Transition work to Leased state
     work.transition_to_leased_at(&lease_id, start_ns)?;
 
-    // Collect ledger events
-    let mut events = Vec::new();
+    // ---------------------------------------------------------------
+    // Legacy ledger event construction (gated behind feature flag).
+    // When the `legacy_holon_ledger` feature is disabled the
+    // `CoreLedgerWriter` path should be used instead.
+    // ---------------------------------------------------------------
+    #[cfg(feature = "legacy_holon_ledger")]
+    let mut events: Vec<LedgerEvent> = Vec::new();
 
-    // Generate unique event IDs
+    #[cfg(feature = "legacy_holon_ledger")]
     let work_created_event_id = format!("{}-work-created", config.work_id);
+    #[cfg(feature = "legacy_holon_ledger")]
     let lease_issued_event_id = format!("{}-lease-issued", config.work_id);
 
-    // Emit work created event
-    let work_created_event = LedgerEvent::builder()
-        .event_id(&work_created_event_id)
-        .work_id(&config.work_id)
-        .holon_id(&config.holder_id)
-        .timestamp_ns(start_ns)
-        .event_type(EventType::WorkCreated {
-            title: config.work_title.clone(),
-        })
-        .previous_hash(EventHash::ZERO)
-        .build();
-    let work_created_hash = work_created_event.compute_hash();
-    events.push(work_created_event);
+    #[cfg(feature = "legacy_holon_ledger")]
+    let last_hash = {
+        // Emit work created event
+        let work_created_event = LedgerEvent::builder()
+            .event_id(&work_created_event_id)
+            .work_id(&config.work_id)
+            .holon_id(&config.holder_id)
+            .timestamp_ns(start_ns)
+            .event_type(EventType::WorkCreated {
+                title: config.work_title.clone(),
+            })
+            .previous_hash(EventHash::ZERO)
+            .build();
+        let work_created_hash = work_created_event.compute_hash();
+        events.push(work_created_event);
 
-    // Emit lease issued event
-    let lease_issued_event = LedgerEvent::builder()
-        .event_id(&lease_issued_event_id)
-        .work_id(&config.work_id)
-        .holon_id(&config.issuer_id)
-        .timestamp_ns(start_ns)
-        .event_type(EventType::LeaseIssued {
-            lease_id: lease_id.clone(),
-            holder_id: config.holder_id.clone(),
-            expires_at_ns,
-        })
-        .previous_hash(work_created_hash)
-        .build();
-    let last_hash = lease_issued_event.compute_hash();
-    events.push(lease_issued_event);
+        // Emit lease issued event
+        let lease_issued_event = LedgerEvent::builder()
+            .event_id(&lease_issued_event_id)
+            .work_id(&config.work_id)
+            .holon_id(&config.issuer_id)
+            .timestamp_ns(start_ns)
+            .event_type(EventType::LeaseIssued {
+                lease_id: lease_id.clone(),
+                holder_id: config.holder_id.clone(),
+                expires_at_ns,
+            })
+            .previous_hash(work_created_hash)
+            .build();
+        let h = lease_issued_event.compute_hash();
+        events.push(lease_issued_event);
+        h
+    };
 
     // Step 4: Call holon intake
     holon.intake(input, &lease_id)?;
@@ -607,8 +628,11 @@ where
     // SECURITY: If serialization fails, we fail the entire spawn operation.
     // This ensures the commitment property is maintained - no event can be
     // silently excluded from the hash chain.
-    let episode_aggregate_hash = compute_episode_aggregate_hash(&episode_events)?;
-    let execution_committed_hash = combine_hashes(last_hash, episode_aggregate_hash);
+    #[cfg(feature = "legacy_holon_ledger")]
+    let execution_committed_hash = {
+        let episode_aggregate_hash = compute_episode_aggregate_hash(&episode_events)?;
+        combine_hashes(last_hash, episode_aggregate_hash)
+    };
 
     // Step 7: Transition work to final state based on outcome
     let end_ns = clock();
@@ -618,42 +642,45 @@ where
         EpisodeLoopOutcome::Completed { .. } => {
             work.transition_to_completed_at(end_ns)?;
 
-            // Emit work completed event
-            // SECURITY: previous_hash now commits to execution history via
-            // execution_committed_hash
-            let completed_event_id = format!("{}-completed", config.work_id);
-            let completed_event = LedgerEvent::builder()
-                .event_id(&completed_event_id)
-                .work_id(&config.work_id)
-                .holon_id(&config.holder_id)
-                .timestamp_ns(end_ns)
-                .event_type(EventType::WorkCompleted {
-                    evidence_ids: Vec::new(),
-                })
-                .previous_hash(execution_committed_hash)
-                .build();
-            // Update hash for chain integrity (even if not used after this)
-            let _ = completed_event.compute_hash();
-            events.push(completed_event);
+            // Legacy ledger event emission (gated)
+            #[cfg(feature = "legacy_holon_ledger")]
+            {
+                let completed_event_id = format!("{}-completed", config.work_id);
+                let completed_event = LedgerEvent::builder()
+                    .event_id(&completed_event_id)
+                    .work_id(&config.work_id)
+                    .holon_id(&config.holder_id)
+                    .timestamp_ns(end_ns)
+                    .event_type(EventType::WorkCompleted {
+                        evidence_ids: Vec::new(),
+                    })
+                    .previous_hash(execution_committed_hash)
+                    .build();
+                let _ = completed_event.compute_hash();
+                events.push(completed_event);
+            }
         },
         EpisodeLoopOutcome::Escalated { reason, .. } => {
             work.transition_to_escalated_at(reason, end_ns)?;
 
-            // Emit work escalated event
-            let escalated_event_id = format!("{}-escalated", config.work_id);
-            let escalated_event = LedgerEvent::builder()
-                .event_id(&escalated_event_id)
-                .work_id(&config.work_id)
-                .holon_id(&config.holder_id)
-                .timestamp_ns(end_ns)
-                .event_type(EventType::WorkEscalated {
-                    to_holon_id: String::new(), // No specific target yet
-                    reason: reason.clone(),
-                })
-                .previous_hash(execution_committed_hash)
-                .build();
-            let _ = escalated_event.compute_hash();
-            events.push(escalated_event);
+            // Legacy ledger event emission (gated)
+            #[cfg(feature = "legacy_holon_ledger")]
+            {
+                let escalated_event_id = format!("{}-escalated", config.work_id);
+                let escalated_event = LedgerEvent::builder()
+                    .event_id(&escalated_event_id)
+                    .work_id(&config.work_id)
+                    .holon_id(&config.holder_id)
+                    .timestamp_ns(end_ns)
+                    .event_type(EventType::WorkEscalated {
+                        to_holon_id: String::new(), // No specific target yet
+                        reason: reason.clone(),
+                    })
+                    .previous_hash(execution_committed_hash)
+                    .build();
+                let _ = escalated_event.compute_hash();
+                events.push(escalated_event);
+            }
         },
         EpisodeLoopOutcome::Error {
             error, recoverable, ..
@@ -665,21 +692,24 @@ where
                 // Non-recoverable errors go to failed state
                 work.transition_to_failed_at(error, end_ns)?;
 
-                // Emit work failed event
-                let failed_event_id = format!("{}-failed", config.work_id);
-                let failed_event = LedgerEvent::builder()
-                    .event_id(&failed_event_id)
-                    .work_id(&config.work_id)
-                    .holon_id(&config.holder_id)
-                    .timestamp_ns(end_ns)
-                    .event_type(EventType::WorkFailed {
-                        reason: error.clone(),
-                        recoverable: *recoverable,
-                    })
-                    .previous_hash(execution_committed_hash)
-                    .build();
-                let _ = failed_event.compute_hash();
-                events.push(failed_event);
+                // Legacy ledger event emission (gated)
+                #[cfg(feature = "legacy_holon_ledger")]
+                {
+                    let failed_event_id = format!("{}-failed", config.work_id);
+                    let failed_event = LedgerEvent::builder()
+                        .event_id(&failed_event_id)
+                        .work_id(&config.work_id)
+                        .holon_id(&config.holder_id)
+                        .timestamp_ns(end_ns)
+                        .event_type(EventType::WorkFailed {
+                            reason: error.clone(),
+                            recoverable: *recoverable,
+                        })
+                        .previous_hash(execution_committed_hash)
+                        .build();
+                    let _ = failed_event.compute_hash();
+                    events.push(failed_event);
+                }
             }
         },
         EpisodeLoopOutcome::Blocked { reason, .. } => {
@@ -715,6 +745,12 @@ where
             }
         },
     }
+
+    // When `legacy_holon_ledger` is disabled, no LedgerEvent construction
+    // occurs. The `events` vec is empty; callers should use `CoreLedgerWriter`
+    // for the core-ledger path.
+    #[cfg(not(feature = "legacy_holon_ledger"))]
+    let events: Vec<crate::ledger::LedgerEvent> = Vec::new();
 
     Ok(SpawnResult {
         work,
@@ -853,6 +889,7 @@ mod unit_tests {
         assert!(result.work.lifecycle() == WorkLifecycle::InProgress);
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_spawn_holon_emits_events() {
         let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(1);
@@ -1177,6 +1214,7 @@ mod unit_tests {
 
     // =========================================================================
     // SECURITY TESTS: Hash Chain Integrity (Finding 2 - Disjoint Hash Chain)
+    // These tests depend on legacy LedgerEvent construction (gated).
     // =========================================================================
 
     /// SECURITY TEST: Verify `WorkCompleted` event's `previous_hash` depends on
@@ -1186,6 +1224,7 @@ mod unit_tests {
     /// Fix: Final lifecycle events now link to a combined hash that
     /// incorporates both the `LeaseIssued` hash and an aggregate of all
     /// episode events.
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_work_completed_hash_depends_on_execution_history() {
         // Run two spawns with the same configuration but different episode counts
@@ -1271,6 +1310,7 @@ mod unit_tests {
     }
 
     /// SECURITY TEST: Verify helper functions for hash chain commitment.
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_compute_episode_aggregate_hash_empty() {
         let hash = compute_episode_aggregate_hash(&[]).expect("empty list should not fail");
@@ -1280,6 +1320,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_compute_episode_aggregate_hash_deterministic() {
         use crate::ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeStarted};
@@ -1309,6 +1350,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_combine_hashes_deterministic() {
         let h1 = EventHash::from_bytes([1u8; 32]);
@@ -1323,6 +1365,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn test_combine_hashes_order_matters() {
         let h1 = EventHash::from_bytes([1u8; 32]);
@@ -1338,12 +1381,14 @@ mod unit_tests {
     }
 }
 
-#[cfg(test)]
+/// Integration tests for legacy ledger event emission.
+///
+/// These tests verify legacy `LedgerEvent` construction in `spawn_holon` and
+/// are gated behind the `legacy_holon_ledger` feature. When the feature is
+/// disabled, no `LedgerEvent` instances are constructed and the `events`
+/// field is always empty.
+#[cfg(all(test, feature = "legacy_holon_ledger"))]
 mod integration_tests {
-    //! Integration tests for `spawn_holon` with `MockHolon`.
-    //!
-    //! These tests verify the complete orchestration flow as specified
-    //! in TCK-00045 definition of done.
 
     use super::*;
     use crate::episode::EpisodeControllerConfig;

@@ -24,7 +24,8 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,ignore
+//! // NOTE: Requires `legacy_holon_ledger` feature.
 //! use apm2_holon::ledger::{EventHash, EventType, LedgerEvent};
 //!
 //! // Create a genesis event (first event in chain)
@@ -53,6 +54,12 @@
 //! // Verify the chain
 //! assert!(second.verify_previous(&genesis));
 //! ```
+
+// When the `legacy_holon_ledger` feature is disabled, legacy chain types
+// (`LedgerEvent`, `EventType`, `ChainError`, `verify_chain`, etc.) are not
+// re-exported and appear as dead code. The `EventHash` and `EventHashError`
+// types are always re-exported and used.
+#![allow(dead_code)]
 
 use std::fmt;
 
@@ -1040,7 +1047,8 @@ impl std::error::Error for ChainError {}
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
+/// // NOTE: Requires `legacy_holon_ledger` feature.
 /// use apm2_holon::ledger::{EventType, LedgerEvent, verify_chain};
 ///
 /// let genesis = LedgerEvent::builder()

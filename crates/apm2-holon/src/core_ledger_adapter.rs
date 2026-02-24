@@ -48,10 +48,16 @@
 //!   `deny_unknown_fields`.
 
 use std::fmt;
+// Core ledger types are available when the `core-ledger` feature is enabled.
+#[cfg(feature = "core-ledger")]
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "core-ledger")]
+use apm2_core::ledger::{EventRecord, LedgerBackend, LedgerError};
+use serde::{Deserialize, Serialize, de};
 use thiserror::Error;
 
+#[cfg(feature = "legacy_holon_ledger")]
 use crate::ledger::{EventType, LedgerEvent};
 use crate::orchestration::OrchestrationEvent;
 
@@ -241,6 +247,26 @@ impl fmt::Display for HexDigest {
     }
 }
 
+impl Serialize for HexDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for HexDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        // Validate format during deserialization (parse, don't validate).
+        Self::try_new(s, "hex_digest").map_err(|e| de::Error::custom(e.to_string()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Holon Event Envelope (wire format in core ledger payload)
 // ---------------------------------------------------------------------------
@@ -250,6 +276,17 @@ impl fmt::Display for HexDigest {
 /// This is the canonical JSON structure stored in `EventRecord.payload`.
 /// It carries the holon-specific payload plus metadata needed for replay
 /// and BFT-readiness.
+///
+/// **Security**: The `is_authority_event` status is NOT part of the wire
+/// format. It is computed dynamically from `event_kind` via
+/// [`HolonEventEnvelope::is_authority_event`] to prevent an attacker from
+/// crafting a payload that falsifies authority status and bypasses BFT
+/// finality checks.
+///
+/// **Parse, don't validate**: Digest fields use [`HexDigest`] which
+/// enforces format (64 lowercase hex chars) during deserialization.
+/// Downstream consumers can rely on the type system to guarantee digest
+/// format without additional runtime checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HolonEventEnvelope {
@@ -265,22 +302,69 @@ pub struct HolonEventEnvelope {
     /// BLAKE3 digest of the original holon ledger event hash, if available.
     /// Links back to the holon-local hash chain for migration verification.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub holon_event_hash: Option<String>,
+    pub holon_event_hash: Option<HexDigest>,
 
     /// CAS digest of any large artifact associated with this event.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_cas_digest: Option<String>,
+    pub artifact_cas_digest: Option<HexDigest>,
 
     /// Finality signal for BFT-readiness (HL-003).
     pub finality: FinalitySignal,
+}
 
-    /// Whether this event represents an authority decision that requires
-    /// BFT consensus when enabled.
-    pub is_authority_event: bool,
+impl HolonEventEnvelope {
+    /// Returns `true` if this event represents an authority decision that
+    /// requires BFT consensus when enabled.
+    ///
+    /// **Security**: This is computed dynamically from `event_kind`, NOT
+    /// deserialized from the wire payload, to prevent attackers from
+    /// falsifying authority status and bypassing BFT finality checks.
+    #[must_use]
+    pub fn is_authority_event(&self) -> bool {
+        is_authority_event_kind(&self.event_kind)
+    }
 }
 
 /// Current schema version for holon event envelopes.
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
+/// Known authority event kind strings.
+///
+/// An event kind is an authority event if it carries state that influences
+/// deterministic output or resource consumption. This includes:
+/// - Work lifecycle terminals (completed, failed, cancelled)
+/// - Work claims and escalation (binding leases to work)
+/// - Lease lifecycle (issuance, renewal, release, expiry)
+/// - Episode completion (execution outcomes and token usage)
+/// - Artifact emission (content hashes affecting replay)
+/// - Orchestration start and termination (budget allocation, terminal
+///   decisions)
+const AUTHORITY_EVENT_KINDS: &[&str] = &[
+    "work_claimed",
+    "work_completed",
+    "work_failed",
+    "work_cancelled",
+    "work_escalated",
+    "episode_completed",
+    "artifact_emitted",
+    "lease_issued",
+    "lease_renewed",
+    "lease_released",
+    "lease_expired",
+    "orchestration.started",
+    "orchestration.terminated",
+];
+
+/// Returns `true` if the given `event_kind` string represents an authority
+/// event that should go through BFT consensus when enabled.
+///
+/// **Fail-closed**: Only explicitly listed kinds return `true`. Any
+/// unknown or unrecognized kind returns `false`, preventing unknown event
+/// types from bypassing finality checks by claiming authority status.
+#[must_use]
+pub fn is_authority_event_kind(event_kind: &str) -> bool {
+    AUTHORITY_EVENT_KINDS.contains(&event_kind)
+}
 
 // ---------------------------------------------------------------------------
 // Event Type Mapping
@@ -289,6 +373,7 @@ pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
 /// Maps a holon `EventType` to its core ledger `event_type` string.
 ///
 /// The format is `holon.<snake_case_variant>`.
+#[cfg(feature = "legacy_holon_ledger")]
 #[must_use]
 pub fn holon_event_type_name(event_type: &EventType) -> String {
     format!("{HOLON_EVENT_PREFIX}{}", event_type.type_name())
@@ -316,6 +401,7 @@ pub fn orchestration_event_type_name(event: &OrchestrationEvent) -> String {
 /// - Lease lifecycle (issuance, renewal, release, expiry)
 /// - Episode completion (execution outcomes and token usage)
 /// - Artifact emission (content hashes that affect deterministic replay)
+#[cfg(feature = "legacy_holon_ledger")]
 #[must_use]
 pub const fn is_authority_event(event_type: &EventType) -> bool {
     matches!(
@@ -352,6 +438,9 @@ pub const fn is_orchestration_authority_event(event: &OrchestrationEvent) -> boo
 
 /// Constructs a [`HolonEventEnvelope`] from a holon [`LedgerEvent`].
 ///
+/// Only available when the `legacy_holon_ledger` feature is enabled,
+/// since it depends on the legacy `LedgerEvent` / `EventType` types.
+///
 /// # Errors
 ///
 /// Returns [`CoreLedgerAdapterError::Serialization`] if the event type
@@ -359,13 +448,13 @@ pub const fn is_orchestration_authority_event(event: &OrchestrationEvent) -> boo
 ///
 /// Returns [`CoreLedgerAdapterError::PayloadTooLarge`] if the serialized
 /// envelope exceeds `MAX_PAYLOAD_SIZE`.
+#[cfg(feature = "legacy_holon_ledger")]
 pub fn envelope_from_ledger_event(
     event: &LedgerEvent,
-    artifact_cas_digest: Option<String>,
+    artifact_cas_digest: Option<HexDigest>,
     finality: FinalitySignal,
 ) -> Result<(String, Vec<u8>), CoreLedgerAdapterError> {
     let event_type_str = holon_event_type_name(event.event_type());
-    let is_authority = is_authority_event(event.event_type());
 
     let payload_value = serde_json::to_value(event.event_type()).map_err(|e| {
         CoreLedgerAdapterError::Serialization(format!("event type serialization: {e}"))
@@ -374,7 +463,8 @@ pub fn envelope_from_ledger_event(
     let holon_hash = if event.compute_hash().is_zero() {
         None
     } else {
-        Some(event.compute_hash().to_hex())
+        let hex = event.compute_hash().to_hex();
+        Some(HexDigest::try_new(hex, "holon_event_hash")?)
     };
 
     let envelope = HolonEventEnvelope {
@@ -384,7 +474,6 @@ pub fn envelope_from_ledger_event(
         holon_event_hash: holon_hash,
         artifact_cas_digest,
         finality,
-        is_authority_event: is_authority,
     };
 
     let canonical_bytes = serde_jcs::to_vec(&envelope)
@@ -413,7 +502,6 @@ pub fn envelope_from_orchestration_event(
     finality: FinalitySignal,
 ) -> Result<(String, Vec<u8>), CoreLedgerAdapterError> {
     let event_type_str = orchestration_event_type_name(event);
-    let is_authority = is_orchestration_authority_event(event);
 
     let event_kind = match event {
         OrchestrationEvent::Started(_) => "orchestration.started",
@@ -432,7 +520,6 @@ pub fn envelope_from_orchestration_event(
         holon_event_hash: None,
         artifact_cas_digest: None,
         finality,
-        is_authority_event: is_authority,
     };
 
     let canonical_bytes = serde_jcs::to_vec(&envelope)
@@ -450,21 +537,18 @@ pub fn envelope_from_orchestration_event(
 
 /// Decodes a [`HolonEventEnvelope`] from core ledger payload bytes.
 ///
-/// After deserialization, validates that `holon_event_hash` and
-/// `artifact_cas_digest` (when present) are well-formed hex-encoded
-/// BLAKE3 digests (64 lowercase hex chars). This prevents path traversal
-/// sequences or pathological characters from propagating downstream.
+/// Digest fields (`holon_event_hash`, `artifact_cas_digest`) are
+/// validated intrinsically during deserialization because they use
+/// [`HexDigest`] which enforces the 64-lowercase-hex format in its
+/// `Deserialize` implementation. No separate validation step is needed.
 ///
 /// # Errors
 ///
 /// Returns [`CoreLedgerAdapterError::Serialization`] if the bytes cannot
-/// be deserialized.
+/// be deserialized (including malformed digest fields).
 ///
 /// Returns [`CoreLedgerAdapterError::PayloadTooLarge`] if the payload
 /// exceeds `MAX_PAYLOAD_SIZE`.
-///
-/// Returns [`CoreLedgerAdapterError::InvalidDigest`] if either digest
-/// field is present but malformed.
 pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerAdapterError> {
     if payload.len() > MAX_PAYLOAD_SIZE {
         return Err(CoreLedgerAdapterError::PayloadTooLarge {
@@ -476,14 +560,6 @@ pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerA
     let envelope: HolonEventEnvelope = serde_json::from_slice(payload).map_err(|e| {
         CoreLedgerAdapterError::Serialization(format!("envelope deserialization: {e}"))
     })?;
-
-    // Validate digest fields at the protocol boundary.
-    if let Some(ref hash) = envelope.holon_event_hash {
-        let _ = HexDigest::try_new(hash.clone(), "holon_event_hash")?;
-    }
-    if let Some(ref digest) = envelope.artifact_cas_digest {
-        let _ = HexDigest::try_new(digest.clone(), "artifact_cas_digest")?;
-    }
 
     Ok(envelope)
 }
@@ -514,7 +590,9 @@ pub fn inspect_replay_stats(envelopes: &[HolonEventEnvelope]) -> ReplayStats {
         if envelope.schema_version > max_schema_version {
             max_schema_version = envelope.schema_version;
         }
-        if envelope.is_authority_event {
+        // SECURITY: Authority status is computed from event_kind, not
+        // trusted from the wire payload. See HolonEventEnvelope docs.
+        if envelope.is_authority_event() {
             authority_count = authority_count.saturating_add(1);
             // Fail-closed: use is_final() (strict allowlist) rather than
             // !is_pending() which would pass unknown future variants.
@@ -552,19 +630,187 @@ pub struct ReplayStats {
 }
 
 // ---------------------------------------------------------------------------
+// CoreLedgerWriter (HL-001 / HL-003)
+// ---------------------------------------------------------------------------
+
+/// Writes holon events into the apm2-core ledger+CAS substrate.
+///
+/// This is the concrete event sink required by HL-001. It serializes
+/// events into [`HolonEventEnvelope`]s, encodes them as JCS bytes, and
+/// appends them as [`EventRecord`]s to the core ledger.
+///
+/// # BFT-readiness (HL-003)
+///
+/// Authority events carry an explicit [`FinalitySignal`]. The writer
+/// passes consensus metadata through to the `EventRecord` so that
+/// `BftLedgerBackend` can route authority events through consensus.
+/// The holon runtime MUST NOT assume local finality is permanent; it
+/// passes the signal explicitly, allowing the BFT layer to upgrade
+/// `Local` to `Finalized` later.
+///
+/// # Synchronization protocol
+///
+/// `CoreLedgerWriter` holds an `Arc<dyn LedgerBackend>` which is
+/// internally synchronized. The writer itself is `Send + Sync` and
+/// can be shared across tasks via `Arc`.
+#[cfg(feature = "core-ledger")]
+pub struct CoreLedgerWriter {
+    /// Core ledger backend for appending events.
+    backend: Arc<dyn LedgerBackend>,
+    /// Namespace for holon events in the core ledger (e.g., `"holon"`).
+    namespace: String,
+    /// Session ID for all events written by this writer.
+    session_id: String,
+    /// Actor ID (signer identity) for all events written by this writer.
+    actor_id: String,
+}
+
+#[cfg(feature = "core-ledger")]
+impl fmt::Debug for CoreLedgerWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreLedgerWriter")
+            .field("namespace", &self.namespace)
+            .field("session_id", &self.session_id)
+            .field("actor_id", &self.actor_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "core-ledger")]
+impl CoreLedgerWriter {
+    /// Creates a new writer bound to the given ledger backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - The core ledger backend (e.g., `SqliteLedgerBackend` or
+    ///   `BftLedgerBackend`).
+    /// * `namespace` - Namespace prefix for holon events (e.g., `"holon"`).
+    /// * `session_id` - Session ID for attribution.
+    /// * `actor_id` - Actor/signer identity for attribution.
+    #[must_use]
+    pub fn new(
+        backend: Arc<dyn LedgerBackend>,
+        namespace: impl Into<String>,
+        session_id: impl Into<String>,
+        actor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            backend,
+            namespace: namespace.into(),
+            session_id: session_id.into(),
+            actor_id: actor_id.into(),
+        }
+    }
+
+    /// Writes an orchestration event to the core ledger.
+    ///
+    /// The event is serialized into a [`HolonEventEnvelope`], encoded
+    /// as JCS bytes, and appended as an [`EventRecord`]. The
+    /// [`FinalitySignal`] is threaded through so that BFT-enabled
+    /// deployments can route authority events through consensus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreLedgerAdapterError::Serialization`] if serialization
+    /// fails, [`CoreLedgerAdapterError::PayloadTooLarge`] if the envelope
+    /// exceeds the size limit, or [`CoreLedgerAdapterError::LedgerError`]
+    /// if the ledger append fails.
+    pub async fn write_orchestration_event(
+        &self,
+        event: &OrchestrationEvent,
+        finality: FinalitySignal,
+        timestamp_ns: u64,
+    ) -> Result<u64, CoreLedgerAdapterError> {
+        let (event_type_str, canonical_bytes) = envelope_from_orchestration_event(event, finality)?;
+
+        let mut record = EventRecord::new(
+            &event_type_str,
+            &self.session_id,
+            &self.actor_id,
+            canonical_bytes,
+        );
+        record.timestamp_ns = timestamp_ns;
+
+        // Thread consensus metadata from FinalitySignal into EventRecord.
+        if let FinalitySignal::Finalized { epoch, round } = finality {
+            record.consensus_epoch = Some(epoch);
+            record.consensus_round = Some(round);
+        }
+        record.canonicalizer_id = Some("jcs".to_string());
+        record.canonicalizer_version = Some("rfc8785".to_string());
+
+        let seq_id = self
+            .backend
+            .append(&self.namespace, &record)
+            .await
+            .map_err(|e: LedgerError| CoreLedgerAdapterError::LedgerError(e.to_string()))?;
+
+        Ok(seq_id)
+    }
+
+    /// Writes a holon event (from legacy `LedgerEvent`) to the core ledger.
+    ///
+    /// Only available when both `core-ledger` and `legacy_holon_ledger`
+    /// features are enabled, since it bridges the legacy event types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreLedgerAdapterError`] on serialization, size, or
+    /// ledger append failure.
+    #[cfg(feature = "legacy_holon_ledger")]
+    pub async fn write_holon_event(
+        &self,
+        event: &LedgerEvent,
+        artifact_cas_digest: Option<HexDigest>,
+        finality: FinalitySignal,
+        timestamp_ns: u64,
+    ) -> Result<u64, CoreLedgerAdapterError> {
+        let (event_type_str, canonical_bytes) =
+            envelope_from_ledger_event(event, artifact_cas_digest, finality)?;
+
+        let mut record = EventRecord::new(
+            &event_type_str,
+            &self.session_id,
+            &self.actor_id,
+            canonical_bytes,
+        );
+        record.timestamp_ns = timestamp_ns;
+
+        if let FinalitySignal::Finalized { epoch, round } = finality {
+            record.consensus_epoch = Some(epoch);
+            record.consensus_round = Some(round);
+        }
+        record.canonicalizer_id = Some("jcs".to_string());
+        record.canonicalizer_version = Some("rfc8785".to_string());
+
+        let seq_id = self
+            .backend
+            .append(&self.namespace, &record)
+            .await
+            .map_err(|e: LedgerError| CoreLedgerAdapterError::LedgerError(e.to_string()))?;
+
+        Ok(seq_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "legacy_holon_ledger")]
     use crate::ledger::{EventType, LedgerEvent};
     use crate::orchestration::{OrchestrationEvent, OrchestrationStarted, OrchestrationTerminated};
 
     // -----------------------------------------------------------------------
-    // HL-001: Event type mapping
+    // HL-001: Event type mapping (legacy bridge)
+    // These tests use `holon_event_type_name` which requires the legacy
+    // feature.
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn event_type_mapping_produces_holon_prefix() {
         let et = EventType::WorkCreated {
@@ -575,9 +821,9 @@ mod tests {
         assert_eq!(name, "holon.work_created");
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn all_event_types_have_stable_discriminants() {
-        // Verify a representative sample of event types produce stable strings
         let cases: Vec<(EventType, &str)> = vec![
             (
                 EventType::WorkCreated { title: "t".into() },
@@ -652,9 +898,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // HL-001: Envelope construction and round-trip
+    // HL-001: Envelope construction and round-trip (legacy bridge)
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn envelope_round_trip_deterministic() {
         let event = LedgerEvent::builder()
@@ -676,7 +923,11 @@ mod tests {
         let envelope = decode_envelope(&payload).unwrap();
         assert_eq!(envelope.schema_version, ENVELOPE_SCHEMA_VERSION);
         assert_eq!(envelope.event_kind, "work_created");
-        assert!(!envelope.is_authority_event);
+        // Authority status is computed dynamically from event_kind.
+        assert!(
+            !envelope.is_authority_event(),
+            "work_created is not an authority event"
+        );
         assert!(envelope.finality.is_final());
 
         // Second serialization must produce identical bytes (deterministic)
@@ -688,8 +939,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
-    fn authority_events_flagged_correctly() {
+    fn authority_events_flagged_correctly_via_legacy_event_type() {
         let authority_types = vec![
             EventType::WorkClaimed {
                 lease_id: "l".into(),
@@ -774,6 +1026,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Authority event kind computation (dynamic, not from wire)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn authority_event_kind_computed_dynamically() {
+        // Authority kinds
+        assert!(is_authority_event_kind("work_claimed"));
+        assert!(is_authority_event_kind("work_completed"));
+        assert!(is_authority_event_kind("work_failed"));
+        assert!(is_authority_event_kind("work_cancelled"));
+        assert!(is_authority_event_kind("work_escalated"));
+        assert!(is_authority_event_kind("episode_completed"));
+        assert!(is_authority_event_kind("artifact_emitted"));
+        assert!(is_authority_event_kind("lease_issued"));
+        assert!(is_authority_event_kind("lease_renewed"));
+        assert!(is_authority_event_kind("lease_released"));
+        assert!(is_authority_event_kind("lease_expired"));
+        assert!(is_authority_event_kind("orchestration.started"));
+        assert!(is_authority_event_kind("orchestration.terminated"));
+
+        // Non-authority kinds
+        assert!(!is_authority_event_kind("work_created"));
+        assert!(!is_authority_event_kind("work_progressed"));
+        assert!(!is_authority_event_kind("episode_started"));
+        assert!(!is_authority_event_kind("evidence_published"));
+        assert!(!is_authority_event_kind("budget_consumed"));
+        assert!(!is_authority_event_kind(
+            "orchestration.iteration_completed"
+        ));
+
+        // Fail-closed: unknown kinds are not authority
+        assert!(!is_authority_event_kind(""));
+        assert!(!is_authority_event_kind("malicious_fake_event"));
+    }
+
+    #[test]
+    fn envelope_computes_authority_from_event_kind_not_wire() {
+        // Construct an envelope with an authority event_kind
+        let envelope = HolonEventEnvelope {
+            schema_version: 1,
+            event_kind: "work_claimed".into(),
+            payload: serde_json::Value::Null,
+            holon_event_hash: None,
+            artifact_cas_digest: None,
+            finality: FinalitySignal::Local,
+        };
+        assert!(
+            envelope.is_authority_event(),
+            "work_claimed must be authority"
+        );
+
+        // Construct an envelope with a non-authority event_kind
+        let envelope2 = HolonEventEnvelope {
+            schema_version: 1,
+            event_kind: "work_created".into(),
+            payload: serde_json::Value::Null,
+            holon_event_hash: None,
+            artifact_cas_digest: None,
+            finality: FinalitySignal::Local,
+        };
+        assert!(
+            !envelope2.is_authority_event(),
+            "work_created must not be authority"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SECURITY: attacker cannot bypass BFT finality via wire payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attacker_cannot_falsify_authority_status_via_wire() {
+        // Previously, is_authority_event was a wire field. Now it's
+        // computed. Verify that an envelope deserialized from bytes
+        // correctly identifies authority regardless of what was in the
+        // wire payload (the field no longer exists).
+        let json =
+            r#"{"schema_version":1,"event_kind":"work_completed","payload":{},"finality":"Local"}"#;
+        let envelope = decode_envelope(json.as_bytes()).unwrap();
+        assert!(
+            envelope.is_authority_event(),
+            "work_completed must always be authority, regardless of wire"
+        );
+
+        // Non-authority event kind
+        let json2 =
+            r#"{"schema_version":1,"event_kind":"work_created","payload":{},"finality":"Local"}"#;
+        let envelope2 = decode_envelope(json2.as_bytes()).unwrap();
+        assert!(
+            !envelope2.is_authority_event(),
+            "work_created is not authority"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // HL-003: BFT finality signals
     // -----------------------------------------------------------------------
 
@@ -801,6 +1148,7 @@ mod tests {
         assert!(!fs.is_pending());
     }
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn authority_event_carries_finality_in_envelope() {
         let event = LedgerEvent::builder()
@@ -821,7 +1169,7 @@ mod tests {
         .unwrap();
 
         let envelope = decode_envelope(&payload).unwrap();
-        assert!(envelope.is_authority_event);
+        assert!(envelope.is_authority_event());
         assert_eq!(
             envelope.finality,
             FinalitySignal::Finalized { epoch: 1, round: 3 }
@@ -829,9 +1177,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // HL-001: CAS digest embedding
+    // HL-001: CAS digest embedding (legacy bridge)
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn artifact_cas_digest_embedded_in_envelope() {
         let event = LedgerEvent::builder()
@@ -846,17 +1195,16 @@ mod tests {
             })
             .build();
 
-        // Use a valid 64-char hex digest for the CAS digest.
-        let cas_digest =
+        let cas_digest_str =
             "deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe".to_string();
+        let cas_digest = HexDigest::try_new(cas_digest_str.clone(), "test").unwrap();
         let (_, payload) =
-            envelope_from_ledger_event(&event, Some(cas_digest.clone()), FinalitySignal::Local)
-                .unwrap();
+            envelope_from_ledger_event(&event, Some(cas_digest), FinalitySignal::Local).unwrap();
 
         let envelope = decode_envelope(&payload).unwrap();
         assert_eq!(
-            envelope.artifact_cas_digest.as_deref(),
-            Some(cas_digest.as_str()),
+            envelope.artifact_cas_digest.as_ref().map(HexDigest::as_str),
+            Some(cas_digest_str.as_str()),
         );
     }
 
@@ -866,9 +1214,22 @@ mod tests {
 
     #[test]
     fn deny_unknown_fields_in_envelope() {
+        // `is_authority_event` was removed from the wire format and is now
+        // treated as an unknown field, which must be denied.
         let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"finality":"Local","is_authority_event":false,"unknown_field":"evil"}"#;
         let result: Result<HolonEventEnvelope, _> = serde_json::from_str(json);
         assert!(result.is_err(), "must deny unknown fields");
+    }
+
+    #[test]
+    fn deny_legacy_is_authority_event_field() {
+        // The old wire field `is_authority_event` must be rejected.
+        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"finality":"Local","is_authority_event":true}"#;
+        let result: Result<HolonEventEnvelope, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "must reject legacy is_authority_event field"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -877,7 +1238,6 @@ mod tests {
 
     #[test]
     fn rejects_oversized_payload() {
-        // Create a huge payload
         let huge = vec![0u8; MAX_PAYLOAD_SIZE + 1];
         let result = decode_envelope(&huge);
         assert!(matches!(
@@ -887,7 +1247,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Digest validation
+    // Digest validation (HexDigest type enforcement)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -929,33 +1289,36 @@ mod tests {
     }
 
     #[test]
+    fn hex_digest_serde_round_trip() {
+        let digest = HexDigest::try_new("a".repeat(64), "test").unwrap();
+        let json = serde_json::to_string(&digest).unwrap();
+        let decoded: HexDigest = serde_json::from_str(&json).unwrap();
+        assert_eq!(digest, decoded);
+    }
+
+    #[test]
+    fn hex_digest_deserialize_rejects_invalid() {
+        let json = r#""BADCAFE""#;
+        let result: Result<HexDigest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "serde must reject invalid hex digests");
+    }
+
+    #[test]
     fn decode_envelope_rejects_malformed_holon_event_hash() {
-        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"holon_event_hash":"BADCAFE","finality":"Local","is_authority_event":false}"#;
+        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"holon_event_hash":"BADCAFE","finality":"Local"}"#;
         let result = decode_envelope(json.as_bytes());
         assert!(
-            matches!(
-                result,
-                Err(CoreLedgerAdapterError::InvalidDigest {
-                    field: "holon_event_hash",
-                    ..
-                })
-            ),
+            result.is_err(),
             "should reject malformed holon_event_hash: {result:?}"
         );
     }
 
     #[test]
     fn decode_envelope_rejects_malformed_artifact_cas_digest() {
-        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"artifact_cas_digest":"../../etc/passwd","finality":"Local","is_authority_event":false}"#;
+        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"artifact_cas_digest":"../../etc/passwd","finality":"Local"}"#;
         let result = decode_envelope(json.as_bytes());
         assert!(
-            matches!(
-                result,
-                Err(CoreLedgerAdapterError::InvalidDigest {
-                    field: "artifact_cas_digest",
-                    ..
-                })
-            ),
+            result.is_err(),
             "should reject path-traversal in artifact_cas_digest: {result:?}"
         );
     }
@@ -964,14 +1327,14 @@ mod tests {
     fn decode_envelope_accepts_valid_digests() {
         let valid_hash = "a".repeat(64);
         let json = format!(
-            r#"{{"schema_version":1,"event_kind":"test","payload":{{}},"holon_event_hash":"{valid_hash}","artifact_cas_digest":"{valid_hash}","finality":"Local","is_authority_event":false}}"#,
+            r#"{{"schema_version":1,"event_kind":"test","payload":{{}},"holon_event_hash":"{valid_hash}","artifact_cas_digest":"{valid_hash}","finality":"Local"}}"#,
         );
         let result = decode_envelope(json.as_bytes());
         assert!(result.is_ok(), "should accept valid 64-char hex digests");
     }
 
     // -----------------------------------------------------------------------
-    // Replay statistics (renamed from verify_replay_determinism)
+    // Replay statistics
     // -----------------------------------------------------------------------
 
     #[test]
@@ -984,7 +1347,6 @@ mod tests {
                 holon_event_hash: None,
                 artifact_cas_digest: None,
                 finality: FinalitySignal::Local,
-                is_authority_event: false,
             },
             HolonEventEnvelope {
                 schema_version: 1,
@@ -993,7 +1355,6 @@ mod tests {
                 holon_event_hash: None,
                 artifact_cas_digest: None,
                 finality: FinalitySignal::Finalized { epoch: 1, round: 1 },
-                is_authority_event: true,
             },
             HolonEventEnvelope {
                 schema_version: 1,
@@ -1002,7 +1363,6 @@ mod tests {
                 holon_event_hash: None,
                 artifact_cas_digest: None,
                 finality: FinalitySignal::Pending,
-                is_authority_event: true,
             },
         ];
 
@@ -1022,7 +1382,6 @@ mod tests {
             holon_event_hash: None,
             artifact_cas_digest: None,
             finality: FinalitySignal::Local,
-            is_authority_event: true,
         }];
 
         let result = inspect_replay_stats(&envelopes);
@@ -1048,7 +1407,7 @@ mod tests {
         assert_eq!(event_type, "holon.orchestration.started");
         let envelope = decode_envelope(&payload).unwrap();
         assert!(
-            envelope.is_authority_event,
+            envelope.is_authority_event(),
             "OrchestrationStarted carries budget allocation and must be authority"
         );
     }
@@ -1078,7 +1437,7 @@ mod tests {
 
         assert_eq!(event_type, "holon.orchestration.terminated");
         let envelope = decode_envelope(&payload).unwrap();
-        assert!(envelope.is_authority_event);
+        assert!(envelope.is_authority_event());
         assert!(envelope.finality.is_final());
     }
 
@@ -1088,15 +1447,14 @@ mod tests {
 
     #[test]
     fn jcs_produces_deterministic_output_across_field_order() {
-        // Construct the same envelope twice and verify byte equality
+        let digest = HexDigest::try_new("a".repeat(64), "test").unwrap();
         let envelope = HolonEventEnvelope {
             schema_version: 1,
             event_kind: "work_created".into(),
             payload: serde_json::json!({"title": "test", "z_field": 1, "a_field": 2}),
-            holon_event_hash: Some("a".repeat(64)),
+            holon_event_hash: Some(digest),
             artifact_cas_digest: None,
             finality: FinalitySignal::Local,
-            is_authority_event: false,
         };
 
         let bytes1 = serde_jcs::to_vec(&envelope).unwrap();
@@ -1105,7 +1463,6 @@ mod tests {
 
         // Verify JCS sorted keys in the output
         let output = String::from_utf8(bytes1).unwrap();
-        // JCS sorts keys lexicographically; verify key ordering
         let a_pos = output.find("\"a_field\"").unwrap();
         let z_pos = output.find("\"z_field\"").unwrap();
         assert!(
@@ -1115,9 +1472,146 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // HL-004: Reconstructibility — envelope contains enough data to fold state
+    // HL-004: Round-trip determinism (encode -> decode -> re-encode)
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn round_trip_encode_decode_reencode_is_deterministic() {
+        // Encode a sequence of events, decode back, and re-encode.
+        // Verify the re-encoded bytes match the original (deterministic
+        // round-trip).
+        let events = vec![
+            OrchestrationEvent::Started(OrchestrationStarted::new(
+                "orch-001", "work-001", 10, 100_000, 60_000, 1000,
+            )),
+            OrchestrationEvent::Terminated(OrchestrationTerminated::new(
+                "orch-001",
+                "work-001",
+                crate::orchestration::TerminationReason::Pass,
+                5,
+                1000,
+                500,
+                2000,
+            )),
+        ];
+
+        for event in &events {
+            let (event_type, original_bytes) =
+                envelope_from_orchestration_event(event, FinalitySignal::Local).unwrap();
+
+            // Decode
+            let decoded = decode_envelope(&original_bytes).unwrap();
+
+            // Re-encode from decoded envelope
+            let re_encoded = serde_jcs::to_vec(&decoded).unwrap();
+
+            assert_eq!(
+                original_bytes, re_encoded,
+                "round-trip must be deterministic for {event_type}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HL-004: Reconstructibility — decode from serialized envelope only
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_loss_reconstructibility() {
+        // Simulate "cache loss" by decoding from serialized bytes and
+        // verifying reconstruction produces the same envelope.
+        let event = OrchestrationEvent::Started(OrchestrationStarted::new(
+            "orch-001", "work-001", 10, 100_000, 60_000, 1000,
+        ));
+
+        let (_, bytes) = envelope_from_orchestration_event(&event, FinalitySignal::Local).unwrap();
+
+        // "Cache loss": decode from raw bytes only
+        let reconstructed = decode_envelope(&bytes).unwrap();
+
+        // Verify reconstruction is faithful
+        assert_eq!(reconstructed.schema_version, ENVELOPE_SCHEMA_VERSION);
+        assert_eq!(reconstructed.event_kind, "orchestration.started");
+        assert!(reconstructed.is_authority_event());
+        assert_eq!(reconstructed.finality, FinalitySignal::Local);
+
+        // Verify the reconstructed envelope re-serializes identically
+        let re_bytes = serde_jcs::to_vec(&reconstructed).unwrap();
+        assert_eq!(bytes, re_bytes);
+    }
+
+    #[test]
+    fn multi_event_sequence_round_trip_reconstructibility() {
+        // Create a sequence of events, encode them all, then reconstruct
+        // from just the serialized bytes and verify equivalence.
+        let digest = HexDigest::try_new("b".repeat(64), "test").unwrap();
+        let envelopes = vec![
+            HolonEventEnvelope {
+                schema_version: 1,
+                event_kind: "work_created".into(),
+                payload: serde_json::json!({"title": "Test work"}),
+                holon_event_hash: None,
+                artifact_cas_digest: None,
+                finality: FinalitySignal::Local,
+            },
+            HolonEventEnvelope {
+                schema_version: 1,
+                event_kind: "lease_issued".into(),
+                payload: serde_json::json!({"lease_id": "L-001", "holder_id": "H-001"}),
+                holon_event_hash: None,
+                artifact_cas_digest: Some(digest),
+                finality: FinalitySignal::Local,
+            },
+            HolonEventEnvelope {
+                schema_version: 1,
+                event_kind: "work_completed".into(),
+                payload: serde_json::json!({"evidence_ids": ["ev-001"]}),
+                holon_event_hash: None,
+                artifact_cas_digest: None,
+                finality: FinalitySignal::Finalized { epoch: 1, round: 3 },
+            },
+        ];
+
+        // Encode all envelopes
+        let serialized: Vec<Vec<u8>> = envelopes
+            .iter()
+            .map(|env| serde_jcs::to_vec(env).unwrap())
+            .collect();
+
+        // Reconstruct all from serialized bytes only (simulating cache loss)
+        let reconstructed: Vec<HolonEventEnvelope> = serialized
+            .iter()
+            .map(|bytes| decode_envelope(bytes).unwrap())
+            .collect();
+
+        // Verify each reconstructed envelope matches the original
+        assert_eq!(envelopes.len(), reconstructed.len());
+        for (original, restored) in envelopes.iter().zip(reconstructed.iter()) {
+            assert_eq!(original.schema_version, restored.schema_version);
+            assert_eq!(original.event_kind, restored.event_kind);
+            assert_eq!(original.holon_event_hash, restored.holon_event_hash);
+            assert_eq!(original.artifact_cas_digest, restored.artifact_cas_digest);
+            assert_eq!(original.finality, restored.finality);
+
+            // Re-encode and verify byte equality
+            let orig_bytes = serde_jcs::to_vec(original).unwrap();
+            let restored_bytes = serde_jcs::to_vec(restored).unwrap();
+            assert_eq!(orig_bytes, restored_bytes);
+        }
+
+        // Verify replay stats match
+        let original_stats = inspect_replay_stats(&envelopes);
+        let restored_stats = inspect_replay_stats(&reconstructed);
+        assert_eq!(original_stats, restored_stats);
+        assert_eq!(original_stats.event_count, 3);
+        assert_eq!(original_stats.authority_count, 2); // lease_issued + work_completed
+    }
+
+    // -----------------------------------------------------------------------
+    // HL-004: Reconstructibility — legacy bridge
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "legacy_holon_ledger")]
     #[test]
     fn envelope_preserves_original_holon_hash_for_migration() {
         let genesis = LedgerEvent::builder()
@@ -1130,7 +1624,6 @@ mod tests {
             })
             .build();
 
-        // The genesis event has a non-zero hash
         let hash = genesis.compute_hash();
         assert!(!hash.is_zero());
 
@@ -1138,9 +1631,11 @@ mod tests {
             envelope_from_ledger_event(&genesis, None, FinalitySignal::Local).unwrap();
         let envelope = decode_envelope(&payload).unwrap();
 
-        // The holon hash is preserved for cross-reference
         assert!(envelope.holon_event_hash.is_some());
-        assert_eq!(envelope.holon_event_hash.unwrap(), hash.to_hex());
+        assert_eq!(
+            envelope.holon_event_hash.as_ref().unwrap().as_str(),
+            hash.to_hex()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1163,5 +1658,55 @@ mod tests {
             let decoded: FinalitySignal = serde_json::from_str(&json).unwrap();
             assert_eq!(signal, decoded, "round-trip failed for {signal:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CoreLedgerWriter integration test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn core_ledger_writer_writes_orchestration_event() {
+        use std::sync::Arc;
+
+        use apm2_core::ledger::{LedgerBackend, SqliteLedgerBackend};
+
+        let backend: Arc<dyn LedgerBackend> = Arc::new(SqliteLedgerBackend::in_memory().unwrap());
+
+        let writer =
+            CoreLedgerWriter::new(backend.clone(), "holon-test", "session-001", "actor-001");
+
+        let event = OrchestrationEvent::Started(OrchestrationStarted::new(
+            "orch-001", "work-001", 10, 100_000, 60_000, 1000,
+        ));
+
+        let seq_id = writer
+            .write_orchestration_event(
+                &event,
+                FinalitySignal::Finalized { epoch: 1, round: 2 },
+                5_000_000,
+            )
+            .await
+            .unwrap();
+
+        assert!(seq_id > 0, "event must be assigned a sequence ID");
+
+        // Read back and verify
+        let events: Vec<apm2_core::ledger::EventRecord> =
+            backend.read_from("holon-test", 0, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "holon.orchestration.started");
+        assert_eq!(events[0].session_id, "session-001");
+        assert_eq!(events[0].actor_id, "actor-001");
+        assert_eq!(events[0].consensus_epoch, Some(1));
+        assert_eq!(events[0].consensus_round, Some(2));
+
+        // Decode the payload and verify content
+        let envelope = decode_envelope(&events[0].payload).unwrap();
+        assert_eq!(envelope.event_kind, "orchestration.started");
+        assert!(envelope.is_authority_event());
+        assert_eq!(
+            envelope.finality,
+            FinalitySignal::Finalized { epoch: 1, round: 2 }
+        );
     }
 }
