@@ -90,6 +90,7 @@ ticket_meta:
     - "Direct receipt-emission paths now fail closed when receipt persistence fails after terminal move: denied/quarantined files are restored to `queue/pending` for reconcile-safe retry instead of remaining terminal-without-receipt."
     - "Push/work-current identity resolution now fail closed when branch-derived `TCK-*` alias is unresolved; implicit global active-work fallback is disabled to prevent cross-PR/work misbinding."
     - "Projection fallback for identity recovery is now explicit-only (`--lease-id`/`--session-id`) when no alias context is derivable."
+    - "Work projection replay now performs deterministic PR rebind migration from legacy non-ticket work IDs to canonical `W-TCK-*` work IDs, preventing projection rebuild failure under mixed historical associations."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
@@ -131,6 +132,7 @@ ticket_meta:
     - Terminal receipts produced from guarded commit paths include CLCK evidence fields required for continuity audit.
     - One-shot inline worker fallback cannot leak long-lived watcher/watchdog runtime primitives across retries.
     - PR association idempotency is robust to commit SHA case variants in both legacy and canonical ledger storage.
+    - Projection replay remains available (non-bricking) when historical ledgers contain legacy-to-canonical PR association migration events.
     - Fast-check phase fails before queued gates when FAC review machine-spec snapshot drift is present.
   notes:
     verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.

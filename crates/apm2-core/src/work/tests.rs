@@ -2383,6 +2383,49 @@ fn test_pr_number_uniqueness_enforced() {
 }
 
 #[test]
+fn test_pr_number_rebinds_from_legacy_to_canonical_ticket_work() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    let legacy_work_id = "W-439f2df5-4650-4632-9889-a39af6dae839";
+    let canonical_work_id = "W-TCK-00640";
+
+    setup_in_progress_work(&mut reducer, &ctx, legacy_work_id);
+    setup_in_progress_work(&mut reducer, &ctx, canonical_work_id);
+
+    let legacy_payload = helpers::work_pr_associated_payload(legacy_work_id, 803, "legacy_sha");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", legacy_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let canonical_payload =
+        helpers::work_pr_associated_payload(canonical_work_id, 803, "canonical_sha");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", canonical_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let legacy = reducer.state().get(legacy_work_id).unwrap();
+    assert_eq!(legacy.state, WorkState::Aborted);
+    assert_eq!(legacy.last_rationale_code, "pr_rebound_ticket_work_id");
+    assert!(
+        legacy
+            .abort_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(canonical_work_id))
+    );
+
+    let canonical = reducer.state().get(canonical_work_id).unwrap();
+    assert_eq!(canonical.pr_number, Some(803));
+    assert_eq!(canonical.commit_sha.as_deref(), Some("canonical_sha"));
+}
+
+#[test]
 fn test_pr_number_can_be_reused_after_terminal_state() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
