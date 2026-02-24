@@ -68,6 +68,7 @@ ticket_meta:
     - "Work status runtime-binding branch now uses clippy-clean `lease_id.is_empty()` guard ordering (no behavior change)."
     - "Worker claimed-lock handling now retains the lock through terminal queue transition to close TOCTOU re-claim races."
     - "`work.pr_associated` tuple uniqueness now normalizes commit SHA case via case-insensitive partial unique indexes for both legacy and canonical sqlite event tables."
+    - "Gates/warm pipeline-commit failures now stay fail-closed in `claimed/` for reconcile recovery (no authority-token requeue replay loops)."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
