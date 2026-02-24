@@ -28696,6 +28696,18 @@ mod tests {
                     timestamp_ns: 1_000_000_100,
                 })
                 .expect("transition Claimed->InProgress should persist");
+            // CSID-004: A published changeset must exist before the projection
+            // admits an InProgress -> Review transition (fail-closed guard).
+            dispatcher
+                .event_emitter
+                .emit_changeset_published(
+                    "W-REVIEW-STATE-001",
+                    &[0x42; 32],
+                    &[0xCA; 32],
+                    "actor:implementer",
+                    1_000_000_150,
+                )
+                .expect("changeset_published should persist");
             dispatcher
                 .event_emitter
                 .emit_work_transitioned(&WorkTransition {
