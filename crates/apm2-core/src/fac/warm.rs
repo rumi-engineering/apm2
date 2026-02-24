@@ -733,7 +733,7 @@ fn build_phase_command(
 /// When `containment` is `Some`, warm subprocesses are wrapped in `systemd-run`
 /// transient units with MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec constraints
 /// from the lane profile. This matches the containment model used by standard
-/// FAC bounded test execution (RFC-0032::REQ-0024/RFC-0032::REQ-0041). When
+/// FAC bounded test execution (`RFC-0032::REQ-0024/RFC-0032::REQ-0041`). When
 /// `None`, falls back
 /// to direct `Command::spawn` with a logged warning.
 ///
