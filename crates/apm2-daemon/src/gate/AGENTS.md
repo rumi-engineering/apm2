@@ -25,7 +25,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT01] `PolicyResolvedForChangeSet` MUST be emitted before any `GateLeaseIssued` event for the same `work_id`.
 - [INV-GT02] Maximum concurrent orchestrations bounded to `MAX_CONCURRENT_ORCHESTRATIONS` (1,000).
 - [INV-GT03] Maximum gate types per orchestration bounded to `MAX_GATE_TYPES` (8).
-- [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts).
+- [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts). Timeout authority is anchored to the wall-clock `GateLease.expires_at` field. Persisted monotonic timestamps (`observed_monotonic_ns`, `deadline_monotonic_ns`) are a process-local cache and MUST be rebased on load after daemon restart. Monotonic rewind does NOT trigger immediate timeout; only `lease.expires_at <= now_wall_ms` produces a legitimate timeout (TCK-00674).
 - [INV-GT05] Changeset digest in each lease matches the authoritative `ChangeSetPublished` digest.
 - [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). Session lifecycle timeout progression is polled via `poll_session_lifecycle`; there is no session-termination gate-start entrypoint.
 - [INV-GT13] Idempotency key is `(work_id, changeset_digest)`, a pure function of authoritative publication inputs (CSID-003).
@@ -133,3 +133,4 @@ Abstraction over GitHub merge operations for testability.
 - TCK-00388: Gate orchestrator implementation
 - TCK-00390: Merge executor implementation
 - TCK-00672: End-to-end changeset identity wiring (CSID-003 gate-start migration)
+- TCK-00674: Eliminate restart-induced mass timeouts by rebasing persisted monotonic deadlines

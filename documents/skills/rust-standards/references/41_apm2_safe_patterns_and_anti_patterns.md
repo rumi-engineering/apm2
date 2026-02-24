@@ -173,3 +173,19 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - REJECT IF: adding a field/variant does not update constructors, matches, serialization, and invariants.
 - REJECT IF: `match` expressions use `..` or default arms for structs/enums that appear in SCP boundaries (hides missing field handling).
 - ENFORCE BY: exhaustive matches (avoid `_ =>` for owned enums); clippy patterns; tests that construct and round-trip every variant; verify new fields are included in all comparison and serialization logic.
+
+### ANTI-4
+
+[HAZARD: RSK-2619] Persisted Monotonic Timestamps Treated as Durable Truth.
+- TRIGGER: storing `Instant`-derived nanosecond values (e.g. `monotonic_now_ns()`) in SQLite, files, or any storage that survives process restart.
+- FAILURE MODE: after daemon restart, `MONO_EPOCH` resets; persisted values appear to be far in the future relative to the new process epoch. Naive comparisons treat this rewind as a timeout or stale state, causing mass false timeouts, spurious denials, or cascade failures.
+- REJECT IF: persisted monotonic timestamps are compared against `monotonic_now_ns()` without an explicit rebase-on-load path.
+- REJECT IF: monotonic rewind (e.g. `persisted_observed > current_monotonic`) triggers irreversible actions (timeouts, denials, state transitions) without wall-clock validation.
+- ENFORCE BY:
+  - Treat persisted monotonic values as a **cache**, not a source of truth.
+  - On load, detect stale entries (`observed == 0`, `observed > now`, `deadline < observed`) and rebase using the authoritative wall-clock anchor (e.g. `GateLease.expires_at`).
+  - Rebase algorithm: `remaining_ms = expires_at.saturating_sub(now_wall_ms)`, `new_deadline = now_monotonic + remaining_ms * 1_000_000`.
+  - Fail-closed remains anchored to wall-clock expiry: `expires_at <= now_wall_ms` means `remaining_ms == 0`, so the entry is still timed out after rebase.
+  - Persist rebased values immediately (idempotent upsert) so future loads are consistent.
+- Grep anchors: `observed_monotonic_ns`, `deadline_monotonic_ns`, `MONO_EPOCH`, `monotonic_now_ns`.
+[PROVENANCE] TCK-00674; RS-40 (INV-2501, RSK-2503); gate_timeout_kernel.rs.

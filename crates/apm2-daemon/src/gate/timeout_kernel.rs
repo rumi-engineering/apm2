@@ -199,6 +199,15 @@ impl GateTimeoutIntent {
     }
 }
 
+/// Cached observation of a gate lease's timeout state.
+///
+/// **Monotonic time is process-local.** The `observed_monotonic_ns` and
+/// `deadline_monotonic_ns` fields are anchored to `MONO_EPOCH` which resets on
+/// daemon restart. These values MUST NOT be treated as durable truth. If
+/// persisted for caching (e.g. to `SQLite`), they MUST be rebased on load using
+/// the wall-clock `lease.expires_at` as the authoritative expiry signal.
+///
+/// See [`ObservedLeaseState::needs_rebase`] and [`ObservedLeaseState::rebase`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedLeaseState {
     lease: GateLease,
@@ -227,10 +236,46 @@ impl ObservedLeaseState {
         }
     }
 
-    const fn is_timed_out(&self, monotonic_now_ns: u64) -> bool {
-        if monotonic_now_ns < self.observed_monotonic_ns {
-            return true;
+    /// Returns true when the monotonic cache is stale and needs rebasing.
+    ///
+    /// Conditions that trigger rebase:
+    /// - `observed_monotonic_ns == 0 || deadline_monotonic_ns == 0` (legacy
+    ///   rows)
+    /// - `observed_monotonic_ns > now_monotonic_ns` (daemon restart / monotonic
+    ///   rewind)
+    /// - `deadline_monotonic_ns < observed_monotonic_ns` (corrupt row)
+    const fn needs_rebase(&self, now_monotonic_ns: u64) -> bool {
+        self.observed_monotonic_ns == 0
+            || self.deadline_monotonic_ns == 0
+            || self.observed_monotonic_ns > now_monotonic_ns
+            || self.deadline_monotonic_ns < self.observed_monotonic_ns
+    }
+
+    /// Rebases monotonic timestamps using wall-clock `lease.expires_at` as
+    /// the authoritative timeout source. Returns a new state with consistent
+    /// monotonic values anchored to the current process epoch.
+    ///
+    /// Fail-closed: if `lease.expires_at <= now_wall_ms`, `remaining_ms` is 0
+    /// and the deadline equals `now_monotonic_ns` (still timed out).
+    fn rebase(&self, now_wall_ms: u64, now_monotonic_ns: u64) -> Self {
+        let remaining_ms = self.lease.expires_at.saturating_sub(now_wall_ms);
+        let new_deadline = now_monotonic_ns.saturating_add(remaining_ms.saturating_mul(1_000_000));
+        Self {
+            lease: self.lease.clone(),
+            gate_type: self.gate_type,
+            observed_wall_ms: now_wall_ms,
+            observed_monotonic_ns: now_monotonic_ns,
+            deadline_monotonic_ns: new_deadline,
         }
+    }
+
+    /// Returns true when the lease has timed out according to the monotonic
+    /// deadline cache. Monotonic rewind does NOT cause an immediate timeout;
+    /// callers must rebase stale states before checking timeout.
+    const fn is_timed_out(&self, monotonic_now_ns: u64) -> bool {
+        // Note: we do NOT treat `monotonic_now_ns < observed_monotonic_ns` as
+        // timed out. Monotonic rewind indicates a daemon restart; the caller
+        // is responsible for rebasing stale entries before planning timeouts.
         monotonic_now_ns >= self.deadline_monotonic_ns
     }
 }
@@ -383,6 +428,7 @@ impl SqliteTimeoutObservedLeaseStore {
         let now_wall_ms = epoch_now_ms_u64();
         let now_monotonic_ns = monotonic_now_ns()?;
         let mut leases = HashMap::new();
+        let mut to_rebase: Vec<ObservedLeaseState> = Vec::new();
         for row in rows {
             let (
                 lease_id,
@@ -400,28 +446,78 @@ impl SqliteTimeoutObservedLeaseStore {
             let observed_wall_ms = u64::try_from(observed_wall_ms_i64).unwrap_or(now_wall_ms);
             let observed_monotonic_ns = u64::try_from(observed_monotonic_ns_i64).unwrap_or(0);
             let deadline_monotonic_ns = u64::try_from(deadline_monotonic_ns_i64).unwrap_or(0);
-            let state = if observed_monotonic_ns == 0 || deadline_monotonic_ns == 0 {
-                // Legacy rows did not persist monotonic state; fail-closed by
-                // making them immediately eligible for timeout.
-                ObservedLeaseState {
-                    lease,
-                    gate_type,
-                    observed_wall_ms: now_wall_ms,
-                    observed_monotonic_ns: now_monotonic_ns,
-                    deadline_monotonic_ns: now_monotonic_ns,
-                }
+            let raw_state = ObservedLeaseState {
+                lease,
+                gate_type,
+                observed_wall_ms,
+                observed_monotonic_ns,
+                deadline_monotonic_ns,
+            };
+            // Rebase monotonic cache if stale (legacy rows with zeros, restart
+            // rewind where persisted monotonic > current process monotonic, or
+            // corrupt rows where deadline < observed). Fail-closed remains
+            // anchored to `lease.expires_at`: if the lease has already expired
+            // per wall clock, remaining_ms == 0 and deadline == now (timed out).
+            let state = if raw_state.needs_rebase(now_monotonic_ns) {
+                let rebased = raw_state.rebase(now_wall_ms, now_monotonic_ns);
+                to_rebase.push(rebased.clone());
+                rebased
             } else {
-                ObservedLeaseState {
-                    lease,
-                    gate_type,
-                    observed_wall_ms,
-                    observed_monotonic_ns,
-                    deadline_monotonic_ns,
-                }
+                raw_state
             };
             leases.insert(lease_id, state);
         }
+        // Drop the statement/rows before persisting rebased entries, since we
+        // are still holding the connection guard.
+        drop(stmt);
+        // Persist rebased values so future loads are consistent. We use the
+        // already-acquired guard to avoid deadlock.
+        for rebased in &to_rebase {
+            Self::upsert_with_conn(&guard, rebased)?;
+        }
         Ok(leases)
+    }
+
+    /// Persist a rebased `ObservedLeaseState` using an already-acquired
+    /// connection guard, avoiding deadlock when called from `load_all`.
+    fn upsert_with_conn(conn: &Connection, state: &ObservedLeaseState) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        conn.execute(
+            "INSERT INTO gate_timeout_observed_leases
+             (lease_id, gate_type, lease_json, observed_wall_ms,
+              observed_monotonic_ns, deadline_monotonic_ns, updated_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(lease_id) DO UPDATE SET
+               gate_type = excluded.gate_type,
+               lease_json = excluded.lease_json,
+               observed_wall_ms = excluded.observed_wall_ms,
+               observed_monotonic_ns = excluded.observed_monotonic_ns,
+               deadline_monotonic_ns = excluded.deadline_monotonic_ns,
+               updated_at_ns = excluded.updated_at_ns",
+            params![
+                &state.lease.lease_id,
+                gate_type_label(state.gate_type),
+                serde_json::to_string(&state.lease)
+                    .map_err(|e| format!("failed to encode observed lease json: {e}"))?,
+                i64::try_from(state.observed_wall_ms).map_err(|_| {
+                    "observed lease wall-clock value exceeds i64 range".to_string()
+                })?,
+                i64::try_from(state.observed_monotonic_ns).map_err(|_| {
+                    "observed lease monotonic value exceeds i64 range".to_string()
+                })?,
+                i64::try_from(state.deadline_monotonic_ns).map_err(|_| {
+                    "observed lease monotonic deadline exceeds i64 range".to_string()
+                })?,
+                now_ns
+            ],
+        )
+        .map_err(|e| {
+            format!(
+                "failed to upsert observed lease '{}': {e}",
+                state.lease.lease_id
+            )
+        })?;
+        Ok(())
     }
 
     fn upsert(&self, state: &ObservedLeaseState) -> Result<(), String> {
@@ -727,6 +823,25 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
 
     async fn plan(&mut self) -> Result<Vec<GateTimeoutIntent>, Self::Error> {
         let monotonic_now_ns = monotonic_now_ns()?;
+        let now_wall_ms = epoch_now_ms_u64();
+
+        // Guard: scan for stale/corrupt monotonic entries and rebase them
+        // before generating timeout intents. This prevents a long-running
+        // daemon from being wedged by corrupted or rewind-affected rows.
+        let stale_keys: Vec<String> = self
+            .observed_leases
+            .iter()
+            .filter(|(_, state)| state.needs_rebase(monotonic_now_ns))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &stale_keys {
+            if let Some(state) = self.observed_leases.get(key) {
+                let rebased = state.rebase(now_wall_ms, monotonic_now_ns);
+                self.observed_lease_store.upsert(&rebased)?;
+                self.observed_leases.insert(key.clone(), rebased);
+            }
+        }
+
         let mut timed_out: Vec<GateTimeoutIntent> = self
             .observed_leases
             .values()
@@ -737,7 +852,7 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
             })
             .collect();
         timed_out.sort_by(|a, b| a.lease.lease_id.cmp(&b.lease.lease_id));
-        Ok(timed_out.into_iter().collect())
+        Ok(timed_out)
     }
 
     async fn execute(
@@ -2138,6 +2253,13 @@ fn epoch_now_ns_i64() -> Result<i64, String> {
         .map_err(|_| "current epoch timestamp exceeds i64 range".to_string())
 }
 
+/// Returns nanoseconds elapsed since the process-local monotonic epoch.
+///
+/// **Monotonic time is process-local.** `MONO_EPOCH` is initialized once via
+/// `OnceLock<Instant>` and resets on daemon restart. Values derived from this
+/// function MUST NOT be persisted as durable truth. If persisted for caching,
+/// they MUST be rebased on load using a wall-clock anchor (e.g.
+/// `GateLease.expires_at`). See `ObservedLeaseState::needs_rebase`.
 fn monotonic_now_ns() -> Result<u64, String> {
     static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = MONO_EPOCH.get_or_init(Instant::now);
@@ -2369,7 +2491,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_lease_state_timeout_is_monotonic_and_fail_closed_on_clock_reset() {
+    fn observed_lease_state_timeout_deadline_semantics() {
         let lease = sample_gate_lease("lease-mono-1", 1_500);
         let state = sample_observed_state(&lease, GateType::Quality, 1_000, 10_000, 20_000);
 
@@ -2381,10 +2503,98 @@ mod tests {
             state.is_timed_out(20_001),
             "monotonic now after deadline should timeout"
         );
+        // Monotonic rewind (e.g. daemon restart) does NOT produce immediate
+        // timeout. Callers must rebase stale entries before checking timeout.
         assert!(
-            state.is_timed_out(9_999),
-            "monotonic clock reset should fail closed"
+            !state.is_timed_out(9_999),
+            "monotonic clock rewind must not produce false timeout"
         );
+    }
+
+    #[test]
+    fn observed_lease_state_needs_rebase_detects_stale_entries() {
+        let lease = sample_gate_lease("lease-rebase-detect", 5_000);
+        let now_mono = 1_000_u64;
+
+        // Legacy rows: zero monotonic values
+        let legacy = sample_observed_state(&lease, GateType::Quality, 1_000, 0, 0);
+        assert!(
+            legacy.needs_rebase(now_mono),
+            "legacy rows with zero monotonic must need rebase"
+        );
+
+        // Restart rewind: persisted observed > current process monotonic
+        let rewind =
+            sample_observed_state(&lease, GateType::Quality, 1_000, 999_999_000, 999_999_500);
+        assert!(
+            rewind.needs_rebase(now_mono),
+            "persisted observed_monotonic > now must need rebase"
+        );
+
+        // Corrupt row: deadline < observed
+        let corrupt = sample_observed_state(&lease, GateType::Quality, 1_000, 500, 100);
+        assert!(
+            corrupt.needs_rebase(now_mono),
+            "deadline < observed must need rebase"
+        );
+
+        // Healthy state: no rebase needed
+        let healthy = sample_observed_state(&lease, GateType::Quality, 1_000, 500, 900);
+        assert!(
+            !healthy.needs_rebase(now_mono),
+            "healthy state must not need rebase"
+        );
+    }
+
+    #[test]
+    fn observed_lease_state_rebase_preserves_fail_closed_for_expired_lease() {
+        let now_wall_ms = epoch_now_ms_u64();
+        // Lease already expired
+        let expired_lease =
+            sample_gate_lease("lease-rebase-expired", now_wall_ms.saturating_sub(1));
+        let stale = sample_observed_state(
+            &expired_lease,
+            GateType::Quality,
+            1_000,
+            999_999_000,
+            999_999_500,
+        );
+        let now_mono = monotonic_now_ns().expect("monotonic clock should work in tests");
+
+        let rebased = stale.rebase(now_wall_ms, now_mono);
+
+        // remaining_ms is 0 because lease.expires_at <= now_wall_ms
+        assert_eq!(
+            rebased.deadline_monotonic_ns, now_mono,
+            "expired lease must have deadline == now (still timed out)"
+        );
+        assert!(
+            rebased.is_timed_out(now_mono),
+            "rebased expired lease must still be timed out"
+        );
+    }
+
+    #[test]
+    fn observed_lease_state_rebase_keeps_future_lease_alive() {
+        let now_wall_ms = epoch_now_ms_u64();
+        let future_expires = now_wall_ms + 60_000; // 60 seconds in the future
+        let lease = sample_gate_lease("lease-rebase-alive", future_expires);
+        let stale =
+            sample_observed_state(&lease, GateType::Quality, 1_000, 999_999_000, 999_999_500);
+        let now_mono = monotonic_now_ns().expect("monotonic clock should work in tests");
+
+        let rebased = stale.rebase(now_wall_ms, now_mono);
+
+        assert!(
+            rebased.deadline_monotonic_ns > now_mono,
+            "rebased future lease must have deadline in the future"
+        );
+        assert!(
+            !rebased.is_timed_out(now_mono),
+            "rebased future lease must not be timed out"
+        );
+        assert_eq!(rebased.observed_monotonic_ns, now_mono);
+        assert_eq!(rebased.observed_wall_ms, now_wall_ms);
     }
 
     #[tokio::test]
@@ -2566,5 +2776,152 @@ mod tests {
             },
             other => panic!("unexpected execution outcome: {other:?}"),
         }
+    }
+
+    /// GT-TIME-003: Simulates a daemon restart where persisted monotonic values
+    /// are far in the future compared to the current process monotonic clock.
+    /// Verifies that `load_all()` rebases the state and `is_timed_out()`
+    /// returns false when the wall-clock lease has not expired.
+    #[test]
+    fn test_observed_lease_store_sqlite_rebases_monotonic_after_restart() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        let store = SqliteTimeoutObservedLeaseStore::new(Arc::clone(&conn))
+            .expect("sqlite observed lease store init should succeed");
+
+        let now_wall_ms = epoch_now_ms_u64();
+        // Lease expires 120 seconds in the future — should NOT time out.
+        let future_expires = now_wall_ms + 120_000;
+        let lease = sample_gate_lease("lease-restart-rebase", future_expires);
+
+        // Simulate persisted values from a prior run: monotonic values far in
+        // the future relative to the current process epoch.
+        let stale_state = ObservedLeaseState {
+            lease,
+            gate_type: GateType::Quality,
+            observed_wall_ms: now_wall_ms.saturating_sub(60_000),
+            observed_monotonic_ns: 999_999_999_000,
+            deadline_monotonic_ns: 999_999_999_500,
+        };
+        store
+            .upsert(&stale_state)
+            .expect("upsert stale state should succeed");
+
+        // load_all() should detect the rewind and rebase.
+        let loaded = store.load_all().expect("load_all should succeed");
+        let rebased = loaded
+            .get("lease-restart-rebase")
+            .expect("lease should be present after load");
+
+        let now_mono = monotonic_now_ns().expect("monotonic clock should work");
+        // After rebase, deadline must be in the future (lease has not expired).
+        assert!(
+            rebased.deadline_monotonic_ns >= now_mono,
+            "rebased deadline must be >= now_monotonic (deadline={}, now={})",
+            rebased.deadline_monotonic_ns,
+            now_mono,
+        );
+        assert!(
+            !rebased.is_timed_out(now_mono),
+            "rebased lease with future expires_at must NOT be timed out"
+        );
+        // Observed values should be anchored to current process epoch.
+        assert!(
+            rebased.observed_monotonic_ns <= now_mono,
+            "rebased observed_monotonic must be <= now_monotonic"
+        );
+    }
+
+    /// GT-TIME-003: Inserts a legacy row (monotonic columns == 0) with
+    /// `expires_at` in the future. Verifies that `load_all()` rebases instead
+    /// of producing an immediate timeout.
+    #[test]
+    fn test_observed_lease_store_sqlite_legacy_rows_rebase_instead_of_immediate_timeout() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        let store = SqliteTimeoutObservedLeaseStore::new(Arc::clone(&conn))
+            .expect("sqlite observed lease store init should succeed");
+
+        let now_wall_ms = epoch_now_ms_u64();
+        // Lease expires 60 seconds in the future.
+        let future_expires = now_wall_ms + 60_000;
+        let lease = sample_gate_lease("lease-legacy-rebase", future_expires);
+
+        // Insert legacy row: monotonic columns are 0.
+        let legacy_state = ObservedLeaseState {
+            lease,
+            gate_type: GateType::Security,
+            observed_wall_ms: now_wall_ms.saturating_sub(10_000),
+            observed_monotonic_ns: 0,
+            deadline_monotonic_ns: 0,
+        };
+        store
+            .upsert(&legacy_state)
+            .expect("upsert legacy state should succeed");
+
+        // load_all() should rebase.
+        let loaded = store.load_all().expect("load_all should succeed");
+        let rebased = loaded
+            .get("lease-legacy-rebase")
+            .expect("lease should be present after load");
+
+        let now_mono = monotonic_now_ns().expect("monotonic clock should work");
+        // Legacy row should have been rebased, not left with zeros.
+        assert_ne!(
+            rebased.observed_monotonic_ns, 0,
+            "rebased legacy row must not have zero observed_monotonic_ns"
+        );
+        assert!(
+            rebased.deadline_monotonic_ns > now_mono,
+            "rebased legacy row with future expires_at must have deadline in the future (deadline={}, now={})",
+            rebased.deadline_monotonic_ns,
+            now_mono,
+        );
+        assert!(
+            !rebased.is_timed_out(now_mono),
+            "rebased legacy row with future expires_at must NOT be timed out"
+        );
+    }
+
+    /// GT-TIME-003: Verifies that an already-expired lease still times out
+    /// correctly even after rebase — fail-closed remains anchored to
+    /// `lease.expires_at`.
+    #[test]
+    fn test_observed_lease_store_sqlite_expired_lease_still_times_out_after_rebase() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        let store = SqliteTimeoutObservedLeaseStore::new(Arc::clone(&conn))
+            .expect("sqlite observed lease store init should succeed");
+
+        let now_wall_ms = epoch_now_ms_u64();
+        // Lease already expired 10 seconds ago.
+        let expired_at = now_wall_ms.saturating_sub(10_000);
+        let lease = sample_gate_lease("lease-expired-rebase", expired_at);
+
+        let stale_state = ObservedLeaseState {
+            lease,
+            gate_type: GateType::Quality,
+            observed_wall_ms: now_wall_ms.saturating_sub(60_000),
+            observed_monotonic_ns: 999_999_999_000,
+            deadline_monotonic_ns: 999_999_999_500,
+        };
+        store
+            .upsert(&stale_state)
+            .expect("upsert stale expired state should succeed");
+
+        let loaded = store.load_all().expect("load_all should succeed");
+        let rebased = loaded
+            .get("lease-expired-rebase")
+            .expect("lease should be present after load");
+
+        let now_mono = monotonic_now_ns().expect("monotonic clock should work");
+        // Expired lease: remaining_ms == 0, so deadline == now_monotonic.
+        assert!(
+            rebased.is_timed_out(now_mono),
+            "rebased expired lease must still be timed out"
+        );
     }
 }
