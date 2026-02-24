@@ -20435,8 +20435,20 @@ impl PrivilegedDispatcher {
             })?;
         let actor_id = derive_actor_id(peer_creds);
 
-        // Validate work_id exists in registry (fail-closed)
-        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+        // Validate `(work_id, lease_id)` claim binding using role-aware lookup.
+        // `WorkRegistry` is keyed by `(work_id, role)`, so role-agnostic
+        // `get_claim(work_id)` can select the wrong role when multiple claims
+        // exist. Resolve by lease_id first and fail closed on ambiguity.
+        let Some(claim) = self
+            .work_registry
+            .get_claim_by_lease_id(&request.work_id, &request.lease_id)
+        else {
+            if self.work_registry.get_claim(&request.work_id).is_some() {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    "lease_id does not match the active lease for this work claim",
+                ));
+            }
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::InvalidArgument,
                 format!("work_id not found in registry: {}", request.work_id),
@@ -21292,8 +21304,19 @@ impl PrivilegedDispatcher {
         };
         let actor_id = derive_actor_id(peer_creds);
 
-        // 4. Validate work_id exists in registry (fail-closed)
-        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+        // 4. Validate `(work_id, lease_id)` claim binding using role-aware
+        // lookup. `WorkRegistry` is keyed by `(work_id, role)` and
+        // role-agnostic `get_claim(work_id)` can select the wrong role.
+        let Some(claim) = self
+            .work_registry
+            .get_claim_by_lease_id(&request.work_id, &request.lease_id)
+        else {
+            if self.work_registry.get_claim(&request.work_id).is_some() {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    "lease_id does not match the active lease for this work claim",
+                ));
+            }
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("work_id not found in registry: {}", request.work_id),
@@ -34175,6 +34198,81 @@ mod tests {
             }
         }
 
+        #[test]
+        fn test_publish_work_context_entry_resolves_claim_by_lease_id_with_multi_role_claims() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let peer_creds = ctx.peer_credentials().expect("peer creds required");
+            let actor_id = derive_actor_id(peer_creds);
+            let work_id = "W-CTX-MULTI-ROLE-001";
+            let reviewer_lease = "lease-ctx-reviewer-001";
+            let implementer_lease = "lease-ctx-implementer-001";
+
+            // Register reviewer first so role-agnostic get_claim(work_id)
+            // would select the wrong claim if lease-aware resolution regresses.
+            let reviewer_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: reviewer_lease.to_string(),
+                actor_id: actor_id.clone(),
+                role: WorkRole::Reviewer,
+                policy_resolution: test_policy_resolution_with_lineage(
+                    work_id,
+                    &actor_id,
+                    WorkRole::Reviewer,
+                    0,
+                ),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(reviewer_claim)
+                .expect("register reviewer claim");
+
+            let implementer_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: implementer_lease.to_string(),
+                actor_id,
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution_with_lineage(
+                    work_id,
+                    &derive_actor_id(peer_creds),
+                    WorkRole::Implementer,
+                    0,
+                ),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(implementer_claim)
+                .expect("register implementer claim");
+
+            let entry_json = make_entry_json(work_id, "HANDOFF_NOTE", "key-multi-role-lease");
+            let request = PublishWorkContextEntryRequest {
+                work_id: work_id.to_string(),
+                kind: "HANDOFF_NOTE".to_string(),
+                dedupe_key: "key-multi-role-lease".to_string(),
+                entry_json,
+                lease_id: implementer_lease.to_string(),
+            };
+            let frame = encode_publish_work_context_entry_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC authority gate not wired"),
+                        "lease-aware claim lookup should pass pre-admission ownership checks and reach PCAC gate; got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected fail-closed PCAC error, got: {other:?}"),
+            }
+        }
+
         /// MAJOR regression: `effect_intent_digest` must bind to canonical
         /// bytes (post daemon-authoritative field overwrite), NOT to
         /// the raw client `entry_json`. Validates RFC-0027 Law 2
@@ -34725,6 +34823,74 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error for missing PCAC gate, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_record_work_pr_association_resolves_claim_by_lease_id_with_multi_role_claims() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+            let peer_creds = ctx.peer_credentials().expect("peer creds required");
+            let actor_id = derive_actor_id(peer_creds);
+            let work_id = "W-PR-MULTI-ROLE-001";
+            let reviewer_lease = "lease-pr-reviewer-001";
+            let implementer_lease = "lease-pr-implementer-001";
+
+            // Register reviewer first so role-agnostic lookups would select
+            // the wrong claim if lease-aware resolution regresses.
+            let reviewer_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: reviewer_lease.to_string(),
+                actor_id: actor_id.clone(),
+                role: WorkRole::Reviewer,
+                policy_resolution: test_policy_resolution_with_lineage(
+                    work_id,
+                    &actor_id,
+                    WorkRole::Reviewer,
+                    0,
+                ),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(reviewer_claim)
+                .expect("register reviewer claim");
+
+            let implementer_claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: implementer_lease.to_string(),
+                actor_id,
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution_with_lineage(
+                    work_id,
+                    &derive_actor_id(peer_creds),
+                    WorkRole::Implementer,
+                    0,
+                ),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(implementer_claim)
+                .expect("register implementer claim");
+
+            let request = make_request(work_id, 42, VALID_COMMIT_SHA, implementer_lease);
+            let frame = encode_frame(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("PCAC") && err.message.contains("fail-closed"),
+                        "lease-aware claim lookup should pass pre-admission ownership checks and reach PCAC gate; got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected fail-closed PCAC error, got: {other:?}"),
             }
         }
 

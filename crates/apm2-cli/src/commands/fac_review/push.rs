@@ -1787,6 +1787,24 @@ fn resolve_push_work_id_from_projection_fallback(
     select_push_fallback_work_id_from_list(&list_response.work_items, lease_filter, session_filter)
 }
 
+fn validate_explicit_ticket_alias_binding(
+    work_id: &str,
+    ticket_alias: &str,
+    resolved_work_id: Option<&str>,
+) -> Result<String, String> {
+    match resolved_work_id {
+        Some(resolved) if resolved == work_id => Ok(ticket_alias.to_string()),
+        Some(resolved) => Err(format!(
+            "`--work-id` mismatch: provided `{work_id}` but ticket alias \
+             `{ticket_alias}` resolved to `{resolved}`",
+        )),
+        None => Err(format!(
+            "ticket alias `{ticket_alias}` did not resolve to a canonical work_id; \
+             explicit `--ticket-alias` inputs are fail-closed"
+        )),
+    }
+}
+
 fn resolve_work_id_for_push(
     work_id_arg: Option<&str>,
     ticket_alias_arg: Option<&str>,
@@ -1811,19 +1829,12 @@ fn resolve_work_id_for_push(
         (Some(work_id), Some(ticket_alias)) => {
             validate_push_work_id(&work_id)?;
             let resolved_work_id = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)?;
-            if let Some(ref resolved_work_id) = resolved_work_id
-                && resolved_work_id != &work_id
-            {
-                return Err(format!(
-                    "`--work-id` mismatch: provided `{work_id}` but ticket alias \
-                     `{ticket_alias}` resolved to `{resolved_work_id}`",
-                ));
-            }
-            // Only persist ticket_alias when daemon projection authority
-            // verified it. Unverified aliases are never projected as
-            // authoritative identity bindings.
-            let verified_alias = resolved_work_id.map(|_| ticket_alias.to_string());
-            Ok((work_id, verified_alias))
+            let verified_alias = validate_explicit_ticket_alias_binding(
+                &work_id,
+                ticket_alias,
+                resolved_work_id.as_deref(),
+            )?;
+            Ok((work_id, Some(verified_alias)))
         },
         (Some(work_id), None) => {
             validate_push_work_id(&work_id)?;
@@ -1833,18 +1844,10 @@ fn resolve_work_id_for_push(
             if let Some(work_id) = resolve_ticket_alias_to_work_id(ticket_alias, operator_socket)? {
                 return Ok((work_id, Some(ticket_alias.to_string())));
             }
-            let fallback_work_id = resolve_push_work_id_from_projection_fallback(
-                operator_socket,
-                requested_lease_id.as_deref(),
-                requested_session_id.as_deref(),
-            )
-            .map_err(|fallback_err| {
-                format!(
-                    "ticket alias `{ticket_alias}` did not resolve to a canonical work_id and \
-                     projection fallback failed: {fallback_err}"
-                )
-            })?;
-            Ok((fallback_work_id, None))
+            Err(format!(
+                "ticket alias `{ticket_alias}` did not resolve to a canonical work_id; \
+                 explicit `--ticket-alias` inputs are fail-closed"
+            ))
         },
         (None, None) => match resolve_tck_id(branch, worktree_dir) {
             Ok(derived_alias) => {
@@ -3793,6 +3796,29 @@ mod tests {
         let parsed = parse_handoff_note(Some("  ready for review  "))
             .expect("non-empty handoff note should be accepted");
         assert_eq!(parsed.as_deref(), Some("ready for review"));
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_accepts_matching_resolution() {
+        let alias =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-12345678"))
+                .expect("matching alias resolution should be accepted");
+        assert_eq!(alias, "TCK-00640");
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_rejects_mismatched_resolution() {
+        let err =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-87654321"))
+                .expect_err("mismatched alias resolution must fail closed");
+        assert!(err.contains("`--work-id` mismatch"));
+    }
+
+    #[test]
+    fn validate_explicit_ticket_alias_binding_rejects_unresolved_alias() {
+        let err = validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", None)
+            .expect_err("unresolved explicit alias must fail closed");
+        assert!(err.contains("fail-closed"));
     }
 
     fn sample_daemon_work_item(
