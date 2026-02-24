@@ -705,10 +705,7 @@ fn is_legacy_work_transitioned_payload_shape(payload: &[u8], expected_work_id: &
         return false;
     };
 
-    if object.contains_key("session_id")
-        || object.contains_key("actor_id")
-        || object.contains_key("payload")
-    {
+    if object.contains_key("session_id") || object.contains_key("payload") {
         return false;
     }
 
@@ -1760,6 +1757,7 @@ mod tests {
             "W-legacy-001",
             serde_json::to_vec(&serde_json::json!({
                 "work_id": "W-legacy-001",
+                "actor_id": "actor:test-projection",
                 "from_state": "OPEN",
                 "to_state": "CLAIMED",
                 "previous_transition_count": 0
