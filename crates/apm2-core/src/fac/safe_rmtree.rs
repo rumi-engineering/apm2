@@ -657,14 +657,15 @@ fn maybe_repair_directory_mode_for_current_uid(
         return Ok(());
     }
 
-    // Handle-relative chmod via "." keeps the operation bound to this inode.
-    // Use `NoFollowSymlink` to fail closed if the final component ever
-    // resolves to a symlink.
+    // Apply mode repair relative to the previously-opened handle. We avoid
+    // `AT_SYMLINK_NOFOLLOW` because Linux rejects that flag for chmod-style
+    // operations (`EOPNOTSUPP`); safety is preserved because `dir_fd` was
+    // opened with `O_NOFOLLOW|O_DIRECTORY`.
     stat::fchmodat(
         dir_fd,
         Path::new("."),
         Mode::from_bits_truncate(repaired_mode),
-        stat::FchmodatFlags::NoFollowSymlink,
+        stat::FchmodatFlags::FollowSymlink,
     )
     .map_err(|err| {
         SafeRmtreeError::io(

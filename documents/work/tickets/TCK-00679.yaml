@@ -113,6 +113,9 @@ scope:
         via handle-relative operations and bounded traversal. Remaining work is
         hardening/verification:
           - preserve symlink refusal and ownership checks under race pressure
+          - preserve Linux portability by avoiding unsupported chmod flag usage
+            (`AT_SYMLINK_NOFOLLOW`/`NoFollowSymlink`) for directory mode repair
+            while still operating via an `O_NOFOLLOW|O_DIRECTORY` handle
           - keep global directory-scan and depth bounds enforced
           - maintain deterministic error surfaces for doctor/lane recovery flows
 
@@ -123,6 +126,7 @@ scope:
         verifies the lane recovers within 60s without manual intervention.
   requirement_clarifications:
     - "safe_rmtree pre-delete normalization must use handle-based directory operations (no symlink-following chmod path) and bounded traversal to prevent TOCTOU/DoS regressions."
+    - "Directory mode repair must remain Linux-compatible: no `fchmodat` nofollow flag combinations rejected by the kernel; safety comes from nofollow directory handles."
     - "Lane recovery must remain doctor-driven and deterministic under repeated crash/restart cycles."
 
   out_of_scope:
@@ -147,4 +151,5 @@ definition_of_done:
     - "Lane cleanup recovers from 0333-mode directories without manual chmod"
     - "doctor --fix succeeds on lanes corrupted by permission-denied tmp residue"
     - "No CORRUPT lanes after worker restart during active gate execution"
+    - "Directory mode normalization does not fail with `EOPNOTSUPP` on Linux kernels when repairing user-owned directories."
     - "Integration test: kill worker mid-gate, verify lane auto-recovers within 60s"

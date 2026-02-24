@@ -790,7 +790,7 @@ impl SqliteLedgerEventEmitter {
                  AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
                  GROUP BY work_id, \
                           json_extract(CAST(payload AS TEXT), '$.pr_number'), \
-                          json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                          lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
              ) AND event_type = 'work.pr_associated' \
              AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
              AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
@@ -809,6 +809,20 @@ impl SqliteLedgerEventEmitter {
                 work_id, \
                 json_extract(CAST(payload AS TEXT), '$.pr_number'), \
                 json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+             ) \
+             WHERE event_type = 'work.pr_associated' \
+             AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+             AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+            [],
+        )?;
+        // Case-insensitive tuple uniqueness to close mixed-case replay races
+        // against historical payloads and align with lower(...) tuple probes.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_pr_associated_unique_ci \
+             ON ledger_events( \
+                work_id, \
+                json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
              ) \
              WHERE event_type = 'work.pr_associated' \
              AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
@@ -927,7 +941,7 @@ impl SqliteLedgerEventEmitter {
                      AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL \
                      GROUP BY session_id, \
                               json_extract(CAST(payload AS TEXT), '$.pr_number'), \
-                              json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                              lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
                  ) AND event_type = 'work.pr_associated' \
                  AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
                  AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
@@ -946,6 +960,18 @@ impl SqliteLedgerEventEmitter {
                     session_id, \
                     json_extract(CAST(payload AS TEXT), '$.pr_number'), \
                     json_extract(CAST(payload AS TEXT), '$.commit_sha') \
+                 ) \
+                 WHERE event_type = 'work.pr_associated' \
+                 AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
+                 AND json_extract(CAST(payload AS TEXT), '$.commit_sha') IS NOT NULL",
+                [],
+            )?;
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_pr_associated_unique_ci \
+                 ON events( \
+                    session_id, \
+                    json_extract(CAST(payload AS TEXT), '$.pr_number'), \
+                    lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) \
                  ) \
                  WHERE event_type = 'work.pr_associated' \
                  AND json_extract(CAST(payload AS TEXT), '$.pr_number') IS NOT NULL \
@@ -9270,6 +9296,11 @@ mod tests {
                 .expect("canonical schema init should succeed");
             apm2_core::ledger::migrate_legacy_ledger_events(&guard)
                 .expect("legacy event migration should succeed");
+            // Re-run emitter schema init so canonical partial indexes (including
+            // case-insensitive work.pr_associated tuple uniqueness) are
+            // installed when `events` exists.
+            SqliteLedgerEventEmitter::init_schema_for_test(&guard)
+                .expect("schema re-init should install canonical indexes");
             emitter
                 .freeze_legacy_writes(&guard)
                 .expect("freeze should succeed");
@@ -9312,6 +9343,137 @@ mod tests {
             canonical_pr_number,
             &canonical_commit_sha.to_ascii_uppercase()
         ));
+    }
+
+    #[test]
+    fn tck_00639_work_pr_associated_unique_constraint_is_case_insensitive() {
+        let emitter = test_emitter();
+
+        let work_id = "W-PR-UNIQUE-CI-LEGACY-001";
+        let pr_number = 912_u64;
+        let commit_sha_lower = "dddddddddddddddddddddddddddddddddddddddd";
+        let commit_sha_upper = commit_sha_lower.to_ascii_uppercase();
+
+        let payload = apm2_core::work::helpers::work_pr_associated_payload(
+            work_id,
+            pr_number,
+            commit_sha_lower,
+        );
+        let envelope_lower = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": work_id,
+            "actor_id": "actor-legacy-ci",
+            "payload": hex::encode(payload),
+            "pr_number": pr_number,
+            "commit_sha": commit_sha_lower,
+        });
+        emitter
+            .emit_session_event_with_envelope(
+                work_id,
+                "work.pr_associated",
+                &envelope_lower,
+                "actor-legacy-ci",
+                3_000_000_000,
+            )
+            .expect("legacy lowercase tuple insert should succeed");
+
+        let payload_upper = apm2_core::work::helpers::work_pr_associated_payload(
+            work_id,
+            pr_number,
+            &commit_sha_upper,
+        );
+        let envelope_upper = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": work_id,
+            "actor_id": "actor-legacy-ci",
+            "payload": hex::encode(payload_upper),
+            "pr_number": pr_number,
+            "commit_sha": commit_sha_upper,
+        });
+        let legacy_duplicate = emitter.emit_session_event_with_envelope(
+            work_id,
+            "work.pr_associated",
+            &envelope_upper,
+            "actor-legacy-ci",
+            4_000_000_000,
+        );
+        assert!(
+            legacy_duplicate
+                .err()
+                .is_some_and(|err| err.to_string().contains("UNIQUE constraint")),
+            "legacy tuple with case-only commit variation must hit UNIQUE constraint"
+        );
+
+        {
+            let guard = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available");
+            apm2_core::ledger::init_canonical_schema(&guard)
+                .expect("canonical schema init should succeed");
+            apm2_core::ledger::migrate_legacy_ledger_events(&guard)
+                .expect("legacy event migration should succeed");
+            SqliteLedgerEventEmitter::init_schema_for_test(&guard)
+                .expect("schema re-init should install canonical indexes");
+            emitter
+                .freeze_legacy_writes(&guard)
+                .expect("freeze should succeed");
+        }
+
+        let canonical_work_id = "W-PR-UNIQUE-CI-CANONICAL-001";
+        let canonical_pr_number = 913_u64;
+        let canonical_commit_lower = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let canonical_commit_upper = canonical_commit_lower.to_ascii_uppercase();
+
+        let canonical_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_lower,
+        );
+        let canonical_envelope_lower = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical-ci",
+            "payload": hex::encode(canonical_payload),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_lower,
+        });
+        emitter
+            .emit_session_event_with_envelope(
+                canonical_work_id,
+                "work.pr_associated",
+                &canonical_envelope_lower,
+                "actor-canonical-ci",
+                5_000_000_000,
+            )
+            .expect("canonical lowercase tuple insert should succeed");
+
+        let canonical_payload_upper = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            &canonical_commit_upper,
+        );
+        let canonical_envelope_upper = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical-ci",
+            "payload": hex::encode(canonical_payload_upper),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_upper,
+        });
+        let canonical_duplicate = emitter.emit_session_event_with_envelope(
+            canonical_work_id,
+            "work.pr_associated",
+            &canonical_envelope_upper,
+            "actor-canonical-ci",
+            6_000_000_000,
+        );
+        assert!(
+            canonical_duplicate
+                .err()
+                .is_some_and(|err| err.to_string().contains("UNIQUE constraint")),
+            "canonical tuple with case-only commit variation must hit UNIQUE constraint"
+        );
     }
 
     /// Regression: `get_event_by_evidence_identity` on
