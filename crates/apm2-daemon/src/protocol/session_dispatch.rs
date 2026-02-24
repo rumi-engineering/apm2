@@ -141,6 +141,7 @@ use crate::episode::{
     CapabilityManifest, EpisodeId, EpisodeRuntime, SharedSessionBrokerRegistry, SharedToolBroker,
     ToolClass,
 };
+use crate::gate::GateOrchestrator;
 use crate::htf::{ClockError, HolonicClock};
 
 const RESERVED_DAEMON_EVENT_TYPE_PREFIXES: &[&str] = &[
@@ -1216,6 +1217,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// operations. It is separate from the session registry because
     /// `SessionState` must remain `Clone + Serialize + Deserialize`.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
+    /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`] (CSID-003). Session
+    /// termination only triggers timeout polling.
+    #[allow(dead_code)]
+    gate_orchestrator: Option<Arc<GateOrchestrator>>,
     /// Pre-actuation gate for stop/budget checks (TCK-00351).
     ///
     /// When set, every `RequestTool` invocation must pass through this gate
@@ -1473,6 +1481,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             episode_runtime: None,
             session_registry: None,
             telemetry_store: None,
+            gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
             stop_conditions_store: None,
@@ -1509,6 +1518,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             episode_runtime: None,
             session_registry: None,
             telemetry_store: None,
+            gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
             stop_conditions_store: None,
@@ -1550,6 +1560,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             episode_runtime: None,
             session_registry: None,
             telemetry_store: None,
+            gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
             stop_conditions_store: None,
@@ -1591,6 +1602,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             episode_runtime: None,
             session_registry: None,
             telemetry_store: None,
+            gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
             stop_conditions_store: None,
@@ -1648,6 +1660,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             episode_runtime: None,
             session_registry: None,
             telemetry_store: None,
+            gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
             stop_conditions_store: None,
@@ -1774,6 +1787,26 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ) -> Self {
         self.telemetry_store = Some(store);
         self
+    }
+
+    /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// When set, session termination via `ToolDecision::Terminate` triggers
+    /// gate orchestration. Events from the orchestrator are persisted to
+    /// the ledger through the dispatcher's `ledger` emitter.
+    /// Sets the gate orchestrator (builder pattern).
+    #[must_use]
+    pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
+        self.gate_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Sets the gate orchestrator on an already-constructed dispatcher.
+    ///
+    /// This is used by `DispatcherState::with_gate_orchestrator` to wire
+    /// the orchestrator after the session dispatcher has been built.
+    pub fn set_gate_orchestrator(&mut self, orchestrator: Arc<GateOrchestrator>) {
+        self.gate_orchestrator = Some(orchestrator);
     }
 
     /// Sets the pre-actuation gate for stop/budget checks (TCK-00351).
@@ -10117,6 +10150,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     store.remove(session_id);
                 }
 
+                // FAC vNext (TCK-00672): Session termination is lifecycle-only.
+                // Gate start orchestration is triggered authoritatively from
+                // `changeset_published` via the gate-start orchestrator-kernel
+                // pipeline.
+
                 // TCK-00307: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
                     if let Some(event_bytes) = refinement_event {
@@ -14761,6 +14799,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-DOWNGRADE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -14945,6 +14984,7 @@ mod tests {
             let governance_payload = serde_json::to_vec(
                 &crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 },
@@ -16827,6 +16867,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17011,6 +17052,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-TIMING".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17193,6 +17235,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17747,6 +17790,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -18481,6 +18525,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-001".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 1,
             })
@@ -18510,6 +18555,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-002".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 2,
             })
@@ -24697,6 +24743,7 @@ mod tests {
         ) {
             let payload = serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-emit".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash,
                 timestamp_ms: 1,
             })
@@ -27094,6 +27141,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash,
                     timestamp_ms: 1,
                 })

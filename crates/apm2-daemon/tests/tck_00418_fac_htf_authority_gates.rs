@@ -810,7 +810,7 @@ fn store_envelope_with_wall_ns(
 /// This test:
 /// 1. Creates a single shared `MemoryCas`.
 /// 2. Wires a `GateOrchestrator` with that CAS.
-/// 3. Triggers `start_for_changeset` which issues gate leases (storing
+/// 3. Triggers publication-driven start which issues gate leases (storing
 ///    `ClockProfile` and `TimeEnvelope` in the shared CAS).
 /// 4. Retrieves the issued lease via `gate_lease()`.
 /// 5. Wires a `PrivilegedDispatcher` with the SAME CAS.
@@ -819,7 +819,8 @@ fn store_envelope_with_wall_ns(
 ///    validation path does NOT fail with a CAS resolution error.
 #[tokio::test]
 async fn test_shared_cas_orchestrator_dispatcher_continuity() {
-    use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig, GateStartInfo, GateType};
+    use apm2_core::fac::ChangesetPublication;
+    use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig, GateType};
 
     // Step 1: Single shared CAS
     let shared_cas: Arc<dyn ContentAddressedStore> = Arc::new(MemoryCas::default());
@@ -832,23 +833,24 @@ async fn test_shared_cas_orchestrator_dispatcher_continuity() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer)
         .with_cas(Arc::clone(&shared_cas));
 
-    // Step 3: Trigger gate start => issues leases with CAS-backed
+    // Step 3: Trigger publication-driven start => issues leases with CAS-backed
     // time_envelope_ref.
-    // Use a recent timestamp to avoid stale-termination rejection.
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     let now_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
-    let info = GateStartInfo {
-        source_event_id: "sess-cas-test".to_string(),
+    let publication = ChangesetPublication {
         work_id: "W-CAS-CONTINUITY".to_string(),
         changeset_digest: [0x42; 32],
-        source_timestamp_ms: now_ms,
+        bundle_cas_hash: [0xAB; 32],
+        published_at_ms: now_ms,
+        publisher_actor_id: "actor:publisher".to_string(),
+        changeset_published_event_id: "evt-cas-test".to_string(),
     };
     let (_gate_types, _signers, events) = orch
-        .start_for_changeset(info)
+        .start_for_changeset(publication)
         .await
-        .expect("gate start should succeed");
+        .expect("publication start should succeed");
 
     // Sanity: at least one GateLeaseIssued event was emitted
     assert!(

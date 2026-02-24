@@ -1,9 +1,11 @@
-// AGENT-AUTHORED (TCK-00388)
+// AGENT-AUTHORED (TCK-00388, TCK-00672)
 //! Gate execution orchestrator implementation.
 //!
-//! Watches for `changeset_published` ledger events and autonomously drives
-//! the gate lifecycle: policy resolution -> lease issuance -> gate executor
-//! spawn -> receipt collection.
+//! Gate orchestration is publication-driven: the single authoritative
+//! entrypoint is [`GateOrchestrator::start_for_changeset`] which accepts a
+//! [`ChangesetPublication`] derived from an authoritative `ChangeSetPublished`
+//! ledger event. Session termination is a lifecycle-only signal used solely
+//! for timeout polling; it **never** starts new gate orchestrations.
 //!
 //! # Security Model
 //!
@@ -11,7 +13,8 @@
 //!   before any `GateLeaseIssued` event for the same `work_id`.
 //! - **Fail-closed**: Gate timeout produces FAIL verdict, blocking merge.
 //! - **Domain separation**: All leases use `GATE_LEASE_ISSUED:` prefix.
-//! - **Changeset binding**: Lease `changeset_digest` matches source input.
+//! - **Changeset binding**: Lease `changeset_digest` is bound to the
+//!   authoritative `ChangeSetPublished` digest, not session data.
 //! - **Receipt authenticity**: Gate receipt signatures are verified against the
 //!   executor's verifying key before state transitions.
 //!
@@ -22,7 +25,6 @@
 //! invocations could steal or drop events from a global buffer.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -30,9 +32,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
-    AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
-    PolicyInheritanceValidator, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
-    RiskTier,
+    AatLeaseExtension, ChangesetPublication, GateLease, GateLeaseBuilder, GateReceipt,
+    GateReceiptBuilder, PolicyInheritanceValidator, PolicyResolvedForChangeSet,
+    PolicyResolvedForChangeSetBuilder, RiskTier,
 };
 use apm2_core::htf::{
     BoundedWallInterval, Canonicalizable, ClockProfile, Hlc, LedgerTime, MonotonicReading,
@@ -72,10 +74,11 @@ pub const MAX_WORK_ID_LENGTH: usize = 4096;
 
 /// Maximum number of entries in the idempotency key store (Security MAJOR 1).
 ///
-/// Bounds the `seen_idempotency_keys` set to prevent unbounded memory growth
-/// over the process lifetime. When this limit is reached, the set is cleared
-/// (the active orchestrations map serves as the primary duplicate guard;
-/// the seen-keys set provides secondary coverage for the post-removal window).
+/// Bounds the `seen_idempotency_keys` deque to prevent unbounded memory growth
+/// over the process lifetime. When this limit is reached, the oldest half
+/// is evicted (the active orchestrations map serves as the primary duplicate
+/// guard; the seen-keys set provides secondary coverage for the post-removal
+/// window).
 ///
 /// 10 * `MAX_CONCURRENT_ORCHESTRATIONS` provides ample headroom for completed
 /// orchestrations that have been removed but whose keys should still be
@@ -135,8 +138,8 @@ impl Clock for SystemClock {
 
 /// Gate types that the orchestrator manages.
 ///
-/// Each starting changeset with associated work triggers execution of
-/// all required gate types.
+/// Each published changeset triggers execution of all required gate types
+/// via [`GateOrchestrator::start_for_changeset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum GateType {
     /// Agent Acceptance Testing gate.
@@ -253,57 +256,54 @@ pub struct GateOutcome {
 }
 
 // =============================================================================
-// Gate Start Info
+// Session Terminated Info
 // =============================================================================
 
-/// Information about a starting changeset that triggers gate orchestration.
+/// Information about a terminated session lifecycle event used by legacy
+/// session-seeded unit tests.
 ///
-/// This struct captures the data needed from a `changeset_published` event
-/// to drive the gate lifecycle.
+/// Production orchestration is publication-driven via
+/// [`GateOrchestrator::start_for_changeset`].
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct GateStartInfo {
-    /// Authoritative `changeset_published` event ID.
-    pub source_event_id: String,
-    /// The work ID associated with this changeset.
+pub struct SessionTerminatedInfo {
+    /// The session ID that terminated.
+    pub session_id: String,
+    /// The work ID associated with this session.
     pub work_id: String,
-    /// The changeset digest from the starting changeset.
+    /// The changeset digest from the terminated session.
     pub changeset_digest: [u8; 32],
-    /// Timestamp of gate start (milliseconds since epoch).
-    pub source_timestamp_ms: u64,
+    /// Timestamp of session termination (milliseconds since epoch).
+    pub terminated_at_ms: u64,
 }
 
 // =============================================================================
-// Idempotency Key (Security MAJOR 1)
+// Idempotency Key
 // =============================================================================
 
-/// Deterministic idempotency key computed from `work_id + changeset_digest`.
+/// Deterministic idempotency key computed from `(work_id, changeset_digest)`.
 ///
-/// Used to prevent replay of changeset-start events after restart. The key is
-/// persisted alongside the orchestration entry and enforced at the admission
-/// boundary.
+/// This is the authoritative gate-start idempotency tuple for publication-
+/// driven orchestration and is stable across replay/restart. It is a pure
+/// function of authoritative inputs from `ChangeSetPublished` and does not
+/// depend on session identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IdempotencyKey {
-    /// The work ID from the published changeset.
+    /// The work item bound to the publication.
     work_id: String,
-    /// The changeset digest from the starting changeset.
+    /// The canonical changeset digest from `ChangeSetPublished`.
     changeset_digest: [u8; 32],
 }
 
 impl IdempotencyKey {
-    /// Creates a new idempotency key from gate start info.
-    fn from_info(info: &GateStartInfo) -> Self {
+    /// Creates a new idempotency key from authoritative publication identity.
+    fn from_work_digest(work_id: &str, changeset_digest: [u8; 32]) -> Self {
         Self {
-            work_id: info.work_id.clone(),
-            changeset_digest: info.changeset_digest,
+            work_id: work_id.to_string(),
+            changeset_digest,
         }
     }
 }
-
-/// Maximum age of a gate-start event in milliseconds (1 hour).
-///
-/// Gate-start events older than this are rejected as stale to prevent
-/// replay attacks after restart (Security MAJOR 1).
-pub const MAX_SOURCE_EVENT_AGE_MS: u64 = 3_600_000;
 
 // =============================================================================
 // Error Types
@@ -437,27 +437,17 @@ pub enum GateOrchestratorError {
         reason: String,
     },
 
-    /// Replay detected: an orchestration with the same idempotency key
+    /// Replay detected: an orchestration with the same publication identity
     /// (`work_id` + `changeset_digest`) already exists or was previously
-    /// processed (Security MAJOR 1).
+    /// processed.
     #[error(
-        "replay detected for work_id={work_id}: an orchestration with the same idempotency key already exists"
+        "replay detected for work_id={work_id} changeset_digest={changeset_digest}: an orchestration with the same idempotency key already exists"
     )]
     ReplayDetected {
-        /// The work ID that was replayed.
-        work_id: String,
-    },
-
-    /// Stale gate-start event: `source_timestamp_ms` is too old to be accepted
-    /// (Security MAJOR 1).
-    #[error(
-        "stale gate-start event for work_id {work_id}: source_timestamp_ms={source_timestamp_ms} is older than freshness threshold"
-    )]
-    StaleSourceEvent {
         /// The work ID.
         work_id: String,
-        /// The stale timestamp.
-        source_timestamp_ms: u64,
+        /// Hex-encoded changeset digest.
+        changeset_digest: String,
     },
 
     /// Sublease validation failed during delegated lease issuance (TCK-00340).
@@ -489,6 +479,8 @@ pub enum GateOrchestratorEvent {
     PolicyResolved {
         /// The work ID.
         work_id: String,
+        /// The changeset digest this policy resolution is bound to.
+        changeset_digest: [u8; 32],
         /// The policy resolution hash.
         policy_hash: [u8; 32],
         /// Timestamp (ms since epoch).
@@ -504,6 +496,8 @@ pub enum GateOrchestratorEvent {
         lease_id: String,
         /// The executor actor ID.
         executor_actor_id: String,
+        /// The changeset digest this lease is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -517,6 +511,8 @@ pub enum GateOrchestratorEvent {
         episode_id: String,
         /// The adapter profile ID.
         adapter_profile_id: String,
+        /// The changeset digest this episode is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -530,6 +526,8 @@ pub enum GateOrchestratorEvent {
         receipt_id: String,
         /// Whether the gate passed.
         passed: bool,
+        /// The changeset digest this receipt is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -541,6 +539,8 @@ pub enum GateOrchestratorEvent {
         gate_type: GateType,
         /// The lease ID that expired.
         lease_id: String,
+        /// The changeset digest this timeout is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -555,6 +555,8 @@ pub enum GateOrchestratorEvent {
         gate_type: GateType,
         /// The receipt ID of the timeout receipt.
         receipt_id: String,
+        /// The changeset digest this timeout receipt is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -566,52 +568,63 @@ pub enum GateOrchestratorEvent {
         all_passed: bool,
         /// Individual gate outcomes.
         outcomes: Vec<GateOutcome>,
+        /// The changeset digest this completion is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
 }
 
-/// Canonical persistence metadata for a gate-orchestrator event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GateEventPersistenceFields {
-    /// Canonical ledger event type.
-    pub event_type: &'static str,
-    /// Event timestamp in nanoseconds since epoch.
-    pub timestamp_ns: u64,
-}
+impl GateOrchestratorEvent {
+    /// Returns the `work_id` from any event variant.
+    ///
+    /// Every variant carries a `work_id` field that identifies the work item
+    /// this event is bound to. This is used by the receipt writer to emit
+    /// events under the correct ledger `session_id` (which maps to `work_id`).
+    #[must_use]
+    pub fn work_id(&self) -> &str {
+        match self {
+            Self::PolicyResolved { work_id, .. }
+            | Self::GateLeaseIssued { work_id, .. }
+            | Self::GateExecutorSpawned { work_id, .. }
+            | Self::GateReceiptCollected { work_id, .. }
+            | Self::GateTimedOut { work_id, .. }
+            | Self::GateTimeoutReceiptGenerated { work_id, .. }
+            | Self::AllGatesCompleted { work_id, .. } => work_id,
+        }
+    }
 
-/// Maps an orchestrator event to canonical persistence fields.
-#[must_use]
-pub const fn gate_event_persistence_fields(
-    event: &GateOrchestratorEvent,
-) -> GateEventPersistenceFields {
-    let (event_type, timestamp_ms) = match event {
-        GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } => {
-            ("gate.policy_resolved", *timestamp_ms)
-        },
-        GateOrchestratorEvent::GateLeaseIssued { timestamp_ms, .. } => {
-            ("gate.lease_issued", *timestamp_ms)
-        },
-        GateOrchestratorEvent::GateExecutorSpawned { timestamp_ms, .. } => {
-            ("gate.executor_spawned", *timestamp_ms)
-        },
-        GateOrchestratorEvent::GateReceiptCollected { timestamp_ms, .. } => {
-            ("gate.receipt_collected", *timestamp_ms)
-        },
-        GateOrchestratorEvent::GateTimedOut { timestamp_ms, .. } => {
-            ("gate.timed_out", *timestamp_ms)
-        },
-        GateOrchestratorEvent::GateTimeoutReceiptGenerated { timestamp_ms, .. } => {
-            ("gate.timeout_receipt_generated", *timestamp_ms)
-        },
-        GateOrchestratorEvent::AllGatesCompleted { timestamp_ms, .. } => {
-            ("gate.all_completed", *timestamp_ms)
-        },
-    };
-
-    GateEventPersistenceFields {
-        event_type,
-        timestamp_ns: timestamp_ms.saturating_mul(1_000_000),
+    /// Returns the `changeset_digest` from any event variant.
+    ///
+    /// Every variant carries a `changeset_digest` field that binds the event
+    /// to the authoritative `ChangeSetPublished` digest. This is essential
+    /// for digest-bound persistence (CSID-004): the reducer requires both
+    /// `work_id` and `changeset_digest` in persisted event payloads.
+    #[must_use]
+    pub const fn changeset_digest(&self) -> [u8; 32] {
+        match self {
+            Self::PolicyResolved {
+                changeset_digest, ..
+            }
+            | Self::GateLeaseIssued {
+                changeset_digest, ..
+            }
+            | Self::GateExecutorSpawned {
+                changeset_digest, ..
+            }
+            | Self::GateReceiptCollected {
+                changeset_digest, ..
+            }
+            | Self::GateTimedOut {
+                changeset_digest, ..
+            }
+            | Self::GateTimeoutReceiptGenerated {
+                changeset_digest, ..
+            }
+            | Self::AllGatesCompleted {
+                changeset_digest, ..
+            } => *changeset_digest,
+        }
     }
 }
 
@@ -622,9 +635,9 @@ pub const fn gate_event_persistence_fields(
 /// Internal state for a single gate orchestration.
 #[derive(Debug)]
 struct OrchestrationEntry {
-    /// Gate start info that triggered this orchestration.
-    /// Used by downstream merge automation (TCK-00390) and status queries.
-    _start_info: GateStartInfo,
+    /// Authoritative publication that triggered this orchestration.
+    /// Used by downstream merge automation and status queries.
+    _publication: ChangesetPublication,
     /// The policy resolution for this changeset.
     policy_resolution: PolicyResolvedForChangeSet,
     /// Gate statuses indexed by gate type.
@@ -650,7 +663,7 @@ struct OrchestrationEntry {
     /// Deterministic idempotency key (Security MAJOR 1).
     ///
     /// Computed from `work_id + changeset_digest` to prevent replay of
-    /// gate-start events generating new gate lifecycles. Stored for
+    /// publication events generating new gate lifecycles. Stored for
     /// debugging/audit purposes alongside the `seen_idempotency_keys` set.
     #[allow(dead_code)]
     idempotency_key: IdempotencyKey,
@@ -669,7 +682,7 @@ pub struct GateOrchestratorConfig {
     pub gate_timeout_ms: u64,
     /// Maximum accepted heartbeat age for authoritative progression checks.
     pub max_heartbeat_age_ticks: u64,
-    /// Gate types to execute for each starting changeset.
+    /// Gate types to execute for each published changeset.
     pub gate_types: Vec<GateType>,
     /// Issuer actor ID for gate leases.
     pub issuer_actor_id: String,
@@ -699,13 +712,18 @@ impl Default for GateOrchestratorConfig {
 
 /// Gate execution orchestrator for autonomous gate lifecycle management.
 ///
-/// The `GateOrchestrator` starts from authoritative changeset identity and
-/// autonomously orchestrates the gate lifecycle:
+/// Gate orchestration is publication-driven: the single authoritative
+/// entrypoint is [`Self::start_for_changeset`] which consumes a
+/// [`ChangesetPublication`] derived from `ChangeSetPublished`. The
+/// orchestrator autonomously drives the gate lifecycle:
 ///
 /// 1. Resolve policy via `PolicyResolvedForChangeSet`
 /// 2. Issue `GateLease` for each required gate
 /// 3. Spawn gate executor episodes
 /// 4. Collect `GateReceipt` results or handle timeout
+///
+/// Session termination is a lifecycle-only signal used for timeout polling;
+/// it never starts new gate orchestrations.
 ///
 /// # Security
 ///
@@ -713,7 +731,7 @@ impl Default for GateOrchestratorConfig {
 /// - Gate leases use domain-separated Ed25519 signatures
 /// - Receipt signatures are verified against executor verifying key
 /// - Timeout produces fail-closed FAIL verdict
-/// - Changeset digest in leases matches source input
+/// - Changeset digest in leases is bound to the published changeset digest
 ///
 /// # Event Model (BLOCKER 3 fix)
 ///
@@ -727,8 +745,16 @@ impl Default for GateOrchestratorConfig {
 pub struct GateOrchestrator {
     /// Configuration.
     config: GateOrchestratorConfig,
-    /// Active orchestrations indexed by `work_id`.
-    orchestrations: RwLock<HashMap<String, OrchestrationEntry>>,
+    /// Active orchestrations indexed by `(work_id, changeset_digest)`.
+    ///
+    /// CSID-003 + Code-Quality MAJOR fix: Keyed by composite
+    /// `(work_id, changeset_digest)` for dedup, but enforces a
+    /// **one-active-per-work_id** invariant (latest changeset wins per
+    /// RFC-0032). Starting `(work, digest2)` while `(work, digest1)` is
+    /// active supersedes the old entry; starting the same `(work, digest1)`
+    /// twice is denied. This ensures `find_by_work_id` helpers always
+    /// resolve to the correct (unique) entry.
+    orchestrations: RwLock<HashMap<(String, [u8; 32]), OrchestrationEntry>>,
     /// Signer for gate leases and policy resolutions.
     signer: Arc<Signer>,
     /// Injected clock for timestamps and timeout checking (MAJOR 1).
@@ -736,8 +762,10 @@ pub struct GateOrchestrator {
     /// Seen idempotency keys for replay rejection (Security MAJOR 1).
     ///
     /// Tracks idempotency keys for both active and completed orchestrations
-    /// to prevent replayed gate-start events from generating new lifecycles.
-    seen_idempotency_keys: RwLock<std::collections::HashSet<IdempotencyKey>>,
+    /// to prevent replayed termination events from generating new lifecycles.
+    /// Ordered idempotency keys — `VecDeque` preserves insertion order so
+    /// that eviction removes the oldest half (not all entries).
+    seen_idempotency_keys: RwLock<std::collections::VecDeque<IdempotencyKey>>,
     /// Gate timeout as a `Duration` for monotonic comparison (Security BLOCKER
     /// 1).
     gate_timeout_duration: std::time::Duration,
@@ -763,7 +791,7 @@ impl GateOrchestrator {
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock: Arc::new(SystemClock),
-            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            seen_idempotency_keys: RwLock::new(std::collections::VecDeque::new()),
             gate_timeout_duration,
             cas: None,
         }
@@ -785,7 +813,7 @@ impl GateOrchestrator {
             orchestrations: RwLock::new(HashMap::new()),
             signer,
             clock,
-            seen_idempotency_keys: RwLock::new(std::collections::HashSet::new()),
+            seen_idempotency_keys: RwLock::new(std::collections::VecDeque::new()),
             gate_timeout_duration,
             cas: None,
         }
@@ -824,6 +852,51 @@ impl GateOrchestrator {
         self.orchestrations.read().await.len()
     }
 
+    /// Starts gate orchestration for an authoritative published changeset.
+    ///
+    /// This is the FAC vNext gate-start entrypoint for
+    /// `ChangeSetPublished -> StartGates` wiring.
+    pub async fn start_for_changeset(
+        &self,
+        publication: ChangesetPublication,
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
+        self.start_for_publication(publication).await
+    }
+
+    /// Test-only helper that derives a publication wrapper from session data.
+    ///
+    /// Production code MUST use [`Self::start_for_changeset`] and must not
+    /// bootstrap gate start from session lifecycle events.
+    #[cfg(test)]
+    pub(crate) async fn start_from_test_session(
+        &self,
+        info: SessionTerminatedInfo,
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
+        self.start_for_changeset(ChangesetPublication {
+            work_id: info.work_id,
+            changeset_digest: info.changeset_digest,
+            bundle_cas_hash: [0u8; 32],
+            published_at_ms: info.terminated_at_ms,
+            publisher_actor_id: info.session_id.clone(),
+            changeset_published_event_id: info.session_id,
+        })
+        .await
+    }
+
     /// Returns the orchestrator's verifying key (for lease signature
     /// verification).
     #[must_use]
@@ -843,22 +916,12 @@ impl GateOrchestrator {
         gate_type: GateType,
     ) -> Option<VerifyingKey> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
+        find_by_work_id(&orchestrations, work_id)
             .and_then(|e| e.executor_keys.get(&gate_type).copied())
     }
 
-    /// Handles a `changeset_published` event by starting gate orchestration.
-    ///
-    /// This is the primary entry point for the gate lifecycle. When an
-    /// authoritative changeset is published for a work item, this method:
-    ///
-    /// 1. Validates input
-    /// 2. Resolves policy for the changeset
-    /// 3. Issues gate leases for each required gate type
-    /// 4. Performs admission check (duplicate + capacity) and inserts
-    ///    atomically
-    /// 5. Returns events only after successful insertion (BLOCKER 2 fix)
+    /// Starts gate orchestration from authoritative published changeset
+    /// identity.
     ///
     /// # Ordering Invariant
     ///
@@ -878,22 +941,13 @@ impl GateOrchestrator {
     ///
     /// # Errors
     ///
-    /// Returns `GateOrchestratorError` if:
-    /// - `work_id` is empty or too long
-    /// - Maximum concurrent orchestrations exceeded
-    /// - Duplicate orchestration for the same `work_id`
-    /// - Policy resolution or lease issuance fails
+    /// Returns `GateOrchestratorError` if admission or lease issuance fails.
     ///
-    /// # Returns
-    ///
-    /// A tuple of `(gate_types, executor_signers, events)`. The
-    /// `executor_signers` map contains one `Arc<Signer>` per gate type
-    /// that the caller must hand to the spawned executor. Receipts signed
-    /// with these signers are the only ones accepted by the orchestrator
-    /// (BLOCKER 4 fix).
-    pub async fn start_for_changeset(
+    /// Idempotency semantics: if `(work_id, changeset_digest)` has already
+    /// been observed, this method is a no-op and returns empty outputs.
+    async fn start_for_publication(
         &self,
-        info: GateStartInfo,
+        publication: ChangesetPublication,
     ) -> Result<
         (
             Vec<GateType>,
@@ -903,19 +957,28 @@ impl GateOrchestrator {
         GateOrchestratorError,
     > {
         // Validate work_id
-        if info.work_id.is_empty() {
+        if publication.work_id.is_empty() {
             return Err(GateOrchestratorError::EmptyWorkId);
         }
-        if info.work_id.len() > MAX_WORK_ID_LENGTH {
+        if publication.work_id.len() > MAX_WORK_ID_LENGTH {
             return Err(GateOrchestratorError::WorkIdTooLong {
-                actual: info.work_id.len(),
+                actual: publication.work_id.len(),
                 max: MAX_WORK_ID_LENGTH,
             });
         }
-        if info.source_event_id.len() > MAX_STRING_LENGTH {
+        if publication.changeset_published_event_id.len() > MAX_STRING_LENGTH {
             return Err(GateOrchestratorError::StringTooLong {
-                field: "source_event_id",
-                actual: info.source_event_id.len(),
+                field: "changeset_published_event_id",
+                actual: publication.changeset_published_event_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        // NIT (Security): Validate publisher_actor_id length consistent with
+        // work_id and event_id validation above.
+        if publication.publisher_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(GateOrchestratorError::StringTooLong {
+                field: "publisher_actor_id",
+                actual: publication.publisher_actor_id.len(),
                 max: MAX_STRING_LENGTH,
             });
         }
@@ -923,42 +986,14 @@ impl GateOrchestrator {
         let now_ms = self.clock.now_ms();
         let monotonic_now = self.clock.monotonic_now();
 
-        // Security MAJOR 1: Compute idempotency key for replay detection.
-        let idempotency_key = IdempotencyKey::from_info(&info);
-
-        // Replay-first admission: exact replay identities are resolved before
-        // freshness checks so old-but-idempotent retries cannot be rejected as
-        // stale. Freshness remains enforced for truly new admissions below.
-        {
-            let seen_keys = self.seen_idempotency_keys.read().await;
-            if seen_keys.contains(&idempotency_key) {
-                return Err(GateOrchestratorError::ReplayDetected {
-                    work_id: info.work_id.clone(),
-                });
-            }
-        }
-
-        // Security MAJOR 1: Freshness check - reject stale gate-start events.
-        // This prevents replayed starts from older lifecycles after restart.
-        // Security BLOCKER 2 FIX: Use saturating_add to prevent u64 overflow on
-        // adversarial `source_timestamp_ms` values near u64::MAX. When overflow
-        // would occur, the threshold saturates to u64::MAX, meaning the event
-        // is never considered stale (safe: a future timestamp is not stale).
-        if info.source_timestamp_ms > 0 {
-            let threshold = info
-                .source_timestamp_ms
-                .saturating_add(MAX_SOURCE_EVENT_AGE_MS);
-            if now_ms > threshold {
-                return Err(GateOrchestratorError::StaleSourceEvent {
-                    work_id: info.work_id.clone(),
-                    source_timestamp_ms: info.source_timestamp_ms,
-                });
-            }
-        }
+        // Compute publication-native idempotency key.
+        let idempotency_key =
+            IdempotencyKey::from_work_digest(&publication.work_id, publication.changeset_digest);
 
         // Step 1: Resolve policy for the changeset.
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
-        let policy_resolution = self.resolve_policy(&info, now_ms)?;
+        let policy_resolution =
+            self.resolve_policy(&publication.work_id, publication.changeset_digest, now_ms)?;
         let policy_hash = policy_resolution.resolved_policy_hash();
         let risk_tier =
             RiskTier::try_from(policy_resolution.resolved_risk_tier).unwrap_or(RiskTier::Tier4);
@@ -980,7 +1015,14 @@ impl GateOrchestrator {
             let executor_signer = Arc::new(Signer::generate());
             let executor_vk = executor_signer.verifying_key();
 
-            let lease = self.issue_gate_lease(&info, gate_type, &policy_hash, now_ms, risk_tier)?;
+            let lease = self.issue_gate_lease(
+                &publication.work_id,
+                publication.changeset_digest,
+                gate_type,
+                &policy_hash,
+                now_ms,
+                risk_tier,
+            )?;
             let lease_id = lease.lease_id.clone();
             gates.insert(gate_type, GateStatus::LeaseIssued { lease_id });
             leases.insert(gate_type, lease);
@@ -1005,14 +1047,52 @@ impl GateOrchestrator {
             let mut seen_keys = self.seen_idempotency_keys.write().await;
             let mut orchestrations = self.orchestrations.write().await;
 
-            // Replay check: reject if we've seen this idempotency key before.
-            if seen_keys.contains(&idempotency_key) {
-                return Err(GateOrchestratorError::ReplayDetected {
-                    work_id: info.work_id.clone(),
+            // Replay check: identical (work_id, changeset_digest) is a no-op.
+            if seen_keys.iter().any(|k| k == &idempotency_key) {
+                debug!(
+                    work_id = %publication.work_id,
+                    changeset_digest = %hex::encode(publication.changeset_digest),
+                    "Duplicate gate-start publication observed; returning no-op"
+                );
+                return Ok((Vec::new(), HashMap::new(), Vec::new()));
+            }
+
+            // Step 1: Enforce one active orchestration per work_id
+            // (latest-wins policy per RFC-0032). When a new
+            // (work_id, digest2) arrives while (work_id, digest1) is
+            // active, the old orchestration is superseded/removed so
+            // that find_by_work_id helpers always resolve to the
+            // correct entry. Starting the same (work_id, digest)
+            // twice is denied as a duplicate.
+            //
+            // CRITICAL: The supersede check MUST happen BEFORE the capacity
+            // check. Otherwise, at capacity=1, starting (work, digest2)
+            // while (work, digest1) is active returns MaxOrchestrationsExceeded
+            // instead of superseding (INV-GT14 latest-wins violation).
+            let composite_key = (publication.work_id.clone(), publication.changeset_digest);
+            if orchestrations.contains_key(&composite_key) {
+                return Err(GateOrchestratorError::DuplicateOrchestration {
+                    work_id: publication.work_id.clone(),
                 });
             }
 
-            // Capacity check.
+            // Supersede any existing orchestration for this work_id
+            // with a different digest (latest changeset wins).
+            let old_key = orchestrations
+                .keys()
+                .find(|(wid, _)| wid == &publication.work_id)
+                .cloned();
+            if let Some(key) = old_key {
+                info!(
+                    work_id = %publication.work_id,
+                    old_digest = %hex::encode(key.1),
+                    new_digest = %hex::encode(publication.changeset_digest),
+                    "Superseding old orchestration with latest changeset (latest-wins)"
+                );
+                orchestrations.remove(&key);
+            }
+
+            // Step 2: Capacity check (after supersede, so freed slot is counted).
             if orchestrations.len() >= self.config.max_concurrent_orchestrations {
                 return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
                     current: orchestrations.len(),
@@ -1020,27 +1100,20 @@ impl GateOrchestrator {
                 });
             }
 
-            // Duplicate work_id check + insert.
-            match orchestrations.entry(info.work_id.clone()) {
-                Entry::Occupied(_) => {
-                    return Err(GateOrchestratorError::DuplicateOrchestration {
-                        work_id: info.work_id.clone(),
-                    });
+            orchestrations.insert(
+                composite_key,
+                OrchestrationEntry {
+                    _publication: publication.clone(),
+                    policy_resolution,
+                    gates,
+                    leases: leases.clone(),
+                    executor_keys,
+                    receipts: HashMap::new(),
+                    _started_at_ms: now_ms,
+                    started_at_monotonic: monotonic_now,
+                    idempotency_key: idempotency_key.clone(),
                 },
-                Entry::Vacant(vacant) => {
-                    vacant.insert(OrchestrationEntry {
-                        _start_info: info.clone(),
-                        policy_resolution,
-                        gates,
-                        leases: leases.clone(),
-                        executor_keys,
-                        receipts: HashMap::new(),
-                        _started_at_ms: now_ms,
-                        started_at_monotonic: monotonic_now,
-                        idempotency_key: idempotency_key.clone(),
-                    });
-                },
-            }
+            );
 
             // Security MAJOR 1: Register idempotency key atomically with
             // the orchestration insert. Bounded eviction: if we exceed the
@@ -1048,14 +1121,20 @@ impl GateOrchestrator {
             // map is the authoritative duplicate guard; the seen-keys set is
             // a secondary defence that covers the window after removal).
             if seen_keys.len() >= MAX_IDEMPOTENCY_KEYS {
+                // Evict the oldest half to preserve recent replay protection
+                // while bounding memory growth. This is an improvement over
+                // clearing all entries which would remove replay protection
+                // for recently-completed orchestrations.
+                let evict_count = seen_keys.len() / 2;
                 warn!(
                     current = seen_keys.len(),
                     max = MAX_IDEMPOTENCY_KEYS,
-                    "Idempotency key store at capacity, evicting oldest entries"
+                    evicting = evict_count,
+                    "Idempotency key store at capacity, evicting oldest half"
                 );
-                seen_keys.clear();
+                seen_keys.drain(..evict_count);
             }
-            seen_keys.insert(idempotency_key);
+            seen_keys.push_back(idempotency_key);
         }
 
         // Step 4 (BLOCKER 3 FIX): Stage events locally per-invocation and
@@ -1064,13 +1143,14 @@ impl GateOrchestrator {
 
         // PolicyResolved is ALWAYS first (ordering invariant).
         events.push(GateOrchestratorEvent::PolicyResolved {
-            work_id: info.work_id.clone(),
+            work_id: publication.work_id.clone(),
+            changeset_digest: publication.changeset_digest,
             policy_hash,
             timestamp_ms: now_ms,
         });
 
         info!(
-            work_id = %info.work_id,
+            work_id = %publication.work_id,
             policy_hash = %hex::encode(policy_hash),
             "Policy resolved for changeset"
         );
@@ -1081,17 +1161,18 @@ impl GateOrchestrator {
             let executor_actor_id = lease.executor_actor_id.clone();
 
             debug!(
-                work_id = %info.work_id,
+                work_id = %publication.work_id,
                 gate_type = %gate_type,
                 lease_id = %lease_id,
                 "Gate lease issued"
             );
 
             events.push(GateOrchestratorEvent::GateLeaseIssued {
-                work_id: info.work_id.clone(),
+                work_id: publication.work_id.clone(),
                 gate_type,
                 lease_id,
                 executor_actor_id,
+                changeset_digest: publication.changeset_digest,
                 timestamp_ms: now_ms,
             });
         }
@@ -1121,10 +1202,18 @@ impl GateOrchestrator {
         episode_id: &str,
     ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
         let now_ms = self.clock.now_ms();
+        let digest;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            // Capture the changeset digest before mutating state so persisted
+            // events are digest-bound (Security MAJOR fix).
+            digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+                GateOrchestratorError::OrchestrationNotFound {
+                    work_id: work_id.to_string(),
+                }
+            })?;
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1173,6 +1262,7 @@ impl GateOrchestrator {
             gate_type,
             episode_id: episode_id.to_string(),
             adapter_profile_id: gate_type.adapter_profile_id().to_string(),
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         }])
     }
@@ -1273,9 +1363,15 @@ impl GateOrchestrator {
             }
         }
 
+        // Capture the changeset digest from the receipt itself (it was
+        // already validated against the lease below). This ensures the
+        // persisted GateReceiptCollected event is digest-bound (Security
+        // MAJOR fix: receipt persistence must include changeset_digest).
+        let receipt_digest = receipt.changeset_digest;
+
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1382,6 +1478,7 @@ impl GateOrchestrator {
             gate_type,
             receipt_id,
             passed,
+            changeset_digest: receipt_digest,
             timestamp_ms: now_ms,
         }];
 
@@ -1439,11 +1536,19 @@ impl GateOrchestrator {
     ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let now_ms = self.clock.now_ms();
         let lease_id;
+        let digest;
         let mut timeout_receipt_id: Option<String> = None;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
-            let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
+            // Capture changeset digest for digest-bound event persistence
+            // (Security MAJOR fix).
+            digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+                GateOrchestratorError::OrchestrationNotFound {
+                    work_id: work_id.to_string(),
+                }
+            })?;
+            let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
                 }
@@ -1497,6 +1602,7 @@ impl GateOrchestrator {
             work_id: work_id.to_string(),
             gate_type,
             lease_id,
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         }];
 
@@ -1507,6 +1613,7 @@ impl GateOrchestrator {
                 work_id: work_id.to_string(),
                 gate_type,
                 receipt_id,
+                changeset_digest: digest,
                 timestamp_ms: now_ms,
             });
         }
@@ -1531,7 +1638,7 @@ impl GateOrchestrator {
         let orchestrations = self.orchestrations.read().await;
         let mut timed_out = Vec::new();
 
-        for (work_id, entry) in orchestrations.iter() {
+        for ((work_id, _digest), entry) in orchestrations.iter() {
             // Security BLOCKER 1: Use monotonic elapsed time, not wall-clock.
             let elapsed = entry.started_at_monotonic.elapsed();
             if elapsed >= self.gate_timeout_duration {
@@ -1569,12 +1676,14 @@ impl GateOrchestrator {
                 work_id: lease.work_id.clone(),
                 gate_type,
                 lease_id: lease.lease_id.clone(),
+                changeset_digest: lease.changeset_digest,
                 timestamp_ms: now_ms,
             },
             GateOrchestratorEvent::GateTimeoutReceiptGenerated {
                 work_id: lease.work_id.clone(),
                 gate_type,
                 receipt_id: timeout_receipt.receipt_id,
+                changeset_digest: lease.changeset_digest,
                 timestamp_ms: now_ms,
             },
         ]
@@ -1624,25 +1733,19 @@ impl GateOrchestrator {
     /// Returns the gate status for a specific gate in an orchestration.
     pub async fn gate_status(&self, work_id: &str, gate_type: GateType) -> Option<GateStatus> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .and_then(|e| e.gates.get(&gate_type).cloned())
+        find_by_work_id(&orchestrations, work_id).and_then(|e| e.gates.get(&gate_type).cloned())
     }
 
     /// Returns the gate lease for a specific gate in an orchestration.
     pub async fn gate_lease(&self, work_id: &str, gate_type: GateType) -> Option<GateLease> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .and_then(|e| e.leases.get(&gate_type).cloned())
+        find_by_work_id(&orchestrations, work_id).and_then(|e| e.leases.get(&gate_type).cloned())
     }
 
     /// Returns the policy resolution for a work item.
     pub async fn policy_resolution(&self, work_id: &str) -> Option<PolicyResolvedForChangeSet> {
         let orchestrations = self.orchestrations.read().await;
-        orchestrations
-            .get(work_id)
-            .map(|e| e.policy_resolution.clone())
+        find_by_work_id(&orchestrations, work_id).map(|e| e.policy_resolution.clone())
     }
 
     /// Removes a completed orchestration from the active set.
@@ -1650,7 +1753,45 @@ impl GateOrchestrator {
     /// Returns `true` if the orchestration was found and removed.
     pub async fn remove_orchestration(&self, work_id: &str) -> bool {
         let mut orchestrations = self.orchestrations.write().await;
-        orchestrations.remove(work_id).is_some()
+        remove_by_work_id(&mut orchestrations, work_id)
+    }
+
+    // =========================================================================
+    // Publication-Driven Gate Lifecycle (CSID-003)
+    // =========================================================================
+
+    /// Lifecycle-only hook for session termination notifications.
+    ///
+    /// Session termination is a lifecycle signal only; it **never** starts new
+    /// gate orchestrations. Gate orchestration is exclusively publication-
+    /// driven through [`Self::start_for_changeset`].
+    ///
+    /// This method polls timeout progression on already-active orchestrations
+    /// and returns any resulting timeout events (fail-closed FAIL verdicts).
+    ///
+    /// # Example Integration
+    ///
+    /// ```rust,ignore
+    /// // In daemon startup:
+    /// let orchestrator = Arc::new(GateOrchestrator::new(config, signer));
+    ///
+    /// // When a session terminates (lifecycle accounting only):
+    /// let events = orchestrator
+    ///     .poll_session_lifecycle()
+    ///     .await;
+    ///
+    /// // Persist timeout events to ledger
+    /// for event in events {
+    ///     ledger.append(event).await?;
+    /// }
+    /// ```
+    pub async fn poll_session_lifecycle(&self) -> Vec<GateOrchestratorEvent> {
+        let events = self.poll_timeouts().await;
+        debug!(
+            event_count = events.len(),
+            "Session lifecycle poll completed (publication-driven gate start only)"
+        );
+        events
     }
 
     // =========================================================================
@@ -1664,17 +1805,18 @@ impl GateOrchestrator {
     /// This MUST be called before any lease issuance for the same `work_id`.
     fn resolve_policy(
         &self,
-        info: &GateStartInfo,
+        work_id: &str,
+        changeset_digest: [u8; 32],
         _now_ms: u64,
     ) -> Result<PolicyResolvedForChangeSet, GateOrchestratorError> {
-        PolicyResolvedForChangeSetBuilder::new(&info.work_id, info.changeset_digest)
+        PolicyResolvedForChangeSetBuilder::new(work_id, changeset_digest)
             .resolved_risk_tier(1) // Default risk tier 1 (low)
             .resolved_determinism_class(0) // Non-deterministic
             .resolver_actor_id(&self.config.resolver_actor_id)
             .resolver_version(&self.config.resolver_version)
             .try_build_and_sign(&self.signer)
             .map_err(|e| GateOrchestratorError::PolicyResolutionFailed {
-                work_id: info.work_id.clone(),
+                work_id: work_id.to_string(),
                 reason: e.to_string(),
             })
     }
@@ -1837,37 +1979,33 @@ impl GateOrchestrator {
     /// # Security
     ///
     /// - Uses domain-separated Ed25519 signatures (`GATE_LEASE_ISSUED:` prefix)
-    /// - Binds the `changeset_digest` from the starting changeset
+    /// - Binds the `changeset_digest` from authoritative publication identity
     /// - Sets temporal bounds (`issued_at` to `issued_at` + timeout)
     /// - `time_envelope_ref` is a CAS-backed hex-encoded hash when CAS is
     ///   configured, ensuring downstream HTF authority validation succeeds.
     fn issue_gate_lease(
         &self,
-        info: &GateStartInfo,
+        work_id: &str,
+        changeset_digest: [u8; 32],
         gate_type: GateType,
         policy_hash: &[u8; 32],
         now_ms: u64,
         risk_tier: RiskTier,
     ) -> Result<GateLease, GateOrchestratorError> {
-        let lease_id = format!(
-            "lease-{}-{}-{}",
-            info.work_id,
-            gate_type.as_gate_id(),
-            now_ms
-        );
+        let lease_id = format!("lease-{}-{}-{}", work_id, gate_type.as_gate_id(), now_ms);
         let executor_actor_id = format!("executor-{}-{}", gate_type.as_gate_id(), now_ms);
 
         // Produce a CAS-backed time_envelope_ref when CAS is available.
         // Fall back to legacy format only when CAS is not configured (tests
         // without CAS wiring).
         let time_envelope_ref = if self.cas.is_some() {
-            self.create_cas_time_envelope_ref(&info.work_id, now_ms, risk_tier)?
+            self.create_cas_time_envelope_ref(work_id, now_ms, risk_tier)?
         } else {
-            format!("htf:gate:{}:{}", info.work_id, now_ms)
+            format!("htf:gate:{work_id}:{now_ms}")
         };
 
-        let mut builder = GateLeaseBuilder::new(&lease_id, &info.work_id, gate_type.as_gate_id())
-            .changeset_digest(info.changeset_digest)
+        let mut builder = GateLeaseBuilder::new(&lease_id, work_id, gate_type.as_gate_id())
+            .changeset_digest(changeset_digest)
             .executor_actor_id(&executor_actor_id)
             .issued_at(now_ms)
             .expires_at(now_ms + self.config.gate_timeout_ms)
@@ -1879,7 +2017,7 @@ impl GateOrchestrator {
         // This binds the lease to a specific RCP manifest and view commitment.
         if gate_type == GateType::Aat {
             builder = builder.aat_extension(AatLeaseExtension {
-                view_commitment_hash: info.changeset_digest,
+                view_commitment_hash: changeset_digest,
                 rcp_manifest_hash: *policy_hash,
                 rcp_profile_id: gate_type.adapter_profile_id().to_string(),
                 selection_policy_id: "default-selection-policy".to_string(),
@@ -1888,7 +2026,7 @@ impl GateOrchestrator {
 
         builder.try_build_and_sign(&self.signer).map_err(|e| {
             GateOrchestratorError::LeaseIssuanceFailed {
-                work_id: info.work_id.clone(),
+                work_id: work_id.to_string(),
                 gate_id: gate_type.as_gate_id().to_string(),
                 reason: e.to_string(),
             }
@@ -2017,7 +2155,14 @@ impl GateOrchestrator {
         events: &mut Vec<GateOrchestratorEvent>,
     ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
         let orchestrations = self.orchestrations.read().await;
-        let entry = orchestrations.get(work_id).ok_or_else(|| {
+        // Capture changeset digest for digest-bound AllGatesCompleted event
+        // (Security MAJOR fix).
+        let digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+            GateOrchestratorError::OrchestrationNotFound {
+                work_id: work_id.to_string(),
+            }
+        })?;
+        let entry = find_by_work_id(&orchestrations, work_id).ok_or_else(|| {
             GateOrchestratorError::OrchestrationNotFound {
                 work_id: work_id.to_string(),
             }
@@ -2076,6 +2221,7 @@ impl GateOrchestrator {
             work_id: work_id.to_string(),
             all_passed,
             outcomes: outcomes.clone(),
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         });
 
@@ -2103,6 +2249,63 @@ impl GateOrchestrator {
 
         Ok(Some(outcomes))
     }
+}
+
+// =============================================================================
+// Composite Key Helpers (CSID-003)
+// =============================================================================
+
+/// Finds the orchestration entry matching `work_id`.
+///
+/// The one-active-per-work_id invariant (enforced in `start_for_publication`)
+/// guarantees at most one entry exists per `work_id`, making this lookup
+/// unambiguous. Used by receipt recording, status queries, and timeouts.
+fn find_by_work_id<'a>(
+    map: &'a HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<&'a OrchestrationEntry> {
+    map.iter()
+        .find(|((wid, _), _)| wid == work_id)
+        .map(|(_, entry)| entry)
+}
+
+/// Finds the orchestration entry matching `work_id`, mutable.
+///
+/// The one-active-per-work_id invariant guarantees unambiguous lookup.
+fn find_by_work_id_mut<'a>(
+    map: &'a mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<&'a mut OrchestrationEntry> {
+    map.iter_mut()
+        .find(|((wid, _), _)| wid == work_id)
+        .map(|(_, entry)| entry)
+}
+
+/// Finds the changeset digest for the orchestration matching `work_id`.
+///
+/// The composite key `(work_id, changeset_digest)` is the authoritative
+/// identity binding. This helper extracts the digest portion so that
+/// event constructors can include it in persisted payloads (CSID-004:
+/// digest-bound receipt persistence).
+fn find_digest_for_work_id(
+    map: &HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<[u8; 32]> {
+    map.keys()
+        .find(|(wid, _)| wid == work_id)
+        .map(|(_, digest)| *digest)
+}
+
+/// Removes the orchestration entry matching `work_id`.
+///
+/// The one-active-per-work_id invariant guarantees at most one entry.
+/// Returns `true` if an entry was found and removed.
+fn remove_by_work_id(
+    map: &mut HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> bool {
+    let key = map.keys().find(|(wid, _)| wid == work_id).cloned();
+    key.is_some_and(|k| map.remove(&k).is_some())
 }
 
 // =============================================================================
@@ -2168,6 +2371,8 @@ pub fn create_timeout_receipt(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
 
     /// Helper: creates a test signer (for orchestrator lease signing).
@@ -2175,16 +2380,16 @@ mod tests {
         Arc::new(Signer::generate())
     }
 
-    /// Helper: creates a test gate-start info.
+    /// Helper: creates a test session terminated info.
     ///
-    /// Uses `source_timestamp_ms: 0` to bypass freshness checks in tests.
+    /// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
     /// Tests that specifically validate freshness logic set a non-zero value.
-    fn test_gate_start_info(work_id: &str) -> GateStartInfo {
-        GateStartInfo {
-            source_event_id: format!("evt-{work_id}"),
+    fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
+        SessionTerminatedInfo {
+            session_id: format!("session-{work_id}"),
             work_id: work_id.to_string(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         }
     }
 
@@ -2198,42 +2403,10 @@ mod tests {
         orch: &GateOrchestrator,
         work_id: &str,
     ) -> HashMap<GateType, Arc<Signer>> {
-        let info = test_gate_start_info(work_id);
+        let info = test_session_info(work_id);
         let (_gate_types, executor_signers, _events) =
-            orch.start_for_changeset(info).await.unwrap();
+            orch.start_from_test_session(info).await.unwrap();
         executor_signers
-    }
-
-    /// Helper: reproduce the historical "start + immediate timeout sweep +
-    /// spawn bookkeeping" behavior without wrapper APIs.
-    async fn start_and_record_spawns(
-        orch: &GateOrchestrator,
-        info: GateStartInfo,
-    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
-        let work_id = info.work_id.clone();
-        let (gate_types, _executor_signers, mut events) = orch.start_for_changeset(info).await?;
-
-        for (timed_work_id, gate_type) in orch.check_timeouts().await {
-            if timed_work_id == work_id {
-                if let Ok((_outcomes, timeout_events)) =
-                    orch.handle_gate_timeout(&timed_work_id, gate_type).await
-                {
-                    events.extend(timeout_events);
-                }
-            }
-        }
-
-        for &gate_type in &gate_types {
-            let episode_id = format!("gate-exec-{}-{}", gate_type.as_gate_id(), work_id);
-            if let Ok(spawn_events) = orch
-                .record_executor_spawned(&work_id, gate_type, &episode_id)
-                .await
-            {
-                events.extend(spawn_events);
-            }
-        }
-
-        Ok(events)
     }
 
     /// Helper: build a valid receipt signed with the correct executor signer.
@@ -2266,12 +2439,12 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_start_for_changeset_issues_all_gates() {
+    async fn test_start_from_test_session_issues_all_gates() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-001");
+        let info = test_session_info("work-001");
 
         let (gate_types, _executor_signers, _events) =
-            orch.start_for_changeset(info).await.unwrap();
+            orch.start_from_test_session(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -2283,9 +2456,9 @@ mod tests {
     #[tokio::test]
     async fn test_policy_resolved_before_leases() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-002");
+        let info = test_session_info("work-002");
 
-        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // First event must be PolicyResolved
         assert!(matches!(
@@ -2305,9 +2478,9 @@ mod tests {
     async fn test_gate_lease_signatures_valid() {
         let signer = test_signer();
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_gate_start_info("work-003");
+        let info = test_session_info("work-003");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-003", gate_type).await.unwrap();
@@ -2322,14 +2495,14 @@ mod tests {
     async fn test_gate_lease_changeset_binding() {
         let orch = test_orchestrator();
         let changeset = [0xAB; 32];
-        let info = GateStartInfo {
-            source_event_id: "evt-binding".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-binding".to_string(),
             work_id: "work-binding".to_string(),
             changeset_digest: changeset,
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-binding", gate_type).await.unwrap();
@@ -2343,9 +2516,9 @@ mod tests {
     #[tokio::test]
     async fn test_gate_lease_policy_hash_matches_resolution() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-004");
+        let info = test_session_info("work-004");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-004").await.unwrap();
         let policy_hash = resolution.resolved_policy_hash();
@@ -2362,9 +2535,9 @@ mod tests {
     #[tokio::test]
     async fn test_record_executor_spawned() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-005");
+        let info = test_session_info("work-005");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let events = orch
             .record_executor_spawned("work-005", GateType::Quality, "ep-001")
@@ -2463,9 +2636,9 @@ mod tests {
     #[tokio::test]
     async fn test_gate_timeout_produces_fail_verdict() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-008");
+        let info = test_session_info("work-008");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let (result, events) = orch
             .handle_gate_timeout("work-008", GateType::Aat)
@@ -2571,15 +2744,15 @@ mod tests {
     #[tokio::test]
     async fn test_empty_work_id_rejected() {
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "evt-empty".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-empty".to_string(),
             work_id: String::new(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
 
         let err = orch
-            .start_for_changeset(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
@@ -2589,15 +2762,15 @@ mod tests {
     #[tokio::test]
     async fn test_work_id_too_long_rejected() {
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "evt-long".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-long".to_string(),
             work_id: "x".repeat(MAX_WORK_ID_LENGTH + 1),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
 
         let err = orch
-            .start_for_changeset(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
@@ -2605,50 +2778,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duplicate_orchestration_rejected_via_replay() {
-        // Security MAJOR 1: Same source_event_id + changeset_digest → ReplayDetected
+    async fn test_duplicate_orchestration_replay_is_noop() {
+        // Security MAJOR 1: Same (work_id, changeset_digest) is idempotent.
         let orch = test_orchestrator();
-        let info1 = test_gate_start_info("work-dup");
-        let info2 = test_gate_start_info("work-dup");
+        let info1 = test_session_info("work-dup");
+        let info2 = test_session_info("work-dup");
 
-        orch.start_for_changeset(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
-        let err = orch
-            .start_for_changeset(info2)
-            .await
-            .err()
-            .expect("expected error");
-        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
+        let (gate_types, signers, events) = orch.start_from_test_session(info2).await.unwrap();
+        assert!(gate_types.is_empty());
+        assert!(signers.is_empty());
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
-    async fn test_duplicate_work_id_different_session_rejected() {
-        // Same work_id but different source_event_id → DuplicateOrchestration
+    async fn test_same_work_id_different_digest_allowed() {
+        // CSID-003: Same work_id but different changeset_digest → ALLOWED
+        // (different changesets for the same work can be orchestrated
+        // concurrently).
         let orch = test_orchestrator();
-        let info1 = GateStartInfo {
-            source_event_id: "evt-alpha".to_string(),
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-alpha".to_string(),
             work_id: "work-dup-wid".to_string(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
-        let info2 = GateStartInfo {
-            source_event_id: "evt-beta".to_string(),
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-beta".to_string(),
             work_id: "work-dup-wid".to_string(),
-            changeset_digest: [0x99; 32], // Different digest avoids replay check
-            source_timestamp_ms: 0,
+            changeset_digest: [0x99; 32], // Different digest → separate orchestration
+            terminated_at_ms: 0,
         };
 
-        orch.start_for_changeset(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
-        let err = orch
-            .start_for_changeset(info2)
-            .await
-            .err()
-            .expect("expected error");
-        assert!(matches!(
-            err,
-            GateOrchestratorError::DuplicateOrchestration { .. }
-        ));
+        // With composite key (work_id, changeset_digest), this should succeed.
+        let result = orch.start_from_test_session(info2).await;
+        assert!(
+            result.is_ok(),
+            "same work_id with different digest should be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_work_id_same_digest_duplicate_rejected() {
+        // CSID-003: Same (work_id, changeset_digest) → DuplicateOrchestration
+        let orch = test_orchestrator();
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-alpha".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x42; 32],
+            terminated_at_ms: 0,
+        };
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-beta".to_string(),
+            work_id: "work-dup-wid".to_string(),
+            changeset_digest: [0x42; 32], // Same digest → duplicate
+            terminated_at_ms: 0,
+        };
+
+        orch.start_from_test_session(info1).await.unwrap();
+
+        // Same (work_id, changeset_digest) should be detected as replay/no-op.
+        // Note: the idempotency key set provides this guard, returning
+        // empty outputs instead of an error.
+        let result = orch.start_from_test_session(info2).await;
+        assert!(result.is_ok(), "duplicate should be no-op, not error");
+        let (gate_types, _, events) = result.unwrap();
+        assert!(
+            gate_types.is_empty(),
+            "duplicate should return empty outputs"
+        );
+        assert!(events.is_empty(), "duplicate should return no events");
     }
 
     #[tokio::test]
@@ -2659,15 +2861,15 @@ mod tests {
         };
         let orch = GateOrchestrator::new(config, test_signer());
 
-        orch.start_for_changeset(test_gate_start_info("work-a"))
+        orch.start_from_test_session(test_session_info("work-a"))
             .await
             .unwrap();
-        orch.start_for_changeset(test_gate_start_info("work-b"))
+        orch.start_from_test_session(test_session_info("work-b"))
             .await
             .unwrap();
 
         let result = orch
-            .start_for_changeset(test_gate_start_info("work-c"))
+            .start_from_test_session(test_session_info("work-c"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -2694,9 +2896,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_orchestration() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-remove");
+        let info = test_session_info("work-remove");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
 
         assert!(orch.remove_orchestration("work-remove").await);
@@ -2714,9 +2916,9 @@ mod tests {
     async fn test_leases_use_domain_separated_signatures() {
         let signer = test_signer();
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_gate_start_info("work-domain");
+        let info = test_session_info("work-domain");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // Verify that all leases have valid domain-separated signatures
         for gate_type in GateType::all() {
@@ -2742,9 +2944,9 @@ mod tests {
     #[tokio::test]
     async fn test_policy_hash_consistency_across_gates() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-consistency");
+        let info = test_session_info("work-consistency");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-consistency").await.unwrap();
         let expected_hash = resolution.resolved_policy_hash();
@@ -2773,9 +2975,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_gate_start_info("work-temporal");
+        let info = test_session_info("work-temporal");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-temporal", gate_type).await.unwrap();
@@ -2833,28 +3035,28 @@ mod tests {
     }
 
     // =========================================================================
-    // Source Event ID Validation Tests
+    // Session ID Validation Tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_source_event_id_too_long_rejected() {
+    async fn test_session_id_too_long_rejected() {
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "s".repeat(MAX_STRING_LENGTH + 1),
+        let info = SessionTerminatedInfo {
+            session_id: "s".repeat(MAX_STRING_LENGTH + 1),
             work_id: "work-valid".to_string(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
 
         let err = orch
-            .start_for_changeset(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
         assert!(matches!(
             err,
             GateOrchestratorError::StringTooLong {
-                field: "source_event_id",
+                field: "changeset_published_event_id",
                 ..
             }
         ));
@@ -2867,9 +3069,9 @@ mod tests {
     #[tokio::test]
     async fn test_events_returned_per_invocation() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-per-inv");
+        let info = test_session_info("work-per-inv");
 
-        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // Events are returned from the call, not buffered
         assert!(!events.is_empty());
@@ -2880,9 +3082,9 @@ mod tests {
     #[tokio::test]
     async fn test_event_count_matches_gates() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-events");
+        let info = test_session_info("work-events");
 
-        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
         // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
         assert_eq!(events.len(), 4);
     }
@@ -2894,20 +3096,18 @@ mod tests {
     #[tokio::test]
     async fn test_no_events_on_duplicate_orchestration() {
         let orch = test_orchestrator();
-        let info1 = test_gate_start_info("work-no-events-dup");
-        let info2 = test_gate_start_info("work-no-events-dup");
+        let info1 = test_session_info("work-no-events-dup");
+        let info2 = test_session_info("work-no-events-dup");
 
         // First succeeds
-        let (_gate_types, _signers, events1) = orch.start_for_changeset(info1).await.unwrap();
+        let (_gate_types, _signers, events1) = orch.start_from_test_session(info1).await.unwrap();
         assert!(!events1.is_empty());
 
-        // Second fails with ReplayDetected (same work+changeset) - no events
-        let err = orch
-            .start_for_changeset(info2)
-            .await
-            .err()
-            .expect("expected error");
-        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
+        // Second call is idempotent no-op with empty outputs.
+        let (gate_types, signers, events2) = orch.start_from_test_session(info2).await.unwrap();
+        assert!(gate_types.is_empty());
+        assert!(signers.is_empty());
+        assert!(events2.is_empty());
     }
 
     #[tokio::test]
@@ -2919,13 +3119,13 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
 
         // First succeeds
-        orch.start_for_changeset(test_gate_start_info("work-max-a"))
+        orch.start_from_test_session(test_session_info("work-max-a"))
             .await
             .unwrap();
 
         // Second fails - no events should be returned
         let result = orch
-            .start_for_changeset(test_gate_start_info("work-max-b"))
+            .start_from_test_session(test_session_info("work-max-b"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -2946,9 +3146,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_gate_start_info("work-expire");
+        let info = test_session_info("work-expire");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // With 0ms timeout, all gates should be timed out immediately
         let timed_out = orch.check_timeouts().await;
@@ -2956,51 +3156,33 @@ mod tests {
     }
 
     // =========================================================================
-    // BLOCKER 3: Lifecycle Integration Tests
+    // BLOCKER 3: Daemon Runtime Integration Tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_start_for_changeset_returns_gates_and_events() {
+    async fn test_poll_session_lifecycle_returns_no_bootstrap_events() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-daemon");
+        let events = orch.poll_session_lifecycle().await;
 
-        let (gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
-
-        assert_eq!(gate_types.len(), 3);
-        assert!(gate_types.contains(&GateType::Aat));
-        assert!(gate_types.contains(&GateType::Quality));
-        assert!(gate_types.contains(&GateType::Security));
-
-        // Events: 1 PolicyResolved + 3 GateLeaseIssued = 4
-        assert_eq!(events.len(), 4);
-        assert!(matches!(
-            events[0],
-            GateOrchestratorEvent::PolicyResolved { .. }
-        ));
+        // Lifecycle hook is session-only and must not start gates.
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
-    async fn test_timeout_sweep_handles_immediate_timeouts() {
+    async fn test_poll_session_lifecycle_handles_immediate_timeouts() {
         let config = GateOrchestratorConfig {
             gate_timeout_ms: 0, // Instant timeout
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let work_id = "work-imm-timeout";
-        let info = test_gate_start_info(work_id);
+        // Seed an active orchestration via publication-driven start.
+        let _ = orch
+            .start_from_test_session(test_session_info("work-imm-timeout-seed"))
+            .await
+            .unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
-        let (_gate_types, _signers, mut events) = orch.start_for_changeset(info).await.unwrap();
-        for (timed_work_id, gate_type) in orch.check_timeouts().await {
-            if timed_work_id == work_id {
-                let (_outcomes, timeout_events) = orch
-                    .handle_gate_timeout(&timed_work_id, gate_type)
-                    .await
-                    .unwrap();
-                events.extend(timeout_events);
-            }
-        }
-
-        // Should have timeout events in addition to policy+lease events
+        // Lifecycle hook should sweep and emit timeout events for seeded gates.
         let timeout_count = events
             .iter()
             .filter(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. }))
@@ -3009,19 +3191,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_for_changeset_duplicate_rejected() {
+    async fn test_poll_session_lifecycle_is_idempotent() {
         let orch = test_orchestrator();
 
-        orch.start_for_changeset(test_gate_start_info("work-dup2"))
+        let events1 = orch.poll_session_lifecycle().await;
+        let events2 = orch.poll_session_lifecycle().await;
+        assert!(
+            events1.is_empty() && events2.is_empty(),
+            "lifecycle-only hook should be idempotent and never replay-reject"
+        );
+
+        orch.start_from_test_session(test_session_info("work-dup2"))
             .await
             .unwrap();
-
-        let result = orch
-            .start_for_changeset(test_gate_start_info("work-dup2"))
-            .await;
-        assert!(result.is_err(), "expected ReplayDetected");
-        let err = result.err().unwrap();
-        assert!(matches!(err, GateOrchestratorError::ReplayDetected { .. }));
+        let _ = orch.poll_session_lifecycle().await;
     }
 
     // =========================================================================
@@ -3724,9 +3907,9 @@ mod tests {
             test_signer(),
             mock_clock,
         );
-        let info = test_gate_start_info("work-clock");
+        let info = test_session_info("work-clock");
 
-        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // All events should use the mock clock's timestamp
         if let GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } = &events[0] {
@@ -3759,95 +3942,54 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_replay_same_work_changeset_rejected() {
+    async fn test_replay_same_work_changeset_is_noop() {
         let orch = test_orchestrator();
-        let info1 = GateStartInfo {
-            source_event_id: "evt-replay".to_string(),
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-replay".to_string(),
             work_id: "work-replay-1".to_string(),
             changeset_digest: [0xAA; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
-        orch.start_for_changeset(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
-        // Remove the orchestration so work_id is free, but replay key persists
+        // Remove the orchestration so work_id is free, but replay key persists.
         orch.remove_orchestration("work-replay-1").await;
 
-        // Same work_id + changeset_digest must replay-reject even when
-        // source_event_id changes.
-        let info2 = GateStartInfo {
-            source_event_id: "evt-replay-different".to_string(),
+        // Same (work_id, changeset_digest) is a no-op on replay.
+        let info2 = SessionTerminatedInfo {
+            session_id: "session-replay-2".to_string(),
             work_id: "work-replay-1".to_string(),
             changeset_digest: [0xAA; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
-        let err = orch
-            .start_for_changeset(info2)
-            .await
-            .err()
-            .expect("expected replay error");
+        let (gate_types, signers, events) = orch.start_from_test_session(info2).await.unwrap();
         assert!(
-            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
-            "Same work+changeset after removal should be rejected as replay"
+            gate_types.is_empty() && signers.is_empty() && events.is_empty(),
+            "Replay should return no-op outputs"
         );
     }
 
     #[tokio::test]
-    async fn test_stale_gate_start_event_rejected() {
+    async fn test_terminated_timestamp_does_not_gate_publication_start() {
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "evt-stale".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-stale".to_string(),
             work_id: "work-stale".to_string(),
             changeset_digest: [0x42; 32],
             // A very old timestamp (2024)
-            source_timestamp_ms: 1_704_067_200_000,
+            terminated_at_ms: 1_704_067_200_000,
         };
-        let err = orch
-            .start_for_changeset(info)
-            .await
-            .err()
-            .expect("expected stale error");
-        assert!(
-            matches!(err, GateOrchestratorError::StaleSourceEvent { .. }),
-            "Old gate-start event should be rejected as stale"
-        );
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
+        assert_eq!(events.len(), 4, "publication-wrapped start should succeed");
     }
 
     #[tokio::test]
-    async fn test_stale_replay_is_classified_as_replay_before_freshness() {
+    async fn test_zero_terminated_at_ms_bypasses_freshness_check() {
         let orch = test_orchestrator();
-        let initial = GateStartInfo {
-            source_event_id: "evt-stale-replay-initial".to_string(),
-            work_id: "work-stale-replay".to_string(),
-            changeset_digest: [0x77; 32],
-            source_timestamp_ms: 0,
-        };
-        orch.start_for_changeset(initial).await.unwrap();
-        orch.remove_orchestration("work-stale-replay").await;
-
-        let replay_with_old_timestamp = GateStartInfo {
-            source_event_id: "evt-stale-replay-retry".to_string(),
-            work_id: "work-stale-replay".to_string(),
-            changeset_digest: [0x77; 32],
-            source_timestamp_ms: 1_704_067_200_000,
-        };
-        let err = orch
-            .start_for_changeset(replay_with_old_timestamp)
-            .await
-            .err()
-            .expect("expected replay error");
-        assert!(
-            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
-            "replayed identities must be replay-classified before freshness checks"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_zero_source_timestamp_ms_bypasses_freshness_check() {
-        let orch = test_orchestrator();
-        // source_timestamp_ms: 0 should bypass the freshness check
-        let info = test_gate_start_info("work-fresh");
-        assert_eq!(info.source_timestamp_ms, 0);
-        orch.start_for_changeset(info).await.unwrap();
+        // terminated_at_ms: 0 should bypass the freshness check
+        let info = test_session_info("work-fresh");
+        assert_eq!(info.terminated_at_ms, 0);
+        orch.start_from_test_session(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
     }
 
@@ -3862,9 +4004,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_gate_start_info("work-poll");
+        let info = test_session_info("work-poll");
 
-        orch.start_for_changeset(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // poll_timeouts should handle all 3 expired gates
         let events = orch.poll_timeouts().await;
@@ -4053,19 +4195,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_freshness_gate_no_panic_on_u64_max_timestamp() {
-        // Security BLOCKER 2: Adversarial source_timestamp_ms near u64::MAX
+        // Security BLOCKER 2: Adversarial terminated_at_ms near u64::MAX
         // must not panic via arithmetic overflow.
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "evt-overflow".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-overflow".to_string(),
             work_id: "work-overflow".to_string(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: u64::MAX - 1, // Near u64::MAX
+            terminated_at_ms: u64::MAX - 1, // Near u64::MAX
         };
 
         // This should NOT panic. The saturating_add prevents overflow.
         // The event is in the far future, so it won't be stale.
-        let result = orch.start_for_changeset(info).await;
+        let result = orch.start_from_test_session(info).await;
         assert!(
             result.is_ok(),
             "Near-u64::MAX timestamp should not panic or be rejected as stale"
@@ -4076,16 +4218,16 @@ mod tests {
     async fn test_freshness_gate_no_panic_on_exact_u64_max() {
         // Exact u64::MAX should also be safe.
         let orch = test_orchestrator();
-        let info = GateStartInfo {
-            source_event_id: "evt-exact-max".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-exact-max".to_string(),
             work_id: "work-exact-max".to_string(),
             changeset_digest: [0x42; 32],
-            source_timestamp_ms: u64::MAX,
+            terminated_at_ms: u64::MAX,
         };
 
-        // saturating_add(MAX_SOURCE_EVENT_AGE_MS) should produce u64::MAX
+        // saturating_add(MAX_TERMINATED_AT_AGE_MS) should produce u64::MAX
         // (saturated), meaning the event is never considered stale.
-        let result = orch.start_for_changeset(info).await;
+        let result = orch.start_from_test_session(info).await;
         assert!(
             result.is_ok(),
             "Exact u64::MAX timestamp should not panic or be rejected as stale"
@@ -4108,33 +4250,29 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
 
         // Insert one orchestration.
-        let info1 = GateStartInfo {
-            source_event_id: "evt-bound-1".to_string(),
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-bound-1".to_string(),
             work_id: "work-bound-1".to_string(),
             changeset_digest: [0x01; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
-        orch.start_for_changeset(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
         // Remove it to free the slot.
         orch.remove_orchestration("work-bound-1").await;
 
-        // The idempotency key is still in the seen set, so replay is rejected.
-        let info1_replay = GateStartInfo {
-            source_event_id: "evt-bound-1-replay".to_string(),
-            work_id: "work-bound-1".to_string(),
+        // Idempotency key is (work_id, changeset_digest), so a different
+        // work_id with the same digest is admissible.
+        let info1_replay = SessionTerminatedInfo {
+            session_id: "session-bound-1".to_string(),
+            work_id: "work-bound-1-again".to_string(),
             changeset_digest: [0x01; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
-        let err = orch
-            .start_for_changeset(info1_replay)
-            .await
-            .err()
-            .expect("expected replay error");
-        assert!(
-            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
-            "Replay should be detected even after orchestration removal"
-        );
+        let (gate_types, _signers, events) =
+            orch.start_from_test_session(info1_replay).await.unwrap();
+        assert_eq!(gate_types.len(), GateType::all().len());
+        assert!(!events.is_empty());
     }
 
     // =========================================================================
@@ -4142,50 +4280,31 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_start_and_spawn_transitions_to_running() {
+    async fn test_poll_session_lifecycle_transitions_to_running() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-drive");
+        let events = orch.poll_session_lifecycle().await;
 
-        let events = start_and_record_spawns(&orch, info).await.unwrap();
-
-        // Should have: 1 PolicyResolved + 3 LeaseIssued + 3 ExecutorSpawned = 7
-        assert_eq!(events.len(), 7, "Expected 7 events from setup + spawn flow");
-
-        // Verify all gates are now in Running state.
-        for gate_type in GateType::all() {
-            let status = orch.gate_status("work-drive", gate_type).await.unwrap();
-            assert!(
-                matches!(status, GateStatus::Running { .. }),
-                "Gate {gate_type} should be in Running state after setup + spawn"
-            );
-        }
+        // Session lifecycle hook must not bootstrap gates.
+        assert!(events.is_empty());
+        assert_eq!(orch.active_count().await, 0);
     }
 
     #[tokio::test]
-    async fn test_start_and_spawn_with_zero_timeout() {
-        // With zero timeout, gates time out immediately during setup.
-        // Setup + spawn should still succeed (executor spawns will fail
-        // because gates are already timed out, but that's best-effort).
+    async fn test_poll_session_lifecycle_with_zero_timeout() {
+        // With zero timeout, pre-existing orchestrations time out during the
+        // lifecycle sweep.
         let config = GateOrchestratorConfig {
             gate_timeout_ms: 0,
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_gate_start_info("work-drive-timeout");
+        let _ = orch
+            .start_from_test_session(test_session_info("work-drive-timeout-seed"))
+            .await
+            .unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
-        let events = start_and_record_spawns(&orch, info).await.unwrap();
-
-        // Should have at least: 1 PolicyResolved + 3 LeaseIssued + 3 TimedOut = 7
-        // Executor spawns fail because gates are already timed out.
-        assert!(
-            events.len() >= 7,
-            "Expected at least 7 events, got {}",
-            events.len()
-        );
-
-        // Security MAJOR 1: With zero timeout all 3 gates time out, triggering
-        // AllGatesCompleted and orchestration reclamation.  The active map
-        // should be empty.
+        // All seeded gates should time out and be reclaimed.
         assert_eq!(
             orch.active_count().await,
             0,
@@ -4204,16 +4323,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_and_spawn_executor_events_have_adapter_profile() {
+    async fn test_poll_session_lifecycle_executor_events_have_adapter_profile() {
         let orch = test_orchestrator();
-        let info = test_gate_start_info("work-drive-profile");
+        let events = orch.poll_session_lifecycle().await;
 
-        let events = start_and_record_spawns(&orch, info).await.unwrap();
-
-        // Check that executor spawned events have correct adapter profiles.
-        let spawn_events: Vec<_> = events
+        // Session lifecycle progression must not emit executor-spawn events.
+        let has_spawn_event = events
             .iter()
-            .filter_map(|e| {
+            .find_map(|e| {
                 if let GateOrchestratorEvent::GateExecutorSpawned {
                     gate_type,
                     adapter_profile_id,
@@ -4225,17 +4342,8 @@ mod tests {
                     None
                 }
             })
-            .collect();
-
-        assert_eq!(spawn_events.len(), 3, "Should have 3 executor spawn events");
-
-        for (gate_type, adapter_profile_id) in &spawn_events {
-            assert_eq!(
-                adapter_profile_id.as_str(),
-                gate_type.adapter_profile_id(),
-                "Adapter profile mismatch for {gate_type}"
-            );
-        }
+            .is_some();
+        assert!(!has_spawn_event);
     }
 
     // =========================================================================
@@ -4601,8 +4709,9 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
-        let info = test_gate_start_info("work-cas-test");
-        let (_gate_types, _exec_signers, events) = orch.start_for_changeset(info).await.unwrap();
+        let info = test_session_info("work-cas-test");
+        let (_gate_types, _exec_signers, events) =
+            orch.start_from_test_session(info).await.unwrap();
 
         // Find a lease issuance event.
         let lease_event = events
@@ -4665,8 +4774,8 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
-        let info = test_gate_start_info("work-delegate-cas");
-        let _ = orch.start_for_changeset(info).await.unwrap();
+        let info = test_session_info("work-delegate-cas");
+        let _ = orch.start_from_test_session(info).await.unwrap();
 
         let parent_lease = orch
             .gate_lease("work-delegate-cas", GateType::Quality)
@@ -4783,5 +4892,128 @@ mod tests {
                 tier, profile.attestation
             );
         }
+    }
+
+    // =========================================================================
+    // One-Active-Per-Work-Id (Latest-Wins) Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_new_digest_supersedes_old_orchestration_for_same_work_id() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "supersede-work".to_string(),
+            changeset_digest: [0x11; 32],
+            bundle_cas_hash: [0xAA; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:1".to_string(),
+            changeset_published_event_id: "evt-1".to_string(),
+        };
+        let pub2 = ChangesetPublication {
+            work_id: "supersede-work".to_string(),
+            changeset_digest: [0x22; 32],
+            bundle_cas_hash: [0xBB; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:2".to_string(),
+            changeset_published_event_id: "evt-2".to_string(),
+        };
+
+        // Start first orchestration.
+        let (types1, _, events1) = orch.start_for_changeset(pub1).await.unwrap();
+        assert_eq!(types1.len(), 3, "first start should issue 3 gate types");
+        assert!(!events1.is_empty(), "first start should emit events");
+        assert_eq!(orch.active_count().await, 1);
+
+        // Start second orchestration for same work_id, different digest.
+        // The old one should be superseded.
+        let (types2, _, events2) = orch.start_for_changeset(pub2).await.unwrap();
+        assert_eq!(types2.len(), 3, "second start should issue 3 gate types");
+        assert!(!events2.is_empty(), "second start should emit events");
+        // Still only 1 active orchestration (old was superseded).
+        assert_eq!(
+            orch.active_count().await,
+            1,
+            "only one active orchestration per work_id (latest-wins)"
+        );
+
+        // Verify the active one is for the new digest.
+        let lease = orch
+            .gate_lease("supersede-work", GateType::Aat)
+            .await
+            .expect("lease should exist for the new digest");
+        assert_eq!(
+            lease.changeset_digest, [0x22; 32],
+            "active lease should be for the new (superseding) digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_same_digest_is_idempotent_noop() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "dup-work".to_string(),
+            changeset_digest: [0x33; 32],
+            bundle_cas_hash: [0xCC; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:dup".to_string(),
+            changeset_published_event_id: "evt-dup".to_string(),
+        };
+
+        let (types1, _, events1) = orch.start_for_changeset(pub1.clone()).await.unwrap();
+        assert_eq!(types1.len(), 3, "first start should issue 3 gate types");
+        assert!(!events1.is_empty(), "first start should emit events");
+
+        // Same (work_id, digest) again should be a silent no-op
+        // (idempotent replay rejection, not an error).
+        let (types2, signers2, events2) = orch.start_for_changeset(pub1).await.unwrap();
+        assert!(
+            types2.is_empty(),
+            "duplicate should return empty gate types (no-op)"
+        );
+        assert!(
+            signers2.is_empty(),
+            "duplicate should return empty signers (no-op)"
+        );
+        assert!(
+            events2.is_empty(),
+            "duplicate should return empty events (no-op)"
+        );
+        // Still only one orchestration.
+        assert_eq!(orch.active_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_work_id_unambiguous_after_supersede() {
+        let orch = test_orchestrator();
+        let pub1 = ChangesetPublication {
+            work_id: "find-work".to_string(),
+            changeset_digest: [0x44; 32],
+            bundle_cas_hash: [0xDD; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:find".to_string(),
+            changeset_published_event_id: "evt-find-1".to_string(),
+        };
+        let pub2 = ChangesetPublication {
+            work_id: "find-work".to_string(),
+            changeset_digest: [0x55; 32],
+            bundle_cas_hash: [0xEE; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:find".to_string(),
+            changeset_published_event_id: "evt-find-2".to_string(),
+        };
+
+        let _ = orch.start_for_changeset(pub1).await.unwrap();
+        let (_, signers2, _) = orch.start_for_changeset(pub2).await.unwrap();
+
+        // Executor key should match the new orchestration.
+        let vk = orch
+            .executor_verifying_key("find-work", GateType::Security)
+            .await
+            .expect("executor key should exist");
+        let expected_vk = signers2[&GateType::Security].verifying_key();
+        assert_eq!(
+            vk, expected_vk,
+            "executor key must match the latest (superseding) orchestration"
+        );
     }
 }

@@ -4,21 +4,21 @@
 
 ## Overview
 
-The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). The `GateOrchestrator` starts from authoritative `changeset_published` identity and drives the gate pipeline: policy resolution, lease issuance, gate executor spawning, and receipt collection. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
+The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). Gate start is publication-driven: authoritative `changeset_published` ledger events feed `GateStartKernel`, which calls `GateOrchestrator::start_for_changeset` to drive policy resolution and lease issuance. Session termination remains lifecycle/accounting-only and MUST NOT bootstrap gate start. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
 
 ### FAC Gate State Machine
 
 ```text
 changeset_published -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
-                                                   -> ALL_PASS -> MERGE -> Completed
-                                                   -> CONFLICT -> ReviewBlocked
+                                                -> ALL_PASS -> MERGE -> Completed
+                                                -> CONFLICT -> ReviewBlocked
 ```
 
 ## Key Types
 
 ### `GateOrchestrator`
 
-Starts from authoritative changeset identity and autonomously orchestrates the gate lifecycle.
+Consumes authoritative changeset publication identity and autonomously orchestrates the gate lifecycle.
 
 **Invariants:**
 
@@ -26,7 +26,15 @@ Starts from authoritative changeset identity and autonomously orchestrates the g
 - [INV-GT02] Maximum concurrent orchestrations bounded to `MAX_CONCURRENT_ORCHESTRATIONS` (1,000).
 - [INV-GT03] Maximum gate types per orchestration bounded to `MAX_GATE_TYPES` (8).
 - [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts).
-- [INV-GT05] Changeset digest in each lease matches the authoritative published changeset.
+- [INV-GT05] Changeset digest in each lease matches the authoritative `ChangeSetPublished` digest.
+- [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). Session lifecycle timeout progression is polled via `poll_session_lifecycle`; there is no session-termination gate-start entrypoint.
+- [INV-GT13] Idempotency key is `(work_id, changeset_digest)`, a pure function of authoritative publication inputs (CSID-003).
+- [INV-GT14] Orchestrations map keyed by `(work_id, changeset_digest)` composite key (CSID-003) but enforces a **one-active-per-work_id** invariant (latest changeset wins per RFC-0032). Starting `(work, digest2)` while `(work, digest1)` is active supersedes the old entry; starting the same `(work, digest1)` twice is denied. This ensures `find_by_work_id` helpers always resolve unambiguously.
+- [INV-GT15] Event payloads enforce `MAX_PAYLOAD_BYTES` (1 MiB) size limit BEFORE JSON deserialization to prevent memory exhaustion.
+- [INV-GT16] `publisher_actor_id` is derived from the verified `actor_id` column of the ledger row (signed envelope), not from untrusted payload content. Cross-validation rejects identity mismatches.
+- [INV-GT17] `publisher_actor_id` length is validated against `MAX_STRING_LENGTH` consistent with other string fields.
+- [INV-GT18] `GateStartKernel` cursor migration safety: on upgrade from pre-unified to unified event reader, persisted cursors with raw event IDs (no `legacy:` or `canonical:` prefix) are detected and reset to the beginning. Re-processing is safe because the intent store's `state='done'` markers provide idempotent deduplication (CSID-003).
+- [INV-GT19] `GateStartKernel` malformed-row resilience: `parse_changeset_publication_payload` errors do NOT propagate with `?` during the observe poll. Malformed rows are logged, and a cursor-advancing event with `publication = None` is emitted so the kernel advances past the bad row. `apply_events` skips `None` publications. This prevents permanent deadlock on corrupt ledger data.
 
 **Contracts:**
 
@@ -120,5 +128,7 @@ Abstraction over GitHub merge operations for testability.
 
 - RFC-0015: Forge Admission Cycle
 - RFC-0019: Automated FAC v0
+- RFC-0032: FAC vNext changeset identity
 - TCK-00388: Gate orchestrator implementation
 - TCK-00390: Merge executor implementation
+- TCK-00672: End-to-end changeset identity wiring (CSID-003 gate-start migration)

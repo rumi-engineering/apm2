@@ -459,6 +459,25 @@ message WorkStatusResponse {
   bool implementer_claim_blocked = 9;
   // Structured dependency diagnostics for doctor/work status consumers.
   repeated WorkDependencyDiagnostic dependency_diagnostics = 10;
+  // STEP_10: FAC identity chain surface.
+  // Latest changeset digest (hex-encoded, 64 chars) from ChangeSetPublished.
+  optional string latest_changeset_digest = 11;
+  // Event ID of the ChangeSetPublished event that established the latest
+  // changeset identity binding.
+  optional string changeset_published_event_id = 12;
+  // CAS hash (hex-encoded) of the ChangeSetBundleV1 for the latest changeset.
+  optional string bundle_cas_hash = 13;
+  // Gate status for the latest changeset digest: "pending", "passed", "failed",
+  // or "unknown" when no gate activity has been observed.
+  optional string gate_status = 14;
+  // Review status for the latest changeset digest: "pending", "passed",
+  // "blocked", or "unknown".
+  optional string review_status = 15;
+  // Merge status for the latest changeset digest: "pending", "merged", or
+  // "unknown".
+  optional string merge_status = 16;
+  // Number of identity-chain defects recorded for this work item.
+  uint32 identity_chain_defect_count = 17;
 }
 
 // IPC-PRIV-019: WorkList (TCK-00415)

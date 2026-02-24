@@ -1,11 +1,12 @@
-// AGENT-AUTHORED (TCK-00388, TCK-00390)
+// AGENT-AUTHORED (TCK-00388, TCK-00390, TCK-00672)
 //! Gate execution orchestrator and merge executor for autonomous gate
 //! lifecycle.
 //!
-//! This module implements the [`GateOrchestrator`] which starts gate
-//! lifecycle execution from authoritative changeset identity input:
-//! policy resolution, lease issuance, gate executor spawning, and receipt
-//! collection.
+//! This module implements the [`GateOrchestrator`] which consumes
+//! authoritative `ChangeSetPublished` events and drives publication-based
+//! gate orchestration: policy resolution, lease issuance, gate executor
+//! spawning, and receipt collection. Session termination is a lifecycle-
+//! only signal for timeout polling (CSID-003).
 //!
 //! It also implements the [`MergeExecutor`] (TCK-00390) which watches for
 //! all required gate receipts reaching PASS verdict and autonomously
@@ -15,15 +16,15 @@
 //! # FAC State Machine
 //!
 //! ```text
-//! changeset_published -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
-//!                                                  -> ALL_PASS -> MERGE -> Completed
-//!                                                  -> CONFLICT -> ReviewBlocked
+//! ChangeSetPublished -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+//!                                                 -> ALL_PASS -> MERGE -> Completed
+//!                                                 -> CONFLICT -> ReviewBlocked
 //! ```
 //!
-//! The `GateOrchestrator` bridges the gap between changeset publication and
-//! gate execution by:
+//! The `GateOrchestrator` bridges `ChangeSetPublished` events and gate
+//! execution by:
 //!
-//! 1. Accepting published changeset identity input
+//! 1. Consuming `ChangeSetPublished` via `start_for_changeset`
 //! 2. Resolving policy via `PolicyResolvedForChangeSet`
 //! 3. Issuing `GateLease` for each required gate (aat, quality, security)
 //! 4. Spawning gate executor episodes via `EpisodeRuntime`
@@ -39,7 +40,7 @@
 //! - **Fail-closed timeouts**: Expired leases produce FAIL verdict, not silent
 //!   expiry.
 //! - **Changeset binding**: The `changeset_digest` in each lease MUST match the
-//!   authoritative published changeset.
+//!   authoritative `ChangeSetPublished` digest.
 //!
 //! # Resource Limits
 //!
@@ -49,17 +50,20 @@
 
 pub mod merge_executor;
 mod orchestrator;
+mod start_kernel;
 mod timeout_kernel;
 
 pub use merge_executor::{
     ExecuteOrBlockResult, GitHubMergeAdapter, MAX_PENDING_MERGES, MergeExecutor,
     MergeExecutorError, MergeExecutorEvent, MergeInput, MergeResult,
 };
+#[cfg(test)]
+pub(crate) use orchestrator::SessionTerminatedInfo;
 pub use orchestrator::{
-    Clock, DEFAULT_GATE_TIMEOUT_MS, GateEventPersistenceFields, GateOrchestrator,
-    GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent, GateOutcome,
-    GateStartInfo, GateStatus, GateType, MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES,
-    MAX_IDEMPOTENCY_KEYS, MAX_SOURCE_EVENT_AGE_MS, MAX_WORK_ID_LENGTH, SystemClock,
-    TIMEOUT_AUTHORITY_ACTOR_ID, create_timeout_receipt, gate_event_persistence_fields,
+    Clock, DEFAULT_GATE_TIMEOUT_MS, GateOrchestrator, GateOrchestratorConfig,
+    GateOrchestratorError, GateOrchestratorEvent, GateOutcome, GateStatus, GateType,
+    MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES, MAX_IDEMPOTENCY_KEYS, MAX_WORK_ID_LENGTH,
+    SystemClock, TIMEOUT_AUTHORITY_ACTOR_ID, create_timeout_receipt,
 };
+pub use start_kernel::{GateStartKernel, GateStartKernelConfig, GateStartKernelError};
 pub use timeout_kernel::{GateTimeoutKernel, GateTimeoutKernelConfig, GateTimeoutKernelError};

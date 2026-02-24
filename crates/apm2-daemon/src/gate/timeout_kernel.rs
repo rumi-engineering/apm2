@@ -19,10 +19,7 @@ use apm2_core::orchestrator_kernel::{
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::gate::{
-    GateEventPersistenceFields, GateOrchestrator, GateOrchestratorEvent, GateType,
-    gate_event_persistence_fields,
-};
+use crate::gate::{GateOrchestrator, GateOrchestratorEvent, GateType};
 use crate::ledger::SqliteLedgerEventEmitter;
 use crate::protocol::dispatch::LedgerEventEmitter;
 
@@ -2005,16 +2002,16 @@ impl ReceiptWriter<GateOrchestratorEvent> for GateTimeoutReceiptWriter {
         };
 
         for event in receipts {
-            let fields = timeout_event_persistence_fields(event)?;
+            let (event_type, timestamp_ns) = timeout_event_persistence_fields(event);
             let payload = serde_json::to_vec(event)
                 .map_err(|e| format!("failed to serialize timeout event for persistence: {e}"))?;
             emitter
                 .emit_session_event(
                     TIMEOUT_PERSISTOR_SESSION_ID,
-                    fields.event_type,
+                    event_type,
                     &payload,
                     TIMEOUT_PERSISTOR_ACTOR_ID,
-                    fields.timestamp_ns,
+                    timestamp_ns,
                 )
                 .map_err(|e| format!("failed to persist timeout event to ledger: {e}"))?;
         }
@@ -2022,20 +2019,21 @@ impl ReceiptWriter<GateOrchestratorEvent> for GateTimeoutReceiptWriter {
     }
 }
 
-/// Maps timeout-kernel events to canonical persistence metadata.
-///
-/// Fail-closed: only timeout lifecycle events are admitted.
-pub fn timeout_event_persistence_fields(
-    event: &GateOrchestratorEvent,
-) -> Result<GateEventPersistenceFields, String> {
-    let fields = gate_event_persistence_fields(event);
+/// Maps orchestrator events to persisted event type and timestamp.
+#[must_use]
+pub fn timeout_event_persistence_fields(event: &GateOrchestratorEvent) -> (&'static str, u64) {
     match event {
-        GateOrchestratorEvent::GateTimedOut { .. }
-        | GateOrchestratorEvent::GateTimeoutReceiptGenerated { .. }
-        | GateOrchestratorEvent::AllGatesCompleted { .. } => Ok(fields),
-        _ => Err(format!(
-            "non-timeout gate event {event:?} cannot be persisted by timeout kernel"
-        )),
+        GateOrchestratorEvent::GateTimedOut { timestamp_ms, .. } => {
+            ("gate.timed_out", timestamp_ms.saturating_mul(1_000_000))
+        },
+        GateOrchestratorEvent::GateTimeoutReceiptGenerated { timestamp_ms, .. } => (
+            "gate.timeout_receipt_generated",
+            timestamp_ms.saturating_mul(1_000_000),
+        ),
+        GateOrchestratorEvent::AllGatesCompleted { timestamp_ms, .. } => {
+            ("gate.all_completed", timestamp_ms.saturating_mul(1_000_000))
+        },
+        _ => ("gate.event", epoch_now_ns_u64()),
     }
 }
 
@@ -2068,11 +2066,17 @@ fn parse_gate_type_from_gate_id(gate_id: &str) -> Option<GateType> {
 fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), String> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode gate_lease_issued payload json: {e}"))?;
-    let full_lease = payload_json
+    let (lease_value, decode_context) = payload_json
         .get("full_lease")
-        .ok_or_else(|| "gate_lease_issued payload missing full_lease".to_string())?;
-    let lease: GateLease = serde_json::from_value(full_lease.clone())
-        .map_err(|e| format!("failed to decode full_lease payload: {e}"))?;
+        .cloned()
+        // Legacy persisted shape stored GateLease fields at top-level.
+        .map_or_else(
+            || (payload_json.clone(), "legacy_top_level"),
+            |value| (value, "full_lease"),
+        );
+    let lease: GateLease = serde_json::from_value(lease_value).map_err(|e| {
+        format!("failed to decode gate_lease_issued payload ({decode_context}): {e}")
+    })?;
     let gate_type = parse_gate_type_from_gate_id(&lease.gate_id).ok_or_else(|| {
         format!(
             "gate_lease_issued full_lease has unsupported gate_id '{}'",
@@ -2146,7 +2150,7 @@ mod tests {
     use apm2_core::crypto::Signer;
 
     use super::*;
-    use crate::gate::GateStartInfo;
+    use crate::gate::SessionTerminatedInfo;
 
     fn sample_gate_lease(lease_id: &str, expires_at: u64) -> GateLease {
         GateLease {
@@ -2179,6 +2183,31 @@ mod tests {
             observed_monotonic_ns,
             deadline_monotonic_ns,
         }
+    }
+
+    #[test]
+    fn parse_gate_lease_payload_accepts_full_lease_envelope() {
+        let lease = sample_gate_lease("lease-parse-envelope", 2_000);
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "full_lease": lease,
+        }))
+        .expect("payload serialize");
+
+        let (parsed, gate_type) =
+            parse_gate_lease_payload(&payload).expect("full_lease envelope should parse");
+        assert_eq!(parsed.lease_id, "lease-parse-envelope");
+        assert_eq!(gate_type, GateType::Quality);
+    }
+
+    #[test]
+    fn parse_gate_lease_payload_accepts_legacy_top_level_shape() {
+        let lease = sample_gate_lease("lease-parse-legacy", 3_000);
+        let payload = serde_json::to_vec(&lease).expect("legacy payload serialize");
+
+        let (parsed, gate_type) =
+            parse_gate_lease_payload(&payload).expect("legacy top-level payload should parse");
+        assert_eq!(parsed.lease_id, "lease-parse-legacy");
+        assert_eq!(gate_type, GateType::Quality);
     }
 
     #[test]
@@ -2312,14 +2341,15 @@ mod tests {
 
     #[test]
     fn timeout_event_mapping_uses_expected_types() {
-        let fields = timeout_event_persistence_fields(&GateOrchestratorEvent::GateTimedOut {
-            work_id: "W-1".to_string(),
-            gate_type: GateType::Quality,
-            lease_id: "lease-1".to_string(),
-            timestamp_ms: 7,
-        })
-        .expect("timeout event mapping should succeed");
-        assert_eq!(fields.event_type, "gate.timed_out");
+        let (event_type, _) =
+            timeout_event_persistence_fields(&GateOrchestratorEvent::GateTimedOut {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                lease_id: "lease-1".to_string(),
+                changeset_digest: [0x42; 32],
+                timestamp_ms: 7,
+            });
+        assert_eq!(event_type, "gate.timed_out");
     }
 
     #[test]
@@ -2406,14 +2436,14 @@ mod tests {
             crate::gate::GateOrchestratorConfig::default(),
             Arc::new(Signer::generate()),
         ));
-        let info = GateStartInfo {
-            source_event_id: "session-kernel-timeout".to_string(),
+        let info = SessionTerminatedInfo {
+            session_id: "session-kernel-timeout".to_string(),
             work_id: "work-kernel-timeout".to_string(),
             changeset_digest: [7u8; 32],
-            source_timestamp_ms: 0,
+            terminated_at_ms: 0,
         };
         let _ = orchestrator
-            .start_for_changeset(info)
+            .start_from_test_session(info)
             .await
             .expect("orchestration should start");
         let mut domain = GateTimeoutDomain::new(

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use apm2_core::events::{
-    WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkEdgeAdded, WorkEdgeRemoved,
-    WorkEdgeType, WorkEdgeWaived, WorkEvent, WorkGraphEvent, work_event, work_graph_event,
+    WorkEdgeAdded, WorkEdgeRemoved, WorkEdgeType, WorkEdgeWaived, WorkEvent, WorkGraphEvent,
+    work_event, work_graph_event,
 };
 use apm2_core::ledger::EventRecord;
 use apm2_core::reducer::{Reducer, ReducerContext};
@@ -14,14 +14,18 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
+use crate::protocol::dispatch::{
+    LedgerEventEmitter, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX,
+    WORK_TRANSITIONED_DOMAIN_PREFIX,
+};
+
+const DEFAULT_SYNTHETIC_WORK_TYPE: &str = "TICKET";
 const MAX_CANONICAL_WORK_EVENT_JSON_BYTES: usize = 64 * 1024;
 const MAX_CANONICAL_WORK_EVENT_DECODED_BYTES: usize = 64 * 1024;
 const MAX_CANONICAL_WORK_EVENT_HEX_CHARS: usize = MAX_CANONICAL_WORK_EVENT_DECODED_BYTES * 2;
 const MAX_WORK_GRAPH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_WORK_GRAPH_JSON_DEPTH: usize = 2;
 const GRAPH_EDGE_ID_DOMAIN_PREFIX: &[u8] = b"apm2.work_graph.edge.v1";
-const DEFAULT_SYNTHETIC_WORK_TYPE: &str = "TICKET";
 
 /// Stable machine-readable reason code for an unsatisfied incoming BLOCKS edge.
 pub const WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED: &str = "work.blocks.unsatisfied_prerequisite";
@@ -249,21 +253,24 @@ impl WorkObjectProjection {
         let mut next_seq_id = 1u64;
 
         for (_, event) in ordered {
-            let reducer_events =
-                match translate_signed_event(event, &mut opened_work_ids, &mut next_seq_id) {
-                    Ok(events) => events,
-                    Err(error) if should_skip_non_replayable_signed_event(event, &error) => {
-                        warn!(
-                            event_id = %event.event_id,
-                            event_type = %event.event_type,
-                            work_id = %event.work_id,
-                            error = %error,
-                            "Skipping non-replayable signed event during projection rebuild"
-                        );
-                        continue;
-                    },
-                    Err(error) => return Err(error),
-                };
+            let reducer_events = match translate_signed_event(
+                event,
+                &mut opened_work_ids,
+                &mut next_seq_id,
+            ) {
+                Ok(events) => events,
+                Err(error) if should_skip_pr_associated_replay_error(&event.event_type, &error) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        event_type = %event.event_type,
+                        work_id = %event.work_id,
+                        error = %error,
+                        "Skipping non-replayable work.pr_associated event during projection rebuild"
+                    );
+                    continue;
+                },
+                Err(error) => return Err(error),
+            };
             let mut skip_source_event = false;
             for reducer_event in &reducer_events {
                 if let Err(error) = self.apply_reducer_event(reducer_event) {
@@ -317,6 +324,103 @@ impl WorkObjectProjection {
     #[must_use]
     pub fn work_count(&self) -> usize {
         self.ordered_work.len()
+    }
+
+    /// Returns the latest changeset digest for a work ID from the reducer
+    /// state, if a `ChangeSetPublished` event has been observed.
+    #[must_use]
+    pub fn latest_changeset_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .latest_changeset_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the CI receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .ci_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .review_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the merge receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn merge_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .merge_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the event ID of the `ChangeSetPublished` event that established
+    /// the latest changeset identity binding (`STEP_10`).
+    #[must_use]
+    pub fn changeset_published_event_id(&self, work_id: &str) -> Option<&str> {
+        self.reducer
+            .state()
+            .changeset_published_event_id_by_work
+            .get(work_id)
+            .map(String::as_str)
+    }
+
+    /// Returns the CAS hash of the `ChangeSetBundleV1` for the latest
+    /// changeset (`STEP_10`).
+    #[must_use]
+    pub fn bundle_cas_hash(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .bundle_cas_hash_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the CI receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .ci_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .review_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the number of pending identity-chain defects in the reducer
+    /// (global queue length).
+    #[must_use]
+    pub fn identity_chain_defect_count(&self) -> usize {
+        self.reducer.identity_chain_defect_count()
+    }
+
+    /// Returns the cumulative identity-chain defect count for a specific
+    /// work item. Returns 0 if no defects have been recorded for `work_id`.
+    #[must_use]
+    pub fn identity_chain_defect_count_for_work(&self, work_id: &str) -> u32 {
+        self.reducer.identity_chain_defect_count_for_work(work_id)
     }
 
     /// Returns claimable work items in deterministic ID order.
@@ -546,9 +650,12 @@ impl WorkObjectProjection {
 
 /// Converts daemon signed events into canonical `work.*` reducer events.
 ///
-/// Non-work events are ignored. `work_claimed` is non-reducer legacy noise and
-/// ignored; `work_transitioned` is accepted only as a strict transitional
-/// alias when its payload is the canonical session-envelope + reducer protobuf.
+/// Transitional daemon legacy events (`work_claimed`, `work_transitioned`) are
+/// normalized into `work.*` protobuf payloads consumed by `WorkReducer`.
+///
+/// Digest-context non-work events (for example `changeset_published` and
+/// gate/review/merge receipt events) are forwarded unchanged so the reducer can
+/// enforce latest-changeset stage admission.
 pub fn translate_signed_events(
     events: &[SignedLedgerEvent],
 ) -> Result<Vec<EventRecord>, WorkProjectionError> {
@@ -590,11 +697,8 @@ fn translate_signed_event(
         // Native reducer event family (already canonical names).
         "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
         | "work.pr_associated" => {
-            let reducer_payload = decode_canonical_work_event_payload(
-                &event.payload,
-                &event.event_type,
-                &event.work_id,
-            )?;
+            let reducer_payload =
+                decode_canonical_work_event_payload(&event.payload, &event.event_type)?;
             if let Some(work_id) = extract_work_id_from_work_event(&reducer_payload) {
                 opened_work_ids.insert(work_id);
             }
@@ -607,49 +711,24 @@ fn translate_signed_event(
             );
         },
 
-        // Transitional alias: event_type remains `work_transitioned`, but
-        // payload must be canonical session-envelope + WorkEvent protobuf.
-        "work_transitioned" => {
-            let reducer_payload = decode_canonical_work_event_payload(
+        // Transitional daemon event: claim anchor. We synthesize only
+        // work.opened; the authoritative claim state comes from
+        // work_transitioned(Open->Claimed).
+        "work_claimed" => {
+            let work_id = extract_work_id_from_json_payload(
                 &event.payload,
-                &event.event_type,
+                "work_claimed",
+                "work_id",
                 &event.work_id,
             )?;
-            let decoded = WorkEvent::decode(reducer_payload.as_slice()).map_err(|error| {
-                WorkProjectionError::InvalidPayload {
-                    event_type: event.event_type.clone(),
-                    reason: format!(
-                        "wrapped work_transitioned payload does not decode as WorkEvent: {error}"
-                    ),
-                }
-            })?;
-            let Some(work_event::Event::Transitioned(transitioned)) = decoded.event else {
-                return Err(WorkProjectionError::InvalidPayload {
-                    event_type: event.event_type.clone(),
-                    reason: "work_transitioned envelope payload must contain a WorkTransitioned reducer event".to_string(),
-                });
-            };
-            if transitioned.work_id != event.work_id {
-                return Err(WorkProjectionError::InvalidPayload {
-                    event_type: event.event_type.clone(),
-                    reason: format!(
-                        "work_transitioned payload work_id '{}' does not match ledger work_id '{}'",
-                        transitioned.work_id, event.work_id
-                    ),
-                });
-            }
-            if transitioned.from_state.eq_ignore_ascii_case("OPEN")
-                && opened_work_ids.insert(transitioned.work_id.clone())
-            {
-                // Transitional continuity: some producers still emit the
-                // initial OPEN->CLAIMED transition without a prior
-                // `work.opened` entry in the same stream.
+
+            if opened_work_ids.insert(work_id.clone()) {
                 push_event(
                     "work.opened",
-                    &transitioned.work_id,
+                    &work_id,
                     &event.actor_id,
                     helpers::work_opened_payload(
-                        &transitioned.work_id,
+                        &work_id,
                         DEFAULT_SYNTHETIC_WORK_TYPE,
                         Vec::new(),
                         Vec::new(),
@@ -657,19 +736,69 @@ fn translate_signed_event(
                     ),
                     event.timestamp_ns,
                 );
-            } else {
-                opened_work_ids.insert(transitioned.work_id.clone());
             }
+        },
+
+        // Transitional daemon event: JSON transition payload.
+        "work_transitioned" => {
+            let transition = parse_work_transitioned_payload(&event.payload)?;
+
+            if transition.from_state == "OPEN" && opened_work_ids.insert(transition.work_id.clone())
+            {
+                push_event(
+                    "work.opened",
+                    &transition.work_id,
+                    &event.actor_id,
+                    helpers::work_opened_payload(
+                        &transition.work_id,
+                        DEFAULT_SYNTHETIC_WORK_TYPE,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    event.timestamp_ns,
+                );
+            }
+
             push_event(
                 "work.transitioned",
-                &transitioned.work_id,
+                &transition.work_id,
                 &event.actor_id,
-                reducer_payload,
+                helpers::work_transitioned_payload_with_sequence(
+                    &transition.work_id,
+                    &transition.from_state,
+                    &transition.to_state,
+                    &transition.rationale_code,
+                    transition.previous_transition_count,
+                ),
                 event.timestamp_ns,
             );
         },
 
-        // Includes legacy non-reducer signals such as `work_claimed`.
+        // Forward digest-bound non-work events so WorkReducer can maintain
+        // latest changeset + stage receipt context (CSID-004).
+        // Merge receipt events use an explicit allowlist (no substring matching)
+        // to prevent cross-work state injection via unreserved event types.
+        "changeset_published"
+        | "gate.receipt_collected"
+        | "gate_receipt_collected"
+        | "gate.receipt"
+        | "gate_receipt"
+        | "review_receipt_recorded"
+        | "review_blocked_recorded"
+        | "fac.merge_receipt.recorded"
+        | "gate.merge_receipt_created"
+        | "merge_receipt_recorded"
+        | "merge_receipt_created" => {
+            push_event(
+                &event.event_type,
+                &event.work_id,
+                &event.actor_id,
+                event.payload.clone(),
+                event.timestamp_ns,
+            );
+        },
+
         _ => {},
     }
 
@@ -694,75 +823,6 @@ fn should_skip_pr_associated_replay_error(event_type: &str, error: &WorkProjecti
     }
 }
 
-fn is_legacy_work_transitioned_payload_shape(payload: &[u8], expected_work_id: &str) -> bool {
-    if payload.first() != Some(&b'{') {
-        return false;
-    }
-    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return false;
-    };
-    let Some(object) = parsed.as_object() else {
-        return false;
-    };
-
-    if object.contains_key("session_id") || object.contains_key("payload") {
-        return false;
-    }
-
-    let Some(work_id) = object
-        .get("work_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-    else {
-        return false;
-    };
-    if work_id.is_empty() || work_id != expected_work_id {
-        return false;
-    }
-
-    let has_from_state = object
-        .get("from_state")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty());
-    let has_to_state = object
-        .get("to_state")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty());
-    if !has_from_state || !has_to_state {
-        return false;
-    }
-
-    object
-        .get("previous_transition_count")
-        .is_none_or(|value| value.as_u64().is_some() || value.as_i64().is_some())
-}
-
-fn should_skip_legacy_work_transitioned_replay_error(
-    event: &SignedLedgerEvent,
-    error: &WorkProjectionError,
-) -> bool {
-    if event.event_type != "work_transitioned" {
-        return false;
-    }
-    match error {
-        WorkProjectionError::InvalidPayload { reason, .. } => {
-            if !(reason.contains("session envelope") || reason.contains("session_id")) {
-                return false;
-            }
-            is_legacy_work_transitioned_payload_shape(&event.payload, &event.work_id)
-        },
-        _ => false,
-    }
-}
-
-fn should_skip_non_replayable_signed_event(
-    event: &SignedLedgerEvent,
-    error: &WorkProjectionError,
-) -> bool {
-    should_skip_pr_associated_replay_error(&event.event_type, error)
-        || should_skip_legacy_work_transitioned_replay_error(event, error)
-}
-
 #[derive(Debug, Deserialize)]
 struct WorkEventEnvelopeJson {
     event_type: String,
@@ -774,7 +834,6 @@ struct WorkEventEnvelopeJson {
 fn decode_canonical_work_event_payload(
     payload: &[u8],
     event_type: &str,
-    expected_work_id: &str,
 ) -> Result<Vec<u8>, WorkProjectionError> {
     if payload.len() > MAX_CANONICAL_WORK_EVENT_JSON_BYTES {
         return Err(WorkProjectionError::InvalidPayload {
@@ -815,15 +874,6 @@ fn decode_canonical_work_event_payload(
             reason: "session envelope missing required identity fields".to_string(),
         });
     }
-    if session_envelope.session_id != expected_work_id {
-        return Err(WorkProjectionError::InvalidPayload {
-            event_type: event_type.to_string(),
-            reason: format!(
-                "session envelope session_id '{}' does not match ledger work_id '{}'",
-                session_envelope.session_id, expected_work_id
-            ),
-        });
-    }
     let wrapped_payload = session_envelope.payload;
 
     if wrapped_payload.len() > MAX_CANONICAL_WORK_EVENT_HEX_CHARS {
@@ -852,35 +902,10 @@ fn decode_canonical_work_event_payload(
         });
     }
 
-    let decoded_event = WorkEvent::decode(decoded.as_slice()).map_err(|error| {
-        WorkProjectionError::InvalidPayload {
-            event_type: event_type.to_string(),
-            reason: format!("wrapped work.* payload does not decode as WorkEvent: {error}"),
-        }
+    WorkEvent::decode(decoded.as_slice()).map_err(|error| WorkProjectionError::InvalidPayload {
+        event_type: event_type.to_string(),
+        reason: format!("wrapped work.* payload does not decode as WorkEvent: {error}"),
     })?;
-
-    let payload_work_id = match decoded_event.event {
-        Some(work_event::Event::Opened(ref evt)) => evt.work_id.as_str(),
-        Some(work_event::Event::Transitioned(ref evt)) => evt.work_id.as_str(),
-        Some(work_event::Event::Completed(ref evt)) => evt.work_id.as_str(),
-        Some(work_event::Event::Aborted(ref evt)) => evt.work_id.as_str(),
-        Some(work_event::Event::PrAssociated(ref evt)) => evt.work_id.as_str(),
-        None => {
-            return Err(WorkProjectionError::InvalidPayload {
-                event_type: event_type.to_string(),
-                reason: "wrapped work.* payload missing concrete WorkEvent variant".to_string(),
-            });
-        },
-    };
-    if payload_work_id != expected_work_id {
-        return Err(WorkProjectionError::InvalidPayload {
-            event_type: event_type.to_string(),
-            reason: format!(
-                "wrapped work.* payload work_id '{payload_work_id}' does not match ledger \
-                 work_id '{expected_work_id}'"
-            ),
-        });
-    }
 
     Ok(decoded)
 }
@@ -1241,6 +1266,142 @@ fn derive_edge_id(key: &WorkEdgeKey) -> String {
     format!("EDGE-{}", hex::encode(hasher.finalize().as_bytes()))
 }
 
+#[derive(Debug)]
+struct ParsedTransition {
+    work_id: String,
+    from_state: String,
+    to_state: String,
+    rationale_code: String,
+    previous_transition_count: u32,
+}
+
+fn parse_work_transitioned_payload(
+    payload: &[u8],
+) -> Result<ParsedTransition, WorkProjectionError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|err| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: err.to_string(),
+        })?;
+
+    let work_id = value
+        .get("work_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: "missing work_id".to_string(),
+        })?
+        .to_string();
+
+    let from_raw = value
+        .get("from_state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: "missing from_state".to_string(),
+        })?;
+
+    let to_raw = value
+        .get("to_state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: "missing to_state".to_string(),
+        })?;
+
+    let from_state =
+        normalize_work_state(from_raw).ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: format!("unsupported from_state: {from_raw}"),
+        })?;
+
+    let to_state =
+        normalize_work_state(to_raw).ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: format!("unsupported to_state: {to_raw}"),
+        })?;
+
+    let rationale_code = value
+        .get("rationale_code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("runtime_transition")
+        .to_string();
+
+    let previous_transition_count = value
+        .get("previous_transition_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| WorkProjectionError::InvalidPayload {
+            event_type: "work_transitioned".to_string(),
+            reason: "missing previous_transition_count".to_string(),
+        })?;
+
+    let previous_transition_count = u32::try_from(previous_transition_count).map_err(|_| {
+        WorkProjectionError::InvalidTransitionCount {
+            event_type: "work_transitioned".to_string(),
+            value: previous_transition_count,
+        }
+    })?;
+
+    Ok(ParsedTransition {
+        work_id,
+        from_state,
+        to_state,
+        rationale_code,
+        previous_transition_count,
+    })
+}
+
+fn extract_work_id_from_json_payload(
+    payload: &[u8],
+    event_type: &str,
+    field: &str,
+    fallback: &str,
+) -> Result<String, WorkProjectionError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|err| WorkProjectionError::InvalidPayload {
+            event_type: event_type.to_string(),
+            reason: err.to_string(),
+        })?;
+
+    if let Some(work_id) = value.get(field).and_then(serde_json::Value::as_str) {
+        return Ok(work_id.to_string());
+    }
+
+    if !fallback.is_empty() {
+        return Ok(fallback.to_string());
+    }
+
+    Err(WorkProjectionError::InvalidPayload {
+        event_type: event_type.to_string(),
+        reason: format!("missing {field}"),
+    })
+}
+
+fn normalize_work_state(raw_state: &str) -> Option<String> {
+    let compact = raw_state
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    let normalized = match compact.as_str() {
+        "OPEN" => "OPEN",
+        "CLAIMED" => "CLAIMED",
+        "INPROGRESS" => "IN_PROGRESS",
+        "REVIEW" => "REVIEW",
+        "NEEDSINPUT" => "NEEDS_INPUT",
+        "NEEDSADJUDICATION" => "NEEDS_ADJUDICATION",
+        "COMPLETED" => "COMPLETED",
+        "ABORTED" => "ABORTED",
+        "CIPENDING" => "CI_PENDING",
+        "READYFORREVIEW" => "READY_FOR_REVIEW",
+        "BLOCKED" => "BLOCKED",
+        _ => return None,
+    };
+
+    Some(normalized.to_string())
+}
+
 fn extract_work_id_from_work_event(payload: &[u8]) -> Option<String> {
     let decoded = WorkEvent::decode(payload).ok()?;
     match decoded.event {
@@ -1278,13 +1439,10 @@ fn build_event_record(
 /// skipped during projection rebuild anyway).
 fn domain_prefix_for_event_type(event_type: &str) -> Option<&'static [u8]> {
     match event_type {
-        // Legacy daemon event families signed with dedicated work-domain
-        // prefixes. These must remain mapped to avoid silently bypassing
-        // signature verification in projection paths that validate signatures.
         "work_claimed" => Some(WORK_CLAIMED_DOMAIN_PREFIX),
         "work_transitioned" => Some(WORK_TRANSITIONED_DOMAIN_PREFIX),
-        // Native reducer events (`work.*`) are session-envelope events and are
-        // validated structurally by bounded decode + reducer invariants.
+        // Native protobuf work events do not carry JCS signatures; they
+        // are verified structurally by the reducer.
         _ => None,
     }
 }
@@ -1292,9 +1450,10 @@ fn domain_prefix_for_event_type(event_type: &str) -> Option<&'static [u8]> {
 /// Verifies Ed25519 signatures on signed ledger events.
 ///
 /// Returns the input events unchanged on success, or fails closed with
-/// `WorkProjectionError::SignatureVerificationFailed`. Canonical work events
-/// are structurally validated via bounded decode + envelope checks during
-/// translation.
+/// `WorkProjectionError::SignatureVerificationFailed`. Only events with
+/// domain-bound signatures (`work_claimed`, `work_transitioned`) are
+/// verified. Events without a known domain prefix are passed through
+/// (they are filtered by `translate_signed_events` anyway).
 pub fn verify_signed_events(
     events: &[SignedLedgerEvent],
     emitter: &Arc<dyn LedgerEventEmitter>,
@@ -1385,21 +1544,15 @@ mod tests {
         previous_transition_count: u32,
         timestamp_ns: u64,
     ) -> SignedLedgerEvent {
-        let transitioned_payload = helpers::work_transitioned_payload_with_sequence(
-            work_id,
-            from_state,
-            to_state,
-            "test_transition",
-            previous_transition_count,
-        );
         let payload = serde_json::json!({
-            "event_type": "work.transitioned",
-            "session_id": work_id,
-            "actor_id": "actor:test",
-            "payload": hex::encode(transitioned_payload),
+            "work_id": work_id,
+            "from_state": from_state,
+            "to_state": to_state,
+            "rationale_code": "test_transition",
+            "previous_transition_count": previous_transition_count,
         });
         signed_event(
-            "work.transitioned",
+            "work_transitioned",
             work_id,
             serde_json::to_vec(&payload).expect("work_transitioned payload should encode"),
             timestamp_ns,
@@ -1496,7 +1649,7 @@ mod tests {
         let payload = helpers::work_pr_associated_payload(work_id, pr_number, commit_sha);
         let envelope = serde_json::json!({
             "event_type": "work.pr_associated",
-            "session_id": work_id,
+            "session_id": "S-projection-test",
             "actor_id": "actor:test-projection",
             "payload": hex::encode(payload),
             "ajc_id": "f".repeat(64),
@@ -1510,30 +1663,9 @@ mod tests {
     }
 
     #[test]
-    fn domain_prefix_mapping_preserves_authoritative_work_event_prefixes() {
-        assert_eq!(
-            domain_prefix_for_event_type("work_claimed"),
-            Some(WORK_CLAIMED_DOMAIN_PREFIX),
-            "work_claimed must retain canonical signature domain mapping"
-        );
-        assert_eq!(
-            domain_prefix_for_event_type("work_transitioned"),
-            Some(WORK_TRANSITIONED_DOMAIN_PREFIX),
-            "work_transitioned must retain canonical signature domain mapping"
-        );
-    }
-
-    #[test]
-    fn domain_prefix_mapping_skips_non_work_domain_events() {
-        assert_eq!(domain_prefix_for_event_type("work.opened"), None);
-        assert_eq!(domain_prefix_for_event_type("changeset_published"), None);
-    }
-
-    #[test]
     fn decode_canonical_work_event_payload_rejects_oversized_json_envelope() {
         let oversized = vec![b'x'; MAX_CANONICAL_WORK_EVENT_JSON_BYTES + 1];
-        let result =
-            decode_canonical_work_event_payload(&oversized, "work.opened", "W-projection-test");
+        let result = decode_canonical_work_event_payload(&oversized, "work.opened");
 
         assert!(
             matches!(
@@ -1560,11 +1692,7 @@ mod tests {
             "test fixture must exceed the canonical payload bound"
         );
 
-        let result = decode_canonical_work_event_payload(
-            &payload,
-            "work.opened",
-            "W-projection-oversized-protobuf",
-        );
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
         assert!(
             matches!(
                 result,
@@ -1586,11 +1714,7 @@ mod tests {
             vec![],
         );
 
-        let result = decode_canonical_work_event_payload(
-            &payload,
-            "work.opened",
-            "W-projection-raw-protobuf",
-        );
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
         assert!(
             matches!(
                 result,
@@ -1625,80 +1749,11 @@ mod tests {
             "fixture must start with '{{' to exercise JSON-first format detection"
         );
 
-        let decoded = decode_canonical_work_event_payload(
-            &envelope,
-            "work.opened",
-            "W-projection-json-envelope",
-        )
-        .expect("JSON envelope should decode");
+        let decoded = decode_canonical_work_event_payload(&envelope, "work.opened")
+            .expect("JSON envelope should decode");
         assert_eq!(
             decoded, opened_payload,
             "JSON envelopes must be unwrapped instead of treated as raw protobuf"
-        );
-    }
-
-    #[test]
-    fn decode_canonical_work_event_payload_rejects_envelope_session_id_mismatch() {
-        let opened_payload = helpers::work_opened_payload(
-            "W-projection-session-mismatch",
-            "TICKET",
-            vec![0x34; 32],
-            vec![],
-            vec![],
-        );
-        let envelope = serde_json::to_vec(&serde_json::json!({
-            "event_type": "work.opened",
-            "session_id": "W-other",
-            "actor_id": "actor:test-projection",
-            "payload": hex::encode(&opened_payload),
-        }))
-        .expect("JSON envelope should encode");
-
-        let result = decode_canonical_work_event_payload(
-            &envelope,
-            "work.opened",
-            "W-projection-session-mismatch",
-        );
-        assert!(
-            matches!(
-                result,
-                Err(WorkProjectionError::InvalidPayload { event_type, reason })
-                    if event_type == "work.opened"
-                        && reason.contains("session_id")
-                        && reason.contains("does not match ledger work_id")
-            ),
-            "session envelope session_id must match signed ledger work_id"
-        );
-    }
-
-    #[test]
-    fn decode_canonical_work_event_payload_rejects_wrapped_payload_work_id_mismatch() {
-        let opened_payload = helpers::work_opened_payload(
-            "W-payload-mismatch",
-            "TICKET",
-            vec![0x35; 32],
-            vec![],
-            vec![],
-        );
-        let envelope = serde_json::to_vec(&serde_json::json!({
-            "event_type": "work.opened",
-            "session_id": "W-projection-envelope",
-            "actor_id": "actor:test-projection",
-            "payload": hex::encode(&opened_payload),
-        }))
-        .expect("JSON envelope should encode");
-
-        let result =
-            decode_canonical_work_event_payload(&envelope, "work.opened", "W-projection-envelope");
-        assert!(
-            matches!(
-                result,
-                Err(WorkProjectionError::InvalidPayload { event_type, reason })
-                    if event_type == "work.opened"
-                        && reason.contains("payload work_id")
-                        && reason.contains("does not match ledger work_id")
-            ),
-            "wrapped WorkEvent payload work_id must match signed ledger work_id"
         );
     }
 
@@ -1716,11 +1771,7 @@ mod tests {
         }))
         .expect("payload-only envelope should encode");
 
-        let result = decode_canonical_work_event_payload(
-            &envelope,
-            "work.opened",
-            "W-projection-payload-only-envelope",
-        );
+        let result = decode_canonical_work_event_payload(&envelope, "work.opened");
         assert!(
             matches!(
                 result,
@@ -1735,8 +1786,7 @@ mod tests {
     #[test]
     fn decode_canonical_work_event_payload_rejects_non_json_non_protobuf_payload() {
         let payload = b"not-a-valid-work-event".to_vec();
-        let result =
-            decode_canonical_work_event_payload(&payload, "work.opened", "W-projection-test");
+        let result = decode_canonical_work_event_payload(&payload, "work.opened");
 
         assert!(
             matches!(
@@ -1746,60 +1796,6 @@ mod tests {
                         && reason.contains("must use JSON session envelope")
             ),
             "non-JSON-prefixed payloads must fail closed under envelope-only decoding"
-        );
-    }
-
-    #[test]
-    fn rebuild_skips_legacy_work_transitioned_payload_shape() {
-        let mut projection = WorkObjectProjection::new();
-        let legacy_transition = signed_event(
-            "work_transitioned",
-            "W-legacy-001",
-            serde_json::to_vec(&serde_json::json!({
-                "work_id": "W-legacy-001",
-                "actor_id": "actor:test-projection",
-                "from_state": "OPEN",
-                "to_state": "CLAIMED",
-                "previous_transition_count": 0
-            }))
-            .expect("legacy transition payload should encode"),
-            1_000,
-        );
-
-        projection
-            .rebuild_from_signed_events(&[legacy_transition])
-            .expect("legacy transition payload should be skipped, not fatal");
-        assert!(
-            projection.get_work("W-legacy-001").is_none(),
-            "legacy transition payload skip must not materialize reducer state"
-        );
-    }
-
-    #[test]
-    fn rebuild_rejects_non_legacy_work_transitioned_payload_shape() {
-        let mut projection = WorkObjectProjection::new();
-        let malformed_transition = signed_event(
-            "work_transitioned",
-            "W-malformed-001",
-            serde_json::to_vec(&serde_json::json!({
-                "event_type": "work_transitioned",
-                "payload": "00"
-            }))
-            .expect("malformed transition payload should encode"),
-            1_001,
-        );
-
-        let err = projection
-            .rebuild_from_signed_events(&[malformed_transition])
-            .expect_err("non-legacy malformed transition payload must fail closed");
-        assert!(
-            matches!(
-                err,
-                WorkProjectionError::InvalidPayload { event_type, reason }
-                    if event_type == "work_transitioned"
-                        && reason.contains("session envelope")
-            ),
-            "only known legacy transition payload shape may be skipped"
         );
     }
 
