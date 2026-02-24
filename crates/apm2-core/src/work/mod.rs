@@ -72,6 +72,6 @@ pub use parity::{
 };
 pub use reducer::{
     MAX_IDENTITY_CHAIN_DEFECTS, ReceiptOutcome, WorkReducer, WorkReducerState,
-    hash_defect_preimage, helpers,
+    extract_work_id_and_digest_from_payload, hash_defect_preimage, helpers,
 };
 pub use state::{Work, WorkState, WorkType};

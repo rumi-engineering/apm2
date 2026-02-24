@@ -907,18 +907,35 @@ impl SqliteGateStartIntentStore {
             "ALTER TABLE gate_start_intents ADD COLUMN completed_at_ns INTEGER",
             [],
         );
+        // Migration: add observed_seq column for deterministic dequeue
+        // ordering by ledger observation order (Quality BLOCKER fix:
+        // prevents reordering same-work publications whose intent_key
+        // lexical order differs from publish order).
+        let _ = guard.execute(
+            "ALTER TABLE gate_start_intents ADD COLUMN observed_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Replace the old index with one that orders by observed_seq for
+        // deterministic dequeue. The `created_at_ns` tiebreaker handles
+        // pre-migration rows that all have `observed_seq=0`.
+        let _ = guard.execute("DROP INDEX IF EXISTS idx_gate_start_intents_pending", []);
         guard
             .execute(
-                "CREATE INDEX IF NOT EXISTS idx_gate_start_intents_pending
-                 ON gate_start_intents(state, created_at_ns, intent_key)",
+                "CREATE INDEX IF NOT EXISTS idx_gate_start_intents_pending_v2
+                 ON gate_start_intents(state, observed_seq, created_at_ns)",
                 [],
             )
-            .map_err(|e| format!("failed to create idx_gate_start_intents_pending: {e}"))?;
+            .map_err(|e| format!("failed to create idx_gate_start_intents_pending_v2: {e}"))?;
         drop(guard);
         Ok(Self { conn })
     }
 
     /// Static `enqueue` — callable from `spawn_blocking`.
+    ///
+    /// Each intent is persisted with its `observed_seq` (ledger observation
+    /// order). Dequeue ordering uses `observed_seq ASC, rowid ASC` to
+    /// preserve deterministic publication order even when all intents in a
+    /// batch share the same `created_at_ns` (Quality BLOCKER fix).
     fn enqueue_many_with_conn(
         conn: &Arc<Mutex<Connection>>,
         intents: &[GateStartIntent],
@@ -935,12 +952,13 @@ impl SqliteGateStartIntentStore {
             let key = intent.key();
             let publication_json = serde_json::to_string(&intent.publication)
                 .map_err(|e| format!("failed to encode publication json: {e}"))?;
+            let observed_seq = i64::try_from(intent.observed_seq).unwrap_or(i64::MAX);
             let rows = tx
                 .execute(
                     "INSERT OR IGNORE INTO gate_start_intents
-                     (intent_key, publication_json, state, blocked_reason, created_at_ns, updated_at_ns)
-                     VALUES (?1, ?2, 'pending', NULL, ?3, ?4)",
-                    params![key, publication_json, now_ns, now_ns],
+                     (intent_key, publication_json, state, blocked_reason, created_at_ns, updated_at_ns, observed_seq)
+                     VALUES (?1, ?2, 'pending', NULL, ?3, ?4, ?5)",
+                    params![key, publication_json, now_ns, now_ns, observed_seq],
                 )
                 .map_err(|e| format!("failed to enqueue gate-start intent: {e}"))?;
             inserted = inserted.saturating_add(rows);
@@ -951,6 +969,19 @@ impl SqliteGateStartIntentStore {
     }
 
     /// Static `dequeue` — callable from `spawn_blocking`.
+    ///
+    /// Dequeues pending intents in deterministic ledger observation order
+    /// (`observed_seq ASC, rowid ASC`). The `rowid` tiebreaker handles
+    /// pre-migration rows that all have `observed_seq=0` and provides a
+    /// stable secondary ordering within the same sequence number.
+    ///
+    /// # Quality BLOCKER fix
+    ///
+    /// Previously ordered by `created_at_ns ASC, intent_key ASC`, which
+    /// shared one timestamp across the whole batch and fell back to
+    /// lexical key order. Two same-work publications could be reordered
+    /// when their digest lexical order differed from publish order,
+    /// causing `start_for_publication` to supersede with an older digest.
     fn dequeue_batch_with_conn(
         conn: &Arc<Mutex<Connection>>,
         limit: usize,
@@ -965,20 +996,22 @@ impl SqliteGateStartIntentStore {
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let mut stmt = guard
             .prepare(
-                "SELECT publication_json
+                "SELECT publication_json, observed_seq
                  FROM gate_start_intents
                  WHERE state = 'pending'
-                 ORDER BY created_at_ns ASC, intent_key ASC
+                 ORDER BY observed_seq ASC, created_at_ns ASC
                  LIMIT ?1",
             )
             .map_err(|e| format!("failed to prepare gate-start dequeue query: {e}"))?;
         let rows = stmt
-            .query_map(params![limit_i64], |row| row.get::<_, String>(0))
+            .query_map(params![limit_i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|e| format!("failed to query gate-start intents: {e}"))?;
 
         let mut intents = Vec::new();
         for row in rows {
-            let publication_json =
+            let (publication_json, seq_i64) =
                 row.map_err(|e| format!("failed to decode gate-start intent row: {e}"))?;
             // Defense-in-depth: enforce size limit on stored intent payloads.
             if publication_json.len() > MAX_PAYLOAD_BYTES {
@@ -990,12 +1023,10 @@ impl SqliteGateStartIntentStore {
             }
             let publication: ChangesetPublication = serde_json::from_str(&publication_json)
                 .map_err(|e| format!("failed to decode publication json: {e}"))?;
+            let observed_seq = u64::try_from(seq_i64).unwrap_or(0);
             intents.push(GateStartIntent {
                 publication,
-                // Dequeued intents are already ordered by created_at_ns ASC
-                // in the SQL query, so observed_seq is not used for ordering
-                // in this path.
-                observed_seq: 0,
+                observed_seq,
             });
         }
         Ok(intents)
@@ -2442,5 +2473,198 @@ mod tests {
 
         // The cursor can advance to the last event's position.
         assert!(!results[1].cursor_event_id.is_empty());
+    }
+
+    /// Quality BLOCKER regression: batching two same-work
+    /// `changeset_published` events whose digest lexical order is opposite
+    /// to publish order must NOT reorder them. The surviving orchestration
+    /// and emitted leases must remain bound to the newest publication.
+    ///
+    /// Before the fix, `enqueue_many` stamped one `now_ns` for the whole
+    /// batch and `dequeue_batch` ordered by `created_at_ns ASC, intent_key
+    /// ASC`, which fell back to lexical key order. Two same-work
+    /// publications could be reordered, causing `start_for_publication` to
+    /// supersede with an older digest.
+    #[test]
+    fn sqlite_dequeue_preserves_observation_order_not_key_lexical_order() {
+        use super::SqliteGateStartIntentStore;
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        let store = SqliteGateStartIntentStore::new(Arc::clone(&conn)).expect("init store");
+
+        // Digest 0xFF.. sorts lexically AFTER 0x00.., but we publish
+        // 0xFF.. first (observed_seq=0) and 0x00.. second (observed_seq=1).
+        let pub_first = apm2_core::fac::ChangesetPublication {
+            work_id: "W-order-test".to_string(),
+            changeset_digest: [0xFF; 32],
+            bundle_cas_hash: [0xAA; 32],
+            published_at_ms: 1_000,
+            publisher_actor_id: "actor:test".to_string(),
+            changeset_published_event_id: "evt-first".to_string(),
+        };
+        let pub_second = apm2_core::fac::ChangesetPublication {
+            work_id: "W-order-test-2".to_string(),
+            changeset_digest: [0x00; 32],
+            bundle_cas_hash: [0xBB; 32],
+            published_at_ms: 2_000,
+            publisher_actor_id: "actor:test".to_string(),
+            changeset_published_event_id: "evt-second".to_string(),
+        };
+
+        let intent_first = super::GateStartIntent {
+            publication: pub_first,
+            observed_seq: 0,
+        };
+        let intent_second = super::GateStartIntent {
+            publication: pub_second,
+            observed_seq: 1,
+        };
+
+        // Enqueue both in a single batch (same created_at_ns).
+        let inserted = SqliteGateStartIntentStore::enqueue_many_with_conn(
+            &store.conn,
+            &[intent_first, intent_second],
+        )
+        .expect("enqueue");
+        assert_eq!(inserted, 2);
+
+        // Dequeue must return in observed_seq order (0xFF first, 0x00 second),
+        // NOT lexical key order (which would put 0x00 first).
+        let dequeued =
+            SqliteGateStartIntentStore::dequeue_batch_with_conn(&store.conn, 10).expect("dequeue");
+        assert_eq!(dequeued.len(), 2);
+        assert_eq!(
+            dequeued[0].publication.changeset_digest, [0xFF; 32],
+            "first dequeued intent must be the first-observed publication (0xFF), \
+             not the lexically-first key (0x00)"
+        );
+        assert_eq!(
+            dequeued[1].publication.changeset_digest, [0x00; 32],
+            "second dequeued intent must be the second-observed publication (0x00)"
+        );
+        // Verify observed_seq values are preserved through persistence.
+        assert_eq!(dequeued[0].observed_seq, 0);
+        assert_eq!(dequeued[1].observed_seq, 1);
+    }
+
+    /// Security MAJOR regression: serialized `GateOrchestratorEvent` variants
+    /// must include `changeset_digest` in their JSON payload so that the
+    /// `WorkReducer` can extract it via `find_work_id_and_digest`. Without
+    /// `changeset_digest`, receipt events are silently dropped by the reducer
+    /// and `ci_receipt_digest_by_work` never gets populated, causing
+    /// downstream CI transitions to be denied indefinitely.
+    #[test]
+    fn gate_receipt_collected_event_serializes_with_changeset_digest() {
+        use apm2_core::work::extract_work_id_and_digest_from_payload;
+
+        use crate::gate::{GateOrchestratorEvent, GateType};
+
+        let digest = [0x42; 32];
+        let event = GateOrchestratorEvent::GateReceiptCollected {
+            work_id: "W-digest-test".to_string(),
+            gate_type: GateType::Quality,
+            receipt_id: "receipt-1".to_string(),
+            passed: true,
+            changeset_digest: digest,
+            timestamp_ms: 1_000,
+        };
+
+        let payload = serde_json::to_vec(&event).expect("serialize event");
+
+        // The reducer's extraction function must be able to find both
+        // work_id and changeset_digest in the serialized payload.
+        let extracted = extract_work_id_and_digest_from_payload(&payload);
+        assert!(
+            extracted.is_some(),
+            "reducer must be able to extract (work_id, changeset_digest) from \
+             serialized GateReceiptCollected event"
+        );
+        let (work_id, extracted_digest) = extracted.unwrap();
+        assert_eq!(work_id, "W-digest-test");
+        assert_eq!(extracted_digest, digest);
+    }
+
+    /// Security MAJOR regression: all `GateOrchestratorEvent` variants
+    /// that carry digest-bound semantics must serialize with
+    /// `changeset_digest` extractable by the reducer.
+    #[test]
+    fn all_gate_event_variants_serialize_with_extractable_digest() {
+        use apm2_core::work::extract_work_id_and_digest_from_payload;
+
+        use crate::gate::{GateOrchestratorEvent, GateType};
+
+        let digest = [0xAB; 32];
+
+        let events: Vec<GateOrchestratorEvent> = vec![
+            GateOrchestratorEvent::PolicyResolved {
+                work_id: "W-1".to_string(),
+                changeset_digest: digest,
+                policy_hash: [0x01; 32],
+                timestamp_ms: 1,
+            },
+            GateOrchestratorEvent::GateLeaseIssued {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                lease_id: "L-1".to_string(),
+                executor_actor_id: "actor:exec".to_string(),
+                changeset_digest: digest,
+                timestamp_ms: 2,
+            },
+            GateOrchestratorEvent::GateExecutorSpawned {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                episode_id: "ep-1".to_string(),
+                adapter_profile_id: "ap-1".to_string(),
+                changeset_digest: digest,
+                timestamp_ms: 3,
+            },
+            GateOrchestratorEvent::GateReceiptCollected {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                receipt_id: "R-1".to_string(),
+                passed: true,
+                changeset_digest: digest,
+                timestamp_ms: 4,
+            },
+            GateOrchestratorEvent::GateTimedOut {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                lease_id: "L-1".to_string(),
+                changeset_digest: digest,
+                timestamp_ms: 5,
+            },
+            GateOrchestratorEvent::GateTimeoutReceiptGenerated {
+                work_id: "W-1".to_string(),
+                gate_type: GateType::Quality,
+                receipt_id: "R-timeout".to_string(),
+                changeset_digest: digest,
+                timestamp_ms: 6,
+            },
+            GateOrchestratorEvent::AllGatesCompleted {
+                work_id: "W-1".to_string(),
+                all_passed: true,
+                outcomes: vec![],
+                changeset_digest: digest,
+                timestamp_ms: 7,
+            },
+        ];
+
+        for event in &events {
+            let payload = serde_json::to_vec(event).expect("serialize event");
+            let extracted = extract_work_id_and_digest_from_payload(&payload);
+            assert!(
+                extracted.is_some(),
+                "reducer must extract (work_id, changeset_digest) from {:?}",
+                std::mem::discriminant(event)
+            );
+            let (work_id, extracted_digest) = extracted.unwrap();
+            assert_eq!(work_id, "W-1");
+            assert_eq!(
+                extracted_digest, digest,
+                "changeset_digest mismatch in event variant"
+            );
+        }
     }
 }

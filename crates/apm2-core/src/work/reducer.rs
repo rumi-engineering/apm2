@@ -1214,7 +1214,17 @@ fn extract_cas_hash_from_payload(payload: &[u8]) -> Option<[u8; 32]> {
     decode_digest_value(cas_hash_value)
 }
 
-fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
+/// Extracts `(work_id, changeset_digest)` from a JSON event payload.
+///
+/// Returns `None` if the payload exceeds `MAX_PAYLOAD_BYTES` (1 MiB), is not
+/// valid JSON, or does not contain both `work_id` (string) and
+/// `changeset_digest` (hex string or byte array) at any nesting level.
+///
+/// This is the authoritative extraction function used by the reducer to
+/// populate digest-bound projections (`ci_receipt_digest_by_work`,
+/// `review_receipt_digest_by_work`, etc.). Event producers MUST include
+/// both fields for their events to be admissible.
+pub fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
     // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
     // prevent DoS via oversized payloads exhausting daemon memory.
     if payload.len() > MAX_PAYLOAD_BYTES {

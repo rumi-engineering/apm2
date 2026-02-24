@@ -496,6 +496,8 @@ pub enum GateOrchestratorEvent {
         lease_id: String,
         /// The executor actor ID.
         executor_actor_id: String,
+        /// The changeset digest this lease is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -509,6 +511,8 @@ pub enum GateOrchestratorEvent {
         episode_id: String,
         /// The adapter profile ID.
         adapter_profile_id: String,
+        /// The changeset digest this episode is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -522,6 +526,8 @@ pub enum GateOrchestratorEvent {
         receipt_id: String,
         /// Whether the gate passed.
         passed: bool,
+        /// The changeset digest this receipt is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -533,6 +539,8 @@ pub enum GateOrchestratorEvent {
         gate_type: GateType,
         /// The lease ID that expired.
         lease_id: String,
+        /// The changeset digest this timeout is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -547,6 +555,8 @@ pub enum GateOrchestratorEvent {
         gate_type: GateType,
         /// The receipt ID of the timeout receipt.
         receipt_id: String,
+        /// The changeset digest this timeout receipt is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -558,6 +568,8 @@ pub enum GateOrchestratorEvent {
         all_passed: bool,
         /// Individual gate outcomes.
         outcomes: Vec<GateOutcome>,
+        /// The changeset digest this completion is bound to.
+        changeset_digest: [u8; 32],
         /// Timestamp (ms since epoch).
         timestamp_ms: u64,
     },
@@ -579,6 +591,39 @@ impl GateOrchestratorEvent {
             | Self::GateTimedOut { work_id, .. }
             | Self::GateTimeoutReceiptGenerated { work_id, .. }
             | Self::AllGatesCompleted { work_id, .. } => work_id,
+        }
+    }
+
+    /// Returns the `changeset_digest` from any event variant.
+    ///
+    /// Every variant carries a `changeset_digest` field that binds the event
+    /// to the authoritative `ChangeSetPublished` digest. This is essential
+    /// for digest-bound persistence (CSID-004): the reducer requires both
+    /// `work_id` and `changeset_digest` in persisted event payloads.
+    #[must_use]
+    pub const fn changeset_digest(&self) -> [u8; 32] {
+        match self {
+            Self::PolicyResolved {
+                changeset_digest, ..
+            }
+            | Self::GateLeaseIssued {
+                changeset_digest, ..
+            }
+            | Self::GateExecutorSpawned {
+                changeset_digest, ..
+            }
+            | Self::GateReceiptCollected {
+                changeset_digest, ..
+            }
+            | Self::GateTimedOut {
+                changeset_digest, ..
+            }
+            | Self::GateTimeoutReceiptGenerated {
+                changeset_digest, ..
+            }
+            | Self::AllGatesCompleted {
+                changeset_digest, ..
+            } => *changeset_digest,
         }
     }
 }
@@ -1127,6 +1172,7 @@ impl GateOrchestrator {
                 gate_type,
                 lease_id,
                 executor_actor_id,
+                changeset_digest: publication.changeset_digest,
                 timestamp_ms: now_ms,
             });
         }
@@ -1156,9 +1202,17 @@ impl GateOrchestrator {
         episode_id: &str,
     ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
         let now_ms = self.clock.now_ms();
+        let digest;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
+            // Capture the changeset digest before mutating state so persisted
+            // events are digest-bound (Security MAJOR fix).
+            digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+                GateOrchestratorError::OrchestrationNotFound {
+                    work_id: work_id.to_string(),
+                }
+            })?;
             let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
@@ -1208,6 +1262,7 @@ impl GateOrchestrator {
             gate_type,
             episode_id: episode_id.to_string(),
             adapter_profile_id: gate_type.adapter_profile_id().to_string(),
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         }])
     }
@@ -1307,6 +1362,12 @@ impl GateOrchestrator {
                 });
             }
         }
+
+        // Capture the changeset digest from the receipt itself (it was
+        // already validated against the lease below). This ensures the
+        // persisted GateReceiptCollected event is digest-bound (Security
+        // MAJOR fix: receipt persistence must include changeset_digest).
+        let receipt_digest = receipt.changeset_digest;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -1417,6 +1478,7 @@ impl GateOrchestrator {
             gate_type,
             receipt_id,
             passed,
+            changeset_digest: receipt_digest,
             timestamp_ms: now_ms,
         }];
 
@@ -1474,10 +1536,18 @@ impl GateOrchestrator {
     ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
         let now_ms = self.clock.now_ms();
         let lease_id;
+        let digest;
         let mut timeout_receipt_id: Option<String> = None;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
+            // Capture changeset digest for digest-bound event persistence
+            // (Security MAJOR fix).
+            digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+                GateOrchestratorError::OrchestrationNotFound {
+                    work_id: work_id.to_string(),
+                }
+            })?;
             let entry = find_by_work_id_mut(&mut orchestrations, work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
@@ -1532,6 +1602,7 @@ impl GateOrchestrator {
             work_id: work_id.to_string(),
             gate_type,
             lease_id,
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         }];
 
@@ -1542,6 +1613,7 @@ impl GateOrchestrator {
                 work_id: work_id.to_string(),
                 gate_type,
                 receipt_id,
+                changeset_digest: digest,
                 timestamp_ms: now_ms,
             });
         }
@@ -1604,12 +1676,14 @@ impl GateOrchestrator {
                 work_id: lease.work_id.clone(),
                 gate_type,
                 lease_id: lease.lease_id.clone(),
+                changeset_digest: lease.changeset_digest,
                 timestamp_ms: now_ms,
             },
             GateOrchestratorEvent::GateTimeoutReceiptGenerated {
                 work_id: lease.work_id.clone(),
                 gate_type,
                 receipt_id: timeout_receipt.receipt_id,
+                changeset_digest: lease.changeset_digest,
                 timestamp_ms: now_ms,
             },
         ]
@@ -2081,6 +2155,13 @@ impl GateOrchestrator {
         events: &mut Vec<GateOrchestratorEvent>,
     ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
         let orchestrations = self.orchestrations.read().await;
+        // Capture changeset digest for digest-bound AllGatesCompleted event
+        // (Security MAJOR fix).
+        let digest = find_digest_for_work_id(&orchestrations, work_id).ok_or_else(|| {
+            GateOrchestratorError::OrchestrationNotFound {
+                work_id: work_id.to_string(),
+            }
+        })?;
         let entry = find_by_work_id(&orchestrations, work_id).ok_or_else(|| {
             GateOrchestratorError::OrchestrationNotFound {
                 work_id: work_id.to_string(),
@@ -2140,6 +2221,7 @@ impl GateOrchestrator {
             work_id: work_id.to_string(),
             all_passed,
             outcomes: outcomes.clone(),
+            changeset_digest: digest,
             timestamp_ms: now_ms,
         });
 
@@ -2197,6 +2279,21 @@ fn find_by_work_id_mut<'a>(
     map.iter_mut()
         .find(|((wid, _), _)| wid == work_id)
         .map(|(_, entry)| entry)
+}
+
+/// Finds the changeset digest for the orchestration matching `work_id`.
+///
+/// The composite key `(work_id, changeset_digest)` is the authoritative
+/// identity binding. This helper extracts the digest portion so that
+/// event constructors can include it in persisted payloads (CSID-004:
+/// digest-bound receipt persistence).
+fn find_digest_for_work_id(
+    map: &HashMap<(String, [u8; 32]), OrchestrationEntry>,
+    work_id: &str,
+) -> Option<[u8; 32]> {
+    map.keys()
+        .find(|(wid, _)| wid == work_id)
+        .map(|(_, digest)| *digest)
 }
 
 /// Removes the orchestration entry matching `work_id`.
