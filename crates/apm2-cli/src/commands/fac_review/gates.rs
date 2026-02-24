@@ -7308,6 +7308,14 @@ time.sleep(20)\n",
             b"# empty\n",
         )
         .expect("write allowlist");
+        let machine_spec_snapshot =
+            crate::commands::fac_review::fac_review_machine_spec_json_string(true)
+                .expect("render machine spec snapshot");
+        fs::write(
+            review_gate_dir.join("fac_review_state_machine.cac.json"),
+            machine_spec_snapshot.as_bytes(),
+        )
+        .expect("write machine spec snapshot");
 
         let prompt = concat!(
             "{\n",
