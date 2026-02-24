@@ -312,7 +312,7 @@ operational_playbook:
       observed_via: "Operator describes work to be done; no TCK YAML file exists at documents/work/tickets/ and no existing work object is found via `apm2 fac work current`"
       action: |
         Work creation currently requires a canonical work object materialized via
-        `apm2 fac work open --from-ticket <yaml_path> --lease-id <lease_id>`.
+        `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>`.
         Inline creation without a YAML file is NOT yet implemented in the CLI.
         Resolution options in priority order:
         (1) Check whether a work object already exists in the daemon for this scope:
@@ -321,7 +321,7 @@ operational_playbook:
         (2) If no work object exists: operator must create a minimal ticket file at
             documents/work/tickets/<NEW_ID>.json with at minimum:
               ticket_meta.ticket.id, ticket_meta.ticket.title, work_type
-            then run `apm2 fac work open --from-ticket ...` to materialize it.
+            then run `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>` to materialize it.
         (3) Do NOT dispatch an implementor until a canonical work object is confirmed
             in the daemon. Dispatching without work identity is a BLOCKED escalation.
 

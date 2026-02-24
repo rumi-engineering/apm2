@@ -75,7 +75,7 @@ decision_tree:
             (d) Nothing resolves: STOP with BLOCKED. State which resolution paths
                 were attempted and what each returned. Do not infer scope from the
                 branch name alone. Remediation: operator must create a canonical
-                work object first via `apm2 fac work open --from-ticket <yaml>`.
+                work object first via `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>`.
 
             In all cases: note custody.responsibility_domains —
             DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed
