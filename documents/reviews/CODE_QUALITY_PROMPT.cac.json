@@ -1,6 +1,6 @@
 {
   "schema": "apm2.review.prompt.v1",
-  "schema_version": "2.1.0",
+  "schema_version": "2.2.0",
   "kind": "review.executable_prompt",
   "meta": {
     "stable_id": "dcp://apm2.review/prompt/code-quality-review@2",
@@ -128,12 +128,12 @@
               "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.json (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] that the diff must preserve."
             },
             {
-              "action": "read_ticket",
-              "rule": "Identify the ticket ID from commit messages in $commit_history_path (convention: 'TCK-XXXXX: ...'). Read the ticket file at documents/work/tickets/TCK-XXXXX.json in full. Extract scope.in_scope (the delivery contract), scope.out_of_scope (hard boundaries), and definition_of_done.criteria (completion checklist). For each entry in binds.requirements, read the file at requirement_ref and extract acceptance_criteria. These form the requirements baseline for completeness checking in STEP_3."
+              "action": "read_work_scope",
+              "rule": "Identify the work identifier from commit messages (convention: 'W-...' daemon work_id or 'TCK-XXXXX' alias). Run `apm2 fac work show --work-id <id>` to retrieve the work object. From the work object, extract: `requirement_ids` (list of RFC requirement node IDs, e.g. 'RFC-0032::REQ-0041'), `scope.in_scope`, `scope.out_of_scope`, and `definition_of_done.criteria`. For each requirement_id, read the corresponding requirement node from the RFC JSON at `documents/rfcs/RFC-XXXX.cac.rfc_doc.v1.json` and extract its `statement` and `acceptance` fields. These form the requirements baseline for completeness checking in STEP_3. If no work object is found, derive requirements from RFC nodes referenced in the diff's AGENTS.json or commit messages."
             },
             {
               "action": "selective_read",
-              "rule": "Read RFC/ticket/doc references linked from the ticket or touched files when necessary for intent verification."
+              "rule": "Read RFC/doc references linked from the work object or touched files when necessary for intent verification."
             }
           ],
           "next": "STEP_3_ANALYZE_AND_EMIT"
@@ -163,7 +163,7 @@
             "command": "apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA --type code-quality --severity <severity> --summary \"<one-line>\" --risk \"<why this matters>\" --impact \"<consequences if unaddressed>\" --location \"<file:line or module>\" --body \"<detailed description and required action>\"",
             "quality_rules": [
               "Each finding MUST include: summary, risk, impact, location, and body (required action).",
-              "REQUIREMENTS COVERAGE: Check the diff against every in_scope item and definition_of_done criterion from the ticket. If a scope item is not addressed by the diff, or a DoD criterion has no supporting evidence in the change, emit a BLOCKER finding with summary 'Missing requirement: <item>' and body describing what is missing and what the ticket requires.",
+              "REQUIREMENTS COVERAGE: Check the diff against every in_scope item, definition_of_done criterion, and RFC requirement acceptance field from the work object. If a scope item is not addressed by the diff, or a DoD criterion has no supporting evidence in the change, emit a BLOCKER finding with summary 'Missing requirement: <item>' and body describing what is missing and what the work object requires.",
               "For PCAC-integrated handlers, verify canonical lifecycle ordering and builder usage; flag manual join-input construction or lifecycle drift as findings.",
               "For prior-round findings that are now resolved, emit with --severity NIT and note the resolution in --body."
             ]
