@@ -88,10 +88,8 @@
         "documents/strategy/BUSINESS_PLAN.json",
         "documents/prompts/instruction.business_strategy_protocol.v1.json",
         "documents/security/THREAT_MODEL.cac.json",
-        "documents/rfcs/RFC-0016/README.yaml",
-        "documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md",
-        "documents/rfcs/RFC-0015/00_meta.yaml",
-        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+        "documents/rfcs/RFC-0016.cac.rfc_doc.v1.json",
+        "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
       ]
     ],
     "r": {

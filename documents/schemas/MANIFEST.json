@@ -20,58 +20,10 @@
     "description": "Canonical schema registry. All CAC and YAML schemas for the APM2 project.",
     "schemas": [
       {
-        "schema_id": "01_evidence_artifact.schema",
-        "file": "01_evidence_artifact.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for evidence artifact"
-      },
-      {
-        "schema_id": "02_requirement.schema",
-        "file": "02_requirement.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for requirement"
-      },
-      {
-        "schema_id": "03_quality_coverage.schema",
-        "file": "03_quality_coverage.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for quality coverage"
-      },
-      {
-        "schema_id": "04_ticket_meta.schema",
-        "file": "04_ticket_meta.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for ticket meta"
-      },
-      {
-        "schema_id": "05_waiver.schema",
-        "file": "05_waiver.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for waiver"
-      },
-      {
-        "schema_id": "06_gate_review.schema",
-        "file": "06_gate_review.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for gate review"
-      },
-      {
-        "schema_id": "07_prd_meta.schema",
-        "file": "07_prd_meta.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for prd meta"
-      },
-      {
-        "schema_id": "08_rfc_meta.schema",
-        "file": "08_rfc_meta.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for rfc meta"
-      },
-      {
-        "schema_id": "09_routing_profile.schema",
-        "file": "09_routing_profile.schema.yaml",
-        "format": "yaml",
-        "description": "YAML schema for routing profile"
+        "schema_id": "apm2.agents_context.v1.schema",
+        "file": "apm2.agents_context.v1.schema.json",
+        "format": "json",
+        "description": "Module behavior registry for AGENTS.json files: maps invariants, safety properties, requirements, and capabilities to RFC system specs via stable behavior IDs"
       },
       {
         "schema_id": "apm2.prd.cac.v1.schema",

@@ -28,7 +28,7 @@
     "required_artifacts": {
       "waiver_file": {
         "location": "documents/work/waivers/",
-        "naming": "WVR-XXXX.yaml"
+        "naming": "WVR-XXXX.json"
       },
       "waiver_links": [
         "Blocking PR number",

@@ -95,8 +95,8 @@
           "verification": {
             "method": "RECEIPT_VERIFICATION",
             "evidence_refs": [
-              "documents/rfcs/RFC-0020/requirements/REQ-0004.yaml",
-              "documents/rfcs/RFC-0020/requirements/REQ-0016.yaml"
+              "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+              "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
             ]
           }
         }
@@ -170,8 +170,8 @@
         "verification": {
           "method": "POLICY_REVIEW",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0002.yaml",
-            "documents/rfcs/RFC-0020/requirements/REQ-0003.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -187,7 +187,7 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0027.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -203,8 +203,8 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0015.yaml",
-            "documents/rfcs/RFC-0020/requirements/REQ-0018.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       }
@@ -222,8 +222,8 @@
           "verification": {
             "method": "RECEIPT_VERIFICATION",
             "evidence_refs": [
-              "documents/rfcs/RFC-0020/requirements/REQ-0010.yaml",
-              "documents/rfcs/RFC-0020/requirements/REQ-0011.yaml"
+              "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+              "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
             ]
           }
         },
@@ -239,7 +239,7 @@
           "verification": {
             "method": "RECEIPT_VERIFICATION",
             "evidence_refs": [
-              "documents/rfcs/RFC-0020/requirements/REQ-0018.yaml"
+              "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
             ]
           }
         }
@@ -315,8 +315,8 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0028.yaml",
-            "documents/rfcs/RFC-0020/requirements/REQ-0029.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -332,8 +332,8 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0005.yaml",
-            "documents/rfcs/RFC-0020/requirements/REQ-0015.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -348,7 +348,7 @@
         "verification": {
           "method": "POLICY_REVIEW",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0032.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -363,8 +363,8 @@
         "verification": {
           "method": "POLICY_REVIEW",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0030.yaml",
-            "documents/rfcs/RFC-0020/requirements/REQ-0032.yaml"
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json"
           ]
         }
       },
@@ -380,7 +380,7 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
             "documents/security/consensus-runbook.cac.json"
           ]
         }
@@ -396,7 +396,7 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
             "documents/security/consensus-runbook.cac.json"
           ]
         }
@@ -414,7 +414,7 @@
         "verification": {
           "method": "RECEIPT_VERIFICATION",
           "evidence_refs": [
-            "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml",
+            "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
             "documents/security/consensus-runbook.cac.json"
           ]
         }
