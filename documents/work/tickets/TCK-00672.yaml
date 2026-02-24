@@ -368,15 +368,6 @@ plan:
         - an extension of existing `apm2 daemon doctor` / `apm2 work inspect`.
 
       Must be safe-by-default: do not dump full diffs; only identifiers + bounded summaries.
-implementation_status:
-  completed_in_this_pr:
-    - Synthetic `changeset_digest = blake3(session_id || work_id)` derivation was removed from `SessionDispatcher`.
-    - Session termination no longer starts gates; `SessionTerminated` is lifecycle/accounting only.
-    - `PublishChangeSet` now starts gate lifecycle via `GateOrchestrator::start_for_changeset(GateStartInfo)`.
-    - Gate startup events from publish path are persisted as canonical ledger events (`gate.policy_resolved`, `gate.lease_issued`).
-    - Gate start idempotency remains keyed to authoritative identity `(work_id, changeset_digest)`.
-  remaining_focus:
-    - Complete cursor-driven orchestrator-kernel cutover for all downstream stages (gates/review/merge) and latest-digest enforcement.
 definition_of_done:
   evidence_ids:
   - EXEC-TCK00672-NO-SYNTHETIC-DIGEST
