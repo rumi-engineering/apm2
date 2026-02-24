@@ -9,7 +9,7 @@ orientation: "You are managing the Forge Admission Cycle for one or more merge r
 title: Parallel PR Orchestrator Monitor
 protocol:
   id: ORCH-MONITOR
-  version: 2.1.0
+  version: 2.2.0
   type: executable_specification
   inputs[1]:
     - PR_SCOPE_OPTIONAL
@@ -39,7 +39,7 @@ references[1]:
 
 implementor_warm_handoff_required_payload[5]:
   - field: implementor_skill_invocation
-    requirement: "Dispatch prompt MUST begin with `/implementor-default <TICKET_ID or PR_CONTEXT>`; `/ticket` is deprecated."
+    requirement: "Dispatch prompt MUST begin with `/implementor-default <WORK_IDENTIFIER>` where WORK_IDENTIFIER is the canonical work_id (`W-...`), TCK alias (`TCK-xxxxx`), or PR context. `/ticket` is deprecated."
   - field: implementor_core_instruction_source
     requirement: "State that `@documents/skills/implementor-default/SKILL.md` are the primary execution contract for implementation."
   - field: prompt_scope_boundary
@@ -138,9 +138,16 @@ decision_tree:
           action: |
             For `recommended_action.action=dispatch_implementor`, run `recommended_action.command`
             to retrieve current findings, then dispatch one fresh implementor with
-            `/implementor-default <TICKET_ID or PR_CONTEXT>`.
-            Include `@documents/skills/implementor-default/SKILL.md`, ticket ID, and worktree path
-            in the warm handoff payload.
+            `/implementor-default <WORK_IDENTIFIER>` where WORK_IDENTIFIER is:
+              - the canonical work_id (`W-...`) if no YAML file exists for this work, or
+              - the TCK alias (`TCK-xxxxx`) if a YAML file exists at
+                `documents/work/tickets/<alias>.yaml`, or
+              - the PR context if resolving from an open PR.
+            Include `@documents/skills/implementor-default/SKILL.md`, work identifier,
+            and worktree path in the warm handoff payload.
+            If no work object exists in the daemon and no YAML file exists, do NOT
+            dispatch an implementor — escalate to operator (see CREATE_WORK_WITHOUT_YAML
+            in the operational playbook).
         - id: NO_DUPLICATE_OWNERSHIP
           action: "Never run two implementor agents or two review batches for the same PR in the same tick."
         - id: WARM_NEW_PR
@@ -223,7 +230,10 @@ decision_tree:
             If branch sync facts are missing from artifacts or unresolved conflicts remain,
             redispatch a fresh fix subagent.
         - id: REQUIRE_FAC_PUSH
-          action: "Push only via `apm2 fac push` (`--ticket` preferred, `--branch` fallback)."
+          action: |
+            Push only via `apm2 fac push`. Add `--ticket <TICKET_YAML>` only when a
+            YAML file exists for this work item; omit it for daemon-only work objects.
+            Use `--branch` as fallback for branch-only push context.
       next: HEARTBEAT_LOOP
 
     - id: REVIEW_GATE_DEFINITION
@@ -298,6 +308,23 @@ operational_playbook:
       observed_via: "A PR number appears for the first time in `apm2 fac doctor` output during this session"
       action: "Enqueue `apm2 fac warm` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
 
+    - trigger: "Operator reports new work (bug or feature) with no existing YAML file"
+      observed_via: "Operator describes work to be done; no TCK YAML file exists at documents/work/tickets/ and no existing work object is found via `apm2 fac work current`"
+      action: |
+        Work creation currently requires a canonical work object materialized via
+        `apm2 fac work open --from-ticket <yaml_path> --lease-id <lease_id>`.
+        Inline creation without a YAML file is NOT yet implemented in the CLI.
+        Resolution options in priority order:
+        (1) Check whether a work object already exists in the daemon for this scope:
+            run `apm2 fac work current` or ask operator for the work_id. If found,
+            proceed directly with the W-... work_id — no YAML needed.
+        (2) If no work object exists: operator must create a minimal YAML file at
+            documents/work/tickets/<NEW_ID>.yaml with at minimum:
+              ticket_meta.ticket.id, ticket_meta.ticket.title, work_type
+            then run `apm2 fac work open --from-ticket ...` to materialize it.
+        (3) Do NOT dispatch an implementor until a canonical work object is confirmed
+            in the daemon. Dispatching without work identity is a BLOCKED escalation.
+
 invariants[14]:
   - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N>` as the authoritative orchestration surface."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
@@ -313,3 +340,5 @@ invariants[14]:
   - "Run `apm2 fac gc` at session start and periodically (every ~10 ticks or on low-disk signal); GC is idempotent and reclaims gate cache, blobs, lane logs, and quarantine artifacts."
   - "Enqueue `apm2 fac warm` when a new PR first enters monitoring scope; pre-warming populates lane compilation caches and reduces cold-start gate timeouts."
   - "Prefer `apm2 fac doctor --pr <N> --wait-for-recommended-action` over poll-sleep loops. The blocking wait returns on state change or terminal condition and is both cheaper and more responsive than periodic polling."
+  - "A canonical work object in the daemon (ledger-backed, with WorkSpecV1 in CAS) is required before dispatching any implementor. Never dispatch against branch name alone or ambient state. If no work object exists and no YAML file is available, escalate to operator before dispatching."
+  - "Work scope for daemon-only work objects (no YAML file) comes from WorkSpecV1 fields in CAS projection. Implementors resolve this via `apm2 fac work current` — not from the filesystem."

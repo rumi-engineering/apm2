@@ -79,9 +79,13 @@ decision_tree:
             Help output is authoritative for names/flags.
         - id: RESOLVE_SCOPE
           action: |
-            Locate the ticket YAML at `documents/work/tickets/$1.yaml` and read the full file. If a PR number was provided instead, extract the ticket ID from the branch name or PR description.
-            Before proceeding, read the reason field to understand each blocking relationship and note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
-            Orient on the ticket structure: binds links your work to requirements and evidence artifacts via file paths; scope.in_scope is your delivery contract and scope.out_of_scope is a hard boundary; definition_of_done.criteria plus linked requirement acceptance_criteria form your completion checklist.
+            Resolve scope/identity with a three-path contract:
+            (1) If a ticket YAML exists at `documents/work/tickets/$1.yaml`, read it for context and requirement bindings.
+            (2) If no YAML exists, resolve scope from daemon-backed work projection (`apm2 fac work current` and/or operator-provided canonical work_id `W-...`).
+            (3) If neither YAML nor daemon work object exists, stop with BLOCKED and escalate to operator before implementation.
+            If a PR number was provided instead of `$1`, derive scope from PR context (branch alias/work_id), then apply the same three-path rule.
+            For YAML-backed context, read the reason field to understand blocking relationships and note custody.responsibility_domains — DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed review patterns.
+            For YAML-backed context, binds links your work to requirements and evidence artifacts via file paths; scope.in_scope is your delivery contract and scope.out_of_scope is a hard boundary; definition_of_done.criteria plus linked requirement acceptance_criteria form your completion checklist.
         - id: FETCH_REVIEW_FINDINGS
           action: |
             If a PR already exists for this branch, fetch current review findings:
