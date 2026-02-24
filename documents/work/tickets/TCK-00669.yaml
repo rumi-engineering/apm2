@@ -31,6 +31,7 @@ delivery_notes:
     - "Doctor/fix is the canonical operator recovery workflow; direct/manual mutation commands must not bypass the reconciler state machine."
     - "Any remaining queue health/status surfaces must read from daemon projection or daemon RPCs, not ad-hoc local state files."
     - "Claimed queue file locks must remain held for the entire terminal mutation window (no early release before move/receipt commit)."
+    - "Pipeline-commit failures must leave token-bound jobs in `claimed/` for reconciler repair; do not requeue consumed-authority jobs to `pending/`."
 
 root_cause_analysis:
   summary: |

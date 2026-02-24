@@ -687,26 +687,13 @@ pub(super) fn execute_queued_gates_job(
             None, // bytes_backend
             toolchain_fingerprint,
         ) {
-            eprintln!("worker: pipeline commit failed for gates job: {commit_err}");
-            release_claimed_lock_before_terminal_transition(
-                &spec.job_id,
-                "gates_commit_failure_release_to_pending",
-            );
-            if let Err(move_err) = release_claimed_job_to_pending(
+            return handle_pipeline_commit_failure(
+                &commit_err,
+                "completed gates job",
                 claimed_path,
                 queue_root,
                 claimed_file_name,
-                fac_root,
-                spec,
-                "gates_pipeline_commit_failed",
-            ) {
-                eprintln!(
-                    "worker: WARNING: failed to return claimed gates job to pending: {move_err}"
-                );
-            }
-            return JobOutcome::skipped_pipeline_commit(format!(
-                "pipeline commit failed for gates job: {commit_err}"
-            ));
+            );
         }
 
         // TCK-00540 BLOCKER fix: After the receipt is committed, rebind
@@ -1863,19 +1850,13 @@ pub(super) fn execute_warm_job(
     ) {
         eprintln!("worker: pipeline commit failed for warm job: {commit_err}");
         let _ = LaneLeaseV1::remove(lane_dir);
-        if let Err(move_err) = release_claimed_job_to_pending(
+        return handle_pipeline_commit_failure(
+            &commit_err,
+            "completed warm job",
             claimed_path,
             queue_root,
             claimed_file_name,
-            fac_root,
-            spec,
-            "warm_pipeline_commit_failed",
-        ) {
-            eprintln!("worker: WARNING: failed to return claimed warm job to pending: {move_err}");
-        }
-        return JobOutcome::skipped_pipeline_commit(format!(
-            "pipeline commit failed for warm job: {commit_err}"
-        ));
+        );
     }
 
     // Post-completion lane cleanup (same as standard jobs).
