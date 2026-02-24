@@ -9,17 +9,13 @@
 //! - `ccp` - CCP (Code Context Protocol) operations
 //! - `impact-map` - Impact Map generation (PRD to CCP mapping)
 //! - `rfc` - RFC framing from Impact Map and CCP
-//! - `tickets` - Ticket emission from RFC decomposition
-//! - `compile` - End-to-end compile pipeline (CCP -> Impact Map -> RFC ->
-//!   Tickets)
+//! - `compile` - End-to-end compile pipeline (CCP -> Impact Map -> RFC)
 
 pub mod ccp;
 pub mod compile;
 pub mod impact_map;
-pub mod refactor;
 pub mod rfc;
 mod run;
-pub mod tickets;
 
 // Re-export the run function for backward compatibility
 pub use run::run;

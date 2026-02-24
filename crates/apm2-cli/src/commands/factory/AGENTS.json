@@ -6,7 +6,7 @@
       "id": "BEH-CLI-FACTORY-001",
       "kind": "invariant",
       "title": "Pipeline stages execute in strict order with no skipping",
-      "description": "Compile pipeline stages (CCP Build, Impact Map, RFC Frame, Ticket Emit) execute in strict order; no stage is skipped.",
+      "description": "Compile pipeline stages (CCP Build, Impact Map, RFC Frame) execute in strict order; no stage is skipped.",
       "rfc": ["RFC-0017"]
     },
     {

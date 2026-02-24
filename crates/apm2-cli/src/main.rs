@@ -258,14 +258,8 @@ enum FactoryCommands {
     /// RFC commands (RFC framing from Impact Map and CCP)
     Rfc(commands::factory::rfc::RfcCommand),
 
-    /// Ticket commands (emit tickets from RFC decomposition)
-    Tickets(commands::factory::tickets::TicketsCommand),
-
     /// Compile pipeline (end-to-end PRD to tickets)
     Compile(commands::factory::compile::CompileArgs),
-
-    /// Refactor radar (maintenance recommendations)
-    Refactor(commands::factory::refactor::RefactorCommand),
 }
 
 fn main() -> Result<()> {
@@ -476,14 +470,8 @@ fn main() -> Result<()> {
                 commands::factory::impact_map::run_impact_map(&impact_map_cmd)
             },
             FactoryCommands::Rfc(rfc_cmd) => commands::factory::rfc::run_rfc(&rfc_cmd),
-            FactoryCommands::Tickets(tickets_cmd) => {
-                commands::factory::tickets::run_tickets(&tickets_cmd)
-            },
             FactoryCommands::Compile(compile_args) => {
                 commands::factory::compile::run_compile(&compile_args)
-            },
-            FactoryCommands::Refactor(refactor_cmd) => {
-                commands::factory::refactor::run_refactor(&refactor_cmd)
             },
         },
     }
