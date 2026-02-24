@@ -275,6 +275,7 @@ pub fn build_sha_update_message(pr_number: u32, old_sha: &str, new_sha: &str) ->
 pub fn build_prompt_content(
     prompt_template_path: &Path,
     pr_url: &str,
+    pr_number: u32,
     head_sha: &str,
     owner: &str,
     repo: &str,
@@ -286,8 +287,10 @@ pub fn build_prompt_content(
         )
     })?;
 
+    let pr_number_text = pr_number.to_string();
     Ok(template
         .replace("$PR_URL", pr_url)
+        .replace("$PR_NUMBER", &pr_number_text)
         .replace("$HEAD_SHA", head_sha)
         .replace(concat!("{", "owner", "}"), owner)
         .replace(concat!("{", "repo", "}"), repo))

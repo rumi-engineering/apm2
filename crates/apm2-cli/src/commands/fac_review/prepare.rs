@@ -153,12 +153,7 @@ pub fn run_prepare(
     let repo_root = resolve_repo_root()?;
     let local_head = resolve_local_head_sha(&repo_root)?;
     let resolved_head = resolve_head_sha(&owner_repo, resolved_pr, sha, &local_head)?;
-    if !local_head.eq_ignore_ascii_case(&resolved_head.head_sha) {
-        return Err(format!(
-            "local HEAD {local_head} does not match resolved PR head {} (source={}); sync your branch and retry `apm2 fac review prepare`",
-            resolved_head.head_sha, resolved_head.head_source
-        ));
-    }
+    ensure_prepare_head_alignment(&local_head, &resolved_head, sha.is_some())?;
     let _ = projection_store::save_identity_with_context(
         &owner_repo,
         resolved_pr,
@@ -269,6 +264,27 @@ pub fn run_prepare(
     }
 
     Ok(exit_codes::SUCCESS)
+}
+
+fn ensure_prepare_head_alignment(
+    local_head: &str,
+    resolved_head: &OwnedResolvedHead,
+    explicit_sha_supplied: bool,
+) -> Result<(), String> {
+    if local_head.eq_ignore_ascii_case(&resolved_head.head_sha) {
+        return Ok(());
+    }
+    if explicit_sha_supplied {
+        eprintln!(
+            "warn: local HEAD {local_head} differs from requested review SHA {}; continuing because explicit --sha was supplied",
+            resolved_head.head_sha
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "local HEAD {local_head} does not match resolved PR head {} (source={}); sync your branch and retry `apm2 fac review prepare`",
+        resolved_head.head_sha, resolved_head.head_source
+    ))
 }
 
 pub fn cleanup_prepared_review_inputs(
@@ -675,9 +691,10 @@ pub fn prepared_review_dir(owner_repo: &str, pr_number: u32, head_sha: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content, cleanup_prepared_review_inputs_at,
-        count_text_lines, prepared_review_dir_from_root, resolve_base_ref_for_pr_with,
-        resolve_head_sha_with, sha_is_locally_reachable,
+        OwnedResolvedHead, PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content,
+        cleanup_prepared_review_inputs_at, count_text_lines, ensure_prepare_head_alignment,
+        prepared_review_dir_from_root, resolve_base_ref_for_pr_with, resolve_head_sha_with,
+        sha_is_locally_reachable,
     };
 
     #[test]
@@ -718,6 +735,31 @@ mod tests {
         .expect("cleanup");
         assert!(removed);
         assert!(!prepared.exists());
+    }
+
+    #[test]
+    fn ensure_prepare_head_alignment_allows_explicit_sha_mismatch() {
+        let resolved = OwnedResolvedHead {
+            head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            head_source: "explicit_arg",
+        };
+        ensure_prepare_head_alignment("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &resolved, true)
+            .expect("explicit --sha should allow local HEAD mismatch");
+    }
+
+    #[test]
+    fn ensure_prepare_head_alignment_rejects_implicit_mismatch() {
+        let resolved = OwnedResolvedHead {
+            head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            head_source: "github_pr_head",
+        };
+        let err = ensure_prepare_head_alignment(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &resolved,
+            false,
+        )
+        .expect_err("implicit mismatch must remain fail-closed");
+        assert!(err.contains("does not match resolved PR head"));
     }
 
     #[test]

@@ -210,7 +210,7 @@ const fn verdict_dimension_for_kind(review_kind: ReviewKind) -> &'static str {
 
 fn required_verdict_command(review_kind: ReviewKind) -> String {
     format!(
-        "cargo run -p apm2-cli -- fac review verdict set --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\"",
+        "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA --dimension {} --verdict <approve|deny> --reason \"<your synthesized reasoning>\"",
         verdict_dimension_for_kind(review_kind)
     )
 }
@@ -1168,8 +1168,14 @@ fn run_single_review(
 
         let (owner, repo) = split_owner_repo(owner_repo)?;
         if matches!(spawn_mode, SpawnMode::Initial) {
-            let prompt_content =
-                build_prompt_content(&prompt_template, pr_url, &current_head_sha, owner, repo)?;
+            let prompt_content = build_prompt_content(
+                &prompt_template,
+                pr_url,
+                pr_number,
+                &current_head_sha,
+                owner,
+                repo,
+            )?;
             fs::write(&prompt_path, prompt_content)
                 .map_err(|err| format!("failed to write prompt file: {err}"))?;
         }
@@ -2062,9 +2068,10 @@ mod tests {
     #[test]
     fn required_verdict_command_uses_code_quality_dimension_for_quality_reviews() {
         let command = required_verdict_command(ReviewKind::Quality);
-        assert!(command.starts_with("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(command.starts_with("apm2 fac review verdict set"));
         assert!(command.contains("--dimension code-quality"));
-        assert!(!command.contains("--sha"));
+        assert!(command.contains("--pr $PR_NUMBER"));
+        assert!(command.contains("--sha $HEAD_SHA"));
     }
 
     #[test]
@@ -2108,7 +2115,7 @@ mod tests {
         let message = build_missing_verdict_nudge_message(ReviewKind::Security, &prompt_path);
 
         assert!(message.contains("RESUME TASK"));
-        assert!(message.contains("cargo run -p apm2-cli -- fac review verdict set"));
+        assert!(message.contains("apm2 fac review verdict set"));
         assert!(message.contains("--dimension security"));
         assert!(message.contains("...[truncated]"));
     }
