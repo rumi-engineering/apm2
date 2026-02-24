@@ -47,6 +47,8 @@
 //! - [INV-CLA-006] Unknown fields are denied on deserialization via
 //!   `deny_unknown_fields`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -57,14 +59,18 @@ use crate::orchestration::OrchestrationEvent;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum serialized payload size (256 KiB).
+/// Maximum serialized payload size (8 MiB).
 ///
-/// Prevents memory denial-of-service from pathological serialization. Holon
-/// event payloads are metadata-sized; large artifacts go to CAS.
-pub const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
+/// Derivation: `WorkCompleted` events can carry up to 1000 evidence IDs,
+/// each approximately 4 KiB when serialized (~4 MiB total). With envelope
+/// overhead the maximum valid payload can approach ~4.5 MiB. We set the
+/// limit to 8 MiB to accommodate growth while still bounding memory usage
+/// against denial-of-service. Large artifacts should still go to CAS; this
+/// limit covers metadata-heavy events.
+pub const MAX_PAYLOAD_SIZE: usize = 8 * 1024 * 1024;
 
-/// Maximum number of events in a single batch append.
-pub const MAX_BATCH_SIZE: usize = 1024;
+/// Expected length of a hex-encoded BLAKE3 digest (64 lowercase hex chars).
+pub const HEX_DIGEST_LENGTH: usize = 64;
 
 /// Event type prefix for all holon events in the core ledger.
 pub const HOLON_EVENT_PREFIX: &str = "holon.";
@@ -100,9 +106,28 @@ pub enum FinalitySignal {
 impl FinalitySignal {
     /// Returns `true` if this event has reached finality (either local or
     /// BFT-finalized).
+    ///
+    /// **Fail-closed**: This is a strict allowlist. Only explicitly enumerated
+    /// variants return `true`. Because `FinalitySignal` is `#[non_exhaustive]`,
+    /// any future variant will land in the catch-all arm and return `false`
+    /// (i.e., treat unknown states as not-final), preventing state machine
+    /// advancement on unconfirmed authority decisions.
+    ///
+    /// The `match_same_arms` lint is deliberately suppressed: we keep
+    /// `Pending` explicit (rather than merging it into the wildcard) so
+    /// that adding a new variant forces a conscious decision about
+    /// whether it counts as final.
     #[must_use]
+    #[allow(clippy::match_same_arms)]
     pub const fn is_final(&self) -> bool {
-        matches!(self, Self::Local | Self::Finalized { .. })
+        match self {
+            Self::Local | Self::Finalized { .. } => true,
+            Self::Pending => false,
+            // Fail-closed: any future variant added to the non-exhaustive enum
+            // is treated as not-final until explicitly allow-listed here.
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
     }
 
     /// Returns `true` if this event is still pending consensus finalization.
@@ -133,15 +158,6 @@ pub enum CoreLedgerAdapterError {
         max: usize,
     },
 
-    /// Batch size exceeds maximum.
-    #[error("batch too large: {size} exceeds {max} event limit")]
-    BatchTooLarge {
-        /// Actual batch size.
-        size: usize,
-        /// Maximum allowed.
-        max: usize,
-    },
-
     /// CAS store operation failed.
     #[error("CAS store failed: {0}")]
     CasError(String),
@@ -153,6 +169,76 @@ pub enum CoreLedgerAdapterError {
     /// Event type is not recognized.
     #[error("unknown event type: {0}")]
     UnknownEventType(String),
+
+    /// A digest string failed format validation.
+    #[error("invalid digest: {field}: {reason}")]
+    InvalidDigest {
+        /// Which field contained the invalid digest.
+        field: &'static str,
+        /// What was wrong.
+        reason: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Validated Hex Digest (BLAKE3 format)
+// ---------------------------------------------------------------------------
+
+/// A validated hex-encoded BLAKE3 digest string.
+///
+/// Enforces that the inner value is exactly 64 lowercase hexadecimal
+/// characters, preventing path traversal sequences or pathological characters
+/// from propagating through the system if digests are used downstream as
+/// filesystem paths or database keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HexDigest(String);
+
+impl HexDigest {
+    /// Validates and wraps a hex digest string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreLedgerAdapterError::InvalidDigest` if the string is not
+    /// exactly 64 lowercase hex characters.
+    pub fn try_new(value: String, field: &'static str) -> Result<Self, CoreLedgerAdapterError> {
+        if value.len() != HEX_DIGEST_LENGTH {
+            return Err(CoreLedgerAdapterError::InvalidDigest {
+                field,
+                reason: format!(
+                    "expected {HEX_DIGEST_LENGTH} hex chars, got {}",
+                    value.len()
+                ),
+            });
+        }
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(CoreLedgerAdapterError::InvalidDigest {
+                field,
+                reason: "must be lowercase hex characters [0-9a-f]".to_string(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the inner hex string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the wrapper, returning the inner string.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for HexDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,10 +308,14 @@ pub fn orchestration_event_type_name(event: &OrchestrationEvent) -> String {
 /// Returns `true` if the holon event represents an authority decision
 /// that should go through BFT consensus when enabled.
 ///
-/// Authority events are those that represent:
+/// Authority events are those that carry state influencing deterministic
+/// output or resource consumption:
 /// - Work lifecycle terminal decisions (completed, failed, cancelled)
-/// - Lease issuance and release
-/// - Work claims (binding a lease to work)
+/// - Work claims (binding a lease to work) and escalation (delegating local
+///   authority)
+/// - Lease lifecycle (issuance, renewal, release, expiry)
+/// - Episode completion (execution outcomes and token usage)
+/// - Artifact emission (content hashes that affect deterministic replay)
 #[must_use]
 pub const fn is_authority_event(event_type: &EventType) -> bool {
     matches!(
@@ -234,16 +324,26 @@ pub const fn is_authority_event(event_type: &EventType) -> bool {
             | EventType::WorkCompleted { .. }
             | EventType::WorkFailed { .. }
             | EventType::WorkCancelled { .. }
+            | EventType::WorkEscalated { .. }
+            | EventType::EpisodeCompleted { .. }
+            | EventType::ArtifactEmitted { .. }
             | EventType::LeaseIssued { .. }
+            | EventType::LeaseRenewed { .. }
             | EventType::LeaseReleased { .. }
             | EventType::LeaseExpired { .. }
     )
 }
 
 /// Returns `true` if an orchestration event is an authority decision.
+///
+/// Both `Started` (budget allocation) and `Terminated` (terminal decision)
+/// carry state that must be consensus-finalized.
 #[must_use]
 pub const fn is_orchestration_authority_event(event: &OrchestrationEvent) -> bool {
-    matches!(event, OrchestrationEvent::Terminated(_))
+    matches!(
+        event,
+        OrchestrationEvent::Started(_) | OrchestrationEvent::Terminated(_)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +450,11 @@ pub fn envelope_from_orchestration_event(
 
 /// Decodes a [`HolonEventEnvelope`] from core ledger payload bytes.
 ///
+/// After deserialization, validates that `holon_event_hash` and
+/// `artifact_cas_digest` (when present) are well-formed hex-encoded
+/// BLAKE3 digests (64 lowercase hex chars). This prevents path traversal
+/// sequences or pathological characters from propagating downstream.
+///
 /// # Errors
 ///
 /// Returns [`CoreLedgerAdapterError::Serialization`] if the bytes cannot
@@ -357,6 +462,9 @@ pub fn envelope_from_orchestration_event(
 ///
 /// Returns [`CoreLedgerAdapterError::PayloadTooLarge`] if the payload
 /// exceeds `MAX_PAYLOAD_SIZE`.
+///
+/// Returns [`CoreLedgerAdapterError::InvalidDigest`] if either digest
+/// field is present but malformed.
 pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerAdapterError> {
     if payload.len() > MAX_PAYLOAD_SIZE {
         return Err(CoreLedgerAdapterError::PayloadTooLarge {
@@ -365,30 +473,40 @@ pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerA
         });
     }
 
-    serde_json::from_slice(payload).map_err(|e| {
+    let envelope: HolonEventEnvelope = serde_json::from_slice(payload).map_err(|e| {
         CoreLedgerAdapterError::Serialization(format!("envelope deserialization: {e}"))
-    })
+    })?;
+
+    // Validate digest fields at the protocol boundary.
+    if let Some(ref hash) = envelope.holon_event_hash {
+        let _ = HexDigest::try_new(hash.clone(), "holon_event_hash")?;
+    }
+    if let Some(ref digest) = envelope.artifact_cas_digest {
+        let _ = HexDigest::try_new(digest.clone(), "artifact_cas_digest")?;
+    }
+
+    Ok(envelope)
 }
 
 // ---------------------------------------------------------------------------
 // Replay / State Fold Helpers (HL-004)
 // ---------------------------------------------------------------------------
 
-/// Folds a sequence of holon event envelopes to verify deterministic replay.
+/// Inspects a sequence of holon event envelopes and collects replay
+/// statistics: total event count, authority event count, and how many
+/// authority events have not yet reached finality.
 ///
-/// Returns the count of events processed and whether all authority events
-/// have reached finality.
+/// **Note**: This function collects statistics only. It does not re-fold
+/// state or compare hashes; deterministic replay verification requires a
+/// full state fold with hash comparison.
 ///
-/// # Errors
-///
-/// Returns [`CoreLedgerAdapterError::Serialization`] if any envelope
-/// cannot be decoded.
-pub fn verify_replay_determinism(
-    envelopes: &[HolonEventEnvelope],
-) -> Result<ReplayVerification, CoreLedgerAdapterError> {
+/// Finality is checked via the strict-allowlist [`FinalitySignal::is_final`]
+/// method (fail-closed: unknown future variants are treated as not-final).
+#[must_use]
+pub fn inspect_replay_stats(envelopes: &[HolonEventEnvelope]) -> ReplayStats {
     let mut event_count: u64 = 0;
     let mut authority_count: u64 = 0;
-    let mut pending_authority_count: u64 = 0;
+    let mut non_final_authority_count: u64 = 0;
     let mut max_schema_version: u32 = 0;
 
     for envelope in envelopes {
@@ -398,30 +516,35 @@ pub fn verify_replay_determinism(
         }
         if envelope.is_authority_event {
             authority_count = authority_count.saturating_add(1);
-            if envelope.finality.is_pending() {
-                pending_authority_count = pending_authority_count.saturating_add(1);
+            // Fail-closed: use is_final() (strict allowlist) rather than
+            // !is_pending() which would pass unknown future variants.
+            if !envelope.finality.is_final() {
+                non_final_authority_count = non_final_authority_count.saturating_add(1);
             }
         }
     }
 
-    Ok(ReplayVerification {
+    ReplayStats {
         event_count,
         authority_count,
-        pending_authority_count,
-        all_authority_final: pending_authority_count == 0,
+        non_final_authority_count,
+        all_authority_final: non_final_authority_count == 0,
         max_schema_version,
-    })
+    }
 }
 
-/// Result of replay verification.
+/// Statistics collected by [`inspect_replay_stats`] over a sequence of
+/// holon event envelopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayVerification {
-    /// Total number of events processed.
+pub struct ReplayStats {
+    /// Total number of events inspected.
     pub event_count: u64,
     /// Number of authority events.
     pub authority_count: u64,
-    /// Number of authority events still pending finality.
-    pub pending_authority_count: u64,
+    /// Number of authority events that have NOT reached finality (checked
+    /// via the strict-allowlist `is_final()` method, which treats unknown
+    /// future `FinalitySignal` variants as not-final).
+    pub non_final_authority_count: u64,
     /// Whether all authority events have reached finality.
     pub all_authority_final: bool,
     /// Maximum schema version encountered.
@@ -579,10 +702,28 @@ mod tests {
                 recoverable: false,
             },
             EventType::WorkCancelled { reason: "r".into() },
+            EventType::WorkEscalated {
+                to_holon_id: "h".into(),
+                reason: "r".into(),
+            },
+            EventType::EpisodeCompleted {
+                episode_id: "e".into(),
+                outcome: crate::ledger::EpisodeOutcome::Completed,
+                tokens_consumed: 0,
+            },
+            EventType::ArtifactEmitted {
+                artifact_id: "a".into(),
+                artifact_kind: "k".into(),
+                content_hash: None,
+            },
             EventType::LeaseIssued {
                 lease_id: "l".into(),
                 holder_id: "h".into(),
                 expires_at_ns: 0,
+            },
+            EventType::LeaseRenewed {
+                lease_id: "l".into(),
+                new_expires_at_ns: 1000,
             },
             EventType::LeaseReleased {
                 lease_id: "l".into(),
@@ -599,19 +740,28 @@ mod tests {
 
         let non_authority = vec![
             EventType::WorkCreated { title: "t".into() },
+            EventType::WorkProgressed {
+                description: "d".into(),
+                new_state: crate::work::WorkLifecycle::InProgress,
+            },
             EventType::EpisodeStarted {
                 episode_id: "e".into(),
                 attempt_number: 1,
             },
-            EventType::ArtifactEmitted {
-                artifact_id: "a".into(),
-                artifact_kind: "k".into(),
-                content_hash: None,
+            EventType::EvidencePublished {
+                evidence_id: "e".into(),
+                requirement_id: "r".into(),
+                content_hash: "h".into(),
             },
             EventType::BudgetConsumed {
                 resource_type: "tokens".into(),
                 amount: 100,
                 remaining: 900,
+            },
+            EventType::BudgetExhausted {
+                resource_type: "tokens".into(),
+                total_used: 1000,
+                limit: 1000,
             },
         ];
 
@@ -696,14 +846,17 @@ mod tests {
             })
             .build();
 
-        let cas_digest = "deadbeefcafebabe".to_string();
+        // Use a valid 64-char hex digest for the CAS digest.
+        let cas_digest =
+            "deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe".to_string();
         let (_, payload) =
-            envelope_from_ledger_event(&event, Some(cas_digest), FinalitySignal::Local).unwrap();
+            envelope_from_ledger_event(&event, Some(cas_digest.clone()), FinalitySignal::Local)
+                .unwrap();
 
         let envelope = decode_envelope(&payload).unwrap();
         assert_eq!(
             envelope.artifact_cas_digest.as_deref(),
-            Some("deadbeefcafebabe")
+            Some(cas_digest.as_str()),
         );
     }
 
@@ -734,11 +887,95 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // HL-004: Replay verification
+    // Digest validation
     // -----------------------------------------------------------------------
 
     #[test]
-    fn replay_verification_counts_authority_events() {
+    fn hex_digest_accepts_valid_blake3_hex() {
+        let valid = "a".repeat(64);
+        let result = HexDigest::try_new(valid, "test");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hex_digest_rejects_wrong_length() {
+        let short = "abcdef".to_string();
+        let result = HexDigest::try_new(short, "test");
+        assert!(
+            matches!(result, Err(CoreLedgerAdapterError::InvalidDigest { .. })),
+            "should reject wrong-length digest"
+        );
+    }
+
+    #[test]
+    fn hex_digest_rejects_uppercase() {
+        let upper = "A".repeat(64);
+        let result = HexDigest::try_new(upper, "test");
+        assert!(
+            matches!(result, Err(CoreLedgerAdapterError::InvalidDigest { .. })),
+            "should reject uppercase hex"
+        );
+    }
+
+    #[test]
+    fn hex_digest_rejects_non_hex_characters() {
+        let mut bad = "a".repeat(60);
+        bad.push_str("/../");
+        let result = HexDigest::try_new(bad, "test");
+        assert!(
+            matches!(result, Err(CoreLedgerAdapterError::InvalidDigest { .. })),
+            "should reject path traversal characters"
+        );
+    }
+
+    #[test]
+    fn decode_envelope_rejects_malformed_holon_event_hash() {
+        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"holon_event_hash":"BADCAFE","finality":"Local","is_authority_event":false}"#;
+        let result = decode_envelope(json.as_bytes());
+        assert!(
+            matches!(
+                result,
+                Err(CoreLedgerAdapterError::InvalidDigest {
+                    field: "holon_event_hash",
+                    ..
+                })
+            ),
+            "should reject malformed holon_event_hash: {result:?}"
+        );
+    }
+
+    #[test]
+    fn decode_envelope_rejects_malformed_artifact_cas_digest() {
+        let json = r#"{"schema_version":1,"event_kind":"test","payload":{},"artifact_cas_digest":"../../etc/passwd","finality":"Local","is_authority_event":false}"#;
+        let result = decode_envelope(json.as_bytes());
+        assert!(
+            matches!(
+                result,
+                Err(CoreLedgerAdapterError::InvalidDigest {
+                    field: "artifact_cas_digest",
+                    ..
+                })
+            ),
+            "should reject path-traversal in artifact_cas_digest: {result:?}"
+        );
+    }
+
+    #[test]
+    fn decode_envelope_accepts_valid_digests() {
+        let valid_hash = "a".repeat(64);
+        let json = format!(
+            r#"{{"schema_version":1,"event_kind":"test","payload":{{}},"holon_event_hash":"{valid_hash}","artifact_cas_digest":"{valid_hash}","finality":"Local","is_authority_event":false}}"#,
+        );
+        let result = decode_envelope(json.as_bytes());
+        assert!(result.is_ok(), "should accept valid 64-char hex digests");
+    }
+
+    // -----------------------------------------------------------------------
+    // Replay statistics (renamed from verify_replay_determinism)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_stats_counts_authority_events() {
         let envelopes = vec![
             HolonEventEnvelope {
                 schema_version: 1,
@@ -769,15 +1006,15 @@ mod tests {
             },
         ];
 
-        let result = verify_replay_determinism(&envelopes).unwrap();
+        let result = inspect_replay_stats(&envelopes);
         assert_eq!(result.event_count, 3);
         assert_eq!(result.authority_count, 2);
-        assert_eq!(result.pending_authority_count, 1);
+        assert_eq!(result.non_final_authority_count, 1);
         assert!(!result.all_authority_final);
     }
 
     #[test]
-    fn replay_verification_all_final_when_no_pending() {
+    fn replay_stats_all_final_when_no_pending() {
         let envelopes = vec![HolonEventEnvelope {
             schema_version: 1,
             event_kind: "work_claimed".into(),
@@ -788,7 +1025,7 @@ mod tests {
             is_authority_event: true,
         }];
 
-        let result = verify_replay_determinism(&envelopes).unwrap();
+        let result = inspect_replay_stats(&envelopes);
         assert_eq!(result.event_count, 1);
         assert_eq!(result.authority_count, 1);
         assert!(result.all_authority_final);
@@ -799,16 +1036,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn orchestration_started_envelope() {
+    fn orchestration_started_is_authority_event() {
         let started = OrchestrationStarted::new("orch-001", "work-001", 10, 100_000, 60_000, 1000);
         let event = OrchestrationEvent::Started(started);
+
+        assert!(is_orchestration_authority_event(&event));
 
         let (event_type, payload) =
             envelope_from_orchestration_event(&event, FinalitySignal::Local).unwrap();
 
         assert_eq!(event_type, "holon.orchestration.started");
         let envelope = decode_envelope(&payload).unwrap();
-        assert!(!envelope.is_authority_event);
+        assert!(
+            envelope.is_authority_event,
+            "OrchestrationStarted carries budget allocation and must be authority"
+        );
     }
 
     #[test]
@@ -851,7 +1093,7 @@ mod tests {
             schema_version: 1,
             event_kind: "work_created".into(),
             payload: serde_json::json!({"title": "test", "z_field": 1, "a_field": 2}),
-            holon_event_hash: Some("aabb".into()),
+            holon_event_hash: Some("a".repeat(64)),
             artifact_cas_digest: None,
             finality: FinalitySignal::Local,
             is_authority_event: false,

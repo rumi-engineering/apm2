@@ -1147,8 +1147,18 @@ pub enum FinalitySignal {
 **Invariant [INV-CLA-004]**: Holon code never assumes local finality. Authority events carry explicit finality signals; `Pending` events are not yet final.
 
 **Key Methods:**
-- `is_final()` -> `bool`: True for `Local` and `Finalized`
+- `is_final()` -> `bool`: Strict allowlist -- true only for `Local` and `Finalized`. Unknown future variants return `false` (fail-closed).
 - `is_pending()` -> `bool`: True for `Pending`
+
+### `HexDigest`
+
+Validated hex-encoded BLAKE3 digest. Enforces exactly 64 lowercase hex characters at construction. Used to validate `holon_event_hash` and `artifact_cas_digest` at protocol boundaries.
+
+```rust
+pub struct HexDigest(String);
+```
+
+**Construction:** `HexDigest::try_new(value, field_name)` -> `Result<HexDigest, CoreLedgerAdapterError>`
 
 ### `HolonEventEnvelope`
 
@@ -1160,7 +1170,9 @@ pub struct HolonEventEnvelope {
     pub schema_version: u32,
     pub event_kind: String,
     pub payload: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub holon_event_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_cas_digest: Option<String>,
     pub finality: FinalitySignal,
     pub is_authority_event: bool,
@@ -1171,8 +1183,8 @@ pub struct HolonEventEnvelope {
 - `schema_version`: Forward/backward compatibility version (currently `ENVELOPE_SCHEMA_VERSION = 1`)
 - `event_kind`: Holon event type discriminant (e.g., `work_created`)
 - `payload`: Canonical JSON payload of the holon event
-- `holon_event_hash`: BLAKE3 digest linking back to holon-local hash chain (migration)
-- `artifact_cas_digest`: CAS digest of any large artifact associated with this event
+- `holon_event_hash`: BLAKE3 digest linking back to holon-local hash chain (migration). Validated as 64-char lowercase hex on decode.
+- `artifact_cas_digest`: CAS digest of any large artifact associated with this event. Validated as 64-char lowercase hex on decode.
 - `finality`: BFT finality signal
 - `is_authority_event`: Whether this event requires BFT consensus when enabled
 
@@ -1182,10 +1194,10 @@ pub struct HolonEventEnvelope {
 pub enum CoreLedgerAdapterError {
     Serialization(String),
     PayloadTooLarge { size: usize, max: usize },
-    BatchTooLarge { size: usize, max: usize },
     CasError(String),
     LedgerError(String),
     UnknownEventType(String),
+    InvalidDigest { field: &'static str, reason: String },
 }
 ```
 
@@ -1193,8 +1205,8 @@ pub enum CoreLedgerAdapterError {
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_PAYLOAD_SIZE` | 256 KiB | Maximum serialized envelope size (DoS prevention) |
-| `MAX_BATCH_SIZE` | 1024 | Maximum events in a single batch append |
+| `MAX_PAYLOAD_SIZE` | 8 MiB | Maximum serialized envelope size (accommodates WorkCompleted with 1000 evidence IDs) |
+| `HEX_DIGEST_LENGTH` | 64 | Expected length of hex-encoded BLAKE3 digest |
 | `HOLON_EVENT_PREFIX` | `"holon."` | Event type prefix for all holon events |
 | `ENVELOPE_SCHEMA_VERSION` | 1 | Current wire format version |
 
@@ -1213,9 +1225,10 @@ pub const fn is_orchestration_authority_event(event: &OrchestrationEvent) -> boo
 ```
 
 **Authority Events** (require BFT consensus when enabled):
-- `WorkClaimed`, `WorkCompleted`, `WorkFailed`, `WorkCancelled`
-- `LeaseIssued`, `LeaseReleased`, `LeaseExpired`
-- `OrchestrationEvent::Terminated`
+- `WorkClaimed`, `WorkCompleted`, `WorkFailed`, `WorkCancelled`, `WorkEscalated`
+- `EpisodeCompleted`, `ArtifactEmitted`
+- `LeaseIssued`, `LeaseRenewed`, `LeaseReleased`, `LeaseExpired`
+- `OrchestrationEvent::Started`, `OrchestrationEvent::Terminated`
 
 ### Envelope Construction / Decoding
 
@@ -1233,28 +1246,31 @@ pub fn envelope_from_orchestration_event(
     finality: FinalitySignal,
 ) -> Result<(String, Vec<u8>), CoreLedgerAdapterError>;
 
-// Decode from core ledger payload bytes
+// Decode from core ledger payload bytes (validates digest format)
 pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerAdapterError>;
 ```
 
 **Invariant [INV-CLA-001]**: All payloads serialized with `serde_jcs` for deterministic byte representation.
 **Invariant [INV-CLA-005]**: Payloads bounded by `MAX_PAYLOAD_SIZE`.
+**Invariant [INV-CLA-007]**: Digest fields validated as 64-char lowercase hex at protocol boundary (`decode_envelope`).
 
-### Replay Verification (HL-004)
+### Replay Statistics (HL-004)
 
 ```rust
-pub fn verify_replay_determinism(
+pub fn inspect_replay_stats(
     envelopes: &[HolonEventEnvelope],
-) -> Result<ReplayVerification, CoreLedgerAdapterError>;
+) -> ReplayStats;
 
-pub struct ReplayVerification {
+pub struct ReplayStats {
     pub event_count: u64,
     pub authority_count: u64,
-    pub pending_authority_count: u64,
+    pub non_final_authority_count: u64,
     pub all_authority_final: bool,
     pub max_schema_version: u32,
 }
 ```
+
+**Note**: `inspect_replay_stats` collects statistics only; it does not re-fold state or compare hashes. Finality is checked via the strict-allowlist `is_final()` method.
 
 ### Feature Flags
 
