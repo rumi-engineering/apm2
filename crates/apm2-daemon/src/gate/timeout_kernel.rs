@@ -2346,6 +2346,7 @@ mod tests {
                 work_id: "W-1".to_string(),
                 gate_type: GateType::Quality,
                 lease_id: "lease-1".to_string(),
+                changeset_digest: [0x42; 32],
                 timestamp_ms: 7,
             });
         assert_eq!(event_type, "gate.timed_out");
@@ -2442,7 +2443,7 @@ mod tests {
             terminated_at_ms: 0,
         };
         let _ = orchestrator
-            .handle_session_terminated(info)
+            .start_from_test_session(info)
             .await
             .expect("orchestration should start");
         let mut domain = GateTimeoutDomain::new(

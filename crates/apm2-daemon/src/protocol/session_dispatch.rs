@@ -141,7 +141,7 @@ use crate::episode::{
     CapabilityManifest, EpisodeId, EpisodeRuntime, SharedSessionBrokerRegistry, SharedToolBroker,
     ToolClass,
 };
-use crate::gate::{GateOrchestrator, SessionTerminatedInfo};
+use crate::gate::GateOrchestrator;
 use crate::htf::{ClockError, HolonicClock};
 
 const RESERVED_DAEMON_EVENT_TYPE_PREFIXES: &[&str] = &[
@@ -1219,10 +1219,10 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
     /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
-    /// When set, session termination triggers gate orchestration via
-    /// [`GateOrchestrator::on_session_terminated`]. The returned events
-    /// are persisted to the ledger through the session dispatcher's
-    /// `ledger` emitter.
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`] (CSID-003). Session
+    /// termination only triggers timeout polling.
+    #[allow(dead_code)]
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
     /// Pre-actuation gate for stop/budget checks (TCK-00351).
     ///
@@ -10150,115 +10150,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     store.remove(session_id);
                 }
 
-                // Security BLOCKER 1 fix (TCK-00388): Trigger gate
-                // orchestration after session termination.  This ensures the
-                // gate lifecycle (PolicyResolved -> GateLeaseIssued -> receipt
-                // path) fires on every real session termination, not just in
-                // tests.
-                if let (Some(orch), Some(registry)) =
-                    (&self.gate_orchestrator, &self.session_registry)
-                {
-                    // Retrieve authoritative work_id from the session registry.
-                    let work_id = registry
-                        .get_session(session_id)
-                        .map_or_else(|| session_id.to_string(), |s| s.work_id);
-
-                    // Derive changeset_digest deterministically from session
-                    // and work identifiers. The actual changeset hash would
-                    // come from the workspace layer in the full pipeline; here
-                    // we use a BLAKE3 binding so the digest is non-zero and
-                    // unique per session+work pair.
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(session_id.as_bytes());
-                    hasher.update(work_id.as_bytes());
-                    let changeset_digest: [u8; 32] = *hasher.finalize().as_bytes();
-
-                    #[allow(clippy::cast_possible_truncation)]
-                    let terminated_at_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-
-                    let gate_info = SessionTerminatedInfo {
-                        session_id: session_id.to_string(),
-                        work_id: work_id.clone(),
-                        changeset_digest,
-                        terminated_at_ms,
-                    };
-
-                    // The orchestrator's on_session_terminated is async; use
-                    // block_in_place to call it from the sync dispatch path.
-                    // This is safe because the session dispatcher runs on a
-                    // Tokio worker thread.
-                    let orch_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(orch.on_session_terminated(gate_info))
-                    });
-
-                    match orch_result {
-                        Ok((_gate_types, _signers, events)) => {
-                            // Persist gate orchestration events to ledger
-                            // (fail-closed on persistence error).
-                            if let Some(ref ledger) = self.ledger {
-                                for event in &events {
-                                    let event_type = match event {
-                                        crate::gate::GateOrchestratorEvent::PolicyResolved {
-                                            ..
-                                        } => "gate.policy_resolved",
-                                        crate::gate::GateOrchestratorEvent::GateLeaseIssued {
-                                            ..
-                                        } => "gate.lease_issued",
-                                        _ => "gate.event",
-                                    };
-                                    let payload = serde_json::to_vec(event).unwrap_or_default();
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let ts = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_nanos() as u64)
-                                        .unwrap_or(0);
-                                    if let Err(e) = ledger.emit_session_event(
-                                        session_id,
-                                        event_type,
-                                        &payload,
-                                        "orchestrator:gate-lifecycle",
-                                        ts,
-                                    ) {
-                                        error!(
-                                            session_id = %session_id,
-                                            event_type = %event_type,
-                                            error = %e,
-                                            "Failed to persist gate orchestration event (fail-closed)"
-                                        );
-                                        return Ok(SessionResponse::error(
-                                            SessionErrorCode::SessionErrorInternal,
-                                            format!(
-                                                "gate event persistence failed: {e} ({request_id})"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                            info!(
-                                session_id = %session_id,
-                                work_id = %work_id,
-                                event_count = events.len(),
-                                "Gate orchestration triggered on session termination"
-                            );
-                        },
-                        Err(e) => {
-                            // Fail-closed: gate orchestration failure is fatal.
-                            error!(
-                                session_id = %session_id,
-                                error = %e,
-                                "Gate orchestration failed on session termination (fail-closed)"
-                            );
-                            return Ok(SessionResponse::error(
-                                SessionErrorCode::SessionErrorInternal,
-                                format!("gate orchestration failed: {e} ({request_id})"),
-                            ));
-                        },
-                    }
-                }
+                // FAC vNext (TCK-00672): Session termination is lifecycle-only.
+                // Gate start orchestration is triggered authoritatively from
+                // `changeset_published` via the gate-start orchestrator-kernel
+                // pipeline.
 
                 // TCK-00307: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
@@ -14904,6 +14799,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-DOWNGRADE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -15088,6 +14984,7 @@ mod tests {
             let governance_payload = serde_json::to_vec(
                 &crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 },
@@ -16970,6 +16867,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-LEAKAGE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17154,6 +17052,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-TIMING".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17336,6 +17235,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -17890,6 +17790,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-BOUNDARY-NON-STRICT-LEDGER-FAIL".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash: authoritative_policy_hash,
                     timestamp_ms: 1,
                 })
@@ -18624,6 +18525,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-001".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 1,
             })
@@ -18653,6 +18555,7 @@ mod tests {
         let governance_payload =
             serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-002".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash: expected_policy_hash,
                 timestamp_ms: 2,
             })
@@ -24840,6 +24743,7 @@ mod tests {
         ) {
             let payload = serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                 work_id: "work-emit".to_string(),
+                changeset_digest: [0u8; 32],
                 policy_hash,
                 timestamp_ms: 1,
             })
@@ -27237,6 +27141,7 @@ mod tests {
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
                     work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    changeset_digest: [0u8; 32],
                     policy_hash,
                     timestamp_ms: 1,
                 })

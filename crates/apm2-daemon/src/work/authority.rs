@@ -43,6 +43,23 @@ pub struct WorkAuthorityStatus {
     /// Structured dependency diagnostics for consumers such as doctor/work
     /// status.
     pub dependency_diagnostics: Vec<WorkDependencyDiagnostic>,
+    // STEP_10: FAC identity chain surface.
+    /// Latest changeset digest (32 bytes) from `ChangeSetPublished`.
+    pub latest_changeset_digest: Option<[u8; 32]>,
+    /// Event ID of the `ChangeSetPublished` that established the latest
+    /// changeset identity binding.
+    pub changeset_published_event_id: Option<String>,
+    /// CAS hash (32 bytes) of the `ChangeSetBundleV1` for the latest
+    /// changeset.
+    pub bundle_cas_hash: Option<[u8; 32]>,
+    /// Gate status for the latest changeset digest.
+    pub gate_status: Option<String>,
+    /// Review status for the latest changeset digest.
+    pub review_status: Option<String>,
+    /// Merge status for the latest changeset digest.
+    pub merge_status: Option<String>,
+    /// Number of identity-chain defects recorded for this work item.
+    pub identity_chain_defect_count: u32,
 }
 
 /// Authority-layer errors.
@@ -301,6 +318,72 @@ impl ProjectionWorkAuthority {
         let dependency_evaluation =
             projection.evaluate_work_dependencies(&work.work_id, evaluation_time_ns);
 
+        // STEP_10: Derive FAC identity chain status from projection
+        // reducer state.
+        //
+        // MAJOR fix: check both digest match AND receipt outcome.
+        // Digest match alone is insufficient — a receipt whose digest
+        // matches the latest changeset but whose outcome is "failed"
+        // must NOT report "passed".
+        let latest_digest = projection.latest_changeset_digest(&work.work_id);
+        let gate_status = latest_digest
+            .and_then(|ld| {
+                projection.ci_receipt_digest(&work.work_id).map(|ci| {
+                    if ci == ld {
+                        // Digest matches — check the outcome.
+                        match projection.ci_receipt_outcome(&work.work_id) {
+                            Some(apm2_core::work::ReceiptOutcome::Passed) => "passed".to_string(),
+                            Some(apm2_core::work::ReceiptOutcome::Failed) => "failed".to_string(),
+                            // No outcome recorded (should not happen if
+                            // digest is present, but fail-closed to pending).
+                            None => "pending".to_string(),
+                        }
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+        let review_status = latest_digest
+            .and_then(|ld| {
+                projection.review_receipt_digest(&work.work_id).map(|rd| {
+                    if rd == ld {
+                        // Digest matches — check the outcome.
+                        match projection.review_receipt_outcome(&work.work_id) {
+                            Some(apm2_core::work::ReceiptOutcome::Passed) => "passed".to_string(),
+                            Some(apm2_core::work::ReceiptOutcome::Failed) => "failed".to_string(),
+                            None => "pending".to_string(),
+                        }
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+        let merge_status = latest_digest
+            .and_then(|ld| {
+                projection.merge_receipt_digest(&work.work_id).map(|md| {
+                    if md == ld {
+                        "merged".to_string()
+                    } else {
+                        "pending".to_string()
+                    }
+                })
+            })
+            .or_else(|| latest_digest.map(|_| "pending".to_string()));
+
+        // STEP_10: Populate identity chain surface fields from projection
+        // reducer state rather than hardcoding None/0.
+        let changeset_published_event_id = projection
+            .changeset_published_event_id(&work.work_id)
+            .map(ToString::to_string);
+        let bundle_cas_hash = projection.bundle_cas_hash(&work.work_id);
+        // MAJOR fix: Report per-work-item defect count (not global queue
+        // length). Field 17 of `WorkStatusResponse` is documented as "for
+        // this work item".
+        let identity_chain_defect_count =
+            projection.identity_chain_defect_count_for_work(&work.work_id);
+
         WorkAuthorityStatus {
             work_id: work.work_id.clone(),
             state: work.state,
@@ -311,6 +394,13 @@ impl ProjectionWorkAuthority {
             claimed_at_ns: work.claimed_at,
             implementer_claim_blocked: dependency_evaluation.implementer_claim_blocked,
             dependency_diagnostics: dependency_evaluation.diagnostics,
+            latest_changeset_digest: latest_digest,
+            changeset_published_event_id,
+            bundle_cas_hash,
+            gate_status,
+            review_status,
+            merge_status,
+            identity_chain_defect_count,
         }
     }
 

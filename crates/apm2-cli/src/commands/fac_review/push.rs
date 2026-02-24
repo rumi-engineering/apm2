@@ -3930,6 +3930,13 @@ mod tests {
             claimed_at_ns: None,
             implementer_claim_blocked: false,
             dependency_diagnostics: Vec::new(),
+            latest_changeset_digest: None,
+            changeset_published_event_id: None,
+            bundle_cas_hash: None,
+            gate_status: None,
+            review_status: None,
+            merge_status: None,
+            identity_chain_defect_count: 0,
         }
     }
 

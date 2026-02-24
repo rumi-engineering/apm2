@@ -326,6 +326,103 @@ impl WorkObjectProjection {
         self.ordered_work.len()
     }
 
+    /// Returns the latest changeset digest for a work ID from the reducer
+    /// state, if a `ChangeSetPublished` event has been observed.
+    #[must_use]
+    pub fn latest_changeset_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .latest_changeset_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the CI receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .ci_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .review_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the merge receipt digest for a work ID from the reducer state.
+    #[must_use]
+    pub fn merge_receipt_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .merge_receipt_digest_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the event ID of the `ChangeSetPublished` event that established
+    /// the latest changeset identity binding (`STEP_10`).
+    #[must_use]
+    pub fn changeset_published_event_id(&self, work_id: &str) -> Option<&str> {
+        self.reducer
+            .state()
+            .changeset_published_event_id_by_work
+            .get(work_id)
+            .map(String::as_str)
+    }
+
+    /// Returns the CAS hash of the `ChangeSetBundleV1` for the latest
+    /// changeset (`STEP_10`).
+    #[must_use]
+    pub fn bundle_cas_hash(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.reducer
+            .state()
+            .bundle_cas_hash_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the CI receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .ci_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .review_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the number of pending identity-chain defects in the reducer
+    /// (global queue length).
+    #[must_use]
+    pub fn identity_chain_defect_count(&self) -> usize {
+        self.reducer.identity_chain_defect_count()
+    }
+
+    /// Returns the cumulative identity-chain defect count for a specific
+    /// work item. Returns 0 if no defects have been recorded for `work_id`.
+    #[must_use]
+    pub fn identity_chain_defect_count_for_work(&self, work_id: &str) -> u32 {
+        self.reducer.identity_chain_defect_count_for_work(work_id)
+    }
+
     /// Returns claimable work items in deterministic ID order.
     #[must_use]
     pub fn claimable_work(&self) -> Vec<&Work> {
@@ -553,9 +650,12 @@ impl WorkObjectProjection {
 
 /// Converts daemon signed events into canonical `work.*` reducer events.
 ///
-/// Non-work events are ignored. Transitional daemon legacy events
-/// (`work_claimed`, `work_transitioned`) are normalized into `work.*` protobuf
-/// payloads consumed by `WorkReducer`.
+/// Transitional daemon legacy events (`work_claimed`, `work_transitioned`) are
+/// normalized into `work.*` protobuf payloads consumed by `WorkReducer`.
+///
+/// Digest-context non-work events (for example `changeset_published` and
+/// gate/review/merge receipt events) are forwarded unchanged so the reducer can
+/// enforce latest-changeset stage admission.
 pub fn translate_signed_events(
     events: &[SignedLedgerEvent],
 ) -> Result<Vec<EventRecord>, WorkProjectionError> {
@@ -671,6 +771,30 @@ fn translate_signed_event(
                     &transition.rationale_code,
                     transition.previous_transition_count,
                 ),
+                event.timestamp_ns,
+            );
+        },
+
+        // Forward digest-bound non-work events so WorkReducer can maintain
+        // latest changeset + stage receipt context (CSID-004).
+        // Merge receipt events use an explicit allowlist (no substring matching)
+        // to prevent cross-work state injection via unreserved event types.
+        "changeset_published"
+        | "gate.receipt_collected"
+        | "gate_receipt_collected"
+        | "gate.receipt"
+        | "gate_receipt"
+        | "review_receipt_recorded"
+        | "review_blocked_recorded"
+        | "fac.merge_receipt.recorded"
+        | "gate.merge_receipt_created"
+        | "merge_receipt_recorded"
+        | "merge_receipt_created" => {
+            push_event(
+                &event.event_type,
+                &event.work_id,
+                &event.actor_id,
+                event.payload.clone(),
                 event.timestamp_ns,
             );
         },
