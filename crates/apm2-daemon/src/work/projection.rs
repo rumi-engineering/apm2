@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use apm2_core::events::{
-    WorkEdgeAdded, WorkEdgeRemoved, WorkEdgeType, WorkEdgeWaived, WorkEvent, WorkGraphEvent,
-    work_event, work_graph_event,
+    WORK_CLAIMED_DOMAIN_PREFIX, WORK_TRANSITIONED_DOMAIN_PREFIX, WorkEdgeAdded, WorkEdgeRemoved,
+    WorkEdgeType, WorkEdgeWaived, WorkEvent, WorkGraphEvent, work_event, work_graph_event,
 };
 use apm2_core::ledger::EventRecord;
 use apm2_core::reducer::{Reducer, ReducerContext};
@@ -1210,11 +1210,17 @@ fn build_event_record(
 ///
 /// Returns `None` for event types that are not work-relevant (these are
 /// skipped during projection rebuild anyway).
-const fn domain_prefix_for_event_type(event_type: &str) -> Option<&'static [u8]> {
-    // Native protobuf work events do not carry JCS signatures; they are
-    // verified structurally by the reducer.
-    let _ = event_type;
-    None
+fn domain_prefix_for_event_type(event_type: &str) -> Option<&'static [u8]> {
+    match event_type {
+        // Legacy daemon event families signed with dedicated work-domain
+        // prefixes. These must remain mapped to avoid silently bypassing
+        // signature verification in projection paths that validate signatures.
+        "work_claimed" => Some(WORK_CLAIMED_DOMAIN_PREFIX),
+        "work_transitioned" => Some(WORK_TRANSITIONED_DOMAIN_PREFIX),
+        // Native reducer events (`work.*`) are session-envelope events and are
+        // validated structurally by bounded decode + reducer invariants.
+        _ => None,
+    }
 }
 
 /// Verifies Ed25519 signatures on signed ledger events.
@@ -1435,6 +1441,26 @@ mod tests {
             serde_json::to_vec(&envelope).expect("work.pr_associated JSON envelope should encode"),
             timestamp_ns,
         )
+    }
+
+    #[test]
+    fn domain_prefix_mapping_preserves_authoritative_work_event_prefixes() {
+        assert_eq!(
+            domain_prefix_for_event_type("work_claimed"),
+            Some(WORK_CLAIMED_DOMAIN_PREFIX),
+            "work_claimed must retain canonical signature domain mapping"
+        );
+        assert_eq!(
+            domain_prefix_for_event_type("work_transitioned"),
+            Some(WORK_TRANSITIONED_DOMAIN_PREFIX),
+            "work_transitioned must retain canonical signature domain mapping"
+        );
+    }
+
+    #[test]
+    fn domain_prefix_mapping_skips_non_work_domain_events() {
+        assert_eq!(domain_prefix_for_event_type("work.opened"), None);
+        assert_eq!(domain_prefix_for_event_type("changeset_published"), None);
     }
 
     #[test]
