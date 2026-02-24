@@ -8701,7 +8701,6 @@ type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkIdResolutionMode {
     StrictLeaseMapping,
-    AllowClaimHintFallback,
 }
 
 /// Lifecycle selectors returned from privileged PCAC enforcement.
@@ -10947,20 +10946,14 @@ impl PrivilegedDispatcher {
 
     /// Selects lease->work resolution strictness for context-entry publication.
     ///
-    /// `IMPLEMENTER_TERMINAL`/`HANDOFF_NOTE` are FAC push closure artifacts
-    /// that may need claim-scoped recovery when lease-validator mapping is
-    /// absent. Other kinds retain strict lease mapping to preserve
-    /// revocation semantics.
+    /// Security posture is fail-closed for all kinds: privileged publication
+    /// requires an authoritative lease-validator mapping so revocation and
+    /// expiration are always enforced.
     const fn work_id_resolution_mode_for_context_entry_kind(
         kind: apm2_core::fac::work_cas_schemas::WorkContextKind,
     ) -> WorkIdResolutionMode {
-        match kind {
-            apm2_core::fac::work_cas_schemas::WorkContextKind::ImplementerTerminal
-            | apm2_core::fac::work_cas_schemas::WorkContextKind::HandoffNote => {
-                WorkIdResolutionMode::AllowClaimHintFallback
-            },
-            _ => WorkIdResolutionMode::StrictLeaseMapping,
-        }
+        let _ = kind;
+        WorkIdResolutionMode::StrictLeaseMapping
     }
 
     /// Derive a fail-closed PCAC ledger anchor from the validated chain hash.
@@ -11008,12 +11001,10 @@ impl PrivilegedDispatcher {
         )?;
         // Role-scoped lookup: resolve the exact claim bound to this lease_id
         // to prevent cross-role policy confusion when multiple roles have
-        // claims on the same work_id. Falls back to role-agnostic get_claim
-        // for legacy leases that pre-date multi-role registration.
+        // claims on the same work_id.
         let claim = self
             .work_registry
             .get_claim_by_lease_id(&work_id, lease_id)
-            .or_else(|| self.work_registry.get_claim(&work_id))
             .ok_or_else(|| {
                 format!("work claim missing for lease '{lease_id}' and work '{work_id}'")
             })?;
@@ -11035,57 +11026,19 @@ impl PrivilegedDispatcher {
 
     /// Resolve `work_id` for privileged PCAC revalidation.
     ///
-    /// Primary source is the lease validator (authoritative lease mapping).
-    /// If unavailable, a work-scoped claim fallback is permitted only when the
-    /// caller provides a `work_id_hint` that has a claim bound to `lease_id`.
+    /// Primary (and only) source is the lease validator's authoritative
+    /// lease->work mapping.
     fn resolve_work_id_for_pcac_revalidation(
         &self,
         lease_id: &str,
-        work_id_hint: Option<&str>,
+        _work_id_hint: Option<&str>,
         work_id_resolution_mode: WorkIdResolutionMode,
     ) -> Result<String, String> {
         if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
             return Ok(work_id);
         }
-
-        if work_id_resolution_mode == WorkIdResolutionMode::StrictLeaseMapping {
-            return Err(format!("work_id missing for lease '{lease_id}'"));
-        }
-
-        let Some(hinted_work_id) = work_id_hint else {
-            return Err(format!("work_id missing for lease '{lease_id}'"));
-        };
-        let Some(claim) = self
-            .work_registry
-            .get_claim_by_lease_id(hinted_work_id, lease_id)
-            .or_else(|| {
-                self.work_registry
-                    .get_claim(hinted_work_id)
-                    .filter(|claim| {
-                        claim.lease_id.len() == lease_id.len()
-                            && bool::from(claim.lease_id.as_bytes().ct_eq(lease_id.as_bytes()))
-                    })
-            })
-        else {
-            return Err(format!("work_id missing for lease '{lease_id}'"));
-        };
-
-        if claim.work_id == hinted_work_id {
-            warn!(
-                lease_id = %lease_id,
-                work_id = %hinted_work_id,
-                "PCAC revalidation fallback used claim registry due missing lease mapping"
-            );
-        } else {
-            warn!(
-                lease_id = %lease_id,
-                hinted_work_id = %hinted_work_id,
-                claim_work_id = %claim.work_id,
-                "PCAC revalidation fallback recovered claim with mismatched work_id hint"
-            );
-        }
-
-        Ok(claim.work_id)
+        let _ = work_id_resolution_mode;
+        Err(format!("work_id missing for lease '{lease_id}'"))
     }
 
     fn map_pcac_deny_to_privileged_response(
@@ -11132,12 +11085,10 @@ impl PrivilegedDispatcher {
             })?;
         // Role-scoped lookup: resolve the exact claim bound to this
         // lease_id to prevent cross-role policy confusion when multiple
-        // roles have claims on the same work_id. Falls back to
-        // role-agnostic get_claim for legacy leases.
+        // roles have claims on the same work_id.
         let claim = self
             .work_registry
             .get_claim_by_lease_id(&work_id, lease_id)
-            .or_else(|| self.work_registry.get_claim(&work_id))
             .ok_or_else(|| {
                 PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -21404,7 +21355,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(&request.work_id),
-                WorkIdResolutionMode::AllowClaimHintFallback,
+                WorkIdResolutionMode::StrictLeaseMapping,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -21419,6 +21370,7 @@ impl PrivilegedDispatcher {
             };
 
         let pr_num_bytes = request.pr_number.to_le_bytes();
+        let validate_only_byte = [u8::from(request.validate_only)];
         let effect_intent_digest = domain_tagged_hash(
             PrivilegedHandlerClass::RecordWorkPrAssociation,
             "intent",
@@ -21427,6 +21379,7 @@ impl PrivilegedDispatcher {
                 request.work_id.as_bytes(),
                 &pr_num_bytes,
                 request.commit_sha.as_bytes(),
+                &validate_only_byte,
             ],
         );
 
@@ -21434,7 +21387,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(&request.work_id),
             effect_intent_digest,
-            WorkIdResolutionMode::AllowClaimHintFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
         );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
@@ -21453,6 +21406,7 @@ impl PrivilegedDispatcher {
                 request.lease_id.as_bytes(),
                 request.work_id.as_bytes(),
                 &pr_num_bytes,
+                &validate_only_byte,
             ],
         );
 
@@ -21462,6 +21416,7 @@ impl PrivilegedDispatcher {
                 request.work_id.as_bytes(),
                 request.commit_sha.as_bytes(),
                 actor_id.as_bytes(),
+                &validate_only_byte,
             ],
         );
 
@@ -21502,7 +21457,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(&request.work_id),
-            WorkIdResolutionMode::AllowClaimHintFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -34097,11 +34052,11 @@ mod tests {
             }
         }
 
-        /// FAC push closure path: `IMPLEMENTER_TERMINAL` entries must remain
-        /// publishable when lease->work mapping is missing but the active claim
-        /// still binds (`work_id`, `lease_id`).
+        /// `IMPLEMENTER_TERMINAL` publication is fail-closed when lease->work
+        /// mapping is missing; claim-cache fallback is intentionally disabled
+        /// to preserve revocation semantics.
         #[test]
-        fn test_publish_work_context_entry_implementer_terminal_recovers_missing_lease_mapping() {
+        fn test_publish_work_context_entry_implementer_terminal_denies_missing_lease_mapping() {
             let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher();
             assert!(
                 dispatcher.lease_validator.remove_lease(&lease_id),
@@ -34124,17 +34079,20 @@ mod tests {
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
             match response {
-                PrivilegedResponse::PublishWorkContextEntry(resp) => {
-                    assert!(
-                        !resp.entry_id.is_empty(),
-                        "terminal entry publish must return non-empty entry_id"
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
                     );
-                    assert_eq!(resp.work_id, work_id);
+                    assert!(
+                        err.message.contains("revalidation unavailable")
+                            || err.message.contains("work_id missing for lease"),
+                        "Expected strict lease mapping denial, got: {}",
+                        err.message
+                    );
                 },
                 other => {
-                    panic!(
-                        "Expected PublishWorkContextEntry success for terminal fallback, got: {other:?}"
-                    );
+                    panic!("Expected strict lease-mapping denial, got: {other:?}");
                 },
             }
         }
@@ -34819,11 +34777,11 @@ mod tests {
         }
 
         #[test]
-        fn test_record_work_pr_association_recovers_when_lease_mapping_missing() {
+        fn test_record_work_pr_association_denies_when_lease_mapping_missing() {
             let (dispatcher, ctx, work_id, lease_id) = setup_full_dispatcher_for_record_pr();
             assert!(
                 dispatcher.lease_validator.remove_lease(&lease_id),
-                "test setup must remove lease mapping to exercise claim fallback"
+                "test setup must remove lease mapping"
             );
 
             let request = make_request(&work_id, 73, VALID_COMMIT_SHA, &lease_id);
@@ -34831,12 +34789,19 @@ mod tests {
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
             match response {
-                PrivilegedResponse::RecordWorkPrAssociation(resp) => {
-                    assert_eq!(resp.work_id, work_id);
-                    assert_eq!(resp.pr_number, 73);
-                    assert_eq!(resp.commit_sha, VALID_COMMIT_SHA);
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        PrivilegedErrorCode::try_from(err.code),
+                        Ok(PrivilegedErrorCode::CapabilityRequestRejected),
+                    );
+                    assert!(
+                        err.message.contains("revalidation unavailable")
+                            || err.message.contains("work_id missing for lease"),
+                        "Expected strict lease mapping denial, got: {}",
+                        err.message
+                    );
                 },
-                other => panic!("Expected RecordWorkPrAssociation response, got: {other:?}"),
+                other => panic!("Expected strict lease-mapping denial, got: {other:?}"),
             }
         }
 
