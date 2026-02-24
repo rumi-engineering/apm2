@@ -265,6 +265,7 @@ dependencies = [
 name = "apm2-holon"
 version = "0.3.0"
 dependencies = [
+ "apm2-core",
  "blake3",
  "chrono",
  "hex",
@@ -276,6 +277,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

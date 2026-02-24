@@ -9,7 +9,7 @@ This crate defines the fundamental contract surface for agents participating in 
 - **Axiom I (Markov Blanket)**: Each holon defines a clear boundary through its trait contract
 - **Axiom III (Bounded Authority)**: Leases constrain operations and resource consumption
 
-The crate has no runtime dependencies on `apm2-core`, establishing a clean contract boundary that permits alternative runtime implementations. All types are `Send + Sync` for concurrent contexts.
+The crate has an optional dependency on `apm2-core` behind the `core-ledger` feature (enabled by default). When enabled, holon events can be written to the core ledger substrate via the `core_ledger_adapter` module. When disabled, the adapter envelope types and mapping functions remain available (they are pure data), but the concrete `apm2-core` integration paths are gated. All types are `Send + Sync` for concurrent contexts.
 
 **Crate path:** `apm2_holon`
 
@@ -1117,6 +1117,151 @@ pub enum SpawnOutcome {
 - All lifecycle transitions emit corresponding ledger events
 - Escalation reasons are preserved and propagated to caller
 - Budget exhaustion keeps work in `InProgress` for potential continuation
+
+---
+
+## Module: core_ledger_adapter (TCK-00670)
+
+Adapter that bridges holon event vocabulary to the `apm2-core` ledger `EventRecord` format. Introduced by TCK-00670 to converge holonic orchestration onto the core Ledger+CAS substrate.
+
+### Purpose
+
+- **HL-001**: Maps holon `EventType` and `OrchestrationEvent` to core ledger `event_type` strings with the `holon.*` prefix
+- **HL-002**: Enables deprecation of the separate holon ledger chain (gated behind `legacy_holon_ledger` feature)
+- **HL-003**: Threads BFT consensus metadata through authority events via `FinalitySignal`
+- **HL-004**: Provides replay verification and deterministic canonicalization via JCS (RFC 8785)
+
+### `FinalitySignal`
+
+Explicit finality signal for BFT-ready authority events.
+
+```rust
+#[non_exhaustive]
+pub enum FinalitySignal {
+    Local,                           // Single-node finality (default)
+    Pending,                         // Submitted to consensus, not yet finalized
+    Finalized { epoch: u64, round: u64 }, // BFT-finalized with quorum certificate
+}
+```
+
+**Invariant [INV-CLA-004]**: Holon code never assumes local finality. Authority events carry explicit finality signals; `Pending` events are not yet final.
+
+**Key Methods:**
+- `is_final()` -> `bool`: True for `Local` and `Finalized`
+- `is_pending()` -> `bool`: True for `Pending`
+
+### `HolonEventEnvelope`
+
+Wire format stored in `EventRecord.payload`. Uses `deny_unknown_fields`.
+
+```rust
+#[serde(deny_unknown_fields)]
+pub struct HolonEventEnvelope {
+    pub schema_version: u32,
+    pub event_kind: String,
+    pub payload: serde_json::Value,
+    pub holon_event_hash: Option<String>,
+    pub artifact_cas_digest: Option<String>,
+    pub finality: FinalitySignal,
+    pub is_authority_event: bool,
+}
+```
+
+**Fields:**
+- `schema_version`: Forward/backward compatibility version (currently `ENVELOPE_SCHEMA_VERSION = 1`)
+- `event_kind`: Holon event type discriminant (e.g., `work_created`)
+- `payload`: Canonical JSON payload of the holon event
+- `holon_event_hash`: BLAKE3 digest linking back to holon-local hash chain (migration)
+- `artifact_cas_digest`: CAS digest of any large artifact associated with this event
+- `finality`: BFT finality signal
+- `is_authority_event`: Whether this event requires BFT consensus when enabled
+
+### `CoreLedgerAdapterError`
+
+```rust
+pub enum CoreLedgerAdapterError {
+    Serialization(String),
+    PayloadTooLarge { size: usize, max: usize },
+    BatchTooLarge { size: usize, max: usize },
+    CasError(String),
+    LedgerError(String),
+    UnknownEventType(String),
+}
+```
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_PAYLOAD_SIZE` | 256 KiB | Maximum serialized envelope size (DoS prevention) |
+| `MAX_BATCH_SIZE` | 1024 | Maximum events in a single batch append |
+| `HOLON_EVENT_PREFIX` | `"holon."` | Event type prefix for all holon events |
+| `ENVELOPE_SCHEMA_VERSION` | 1 | Current wire format version |
+
+### Event Type Mapping Functions
+
+```rust
+// Maps EventType -> "holon.<type_name>"
+pub fn holon_event_type_name(event_type: &EventType) -> String;
+
+// Maps OrchestrationEvent -> "holon.orchestration.<variant>"
+pub fn orchestration_event_type_name(event: &OrchestrationEvent) -> String;
+
+// Authority event detection
+pub const fn is_authority_event(event_type: &EventType) -> bool;
+pub const fn is_orchestration_authority_event(event: &OrchestrationEvent) -> bool;
+```
+
+**Authority Events** (require BFT consensus when enabled):
+- `WorkClaimed`, `WorkCompleted`, `WorkFailed`, `WorkCancelled`
+- `LeaseIssued`, `LeaseReleased`, `LeaseExpired`
+- `OrchestrationEvent::Terminated`
+
+### Envelope Construction / Decoding
+
+```rust
+// From holon ledger event
+pub fn envelope_from_ledger_event(
+    event: &LedgerEvent,
+    artifact_cas_digest: Option<String>,
+    finality: FinalitySignal,
+) -> Result<(String, Vec<u8>), CoreLedgerAdapterError>;
+
+// From orchestration event
+pub fn envelope_from_orchestration_event(
+    event: &OrchestrationEvent,
+    finality: FinalitySignal,
+) -> Result<(String, Vec<u8>), CoreLedgerAdapterError>;
+
+// Decode from core ledger payload bytes
+pub fn decode_envelope(payload: &[u8]) -> Result<HolonEventEnvelope, CoreLedgerAdapterError>;
+```
+
+**Invariant [INV-CLA-001]**: All payloads serialized with `serde_jcs` for deterministic byte representation.
+**Invariant [INV-CLA-005]**: Payloads bounded by `MAX_PAYLOAD_SIZE`.
+
+### Replay Verification (HL-004)
+
+```rust
+pub fn verify_replay_determinism(
+    envelopes: &[HolonEventEnvelope],
+) -> Result<ReplayVerification, CoreLedgerAdapterError>;
+
+pub struct ReplayVerification {
+    pub event_count: u64,
+    pub authority_count: u64,
+    pub pending_authority_count: u64,
+    pub all_authority_final: bool,
+    pub max_schema_version: u32,
+}
+```
+
+### Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `core-ledger` | Yes | Enables `apm2-core` dependency for concrete ledger integration |
+| `legacy_holon_ledger` | No | Preserves old holon ledger chain for migration reads |
 
 ---
 

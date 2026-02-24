@@ -38,14 +38,26 @@ blake3.workspace = true
 # Canonicalization
 serde_jcs = "0.1"
 
+# Logging
+tracing.workspace = true
+
+# Core substrate (optional — enabled by `core-ledger` feature)
+apm2-core = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest.workspace = true
+# Core substrate is always available in tests for adapter verification
+apm2-core = { workspace = true }
 
 [features]
-default = []
+default = ["core-ledger"]
 # Enable test utilities for deterministic testing
 test-utils = []
+# Write holon events into apm2-core ledger+CAS substrate (TCK-00670)
+core-ledger = ["dep:apm2-core"]
+# Keep legacy holon ledger chain for migration reads (TCK-00670)
+legacy_holon_ledger = []
 
 [lints]
 workspace = true

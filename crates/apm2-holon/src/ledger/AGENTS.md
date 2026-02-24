@@ -2,6 +2,8 @@
 
 > Append-only, hash-chained event log for holonic execution auditing and replay.
 
+**Deprecation Notice (TCK-00670 / HL-002):** Direct use of this module for persistence is deprecated. New code should use `core_ledger_adapter` to write holon events into the `apm2-core` ledger substrate. This module is preserved behind the `legacy_holon_ledger` feature flag for migration reads and replay verification. The types (`EventType`, `LedgerEvent`, `EventHash`) remain public for envelope construction and backwards compatibility.
+
 ## Overview
 
 The `ledger` module provides an immutable, tamper-evident event log for recording all holonic operations. It has two sub-layers:
