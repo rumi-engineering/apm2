@@ -3,7 +3,7 @@
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by
 //! exercising the real `GateOrchestrator` through its daemon entry point
-//! (`on_session_terminated`), including:
+//! (`handle_session_terminated`), including:
 //!
 //! - Full lifecycle: session termination -> policy resolution -> lease issuance
 //!   -> receipt collection -> all-gates-completed
@@ -68,7 +68,7 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
 
     // Step 1: Session terminates via daemon entry point
     let (gate_types, executor_signers, setup_events) = orch
-        .on_session_terminated(test_session_info("work-integ-01"))
+        .handle_session_terminated(test_session_info("work-integ-01"))
         .await
         .unwrap();
 
@@ -150,7 +150,7 @@ async fn tck_00388_event_ordering_invariant() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-02"))
+        .handle_session_terminated(test_session_info("work-integ-02"))
         .await
         .unwrap();
 
@@ -180,7 +180,7 @@ async fn tck_00388_receipt_signature_verified() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, executor_signers, _events) = orch
-        .on_session_terminated(test_session_info("work-integ-03"))
+        .handle_session_terminated(test_session_info("work-integ-03"))
         .await
         .unwrap();
 
@@ -246,14 +246,14 @@ async fn tck_00388_admission_check_before_events() {
 
     // First orchestration succeeds
     let (_gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-04a"))
+        .handle_session_terminated(test_session_info("work-integ-04a"))
         .await
         .unwrap();
     assert!(!events.is_empty(), "First orchestration should emit events");
 
     // Second orchestration fails due to capacity - no events should leak
     let result = orch
-        .on_session_terminated(test_session_info("work-integ-04b"))
+        .handle_session_terminated(test_session_info("work-integ-04b"))
         .await;
     assert!(result.is_err(), "Expected capacity error");
     let err = result.err().unwrap();
@@ -271,12 +271,12 @@ async fn tck_00388_admission_check_before_events() {
     let orch2 = GateOrchestrator::new(config2, Arc::clone(&signer));
 
     orch2
-        .on_session_terminated(test_session_info("work-integ-04c"))
+        .handle_session_terminated(test_session_info("work-integ-04c"))
         .await
         .unwrap();
 
     let result = orch2
-        .on_session_terminated(test_session_info("work-integ-04c"))
+        .handle_session_terminated(test_session_info("work-integ-04c"))
         .await;
     assert!(result.is_err(), "Expected replay/duplicate error");
     let err = result.err().unwrap();
@@ -299,12 +299,21 @@ async fn tck_00388_fail_closed_timeout_semantics() {
     };
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
-    let (gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-05"))
+    let (gate_types, _signers, mut events) = orch
+        .handle_session_terminated(test_session_info("work-integ-05"))
         .await
         .unwrap();
 
     assert_eq!(gate_types.len(), 3);
+
+    // Run timeout sweep explicitly via the canonical lifecycle APIs.
+    for (work_id, gate_type) in orch.check_timeouts().await {
+        if work_id == "work-integ-05" {
+            let (_outcomes, timeout_events) =
+                orch.handle_gate_timeout(&work_id, gate_type).await.unwrap();
+            events.extend(timeout_events);
+        }
+    }
 
     // All 3 gates should have timed out (instant timeout)
     let timeout_count = events
@@ -351,14 +360,15 @@ async fn tck_00388_dispatcher_state_wiring() {
         "gate_orchestrator should be present after with_gate_orchestrator"
     );
 
-    // Call notify_session_terminated through the dispatcher
+    // Call the wired orchestrator through the dispatcher access point.
     let info = test_session_info("work-wiring");
-    let result = dispatcher.notify_session_terminated(info).await;
-
-    // Should return Some(Ok(events))
-    let events = result
+    let events = dispatcher
+        .gate_orchestrator()
         .expect("should return Some when orchestrator is wired")
-        .expect("should succeed for valid session info");
+        .handle_session_terminated(info)
+        .await
+        .expect("should succeed for valid session info")
+        .2;
 
     // Should have PolicyResolved + 3 GateLeaseIssued = 4 events
     assert_eq!(events.len(), 4, "1 PolicyResolved + 3 GateLeaseIssued");
@@ -370,7 +380,7 @@ async fn tck_00388_dispatcher_state_wiring() {
 
 #[tokio::test]
 async fn tck_00388_dispatcher_state_without_orchestrator() {
-    // Without gate orchestrator, notify_session_terminated returns None
+    // Without gate orchestrator, no runtime gate lifecycle wiring exists.
     let dispatcher = DispatcherState::new(None);
 
     assert!(
@@ -378,10 +388,5 @@ async fn tck_00388_dispatcher_state_without_orchestrator() {
         "gate_orchestrator should be None by default"
     );
 
-    let info = test_session_info("work-no-orch");
-    let result = dispatcher.notify_session_terminated(info).await;
-    assert!(
-        result.is_none(),
-        "should return None when no orchestrator is wired"
-    );
+    assert!(dispatcher.gate_orchestrator().is_none());
 }

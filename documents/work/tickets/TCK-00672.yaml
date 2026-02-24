@@ -106,7 +106,7 @@ plan:
            `handle_session_terminated` section.
          - Delete the block that does:
              - `blake3::Hasher::new(); hasher.update(session_id); hasher.update(work_id); ...`
-             - `GateOrchestrator::on_session_terminated(SessionTerminatedInfo{ changeset_digest: <synthetic> ... })`
+             - `GateOrchestrator::handle_session_terminated(SessionTerminatedInfo{ changeset_digest: <synthetic> ... })`
              - emits `gate.*` as session-scoped events.
 
       2. Replace with one of the following (choose A as default):
@@ -163,7 +163,8 @@ plan:
       Gate orchestration must be keyed by the published changeset identity.
 
       1. Replace the SessionTerminated-specific API:
-         - Deprecate/remove `SessionTerminatedInfo` and `GateOrchestrator::on_session_terminated(...)`.
+         - Deprecate/remove `SessionTerminatedInfo` and the remaining session-termination gate start API
+           (`GateOrchestrator::handle_session_terminated(...)`).
          - Introduce `GateStartInfo` or reuse `ChangesetPublication` as the input.
 
       2. Idempotency semantics:

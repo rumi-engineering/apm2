@@ -428,7 +428,7 @@ async fn test_fac_autonomous_full_lifecycle() {
 
     let (gate_types, executor_signers, setup_events) = harness
         .gate_orchestrator
-        .on_session_terminated(session_info)
+        .handle_session_terminated(session_info)
         .await
         .expect("gate orchestration should succeed");
 
@@ -889,7 +889,7 @@ async fn test_gate_failure_halts_lifecycle() {
     };
 
     let (gate_types, executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .handle_session_terminated(session_info)
         .await
         .expect("orchestration setup");
 
@@ -1283,7 +1283,7 @@ async fn test_gate_receipt_signature_verification() {
     };
 
     let (_gate_types, _executor_signers, _events) = orch
-        .on_session_terminated(session_info)
+        .handle_session_terminated(session_info)
         .await
         .expect("orchestration setup");
 

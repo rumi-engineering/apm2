@@ -810,7 +810,7 @@ fn store_envelope_with_wall_ns(
 /// This test:
 /// 1. Creates a single shared `MemoryCas`.
 /// 2. Wires a `GateOrchestrator` with that CAS.
-/// 3. Triggers `on_session_terminated` which issues gate leases (storing
+/// 3. Triggers `handle_session_terminated` which issues gate leases (storing
 ///    `ClockProfile` and `TimeEnvelope` in the shared CAS).
 /// 4. Retrieves the issued lease via `gate_lease()`.
 /// 5. Wires a `PrivilegedDispatcher` with the SAME CAS.
@@ -848,7 +848,7 @@ async fn test_shared_cas_orchestrator_dispatcher_continuity() {
         terminated_at_ms: now_ms,
     };
     let (_gate_types, _signers, events) = orch
-        .on_session_terminated(info)
+        .handle_session_terminated(info)
         .await
         .expect("session termination should succeed");
 
@@ -863,7 +863,7 @@ async fn test_shared_cas_orchestrator_dispatcher_continuity() {
     let lease = orch
         .gate_lease("W-CAS-CONTINUITY", GateType::Quality)
         .await
-        .expect("Quality gate lease should exist after on_session_terminated");
+        .expect("Quality gate lease should exist after handle_session_terminated");
 
     // Verify the time_envelope_ref is a hex-encoded hash (not legacy htf:* format)
     assert!(
