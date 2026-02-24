@@ -3417,7 +3417,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     let rpc_result = match with_operator_client(async move {
         let mut client = OperatorClient::connect(operator_socket).await?;
         let changeset = client
-            .publish_changeset(&rpc_work_id, rpc_bundle_bytes)
+            .publish_changeset(&rpc_work_id, &rpc_lease_id, rpc_bundle_bytes)
             .await?;
         let association = client
             .record_work_pr_association(

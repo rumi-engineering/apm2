@@ -1766,6 +1766,17 @@ pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
 /// to published changesets.
 pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_PREFIX;
 
+/// Invariant label used by authoritative work/lease binding guards.
+pub const INV_FAC_WORK_BIND_001: &str = "INV-FAC-WORK-BIND-001";
+/// Invariant label used by lease-scoped claim resolution guards.
+pub const INV_FAC_CLAIM_BIND_001: &str = "INV-FAC-CLAIM-BIND-001";
+/// Invariant label used by actor ownership checks before privileged mutation.
+pub const INV_FAC_ACTOR_BIND_001: &str = "INV-FAC-ACTOR-BIND-001";
+/// Invariant label used by PR binding anti-flap enforcement.
+pub const INV_FAC_PR_BIND_001: &str = "INV-FAC-PR-BIND-001";
+/// Prefix for authoritative PR binding conflicts surfaced by the emitter.
+pub const WORK_PR_BINDING_CONFLICT_TAG: &str = "WORK_PR_BINDING_CONFLICT";
+
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
 // to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
 // See `apm2_core::fac::domain_separator` for the canonical definition.
@@ -3555,28 +3566,41 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             // `(work_id, pr_number, commit_sha)`, mirroring SQLite UNIQUE
             // index `idx_work_pr_associated_unique`.
             if let Some((pr_number, commit_sha)) = pr_associated_identity.as_ref() {
-                let duplicate = events_by_work.get(session_id).is_some_and(|existing_ids| {
-                    existing_ids.iter().any(|id| {
-                        events.get(id).is_some_and(|existing| {
-                            if existing.event_type != "work.pr_associated" {
-                                return false;
-                            }
-                            let Ok(existing_json) =
-                                serde_json::from_slice::<serde_json::Value>(&existing.payload)
-                            else {
-                                return false;
-                            };
-                            existing_json
-                                .get("pr_number")
-                                .and_then(serde_json::Value::as_u64)
-                                == Some(*pr_number)
-                                && existing_json
-                                    .get("commit_sha")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some(commit_sha.as_str())
-                        })
-                    })
-                });
+                let mut duplicate = false;
+                let mut conflicting_pr_number: Option<u64> = None;
+                if let Some(existing_ids) = events_by_work.get(session_id) {
+                    for id in existing_ids {
+                        let Some(existing) = events.get(id) else {
+                            continue;
+                        };
+                        if existing.event_type != "work.pr_associated" {
+                            continue;
+                        }
+                        let Some((existing_pr_number, existing_commit_sha)) =
+                            PrivilegedDispatcher::extract_work_pr_association_fields(
+                                &existing.payload,
+                            )
+                        else {
+                            continue;
+                        };
+                        if existing_pr_number != *pr_number {
+                            conflicting_pr_number = Some(existing_pr_number);
+                            break;
+                        }
+                        if existing_commit_sha.eq_ignore_ascii_case(commit_sha) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(existing_pr_number) = conflicting_pr_number {
+                    return Err(LedgerEventError::PersistenceFailed {
+                        message: format!(
+                            "{WORK_PR_BINDING_CONFLICT_TAG}: [{INV_FAC_PR_BIND_001}] work_id '{session_id}' is bound to pr_number={existing_pr_number}, requested={pr_number}"
+                        ),
+                    });
+                }
 
                 if duplicate {
                     return Err(LedgerEventError::PersistenceFailed {
@@ -8701,7 +8725,6 @@ type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkIdResolutionMode {
     StrictLeaseMapping,
-    StrictLeaseMappingAllowClaimFallback,
 }
 
 /// Lifecycle selectors returned from privileged PCAC enforcement.
@@ -10867,9 +10890,9 @@ impl PrivilegedDispatcher {
     /// Uses role-scoped claim lookup via `get_claim_by_lease_id` to prevent
     /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
     ///
-    /// If the lease validator cannot resolve lease->work mapping, callers may
-    /// provide a `work_id_hint` and this function will attempt a claim-scoped
-    /// recovery (bound to `lease_id`) before failing closed.
+    /// If `work_id_hint` is provided, it must exactly match the authoritative
+    /// lease->work mapping (constant-time comparison). No fallback lookups are
+    /// allowed.
     ///
     /// Fail-closed behavior:
     /// - Missing lease->work mapping (and no valid hint) => Tier4, fallback
@@ -10884,46 +10907,33 @@ impl PrivilegedDispatcher {
         fallback_policy_hash: [u8; 32],
         work_id_resolution_mode: WorkIdResolutionMode,
     ) -> (RiskTier, [u8; 32]) {
-        if let Ok(work_id) = self.resolve_work_id_for_pcac_revalidation(
+        match self.resolve_authoritative_claim_binding(
             lease_id,
             work_id_hint,
             work_id_resolution_mode,
         ) {
-            match self.resolve_claim_for_pcac_revalidation(
-                &work_id,
-                lease_id,
-                work_id_resolution_mode,
-            ) {
-                Ok(claim) => {
-                    let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
-                        .unwrap_or_else(|_| {
-                            warn!(
-                                lease_id = %lease_id,
-                                work_id = %work_id,
-                                tier_value = claim.policy_resolution.resolved_risk_tier,
-                                "invalid risk tier value in policy resolution — \
-                                 defaulting to Tier4 (fail-closed)"
-                            );
-                            RiskTier::Tier4
-                        });
-                    (tier, claim.policy_resolution.resolved_policy_hash)
-                },
-                Err(error) => {
-                    warn!(
-                        lease_id = %lease_id,
-                        work_id = %work_id,
-                        error = %error,
-                        "work claim resolution failed for lease — defaulting to Tier4 (fail-closed)"
-                    );
-                    (RiskTier::Tier4, fallback_policy_hash)
-                },
-            }
-        } else {
-            warn!(
-                lease_id = %lease_id,
-                "could not resolve work_id from lease — defaulting to Tier4 (fail-closed)"
-            );
-            (RiskTier::Tier4, fallback_policy_hash)
+            Ok((work_id, claim)) => {
+                let tier = RiskTier::try_from(claim.policy_resolution.resolved_risk_tier)
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            lease_id = %lease_id,
+                            work_id = %work_id,
+                            tier_value = claim.policy_resolution.resolved_risk_tier,
+                            "invalid risk tier value in policy resolution — \
+                             defaulting to Tier4 (fail-closed)"
+                        );
+                        RiskTier::Tier4
+                    });
+                (tier, claim.policy_resolution.resolved_policy_hash)
+            },
+            Err(error) => {
+                warn!(
+                    lease_id = %lease_id,
+                    error = %error,
+                    "authoritative claim resolution failed for lease — defaulting to Tier4 (fail-closed)"
+                );
+                (RiskTier::Tier4, fallback_policy_hash)
+            },
         }
     }
 
@@ -10963,37 +10973,48 @@ impl PrivilegedDispatcher {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    /// Resolves the authoritative claim to use for privileged PCAC checks.
+    /// Resolves `(work_id, claim)` from authoritative lease bindings.
     ///
-    /// All modes require lease->work resolution to succeed first.
-    /// `StrictLeaseMappingAllowClaimFallback` permits claim recovery by
-    /// `work_id` only after authoritative lease mapping has succeeded.
-    fn resolve_claim_for_pcac_revalidation(
+    /// The daemon must never fall back to role-agnostic `get_claim(work_id)`
+    /// for privileged admission/revalidation surfaces because that allows
+    /// cross-role policy confusion under multi-role claims.
+    fn resolve_authoritative_claim_binding(
         &self,
-        work_id: &str,
         lease_id: &str,
+        work_id_hint: Option<&str>,
         work_id_resolution_mode: WorkIdResolutionMode,
-    ) -> Result<WorkClaim, String> {
-        if let Some(claim) = self.work_registry.get_claim_by_lease_id(work_id, lease_id) {
-            return Ok(claim);
-        }
-
-        if work_id_resolution_mode == WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback {
-            if let Some(claim) = self.work_registry.get_claim(work_id) {
-                warn!(
-                    lease_id = %lease_id,
-                    work_id = %work_id,
-                    role = ?claim.role,
-                    claim_lease_id = %claim.lease_id,
-                    "PCAC claim lookup used controlled fallback after authoritative lease->work resolution"
-                );
-                return Ok(claim);
+    ) -> Result<(String, WorkClaim), String> {
+        let _ = work_id_resolution_mode;
+        let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) else {
+            return Err(format!(
+                "[{INV_FAC_WORK_BIND_001}] work_id missing for lease '{lease_id}'"
+            ));
+        };
+        if let Some(hint) = work_id_hint {
+            let hint_matches = hint.len() == work_id.len()
+                && bool::from(hint.as_bytes().ct_eq(work_id.as_bytes()));
+            if !hint_matches {
+                return Err(format!(
+                    "[{INV_FAC_WORK_BIND_001}] authoritative lease mapping mismatch for lease \
+                     '{lease_id}'"
+                ));
             }
         }
-
-        Err(format!(
-            "work claim missing for lease '{lease_id}' and work '{work_id}'"
-        ))
+        let Some(claim) = self.work_registry.get_claim_by_lease_id(&work_id, lease_id) else {
+            return Err(format!(
+                "[{INV_FAC_CLAIM_BIND_001}] work claim missing for lease '{lease_id}' and work \
+                 '{work_id}'"
+            ));
+        };
+        let claim_work_matches = claim.work_id.len() == work_id.len()
+            && bool::from(claim.work_id.as_bytes().ct_eq(work_id.as_bytes()));
+        if !claim_work_matches {
+            return Err(format!(
+                "[{INV_FAC_CLAIM_BIND_001}] claim work_id mismatch for lease '{lease_id}' \
+                 (authoritative work_id='{work_id}')"
+            ));
+        }
+        Ok((work_id, claim))
     }
 
     /// Derives fresh revalidation inputs for privileged PCAC lifecycle checks.
@@ -11016,14 +11037,11 @@ impl PrivilegedDispatcher {
 
         let current_time_envelope_ref = *blake3::hash(&hlc.wall_ns.to_le_bytes()).as_bytes();
         let current_ledger_anchor = self.derive_pcac_ledger_anchor()?;
-
-        let work_id = self.resolve_work_id_for_pcac_revalidation(
+        let (work_id, claim) = self.resolve_authoritative_claim_binding(
             lease_id,
             work_id_hint,
             work_id_resolution_mode,
         )?;
-        let claim =
-            self.resolve_claim_for_pcac_revalidation(&work_id, lease_id, work_id_resolution_mode)?;
         if claim.policy_resolution.policy_resolved_ref.is_empty() {
             return Err(format!(
                 "policy_resolved_ref missing for lease '{lease_id}' and work '{work_id}'"
@@ -11038,23 +11056,6 @@ impl PrivilegedDispatcher {
             current_ledger_anchor,
             current_revocation_head,
         ))
-    }
-
-    /// Resolve `work_id` for privileged PCAC revalidation.
-    ///
-    /// Primary (and only) source is the lease validator's authoritative
-    /// lease->work mapping.
-    fn resolve_work_id_for_pcac_revalidation(
-        &self,
-        lease_id: &str,
-        _work_id_hint: Option<&str>,
-        work_id_resolution_mode: WorkIdResolutionMode,
-    ) -> Result<String, String> {
-        if let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) {
-            return Ok(work_id);
-        }
-        let _ = work_id_resolution_mode;
-        Err(format!("work_id missing for lease '{lease_id}'"))
     }
 
     fn map_pcac_deny_to_privileged_response(
@@ -11088,25 +11089,14 @@ impl PrivilegedDispatcher {
         join_revocation_head: [u8; 32],
         effect_intent_digest: [u8; 32],
     ) -> Result<Option<PrivilegedPcacLifecycleArtifacts>, PrivilegedResponse> {
-        let work_id = self
-            .resolve_work_id_for_pcac_revalidation(lease_id, work_id_hint, work_id_resolution_mode)
+        let (work_id, claim) = self
+            .resolve_authoritative_claim_binding(lease_id, work_id_hint, work_id_resolution_mode)
             .map_err(|error| {
                 PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
                     format!(
-                        "PCAC authority denied for {operation}: policy state missing for lease \
-                         '{lease_id}': {error}"
-                    ),
-                )
-            })?;
-        let claim = self
-            .resolve_claim_for_pcac_revalidation(&work_id, lease_id, work_id_resolution_mode)
-            .map_err(|_| {
-                PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
                         "PCAC authority denied for {operation}: work claim missing for policy lookup \
-                         (lease='{lease_id}', work_id='{work_id}')"
+                         (lease='{lease_id}'): {error}"
                     ),
                 )
             })?;
@@ -18477,7 +18467,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
             changeset_digest,
-            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
         );
         if let Err(e) = self.validate_lease_time_authority(&lease_for_receipt, risk_tier) {
             warn!(
@@ -18492,32 +18482,19 @@ impl PrivilegedDispatcher {
             ));
         }
         let lease_time_envelope_ref = lease_for_receipt.time_envelope_ref;
-        let claim_for_receipt = self
-            .work_registry
-            .get_claim_by_lease_id(&lease_for_receipt.work_id, &request.lease_id)
-            .or_else(|| {
-                self.work_registry
-                    .get_claim_for_role(&lease_for_receipt.work_id, WorkRole::Reviewer)
-            })
-            .or_else(|| self.work_registry.get_claim(&lease_for_receipt.work_id));
-        let Some(claim_for_receipt) = claim_for_receipt else {
-            return Ok(deny_response_for_authority_context(
-                DenyCondition::MissingAuthorityContext,
-                format!(
-                    "work claim not found for lease work_id={}",
-                    lease_for_receipt.work_id
-                ),
-            ));
+        let claim_for_receipt = match self.resolve_authoritative_claim_binding(
+            &request.lease_id,
+            Some(authoritative_work_id.as_str()),
+            WorkIdResolutionMode::StrictLeaseMapping,
+        ) {
+            Ok((_work_id, claim)) => claim,
+            Err(error) => {
+                return Ok(deny_response_for_authority_context(
+                    DenyCondition::MissingAuthorityContext,
+                    format!("work claim not found for authoritative lease binding: {error}"),
+                ));
+            },
         };
-        if claim_for_receipt.work_id != authoritative_work_id {
-            return Ok(deny_response_for_authority_context(
-                DenyCondition::MissingAuthorityContext,
-                format!(
-                    "lease work_id '{}' does not match authoritative claim work_id '{}'",
-                    authoritative_work_id, claim_for_receipt.work_id
-                ),
-            ));
-        }
         let claim_role_spec_hash = match Self::validate_claim_authority_context_lineage(
             &claim_for_receipt,
             cas.as_ref(),
@@ -18776,7 +18753,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(authoritative_work_id.as_str()),
-                WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+                WorkIdResolutionMode::StrictLeaseMapping,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -18896,7 +18873,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(authoritative_work_id.as_str()),
-            WorkIdResolutionMode::StrictLeaseMappingAllowClaimFallback,
+            WorkIdResolutionMode::StrictLeaseMapping,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -19637,7 +19614,8 @@ impl PrivilegedDispatcher {
     ///
     /// # Security
     ///
-    /// - `work_id` is validated against the work registry (fail-closed)
+    /// - `(work_id, lease_id)` is validated against authoritative lease+claim
+    ///   bindings (fail-closed)
     /// - Bundle bytes are validated before CAS storage
     /// - Idempotent: re-publishing the same bundle returns the same digest
     ///   without duplicate ledger events
@@ -19655,6 +19633,7 @@ impl PrivilegedDispatcher {
 
         info!(
             work_id = %request.work_id,
+            lease_id = %request.lease_id,
             bundle_size = request.bundle_bytes.len(),
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
             "PublishChangeSet request received"
@@ -19676,6 +19655,18 @@ impl PrivilegedDispatcher {
                 format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
             ));
         }
+        if request.lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id is required",
+            ));
+        }
+        if request.lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
 
         if request.bundle_bytes.is_empty() {
             return Ok(PrivilegedResponse::error(
@@ -19692,18 +19683,51 @@ impl PrivilegedDispatcher {
             })?;
         let actor_id = derive_actor_id(peer_creds);
 
-        // Validate work_id exists in registry (fail-closed: reject orphaned changesets)
-        let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
+        let Some(mapped_work_id) = self.lease_validator.get_lease_work_id(&request.lease_id) else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "[{INV_FAC_WORK_BIND_001}] lease_id is not registered for changeset publishing"
+                ),
+            ));
+        };
+        let work_mapping_matches = mapped_work_id.len() == request.work_id.len()
+            && bool::from(mapped_work_id.as_bytes().ct_eq(request.work_id.as_bytes()));
+        if !work_mapping_matches {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!("[{INV_FAC_WORK_BIND_001}] lease_id is bound to a different work_id"),
+            ));
+        }
+
+        // Validate authoritative `(work_id, lease_id)` claim binding.
+        let Some(claim) = self
+            .work_registry
+            .get_claim_by_lease_id(&request.work_id, &request.lease_id)
+        else {
+            if self.work_registry.get_claim(&request.work_id).is_some() {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    format!(
+                        "[{INV_FAC_CLAIM_BIND_001}] lease_id does not match the active lease for this work claim"
+                    ),
+                ));
+            }
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("work_id not found in registry: {}", request.work_id),
+                format!(
+                    "[{INV_FAC_CLAIM_BIND_001}] work_id not found in registry: {}",
+                    request.work_id
+                ),
             ));
         };
 
         // TCK-00408: Actor ownership check — the authenticated caller must be
         // the actor that owns the work claim. This prevents unauthorized actors
         // from publishing changesets against work items they don't own.
-        if claim.actor_id != actor_id {
+        let actor_matches = claim.actor_id.len() == actor_id.len()
+            && bool::from(claim.actor_id.as_bytes().ct_eq(actor_id.as_bytes()));
+        if !actor_matches {
             warn!(
                 work_id = %request.work_id,
                 claim_actor = %claim.actor_id,
@@ -19713,8 +19737,19 @@ impl PrivilegedDispatcher {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::PermissionDenied,
                 format!(
-                    "authenticated caller '{}' does not own work claim for '{}' (owned by '{}')",
+                    "[{INV_FAC_ACTOR_BIND_001}] authenticated caller '{}' does not own work claim \
+                     for '{}' (owned by '{}')",
                     actor_id, request.work_id, claim.actor_id
+                ),
+            ));
+        }
+        let lease_matches = request.lease_id.len() == claim.lease_id.len()
+            && bool::from(request.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+        if !lease_matches {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "[{INV_FAC_CLAIM_BIND_001}] lease_id does not match the active lease for this work claim"
                 ),
             ));
         }
@@ -19776,7 +19811,8 @@ impl PrivilegedDispatcher {
                 work_id = %request.work_id,
                 changeset_digest = %changeset_digest_hex,
                 event_id = %event_id,
-                "Idempotent: returning existing ChangeSetPublished event"
+                "Idempotent replay ({INV_FAC_WORK_BIND_001}): returning existing \
+                 ChangeSetPublished event"
             );
             return Ok(PrivilegedResponse::PublishChangeSet(
                 PublishChangeSetResponse {
@@ -21673,6 +21709,33 @@ impl PrivilegedDispatcher {
                         commit_sha = %request.commit_sha,
                         "work.pr_associated event emitted"
                     );
+                },
+                Err(e) if e.to_string().contains(WORK_PR_BINDING_CONFLICT_TAG) => {
+                    let bound_pr_number = self
+                        .event_emitter
+                        .get_first_event_by_work_id_and_type(&request.work_id, "work.pr_associated")
+                        .and_then(|existing| {
+                            Self::extract_work_pr_association_fields(&existing.payload)
+                                .map(|(pr, _)| pr)
+                        });
+                    if let Some(existing_pr_number) = bound_pr_number {
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::FailedPrecondition,
+                            format!(
+                                "work_id '{}' is already associated with pr_number={}; \
+                                 conflicting pr_number={} rejected",
+                                request.work_id, existing_pr_number, request.pr_number
+                            ),
+                        ));
+                    }
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!(
+                            "work.pr_associated binding conflict for work_id '{}' \
+                             but authoritative existing binding could not be decoded (fail-closed): {e}",
+                            request.work_id
+                        ),
+                    ));
                 },
                 Err(e) if e.to_string().contains("UNIQUE constraint") => {
                     // Race-safe recovery: a concurrent writer may have committed
@@ -33326,8 +33389,12 @@ mod tests {
             }))
         }
 
-        /// Helper to first claim work so we have a registered `work_id`.
-        fn claim_work(dispatcher: &PrivilegedDispatcher, ctx: &ConnectionContext) -> String {
+        /// Helper to first claim work so we have a registered `(work_id,
+        /// lease_id)`.
+        fn claim_work(
+            dispatcher: &PrivilegedDispatcher,
+            ctx: &ConnectionContext,
+        ) -> (String, String) {
             let request = ClaimWorkRequest {
                 actor_id: "test:actor".to_string(),
                 role: WorkRole::Implementer.into(),
@@ -33337,7 +33404,14 @@ mod tests {
             let frame = encode_claim_work_request(&request);
             let response = dispatcher.dispatch(&frame, ctx).unwrap();
             match response {
-                PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+                PrivilegedResponse::ClaimWork(resp) => {
+                    dispatcher.lease_validator().register_lease(
+                        &resp.lease_id,
+                        &resp.work_id,
+                        "gate-test",
+                    );
+                    (resp.work_id, resp.lease_id)
+                },
                 other => panic!("Expected ClaimWork response, got: {other:?}"),
             }
         }
@@ -33348,11 +33422,12 @@ mod tests {
             let ctx = privileged_ctx();
 
             // First claim work to get a valid work_id
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let bundle_bytes = make_bundle_json("cs-001");
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33368,11 +33443,12 @@ mod tests {
         fn test_publish_changeset_returns_digest_and_cas_hash() {
             let (dispatcher, cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let bundle_bytes = make_bundle_json("cs-002");
             let request = PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes: bundle_bytes.clone(),
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33413,11 +33489,12 @@ mod tests {
         fn test_publish_changeset_emits_ledger_event() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let bundle_bytes = make_bundle_json("cs-003");
             let request = PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33460,13 +33537,14 @@ mod tests {
         fn test_publish_changeset_idempotent() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let bundle_bytes = make_bundle_json("cs-004");
 
             // First publish
             let request1 = PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id: lease_id.clone(),
                 bundle_bytes: bundle_bytes.clone(),
             };
             let frame1 = encode_publish_changeset_request(&request1);
@@ -33481,6 +33559,7 @@ mod tests {
             // Second publish with same bundle
             let request2 = PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             };
             let frame2 = encode_publish_changeset_request(&request2);
@@ -33516,7 +33595,7 @@ mod tests {
         fn test_publish_changeset_semantic_idempotent_noncanonical_json() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let canonical_bundle = make_bundle_json("cs-semantic-idempotent");
             let noncanonical_bundle = make_noncanonical_bundle_json("cs-semantic-idempotent");
@@ -33525,6 +33604,7 @@ mod tests {
                 .dispatch(
                     &encode_publish_changeset_request(&PublishChangeSetRequest {
                         work_id: work_id.clone(),
+                        lease_id: lease_id.clone(),
                         bundle_bytes: canonical_bundle,
                     }),
                     &ctx,
@@ -33541,6 +33621,7 @@ mod tests {
                 .dispatch(
                     &encode_publish_changeset_request(&PublishChangeSetRequest {
                         work_id: work_id.clone(),
+                        lease_id,
                         bundle_bytes: noncanonical_bundle,
                     }),
                     &ctx,
@@ -33578,12 +33659,13 @@ mod tests {
         fn test_publish_changeset_rejects_digest_mismatch() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let mut bundle = make_valid_bundle("cs-digest-mismatch");
             bundle.changeset_digest = [0xAB; 32];
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes: serde_json::to_vec(&bundle).unwrap(),
             };
 
@@ -33614,6 +33696,7 @@ mod tests {
             let bundle_bytes = make_bundle_json("cs-005");
             let request = PublishChangeSetRequest {
                 work_id: "W-nonexistent-001".to_string(),
+                lease_id: "L-nonexistent-001".to_string(),
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33632,6 +33715,7 @@ mod tests {
 
             let request = PublishChangeSetRequest {
                 work_id: String::new(),
+                lease_id: "L-test-lease-001".to_string(),
                 bundle_bytes: make_bundle_json("cs-006"),
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33647,10 +33731,11 @@ mod tests {
         fn test_publish_changeset_rejects_empty_bundle() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes: vec![],
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33666,10 +33751,11 @@ mod tests {
         fn test_publish_changeset_rejects_invalid_json() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes: b"not valid json".to_vec(),
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33695,7 +33781,7 @@ mod tests {
         fn test_publish_changeset_rejects_empty_file_manifest() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             let bundle = ChangeSetBundleV1::builder()
                 .changeset_id("cs-empty-manifest")
@@ -33713,6 +33799,7 @@ mod tests {
 
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33741,13 +33828,14 @@ mod tests {
             // strip CAS to verify PublishChangeSet fail-closed when CAS absent.
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = privileged_ctx();
-            let work_id = claim_work(&dispatcher, &ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
 
             // Strip CAS AFTER claiming work
             let dispatcher = dispatcher.without_cas();
 
             let request = PublishChangeSetRequest {
                 work_id,
+                lease_id,
                 bundle_bytes: make_bundle_json("cs-no-cas"),
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33773,6 +33861,7 @@ mod tests {
 
             let request = PublishChangeSetRequest {
                 work_id: "W-test-001".to_string(),
+                lease_id: "L-test-lease-session".to_string(),
                 bundle_bytes: make_bundle_json("cs-perm"),
             };
             let frame = encode_publish_changeset_request(&request);
@@ -33809,7 +33898,7 @@ mod tests {
             let owner_ctx = privileged_ctx(); // uid=1000, gid=1000
 
             // Claim work as the owner
-            let work_id = claim_work(&dispatcher, &owner_ctx);
+            let (work_id, lease_id) = claim_work(&dispatcher, &owner_ctx);
 
             // Create a different caller context (different uid -> different actor_id)
             let non_owner_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
@@ -33822,6 +33911,7 @@ mod tests {
             let expected_hash = *blake3::hash(&bundle_bytes).as_bytes();
             let request = PublishChangeSetRequest {
                 work_id: work_id.clone(),
+                lease_id,
                 bundle_bytes,
             };
             let frame = encode_publish_changeset_request(&request);
