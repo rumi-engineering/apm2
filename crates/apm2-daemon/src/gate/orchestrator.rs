@@ -1,7 +1,7 @@
 // AGENT-AUTHORED (TCK-00388)
 //! Gate execution orchestrator implementation.
 //!
-//! Watches for `session_terminated` ledger events and autonomously drives
+//! Watches for `changeset_published` ledger events and autonomously drives
 //! the gate lifecycle: policy resolution -> lease issuance -> gate executor
 //! spawn -> receipt collection.
 //!
@@ -11,7 +11,7 @@
 //!   before any `GateLeaseIssued` event for the same `work_id`.
 //! - **Fail-closed**: Gate timeout produces FAIL verdict, blocking merge.
 //! - **Domain separation**: All leases use `GATE_LEASE_ISSUED:` prefix.
-//! - **Changeset binding**: Lease `changeset_digest` matches session data.
+//! - **Changeset binding**: Lease `changeset_digest` matches source input.
 //! - **Receipt authenticity**: Gate receipt signatures are verified against the
 //!   executor's verifying key before state transitions.
 //!
@@ -135,7 +135,7 @@ impl Clock for SystemClock {
 
 /// Gate types that the orchestrator manages.
 ///
-/// Each terminated session with associated work triggers execution of
+/// Each starting changeset with associated work triggers execution of
 /// all required gate types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum GateType {
@@ -253,57 +253,57 @@ pub struct GateOutcome {
 }
 
 // =============================================================================
-// Session Terminated Info
+// Gate Start Info
 // =============================================================================
 
-/// Information about a terminated session that triggers gate orchestration.
+/// Information about a starting changeset that triggers gate orchestration.
 ///
-/// This struct captures the data needed from a `session_terminated` event
+/// This struct captures the data needed from a `changeset_published` event
 /// to drive the gate lifecycle.
 #[derive(Debug, Clone)]
-pub struct SessionTerminatedInfo {
-    /// The session ID that terminated.
-    pub session_id: String,
-    /// The work ID associated with this session.
+pub struct GateStartInfo {
+    /// Authoritative `changeset_published` event ID.
+    pub source_event_id: String,
+    /// The work ID associated with this changeset.
     pub work_id: String,
-    /// The changeset digest from the terminated session.
+    /// The changeset digest from the starting changeset.
     pub changeset_digest: [u8; 32],
-    /// Timestamp of session termination (milliseconds since epoch).
-    pub terminated_at_ms: u64,
+    /// Timestamp of gate start (milliseconds since epoch).
+    pub source_timestamp_ms: u64,
 }
 
 // =============================================================================
 // Idempotency Key (Security MAJOR 1)
 // =============================================================================
 
-/// Deterministic idempotency key computed from `session_id + changeset_digest`.
+/// Deterministic idempotency key computed from `work_id + changeset_digest`.
 ///
-/// Used to prevent replay of termination events after restart. The key is
+/// Used to prevent replay of changeset-start events after restart. The key is
 /// persisted alongside the orchestration entry and enforced at the admission
 /// boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IdempotencyKey {
-    /// The session ID from the terminated session.
-    session_id: String,
-    /// The changeset digest from the terminated session.
+    /// The work ID from the published changeset.
+    work_id: String,
+    /// The changeset digest from the starting changeset.
     changeset_digest: [u8; 32],
 }
 
 impl IdempotencyKey {
-    /// Creates a new idempotency key from session termination info.
-    fn from_info(info: &SessionTerminatedInfo) -> Self {
+    /// Creates a new idempotency key from gate start info.
+    fn from_info(info: &GateStartInfo) -> Self {
         Self {
-            session_id: info.session_id.clone(),
+            work_id: info.work_id.clone(),
             changeset_digest: info.changeset_digest,
         }
     }
 }
 
-/// Maximum age of a termination event in milliseconds (1 hour).
+/// Maximum age of a gate-start event in milliseconds (1 hour).
 ///
-/// Termination events older than this are rejected as stale to prevent
+/// Gate-start events older than this are rejected as stale to prevent
 /// replay attacks after restart (Security MAJOR 1).
-pub const MAX_TERMINATED_AT_AGE_MS: u64 = 3_600_000;
+pub const MAX_SOURCE_EVENT_AGE_MS: u64 = 3_600_000;
 
 // =============================================================================
 // Error Types
@@ -438,26 +438,26 @@ pub enum GateOrchestratorError {
     },
 
     /// Replay detected: an orchestration with the same idempotency key
-    /// (`session_id` + `changeset_digest`) already exists or was previously
+    /// (`work_id` + `changeset_digest`) already exists or was previously
     /// processed (Security MAJOR 1).
     #[error(
-        "replay detected for session_id={session_id}: an orchestration with the same idempotency key already exists"
+        "replay detected for work_id={work_id}: an orchestration with the same idempotency key already exists"
     )]
     ReplayDetected {
-        /// The session ID that was replayed.
-        session_id: String,
+        /// The work ID that was replayed.
+        work_id: String,
     },
 
-    /// Stale termination event: `terminated_at_ms` is too old to be accepted
+    /// Stale gate-start event: `source_timestamp_ms` is too old to be accepted
     /// (Security MAJOR 1).
     #[error(
-        "stale termination event for work_id {work_id}: terminated_at_ms={terminated_at_ms} is older than freshness threshold"
+        "stale gate-start event for work_id {work_id}: source_timestamp_ms={source_timestamp_ms} is older than freshness threshold"
     )]
-    StaleTerminationEvent {
+    StaleSourceEvent {
         /// The work ID.
         work_id: String,
         /// The stale timestamp.
-        terminated_at_ms: u64,
+        source_timestamp_ms: u64,
     },
 
     /// Sublease validation failed during delegated lease issuance (TCK-00340).
@@ -571,6 +571,50 @@ pub enum GateOrchestratorEvent {
     },
 }
 
+/// Canonical persistence metadata for a gate-orchestrator event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateEventPersistenceFields {
+    /// Canonical ledger event type.
+    pub event_type: &'static str,
+    /// Event timestamp in nanoseconds since epoch.
+    pub timestamp_ns: u64,
+}
+
+/// Maps an orchestrator event to canonical persistence fields.
+#[must_use]
+pub const fn gate_event_persistence_fields(
+    event: &GateOrchestratorEvent,
+) -> GateEventPersistenceFields {
+    let (event_type, timestamp_ms) = match event {
+        GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } => {
+            ("gate.policy_resolved", *timestamp_ms)
+        },
+        GateOrchestratorEvent::GateLeaseIssued { timestamp_ms, .. } => {
+            ("gate.lease_issued", *timestamp_ms)
+        },
+        GateOrchestratorEvent::GateExecutorSpawned { timestamp_ms, .. } => {
+            ("gate.executor_spawned", *timestamp_ms)
+        },
+        GateOrchestratorEvent::GateReceiptCollected { timestamp_ms, .. } => {
+            ("gate.receipt_collected", *timestamp_ms)
+        },
+        GateOrchestratorEvent::GateTimedOut { timestamp_ms, .. } => {
+            ("gate.timed_out", *timestamp_ms)
+        },
+        GateOrchestratorEvent::GateTimeoutReceiptGenerated { timestamp_ms, .. } => {
+            ("gate.timeout_receipt_generated", *timestamp_ms)
+        },
+        GateOrchestratorEvent::AllGatesCompleted { timestamp_ms, .. } => {
+            ("gate.all_completed", *timestamp_ms)
+        },
+    };
+
+    GateEventPersistenceFields {
+        event_type,
+        timestamp_ns: timestamp_ms.saturating_mul(1_000_000),
+    }
+}
+
 // =============================================================================
 // Orchestration Entry
 // =============================================================================
@@ -578,9 +622,9 @@ pub enum GateOrchestratorEvent {
 /// Internal state for a single gate orchestration.
 #[derive(Debug)]
 struct OrchestrationEntry {
-    /// Session termination info that triggered this orchestration.
+    /// Gate start info that triggered this orchestration.
     /// Used by downstream merge automation (TCK-00390) and status queries.
-    _session_info: SessionTerminatedInfo,
+    _start_info: GateStartInfo,
     /// The policy resolution for this changeset.
     policy_resolution: PolicyResolvedForChangeSet,
     /// Gate statuses indexed by gate type.
@@ -605,8 +649,8 @@ struct OrchestrationEntry {
     started_at_monotonic: Instant,
     /// Deterministic idempotency key (Security MAJOR 1).
     ///
-    /// Computed from `session_id + changeset_digest` to prevent replay of
-    /// termination events generating new gate lifecycles. Stored for
+    /// Computed from `work_id + changeset_digest` to prevent replay of
+    /// gate-start events generating new gate lifecycles. Stored for
     /// debugging/audit purposes alongside the `seen_idempotency_keys` set.
     #[allow(dead_code)]
     idempotency_key: IdempotencyKey,
@@ -625,7 +669,7 @@ pub struct GateOrchestratorConfig {
     pub gate_timeout_ms: u64,
     /// Maximum accepted heartbeat age for authoritative progression checks.
     pub max_heartbeat_age_ticks: u64,
-    /// Gate types to execute for each terminated session.
+    /// Gate types to execute for each starting changeset.
     pub gate_types: Vec<GateType>,
     /// Issuer actor ID for gate leases.
     pub issuer_actor_id: String,
@@ -655,7 +699,7 @@ impl Default for GateOrchestratorConfig {
 
 /// Gate execution orchestrator for autonomous gate lifecycle management.
 ///
-/// The `GateOrchestrator` watches for `session_terminated` events and
+/// The `GateOrchestrator` starts from authoritative changeset identity and
 /// autonomously orchestrates the gate lifecycle:
 ///
 /// 1. Resolve policy via `PolicyResolvedForChangeSet`
@@ -669,7 +713,7 @@ impl Default for GateOrchestratorConfig {
 /// - Gate leases use domain-separated Ed25519 signatures
 /// - Receipt signatures are verified against executor verifying key
 /// - Timeout produces fail-closed FAIL verdict
-/// - Changeset digest in leases matches session data
+/// - Changeset digest in leases matches source input
 ///
 /// # Event Model (BLOCKER 3 fix)
 ///
@@ -692,7 +736,7 @@ pub struct GateOrchestrator {
     /// Seen idempotency keys for replay rejection (Security MAJOR 1).
     ///
     /// Tracks idempotency keys for both active and completed orchestrations
-    /// to prevent replayed termination events from generating new lifecycles.
+    /// to prevent replayed gate-start events from generating new lifecycles.
     seen_idempotency_keys: RwLock<std::collections::HashSet<IdempotencyKey>>,
     /// Gate timeout as a `Duration` for monotonic comparison (Security BLOCKER
     /// 1).
@@ -804,10 +848,10 @@ impl GateOrchestrator {
             .and_then(|e| e.executor_keys.get(&gate_type).copied())
     }
 
-    /// Handles a `session_terminated` event by starting gate orchestration.
+    /// Handles a `changeset_published` event by starting gate orchestration.
     ///
-    /// This is the primary entry point for the gate lifecycle. When a session
-    /// terminates with associated work, this method:
+    /// This is the primary entry point for the gate lifecycle. When an
+    /// authoritative changeset is published for a work item, this method:
     ///
     /// 1. Validates input
     /// 2. Resolves policy for the changeset
@@ -847,9 +891,9 @@ impl GateOrchestrator {
     /// that the caller must hand to the spawned executor. Receipts signed
     /// with these signers are the only ones accepted by the orchestrator
     /// (BLOCKER 4 fix).
-    pub async fn handle_session_terminated(
+    pub async fn start_for_changeset(
         &self,
-        info: SessionTerminatedInfo,
+        info: GateStartInfo,
     ) -> Result<
         (
             Vec<GateType>,
@@ -868,10 +912,10 @@ impl GateOrchestrator {
                 max: MAX_WORK_ID_LENGTH,
             });
         }
-        if info.session_id.len() > MAX_STRING_LENGTH {
+        if info.source_event_id.len() > MAX_STRING_LENGTH {
             return Err(GateOrchestratorError::StringTooLong {
-                field: "session_id",
-                actual: info.session_id.len(),
+                field: "source_event_id",
+                actual: info.source_event_id.len(),
                 max: MAX_STRING_LENGTH,
             });
         }
@@ -879,20 +923,20 @@ impl GateOrchestrator {
         let now_ms = self.clock.now_ms();
         let monotonic_now = self.clock.monotonic_now();
 
-        // Security MAJOR 1: Freshness check - reject stale termination events.
-        // This prevents replayed termination events from older sessions after restart.
+        // Security MAJOR 1: Freshness check - reject stale gate-start events.
+        // This prevents replayed starts from older lifecycles after restart.
         // Security BLOCKER 2 FIX: Use saturating_add to prevent u64 overflow on
-        // adversarial `terminated_at_ms` values near u64::MAX. When overflow
+        // adversarial `source_timestamp_ms` values near u64::MAX. When overflow
         // would occur, the threshold saturates to u64::MAX, meaning the event
         // is never considered stale (safe: a future timestamp is not stale).
-        if info.terminated_at_ms > 0 {
+        if info.source_timestamp_ms > 0 {
             let threshold = info
-                .terminated_at_ms
-                .saturating_add(MAX_TERMINATED_AT_AGE_MS);
+                .source_timestamp_ms
+                .saturating_add(MAX_SOURCE_EVENT_AGE_MS);
             if now_ms > threshold {
-                return Err(GateOrchestratorError::StaleTerminationEvent {
+                return Err(GateOrchestratorError::StaleSourceEvent {
                     work_id: info.work_id.clone(),
-                    terminated_at_ms: info.terminated_at_ms,
+                    source_timestamp_ms: info.source_timestamp_ms,
                 });
             }
         }
@@ -952,7 +996,7 @@ impl GateOrchestrator {
             // Replay check: reject if we've seen this idempotency key before.
             if seen_keys.contains(&idempotency_key) {
                 return Err(GateOrchestratorError::ReplayDetected {
-                    session_id: info.session_id.clone(),
+                    work_id: info.work_id.clone(),
                 });
             }
 
@@ -973,7 +1017,7 @@ impl GateOrchestrator {
                 },
                 Entry::Vacant(vacant) => {
                     vacant.insert(OrchestrationEntry {
-                        _session_info: info.clone(),
+                        _start_info: info.clone(),
                         policy_resolution,
                         gates,
                         leases: leases.clone(),
@@ -1608,7 +1652,7 @@ impl GateOrchestrator {
     /// This MUST be called before any lease issuance for the same `work_id`.
     fn resolve_policy(
         &self,
-        info: &SessionTerminatedInfo,
+        info: &GateStartInfo,
         _now_ms: u64,
     ) -> Result<PolicyResolvedForChangeSet, GateOrchestratorError> {
         PolicyResolvedForChangeSetBuilder::new(&info.work_id, info.changeset_digest)
@@ -1781,13 +1825,13 @@ impl GateOrchestrator {
     /// # Security
     ///
     /// - Uses domain-separated Ed25519 signatures (`GATE_LEASE_ISSUED:` prefix)
-    /// - Binds the `changeset_digest` from the terminated session
+    /// - Binds the `changeset_digest` from the starting changeset
     /// - Sets temporal bounds (`issued_at` to `issued_at` + timeout)
     /// - `time_envelope_ref` is a CAS-backed hex-encoded hash when CAS is
     ///   configured, ensuring downstream HTF authority validation succeeds.
     fn issue_gate_lease(
         &self,
-        info: &SessionTerminatedInfo,
+        info: &GateStartInfo,
         gate_type: GateType,
         policy_hash: &[u8; 32],
         now_ms: u64,
@@ -2119,16 +2163,16 @@ mod tests {
         Arc::new(Signer::generate())
     }
 
-    /// Helper: creates a test session terminated info.
+    /// Helper: creates a test gate-start info.
     ///
-    /// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
+    /// Uses `source_timestamp_ms: 0` to bypass freshness checks in tests.
     /// Tests that specifically validate freshness logic set a non-zero value.
-    fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
-        SessionTerminatedInfo {
-            session_id: format!("session-{work_id}"),
+    fn test_gate_start_info(work_id: &str) -> GateStartInfo {
+        GateStartInfo {
+            source_event_id: format!("evt-{work_id}"),
             work_id: work_id.to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         }
     }
 
@@ -2142,9 +2186,9 @@ mod tests {
         orch: &GateOrchestrator,
         work_id: &str,
     ) -> HashMap<GateType, Arc<Signer>> {
-        let info = test_session_info(work_id);
+        let info = test_gate_start_info(work_id);
         let (_gate_types, executor_signers, _events) =
-            orch.handle_session_terminated(info).await.unwrap();
+            orch.start_for_changeset(info).await.unwrap();
         executor_signers
     }
 
@@ -2152,11 +2196,10 @@ mod tests {
     /// spawn bookkeeping" behavior without wrapper APIs.
     async fn start_and_record_spawns(
         orch: &GateOrchestrator,
-        info: SessionTerminatedInfo,
+        info: GateStartInfo,
     ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
         let work_id = info.work_id.clone();
-        let (gate_types, _executor_signers, mut events) =
-            orch.handle_session_terminated(info).await?;
+        let (gate_types, _executor_signers, mut events) = orch.start_for_changeset(info).await?;
 
         for (timed_work_id, gate_type) in orch.check_timeouts().await {
             if timed_work_id == work_id {
@@ -2211,12 +2254,12 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_handle_session_terminated_issues_all_gates() {
+    async fn test_start_for_changeset_issues_all_gates() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-001");
+        let info = test_gate_start_info("work-001");
 
         let (gate_types, _executor_signers, _events) =
-            orch.handle_session_terminated(info).await.unwrap();
+            orch.start_for_changeset(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -2228,9 +2271,9 @@ mod tests {
     #[tokio::test]
     async fn test_policy_resolved_before_leases() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-002");
+        let info = test_gate_start_info("work-002");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
 
         // First event must be PolicyResolved
         assert!(matches!(
@@ -2250,9 +2293,9 @@ mod tests {
     async fn test_gate_lease_signatures_valid() {
         let signer = test_signer();
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-003");
+        let info = test_gate_start_info("work-003");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-003", gate_type).await.unwrap();
@@ -2267,14 +2310,14 @@ mod tests {
     async fn test_gate_lease_changeset_binding() {
         let orch = test_orchestrator();
         let changeset = [0xAB; 32];
-        let info = SessionTerminatedInfo {
-            session_id: "session-binding".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-binding".to_string(),
             work_id: "work-binding".to_string(),
             changeset_digest: changeset,
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-binding", gate_type).await.unwrap();
@@ -2288,9 +2331,9 @@ mod tests {
     #[tokio::test]
     async fn test_gate_lease_policy_hash_matches_resolution() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-004");
+        let info = test_gate_start_info("work-004");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-004").await.unwrap();
         let policy_hash = resolution.resolved_policy_hash();
@@ -2307,9 +2350,9 @@ mod tests {
     #[tokio::test]
     async fn test_record_executor_spawned() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-005");
+        let info = test_gate_start_info("work-005");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         let events = orch
             .record_executor_spawned("work-005", GateType::Quality, "ep-001")
@@ -2408,9 +2451,9 @@ mod tests {
     #[tokio::test]
     async fn test_gate_timeout_produces_fail_verdict() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-008");
+        let info = test_gate_start_info("work-008");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         let (result, events) = orch
             .handle_gate_timeout("work-008", GateType::Aat)
@@ -2516,15 +2559,15 @@ mod tests {
     #[tokio::test]
     async fn test_empty_work_id_rejected() {
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "session-empty".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-empty".to_string(),
             work_id: String::new(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_for_changeset(info)
             .await
             .err()
             .expect("expected error");
@@ -2534,15 +2577,15 @@ mod tests {
     #[tokio::test]
     async fn test_work_id_too_long_rejected() {
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "session-long".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-long".to_string(),
             work_id: "x".repeat(MAX_WORK_ID_LENGTH + 1),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_for_changeset(info)
             .await
             .err()
             .expect("expected error");
@@ -2551,15 +2594,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_orchestration_rejected_via_replay() {
-        // Security MAJOR 1: Same session_id + changeset_digest → ReplayDetected
+        // Security MAJOR 1: Same source_event_id + changeset_digest → ReplayDetected
         let orch = test_orchestrator();
-        let info1 = test_session_info("work-dup");
-        let info2 = test_session_info("work-dup");
+        let info1 = test_gate_start_info("work-dup");
+        let info2 = test_gate_start_info("work-dup");
 
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_for_changeset(info1).await.unwrap();
 
         let err = orch
-            .handle_session_terminated(info2)
+            .start_for_changeset(info2)
             .await
             .err()
             .expect("expected error");
@@ -2568,25 +2611,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_work_id_different_session_rejected() {
-        // Same work_id but different session_id → DuplicateOrchestration
+        // Same work_id but different source_event_id → DuplicateOrchestration
         let orch = test_orchestrator();
-        let info1 = SessionTerminatedInfo {
-            session_id: "session-alpha".to_string(),
+        let info1 = GateStartInfo {
+            source_event_id: "evt-alpha".to_string(),
             work_id: "work-dup-wid".to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
-        let info2 = SessionTerminatedInfo {
-            session_id: "session-beta".to_string(),
+        let info2 = GateStartInfo {
+            source_event_id: "evt-beta".to_string(),
             work_id: "work-dup-wid".to_string(),
             changeset_digest: [0x99; 32], // Different digest avoids replay check
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
 
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_for_changeset(info1).await.unwrap();
 
         let err = orch
-            .handle_session_terminated(info2)
+            .start_for_changeset(info2)
             .await
             .err()
             .expect("expected error");
@@ -2604,15 +2647,15 @@ mod tests {
         };
         let orch = GateOrchestrator::new(config, test_signer());
 
-        orch.handle_session_terminated(test_session_info("work-a"))
+        orch.start_for_changeset(test_gate_start_info("work-a"))
             .await
             .unwrap();
-        orch.handle_session_terminated(test_session_info("work-b"))
+        orch.start_for_changeset(test_gate_start_info("work-b"))
             .await
             .unwrap();
 
         let result = orch
-            .handle_session_terminated(test_session_info("work-c"))
+            .start_for_changeset(test_gate_start_info("work-c"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -2639,9 +2682,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_orchestration() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-remove");
+        let info = test_gate_start_info("work-remove");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
 
         assert!(orch.remove_orchestration("work-remove").await);
@@ -2659,9 +2702,9 @@ mod tests {
     async fn test_leases_use_domain_separated_signatures() {
         let signer = test_signer();
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-domain");
+        let info = test_gate_start_info("work-domain");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         // Verify that all leases have valid domain-separated signatures
         for gate_type in GateType::all() {
@@ -2687,9 +2730,9 @@ mod tests {
     #[tokio::test]
     async fn test_policy_hash_consistency_across_gates() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-consistency");
+        let info = test_gate_start_info("work-consistency");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-consistency").await.unwrap();
         let expected_hash = resolution.resolved_policy_hash();
@@ -2718,9 +2761,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_session_info("work-temporal");
+        let info = test_gate_start_info("work-temporal");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-temporal", gate_type).await.unwrap();
@@ -2778,28 +2821,28 @@ mod tests {
     }
 
     // =========================================================================
-    // Session ID Validation Tests
+    // Source Event ID Validation Tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_session_id_too_long_rejected() {
+    async fn test_source_event_id_too_long_rejected() {
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "s".repeat(MAX_STRING_LENGTH + 1),
+        let info = GateStartInfo {
+            source_event_id: "s".repeat(MAX_STRING_LENGTH + 1),
             work_id: "work-valid".to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_for_changeset(info)
             .await
             .err()
             .expect("expected error");
         assert!(matches!(
             err,
             GateOrchestratorError::StringTooLong {
-                field: "session_id",
+                field: "source_event_id",
                 ..
             }
         ));
@@ -2812,9 +2855,9 @@ mod tests {
     #[tokio::test]
     async fn test_events_returned_per_invocation() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-per-inv");
+        let info = test_gate_start_info("work-per-inv");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
 
         // Events are returned from the call, not buffered
         assert!(!events.is_empty());
@@ -2825,9 +2868,9 @@ mod tests {
     #[tokio::test]
     async fn test_event_count_matches_gates() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-events");
+        let info = test_gate_start_info("work-events");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
         // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
         assert_eq!(events.len(), 4);
     }
@@ -2839,16 +2882,16 @@ mod tests {
     #[tokio::test]
     async fn test_no_events_on_duplicate_orchestration() {
         let orch = test_orchestrator();
-        let info1 = test_session_info("work-no-events-dup");
-        let info2 = test_session_info("work-no-events-dup");
+        let info1 = test_gate_start_info("work-no-events-dup");
+        let info2 = test_gate_start_info("work-no-events-dup");
 
         // First succeeds
-        let (_gate_types, _signers, events1) = orch.handle_session_terminated(info1).await.unwrap();
+        let (_gate_types, _signers, events1) = orch.start_for_changeset(info1).await.unwrap();
         assert!(!events1.is_empty());
 
-        // Second fails with ReplayDetected (same session+changeset) - no events
+        // Second fails with ReplayDetected (same work+changeset) - no events
         let err = orch
-            .handle_session_terminated(info2)
+            .start_for_changeset(info2)
             .await
             .err()
             .expect("expected error");
@@ -2864,13 +2907,13 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
 
         // First succeeds
-        orch.handle_session_terminated(test_session_info("work-max-a"))
+        orch.start_for_changeset(test_gate_start_info("work-max-a"))
             .await
             .unwrap();
 
         // Second fails - no events should be returned
         let result = orch
-            .handle_session_terminated(test_session_info("work-max-b"))
+            .start_for_changeset(test_gate_start_info("work-max-b"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -2891,9 +2934,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_session_info("work-expire");
+        let info = test_gate_start_info("work-expire");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         // With 0ms timeout, all gates should be timed out immediately
         let timed_out = orch.check_timeouts().await;
@@ -2905,11 +2948,11 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_handle_session_terminated_returns_gates_and_events() {
+    async fn test_start_for_changeset_returns_gates_and_events() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-daemon");
+        let info = test_gate_start_info("work-daemon");
 
-        let (gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -2932,10 +2975,9 @@ mod tests {
         };
         let orch = GateOrchestrator::new(config, test_signer());
         let work_id = "work-imm-timeout";
-        let info = test_session_info(work_id);
+        let info = test_gate_start_info(work_id);
 
-        let (_gate_types, _signers, mut events) =
-            orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, mut events) = orch.start_for_changeset(info).await.unwrap();
         for (timed_work_id, gate_type) in orch.check_timeouts().await {
             if timed_work_id == work_id {
                 let (_outcomes, timeout_events) = orch
@@ -2955,15 +2997,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_session_terminated_duplicate_rejected() {
+    async fn test_start_for_changeset_duplicate_rejected() {
         let orch = test_orchestrator();
 
-        orch.handle_session_terminated(test_session_info("work-dup2"))
+        orch.start_for_changeset(test_gate_start_info("work-dup2"))
             .await
             .unwrap();
 
         let result = orch
-            .handle_session_terminated(test_session_info("work-dup2"))
+            .start_for_changeset(test_gate_start_info("work-dup2"))
             .await;
         assert!(result.is_err(), "expected ReplayDetected");
         let err = result.err().unwrap();
@@ -3670,9 +3712,9 @@ mod tests {
             test_signer(),
             mock_clock,
         );
-        let info = test_session_info("work-clock");
+        let info = test_gate_start_info("work-clock");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_for_changeset(info).await.unwrap();
 
         // All events should use the mock clock's timestamp
         if let GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } = &events[0] {
@@ -3705,65 +3747,66 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_replay_same_session_changeset_rejected() {
+    async fn test_replay_same_work_changeset_rejected() {
         let orch = test_orchestrator();
-        let info1 = SessionTerminatedInfo {
-            session_id: "session-replay".to_string(),
+        let info1 = GateStartInfo {
+            source_event_id: "evt-replay".to_string(),
             work_id: "work-replay-1".to_string(),
             changeset_digest: [0xAA; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_for_changeset(info1).await.unwrap();
 
         // Remove the orchestration so work_id is free, but replay key persists
         orch.remove_orchestration("work-replay-1").await;
 
-        // Same session_id + changeset_digest but different work_id
-        let info2 = SessionTerminatedInfo {
-            session_id: "session-replay".to_string(),
-            work_id: "work-replay-2".to_string(),
+        // Same work_id + changeset_digest must replay-reject even when
+        // source_event_id changes.
+        let info2 = GateStartInfo {
+            source_event_id: "evt-replay-different".to_string(),
+            work_id: "work-replay-1".to_string(),
             changeset_digest: [0xAA; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
         let err = orch
-            .handle_session_terminated(info2)
+            .start_for_changeset(info2)
             .await
             .err()
             .expect("expected replay error");
         assert!(
             matches!(err, GateOrchestratorError::ReplayDetected { .. }),
-            "Same session+changeset after removal should be rejected as replay"
+            "Same work+changeset after removal should be rejected as replay"
         );
     }
 
     #[tokio::test]
-    async fn test_stale_termination_event_rejected() {
+    async fn test_stale_gate_start_event_rejected() {
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "session-stale".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-stale".to_string(),
             work_id: "work-stale".to_string(),
             changeset_digest: [0x42; 32],
             // A very old timestamp (2024)
-            terminated_at_ms: 1_704_067_200_000,
+            source_timestamp_ms: 1_704_067_200_000,
         };
         let err = orch
-            .handle_session_terminated(info)
+            .start_for_changeset(info)
             .await
             .err()
             .expect("expected stale error");
         assert!(
-            matches!(err, GateOrchestratorError::StaleTerminationEvent { .. }),
-            "Old termination event should be rejected as stale"
+            matches!(err, GateOrchestratorError::StaleSourceEvent { .. }),
+            "Old gate-start event should be rejected as stale"
         );
     }
 
     #[tokio::test]
-    async fn test_zero_terminated_at_ms_bypasses_freshness_check() {
+    async fn test_zero_source_timestamp_ms_bypasses_freshness_check() {
         let orch = test_orchestrator();
-        // terminated_at_ms: 0 should bypass the freshness check
-        let info = test_session_info("work-fresh");
-        assert_eq!(info.terminated_at_ms, 0);
-        orch.handle_session_terminated(info).await.unwrap();
+        // source_timestamp_ms: 0 should bypass the freshness check
+        let info = test_gate_start_info("work-fresh");
+        assert_eq!(info.source_timestamp_ms, 0);
+        orch.start_for_changeset(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
     }
 
@@ -3778,9 +3821,9 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_session_info("work-poll");
+        let info = test_gate_start_info("work-poll");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_for_changeset(info).await.unwrap();
 
         // poll_timeouts should handle all 3 expired gates
         let events = orch.poll_timeouts().await;
@@ -3969,19 +4012,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_freshness_gate_no_panic_on_u64_max_timestamp() {
-        // Security BLOCKER 2: Adversarial terminated_at_ms near u64::MAX
+        // Security BLOCKER 2: Adversarial source_timestamp_ms near u64::MAX
         // must not panic via arithmetic overflow.
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "session-overflow".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-overflow".to_string(),
             work_id: "work-overflow".to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: u64::MAX - 1, // Near u64::MAX
+            source_timestamp_ms: u64::MAX - 1, // Near u64::MAX
         };
 
         // This should NOT panic. The saturating_add prevents overflow.
         // The event is in the far future, so it won't be stale.
-        let result = orch.handle_session_terminated(info).await;
+        let result = orch.start_for_changeset(info).await;
         assert!(
             result.is_ok(),
             "Near-u64::MAX timestamp should not panic or be rejected as stale"
@@ -3992,16 +4035,16 @@ mod tests {
     async fn test_freshness_gate_no_panic_on_exact_u64_max() {
         // Exact u64::MAX should also be safe.
         let orch = test_orchestrator();
-        let info = SessionTerminatedInfo {
-            session_id: "session-exact-max".to_string(),
+        let info = GateStartInfo {
+            source_event_id: "evt-exact-max".to_string(),
             work_id: "work-exact-max".to_string(),
             changeset_digest: [0x42; 32],
-            terminated_at_ms: u64::MAX,
+            source_timestamp_ms: u64::MAX,
         };
 
-        // saturating_add(MAX_TERMINATED_AT_AGE_MS) should produce u64::MAX
+        // saturating_add(MAX_SOURCE_EVENT_AGE_MS) should produce u64::MAX
         // (saturated), meaning the event is never considered stale.
-        let result = orch.handle_session_terminated(info).await;
+        let result = orch.start_for_changeset(info).await;
         assert!(
             result.is_ok(),
             "Exact u64::MAX timestamp should not panic or be rejected as stale"
@@ -4024,26 +4067,26 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
 
         // Insert one orchestration.
-        let info1 = SessionTerminatedInfo {
-            session_id: "session-bound-1".to_string(),
+        let info1 = GateStartInfo {
+            source_event_id: "evt-bound-1".to_string(),
             work_id: "work-bound-1".to_string(),
             changeset_digest: [0x01; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_for_changeset(info1).await.unwrap();
 
         // Remove it to free the slot.
         orch.remove_orchestration("work-bound-1").await;
 
         // The idempotency key is still in the seen set, so replay is rejected.
-        let info1_replay = SessionTerminatedInfo {
-            session_id: "session-bound-1".to_string(),
-            work_id: "work-bound-1-again".to_string(),
+        let info1_replay = GateStartInfo {
+            source_event_id: "evt-bound-1-replay".to_string(),
+            work_id: "work-bound-1".to_string(),
             changeset_digest: [0x01; 32],
-            terminated_at_ms: 0,
+            source_timestamp_ms: 0,
         };
         let err = orch
-            .handle_session_terminated(info1_replay)
+            .start_for_changeset(info1_replay)
             .await
             .err()
             .expect("expected replay error");
@@ -4060,7 +4103,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_and_spawn_transitions_to_running() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-drive");
+        let info = test_gate_start_info("work-drive");
 
         let events = start_and_record_spawns(&orch, info).await.unwrap();
 
@@ -4087,7 +4130,7 @@ mod tests {
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_session_info("work-drive-timeout");
+        let info = test_gate_start_info("work-drive-timeout");
 
         let events = start_and_record_spawns(&orch, info).await.unwrap();
 
@@ -4122,7 +4165,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_and_spawn_executor_events_have_adapter_profile() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-drive-profile");
+        let info = test_gate_start_info("work-drive-profile");
 
         let events = start_and_record_spawns(&orch, info).await.unwrap();
 
@@ -4517,9 +4560,8 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
-        let info = test_session_info("work-cas-test");
-        let (_gate_types, _exec_signers, events) =
-            orch.handle_session_terminated(info).await.unwrap();
+        let info = test_gate_start_info("work-cas-test");
+        let (_gate_types, _exec_signers, events) = orch.start_for_changeset(info).await.unwrap();
 
         // Find a lease issuance event.
         let lease_event = events
@@ -4582,8 +4624,8 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), signer)
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
-        let info = test_session_info("work-delegate-cas");
-        let _ = orch.handle_session_terminated(info).await.unwrap();
+        let info = test_gate_start_info("work-delegate-cas");
+        let _ = orch.start_for_changeset(info).await.unwrap();
 
         let parent_lease = orch
             .gate_lease("work-delegate-cas", GateType::Quality)

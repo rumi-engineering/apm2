@@ -4,21 +4,21 @@
 
 ## Overview
 
-The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). When a session terminates, the `GateOrchestrator` watches for `session_terminated` ledger events and drives the gate pipeline: policy resolution, lease issuance, gate executor spawning, and receipt collection. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
+The `gate` module implements the autonomous gate lifecycle within the Forge Admission Cycle (FAC). The `GateOrchestrator` starts from authoritative `changeset_published` identity and drives the gate pipeline: policy resolution, lease issuance, gate executor spawning, and receipt collection. When all required gates pass, the `MergeExecutor` autonomously merges the PR via the GitHub API and emits a signed `MergeReceipt`.
 
 ### FAC Gate State Machine
 
 ```text
-session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
-                                                -> ALL_PASS -> MERGE -> Completed
-                                                -> CONFLICT -> ReviewBlocked
+changeset_published -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+                                                   -> ALL_PASS -> MERGE -> Completed
+                                                   -> CONFLICT -> ReviewBlocked
 ```
 
 ## Key Types
 
 ### `GateOrchestrator`
 
-Watches for `session_terminated` ledger events and autonomously orchestrates the gate lifecycle.
+Starts from authoritative changeset identity and autonomously orchestrates the gate lifecycle.
 
 **Invariants:**
 
@@ -26,7 +26,7 @@ Watches for `session_terminated` ledger events and autonomously orchestrates the
 - [INV-GT02] Maximum concurrent orchestrations bounded to `MAX_CONCURRENT_ORCHESTRATIONS` (1,000).
 - [INV-GT03] Maximum gate types per orchestration bounded to `MAX_GATE_TYPES` (8).
 - [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts).
-- [INV-GT05] Changeset digest in each lease matches the actual changeset from the terminated session.
+- [INV-GT05] Changeset digest in each lease matches the authoritative published changeset.
 
 **Contracts:**
 

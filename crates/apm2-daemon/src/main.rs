@@ -1399,8 +1399,9 @@ async fn async_main(args: Args) -> Result<()> {
         GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer).with_cas(gate_cas),
     );
 
-    // Wire orchestrator into dispatcher state so session termination events
-    // trigger autonomous gate lifecycle (Quality BLOCKER 1).
+    // Wire orchestrator into dispatcher state so ChangeSetPublished handling
+    // can start autonomous gate lifecycle and DelegateSublease can issue
+    // strict-subset subleases.
     let dispatcher_state = {
         // Unwrap the Arc, attach the orchestrator, and re-wrap.
         // Safety: we just created this Arc and hold the only reference.

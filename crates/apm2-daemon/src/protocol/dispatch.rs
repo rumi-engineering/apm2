@@ -1409,7 +1409,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Records a work item state transition in the ledger, enabling the FAC
     /// CLI (`apm2 fac work status`) to observe work lifecycle state changes
-    /// and the `GateOrchestrator` (TCK-00388) to trigger gate lifecycle.
+    /// and downstream lifecycle automation to track state progression.
     ///
     /// # Arguments
     ///
@@ -1437,9 +1437,8 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Emits a signed `SessionTerminated` event to the ledger (TCK-00395).
     ///
-    /// Records session termination in the ledger, enabling the
-    /// `GateOrchestrator` (TCK-00388) to trigger gate lifecycle after
-    /// session completion.
+    /// Records session termination in the ledger for lifecycle/accounting
+    /// observability.
     ///
     /// # Arguments
     ///
@@ -1736,8 +1735,7 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting session termination events to the
-/// ledger, enabling the `GateOrchestrator` to trigger gate lifecycle
-/// after session completion.
+/// ledger for lifecycle/accounting observability.
 ///
 /// # Note
 ///
@@ -8261,12 +8259,17 @@ pub struct PrivilegedDispatcher {
     /// V1 scope checks in `handle_request_tool`.
     v1_manifest_store: Option<crate::protocol::session_dispatch::SharedV1ManifestStore>,
 
-    /// Gate orchestrator for sublease delegation (TCK-00340).
+    /// Gate orchestrator for FAC gate lifecycle wiring.
     ///
-    /// When present, `DelegateSublease` delegates to the orchestrator to
-    /// issue signed subleases with strict-subset validation. When `None`,
-    /// the handler returns an error indicating the orchestrator is not
-    /// configured.
+    /// When present:
+    /// - `PublishChangeSet` starts gate lifecycle from authoritative
+    ///   `changeset_published` identity.
+    /// - `DelegateSublease` delegates signed sublease issuance with
+    ///   strict-subset validation.
+    ///
+    /// `DelegateSublease` fails closed when this is unset. `PublishChangeSet`
+    /// currently degrades to no-op gate start in test-only wiring where the
+    /// orchestrator is intentionally absent.
     gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
 
     /// PCAC lifecycle gate for privileged authority-bearing handlers
@@ -9972,7 +9975,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the gate orchestrator for sublease delegation (TCK-00340).
+    /// Sets the gate orchestrator for FAC gate lifecycle wiring.
     #[must_use]
     pub fn with_gate_orchestrator(
         mut self,
@@ -19820,22 +19823,33 @@ impl PrivilegedDispatcher {
         };
 
         let changeset_digest_hex = hex::encode(computed_changeset_digest);
-        if let Some((event_id, persisted_cas_hash)) =
+        if let Some((replay_event_id, replay_cas_hash, replay_timestamp_ns)) =
             self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
         {
+            if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
+                &request.work_id,
+                computed_changeset_digest,
+                &replay_event_id,
+                replay_timestamp_ns,
+            ) {
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("gate lifecycle start failed for replayed changeset: {error}"),
+                ));
+            }
             debug!(
                 work_id = %request.work_id,
                 changeset_digest = %changeset_digest_hex,
-                event_id = %event_id,
+                event_id = %replay_event_id,
                 "Idempotent replay ({INV_FAC_WORK_BIND_001}): returning existing \
                  ChangeSetPublished event"
             );
             return Ok(PrivilegedResponse::PublishChangeSet(
                 PublishChangeSetResponse {
                     changeset_digest: changeset_digest_hex,
-                    cas_hash: persisted_cas_hash,
+                    cas_hash: replay_cas_hash,
                     work_id: request.work_id,
-                    event_id,
+                    event_id: replay_event_id,
                 },
             ));
         }
@@ -19881,15 +19895,26 @@ impl PrivilegedDispatcher {
             Err(e) => {
                 // Race-safe idempotency fallback: if another writer persisted the
                 // same semantic event concurrently, replay the persisted binding.
-                if let Some((event_id, persisted_cas_hash)) =
+                if let Some((replay_event_id, replay_cas_hash, replay_timestamp_ns)) =
                     self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
                 {
+                    if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
+                        &request.work_id,
+                        computed_changeset_digest,
+                        &replay_event_id,
+                        replay_timestamp_ns,
+                    ) {
+                        return Ok(PrivilegedResponse::error(
+                            PrivilegedErrorCode::CapabilityRequestRejected,
+                            format!("gate lifecycle start failed for replayed changeset: {error}"),
+                        ));
+                    }
                     return Ok(PrivilegedResponse::PublishChangeSet(
                         PublishChangeSetResponse {
                             changeset_digest: changeset_digest_hex,
-                            cas_hash: persisted_cas_hash,
+                            cas_hash: replay_cas_hash,
                             work_id: request.work_id,
-                            event_id,
+                            event_id: replay_event_id,
                         },
                     ));
                 }
@@ -19909,6 +19934,18 @@ impl PrivilegedDispatcher {
             "ChangeSetPublished: bundle stored in CAS and event emitted to ledger"
         );
 
+        if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
+            &request.work_id,
+            computed_changeset_digest,
+            &signed_event.event_id,
+            timestamp_ns,
+        ) {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("gate lifecycle start failed for published changeset: {error}"),
+            ));
+        }
+
         Ok(PrivilegedResponse::PublishChangeSet(
             PublishChangeSetResponse {
                 changeset_digest: changeset_digest_hex,
@@ -19923,18 +19960,91 @@ impl PrivilegedDispatcher {
     /// `changeset_published` event.
     ///
     /// Matching key: `(work_id, changeset_digest)`. Response values are the
-    /// authoritative persisted `event_id` and `cas_hash`.
+    /// authoritative persisted `event_id`, `cas_hash`, and `timestamp_ns`.
     fn find_changeset_published_replay(
         &self,
         work_id: &str,
         changeset_digest_hex: &str,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, u64)> {
         let event = self
             .event_emitter
             .get_event_by_changeset_identity(work_id, changeset_digest_hex)?;
         let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
         let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
-        Some((event.event_id, persisted_cas_hash))
+        let timestamp_ns = payload.get("timestamp_ns")?.as_u64()?;
+        Some((event.event_id, persisted_cas_hash, timestamp_ns))
+    }
+
+    fn start_gate_lifecycle_for_published_changeset(
+        &self,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+        source_event_id: &str,
+        source_timestamp_ns: u64,
+    ) -> Result<(), String> {
+        let Some(orchestrator) = &self.gate_orchestrator else {
+            debug!(
+                work_id = %work_id,
+                "Gate orchestrator not configured; skipping gate lifecycle start"
+            );
+            return Ok(());
+        };
+
+        let gate_start_timestamp_ms = source_timestamp_ns / 1_000_000;
+        let gate_start = crate::gate::GateStartInfo {
+            source_event_id: source_event_id.to_string(),
+            work_id: work_id.to_string(),
+            changeset_digest,
+            source_timestamp_ms: gate_start_timestamp_ms,
+        };
+
+        let start_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(orchestrator.start_for_changeset(gate_start))
+            })
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    format!("failed to create tokio runtime for gate orchestration: {e}")
+                })?;
+            runtime.block_on(orchestrator.start_for_changeset(gate_start))
+        };
+
+        let events = match start_result {
+            Ok((_gate_types, _executor_signers, events)) => events,
+            Err(crate::gate::GateOrchestratorError::ReplayDetected { .. }) => {
+                debug!(
+                    work_id = %work_id,
+                    source_event_id = %source_event_id,
+                    "Gate orchestration already started for this changeset"
+                );
+                return Ok(());
+            },
+            Err(error) => {
+                return Err(format!(
+                    "gate orchestrator rejected changeset start: {error}"
+                ));
+            },
+        };
+
+        for event in &events {
+            let fields = crate::gate::gate_event_persistence_fields(event);
+            let payload = serde_json::to_vec(event)
+                .map_err(|e| format!("failed to serialize gate orchestration event: {e}"))?;
+            self.event_emitter
+                .emit_session_event(
+                    work_id,
+                    fields.event_type,
+                    &payload,
+                    "orchestrator:gate-lifecycle",
+                    fields.timestamp_ns,
+                )
+                .map_err(|e| format!("failed to persist gate orchestration event: {e}"))?;
+        }
+
+        Ok(())
     }
 
     // =========================================================================
@@ -33341,6 +33451,7 @@ mod tests {
     // TCK-00394: PublishChangeSet IPC endpoint tests
     // ========================================================================
     mod publish_changeset {
+        use apm2_core::crypto::Signer;
         use apm2_core::evidence::MemoryCas;
         use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 
@@ -33401,6 +33512,15 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new()
                 .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
             (dispatcher, cas)
+        }
+
+        fn make_dispatcher_with_cas_and_orchestrator() -> (PrivilegedDispatcher, Arc<MemoryCas>) {
+            let (dispatcher, cas) = make_dispatcher_with_cas();
+            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::new(Signer::generate()),
+            ));
+            (dispatcher.with_gate_orchestrator(orchestrator), cas)
         }
 
         fn privileged_ctx() -> ConnectionContext {
@@ -33552,6 +33672,88 @@ mod tests {
             assert!(
                 payload["timestamp_ns"].as_u64().unwrap() > 0,
                 "timestamp_ns must be > 0"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_starts_gate_lifecycle_from_changeset_identity() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas_and_orchestrator();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let request = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                lease_id,
+                bundle_bytes: make_bundle_json("cs-gate-start-001"),
+            };
+            let response = dispatcher
+                .dispatch(&encode_publish_changeset_request(&request), &ctx)
+                .expect("publish should succeed");
+            assert!(
+                matches!(response, PrivilegedResponse::PublishChangeSet(_)),
+                "expected publish response, got: {response:?}"
+            );
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let policy_events = events
+                .iter()
+                .filter(|event| event.event_type == "gate.policy_resolved")
+                .count();
+            let lease_events = events
+                .iter()
+                .filter(|event| event.event_type == "gate.lease_issued")
+                .count();
+            assert_eq!(
+                policy_events, 1,
+                "publish must emit exactly one gate.policy_resolved event"
+            );
+            assert_eq!(
+                lease_events, 3,
+                "publish must emit one gate.lease_issued event per configured gate"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_replay_does_not_duplicate_gate_start_events() {
+            let (dispatcher, _cas) = make_dispatcher_with_cas_and_orchestrator();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+            let bundle_bytes = make_bundle_json("cs-gate-replay-001");
+
+            let first = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                lease_id: lease_id.clone(),
+                bundle_bytes: bundle_bytes.clone(),
+            };
+            let second = PublishChangeSetRequest {
+                work_id: work_id.clone(),
+                lease_id,
+                bundle_bytes,
+            };
+
+            let _ = dispatcher
+                .dispatch(&encode_publish_changeset_request(&first), &ctx)
+                .expect("first publish should succeed");
+            let _ = dispatcher
+                .dispatch(&encode_publish_changeset_request(&second), &ctx)
+                .expect("replayed publish should succeed");
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let policy_events = events
+                .iter()
+                .filter(|event| event.event_type == "gate.policy_resolved")
+                .count();
+            let lease_events = events
+                .iter()
+                .filter(|event| event.event_type == "gate.lease_issued")
+                .count();
+            assert_eq!(
+                policy_events, 1,
+                "replayed publish must not duplicate gate.policy_resolved"
+            );
+            assert_eq!(
+                lease_events, 3,
+                "replayed publish must not duplicate gate.lease_issued events"
             );
         }
 

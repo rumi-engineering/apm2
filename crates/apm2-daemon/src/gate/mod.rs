@@ -2,10 +2,10 @@
 //! Gate execution orchestrator and merge executor for autonomous gate
 //! lifecycle.
 //!
-//! This module implements the [`GateOrchestrator`] which watches for
-//! `session_terminated` ledger events and autonomously orchestrates the
-//! gate lifecycle: policy resolution, lease issuance, gate executor
-//! spawning, and receipt collection.
+//! This module implements the [`GateOrchestrator`] which starts gate
+//! lifecycle execution from authoritative changeset identity input:
+//! policy resolution, lease issuance, gate executor spawning, and receipt
+//! collection.
 //!
 //! It also implements the [`MergeExecutor`] (TCK-00390) which watches for
 //! all required gate receipts reaching PASS verdict and autonomously
@@ -15,15 +15,15 @@
 //! # FAC State Machine
 //!
 //! ```text
-//! session_terminated -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
-//!                                                 -> ALL_PASS -> MERGE -> Completed
-//!                                                 -> CONFLICT -> ReviewBlocked
+//! changeset_published -> RUN_GATES -> gate_receipt -> AWAIT_REVIEW
+//!                                                  -> ALL_PASS -> MERGE -> Completed
+//!                                                  -> CONFLICT -> ReviewBlocked
 //! ```
 //!
-//! The `GateOrchestrator` bridges the gap between session termination and
+//! The `GateOrchestrator` bridges the gap between changeset publication and
 //! gate execution by:
 //!
-//! 1. Watching for `session_terminated` events on the ledger
+//! 1. Accepting published changeset identity input
 //! 2. Resolving policy via `PolicyResolvedForChangeSet`
 //! 3. Issuing `GateLease` for each required gate (aat, quality, security)
 //! 4. Spawning gate executor episodes via `EpisodeRuntime`
@@ -39,7 +39,7 @@
 //! - **Fail-closed timeouts**: Expired leases produce FAIL verdict, not silent
 //!   expiry.
 //! - **Changeset binding**: The `changeset_digest` in each lease MUST match the
-//!   actual changeset from the terminated session.
+//!   authoritative published changeset.
 //!
 //! # Resource Limits
 //!
@@ -56,10 +56,10 @@ pub use merge_executor::{
     MergeExecutorError, MergeExecutorEvent, MergeInput, MergeResult,
 };
 pub use orchestrator::{
-    Clock, DEFAULT_GATE_TIMEOUT_MS, GateOrchestrator, GateOrchestratorConfig,
-    GateOrchestratorError, GateOrchestratorEvent, GateOutcome, GateStatus, GateType,
-    MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES, MAX_IDEMPOTENCY_KEYS, MAX_TERMINATED_AT_AGE_MS,
-    MAX_WORK_ID_LENGTH, SessionTerminatedInfo, SystemClock, TIMEOUT_AUTHORITY_ACTOR_ID,
-    create_timeout_receipt,
+    Clock, DEFAULT_GATE_TIMEOUT_MS, GateEventPersistenceFields, GateOrchestrator,
+    GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent, GateOutcome,
+    GateStartInfo, GateStatus, GateType, MAX_CONCURRENT_ORCHESTRATIONS, MAX_GATE_TYPES,
+    MAX_IDEMPOTENCY_KEYS, MAX_SOURCE_EVENT_AGE_MS, MAX_WORK_ID_LENGTH, SystemClock,
+    TIMEOUT_AUTHORITY_ACTOR_ID, create_timeout_receipt, gate_event_persistence_fields,
 };
 pub use timeout_kernel::{GateTimeoutKernel, GateTimeoutKernelConfig, GateTimeoutKernelError};

@@ -3,10 +3,10 @@
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by
 //! exercising the real `GateOrchestrator` through its daemon entry point
-//! (`handle_session_terminated`), including:
+//! (`start_for_changeset`), including:
 //!
-//! - Full lifecycle: session termination -> policy resolution -> lease issuance
-//!   -> receipt collection -> all-gates-completed
+//! - Full lifecycle: gate start -> policy resolution -> lease issuance ->
+//!   receipt collection -> all-gates-completed
 //! - Per-invocation event return (no global buffer)
 //! - Event ordering invariant (`PolicyResolved` before `GateLeaseIssued`)
 //! - Receipt signature verification (BLOCKER 4)
@@ -40,19 +40,19 @@ use apm2_core::crypto::Signer;
 use apm2_core::fac::GateReceiptBuilder;
 use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent,
-    GateType, SessionTerminatedInfo,
+    GateStartInfo, GateType,
 };
 use apm2_daemon::state::DispatcherState;
 
-/// Helper: creates a test `SessionTerminatedInfo`.
+/// Helper: creates a test `GateStartInfo`.
 ///
-/// Uses `terminated_at_ms: 0` to bypass freshness checks in tests.
-fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
-    SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
+/// Uses `source_timestamp_ms: 0` to bypass freshness checks in tests.
+fn test_session_info(work_id: &str) -> GateStartInfo {
+    GateStartInfo {
+        source_event_id: format!("session-{work_id}"),
         work_id: work_id.to_string(),
         changeset_digest: [0x42; 32],
-        terminated_at_ms: 0,
+        source_timestamp_ms: 0,
     }
 }
 
@@ -68,7 +68,7 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
 
     // Step 1: Session terminates via daemon entry point
     let (gate_types, executor_signers, setup_events) = orch
-        .handle_session_terminated(test_session_info("work-integ-01"))
+        .start_for_changeset(test_session_info("work-integ-01"))
         .await
         .unwrap();
 
@@ -150,7 +150,7 @@ async fn tck_00388_event_ordering_invariant() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, _signers, events) = orch
-        .handle_session_terminated(test_session_info("work-integ-02"))
+        .start_for_changeset(test_session_info("work-integ-02"))
         .await
         .unwrap();
 
@@ -180,7 +180,7 @@ async fn tck_00388_receipt_signature_verified() {
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
     let (_gate_types, executor_signers, _events) = orch
-        .handle_session_terminated(test_session_info("work-integ-03"))
+        .start_for_changeset(test_session_info("work-integ-03"))
         .await
         .unwrap();
 
@@ -246,14 +246,14 @@ async fn tck_00388_admission_check_before_events() {
 
     // First orchestration succeeds
     let (_gate_types, _signers, events) = orch
-        .handle_session_terminated(test_session_info("work-integ-04a"))
+        .start_for_changeset(test_session_info("work-integ-04a"))
         .await
         .unwrap();
     assert!(!events.is_empty(), "First orchestration should emit events");
 
     // Second orchestration fails due to capacity - no events should leak
     let result = orch
-        .handle_session_terminated(test_session_info("work-integ-04b"))
+        .start_for_changeset(test_session_info("work-integ-04b"))
         .await;
     assert!(result.is_err(), "Expected capacity error");
     let err = result.err().unwrap();
@@ -271,12 +271,12 @@ async fn tck_00388_admission_check_before_events() {
     let orch2 = GateOrchestrator::new(config2, Arc::clone(&signer));
 
     orch2
-        .handle_session_terminated(test_session_info("work-integ-04c"))
+        .start_for_changeset(test_session_info("work-integ-04c"))
         .await
         .unwrap();
 
     let result = orch2
-        .handle_session_terminated(test_session_info("work-integ-04c"))
+        .start_for_changeset(test_session_info("work-integ-04c"))
         .await;
     assert!(result.is_err(), "Expected replay/duplicate error");
     let err = result.err().unwrap();
@@ -300,7 +300,7 @@ async fn tck_00388_fail_closed_timeout_semantics() {
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
     let (gate_types, _signers, mut events) = orch
-        .handle_session_terminated(test_session_info("work-integ-05"))
+        .start_for_changeset(test_session_info("work-integ-05"))
         .await
         .unwrap();
 
@@ -365,7 +365,7 @@ async fn tck_00388_dispatcher_state_wiring() {
     let events = dispatcher
         .gate_orchestrator()
         .expect("should return Some when orchestrator is wired")
-        .handle_session_terminated(info)
+        .start_for_changeset(info)
         .await
         .expect("should succeed for valid session info")
         .2;

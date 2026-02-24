@@ -47,9 +47,9 @@ use apm2_core::work::{WorkReducer, WorkState, WorkType};
 /// in the work reducer).
 const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 use apm2_daemon::gate::{
-    GateOrchestrator, GateOrchestratorConfig, GateOrchestratorEvent, GateOutcome, GateType,
-    GitHubMergeAdapter, MergeExecutor, MergeExecutorError, MergeExecutorEvent, MergeInput,
-    MergeResult, SessionTerminatedInfo,
+    GateOrchestrator, GateOrchestratorConfig, GateOrchestratorEvent, GateOutcome, GateStartInfo,
+    GateType, GitHubMergeAdapter, MergeExecutor, MergeExecutorError, MergeExecutorEvent,
+    MergeInput, MergeResult,
 };
 
 // =============================================================================
@@ -418,17 +418,17 @@ async fn test_fac_autonomous_full_lifecycle() {
 
     harness.advance_time_ms(30_000); // Session runs for 30s
 
-    // Trigger gate orchestration via session termination
-    let session_info = SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
+    // Trigger gate orchestration via gate start
+    let session_info = GateStartInfo {
+        source_event_id: format!("session-{work_id}"),
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0, // bypass freshness for tests
+        source_timestamp_ms: 0, // bypass freshness for tests
     };
 
     let (gate_types, executor_signers, setup_events) = harness
         .gate_orchestrator
-        .handle_session_terminated(session_info)
+        .start_for_changeset(session_info)
         .await
         .expect("gate orchestration should succeed");
 
@@ -881,15 +881,15 @@ async fn test_gate_failure_halts_lifecycle() {
     let changeset_digest = [0x42; 32];
 
     // Step 1: Session terminates
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-gate-fail".to_string(),
+    let session_info = GateStartInfo {
+        source_event_id: "session-gate-fail".to_string(),
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        source_timestamp_ms: 0,
     };
 
     let (gate_types, executor_signers, _events) = orch
-        .handle_session_terminated(session_info)
+        .start_for_changeset(session_info)
         .await
         .expect("orchestration setup");
 
@@ -1275,15 +1275,15 @@ async fn test_gate_receipt_signature_verification() {
     let work_id = "work-sig-verify-001";
     let changeset_digest = [0x42; 32];
 
-    let session_info = SessionTerminatedInfo {
-        session_id: "session-sig-verify".to_string(),
+    let session_info = GateStartInfo {
+        source_event_id: "session-sig-verify".to_string(),
         work_id: work_id.to_string(),
         changeset_digest,
-        terminated_at_ms: 0,
+        source_timestamp_ms: 0,
     };
 
     let (_gate_types, _executor_signers, _events) = orch
-        .handle_session_terminated(session_info)
+        .start_for_changeset(session_info)
         .await
         .expect("orchestration setup");
 
