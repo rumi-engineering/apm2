@@ -10,3 +10,15 @@ fail-fast = false
 # CI uses the same 10-minute per-test timeout.
 slow-timeout = { period = "60s", terminate-after = 10 }
 fail-fast = true
+
+[profile.fac-gates]
+# Push-critical FAC gates: exclude long/e2e/benchmark-pattern tests from the
+# default flow. Heavy suites run explicitly via non-default profiles/commands.
+slow-timeout = { period = "60s", terminate-after = 10 }
+fail-fast = true
+default-filter = 'not (test(/e2e|long_running|benchmark|bench/) or binary(/e2e|long_running|benchmark|bench/))'
+
+[profile.fac-full]
+# Full test sweep profile retained for explicit long-running validation.
+slow-timeout = { period = "60s", terminate-after = 10 }
+fail-fast = true

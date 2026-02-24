@@ -26,6 +26,12 @@ const ATTESTATION_SCHEMA: &str = "apm2.fac.gate_attestation.v2";
 const ATTESTATION_DOMAIN: &str = "apm2.fac.gate.attestation/v2";
 const POLICY_SCHEMA: &str = "apm2.fac.gate_reuse_policy.v2";
 const MAX_ATTESTATION_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Default nextest profile for push-critical FAC gates.
+///
+/// This intentionally excludes long-running suites so the standard gate path
+/// stays bounded and predictable. Heavy suites remain available via explicit,
+/// non-default profiles in `.config/nextest.toml`.
+pub const FAST_GATES_NEXTEST_PROFILE: &str = "fac-gates";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateResourcePolicy {
@@ -443,7 +449,7 @@ pub fn build_nextest_command() -> Vec<String> {
         "--config-file".to_string(),
         ".config/nextest.toml".to_string(),
         "--profile".to_string(),
-        "ci".to_string(),
+        FAST_GATES_NEXTEST_PROFILE.to_string(),
     ]
 }
 
@@ -464,7 +470,10 @@ pub fn gate_command_for_attestation(
             "clippy".to_string(),
             "--offline".to_string(),
             "--workspace".to_string(),
-            "--all-targets".to_string(),
+            "--lib".to_string(),
+            "--bins".to_string(),
+            "--tests".to_string(),
+            "--examples".to_string(),
             "--all-features".to_string(),
             "--".to_string(),
             "-D".to_string(),
