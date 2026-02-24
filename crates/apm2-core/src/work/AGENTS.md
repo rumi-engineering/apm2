@@ -140,6 +140,8 @@ pub struct WorkReducerState {
 - [INV-0118] Review-start stage boundary (`ReadyForReview -> Review`) requires a known latest changeset and, if a review receipt digest exists, it must match the latest digest
 - [INV-0119] `identity_chain_defects` is bounded by `MAX_IDENTITY_CHAIN_DEFECTS` (1000); oldest entries are evicted (ring-buffer via `VecDeque`) to prevent unbounded memory growth
 - [INV-0120] Defect CAS hashes use length-prefixed BLAKE3 (`hash_defect_preimage`) to prevent byte-shifting collisions across variable-length field boundaries
+- [INV-0121] `ci_receipt_outcome_by_work` and `review_receipt_outcome_by_work` store pass/fail outcomes alongside digests; `status_from_work` checks both digest match AND outcome (never conflates digest presence with success)
+- [INV-0122] `identity_chain_defect_count_by_work` is a monotonic per-work-item counter incremented in `push_defect`; `WorkStatusResponse` field 17 reports per-work-item counts, not the global queue length
 
 **Contracts:**
 - [CTR-0106] `apply()` returns `Ok(())` for non-work events (no-op)

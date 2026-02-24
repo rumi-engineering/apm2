@@ -71,6 +71,7 @@ pub use parity::{
     ReplayResult, TransitionClass,
 };
 pub use reducer::{
-    MAX_IDENTITY_CHAIN_DEFECTS, WorkReducer, WorkReducerState, hash_defect_preimage, helpers,
+    MAX_IDENTITY_CHAIN_DEFECTS, ReceiptOutcome, WorkReducer, WorkReducerState,
+    hash_defect_preimage, helpers,
 };
 pub use state::{Work, WorkState, WorkType};

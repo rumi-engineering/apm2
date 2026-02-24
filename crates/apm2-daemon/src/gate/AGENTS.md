@@ -34,6 +34,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT16] `publisher_actor_id` is derived from the verified `actor_id` column of the ledger row (signed envelope), not from untrusted payload content. Cross-validation rejects identity mismatches.
 - [INV-GT17] `publisher_actor_id` length is validated against `MAX_STRING_LENGTH` consistent with other string fields.
 - [INV-GT18] `GateStartKernel` cursor migration safety: on upgrade from pre-unified to unified event reader, persisted cursors with raw event IDs (no `legacy:` or `canonical:` prefix) are detected and reset to the beginning. Re-processing is safe because the intent store's `state='done'` markers provide idempotent deduplication (CSID-003).
+- [INV-GT19] `GateStartKernel` malformed-row resilience: `parse_changeset_publication_payload` errors do NOT propagate with `?` during the observe poll. Malformed rows are logged, and a cursor-advancing event with `publication = None` is emitted so the kernel advances past the bad row. `apply_events` skips `None` publications. This prevents permanent deadlock on corrupt ledger data.
 
 **Contracts:**
 

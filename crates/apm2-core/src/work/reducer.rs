@@ -25,6 +25,18 @@ use crate::reducer::{Reducer, ReducerContext};
 /// to distinguish it from regular agent identities.
 pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 
+/// Receipt outcome for status derivation.
+///
+/// Distinguishes pass from fail so that `status_from_work` never conflates
+/// "digest present" with "outcome passed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiptOutcome {
+    /// The receipt represents a successful/passed result.
+    Passed,
+    /// The receipt represents a failed/blocked result.
+    Failed,
+}
+
 /// State maintained by the work reducer.
 ///
 /// Maps work IDs to their current state.
@@ -37,8 +49,12 @@ pub struct WorkReducerState {
     pub latest_changeset_by_work: HashMap<String, [u8; 32]>,
     /// Last observed CI-bound gate digest per work ID.
     pub ci_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Outcome (pass/fail) of the last observed CI gate receipt per work ID.
+    pub ci_receipt_outcome_by_work: HashMap<String, ReceiptOutcome>,
     /// Last observed review receipt digest per work ID.
     pub review_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Outcome (pass/fail) of the last observed review receipt per work ID.
+    pub review_receipt_outcome_by_work: HashMap<String, ReceiptOutcome>,
     /// Last observed merge receipt digest per work ID.
     pub merge_receipt_digest_by_work: HashMap<String, [u8; 32]>,
     /// Event ID of the `ChangeSetPublished` event that established the latest
@@ -47,6 +63,13 @@ pub struct WorkReducerState {
     /// CAS hash (32 bytes) of the `ChangeSetBundleV1` for the latest
     /// changeset, keyed by work ID (`STEP_10`).
     pub bundle_cas_hash_by_work: HashMap<String, [u8; 32]>,
+    /// Per-work-item cumulative defect count for identity-chain violations.
+    ///
+    /// Incremented whenever a defect is recorded (stale-digest, cross-work
+    /// injection). Unlike the global `identity_chain_defects` queue which
+    /// is bounded and drainable, this counter is monotonic and keyed by
+    /// `work_id` so that `WorkStatusResponse` can report per-item counts.
+    pub identity_chain_defect_count_by_work: HashMap<String, u32>,
 }
 
 impl WorkReducerState {
@@ -221,10 +244,21 @@ impl WorkReducer {
         std::mem::take(&mut self.identity_chain_defects).into()
     }
 
-    /// Returns the number of pending identity-chain defects.
+    /// Returns the number of pending identity-chain defects (global queue).
     #[must_use]
     pub fn identity_chain_defect_count(&self) -> usize {
         self.identity_chain_defects.len()
+    }
+
+    /// Returns the cumulative identity-chain defect count for a specific
+    /// work item. Returns 0 if no defects have been recorded for `work_id`.
+    #[must_use]
+    pub fn identity_chain_defect_count_for_work(&self, work_id: &str) -> u32 {
+        self.state
+            .identity_chain_defect_count_by_work
+            .get(work_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Appends a defect record, evicting the oldest entry when the
@@ -232,7 +266,19 @@ impl WorkReducer {
     ///
     /// O(1) amortised: `VecDeque::pop_front` and `push_back` are both
     /// O(1).
+    ///
+    /// Also increments the per-work-item defect counter so that
+    /// `WorkStatusResponse` can report accurate per-item counts.
     fn push_defect(&mut self, defect: DefectRecorded) {
+        // Increment per-work-item counter (monotonic, never evicted).
+        if !defect.work_id.is_empty() {
+            let count = self
+                .state
+                .identity_chain_defect_count_by_work
+                .entry(defect.work_id.clone())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+        }
         if self.identity_chain_defects.len() >= MAX_IDENTITY_CHAIN_DEFECTS {
             self.identity_chain_defects.pop_front();
         }
@@ -317,11 +363,16 @@ impl WorkReducer {
             // Enforce latest-digest validation: only receipts whose digest
             // matches work_latest_changeset are admissible (CSID-004).
             // Stale receipts are silently ignored with a structured log.
+            //
+            // Gate receipt events always represent passed/collected outcomes.
             "gate.receipt_collected"
             | "gate_receipt_collected"
             | "gate.receipt"
             | "gate_receipt" => {
                 if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
+                    self.state
+                        .ci_receipt_outcome_by_work
+                        .insert(authoritative_work_id.clone(), ReceiptOutcome::Passed);
                     self.state
                         .ci_receipt_digest_by_work
                         .insert(authoritative_work_id, changeset_digest);
@@ -334,8 +385,18 @@ impl WorkReducer {
                     );
                 }
             },
+            // Review receipts: `review_receipt_recorded` = passed,
+            // `review_blocked_recorded` = failed.
             "review_receipt_recorded" | "review_blocked_recorded" => {
+                let outcome = if event.event_type == "review_blocked_recorded" {
+                    ReceiptOutcome::Failed
+                } else {
+                    ReceiptOutcome::Passed
+                };
                 if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
+                    self.state
+                        .review_receipt_outcome_by_work
+                        .insert(authoritative_work_id.clone(), outcome);
                     self.state
                         .review_receipt_digest_by_work
                         .insert(authoritative_work_id, changeset_digest);

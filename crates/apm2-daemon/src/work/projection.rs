@@ -389,10 +389,38 @@ impl WorkObjectProjection {
             .copied()
     }
 
-    /// Returns the number of pending identity-chain defects in the reducer.
+    /// Returns the CI receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn ci_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .ci_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the review receipt outcome for a work ID from the reducer state.
+    #[must_use]
+    pub fn review_receipt_outcome(&self, work_id: &str) -> Option<apm2_core::work::ReceiptOutcome> {
+        self.reducer
+            .state()
+            .review_receipt_outcome_by_work
+            .get(work_id)
+            .copied()
+    }
+
+    /// Returns the number of pending identity-chain defects in the reducer
+    /// (global queue length).
     #[must_use]
     pub fn identity_chain_defect_count(&self) -> usize {
         self.reducer.identity_chain_defect_count()
+    }
+
+    /// Returns the cumulative identity-chain defect count for a specific
+    /// work item. Returns 0 if no defects have been recorded for `work_id`.
+    #[must_use]
+    pub fn identity_chain_defect_count_for_work(&self, work_id: &str) -> u32 {
+        self.reducer.identity_chain_defect_count_for_work(work_id)
     }
 
     /// Returns claimable work items in deterministic ID order.

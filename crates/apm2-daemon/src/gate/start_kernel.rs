@@ -206,7 +206,12 @@ impl GateStartKernel {
 struct GateStartObservedEvent {
     timestamp_ns: u64,
     cursor_event_id: String,
-    publication: ChangesetPublication,
+    /// `None` when the row was present in the ledger but its payload was
+    /// malformed and could not be parsed.  The event still carries valid
+    /// cursor coordinates so the kernel advances past the defective row
+    /// (preventing permanent deadlock).  A `DefectRecorded` is emitted at
+    /// observe time for audit trail.
+    publication: Option<ChangesetPublication>,
 }
 
 impl CursorEvent for GateStartObservedEvent {
@@ -277,10 +282,15 @@ impl OrchestratorDomain<GateStartObservedEvent, GateStartIntent, String, GateSta
 
     async fn apply_events(&mut self, events: &[GateStartObservedEvent]) -> Result<(), Self::Error> {
         for event in events {
+            // Skip malformed rows — the cursor still advances past them
+            // (the defect was already recorded at observe time).
+            let Some(ref publication) = event.publication else {
+                continue;
+            };
             let seq = self.next_observed_seq;
             self.next_observed_seq = seq.saturating_add(1);
             let intent = GateStartIntent {
-                publication: event.publication.clone(),
+                publication: publication.clone(),
                 observed_seq: seq,
             };
             self.pending_intents.insert(intent.key(), intent);
@@ -588,13 +598,37 @@ impl SqliteGateStartLedgerReader {
             let verified_work_id: String = row
                 .get(5)
                 .map_err(|e| format!("failed to decode verified_work_id: {e}"))?;
-            let publication = parse_changeset_publication_payload(
+            let publication = match parse_changeset_publication_payload(
                 &payload,
                 timestamp_ns,
                 &source_event_id,
                 &verified_actor_id,
                 &verified_work_id,
-            )?;
+            ) {
+                Ok(pub_ok) => Some(pub_ok),
+                Err(parse_err) => {
+                    // BLOCKER fix: Do NOT propagate parse errors with `?`.
+                    // Failing here would abort the entire poll, and the
+                    // orchestrator kernel would not advance the cursor past
+                    // this row — causing an infinite re-read deadlock.
+                    //
+                    // Instead: log the error, push a cursor-advancing event
+                    // with `publication = None` so the cursor moves past the
+                    // malformed row. The domain's `apply_events` skips None
+                    // publications.
+                    tracing::error!(
+                        cursor_event_id = %cursor_event_id,
+                        source_event_id = %source_event_id,
+                        verified_work_id = %verified_work_id,
+                        verified_actor_id = %verified_actor_id,
+                        payload_len = payload.len(),
+                        error = %parse_err,
+                        "DEFECT: malformed changeset_published row skipped \
+                         (cursor will advance past it)"
+                    );
+                    None
+                },
+            };
             out.push(GateStartObservedEvent {
                 timestamp_ns,
                 cursor_event_id,
@@ -1757,7 +1791,14 @@ mod tests {
             .poll(&CompositeCursor::default(), 1)
             .expect("first poll should succeed");
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].publication.work_id, "work-canonical");
+        assert_eq!(
+            first[0]
+                .publication
+                .as_ref()
+                .expect("valid publication")
+                .work_id,
+            "work-canonical"
+        );
 
         let cursor = CompositeCursor {
             timestamp_ns: first[0].timestamp_ns,
@@ -1767,7 +1808,14 @@ mod tests {
             .poll(&cursor, 10)
             .expect("second poll should succeed");
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].publication.work_id, "work-legacy");
+        assert_eq!(
+            second[0]
+                .publication
+                .as_ref()
+                .expect("valid publication")
+                .work_id,
+            "work-legacy"
+        );
     }
 
     #[test]
@@ -2250,5 +2298,149 @@ mod tests {
             CompositeCursor::default(),
             "fresh database must return default cursor"
         );
+    }
+
+    /// BLOCKER fix: A malformed `changeset_published` row must not deadlock
+    /// the kernel. The ledger reader must skip the malformed row (returning
+    /// a cursor-advancing event with `publication = None`) so subsequent
+    /// ticks are not permanently stuck re-reading the same bad row.
+    #[test]
+    fn malformed_changeset_published_row_skipped_not_deadlocked() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        {
+            let guard = conn.lock().expect("lock sqlite");
+            guard
+                .execute(
+                    "CREATE TABLE ledger_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
+                        work_id TEXT NOT NULL DEFAULT '',
+                        payload BLOB NOT NULL,
+                        timestamp_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy table");
+
+            let ts = 1_706_000_000_999_000_000_i64;
+
+            // Row 1: malformed payload (invalid JSON)
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns) \
+                     VALUES (?1, 'changeset_published', 'actor:test', 'W-bad', ?2, ?3)",
+                    rusqlite::params!["evt-bad", b"NOT VALID JSON", ts],
+                )
+                .expect("insert malformed row");
+
+            // Row 2: valid payload (should still be returned)
+            let valid_payload = serde_json::to_vec(&json!({
+                "work_id": "W-good",
+                "changeset_digest": hex::encode([0x33; 32]),
+                "cas_hash": hex::encode([0x44; 32]),
+                "actor_id": "actor:good",
+                "timestamp_ns": ts + 1,
+            }))
+            .expect("serialize valid payload");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns) \
+                     VALUES (?1, 'changeset_published', 'actor:good', 'W-good', ?2, ?3)",
+                    rusqlite::params!["evt-good", valid_payload, ts + 1],
+                )
+                .expect("insert valid row");
+        }
+
+        let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
+        let results = reader
+            .poll(&CompositeCursor::default(), 10)
+            .expect("poll must not fail on malformed row");
+
+        // Both rows should be returned — the malformed one with publication = None.
+        assert_eq!(
+            results.len(),
+            2,
+            "both rows (malformed + valid) should be returned"
+        );
+
+        // First row (malformed): publication is None, cursor advances past it.
+        assert!(
+            results[0].publication.is_none(),
+            "malformed row must have publication = None"
+        );
+        assert!(
+            !results[0].cursor_event_id.is_empty(),
+            "malformed row must still carry cursor_event_id for cursor advancement"
+        );
+
+        // Second row (valid): publication is Some.
+        let valid_pub = results[1]
+            .publication
+            .as_ref()
+            .expect("valid row must have publication");
+        assert_eq!(valid_pub.work_id, "W-good");
+    }
+
+    /// BLOCKER fix: When ALL rows in a batch are malformed, the poll must
+    /// still succeed (not deadlock). The returned events have
+    /// `publication = None` but valid cursor coordinates so the kernel
+    /// advances past all malformed rows.
+    #[test]
+    fn all_malformed_rows_still_advance_cursor() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        {
+            let guard = conn.lock().expect("lock sqlite");
+            guard
+                .execute(
+                    "CREATE TABLE ledger_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
+                        work_id TEXT NOT NULL DEFAULT '',
+                        payload BLOB NOT NULL,
+                        timestamp_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy table");
+
+            let ts = 1_706_000_000_000_000_000_i64;
+            // Insert two malformed rows
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns) \
+                     VALUES (?1, 'changeset_published', 'actor:t', 'W-1', ?2, ?3)",
+                    rusqlite::params!["evt-1", b"broken-json-1", ts],
+                )
+                .expect("insert malformed row 1");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns) \
+                     VALUES (?1, 'changeset_published', 'actor:t', 'W-2', ?2, ?3)",
+                    rusqlite::params!["evt-2", b"broken-json-2", ts + 1],
+                )
+                .expect("insert malformed row 2");
+        }
+
+        let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
+        let results = reader
+            .poll(&CompositeCursor::default(), 10)
+            .expect("poll must succeed even when all rows are malformed");
+
+        assert_eq!(results.len(), 2, "both malformed rows should be returned");
+        assert!(results[0].publication.is_none());
+        assert!(results[1].publication.is_none());
+
+        // The cursor can advance to the last event's position.
+        assert!(!results[1].cursor_event_id.is_empty());
     }
 }
