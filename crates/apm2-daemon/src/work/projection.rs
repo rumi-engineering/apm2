@@ -12,6 +12,7 @@ use ed25519_dalek::Verifier;
 use prost::Message;
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::protocol::dispatch::{
     LedgerEventEmitter, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX,
@@ -252,10 +253,43 @@ impl WorkObjectProjection {
         let mut next_seq_id = 1u64;
 
         for (_, event) in ordered {
-            let reducer_events =
-                translate_signed_event(event, &mut opened_work_ids, &mut next_seq_id)?;
+            let reducer_events = match translate_signed_event(
+                event,
+                &mut opened_work_ids,
+                &mut next_seq_id,
+            ) {
+                Ok(events) => events,
+                Err(error) if should_skip_pr_associated_replay_error(&event.event_type, &error) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        event_type = %event.event_type,
+                        work_id = %event.work_id,
+                        error = %error,
+                        "Skipping non-replayable work.pr_associated event during projection rebuild"
+                    );
+                    continue;
+                },
+                Err(error) => return Err(error),
+            };
+            let mut skip_source_event = false;
             for reducer_event in &reducer_events {
-                self.apply_reducer_event(reducer_event)?;
+                if let Err(error) = self.apply_reducer_event(reducer_event) {
+                    if should_skip_pr_associated_replay_error(&event.event_type, &error) {
+                        warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            work_id = %event.work_id,
+                            error = %error,
+                            "Skipping non-replayable work.pr_associated reducer event during projection rebuild"
+                        );
+                        skip_source_event = true;
+                        break;
+                    }
+                    return Err(error);
+                }
+            }
+            if skip_source_event {
+                continue;
             }
 
             if let Some(graph_event) = decode_work_graph_event(event)? {
@@ -645,6 +679,24 @@ fn translate_signed_event(
     }
 
     Ok(translated)
+}
+
+fn should_skip_pr_associated_replay_error(event_type: &str, error: &WorkProjectionError) -> bool {
+    if event_type != "work.pr_associated" {
+        return false;
+    }
+
+    match error {
+        WorkProjectionError::InvalidPayload { .. } => true,
+        WorkProjectionError::Reducer(work_error) => matches!(
+            work_error,
+            WorkError::WorkNotFound { .. }
+                | WorkError::PrAssociationNotAllowed { .. }
+                | WorkError::PrNumberAlreadyAssociated { .. }
+                | WorkError::SequenceMismatch { .. }
+        ),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1464,6 +1516,28 @@ mod tests {
         signed_event("work_graph.edge.waived", to_work_id, payload, timestamp_ns)
     }
 
+    fn work_pr_associated_event(
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+        timestamp_ns: u64,
+    ) -> SignedLedgerEvent {
+        let payload = helpers::work_pr_associated_payload(work_id, pr_number, commit_sha);
+        let envelope = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": "S-projection-test",
+            "actor_id": "actor:test-projection",
+            "payload": hex::encode(payload),
+            "ajc_id": "f".repeat(64),
+        });
+        signed_event(
+            "work.pr_associated",
+            work_id,
+            serde_json::to_vec(&envelope).expect("work.pr_associated JSON envelope should encode"),
+            timestamp_ns,
+        )
+    }
+
     #[test]
     fn decode_canonical_work_event_payload_rejects_oversized_json_envelope() {
         let oversized = vec![b'x'; MAX_CANONICAL_WORK_EVENT_JSON_BYTES + 1];
@@ -1765,5 +1839,56 @@ mod tests {
             matches!(result, Err(WorkProjectionError::InvalidPayload { .. })),
             "WORK_EDGE_TYPE_UNSPECIFIED must fail-closed"
         );
+    }
+
+    #[test]
+    fn rebuild_skips_non_replayable_work_pr_associated_reducer_event() {
+        let work_id = "W-projection-pr-assoc-reducer-skip";
+        let mut projection = WorkObjectProjection::new();
+
+        let events = vec![
+            work_opened_event(work_id, 1_000),
+            work_transitioned_event(work_id, "OPEN", "CLAIMED", 0, 1_001),
+            work_pr_associated_event(work_id, 640, "sha-claimed", 1_002),
+            work_transitioned_event(work_id, "CLAIMED", "IN_PROGRESS", 1, 1_003),
+            work_transitioned_event(work_id, "IN_PROGRESS", "CI_PENDING", 2, 1_004),
+            work_pr_associated_event(work_id, 641, "sha-ci-pending", 1_005),
+        ];
+
+        projection
+            .rebuild_from_signed_events(&events)
+            .expect("non-replayable work.pr_associated reducer events should be skipped");
+
+        let work = projection
+            .get_work(work_id)
+            .expect("work should remain readable after skip");
+        assert_eq!(work.state, WorkState::CiPending);
+        assert_eq!(work.pr_number, Some(640));
+    }
+
+    #[test]
+    fn rebuild_skips_malformed_work_pr_associated_payload() {
+        let work_id = "W-projection-pr-assoc-malformed";
+        let mut projection = WorkObjectProjection::new();
+
+        let events = vec![
+            work_opened_event(work_id, 1_000),
+            signed_event(
+                "work.pr_associated",
+                work_id,
+                b"{\"payload\":\"abc\"}".to_vec(),
+                1_001,
+            ),
+            work_transitioned_event(work_id, "OPEN", "CLAIMED", 0, 1_002),
+        ];
+
+        projection
+            .rebuild_from_signed_events(&events)
+            .expect("malformed work.pr_associated payload should be skipped");
+
+        let work = projection
+            .get_work(work_id)
+            .expect("work should remain available after malformed skip");
+        assert_eq!(work.state, WorkState::Claimed);
     }
 }
