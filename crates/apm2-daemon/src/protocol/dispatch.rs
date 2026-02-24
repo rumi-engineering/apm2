@@ -15082,39 +15082,49 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // 2. Validate lease (TCK-00289: "Implement IssueCapability with lease
-        //    validation")
-        // Ensure the session's lease matches the authoritative work claim.
-        // This confirms the session corresponds to a valid, active work item.
-        if let Some(claim) = self.work_registry.get_claim(&session.work_id) {
-            // Verify lease_id matches
-            // Constant-time comparison is good practice for IDs
-            let lease_matches = session.lease_id.len() == claim.lease_id.len()
-                && bool::from(session.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
-
-            if !lease_matches {
-                warn!(
-                    session_id = %request.session_id,
-                    expected_lease = "[REDACTED]",
-                    actual_lease = "[REDACTED]",
-                    "IssueCapability rejected: lease mismatch against work claim"
-                );
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "lease validation failed: session lease does not match work claim",
-                ));
-            }
-        } else {
+        // 2. Validate lease/work wiring (TCK-00289).
+        //
+        // Resolve lease -> work via the authoritative lease validator first,
+        // then resolve the exact `(work_id, lease_id)` claim row. This avoids
+        // role-agnostic `get_claim(work_id)` ambiguity in multi-role flows.
+        let Some(mapped_work_id) = self.lease_validator.get_lease_work_id(&session.lease_id) else {
+            warn!(
+                session_id = %request.session_id,
+                work_id = %session.work_id,
+                "IssueCapability rejected: session lease missing in lease validator"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease validation failed: session lease is not registered",
+            ));
+        };
+        let work_mapping_matches = mapped_work_id.len() == session.work_id.len()
+            && bool::from(mapped_work_id.as_bytes().ct_eq(session.work_id.as_bytes()));
+        if !work_mapping_matches {
+            warn!(
+                session_id = %request.session_id,
+                "IssueCapability rejected: session lease->work mapping mismatch"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease validation failed: session lease is bound to a different work item",
+            ));
+        }
+        if self
+            .work_registry
+            .get_claim_by_lease_id(&session.work_id, &session.lease_id)
+            .is_none()
+        {
             // Local state-precondition failure (missing in-process work claim),
             // not a governance transport/communication failure.
             warn!(
                 session_id = %request.session_id,
                 work_id = %session.work_id,
-                "IssueCapability rejected: work claim not found"
+                "IssueCapability rejected: work claim for session lease not found"
             );
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                "lease validation failed: work claim not found",
+                "lease validation failed: work claim not found for session lease",
             ));
         }
 
@@ -17681,6 +17691,37 @@ impl PrivilegedDispatcher {
         format!("S-adhoc-{}", hex::encode(digest.as_bytes()))
     }
 
+    /// Selects the most appropriate claim row to hydrate `WorkStatus` metadata.
+    ///
+    /// `WorkRegistry` is keyed by `(work_id, role)`, while role-agnostic
+    /// lookup can return an unrelated claim in multi-role workflows.
+    fn select_claim_for_work_status(
+        &self,
+        authority_status: &WorkAuthorityStatus,
+    ) -> Option<WorkClaim> {
+        let preferred_roles: &[WorkRole] = match authority_status.state {
+            apm2_core::work::WorkState::Review => &[
+                WorkRole::Reviewer,
+                WorkRole::Implementer,
+                WorkRole::Coordinator,
+            ],
+            _ => &[
+                WorkRole::Implementer,
+                WorkRole::Coordinator,
+                WorkRole::Reviewer,
+            ],
+        };
+        for role in preferred_roles {
+            if let Some(claim) = self
+                .work_registry
+                .get_claim_for_role(&authority_status.work_id, *role)
+            {
+                return Some(claim);
+            }
+        }
+        self.work_registry.get_claim(&authority_status.work_id)
+    }
+
     fn authority_status_to_work_status_response(
         &self,
         authority_status: &WorkAuthorityStatus,
@@ -17706,20 +17747,49 @@ impl PrivilegedDispatcher {
         let mut derived_adhoc_session_id: Option<String> = None;
 
         // Supplement with claim metadata when available.
-        if let Some(claim) = self.work_registry.get_claim(&authority_status.work_id) {
+        if let Some(claim) = self.select_claim_for_work_status(authority_status) {
             response.actor_id = Some(claim.actor_id);
             response.role = Some(claim.role.into());
-            response.lease_id = Some(claim.lease_id);
-            if let Some(lease_id) = response
-                .lease_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                derived_adhoc_session_id = Some(Self::derive_claim_scoped_adhoc_session_id(
-                    &authority_status.work_id,
-                    lease_id,
-                ));
+            let lease_id = claim.lease_id.trim();
+            if !lease_id.is_empty() {
+                match self.lease_validator.get_lease_work_id(lease_id) {
+                    Some(mapped_work_id) => {
+                        let work_id_matches = mapped_work_id.len()
+                            == authority_status.work_id.len()
+                            && bool::from(
+                                mapped_work_id
+                                    .as_bytes()
+                                    .ct_eq(authority_status.work_id.as_bytes()),
+                            );
+                        if work_id_matches {
+                            response.lease_id = Some(lease_id.to_string());
+                            derived_adhoc_session_id =
+                                Some(Self::derive_claim_scoped_adhoc_session_id(
+                                    &authority_status.work_id,
+                                    lease_id,
+                                ));
+                        } else {
+                            warn!(
+                                work_id = %authority_status.work_id,
+                                claim_lease_id = %lease_id,
+                                mapped_work_id = %mapped_work_id,
+                                "WorkStatus detected inconsistent claim->lease mapping; omitting runtime lease/session bindings"
+                            );
+                        }
+                    },
+                    None => {
+                        warn!(
+                            work_id = %authority_status.work_id,
+                            claim_lease_id = %lease_id,
+                            "WorkStatus detected claim lease missing in lease validator; omitting runtime lease/session bindings"
+                        );
+                    },
+                }
+            } else {
+                warn!(
+                    work_id = %authority_status.work_id,
+                    "WorkStatus detected claim with empty lease_id; omitting runtime lease/session bindings"
+                );
             }
         }
 
@@ -25002,6 +25072,12 @@ mod tests {
                 permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                work_id,
+                "issue_capability_test",
+                "test-actor",
+            );
 
             // Register session
             let session_state = SessionState {
@@ -25034,6 +25110,184 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             assert!(matches!(response, PrivilegedResponse::IssueCapability(_)));
+        }
+
+        #[test]
+        fn test_issue_capability_rejects_unregistered_session_lease() {
+            use crate::session::SessionState;
+
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let work_id = "W-IC-MISSING-LEASE-001";
+            let lease_id = "L-IC-MISSING-LEASE-001";
+            let session_id = "S-IC-MISSING-LEASE-001";
+
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("resolved-for-{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(claim)
+                .expect("claim registration should succeed");
+
+            dispatcher
+                .session_registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: work_id.to_string(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: lease_id.to_string(),
+                    ephemeral_handle: String::new(),
+                    policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                })
+                .expect("session registration should succeed");
+
+            let request = IssueCapabilityRequest {
+                session_id: session_id.to_string(),
+                capability_request: Some(super::super::super::messages::CapabilityRequest {
+                    tool_class: "file_read".to_string(),
+                    read_patterns: vec!["**/*.rs".to_string()],
+                    write_patterns: vec![],
+                    duration_secs: 3600,
+                }),
+            };
+            let frame = encode_issue_capability_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("session lease is not registered"),
+                        "expected lease registration failure, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected CapabilityRequestRejected error, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_issue_capability_rejects_lease_work_mismatch() {
+            use crate::session::SessionState;
+
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let work_id = "W-IC-WORK-MISMATCH-001";
+            let lease_id = "L-IC-WORK-MISMATCH-001";
+            let session_id = "S-IC-WORK-MISMATCH-001";
+
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("resolved-for-{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(claim)
+                .expect("claim registration should succeed");
+            dispatcher.lease_validator.register_lease_with_executor(
+                lease_id,
+                "W-IC-SOME-OTHER-WORK-001",
+                "issue_capability_test",
+                "test-actor",
+            );
+
+            dispatcher
+                .session_registry
+                .register_session(SessionState {
+                    session_id: session_id.to_string(),
+                    work_id: work_id.to_string(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: lease_id.to_string(),
+                    ephemeral_handle: String::new(),
+                    policy_resolved_ref: String::new(),
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                })
+                .expect("session registration should succeed");
+
+            let request = IssueCapabilityRequest {
+                session_id: session_id.to_string(),
+                capability_request: Some(super::super::super::messages::CapabilityRequest {
+                    tool_class: "file_read".to_string(),
+                    read_patterns: vec!["**/*.rs".to_string()],
+                    write_patterns: vec![],
+                    duration_secs: 3600,
+                }),
+            };
+            let frame = encode_issue_capability_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("bound to a different work item"),
+                        "expected lease/work mismatch failure, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected CapabilityRequestRejected error, got: {other:?}"),
+            }
         }
 
         #[test]
@@ -25421,6 +25675,12 @@ mod tests {
             permeability_receipt: None,
         };
         dispatcher.work_registry.register_claim(claim).unwrap();
+        dispatcher.lease_validator.register_lease_with_executor(
+            lease_id,
+            work_id,
+            "issue_capability_test",
+            "test-actor",
+        );
 
         // Register session
         let session_state = SessionState {
@@ -28135,6 +28395,12 @@ mod tests {
                 permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
+            dispatcher.lease_validator.register_lease_with_executor(
+                "L-CLAIM-001",
+                "W-CLAIM-001",
+                "work_status",
+                "actor:alice",
+            );
 
             // Query WorkStatus
             let request = WorkStatusRequest {
@@ -28157,6 +28423,280 @@ mod tests {
                             "L-CLAIM-001",
                         )),
                         "claimed work without an active episode should expose a deterministic ad-hoc session_id",
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_work_status_omits_runtime_bindings_when_claim_lease_mapping_missing() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-CLAIM-MISSING-LEASE-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:alice",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
+
+            let claim = WorkClaim {
+                work_id: "W-CLAIM-MISSING-LEASE-001".to_string(),
+                lease_id: "L-CLAIM-MISSING-LEASE-001".to_string(),
+                actor_id: "actor:alice".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-ref".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(claim)
+                .expect("claim registration should succeed");
+
+            let request = WorkStatusRequest {
+                work_id: "W-CLAIM-MISSING-LEASE-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, "W-CLAIM-MISSING-LEASE-001");
+                    assert_eq!(resp.status, "CLAIMED");
+                    assert_eq!(resp.actor_id, Some("actor:alice".to_string()));
+                    assert_eq!(resp.role, Some(WorkRole::Implementer.into()));
+                    assert_eq!(
+                        resp.lease_id, None,
+                        "WorkStatus must not surface lease_id when claim lease mapping is missing"
+                    );
+                    assert_eq!(
+                        resp.session_id, None,
+                        "WorkStatus must not derive ad-hoc session_id from inconsistent claim lease state"
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_work_status_omits_runtime_bindings_when_claim_lease_maps_to_other_work() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-CLAIM-WRONG-MAP-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:alice",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
+
+            let claim = WorkClaim {
+                work_id: "W-CLAIM-WRONG-MAP-001".to_string(),
+                lease_id: "L-CLAIM-WRONG-MAP-001".to_string(),
+                actor_id: "actor:alice".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "resolved-ref".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    role_spec_hash: [0u8; 32],
+                    context_pack_recipe_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
+                    resolved_scope_baseline: None,
+                    expected_adapter_profile_hash: None,
+                    pcac_policy: None,
+                    pointer_only_waiver: None,
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+                permeability_receipt: None,
+            };
+            dispatcher
+                .work_registry
+                .register_claim(claim)
+                .expect("claim registration should succeed");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "L-CLAIM-WRONG-MAP-001",
+                "W-SOME-OTHER-WORK-001",
+                "work_status",
+                "actor:alice",
+            );
+
+            let request = WorkStatusRequest {
+                work_id: "W-CLAIM-WRONG-MAP-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, "W-CLAIM-WRONG-MAP-001");
+                    assert_eq!(resp.status, "CLAIMED");
+                    assert_eq!(
+                        resp.lease_id, None,
+                        "WorkStatus must not surface lease_id when lease mapping points to a different work_id"
+                    );
+                    assert_eq!(
+                        resp.session_id, None,
+                        "WorkStatus must not derive ad-hoc session_id when lease mapping points to a different work_id"
+                    );
+                },
+                other => panic!("Expected WorkStatus response, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_work_status_selects_reviewer_claim_in_review_state() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = privileged_ctx();
+
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-REVIEW-STATE-001",
+                    from_state: "Open",
+                    to_state: "Claimed",
+                    rationale_code: "claim",
+                    previous_transition_count: 0,
+                    actor_id: "actor:implementer",
+                    timestamp_ns: 1_000_000_000,
+                })
+                .expect("transition Open->Claimed should persist");
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-REVIEW-STATE-001",
+                    from_state: "Claimed",
+                    to_state: "InProgress",
+                    rationale_code: "start",
+                    previous_transition_count: 1,
+                    actor_id: "actor:implementer",
+                    timestamp_ns: 1_000_000_100,
+                })
+                .expect("transition Claimed->InProgress should persist");
+            dispatcher
+                .event_emitter
+                .emit_work_transitioned(&WorkTransition {
+                    work_id: "W-REVIEW-STATE-001",
+                    from_state: "InProgress",
+                    to_state: "Review",
+                    rationale_code: "review",
+                    previous_transition_count: 2,
+                    actor_id: "actor:reviewer",
+                    timestamp_ns: 1_000_000_200,
+                })
+                .expect("transition InProgress->Review should persist");
+
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-REVIEW-STATE-001".to_string(),
+                    lease_id: "L-IMPLEMENTER-001".to_string(),
+                    actor_id: "actor:implementer".to_string(),
+                    role: WorkRole::Implementer,
+                    policy_resolution: PolicyResolution {
+                        policy_resolved_ref: "resolved-ref".to_string(),
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
+                        context_pack_hash: [0u8; 32],
+                        role_spec_hash: [0u8; 32],
+                        context_pack_recipe_hash: [0u8; 32],
+                        resolved_risk_tier: 0,
+                        resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
+                    },
+                    author_custody_domains: vec![],
+                    executor_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("implementer claim registration should succeed");
+            dispatcher
+                .work_registry
+                .register_claim(WorkClaim {
+                    work_id: "W-REVIEW-STATE-001".to_string(),
+                    lease_id: "L-REVIEWER-001".to_string(),
+                    actor_id: "actor:reviewer".to_string(),
+                    role: WorkRole::Reviewer,
+                    policy_resolution: PolicyResolution {
+                        policy_resolved_ref: "resolved-ref".to_string(),
+                        resolved_policy_hash: [0u8; 32],
+                        capability_manifest_hash: [0u8; 32],
+                        context_pack_hash: [0u8; 32],
+                        role_spec_hash: [0u8; 32],
+                        context_pack_recipe_hash: [0u8; 32],
+                        resolved_risk_tier: 0,
+                        resolved_scope_baseline: None,
+                        expected_adapter_profile_hash: None,
+                        pcac_policy: None,
+                        pointer_only_waiver: None,
+                    },
+                    author_custody_domains: vec![],
+                    executor_custody_domains: vec![],
+                    permeability_receipt: None,
+                })
+                .expect("reviewer claim registration should succeed");
+            dispatcher.lease_validator.register_lease_with_executor(
+                "L-IMPLEMENTER-001",
+                "W-REVIEW-STATE-001",
+                "work_status",
+                "actor:implementer",
+            );
+            dispatcher.lease_validator.register_lease_with_executor(
+                "L-REVIEWER-001",
+                "W-REVIEW-STATE-001",
+                "work_status",
+                "actor:reviewer",
+            );
+
+            let request = WorkStatusRequest {
+                work_id: "W-REVIEW-STATE-001".to_string(),
+            };
+            let frame = encode_work_status_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::WorkStatus(resp) => {
+                    assert_eq!(resp.work_id, "W-REVIEW-STATE-001");
+                    assert_eq!(resp.status, "REVIEW");
+                    assert_eq!(resp.actor_id, Some("actor:reviewer".to_string()));
+                    assert_eq!(resp.role, Some(WorkRole::Reviewer.into()));
+                    assert_eq!(resp.lease_id, Some("L-REVIEWER-001".to_string()));
+                    assert_eq!(
+                        resp.session_id,
+                        Some(PrivilegedDispatcher::derive_claim_scoped_adhoc_session_id(
+                            "W-REVIEW-STATE-001",
+                            "L-REVIEWER-001",
+                        )),
                     );
                 },
                 other => panic!("Expected WorkStatus response, got: {other:?}"),
@@ -28204,6 +28744,12 @@ mod tests {
                 permeability_receipt: None,
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
+            dispatcher.lease_validator.register_lease_with_executor(
+                "L-CLAIM-SESSION-001",
+                "W-CLAIM-SESSION-001",
+                "work_status",
+                "actor:alice",
+            );
 
             let session = SessionState {
                 session_id: "S-REAL-SESSION-001".to_string(),
