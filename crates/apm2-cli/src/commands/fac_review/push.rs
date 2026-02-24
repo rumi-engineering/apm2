@@ -1457,15 +1457,22 @@ pub(super) fn load_latest_push_attempt_for_sha(
     Ok(latest)
 }
 
-fn stage_from_gate_name(gate_name: &str) -> &'static str {
+fn stage_from_gate_name(gate_name: &str) -> Option<&'static str> {
     match gate_name {
-        "rustfmt" => "gate_fmt",
-        "clippy" => "gate_clippy",
-        "doc" => "gate_doc",
-        // Collapse all non-fmt/clippy/doc gates into test stage in the fixed
-        // push-attempt schema.
-        _ => "gate_test",
+        "rustfmt" => Some("gate_fmt"),
+        "clippy" => Some("gate_clippy"),
+        "doc" => Some("gate_doc"),
+        "test" => Some("gate_test"),
+        _ => None,
     }
+}
+
+fn stage_from_gate_result(gate_name: &str, passed: bool) -> Option<&'static str> {
+    stage_from_gate_name(gate_name).or_else(|| (!passed).then_some("gate_test"))
+}
+
+fn stage_from_failed_gate_name(gate_name: &str) -> &'static str {
+    stage_from_gate_name(gate_name).unwrap_or("gate_test")
 }
 
 fn normalize_error_hint(value: &str) -> Option<String> {
@@ -2898,7 +2905,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             let gate_outcome = match run_blocking_evidence_gates(&sha, Some(&work_id), write_mode) {
                 Ok(outcome) => {
                     for gate in &outcome.gate_results {
-                        let stage = stage_from_gate_name(&gate.gate_name);
+                        let stage = stage_from_gate_result(&gate.gate_name, gate.passed);
                         let log_path = gate
                             .log_path
                             .as_ref()
@@ -2911,15 +2918,17 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                                 normalize_error_hint(&format!("gate {} failed", gate.gate_name))
                             })
                         };
-                        if gate.passed {
-                            attempt.set_stage_pass(stage, gate.duration_secs);
-                        } else {
-                            attempt.set_stage_fail(
-                                stage,
-                                gate.duration_secs,
-                                None,
-                                error_hint.clone(),
-                            );
+                        if let Some(stage_name) = stage {
+                            if gate.passed {
+                                attempt.set_stage_pass(stage_name, gate.duration_secs);
+                            } else {
+                                attempt.set_stage_fail(
+                                    stage_name,
+                                    gate.duration_secs,
+                                    None,
+                                    error_hint.clone(),
+                                );
+                            }
                         }
                         if json_output {
                             let status = if gate.passed { "pass" } else { "fail" }.to_string();
@@ -2968,20 +2977,22 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                     let mut mapped_any = false;
                     if let Some(cache) = GateCache::load(&sha) {
                         for (gate_name, gate_result) in cache.gates {
-                            let stage = stage_from_gate_name(&gate_name);
-                            mapped_any = true;
-                            if gate_result.status.eq_ignore_ascii_case("PASS") {
-                                attempt.set_stage_pass(stage, gate_result.duration_secs);
-                            } else {
-                                let hint = latest_gate_error_hint(&gate_name).or_else(|| {
-                                    normalize_error_hint(&format!("gate {gate_name} failed"))
-                                });
-                                attempt.set_stage_fail(
-                                    stage,
-                                    gate_result.duration_secs,
-                                    None,
-                                    hint,
-                                );
+                            let passed = gate_result.status.eq_ignore_ascii_case("PASS");
+                            if let Some(stage_name) = stage_from_gate_result(&gate_name, passed) {
+                                mapped_any = true;
+                                if passed {
+                                    attempt.set_stage_pass(stage_name, gate_result.duration_secs);
+                                } else {
+                                    let hint = latest_gate_error_hint(&gate_name).or_else(|| {
+                                        normalize_error_hint(&format!("gate {gate_name} failed"))
+                                    });
+                                    attempt.set_stage_fail(
+                                        stage_name,
+                                        gate_result.duration_secs,
+                                        None,
+                                        hint,
+                                    );
+                                }
                             }
                             if json_output {
                                 let normalized_status = gate_result.status.to_ascii_lowercase();
@@ -3043,7 +3054,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
                         } else {
                             for gate_name in &failed_gates {
                                 attempt.set_stage_fail(
-                                    stage_from_gate_name(gate_name),
+                                    stage_from_failed_gate_name(gate_name),
                                     duration,
                                     None,
                                     normalize_error_hint(&err),
@@ -4453,6 +4464,35 @@ mod tests {
             failed.error_hint.as_deref(),
             Some("ruleset drift not synchronized")
         );
+    }
+
+    #[test]
+    fn gate_stage_mapping_skips_unknown_passes_and_maps_unknown_failures_to_test_stage() {
+        assert_eq!(stage_from_gate_result("workspace_integrity", true), None);
+        assert_eq!(
+            stage_from_gate_result("workspace_integrity", false),
+            Some("gate_test")
+        );
+        assert_eq!(
+            stage_from_failed_gate_name("workspace_integrity"),
+            "gate_test"
+        );
+    }
+
+    #[test]
+    fn gate_stage_mapping_preserves_primary_test_duration() {
+        let mut record = PushAttemptRecord::new("0123456789abcdef0123456789abcdef01234567");
+        let test_stage = stage_from_gate_result("test", true).expect("test stage");
+        record.set_stage_pass(test_stage, 83);
+        assert_eq!(record.gate_test.duration_s, 83);
+
+        for gate in ["workspace_integrity", "review_artifact_lint"] {
+            if let Some(stage_name) = stage_from_gate_result(gate, true) {
+                record.set_stage_pass(stage_name, 0);
+            }
+        }
+
+        assert_eq!(record.gate_test.duration_s, 83);
     }
 
     #[test]
