@@ -1,0 +1,261 @@
+{
+  "schema": "apm2.runbook.v1",
+  "schema_version": "1.0.0",
+  "kind": "operational.runbook",
+  "meta": {
+    "stable_id": "dcp://apm2.runbooks/fac-systemd-services@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/runbooks/fac-systemd-services.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "FAC Daemon and Worker Systemd Services",
+    "description": "This runbook covers managed operation of the FAC daemon (apm2-daemon) and FAC worker (apm2-worker.service) via systemd units.",
+    "notes": [
+      "`apm2 fac worker` is an internal runtime entrypoint used by systemd (ExecStart), not the primary operator surface.",
+      "Steady-state activation is queue-event driven; fixed poll-cadence flags are not an operator tuning surface.",
+      "Remediation scope is doctor-first and explicit: host/runtime via `apm2 fac doctor --fix`, PR-scoped via `apm2 fac doctor --pr <N> --fix`."
+    ],
+    "prerequisites": [
+      "systemd with systemctl available",
+      "apm2 binary installed at /usr/local/bin/apm2 (or adjust units manually)",
+      "HOME available for user-mode units",
+      "APM2_HOME directory is writable (~/.apm2 by default)"
+    ],
+    "sections": [
+      {
+        "id": "1",
+        "title": "Install managed units",
+        "subsections": [
+          {
+            "id": "1.1",
+            "title": "User mode (recommended for local operators)",
+            "commands": ["cd /path/to/apm2-worktree && apm2 daemon install"],
+            "writes": [
+              "~/.config/systemd/user/apm2-daemon.service",
+              "~/.config/systemd/user/apm2-worker.service",
+              "~/.config/systemd/user/apm2-worker@.service",
+              "~/.config/systemd/user/apm2-daemon.socket"
+            ]
+          },
+          {
+            "id": "1.2",
+            "title": "System mode",
+            "commands": [
+              "sudo cp contrib/systemd/apm2-daemon.service /etc/systemd/system/",
+              "sudo cp contrib/systemd/apm2-worker.service /etc/systemd/system/",
+              "sudo cp contrib/systemd/apm2-worker@.service /etc/systemd/system/",
+              "sudo cp contrib/systemd/apm2-daemon.socket /etc/systemd/system/",
+              "sudo systemctl daemon-reload"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "2",
+        "title": "Service lifecycle",
+        "subsections": [
+          {
+            "id": "2.1",
+            "title": "User mode",
+            "commands": [
+              "systemctl --user enable apm2-daemon.socket",
+              "systemctl --user enable apm2-daemon.service",
+              "systemctl --user enable apm2-worker.service",
+              "systemctl --user start apm2-daemon.socket",
+              "systemctl --user start apm2-daemon.service",
+              "systemctl --user start apm2-worker.service",
+              "systemctl --user status apm2-daemon.service apm2-worker.service apm2-daemon.socket"
+            ]
+          },
+          {
+            "id": "2.2",
+            "title": "System mode",
+            "commands": [
+              "sudo systemctl enable apm2-daemon.socket",
+              "sudo systemctl enable apm2-daemon.service",
+              "sudo systemctl enable apm2-worker.service",
+              "sudo systemctl start apm2-daemon.socket",
+              "sudo systemctl start apm2-daemon.service",
+              "sudo systemctl start apm2-worker.service",
+              "sudo systemctl status apm2-daemon.service apm2-worker.service apm2-daemon.socket"
+            ]
+          },
+          {
+            "id": "2.3",
+            "title": "Stop / restart",
+            "commands": [
+              "systemctl --user stop apm2-worker.service",
+              "systemctl --user stop apm2-daemon.service",
+              "systemctl --user restart apm2-daemon.service",
+              "sudo systemctl stop apm2-worker.service",
+              "sudo systemctl restart apm2-daemon.service"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "3",
+        "title": "Linger (user mode)",
+        "description": "To keep user units running after SSH logout.",
+        "commands": [
+          "loginctl enable-linger \"$USER\"",
+          "systemctl --user show-environment | grep -i xdg_runtime_dir",
+          "loginctl disable-linger \"$USER\""
+        ]
+      },
+      {
+        "id": "4",
+        "title": "Credential provisioning (LoadCredential=)",
+        "description": "Units expect a GitHub token file at ~/.apm2/private/creds/gh-token",
+        "commands": [
+          "mkdir -p ~/.apm2/private/creds",
+          "cat > ~/.apm2/private/creds/gh-token <<'EOF'\n<github token>\nEOF",
+          "chmod 600 ~/.apm2/private/creds/gh-token",
+          "systemctl --user restart apm2-daemon.service",
+          "systemctl --user restart apm2-worker.service"
+        ]
+      },
+      {
+        "id": "5",
+        "title": "Health monitoring (TCK-00600)",
+        "subsections": [
+          {
+            "id": "5.1",
+            "title": "Systemd watchdog",
+            "description": "Both apm2-daemon and apm2-worker services use Type=notify with WatchdogSec=300.",
+            "signals": [
+              { "signal": "READY=1", "description": "Sent after successful initialization. systemd considers the service started only after receiving this." },
+              { "signal": "WATCHDOG=1", "description": "Periodic ping. If no ping within WatchdogSec (300s / 5min), systemd forcefully restarts. Ping interval is ~150s (half watchdog timeout)." },
+              { "signal": "STOPPING=1", "description": "Sent during graceful shutdown to inform systemd the process is intentionally exiting." }
+            ]
+          },
+          {
+            "id": "5.2",
+            "title": "Health status via apm2 fac services status",
+            "per_service_fields": [
+              { "field": "health", "description": "healthy, degraded, or unhealthy (deterministic)" },
+              { "field": "watchdog_sec", "description": "Configured watchdog timeout in seconds (0 if disabled)" },
+              { "field": "main_pid", "description": "Main PID of the service (0 if not running)" },
+              { "field": "uptime_seconds", "description": "Seconds since the service started" }
+            ],
+            "overall_fields": [
+              { "field": "overall_health", "description": "Overall health (healthy or degraded)" },
+              { "field": "worker_heartbeat", "description": "Worker heartbeat file status" }
+            ],
+            "health_classification": {
+              "healthy": "service is loaded, active (running), and enabled",
+              "degraded": "service is loaded but not in the active state and not failed",
+              "unhealthy": "service is in a failed state, not loaded, or not found"
+            }
+          },
+          {
+            "id": "5.3",
+            "title": "Worker heartbeat file",
+            "path": "~/.apm2/private/fac/worker_heartbeat.json",
+            "contents": [
+              "pid - process ID of the worker",
+              "timestamp_unix - Unix epoch timestamp of the last wake/reconcile cycle",
+              "cycle_count - monotonically increasing wake cycle counter",
+              "jobs_completed, jobs_denied, jobs_quarantined - cumulative job stats",
+              "health_status - self-reported status (healthy or degraded)"
+            ],
+            "staleness": "A stale heartbeat (age > 120s) with an active systemd service suggests the worker process is alive but not making progress."
+          },
+          {
+            "id": "5.4",
+            "title": "Monitoring checklist",
+            "commands": [
+              "apm2 fac services status",
+              "apm2 fac services status | jq '.overall_health'",
+              "systemctl --user show apm2-daemon.service -p WatchdogUSec",
+              "journalctl --user -u apm2-daemon.service --grep='watchdog'",
+              "journalctl --user -u apm2-worker.service --grep='watchdog'",
+              "cat ~/.apm2/private/fac/worker_heartbeat.json | jq '.timestamp_unix'"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "6",
+        "title": "Logging",
+        "commands": [
+          "journalctl --user -u apm2-daemon.service",
+          "journalctl --user -u apm2-worker.service",
+          "journalctl -u apm2-daemon.service",
+          "journalctl -u apm2-worker.service"
+        ]
+      },
+      {
+        "id": "7",
+        "title": "Broker IPC reachability checks",
+        "socket_paths": {
+          "user_mode": "%t/apm2/operator.sock",
+          "system_mode": "%t/apm2/operator.sock"
+        },
+        "quick_checks": [
+          "systemctl --user status apm2-daemon.socket",
+          "test -S /run/user/$(id -u)/apm2/operator.sock"
+        ],
+        "recovery": [
+          "systemctl --user reset-failed apm2-daemon.service apm2-daemon.socket",
+          "systemctl --user restart apm2-daemon.socket",
+          "systemctl --user restart apm2-daemon.service"
+        ]
+      },
+      {
+        "id": "8",
+        "title": "Service command failures (quick triage)",
+        "failures": [
+          { "error": "Unit not found", "fix": "Confirm correct file is installed in ~/.config/systemd/user or /etc/systemd/system. Run systemctl daemon-reload." },
+          { "error": "LoadCredential... not found", "fix": "Ensure ~/.apm2/private/creds/gh-token exists and is readable (expected mode 0600, parent mode 0700)." },
+          { "error": "failed to reach operator socket", "fix": "Confirm apm2-daemon.service is active and socket unit is active/enabled. Check journalctl for both services." },
+          { "error": "worker repeatedly restarts", "fix": "Check queue/runtime permissions. Check credentials. Run apm2 fac doctor --fix. For PR-scoped issues run apm2 fac doctor --pr <N> --fix." }
+        ]
+      },
+      {
+        "id": "9",
+        "title": "Failure mode diagnosis (TCK-00600)",
+        "subsections": [
+          {
+            "id": "9.1",
+            "title": "Watchdog-triggered restart",
+            "symptom": "journalctl shows watchdog timeout or Watchdog timestamp expired",
+            "diagnosis": "The process was alive but failed to send WATCHDOG=1 within 5 minutes, typically indicating the main loop is blocked.",
+            "resolution": "The watchdog restart is automatic. If restarts are recurring, investigate root cause (resource exhaustion, network partition, disk full)."
+          },
+          {
+            "id": "9.2",
+            "title": "Service stuck in activating state",
+            "symptom": "systemctl status shows activating (start) indefinitely",
+            "diagnosis": "With Type=notify, systemd waits for READY=1. If the daemon fails to bind its socket or the worker fails to connect to the broker, the signal is never sent.",
+            "resolution": "Check journalctl for startup errors, stop the service, verify socket directory and permissions."
+          },
+          {
+            "id": "9.3",
+            "title": "Worker heartbeat stale but process active",
+            "symptom": "apm2 fac services status shows worker health=healthy but worker_heartbeat.fresh=false",
+            "diagnosis": "Worker process is alive (responding to systemd watchdog) but the wake/reconcile loop is not completing cycles.",
+            "resolution": "Check cycle_count in heartbeat file. If not incrementing, worker is stuck in a job. Check worker logs."
+          },
+          {
+            "id": "9.4",
+            "title": "PID mismatch between heartbeat and systemd",
+            "symptom": "worker_heartbeat.pid does not match systemctl show -p MainPID",
+            "diagnosis": "A previous worker instance wrote the heartbeat and then crashed. The new instance has a different PID.",
+            "resolution": "Wait for the next wake/safety-nudge cycle. The new worker will overwrite the heartbeat file."
+          }
+        ]
+      }
+    ]
+  }
+}

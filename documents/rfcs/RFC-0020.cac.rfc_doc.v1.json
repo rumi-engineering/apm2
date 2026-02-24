@@ -1,0 +1,1433 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0020",
+    "title": "Holonic Substrate Interface (HSI): Contract, Handshake, Identity, Capabilities",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0020",
+    "labels": [
+      "hsi",
+      "protocol",
+      "handshake",
+      "identity",
+      "capabilities",
+      "receipts",
+      "security_boundary",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0020 (legacy requirement YAMLs + markdown)",
+        "note": "Consolidates HSI into single CAC RFC doc; legacy markdown becomes non-normative reference."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0016",
+        "note": "FreshnessPolicy and epoch sealing depend on HTF."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0033",
+        "note": "Receipts and evidence pointers depend on ledger/CAS."
+      },
+      {
+        "kind": "AFFECTS",
+        "ref": "dcp://apm2.dev/rfc/RFC-0032",
+        "note": "FAC uses HSI routes, receipts, and capability semantics."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0020",
+      "notes": "Converted HSI legacy requirement YAMLs into structured requirement nodes and grouped by boundary surfaces."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0020: Holonic Substrate Interface (HSI)",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and boundary",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC specifies the **Holonic Substrate Interface (HSI)**: the boundary contract between holons (agents) and the kernel substrate (daemon).\n\nHSI defines:\n* the route contract (HSIContractManifest),\n* handshake and protocol binding,\n* session authentication and parser hardening,\n* identity, certificates, and authority seals,\n* capability/lease semantics and actuation gating,\n* receipt structures and multiproof equivalence,\n* and enforcement mechanisms that prevent bypass of authority boundaries.\n\nHSI is a security boundary. All inputs (including time) are adversarial by default.\n"
+        },
+        {
+          "type": "section",
+          "title": "1. Contract manifest, routing semantics, and canonicalization",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0001",
+              "title": "HSIContractManifest deterministic generation and semantics coverage",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Implementations MUST generate HSIContractManifestV1 deterministically from daemon and CLI dispatch metadata; build pipelines MUST fail when authoritative routes lack semantics annotations; manifest bytes and hash outputs MUST be reproducible across equivalent builds.\n\nPrimary delivery ticket: TCK-00347",
+                "acceptance": [
+                  "Manifest generation deterministic across repeat builds",
+                  "Missing route semantics annotation fails CI/build",
+                  "Golden hash fixture tests pass",
+                  "Primary implementation ticket TCK-00347 is completed with linked evidence."
+                ],
+                "rationale": "Deterministic contract materialization is required to prevent interface drift across recursive holons and to make handshake compatibility machine-checkable.",
+                "domain": [
+                  "functional"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0001"
+                },
+                "evidence": [
+                  "EVID-0001"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0031",
+              "title": "ToolKinds argument safety and idempotency",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Authoritative tool routes MUST use typed ToolKinds with canonical argument validation, git path and ref validation, and idempotency or precondition declarations for side-effectful operations.\n\nPrimary delivery ticket: TCK-00377",
+                "acceptance": [
+                  "Argument injection and path traversal regression suites pass",
+                  "Non-idempotent tools declare and enforce preconditions",
+                  "Raw command strings are not accepted on authoritative routes",
+                  "Primary implementation ticket TCK-00377 is completed with linked evidence."
+                ],
+                "rationale": "Typed actuation surfaces are required to prevent injection and nondeterministic behavior.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0031"
+                },
+                "evidence": [
+                  "EVID-0031"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0037",
+              "title": "RoleSpec launch contract hash-binding and fail-closed admission checks",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC CLI role launch surfaces MUST require explicit hash bindings for role, context,\npolicy snapshot, and work identity, and MUST deny launch on missing/stale/unverifiable\nbindings prior to authoritative actuation.\n\nPrimary delivery ticket: TCK-00449.",
+                "acceptance": [
+                  "CLI launch command requires role_spec_hash, work_id, and context/policy hash bindings.",
+                  "Launch denies by default on missing, stale, ambiguous, or unverifiable bindings.",
+                  "Launch receipts bind hash commitments and can be independently replay-verified.",
+                  "Admission checks run before any authoritative tool actuation."
+                ],
+                "rationale": "Authority-bearing launch cannot depend on implicit or mutable context; launch-time\nadmissibility must be bound to replayable hash commitments.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0037"
+                },
+                "evidence": [
+                  "EVID-0029",
+                  "EVID-0030"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The daemon's exposed routes are described by a deterministic HSIContractManifest.\nEach route is annotated with semantics (authoritative vs advisory, idempotent vs non-idempotent, risk tier, receipt requirements).\nThe manifest is canonicalized and hashed; the hash is bound into the handshake so the CLI and daemon cannot silently disagree about semantics.\n"
+        },
+        {
+          "type": "section",
+          "title": "2. Handshake, version binding, and canonicalizer binding",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0002",
+              "title": "Handshake contract hash and canonicalizer binding",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Session handshake MUST exchange and persist cli_contract_hash and canonicalizer id/version; risk-tier mismatch policy MUST implement Tier0-1 warn/waive and Tier2+ deny-by-default behavior.\n\nPrimary delivery ticket: TCK-00348",
+                "acceptance": [
+                  "Handshake fails closed for Tier2+ contract/canonicalizer mismatch",
+                  "SessionStarted binds contract hash and canonicalizer metadata",
+                  "Mismatch counters emitted with risk-tier labels",
+                  "Primary implementation ticket TCK-00348 is completed with linked evidence."
+                ],
+                "rationale": "Early contract mismatch detection prevents confused-deputy execution under incompatible syscall semantics.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0002"
+                },
+                "evidence": [
+                  "EVID-0002"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0018",
+              "title": "FreshnessPolicy HTF authority",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FreshnessPolicyV1 MUST evaluate staleness using HTF and ledger-anchor lag authority inputs; remote wall-clock deltas and direct cross-cell remote-tick comparisons are forbidden for authorization semantics; Tier2+ missing/stale/ambiguous freshness authority MUST deny actuation; EpisodeEnvelopeV1 MUST bind FreshnessPinsetV1 (or equivalent deterministic pinset commitment) for reproducibility-critical inputs.\n\nPrimary delivery ticket: TCK-00364",
+                "acceptance": [
+                  "Tier2+ stale heads deny authoritative actions",
+                  "Policy evaluator uses HTF-compatible lag authority only",
+                  "Cross-cell freshness evaluation does not rely on remote monotonic tick comparison",
+                  "Episode envelopes bind freshness pinset commitments used for replay/audit validation",
+                  "Staleness outcomes are deterministic and auditable",
+                  "Primary implementation ticket TCK-00364 is completed with linked evidence."
+                ],
+                "rationale": "Authoritative freshness requires deterministic time authority resistant to clock manipulation.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0018"
+                },
+                "evidence": [
+                  "EVID-0018"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0019",
+              "title": "EpochSeal monotonic federation freshness",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "EpochSealV1 MUST provide monotonic freshness commitments for directory heads, permeability grants, and receipt-batch epoch artifacts; Tier2+ cross-cell authority admissions MUST require a valid EpochSealV1 (or equivalent quorum-certified HTF envelope), and non-monotone, conflicting, or missing seals MUST deny admission.\n\nPrimary delivery ticket: TCK-00365",
+                "acceptance": [
+                  "Epoch seals issued for configured freshness-critical artifacts including directory heads and authority-bearing delegation/batch paths",
+                  "Admission path rejects non-monotone or conflicting epoch sequences",
+                  "Tier2+ authority admissions fail closed on missing/invalid seals",
+                  "Primary implementation ticket TCK-00365 is completed with linked evidence."
+                ],
+                "rationale": "Federation freshness must be robust to replay and equivocation under partitions.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0019"
+                },
+                "evidence": [
+                  "EVID-0019"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Handshake must occur before any privileged operation.\nThe handshake binds protocol version, contract hash, and canonicalizer IDs/versions so both parties agree on parsing and semantics.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. Session state, parser hardening, and bounded economics",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0003",
+              "title": "Session-state, enum decoding, and bounded parser hardening",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Authority-bearing operations MUST require valid session-state progression; decoders MUST enforce bounded payload size before decode and bounded collections after decode; unknown/invalid enum values MUST fail closed without truncation or default coercion; unknown fields in signed/hashed JSON artifacts MUST be rejected, and unknown fields in signed/hashed protobuf artifacts MUST be dropped before canonicalization/signing and MUST NOT be forwarded across holonic boundaries.\n\nPrimary delivery ticket: TCK-00349",
+                "acceptance": [
+                  "No privileged route reachable before validated session-open state",
+                  "Bound violations reject requests with structured defects",
+                  "Invalid enum values never coerce to permissive defaults",
+                  "Signed/hashed JSON rejects unknown fields; signed/hashed protobuf drops unknown fields before hashing and does not forward them",
+                  "Primary implementation ticket TCK-00349 is completed with linked evidence."
+                ],
+                "rationale": "Session and state decode hardening close a primary attack surface for bypassing enforcement.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0003"
+                },
+                "evidence": [
+                  "EVID-0003"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0011",
+              "title": "O(log n) identity verification with bounded economics",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Identity membership and non-membership verification MUST remain O(log n) or better with explicit proof byte, depth, and node-count caps and benchmarked behavior for a 10^12 namespace model; verifiers MUST support head-cache amortization such that verifying K identities against one admitted head requires O(1) signature/quorum checks plus O(K log n) hashing.\n\nPrimary delivery ticket: TCK-00357",
+                "acceptance": [
+                  "Verifier work class validated as O(log n) for membership and non-membership under admitted profiles",
+                  "Head-cache amortization demonstrates O(1) signature/quorum checks per cached head across K identity verifications",
+                  "Bound violations fail closed before memory amplification",
+                  "Forged/malformed proofs consistently denied",
+                  "Primary implementation ticket TCK-00357 is completed with linked evidence."
+                ],
+                "rationale": "Asymptotic guarantees must be operationally constrained by bounded proof economics.",
+                "domain": [
+                  "performance",
+                  "performance"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0011"
+                },
+                "evidence": [
+                  "EVID-0011"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0013",
+              "title": "Verifier cache safety contract",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Verifiers MUST support cache amortization from verified heads across multiple identity checks and MUST invalidate deterministically on revocation, rotation, and head advancement.\n\nPrimary delivery ticket: TCK-00359",
+                "acceptance": [
+                  "Cache reuse measurably reduces repeated verification cost",
+                  "Stale cache entries cannot authorize revoked identities",
+                  "Invalidation path is deterministic and auditable",
+                  "Primary implementation ticket TCK-00359 is completed with linked evidence."
+                ],
+                "rationale": "Cache reuse is required for throughput, but stale cache safety is non-negotiable for security.",
+                "domain": [
+                  "performance",
+                  "performance"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0013"
+                },
+                "evidence": [
+                  "EVID-0013"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0035",
+              "title": "Anti-entropy boundedness and budgeted backpressure",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Federation anti-entropy MUST remain pull-only and budget-bound across episode, cell, and relay scopes; budget exceedance MUST deny further actuation and emit defects.\n\nPrimary delivery ticket: TCK-00381",
+                "acceptance": [
+                  "Anti-entropy delivery is strictly pull-based and bounded",
+                  "Byzantine relay behaviors cannot force authority acceptance",
+                  "Partition/rejoin converges under revocation-wins semantics",
+                  "Primary implementation ticket TCK-00381 is completed with linked evidence."
+                ],
+                "rationale": "Bounded replication and backpressure are required to preserve liveness and containment under load.",
+                "domain": [
+                  "reliability",
+                  "reliability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0035"
+                },
+                "evidence": [
+                  "EVID-0035"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0039",
+              "title": "Launch lifecycle liveness pulse and bounded restart policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Role-launch execution MUST emit deterministic liveness pulse receipts, enforce bounded\nrestart policy, and publish terminal reason taxonomy so stalled or ambiguous runs deny\nauthoritative progression instead of remaining indeterminate.\n\nPrimary delivery ticket: TCK-00451.",
+                "acceptance": [
+                  "Liveness pulse receipts include run identity, time anchor, and health verdict fields.",
+                  "Restart policy is bounded and emits explicit reason-coded transitions.",
+                  "Ambiguous liveness state denies authoritative progression with structured defect output.",
+                  "Terminal reason taxonomy is stable and consumable by gate/orchestrator logic."
+                ],
+                "rationale": "Without deterministic liveness semantics, authority-bearing launch flows can deadlock or\nsilently degrade under fault conditions.",
+                "domain": [
+                  "reliability",
+                  "reliability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0039"
+                },
+                "evidence": [
+                  "EVID-0029",
+                  "EVID-0030"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Sessions must be explicit and stateful. Parsers must be bounded (length limits, enum decoding hardening, no unbounded recursion).\nIdentity verification must be asymptotically bounded.\n"
+        },
+        {
+          "type": "section",
+          "title": "4. Episode envelopes, receipts, and proof obligations",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0004",
+              "title": "Episode envelope and receipt binding completeness",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All authoritative effects MUST bind EpisodeEnvelopeV1 hash, capability_manifest_hash, and ViewCommitmentV1 hash (`view_commitment_hash`) in receipts; EpisodeEnvelopeV1 MUST bind freshness_pinset_hash (or equivalent deterministic pinned-snapshot commitment), and delegated episodes MUST bind permeability_receipt_hash; spawn or resume without valid envelope bindings MUST be denied.\n\nPrimary delivery ticket: TCK-00350",
+                "acceptance": [
+                  "Tool receipts always carry envelope/capability/view bindings",
+                  "Episode envelopes bind a deterministic freshness pinset commitment hash",
+                  "Spawn/resume denied when envelope absent or malformed",
+                  "Replay harness can resolve and verify bindings from CAS + ledger",
+                  "Primary implementation ticket TCK-00350 is completed with linked evidence."
+                ],
+                "rationale": "Proof-carrying effects require immutable commitment roots for replay and audit correctness.",
+                "domain": [
+                  "functional"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0004"
+                },
+                "evidence": [
+                  "EVID-0004"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0005",
+              "title": "Pre-actuation stop and budget proof obligations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Stop conditions and typed budgets MUST be evaluated before tool actuation and represented by explicit receipt evidence or mandatory receipt fields proving precondition evaluation order.\n\nPrimary delivery ticket: TCK-00351",
+                "acceptance": [
+                  "No tool actuation occurs without prior stop/budget evaluation",
+                  "Replay harness verifies ordering invariants",
+                  "Stop uncertainty triggers deny in configured deadline path",
+                  "Primary implementation ticket TCK-00351 is completed with linked evidence."
+                ],
+                "rationale": "Safety-critical gating requires proving preconditions before side effects.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0005"
+                },
+                "evidence": [
+                  "EVID-0005"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0016",
+              "title": "AuthoritySeal unified fact authentication",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "AuthoritySealV1 MUST authenticate facts in SINGLE_SIG, QUORUM_MULTISIG/QUORUM_THRESHOLD, and MERKLE_BATCH modes with domain-separated preimages, mandatory ledger-anchor semantics, and Tier2+/governance time-envelope requirements for authoritative acceptance.\n\nPrimary delivery ticket: TCK-00362",
+                "acceptance": [
+                  "AuthoritySeal verifies direct, quorum, threshold, and Merkle-batch authenticated facts",
+                  "Unsigned/free-floating batch roots are rejected for authority use",
+                  "Domain separation tags and issuer key/quorum identifiers are required and validated",
+                  "Primary implementation ticket TCK-00362 is completed with linked evidence."
+                ],
+                "rationale": "Unified fact-authentication semantics reduce verifier complexity and remove free-floating signature ambiguity.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0016"
+                },
+                "evidence": [
+                  "EVID-0016"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0017",
+              "title": "ReceiptPointer and multiproof acceptance equivalence",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ReceiptPointerV1 and ReceiptMultiProofV1 MUST allow authoritative receipt verification from receipt bytes, seal, and inclusion proof without ledger search and preserve equivalent acceptance semantics to direct signature paths.\n\nPrimary delivery ticket: TCK-00363",
+                "acceptance": [
+                  "Cross-holon authoritative receipt references use ReceiptPointer by default",
+                  "Multiproof validation yields deterministic membership results",
+                  "Behavioral acceptance equivalence documented and tested",
+                  "Primary implementation ticket TCK-00363 is completed with linked evidence."
+                ],
+                "rationale": "Cross-holon evidence exchange requires compact pointers with deterministic verifier behavior.",
+                "domain": [
+                  "functional"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0017"
+                },
+                "evidence": [
+                  "EVID-0017"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Episodes are the unit of work execution. Episode envelopes and receipts bind identity, context, budgets, and stop conditions.\nPre-actuation proof obligations enforce safety before any side effects.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. Identity, certificates, and revocation",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0007",
+              "title": "Canonical key identifier formats",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "PublicKeyIdV1, KeySetIdV1, CellIdV1, HolonIdV1, and SPIFFE-like identity text forms MUST define strict canonical text and binary forms, bounded length, and parser conformance vectors rejecting non-canonical encodings; any *_quorum_id MUST resolve to KeySetDescriptorV1 via digest-first lookup.\n\nPrimary delivery ticket: TCK-00353",
+                "acceptance": [
+                  "Canonical parser rejects mixed case/whitespace/non-canonical encodings, percent-decoding tricks, and Unicode normalization variants",
+                  "Binary and text identity forms round-trip losslessly",
+                  "Any referenced *_quorum_id resolves to a canonical KeySetDescriptorV1 object in CAS",
+                  "Cross-language conformance vectors are stable",
+                  "Primary implementation ticket TCK-00353 is completed with linked evidence."
+                ],
+                "rationale": "Self-certifying identity trust starts at canonical key identifier determinism.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0007"
+                },
+                "evidence": [
+                  "EVID-0007"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0008",
+              "title": "Stable self-certifying cell and holon identity derivation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CellIdV1 and HolonIdV1 MUST derive from CellGenesisV1 and HolonGenesisV1 commitments such that operational key rotation preserves identity continuity.\n\nPrimary delivery ticket: TCK-00354",
+                "acceptance": [
+                  "ID derivation deterministic and collision-resistant under declared hash profile",
+                  "Rotation events preserve stable IDs",
+                  "Genesis artifacts are hash-addressed in CAS",
+                  "Primary implementation ticket TCK-00354 is completed with linked evidence."
+                ],
+                "rationale": "Stable IDs preserve audit graph continuity and delegation chain integrity.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0008"
+                },
+                "evidence": [
+                  "EVID-0008"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0009",
+              "title": "Certificate hierarchy and session-key delegation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CellCertificateV1, HolonCertificateV1, and SessionKeyDelegationV1 MUST enforce non-overlapping root, operational, and session key roles with explicit validity and authority bindings.\n\nPrimary delivery ticket: TCK-00355",
+                "acceptance": [
+                  "Certificate verification checks bindings and expiry constraints",
+                  "Session key delegation bounded by operational key authority",
+                  "Role overlap between root/operational/session keys is rejected",
+                  "Primary implementation ticket TCK-00355 is completed with linked evidence."
+                ],
+                "rationale": "Role-separated key hierarchy minimizes blast radius and supports controlled key lifecycle operations.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0009"
+                },
+                "evidence": [
+                  "EVID-0009"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0010",
+              "title": "Directory head and identity proof artifacts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Boundary-crossing identity values MUST be accompanied by proof-carrying pointers via HolonDirectoryHeadV1, IdentityProofV1, and DirectoryProofV1; unverifiable identity claims MUST be rejected for authoritative actions.\n\nPrimary delivery ticket: TCK-00356",
+                "acceptance": [
+                  "Identity-bearing messages include identity_proof_hash pointers",
+                  "Directory head hashes resolve to signed/authenticated head artifacts",
+                  "Unproofed identity values rejected for authoritative operations",
+                  "Primary implementation ticket TCK-00356 is completed with linked evidence."
+                ],
+                "rationale": "Identity at scale requires verifiable membership semantics without registry scans.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0010"
+                },
+                "evidence": [
+                  "EVID-0010"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0012",
+              "title": "IdentityProofProfile pinning and compatibility",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "IdentityProofProfileV1 MUST declare proof and verifier contracts and be hash-pinned in directory heads; unknown or mismatched profiles MUST fail closed for Tier2+ authority paths.\n\nPrimary delivery ticket: TCK-00358",
+                "acceptance": [
+                  "Profile hash mismatch blocks authoritative verification",
+                  "Session-open path records active proof profile hash",
+                  "Unsupported profiles are rejected deterministically",
+                  "Primary implementation ticket TCK-00358 is completed with linked evidence."
+                ],
+                "rationale": "Profile pinning prevents proof-format ambiguity and cross-implementation parser drift.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0012"
+                },
+                "evidence": [
+                  "EVID-0012"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0014",
+              "title": "Revocation-wins signed CRDT convergence",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Directory convergence MUST implement revocation-wins signed CRDT merge semantics and require explicit re-admission anchors before any revoked identity can become active again.\n\nPrimary delivery ticket: TCK-00360",
+                "acceptance": [
+                  "Concurrent updates converge deterministically",
+                  "Revoked identities cannot resurrect without explicit re-admission proof",
+                  "Byzantine ordering does not violate revocation-wins law",
+                  "Primary implementation ticket TCK-00360 is completed with linked evidence."
+                ],
+                "rationale": "Revocation races are a primary partition-time threat; monotone revocation semantics close that class.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0014"
+                },
+                "evidence": [
+                  "EVID-0014"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0015",
+              "title": "Session-open proof-carrying identity enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "hsi.session.open MUST require client holon_id with identity_proof_hash and daemon cell certificate plus directory head bindings; the daemon MUST bind verified holon_id to session_id and reject identity switching; when session keys are used, session_key_id MUST be bound for replay protection; Tier2+ sessions MUST return an identity freshness witness and freshness-policy pointer, and non-discovery authority paths MUST deny on freshness uncertainty.\n\nPrimary delivery ticket: TCK-00361",
+                "acceptance": [
+                  "Tier2+ authority denied on stale/missing identity freshness proofs",
+                  "Session record pins verified holon_id and rejects post-open identity mutation attempts",
+                  "Tier2+ responses include epoch/freshness witness plus freshness-policy pointer used by actuation checks",
+                  "Discovery-only surfaces can proceed under configured degraded policy",
+                  "Session-open path is fully receipt/defect-instrumented",
+                  "Primary implementation ticket TCK-00361 is completed with linked evidence."
+                ],
+                "rationale": "Session open is the canonical authority admission gate and must be strictly proof-carrying.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0015"
+                },
+                "evidence": [
+                  "EVID-0015"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Identity is self-certifying and hierarchical. Session keys are delegated from long-term identities.\nRevocation converges under a revocation-wins CRDT policy.\n"
+        },
+        {
+          "type": "section",
+          "title": "6. Freshness policy, epoch sealing, and optional VDF delay profiles",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0018",
+              "title": "FreshnessPolicy HTF authority",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FreshnessPolicyV1 MUST evaluate staleness using HTF and ledger-anchor lag authority inputs; remote wall-clock deltas and direct cross-cell remote-tick comparisons are forbidden for authorization semantics; Tier2+ missing/stale/ambiguous freshness authority MUST deny actuation; EpisodeEnvelopeV1 MUST bind FreshnessPinsetV1 (or equivalent deterministic pinset commitment) for reproducibility-critical inputs.\n\nPrimary delivery ticket: TCK-00364",
+                "acceptance": [
+                  "Tier2+ stale heads deny authoritative actions",
+                  "Policy evaluator uses HTF-compatible lag authority only",
+                  "Cross-cell freshness evaluation does not rely on remote monotonic tick comparison",
+                  "Episode envelopes bind freshness pinset commitments used for replay/audit validation",
+                  "Staleness outcomes are deterministic and auditable",
+                  "Primary implementation ticket TCK-00364 is completed with linked evidence."
+                ],
+                "rationale": "Authoritative freshness requires deterministic time authority resistant to clock manipulation.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0018"
+                },
+                "evidence": [
+                  "EVID-0018"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0019",
+              "title": "EpochSeal monotonic federation freshness",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "EpochSealV1 MUST provide monotonic freshness commitments for directory heads, permeability grants, and receipt-batch epoch artifacts; Tier2+ cross-cell authority admissions MUST require a valid EpochSealV1 (or equivalent quorum-certified HTF envelope), and non-monotone, conflicting, or missing seals MUST deny admission.\n\nPrimary delivery ticket: TCK-00365",
+                "acceptance": [
+                  "Epoch seals issued for configured freshness-critical artifacts including directory heads and authority-bearing delegation/batch paths",
+                  "Admission path rejects non-monotone or conflicting epoch sequences",
+                  "Tier2+ authority admissions fail closed on missing/invalid seals",
+                  "Primary implementation ticket TCK-00365 is completed with linked evidence."
+                ],
+                "rationale": "Federation freshness must be robust to replay and equivocation under partitions.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0019"
+                },
+                "evidence": [
+                  "EVID-0019"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0020",
+              "title": "Optional VDF delay profile correctness",
+              "children": [],
+              "data": {
+                "level": "MAY",
+                "statement": "When enabled, VDF profiles MUST derive deterministic challenges from cell_id, prior_epoch_root, and quorum_anchor and produce verifiable outputs bound into epoch seals.\n\nPrimary delivery ticket: TCK-00366",
+                "acceptance": [
+                  "VDF profile can be enabled per-link/per-cell policy",
+                  "Forged/non-monotone VDF evidence is rejected deterministically",
+                  "Epoch seal verification remains bounded when VDF is enabled",
+                  "Primary implementation ticket TCK-00366 is completed with linked evidence."
+                ],
+                "rationale": "Optional delay hardening must remain deterministic and non-disruptive while increasing adversarial cost.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0020"
+                },
+                "evidence": [
+                  "EVID-0020"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Freshness is governed by HTF (RFC-0016). Epoch sealing provides monotone federation freshness.\nOptional VDF delay profiles can be used on adversarial links to impose sequential work.\n"
+        },
+        {
+          "type": "section",
+          "title": "7. Composition and consensus hooks",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0021",
+              "title": "Bisimulation gate for recursion depth N<=12",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The project MUST maintain a machine-checkable bisimulation artifact proving observational equivalence between nested holon composition and flattened execution for recursion depth N<=12.\n\nPrimary delivery ticket: TCK-00367",
+                "acceptance": [
+                  "Model artifact checks observational equivalence for N<=12",
+                  "Counterexamples are emitted as blocking defects",
+                  "Gate integration blocks promotion on proof failure",
+                  "Primary implementation ticket TCK-00367 is completed with linked evidence."
+                ],
+                "rationale": "Bounded formal equivalence is required to preserve recursion semantics during optimization and rollout.",
+                "domain": [
+                  "formal"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0021"
+                },
+                "evidence": [
+                  "EVID-0021"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0022",
+              "title": "Functorial composition law for rewrite admission",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Optimization rewrites MUST be admitted only when they satisfy functorial observation-law constraints over the bounded model and preserve composition semantics.\n\nPrimary delivery ticket: TCK-00368",
+                "acceptance": [
+                  "Admitted rewrite catalog references proof obligations",
+                  "Non-proven rewrites are blocked from release pipelines",
+                  "Optimization does not change observable HSI truth semantics",
+                  "Primary implementation ticket TCK-00368 is completed with linked evidence."
+                ],
+                "rationale": "Category-theoretic rewrite constraints provide an explicit correctness contract for optimization admission.",
+                "domain": [
+                  "formal"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0022"
+                },
+                "evidence": [
+                  "EVID-0022"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0024",
+              "title": "FactRoot composition with RFC-0014 BFT checkpoints",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BFT cells MUST compose receipt batch roots into quorum-certified checkpoint structures through FactRootV1; BFT-mode ReceiptPointerV1 MUST support fact_root_proof plus qc_pointer authentication path; ReceiptBatchDescriptorV1 and FactInclusionProofV1 verification data MUST be sufficient to authenticate included facts without ad hoc ledger search; unauthenticated high-volume roots MUST be rejected for authoritative admission.\n\nPrimary delivery ticket: TCK-00370",
+                "acceptance": [
+                  "BFT-mode batch roots are checkpoint-composed by default",
+                  "Verifier supports QC + FactRoot proof path, including fact_root_proof + qc_pointer in receipt pointers",
+                  "Batch descriptors and fact inclusion proofs are deterministic and sufficient for verifier replay",
+                  "Free-floating batch roots are not accepted for authority",
+                  "Primary implementation ticket TCK-00370 is completed with linked evidence."
+                ],
+                "rationale": "Reuse of consensus proof work is essential to maintain verification economics under scale.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0024"
+                },
+                "evidence": [
+                  "EVID-0024"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0025",
+              "title": "Hierarchical batch forest commitments",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Implementations MUST support BatchEpochRootV1 root-of-roots commitments enabling bounded verification of receipts across batch and epoch levels.\n\nPrimary delivery ticket: TCK-00371",
+                "acceptance": [
+                  "Hierarchical roots are deterministic and content-addressed",
+                  "Verifier can traverse root-of-roots with bounded memory",
+                  "Anti-entropy advertisements can reference epoch roots directly",
+                  "Primary implementation ticket TCK-00371 is completed with linked evidence."
+                ],
+                "rationale": "Hierarchical commitments prevent proof traversal explosion over long-running high-volume histories.",
+                "domain": [
+                  "performance",
+                  "performance"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0025"
+                },
+                "evidence": [
+                  "EVID-0025"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "HSI includes formal hooks for recursive composition and consensus projections:\nbisimulation checks, functorial rewrite admission, and hierarchical commitments.\n"
+        },
+        {
+          "type": "section",
+          "title": "8. Capability containment, permeability lattice, and no-bypass actuation",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0006",
+              "title": "Policy-only capability minting and non-discoverability",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CapabilityManifestV1 MUST be minted only by policy resolver or admissible permeability delegation; requester-authored manifests are forbidden; broker MUST enforce scope, host, path, and quantitative constraints fail-closed.\n\nPrimary delivery ticket: TCK-00352",
+                "acceptance": [
+                  "Capability manifests cannot be minted by requester surfaces",
+                  "Out-of-scope tool/path/host attempts denied with defects",
+                  "Envelope-manifest hash mismatch always denies actuation",
+                  "Primary implementation ticket TCK-00352 is completed with linked evidence."
+                ],
+                "rationale": "Authority laundering prevention depends on strict origin and scope enforcement for capability artifacts.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0006"
+                },
+                "evidence": [
+                  "EVID-0006"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0027",
+              "title": "Permeability authority lattice meet enforcement",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Permeability delegation MUST be admitted only when delegated authority equals D=meet(A,O) over AuthorityVectorV1 dimensions across risk, capabilities, budgets, stop predicates, attestation floor, taint, classification, expiry, and federation caps; PermeabilityReceiptV1 MUST carry authority_overlay_hash (or inline hashed overlay), and delegated episodes/authoritative receipts MUST bind permeability_receipt_hash; missing, unverifiable, expired, or revoked delegation receipts MUST deny actuation.\n\nPrimary delivery ticket: TCK-00373",
+                "acceptance": [
+                  "Delegation widening attempts are denied",
+                  "Meet algorithm deterministic across implementations",
+                  "PermeabilityReceipt admission enforces D == meet(A, O) and rejects unverifiable overlays",
+                  "Delegated envelopes and receipts always bind permeability_receipt_hash",
+                  "Negative tests cover recursion depth >=4 laundering attempts",
+                  "Primary implementation ticket TCK-00373 is completed with linked evidence."
+                ],
+                "rationale": "Strict-subset delegation is only enforceable through a machine-checkable meet algorithm.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0027"
+                },
+                "evidence": [
+                  "EVID-0027"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0028",
+              "title": "Capsule containment with no ambient authority",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tier3+ actuation MUST execute within admitted capsule profiles with namespace, seccomp, cgroup, and deny-by-default egress controls and no ambient OS authority.\n\nMulti-ticket delivery: TCK-00374 delivers policy types, validation logic,\nand unit tests. TCK-00375 wires AdmissionGate::check into the daemon\nactuation path. TCK-00376 ensures no-bypass path ratchet.",
+                "acceptance": [
+                  "Tier3+ actuation executes only inside admitted capsule profile",
+                  "Capsule egress defaults to deny unless policy grants explicit route",
+                  "Escape attempts become blocking defects",
+                  "Primary implementation ticket TCK-00374 is completed with linked evidence."
+                ],
+                "rationale": "Containment boundaries are mandatory for safe autonomous actuation.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0028"
+                },
+                "evidence": [
+                  "EVID-0028"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0029",
+              "title": "Context firewall and TOCTOU integrity",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Context access MUST be constrained by ContextPack commitments and TOCTOU hash checks; Tier3+ violations MUST terminate execution and emit defects.\n\nPrimary delivery ticket: TCK-00375",
+                "acceptance": [
+                  "Out-of-pack context access always denied and logged",
+                  "TOCTOU mismatches are detected before tool execution",
+                  "Tier3+ violations terminate with mandatory defect emission",
+                  "Primary implementation ticket TCK-00375 is completed with linked evidence."
+                ],
+                "rationale": "Prompt-injection and context-poisoning resistance requires strict contextual integrity controls.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0029"
+                },
+                "evidence": [
+                  "EVID-0029"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0030",
+              "title": "No bypass actuation paths",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tool execution paths MUST always traverse broker, capability, and context firewall checks; missing enforcement dependencies MUST deny actuation by default.\n\nPrimary delivery ticket: TCK-00376",
+                "acceptance": [
+                  "No actuation path bypasses broker and policy checks",
+                  "Unavailable enforcement dependency causes deny, never permissive fallback",
+                  "Regression suite prevents bypass reintroduction",
+                  "Primary implementation ticket TCK-00376 is completed with linked evidence."
+                ],
+                "rationale": "Any bypass path invalidates proof-carrying security guarantees.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0030"
+                },
+                "evidence": [
+                  "EVID-0030"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0032",
+              "title": "Dual lattice taint and confidentiality enforcement",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Runtime policy MUST propagate taint and confidentiality labels through context, tool, and evidence flows and require explicit declassification receipts for confidentiality downgrades.\n\nPrimary delivery ticket: TCK-00378",
+                "acceptance": [
+                  "Tier3+ actuators reject untrusted or over-confidential inputs",
+                  "Declassification requires explicit policy and receipt emission",
+                  "Secret leakage adversarial tests pass",
+                  "Primary implementation ticket TCK-00378 is completed with linked evidence."
+                ],
+                "rationale": "Dual-lattice semantics preserve integrity and confidentiality simultaneously under recursion.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0032"
+                },
+                "evidence": [
+                  "EVID-0032"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0038",
+              "title": "Markov-blanket authoritative channel enforcement and no-bypass actuation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Launch-driven authoritative execution MUST enforce Markov-blanket channel boundaries:\nonly typed tool-intent channel events are admissible as authority inputs and all\nauthoritative effects MUST traverse broker + capability + context-firewall checks.\n\nPrimary delivery ticket: TCK-00450.",
+                "acceptance": [
+                  "Authoritative actuation is blocked unless sourced from typed tool-intent channel events.",
+                  "No bypass path exists around broker/capability/context-firewall enforcement in launch flows.",
+                  "Boundary violations emit structured defects and deny authoritative progression.",
+                  "Adversarial replay tests verify no revived side-effects through untyped channels."
+                ],
+                "rationale": "Treating free-form model output as authority input creates bypass and injection surfaces;\ntyped boundary channels are required for containment and replayability.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0038"
+                },
+                "evidence": [
+                  "EVID-0002",
+                  "EVID-0030"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Capabilities are policy-minted and non-discoverable. The permeability lattice governs authority.\nNo side-effectful actuation may occur outside the enforced channels.\n"
+        },
+        {
+          "type": "section",
+          "title": "9. Attestation floors, digest-first admission, and anti-entropy",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0033",
+              "title": "Attestation floor tightening by risk tier",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Tier3+ actuators and cross-cell authoritative imports MUST enforce minimum attestation floors and reject sub-floor inputs or claims.\n\nPrimary delivery ticket: TCK-00379",
+                "acceptance": [
+                  "Tier3+ requests below attestation floor are denied",
+                  "Cross-cell imported facts below floor are quarantined",
+                  "Floor evaluations are receipt/audit-event visible",
+                  "Primary implementation ticket TCK-00379 is completed with linked evidence."
+                ],
+                "rationale": "Higher-risk operations require stronger provenance guarantees.",
+                "domain": [
+                  "security",
+                  "security"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0033"
+                },
+                "evidence": [
+                  "EVID-0033"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0034",
+              "title": "Digest-first HMP classes and admission receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Inter-holon messaging MUST preserve WORK, EVIDENCE, and GOVERNANCE class semantics, default to digest-first payload references, and require AdmissionReceiptV1 (or ImportReceiptV1) for imported authoritative claims binding source cell_id, source anchor/range, verification method, and imported root/hash commitments.\n\nPrimary delivery ticket: TCK-00380",
+                "acceptance": [
+                  "Routing facts and acceptance facts are operationally distinct",
+                  "Authoritative imports require typed AdmissionReceiptV1/ImportReceiptV1 objects bound to evidence and source verification metadata",
+                  "Unsolicited large payloads are dropped with bounded resource use",
+                  "Primary implementation ticket TCK-00380 is completed with linked evidence."
+                ],
+                "rationale": "Separation of routing facts and acceptance facts is foundational for federated trust.",
+                "domain": [
+                  "functional"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0034"
+                },
+                "evidence": [
+                  "EVID-0034"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0026",
+              "title": "Attestation overhead contract and fallback",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "For RFC-0014 BFT cells, batching MUST meet <=1 percent p99 CPU and network overhead targets versus baseline (measured over >=10^6 effects with 10^8 runs and 10^12 projections) and MUST auto-fallback to direct verification when performance, integrity, or freshness gates fail.\n\nPrimary delivery ticket: TCK-00372",
+                "acceptance": [
+                  "Overhead measurements captured at 10^6 and 10^8 scales with documented 10^12 projection and within gate budgets",
+                  "Fallback path activates automatically on integrity/freshness/perf failure",
+                  "Fallback behavior preserves acceptance semantics",
+                  "Primary implementation ticket TCK-00372 is completed with linked evidence."
+                ],
+                "rationale": "Scalability contracts must be measurable and safe under degradation.",
+                "domain": [
+                  "performance",
+                  "performance"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0026"
+                },
+                "evidence": [
+                  "EVID-0026"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0035",
+              "title": "Anti-entropy boundedness and budgeted backpressure",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Federation anti-entropy MUST remain pull-only and budget-bound across episode, cell, and relay scopes; budget exceedance MUST deny further actuation and emit defects.\n\nPrimary delivery ticket: TCK-00381",
+                "acceptance": [
+                  "Anti-entropy delivery is strictly pull-based and bounded",
+                  "Byzantine relay behaviors cannot force authority acceptance",
+                  "Partition/rejoin converges under revocation-wins semantics",
+                  "Primary implementation ticket TCK-00381 is completed with linked evidence."
+                ],
+                "rationale": "Bounded replication and backpressure are required to preserve liveness and containment under load.",
+                "domain": [
+                  "reliability",
+                  "reliability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0035"
+                },
+                "evidence": [
+                  "EVID-0035"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0040",
+              "title": "Auditor and orchestrator projections for launch lineage and uncertainty",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "FAC launch execution MUST expose auditor- and orchestrator-facing projection surfaces\nthat report lineage completeness, liveness state, restart counters, and uncertainty flags\nfrom receipt-backed facts rather than transcript inspection.\n\nPrimary delivery ticket: TCK-00452.",
+                "acceptance": [
+                  "Auditor projection surfaces provide receipt-chain completeness and boundary-conformance indicators.",
+                  "Orchestrator projection surfaces provide active run count, last receipt tick, restart counters, and uncertainty flags.",
+                  "Projection responses are digest-first and replay-consistent across observers.",
+                  "Missing lineage data is surfaced as explicit non-admissible uncertainty."
+                ],
+                "rationale": "Operational control and governance require stable projection interfaces over receipts,\nnot ad-hoc process introspection.",
+                "domain": [
+                  "observability",
+                  "observability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0040"
+                },
+                "evidence": [
+                  "EVID-0040"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Risk tiers tighten attestation requirements. Admission uses digest-first classes with explicit receipts.\nAnti-entropy mechanisms are bounded and budgeted to prevent liveness collapse.\n"
+        },
+        {
+          "type": "section",
+          "title": "10. Business continuity and stop-path safety",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0036",
+              "title": "Business continuity and stop-path safety objectives",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Cells MUST meet defined RPO and RTO targets, execute and receipt disaster and partition drills as DrillReceiptV1 artifacts (binding scenario id/version, observed failure modes, recovery time, stop-order failure count, and supporting evidence references), and satisfy stop-path SLOs including p99 stop propagation <=2s and stop uncertainty deny <=250ms for Tier3+.\n\nPrimary delivery ticket: TCK-00382",
+                "acceptance": [
+                  "Stop-path SLO violations trigger automated fail-safe actions",
+                  "Chaos/partition drills emit DrillReceiptV1 with required bindings and auditable evidence references",
+                  "Formal artifacts are required inputs for stage promotion gates",
+                  "Cross-cell governance stop/rotation operations are authenticated and auditable",
+                  "Primary implementation ticket TCK-00382 is completed with linked evidence."
+                ],
+                "rationale": "Civilizational-scale claims require measurable disaster recovery and safety-loop performance.",
+                "domain": [
+                  "reliability",
+                  "reliability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0036"
+                },
+                "evidence": [
+                  "EVID-0036"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0020::REQ-0039",
+              "title": "Launch lifecycle liveness pulse and bounded restart policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Role-launch execution MUST emit deterministic liveness pulse receipts, enforce bounded\nrestart policy, and publish terminal reason taxonomy so stalled or ambiguous runs deny\nauthoritative progression instead of remaining indeterminate.\n\nPrimary delivery ticket: TCK-00451.",
+                "acceptance": [
+                  "Liveness pulse receipts include run identity, time anchor, and health verdict fields.",
+                  "Restart policy is bounded and emits explicit reason-coded transitions.",
+                  "Ambiguous liveness state denies authoritative progression with structured defect output.",
+                  "Terminal reason taxonomy is stable and consumable by gate/orchestrator logic."
+                ],
+                "rationale": "Without deterministic liveness semantics, authority-bearing launch flows can deadlock or\nsilently degrade under fault conditions.",
+                "domain": [
+                  "reliability",
+                  "reliability"
+                ],
+                "scope": {
+                  "subsystem": "hsi",
+                  "legacy_id": "REQ-0039"
+                },
+                "evidence": [
+                  "EVID-0029",
+                  "EVID-0030"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Stop paths and restart policies must preserve safety and prevent runaway loops.\n"
+        },
+        {
+          "type": "section",
+          "title": "11. Traceability to implementation",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Primary implementation surfaces:\n\n* Protocol framing + handshake: `crates/apm2-daemon/src/protocol/*`\n* HSI contract manifest generation and validation: `crates/apm2-daemon/src/hsi_contract/*`\n* Markov-blanket enforcement: `crates/apm2-core/src/channel/enforcement.rs`\n* Bisimulation gate (consensus hook): `crates/apm2-core/src/consensus/bisimulation.rs`\n* Epoch sealing + VDF profile types: `crates/apm2-core/src/htf/epoch_seal.rs`\n"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,410 @@
+{
+  "schema": "apm2.runbook.v1",
+  "schema_version": "1.0.0",
+  "kind": "operational.runbook",
+  "meta": {
+    "stable_id": "dcp://apm2.runbooks/fac-local-operations@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/runbooks/fac-local-operations.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "FAC Local Operations Runbook",
+    "description": "Operational procedures for running the Forge Admission Cycle (FAC) evidence gates locally using the `apm2 fac gates` command.",
+    "audience": "New operators bootstrapping FAC on a single host.",
+    "prerequisites": "Ubuntu 24.04, systemd user session, cgroup v2.",
+    "authority": "RFC-0019 Amendment A1 (FESv1), RFC-0007 (build tooling).",
+    "sections": [
+      {
+        "id": "1",
+        "title": "Bootstrap: first-time setup",
+        "subsections": [
+          {
+            "id": "1.1",
+            "title": "Install required tools",
+            "commands": [
+              "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+              "sudo apt install mold clang",
+              "cargo install cargo-nextest",
+              "which mold",
+              "cargo nextest --version"
+            ],
+            "notes": "nextest is the preferred and recommended test runner. When the bounded test runner is available (cgroup v2 + Rust bounded-runner path), FAC uses `cargo nextest run` inside a resource-bounded cgroup unit. When the bounded runner inputs are absent, the current implementation falls back to `cargo test --workspace`. Fail-closed enforcement (rejecting execution when nextest is unavailable) is planned for a future ticket (see DD-003 in RFC-0007 for the design intent)."
+          },
+          {
+            "id": "1.2",
+            "title": "Enable systemd user session (required for bounded execution)",
+            "description": "FAC uses `systemd-run --user` to enforce resource limits (memory, CPU, PIDs, wall-time) on evidence gate execution. This requires a functioning user bus.",
+            "commands": [
+              "sudo loginctl enable-linger $(whoami)",
+              "systemctl --user status",
+              "echo $XDG_RUNTIME_DIR"
+            ],
+            "notes": "If bounded execution is unavailable (the bounded runner script is missing or cgroup v2 is unavailable), `apm2 fac gates` falls back to running evidence gates without cgroup resource limits. The bounded execution path is strongly recommended. When bounded execution is selected but the user bus is unavailable, bounded execution does not fall back. It hard-fails during bounded-runner preflight."
+          },
+          {
+            "id": "1.3",
+            "title": "Build and install the apm2 CLI",
+            "commands": ["cd /path/to/apm2 && cargo build --release -p apm2-cli"]
+          },
+          {
+            "id": "1.4",
+            "title": "Initialize FAC directory structure",
+            "description": "Running `apm2 fac bootstrap --user` performs one-shot idempotent host provisioning and creates the full FAC directory tree.",
+            "directory_layout": {
+              "root": "$APM2_HOME/private/fac/",
+              "subdirs": [
+                "lanes/ - Execution lanes (bounded workspaces)",
+                "queue/pending/ - Job queue pending",
+                "queue/claimed/ - Job queue claimed",
+                "queue/completed/ - Job queue completed",
+                "queue/cancelled/ - Job queue cancelled",
+                "queue/denied/ - Job queue denied",
+                "queue/quarantine/ - Job queue quarantine",
+                "receipts/ - Content-addressed receipt objects",
+                "locks/lanes/ - Lane and queue locks",
+                "evidence/ - Per-gate evidence logs",
+                "repo_mirror/ - Node-local bare git mirror",
+                "cargo_home/ - FAC-managed CARGO_HOME",
+                "broker/ - Broker state (policy roots, horizons)",
+                "scheduler/ - Scheduler state persistence",
+                "policy/ - FacPolicyV1 files",
+                "blobs/ - Blob storage",
+                "gate_cache_v2/ - Gate cache for SHA-based result reuse"
+              ]
+            },
+            "commands": [
+              "apm2 fac bootstrap --user",
+              "apm2 fac bootstrap --system",
+              "apm2 fac bootstrap --user --dry-run"
+            ],
+            "bootstrap_phases": [
+              "Create the $APM2_HOME/private/fac/** directory tree with restricted permissions",
+              "Write default FacPolicyV1 -- skipped if the policy file already exists",
+              "Initialize lane pool",
+              "Optionally install systemd templates from contrib/systemd/",
+              "Run doctor checks; exit code is gated on the result (INV-BOOT-004, fail-closed)"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "2",
+        "title": "FESv1 bootstrap and lane management",
+        "subsections": [
+          {
+            "id": "2.1",
+            "title": "Understanding lanes",
+            "description": "A lane is a bounded, cullable execution context with: a dedicated workspace, target directory, log directory, and fixed resource profile enforced via systemd cgroups.",
+            "lifecycle": "IDLE -> LEASED -> RUNNING -> CLEANUP -> IDLE. Exceptional: * -> CORRUPT -> RESET -> IDLE",
+            "default_lane_count": "3 (derived from host memory policy: 96 GB / 24 GB per lane = 3 concurrent lanes)"
+          },
+          {
+            "id": "2.2",
+            "title": "Check and manage lanes",
+            "commands": [
+              "apm2 fac lane status",
+              "apm2 fac lane init",
+              "apm2 fac lane mark-corrupt lane-00 --reason 'manual quarantine'"
+            ]
+          },
+          {
+            "id": "2.3",
+            "title": "Pre-warm lane targets",
+            "description": "The `apm2 fac warm` command enqueues a lane-scoped pre-warm job.",
+            "commands": [
+              "apm2 fac warm",
+              "apm2 fac warm --wait",
+              "apm2 fac warm --wait --wait-timeout-secs 600",
+              "apm2 fac warm --phases fetch,build",
+              "apm2 fac warm --lane bulk"
+            ],
+            "flags": [
+              { "flag": "--phases <CSV>", "default": "fetch,build", "description": "Comma-separated list of phases to warm" },
+              { "flag": "--lane <NAME>", "default": "bulk", "description": "Lane to target for the warm job" },
+              { "flag": "--wait", "default": "off", "description": "Block until receipt is available" },
+              { "flag": "--wait-timeout-secs <N>", "default": "1200", "description": "Maximum seconds to wait when --wait is set" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "3",
+        "title": "Start services",
+        "subsections": [
+          {
+            "id": "3.1",
+            "title": "Running gates",
+            "description": "The `apm2 fac gates` command enqueues a gates job and waits for completion by default.",
+            "commands": [
+              "apm2 fac gates",
+              "apm2 fac gates --quick",
+              "apm2 fac gates --no-wait"
+            ],
+            "workflow": [
+              "Validates local preconditions (clean tree in full mode, input bounds)",
+              "Enqueues bounded evidence execution for the target SHA",
+              "Worker claims and executes the job under FAC policy/containment",
+              "Gate artifacts and receipts are written under FAC private state",
+              "CLI returns a deterministic JSON result"
+            ]
+          },
+          {
+            "id": "3.2",
+            "title": "Running worker services",
+            "commands": [
+              "systemctl --user status apm2-worker.service",
+              "systemctl --user restart apm2-worker.service",
+              "sudo systemctl status apm2-worker.service",
+              "sudo systemctl restart apm2-worker.service"
+            ],
+            "notes": "apm2-worker.service uses watcher wake signals on queue/pending and queue/claimed for steady-state activation. Direct `apm2 fac worker` invocation is diagnostics-only."
+          },
+          {
+            "id": "3.3",
+            "title": "Running GC (garbage collection)",
+            "description": "The `apm2 fac gc` command reclaims disk space across all FAC roots. It is safe to run at any time and is idempotent.",
+            "commands": [
+              "apm2 fac gc --dry-run",
+              "apm2 fac gc",
+              "apm2 fac gc --min-free-bytes 2147483648"
+            ],
+            "gc_targets": [
+              { "kind": "gate_cache", "ttl": "30-day TTL; entries at gate_cache_v2/{sha}/{gate}.yaml" },
+              { "kind": "blob_prune", "ttl": "Policy-determined" },
+              { "kind": "lane_target", "ttl": "During apm2 fac doctor --fix remediation or explicit GC" },
+              { "kind": "lane_log", "ttl": "During apm2 fac doctor --fix remediation or explicit GC" },
+              { "kind": "quarantine_prune", "ttl": "Default TTL from policy" },
+              { "kind": "denied_prune", "ttl": "Default TTL from policy" },
+              { "kind": "cargo_cache", "ttl": "Policy-determined" }
+            ]
+          },
+          {
+            "id": "3.4",
+            "title": "Enqueueing jobs manually (PLANNED)",
+            "description": "PLANNED -- not yet implemented. The `apm2 fac enqueue` subcommand does not exist in the current CLI. Manual job enqueueing is planned for a future ticket implementing the FESv1 queue/worker surface. For now, use `apm2 fac gates` for local gate execution."
+          }
+        ]
+      },
+      {
+        "id": "4",
+        "title": "Respond to quarantine and denials",
+        "subsections": [
+          {
+            "id": "4.1",
+            "title": "Understanding quarantine",
+            "description": "A job is moved to queue/quarantine/ when it fails validation.",
+            "causes": [
+              "RFC-0028 channel boundary check failed",
+              "Malformed job spec (FacJobSpecV1 could not be parsed with bounded deserialization)",
+              "Integrity check failed (job_spec_digest does not match computed digest)"
+            ],
+            "note": "Quarantined items are preserved for forensics. Never delete them manually."
+          },
+          {
+            "id": "4.2",
+            "title": "Diagnosing quarantined jobs",
+            "commands": [
+              "ls ${APM2_HOME:-$HOME/.apm2}/private/fac/queue/quarantine/",
+              "cat ${APM2_HOME:-$HOME/.apm2}/private/fac/queue/quarantine/<job_id>.json",
+              "ls ${APM2_HOME:-$HOME/.apm2}/private/fac/receipts/ | grep <job_id>"
+            ],
+            "common_causes": [
+              { "symptom": "Token decode failure", "cause": "Broker signing key rotated", "fix": "Restart broker, re-enqueue job" },
+              { "symptom": "Policy binding mismatch", "cause": "Policy root changed between enqueue and claim", "fix": "Re-enqueue with current policy root" },
+              { "symptom": "Malformed spec", "cause": "Corrupted file or incompatible schema version", "fix": "Regenerate job spec" },
+              { "symptom": "Digest mismatch", "cause": "File modified after creation (possible A2 attack)", "fix": "Investigate, re-enqueue from trusted source" }
+            ]
+          },
+          {
+            "id": "4.3",
+            "title": "Understanding denials",
+            "description": "A job is moved to queue/denied/ when it fails RFC-0029 queue admission.",
+            "causes": [
+              "Budget exceeded",
+              "Lane capacity: No lanes available within the admission window",
+              "Anti-starvation: Higher-priority queue lanes are draining first"
+            ]
+          },
+          {
+            "id": "4.4",
+            "title": "Recovering from quarantine/denial",
+            "commands": ["apm2 fac gates"]
+          }
+        ]
+      },
+      {
+        "id": "5",
+        "title": "Safe lane recovery with doctor",
+        "subsections": [
+          {
+            "id": "5.1",
+            "title": "When to run host remediation",
+            "triggers": [
+              "Lane cleanup failed (e.g., permission error, disk full during cleanup)",
+              "Process outlived its lease while associated systemd units remained active",
+              "Symlink safety check refused deletion (suspicious filesystem state)",
+              "Tmp residue/corruption prevents lane cleanup"
+            ]
+          },
+          {
+            "id": "5.2",
+            "title": "Check lane state before remediation",
+            "commands": ["apm2 fac lane status"]
+          },
+          {
+            "id": "5.3",
+            "title": "Apply deterministic remediation",
+            "commands": ["apm2 fac doctor --fix"],
+            "guarantees": [
+              "Symlink-safe recursive deletion (verifies each path component)",
+              "Refuses to cross filesystem boundaries",
+              "Refuses to delete unexpected file types (device nodes, sockets)",
+              "Runs lane+queue reconcile, bounded tmp scrub, stale log GC, and post-fix checks",
+              "Fails closed when orphaned units are still active or liveness is inconclusive"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "6",
+        "title": "Troubleshooting",
+        "subsections": [
+          {
+            "id": "6.1",
+            "title": "Gates fail to start",
+            "symptom": "apm2 fac gates hangs or returns immediately with no output",
+            "steps": [
+              "Check process health: systemctl --user status apm2-daemon.service apm2-worker.service",
+              "Check evidence logs: ls ${APM2_HOME:-$HOME/.apm2}/private/fac/evidence/ and apm2 fac logs",
+              "Check disk space: df -h and du -sh ${APM2_HOME:-$HOME/.apm2}/private/fac/"
+            ]
+          },
+          {
+            "id": "6.2",
+            "title": "Cold-start timeout (600s exceeded)",
+            "symptom": "Test gate fails with timeout during large compilation",
+            "steps": [
+              "Pre-warm the build using: apm2 fac warm --wait --wait-timeout-secs 1200",
+              "Fallback: run cargo build --workspace manually before running gates",
+              "If warming itself times out, check if dependencies changed significantly",
+              "Consider running GC to free disk space"
+            ]
+          },
+          {
+            "id": "6.3",
+            "title": "Bounded test execution unavailable",
+            "symptom": "Test gate falls back to cargo test --workspace instead of bounded cargo nextest run",
+            "fix": "Ensure the bounded runner can start. The fallback to cargo test --workspace is expected only when bounded execution prerequisites are missing. Install nextest to enable bounded execution with resource limits."
+          },
+          {
+            "id": "6.4",
+            "title": "systemd-run fails (no user bus)",
+            "symptom": "Failed to connect to user bus or similar systemd error",
+            "steps": [
+              "Enable lingering: sudo loginctl enable-linger $(whoami)",
+              "Verify: systemctl --user status",
+              "Ensure XDG_RUNTIME_DIR is set: echo $XDG_RUNTIME_DIR",
+              "For SSH sessions, ensure pam_systemd is configured"
+            ]
+          },
+          {
+            "id": "6.5",
+            "title": "Disk exhaustion",
+            "symptom": "Builds fail with 'No space left on device'",
+            "steps": [
+              "Run GC: apm2 fac gc --dry-run then apm2 fac gc",
+              "Check for orphaned evidence logs",
+              "Check build target directories: du -sh target/",
+              "Last resort: rm -rf target/ (compilation caches are safe to delete)"
+            ]
+          },
+          {
+            "id": "6.6",
+            "title": "Stale lease / claimed queue drift",
+            "symptom": "pending queue drains slowly while claimed jobs remain stuck",
+            "steps": [
+              "Check lane state: apm2 fac lane status",
+              "Check queue state: apm2 fac queue status",
+              "Run host reconciliation: apm2 fac doctor --fix",
+              "Confirm worker service is active: systemctl --user status apm2-worker.service"
+            ]
+          },
+          {
+            "id": "6.7",
+            "title": "Containment violation",
+            "symptom": "child processes appear outside expected FAC cgroup boundaries",
+            "steps": [
+              "Run containment verification: apm2 fac verify containment",
+              "Review worker logs: journalctl --user -u apm2-worker.service -n 200",
+              "If repeated, run remediation: apm2 fac doctor --fix"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "7",
+        "title": "Reference: CLI commands",
+        "commands": [
+          { "command": "apm2 fac bootstrap", "purpose": "One-shot host provisioning (--dry-run, --user, --system)" },
+          { "command": "apm2 fac services status", "purpose": "Systemd-backed daemon/worker service health" },
+          { "command": "apm2 fac doctor", "purpose": "Check daemon health and prerequisites" },
+          { "command": "apm2 fac doctor --fix", "purpose": "Deterministic host remediation (doctor-first)" },
+          { "command": "apm2 fac lane status", "purpose": "Inspect lane lock/lease/liveness state" },
+          { "command": "apm2 fac lane init", "purpose": "Initialize lane substrate (idempotent)" },
+          { "command": "apm2 fac lane mark-corrupt ...", "purpose": "Operator quarantine for suspicious lanes" },
+          { "command": "apm2 fac queue status", "purpose": "Queue forensics (pending, claimed, denied, quarantine)" },
+          { "command": "apm2 fac warm", "purpose": "Enqueue lane pre-warm job" },
+          { "command": "apm2 fac gc", "purpose": "Reclaim FAC disk state (--dry-run, --min-free-bytes)" },
+          { "command": "apm2 fac quarantine list|prune", "purpose": "Inspect/prune denied and quarantined jobs" },
+          { "command": "apm2 fac job show|cancel", "purpose": "Job lifecycle operations" },
+          { "command": "apm2 fac verify containment", "purpose": "Check cgroup containment for FAC execution" },
+          { "command": "apm2 fac logs [--pr <N>]", "purpose": "Discover local pipeline/review log paths" },
+          { "command": "apm2 fac push", "purpose": "Push + gate + review pipeline orchestration" },
+          { "command": "apm2 fac doctor --pr <N> --fix", "purpose": "PR-scoped doctor-first remediation and repair convergence" },
+          { "command": "apm2 fac review ...", "purpose": "Review orchestration and findings/verdict operations" },
+          { "command": "apm2 fac gates", "purpose": "Internal/advanced gates entrypoint (queue-backed wait model)" },
+          { "command": "apm2 fac worker", "purpose": "Internal runtime entrypoint (service-managed by apm2-worker.service)" }
+        ]
+      },
+      {
+        "id": "8",
+        "title": "Reference: lane lifecycle state machine",
+        "states": ["IDLE", "LEASED", "RUNNING", "CLEANUP", "CORRUPT", "RESET"],
+        "transitions": [
+          { "from": "IDLE", "to": "LEASED", "trigger": "lease acquired" },
+          { "from": "LEASED", "to": "RUNNING", "trigger": "job execution" },
+          { "from": "RUNNING", "to": "CLEANUP", "trigger": "job completes" },
+          { "from": "CLEANUP", "to": "IDLE", "trigger": "cleanup ok" },
+          { "from": "CLEANUP", "to": "CORRUPT", "trigger": "cleanup fails" },
+          { "from": "*", "to": "CORRUPT", "trigger": "any failure" },
+          { "from": "CORRUPT", "to": "RESET", "trigger": "doctor --fix" },
+          { "from": "RESET", "to": "IDLE", "trigger": "reset complete" }
+        ]
+      },
+      {
+        "id": "9",
+        "title": "Reference: queue lane priority order",
+        "description": "Queue lanes determine scheduling priority (highest first).",
+        "priority_order": [
+          { "rank": 1, "lane": "stop_revoke", "description": "Stop/revocation commands (highest priority)" },
+          { "rank": 2, "lane": "control", "description": "Control plane operations" },
+          { "rank": 3, "lane": "consume", "description": "Consumption operations" },
+          { "rank": 4, "lane": "replay", "description": "Replay operations" },
+          { "rank": 5, "lane": "projection_replay", "description": "Projection replay operations" },
+          { "rank": 6, "lane": "bulk", "description": "Bulk operations (lowest priority, default for gates)" }
+        ],
+        "tie_breaking": "Within a queue lane, priority (descending) wins. Ties break by enqueue_time (oldest first), then job_id (lexicographic)."
+      }
+    ]
+  }
+}

@@ -1,0 +1,827 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0031",
+    "title": "CAC RFC Document Format + Requirements Spine Governance",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0031",
+    "labels": [
+      "rfc_format",
+      "requirements",
+      "governance",
+      "cac",
+      "lint",
+      "no_dual_impl",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/* (legacy YAML-frame RFC templates)",
+        "note": "Eliminates multi-file YAML RFC templates and PRD bindings; replaces them with single-file JSON RFC docs."
+      },
+      {
+        "kind": "REFERENCES",
+        "ref": "documents/rfcs/RFC-0031/RFC-0031.cac.rfc_doc.v1.json",
+        "note": "Prior draft of RFC-0031; this document is an in-place consolidation and expansion."
+      },
+      {
+        "kind": "AFFECTS",
+        "ref": "crates/apm2-core/src/rfc_framer",
+        "note": "Legacy YAML RFC framing machinery to be removed or made non-authoritative."
+      },
+      {
+        "kind": "AFFECTS",
+        "ref": "documents/rfcs",
+        "note": "Repository RFC layout and authority policy."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0031",
+      "notes": "Consolidated RFC authority spine and requirement schema; updated to reflect 'no dual implementations' invariant."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0031: CAC RFC Document Format + Requirements Spine Governance",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and non-goals",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC defines the **single canonical representation** for APM2 RFCs and the **formal requirements schema**\nused inside those RFCs.\n\nIt exists to eliminate planning ambiguity caused by multiple partially-overlapping RFC formats (YAML frames, PRD bindings,\nad-hoc Markdown), and to make RFCs mechanically lintable, hashable, and linkable.\n\nNon-goals:\n\n* Re-specify the entire APM2 system (that is done by the living system RFCs enumerated in §4).\n* Preserve backwards-compatibility with legacy RFC templates beyond an explicit, bounded migration window.\n"
+        },
+        {
+          "type": "section",
+          "title": "1. RFC document model",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "An RFC is a single JSON document conforming to the `cac.rfc_doc.v1` envelope.\nThe document is a tree of typed nodes. Nodes are **content** (sections, definitions) or **control** (requirements, plans, tasks, decisions).\n\n### 1.1 Normative node types (v1)\n\n* `rfc` — root node; contains RFC title and children.\n* `section` — hierarchical narrative / definitions / explanatory text.\n* `requirement` — a normative requirement with testable acceptance criteria.\n* `decision` — an explicit architectural decision record (ADR-like).\n* `plan` — an ordered, phase-labeled migration or implementation plan.\n* `task` — an atomic engineering work item, optionally bound to a ticket.\n\nThe **requirements schema** is defined in §2 and is the only acceptable representation for normative requirements going forward.\n"
+        },
+        {
+          "type": "section",
+          "title": "2. Requirements schema",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0001",
+              "title": "Single-file RFC invariant",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Every RFC MUST be represented by exactly one canonical JSON file (no PRD bindings, no multi-file YAML frames). All normative requirements for that RFC MUST be contained in that file.",
+                "acceptance": [
+                  "Repository layout contains `documents/rfcs/<RFC-ID>/<RFC-ID>.cac.rfc_doc.v1.json` for each LIVING RFC.",
+                  "No other file within the RFC directory is required to interpret normative requirements (ancillary files are non-normative references only).",
+                  "CI lint fails if an RFC directory contains legacy template frames (`00_meta.yaml`, `01_problem_and_imports.yaml`, etc.) in lifecycle:LIVING."
+                ],
+                "rationale": "Multi-file RFCs create split-brain truth and make review coverage impossible to audit mechanically.",
+                "domain": [
+                  "governance",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If a legacy RFC still exists for historical context, it MUST be marked `HISTORICAL` and must not be referenced as normative.",
+                  "If multiple JSON files exist for a single RFC ID, CI MUST fail with a deterministic error naming all colliding files."
+                ],
+                "fail_closed": "Treat multiple sources of truth as an integrity violation; abort tooling (compile/lint/admission) rather than guessing.",
+                "theory_refs": [
+                  "LAW-03",
+                  "INV-F-01"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0002",
+              "title": "Fail-closed schema validation for RFC documents",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Tooling that consumes RFC documents MUST validate them against the active `cac.rfc_doc.v1` JSON Schema, rejecting unknown node types and invalid fields with fail-closed behavior.",
+                "acceptance": [
+                  "A `cac.rfc_doc.v1` JSON Schema exists in the bootstrap bundle and is pinned by content hash.",
+                  "Parsing fails if `schema` or `schema_version` is unknown, mismatched, or missing.",
+                  "Parsing fails if any node has an unknown `type` or lacks required fields (`title`, `children`, etc.)."
+                ],
+                "rationale": "RFCs are normative control artifacts; permissive parsing creates silent contract drift.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If a document has a future `schema_version`, tooling MUST refuse to interpret it unless explicitly upgraded.",
+                  "If a document mixes node versions (e.g., embeds v2 node fields), tooling MUST fail rather than partially interpret."
+                ],
+                "fail_closed": "Refuse to execute any action derived from an unvalidated RFC document.",
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0003",
+              "title": "Formal requirement object schema",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Every `requirement` node MUST include a structured payload with: `level`, `statement`, and `acceptance` (non-empty list). It MUST additionally support (and SHOULD populate) `domain`, `scope`, `depends_on`, `edge_cases`, `fail_closed`, `falsification`, `evidence`, `code_refs`, and `theory_refs`.",
+                "acceptance": [
+                  "A JSON Schema exists for requirement nodes (`cac.requirement.v1`) and is referenced by the RFC doc schema.",
+                  "CI lint fails if a requirement omits `statement` or provides an empty `acceptance` list.",
+                  "CI lint warns (or fails at higher strictness tiers) if `edge_cases` is missing for security- or authority-relevant requirements."
+                ],
+                "rationale": "A requirement without testability and explicit failure posture is not a specification; it is prose.",
+                "domain": [
+                  "governance",
+                  "correctness",
+                  "security"
+                ],
+                "theory_refs": [
+                  "LAW-19",
+                  "INV-F-02",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0004",
+              "title": "Unique, stable requirement identifiers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Requirement IDs MUST be globally unique and stable across edits. The canonical format is `<RFC-ID>::REQ-<4-digit>` (e.g., `RFC-0020::REQ-0042`).",
+                "acceptance": [
+                  "CI lint rejects duplicate requirement IDs within an RFC.",
+                  "CI lint rejects requirement IDs that do not match the canonical regex `^RFC-[0-9]{4}::REQ-[0-9]{4}$`.",
+                  "Cross-RFC links reference requirements by full ID string."
+                ],
+                "rationale": "Stable IDs enable traceability, dependency graphs, and gate receipts that cite requirements unambiguously.",
+                "domain": [
+                  "governance",
+                  "correctness"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0005",
+              "title": "No PRD coupling in RFCs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFCs MUST NOT bind to PRDs as required inputs. Any prior PRD binding MUST be removed or reduced to non-normative references.",
+                "acceptance": [
+                  "RFC JSON documents contain no `binds_to_prd` block.",
+                  "CI lint fails if an RFC directory contains a `prd_base_path` reference as a required field.",
+                  "If a PRD is referenced, it MUST appear only as a `relationship` of kind `REFERENCES` with a note clarifying it is non-normative."
+                ],
+                "rationale": "PRDs and RFCs evolve at different tempos; coupling them reintroduces split-brain truth.",
+                "domain": [
+                  "governance"
+                ],
+                "theory_refs": [
+                  "INV-F-01"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0006",
+              "title": "In-place evolution; no dual implementations or adapter shims",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When an RFC changes an implementation-critical invariant, the system MUST migrate **in place**: no long-lived dual implementations, no legacy adapters/shims, and no indefinite bridge windows.",
+                "acceptance": [
+                  "Each RFC that introduces a breaking internal change includes an explicit migration cutover point and a delete-list for deprecated code paths.",
+                  "If a temporary bridge is unavoidable, it MUST be time- and condition-bounded, with a hard fail-closed guard once cutover completes.",
+                  "CI lint rejects RFC plans that introduce 'permanent compatibility layers' without an explicit deletion milestone."
+                ],
+                "rationale": "Dual paths accumulate silent divergence and create policy bypass surfaces.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "governance"
+                ],
+                "edge_cases": [
+                  "Test-only alternate implementations (e.g., in-memory stores) are permitted when they do not create a production dual-truth plane.",
+                  "Bridge code MAY exist only if guarded such that ambiguous states fail closed (e.g., ledger read-mode ambiguity rejection)."
+                ],
+                "fail_closed": "If the system detects ambiguous dual-plane state at runtime, it MUST refuse to proceed rather than guess.",
+                "theory_refs": [
+                  "LAW-03",
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0007",
+              "title": "Explicit supersedence graph",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When an RFC becomes obsolete, it MUST be explicitly marked as superseded, and a single replacement RFC MUST be named as the new authority.",
+                "acceptance": [
+                  "The superseded RFC includes a `relationships` entry of kind `SUPERSEDED_BY` pointing to the replacement RFC stable_id.",
+                  "The replacing RFC includes a reciprocal `relationships` entry of kind `SUPERSEDES` listing the deprecated RFC IDs/paths.",
+                  "CI lint fails if an RFC in `lifecycle:DEPRECATED` status lacks an explicit replacement pointer."
+                ],
+                "rationale": "This eliminates contradictory RFC interpretation during planning.",
+                "domain": [
+                  "governance"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0008",
+              "title": "Canonical living RFC spine",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The APM2 system MUST define a minimal set of **lifecycle:LIVING** RFCs that collectively specify all kernel-authoritative behavior. All other RFCs MUST be `HISTORICAL` or `DEPRECATED` and MUST NOT be used as planning inputs except via the supersedence graph.",
+                "acceptance": [
+                  "The living RFC set is enumerated in §4 and is machine-checkable (list of RFC IDs).",
+                  "CI lint fails if a non-spine RFC is marked `lifecycle:LIVING` without an explicit justification and an update to the spine list.",
+                  "New planning or implementation tickets must cite requirements from the spine RFCs (by requirement ID)."
+                ],
+                "rationale": "A bounded spine prevents the '32 RFCs, half outdated' planning failure mode.",
+                "domain": [
+                  "governance",
+                  "correctness"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0009",
+              "title": "RFC lints are treated as admission gates",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC document validation and linting MUST be an admission gate for any change that modifies normative behavior.",
+                "acceptance": [
+                  "CI includes an RFC lint step that fails on schema violations and spine-invariant violations.",
+                  "FAC gate receipts include RFC lint pass/fail status for changes that touch `documents/rfcs/**` or schema bundles.",
+                  "Lint output is deterministic and includes stable defect IDs for each violated rule."
+                ],
+                "rationale": "If RFCs are normative, they must be enforced with the same rigor as code quality and security gates.",
+                "domain": [
+                  "security",
+                  "governance",
+                  "correctness"
+                ],
+                "theory_refs": [
+                  "INV-F-02",
+                  "LAW-01"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0010",
+              "title": "RFC documents are content-addressable and reproducible",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC documents MUST be canonicalizable to deterministic bytes for hashing, signing, and evidence.",
+                "acceptance": [
+                  "A canonicalizer is defined for `cac.rfc_doc.v1` (ordering, whitespace, numeric/string normalization rules).",
+                  "Repeated canonicalization of a valid RFC document yields byte-identical output.",
+                  "Canonical bytes are hashed using a domain-separated hash function (BLAKE3) and can be stored in CAS."
+                ],
+                "rationale": "Deterministic hashing enables provenance receipts and prevents 'same meaning, different bytes' drift.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The requirements schema is designed to be **mechanically verifiable**, **linkable**, and **gateable**.\nRequirements are not prose bullets; they are structured objects with explicit failure posture.\n\nThe normative requirements for the RFC system itself are below.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. RFC lifecycle and authority",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0011",
+              "title": "RFC status lifecycle is finite-state and monotone",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFCs MUST follow a monotone lifecycle: `DRAFT -> PROPOSED -> APPROVED -> LIVING -> (DEPRECATED -> HISTORICAL)` with no backward transitions. Lifecycle state MUST be encoded as exactly one label of the form `lifecycle:<STATE>` where STATE is one of {DRAFT, PROPOSED, APPROVED, LIVING, DEPRECATED, HISTORICAL}.",
+                "acceptance": [
+                  "Each RFC document includes exactly one lifecycle label `lifecycle:<STATE>` with STATE in {DRAFT, PROPOSED, APPROVED, LIVING, DEPRECATED, HISTORICAL}.",
+                  "CI lint rejects illegal lifecycle transitions (e.g., lifecycle:HISTORICAL -> lifecycle:LIVING) unless accompanied by a new RFC ID and explicit supersedence mapping.",
+                  "Tooling treats only lifecycle:LIVING RFCs as normative inputs for planning gates."
+                ],
+                "rationale": "Monotone status prevents authority oscillation and ensures deprecation is explicit.",
+                "domain": [
+                  "governance"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0012",
+              "title": "Stable IDs are immutable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each RFC MUST have a `meta.stable_id` that never changes for the lifetime of the RFC ID. Renumbering or splitting RFCs MUST be done by creating new RFC IDs with explicit supersedence mapping.",
+                "acceptance": [
+                  "`meta.stable_id` uses the format `dcp://apm2.dev/rfc/<RFC-ID>`.",
+                  "CI lint fails if `stable_id` changes for an existing RFC ID (detected via baseline snapshot).",
+                  "Supersedence entries link by stable_id, not by relative file path."
+                ],
+                "domain": [
+                  "governance",
+                  "security"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0013",
+              "title": "Normative requirements must be implementable or explicitly unimplemented",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Each requirement SHOULD either reference its current implementation surface (`code_refs`) or explicitly declare itself unimplemented and include a plan section describing how it will be implemented.",
+                "acceptance": [
+                  "CI lint warns if a MUST-level requirement lacks any `code_refs` and lacks an 'unimplemented' marker.",
+                  "At least one acceptance criterion for each requirement is mapped to a test, gate, or deterministic inspection procedure."
+                ],
+                "rationale": "Prevents requirements from becoming unowned aspirational text.",
+                "domain": [
+                  "correctness",
+                  "governance"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The RFC system must encode authority explicitly: what is current truth, what is historical background, and how transitions occur."
+        },
+        {
+          "type": "section",
+          "title": "4. Canonical living RFC set",
+          "children": [
+            {
+              "type": "section",
+              "title": "4.1 Legacy RFC disposition map",
+              "children": [],
+              "data": {
+                "heading_level": 3,
+                "disposition_map": [
+                  {
+                    "rfc_id": "RFC-0001",
+                    "title": "APM2 Kernel Architecture: Supervisor, Ledger, Policy, and Syscall Mediation",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0033",
+                      "RFC-0020",
+                      "RFC-0016",
+                      "RFC-0011",
+                      "RFC-0032"
+                    ],
+                    "note": "Kernel architecture concepts decomposed into spine RFCs; persistence truth moved to RFC-0033."
+                  },
+                  {
+                    "rfc_id": "RFC-0002",
+                    "title": "Migrate Development Scripts to xtask",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0031"
+                    ],
+                    "note": "Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed."
+                  },
+                  {
+                    "rfc_id": "RFC-0003",
+                    "title": "Holonic Coordination Framework",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0020"
+                    ],
+                    "note": "Holonic coordination interfaces consolidated into FAC + HSI."
+                  },
+                  {
+                    "rfc_id": "RFC-0004",
+                    "title": "Agent Acceptance Testing (AAT) Implementation",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011"
+                    ],
+                    "note": "AAT/selftest requirements are now gates in FAC and capability manifests in CAC."
+                  },
+                  {
+                    "rfc_id": "RFC-0005",
+                    "title": "Fix Critical xtask Workflow Bugs",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0031"
+                    ],
+                    "note": "Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed."
+                  },
+                  {
+                    "rfc_id": "RFC-0006",
+                    "title": "Dev Loop Quality Improvements",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0031"
+                    ],
+                    "note": "Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed."
+                  },
+                  {
+                    "rfc_id": "RFC-0007",
+                    "title": "Optimize Rust Build Performance Across Worktrees",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0031"
+                    ],
+                    "note": "Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed."
+                  },
+                  {
+                    "rfc_id": "RFC-0008",
+                    "title": "Event-Driven Agent Handoff After CI Completion",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0010",
+                    "title": "Idea Compiler Pipeline - Codebase-Aware RFCs and Multi-Model Orchestration",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0011",
+                    "title": "Context-as-Code (CAC) v1: Canonical Context Pipeline for the APM2 Holonic Kernel",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "LIVING",
+                    "superseded_by": [],
+                    "note": "Spine RFC (authoritative)."
+                  },
+                  {
+                    "rfc_id": "RFC-0012",
+                    "title": "Agent Coordination Layer for Autonomous Work Loop Execution",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0020"
+                    ],
+                    "note": "Holonic coordination interfaces consolidated into FAC + HSI."
+                  },
+                  {
+                    "rfc_id": "RFC-0013",
+                    "title": "APM2 Kernel Daemon and Holonic Runtime Protocol v1",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0020",
+                      "RFC-0011"
+                    ],
+                    "note": "Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011)."
+                  },
+                  {
+                    "rfc_id": "RFC-0014",
+                    "title": "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0033",
+                      "RFC-0020"
+                    ],
+                    "note": "Distributed replication/consensus is treated as a future extension; current authoritative persistence is RFC-0033."
+                  },
+                  {
+                    "rfc_id": "RFC-0015",
+                    "title": "Forge Admission Cycle (FAC) - Hardened Protocol with Cryptographic Gates and OCAP Containment",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0016",
+                    "title": "Holonic Time Fabric (HTF)",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "LIVING",
+                    "superseded_by": [],
+                    "note": "Spine RFC (authoritative)."
+                  },
+                  {
+                    "rfc_id": "RFC-0017",
+                    "title": "Daemon as Control Plane: xtask Demotion, Capability-Minted Episodes, Receipt-Backed Orchestration",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0018",
+                    "title": "Holonic Event Fabric (HEF) Phase 1 - Pulse Plane to Accelerate FAC",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0019",
+                    "title": "Automated FAC v0: End-to-end ingestion, review episode, durable receipt, GitHub projection",
+                    "legacy_status": "APPROVED",
+                    "recommended_lifecycle": "DEPRECATED",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0020",
+                    "title": "Holonic Substrate Interface (HSI)",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "LIVING",
+                    "superseded_by": [],
+                    "note": "Spine RFC (authoritative)."
+                  },
+                  {
+                    "rfc_id": "RFC-0021",
+                    "title": "Venture Proving Holon Interface (VPHI)",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0020"
+                    ],
+                    "note": "Holonic coordination interfaces consolidated into FAC + HSI."
+                  },
+                  {
+                    "rfc_id": "RFC-0022",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0020",
+                      "RFC-0011"
+                    ],
+                    "note": "Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011)."
+                  },
+                  {
+                    "rfc_id": "RFC-0023",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0024",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0031"
+                    ],
+                    "note": "Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed."
+                  },
+                  {
+                    "rfc_id": "RFC-0025",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0026",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0027",
+                    "title": "Proof-Carrying Authority Continuity (PCAC)",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0020",
+                      "RFC-0011"
+                    ],
+                    "note": "Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011)."
+                  },
+                  {
+                    "rfc_id": "RFC-0028",
+                    "title": "Holonic External I/O Security Profile over PCAC",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0020",
+                      "RFC-0011"
+                    ],
+                    "note": "Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011)."
+                  },
+                  {
+                    "rfc_id": "RFC-0029",
+                    "title": "Holonic External I/O Efficiency Profile over PCAC",
+                    "legacy_status": "DRAFT",
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0020",
+                      "RFC-0011"
+                    ],
+                    "note": "Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011)."
+                  },
+                  {
+                    "rfc_id": "RFC-0030",
+                    "title": "",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "HISTORICAL",
+                    "superseded_by": [
+                      "RFC-0032",
+                      "RFC-0011",
+                      "RFC-0033"
+                    ],
+                    "note": "Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence."
+                  },
+                  {
+                    "rfc_id": "RFC-0031",
+                    "title": "Adopt single-file CAC RFC JSON format (v1)",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "LIVING",
+                    "superseded_by": [],
+                    "note": "Spine RFC (authoritative)."
+                  },
+                  {
+                    "rfc_id": "RFC-0032",
+                    "title": "Kernel-Native Forge Admission Cycle vNext",
+                    "legacy_status": null,
+                    "recommended_lifecycle": "LIVING",
+                    "superseded_by": [],
+                    "note": "Spine RFC (authoritative)."
+                  }
+                ]
+              },
+              "body": "    This table declares the **authority disposition** for every RFC directory currently present in the repository.\n    It is intended to be the single planning reference that prevents outdated RFCs from being treated as normative.\n\n    | RFC | Legacy Status | Recommended lifecycle | Superseded by | Note |\n|---|---|---|---|---|\n| RFC-0001 | DRAFT | lifecycle:HISTORICAL | RFC-0033, RFC-0020, RFC-0016, RFC-0011, RFC-0032 | Kernel architecture concepts decomposed into spine RFCs; persistence truth moved to RFC-0033. |\n| RFC-0002 | DRAFT | lifecycle:HISTORICAL | RFC-0031 | Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed. |\n| RFC-0003 | DRAFT | lifecycle:HISTORICAL | RFC-0032, RFC-0020 | Holonic coordination interfaces consolidated into FAC + HSI. |\n| RFC-0004 | APPROVED | lifecycle:DEPRECATED | RFC-0032, RFC-0011 | AAT/selftest requirements are now gates in FAC and capability manifests in CAC. |\n| RFC-0005 | DRAFT | lifecycle:HISTORICAL | RFC-0031 | Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed. |\n| RFC-0006 | DRAFT | lifecycle:HISTORICAL | RFC-0031 | Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed. |\n| RFC-0007 | DRAFT | lifecycle:HISTORICAL | RFC-0031 | Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed. |\n| RFC-0008 | DRAFT | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0010 | DRAFT | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0011 | APPROVED | lifecycle:LIVING |  | Spine RFC (authoritative). |\n| RFC-0012 | APPROVED | lifecycle:DEPRECATED | RFC-0032, RFC-0020 | Holonic coordination interfaces consolidated into FAC + HSI. |\n| RFC-0013 | DRAFT | lifecycle:HISTORICAL | RFC-0020, RFC-0011 | Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011). |\n| RFC-0014 | APPROVED | lifecycle:DEPRECATED | RFC-0033, RFC-0020 | Distributed replication/consensus is treated as a future extension; current authoritative persistence is RFC-0033. |\n| RFC-0015 | DRAFT | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0016 | APPROVED | lifecycle:LIVING |  | Spine RFC (authoritative). |\n| RFC-0017 | APPROVED | lifecycle:DEPRECATED | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0018 | APPROVED | lifecycle:DEPRECATED | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0019 | APPROVED | lifecycle:DEPRECATED | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0020 | DRAFT | lifecycle:LIVING |  | Spine RFC (authoritative). |\n| RFC-0021 | DRAFT | lifecycle:HISTORICAL | RFC-0032, RFC-0020 | Holonic coordination interfaces consolidated into FAC + HSI. |\n| RFC-0022 |  | lifecycle:HISTORICAL | RFC-0020, RFC-0011 | Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011). |\n| RFC-0023 |  | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0024 |  | lifecycle:HISTORICAL | RFC-0031 | Non-authoritative engineering/process RFC; moved under general engineering docs or future dedicated RFC if needed. |\n| RFC-0025 |  | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0026 |  | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0027 | DRAFT | lifecycle:HISTORICAL | RFC-0020, RFC-0011 | Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011). |\n| RFC-0028 | DRAFT | lifecycle:HISTORICAL | RFC-0020, RFC-0011 | Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011). |\n| RFC-0029 | DRAFT | lifecycle:HISTORICAL | RFC-0020, RFC-0011 | Protocol/context access surfaces consolidated under HSI (RFC-0020) and CAC (RFC-0011). |\n| RFC-0030 |  | lifecycle:HISTORICAL | RFC-0032, RFC-0011, RFC-0033 | Admission/execution/refinement concepts consolidated into FAC (RFC-0032) with CAC + ledger evidence. |\n| RFC-0031 |  | lifecycle:LIVING |  | Spine RFC (authoritative). |\n| RFC-0032 |  | lifecycle:LIVING |  | Spine RFC (authoritative). |\n"
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The **canonical living RFC spine** is the minimal set of RFCs that jointly specify system behavior:\n\n1. **RFC-0031** — RFC document model + requirements schema + spine governance (this RFC).\n2. **RFC-0011** — Context-as-Code (CAC) substrate: canonicalization, schema admission, patch/admission, context packs, ArtifactFetch.\n3. **RFC-0016** — Holonic Time Fabric (HTF): monotone ticks, HLC bounds, time envelopes, lease/time authority rules.\n4. **RFC-0020** — Holonic Substrate Interface (HSI): protocol handshake, contract manifest, route semantics, receipts, session auth.\n5. **RFC-0033** — Ledger + CAS + daemon persistence contract: append-only ledger, hash chaining, durable CAS, migration guards.\n6. **RFC-0032** — Kernel-Native Forge Admission Cycle (FAC) vNext: work lifecycle, gates/receipts, evidence, merge/projection, quarantine.\n\nAll other RFCs are **non-authoritative historical artifacts** unless explicitly referenced by the spine RFCs as background.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. Tooling and enforcement",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0014",
+              "title": "RFC lint tool provides deterministic defect IDs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC lint output MUST be deterministic and MUST assign stable defect identifiers for each violated rule, so that FAC receipts and regressions can be tracked over time.",
+                "acceptance": [
+                  "Lint emits machine-readable JSON output with defect_id, severity, location (RFC id + JSON pointer), and message.",
+                  "The same input repository state yields byte-identical lint output.",
+                  "Defect IDs are stable across runs and do not depend on filesystem traversal order."
+                ],
+                "domain": [
+                  "correctness",
+                  "governance"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0031::REQ-0015",
+              "title": "RFC tools are hermetic with respect to external state",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "RFC compilation/linting MUST be hermetic: it MUST NOT depend on network access, wall-clock time, or non-reproducible environment state.",
+                "acceptance": [
+                  "RFC lint/compile runs in CI without network access.",
+                  "Outputs do not embed wall-clock timestamps (unless explicitly marked as non-normative provenance notes).",
+                  "All schema inputs are loaded from the pinned bootstrap bundle or from repository paths referenced by stable IDs."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "theory_refs": [
+                  "LAW-20",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "RFCs are only useful if enforced. This section specifies the minimum tooling invariants required for RFCs to be treated as system control artifacts."
+        },
+        {
+          "type": "section",
+          "title": "6. Migration and archival policy",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Legacy RFC directories using the YAML frame template (`00_meta.yaml`, `01_problem_and_imports.yaml`, etc.) are permitted only as HISTORICAL artifacts.\nThe migration policy is:\n\n* Convert each spine RFC to a single-file `cac.rfc_doc.v1` JSON document.\n* Add explicit supersedence relationships for every RFC removed from the spine.\n* Delete (or archive under a non-normative path) legacy templates after cutover; do not keep parallel truth.\n\nThis RFC does not prescribe the sequencing for system migrations; each system RFC includes its own migration plan.\n"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,1208 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0011",
+    "title": "Context-as-Code (CAC) v1: Canonical Context Pipeline",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0011",
+    "labels": [
+      "cac",
+      "context",
+      "canonicalization",
+      "schemas",
+      "dcp",
+      "artifactfetch",
+      "packs",
+      "budgets",
+      "receipts",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0011 (legacy YAML frames)",
+        "note": "Converts RFC-0011 from multi-file YAML into a single CAC RFC doc with structured requirements."
+      },
+      {
+        "kind": "REFERENCES",
+        "ref": "crates/apm2-core/src/cac/AGENTS.md",
+        "note": "Implementation invariants and contracts for CAC module."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0033",
+        "note": "CAC stores artifacts in CAS and records provenance in the ledger."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0020",
+        "note": "ArtifactFetch and admission are exposed via HSI routes."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0016",
+        "note": "HTF governs authoritative time/lease semantics; CAC receipts use wall time only as metadata."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0011",
+      "notes": "Consolidated CAC v1 requirements from legacy RFC-0011 YAML frames and aligned to current Rust implementation surfaces."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0011: Context-as-Code (CAC) v1 — Canonical Context Pipeline",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and system boundary",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC specifies **Context-as-Code (CAC)** as a kernel-authoritative substrate.\nCAC defines how normative control artifacts (RFCs, policies, schema bundles, tickets, context packs, target profiles, etc.)\nare represented, admitted, addressed, compiled, consumed, and audited.\n\nCAC is a control-plane substrate:\n* **Truth plane**: CAS + append-only ledger receipts (RFC-0033).\n* **Time plane**: HTF ticks + bounded HLC (RFC-0016).\n* **Interface plane**: HSI routes for ArtifactFetch and admission (RFC-0020).\n"
+        },
+        {
+          "type": "section",
+          "title": "1. Canonical artifact representation (CAC-JSON)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0001",
+              "title": "Canonical context substrate (CAC-JSON)",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All normative control artifacts MUST be stored as CAC-JSON, validated against\nversioned schemas with fail-closed behavior (unknown fields rejected), canonicalized\nto stable bytes prior to admission, and addressable by stable IDs and immutable\ncontent hashes (CAS).",
+                "acceptance": [
+                  "Schema admission rejects non-CAC-JSON normative artifacts",
+                  "Unknown fields are rejected; validation failures block admission",
+                  "canonicalize(canonical_bytes) == canonical_bytes for all valid inputs",
+                  "DCP resolution returns pinned content_hash for stable_id"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0001 (PRD REQ-0001).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0017",
+              "title": "Input complexity limits are enforced before expensive operations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAC validation MUST enforce bounded input complexity (max depth, max object properties, max array members, maximum bytes) before invoking schema validation or any other potentially expensive operation.",
+                "acceptance": [
+                  "Validator rejects inputs exceeding MAX_DEPTH, MAX_OBJECT_PROPERTIES, or MAX_ARRAY_MEMBERS with a deterministic error.",
+                  "Size checks occur before JSON Schema validation in the validation path.",
+                  "Errors include a JSON pointer path to the violating substructure when applicable."
+                ],
+                "rationale": "Prevents adversarial inputs from triggering pathological validator complexity and resource exhaustion.",
+                "domain": [
+                  "security",
+                  "performance"
+                ],
+                "scope": {
+                  "crate": "crates/apm2-core/src/cac/validator.rs"
+                },
+                "edge_cases": [
+                  "If the JSON is syntactically valid but semantically huge, the validator MUST reject by size even if schema would reject later.",
+                  "If validation is invoked in replay mode, the same limits MUST apply (replay is not a bypass for DoS constraints)."
+                ],
+                "fail_closed": "Reject the artifact and do not store it in CAS.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/validator.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0008",
+              "title": "Typed quantities and context budgets",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Budgets, timeouts, costs, and probabilities MUST be expressed as typed quantities\nwith explicit units. ContextPack compilation and validation MUST reject packs\nexceeding token/artifact/byte budgets.",
+                "acceptance": [
+                  "Budget fields validate against quantity schema with unit field",
+                  "Schema validation rejects quantities with invalid unit values",
+                  "Pack exceeding budget triggers compilation failure",
+                  "Quantity serialization/deserialization preserves exact values"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0008 (PRD REQ-0008).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0009",
+              "title": "Canonicalizer governance",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Canonicalizer id/version MUST be recorded in envelopes and receipts for all normative\nartifacts. Canonicalization test vectors MUST be governed artifacts pinned in the\nbootstrap bundle.",
+                "acceptance": [
+                  "Envelope schema requires canonicalizer_id and canonicalizer_version fields",
+                  "AdmissionReceipt includes canonicalizer metadata",
+                  "Bootstrap bundle includes canonicalizer.vectors artifact kind",
+                  "Bootstrap manifest includes test vector content hash"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0009 (PRD REQ-0009).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0010",
+              "title": "Bootstrap trust root immutability",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The bootstrap schema bundle MUST be embedded and pinned by hash in the apm2 binary.\nAdmission MUST reject patches targeting bootstrap stable IDs. The validator MUST\nrefuse to operate if bootstrap verification fails.",
+                "acceptance": [
+                  "Binary includes bootstrap manifest with content hashes",
+                  "Startup fails if bootstrap verification fails",
+                  "Patch targeting bootstrap ID returns rejection error",
+                  "Validation fails if bootstrap is unverified"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0010 (PRD REQ-0010).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0028",
+              "title": "Content hashes are strict BLAKE3 hex strings",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All content_hash fields in CAC receipts, DCP entries, and manifests MUST be 64-character lowercase hex BLAKE3 digests, and must be rejected if invalid.",
+                "acceptance": [
+                  "Validation rejects hashes not matching regex `^[0-9a-f]{64}$`.",
+                  "If a CAS store returns a hash that does not match computed bytes, the operation fails.",
+                  "No upper/lowercase ambiguity is permitted; canonical form is lowercase."
+                ],
+                "rationale": "Hash format strictness prevents subtle mismatch bugs and makes logs/receipts deterministic.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If a future hash function is introduced, it must be domain-separated by algorithm identifier; mixed-hash systems must be explicitly versioned."
+                ],
+                "fail_closed": "Reject artifacts/receipts with invalid hash strings.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/dcp_index.rs",
+                  "crates/apm2-core/src/cac/admission.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0019",
+              "title": "DCP ID syntax and length constraints",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "DCP stable IDs MUST be bounded (<= 1024 bytes) and MUST not contain control characters. The allowed character set and grammar MUST be enforced before admission.",
+                "acceptance": [
+                  "Admission rejects DCP IDs longer than 1024 characters.",
+                  "Admission rejects DCP IDs containing ASCII control characters or other non-printing characters.",
+                  "Errors are deterministic and include a reason string suitable for defect reporting."
+                ],
+                "rationale": "Prevents metadata injection, log/receipt corruption, and unbounded ledger bloat.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "scope": {
+                  "constant": "MAX_DCP_ID_LENGTH",
+                  "crate": "crates/apm2-core/src/cac/admission.rs"
+                },
+                "edge_cases": [
+                  "If a DCP ID is valid UTF-8 but contains zero-width joiners or confusing Unicode, policy MAY additionally restrict; baseline MUST at least reject control characters.",
+                  "If an artifact kind permits longer identifiers, it still MUST comply with the global bound unless a future RFC revises the limit."
+                ],
+                "fail_closed": "Reject admission immediately.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/admission.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0027",
+              "title": "Stable ID grammar is enforced",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Stable IDs MUST follow the canonical grammar `namespace:kind:identifier[@version]` and MUST be rejected if malformed. The grammar MUST be strict enough to make stable IDs unambiguous under canonicalization and safe to embed in receipts and metadata.",
+                "acceptance": [
+                  "Validation rejects stable IDs missing required components (namespace/kind/identifier).",
+                  "Validation rejects stable IDs with invalid characters outside the allowlist `[A-Za-z0-9_.:-@/]` (or stricter).",
+                  "The validator provides a deterministic parse error indicating which component failed."
+                ],
+                "rationale": "Loose stable ID parsing causes collision and injection vulnerabilities at the control-plane boundary.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If versions are omitted, the stable ID refers to an unversioned artifact and still must be globally unique.",
+                  "If a future stable ID grammar revision occurs, it must be versioned and old IDs remain valid by explicit compatibility policy."
+                ],
+                "fail_closed": "Reject admission/registration of malformed IDs.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/dcp_index.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "CAC-JSON is a strict JSON profile used as the **sole normative representation** for control artifacts.\nIt is canonicalized to deterministic bytes prior to hashing, signing, and CAS storage.\n\nThis section specifies profile constraints (fail-closed unknown-field handling, complexity bounds),\nand canonicalizer governance required to keep hashes stable across environments.\n"
+        },
+        {
+          "type": "section",
+          "title": "2. Admission pipeline, freeze enforcement, and receipts",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0002",
+              "title": "Patch-first machine authoring",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Machines MUST produce changes as patch streams (JSON Patch / Merge Patch) rather\nthan whole-document rewrites. Admission MUST enforce replay protection via expected\nbase hash. Every accepted patch MUST produce an admission receipt and emit ledger provenance.",
+                "acceptance": [
+                  "PatchRecords use JSON Patch (RFC 6902) or Merge Patch (RFC 7396) format",
+                  "Patch with wrong expected_base_hash is rejected with replay violation event",
+                  "AdmissionReceipt references patch_hash, base_hash, new_hash, schema_hash"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0002 (PRD REQ-0002).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0004",
+              "title": "Bounded context production with replayable evidence",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Production holons MUST operate under explicit leases/budgets and publish replayable\nevidence. Tool calls MUST be classified as planned/unplanned and feed defect signals.\nAdmissions MUST include a ChangeSet report to summarize semantic deltas.",
+                "acceptance": [
+                  "PatchRecord inputs include budget/lease refs; budget exceeded emits event",
+                  "ToolEvent includes planned/unplanned classification",
+                  "Admission requires ChangeSetReport for patch streams",
+                  "EvidencePublished events reference CAS hashes for production evidence"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0004 (PRD REQ-0004).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0016",
+              "title": "Admission pipeline is atomic and CAS-first",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The CAC admission pipeline MUST be atomic: an artifact is considered admitted only if (1) it canonicalizes and validates successfully, (2) its canonical bytes are persisted in CAS (or deduplicated with verified hash), and (3) an AdmissionReceipt is generated. If any step fails, no partial admission state may be externally visible.",
+                "acceptance": [
+                  "AdmissionGate returns an error and does not emit an AdmissionReceipt when validation/canonicalization/storage fails.",
+                  "CAS store is invoked before emitting any ledger provenance event for the artifact.",
+                  "Deduplication path verifies that the returned CAS hash matches the computed hash of canonical bytes."
+                ],
+                "rationale": "Partial admission creates unreplayable, unauditable states and breaks monotone ledger/projection assumptions.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "scope": {
+                  "crate": "crates/apm2-core/src/cac/admission.rs"
+                },
+                "edge_cases": [
+                  "If CAS storage succeeds but receipt/event emission fails, the CAS object is allowed to remain (garbage collectible) but MUST NOT be referenced by stable ID until a successful admission occurs.",
+                  "If canonicalization produces bytes that exceed size limits, admission MUST fail before any schema validation to avoid DoS."
+                ],
+                "fail_closed": "On any ambiguity (e.g., hash mismatch, partial errors), reject admission and emit a deterministic defect.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/admission.rs"
+                ],
+                "theory_refs": [
+                  "LAW-03",
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0020",
+              "title": "Patch replay protection is base-hash strict",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "For patch admissions (JSON Patch or Merge Patch), the admission gate MUST require `expected_base_hash` and MUST reject patches where `expected_base_hash` does not exactly match the canonical hash of the provided base document.",
+                "acceptance": [
+                  "Admission rejects patch requests missing schema_hash (MissingSchemaHash).",
+                  "Admission rejects patch requests where computed base hash != expected_base_hash.",
+                  "AdmissionReceipt records base_hash, patch_hash, and new_hash for patch operations."
+                ],
+                "rationale": "Prevents replay and TOCTOU where a patch is applied against an unintended base state.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "scope": {
+                  "crate": "crates/apm2-core/src/cac/patch_engine.rs"
+                },
+                "edge_cases": [
+                  "If the base document is not provided, patch admission MUST be rejected (no server-side fetch in the critical path unless explicitly authorized and pinned).",
+                  "If a patch results in no-op (new_hash == base_hash), admission MAY still succeed but must record that outcome deterministically."
+                ],
+                "fail_closed": "Reject the patch admission; do not store derived bytes in CAS.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/admission.rs",
+                  "crates/apm2-core/src/cac/patch_engine.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0021",
+              "title": "Schema hash and schema ID semantics are explicit and immutable per admission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each admission MUST record the BLAKE3 hash of the exact JSON Schema used for validation (schema_hash). If a schema stable ID is provided, it MUST be recorded as schema_id and MUST correspond to the schema_hash.",
+                "acceptance": [
+                  "AdmissionReceipt includes schema_hash always and includes schema_id when provided.",
+                  "DcpEntry.schema_id is the schema stable ID used during registration; empty string if none.",
+                  "If schema_id is provided, tooling can resolve schema_id to a DCP entry whose content_hash == schema_hash (consistency check)."
+                ],
+                "rationale": "Validation is only meaningful if the exact schema is pinned and replayable.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "edge_cases": [
+                  "If schema_id resolves to a different hash than schema_hash, admission MUST fail (schema drift).",
+                  "If schema_id is not provided, admission is allowed only for artifact kinds whose schema is embedded/pinned by bootstrap policy."
+                ],
+                "fail_closed": "Reject admission on schema ambiguity.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/admission.rs",
+                  "crates/apm2-core/src/cac/dcp_index.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-02"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0025",
+              "title": "Freeze enforcement gates admission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Admission MUST consult a freeze-check mechanism for the relevant scope and MUST reject admissions to frozen scopes with a structured Frozen error.",
+                "acceptance": [
+                  "AdmissionRequest includes a scope identifier used for freeze checking (repo/work/namespace).",
+                  "If FreezeCheck returns Frozen, AdmissionError::RepoFrozen is returned and no CAS storage occurs for new content.",
+                  "Freeze IDs and reasons are bounded in length (MAX_FREEZE_ID_LENGTH, MAX_REASON_LENGTH)."
+                ],
+                "rationale": "Freeze is a containment mechanism when divergence or corruption is detected; admission must not bypass it.",
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If freeze check fails internally (InternalError), admission must fail (no best-effort).",
+                  "NoOpFreezeCheck is allowed only in explicitly non-production environments; production MUST use a real freeze registry."
+                ],
+                "fail_closed": "Treat freeze-check failure as a hard admission failure.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/freeze_check.rs",
+                  "crates/apm2-daemon/src/ledger.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Admission is the only allowed path for normative artifacts to enter the system.\nAdmission yields:\n\n* canonical bytes,\n* a CAS content hash,\n* and an AdmissionReceipt binding schema + canonicalizer + patch lineage (when applicable).\n\nAdmission is freeze-aware: scopes can be frozen by divergence/watchdogs and admission must fail closed.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. Stable-ID (DCP) resolution and dependency closure",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0018",
+              "title": "Reserved stable-ID namespaces are enforced at admission time",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Admission MUST reject DCP IDs using reserved prefixes (e.g., `cac:`, `bootstrap:`, `internal:`) unless explicitly authorized by policy.",
+                "acceptance": [
+                  "Admission rejects reserved-prefix DCP IDs by default with a ReservedPrefix error.",
+                  "The reserved prefix list is finite and centrally defined (single source of truth).",
+                  "Authorization to use reserved prefixes is explicitly checked before any expensive operations."
+                ],
+                "rationale": "Reserved namespaces are trust roots and internal control surfaces; they must not be forgeable by untrusted authors.",
+                "domain": [
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "crate": "crates/apm2-core/src/cac/dcp_index.rs"
+                },
+                "edge_cases": [
+                  "During ledger replay, reserved-prefix enforcement may be disabled for historical events; replay MUST still validate schema/hash integrity and MUST NOT allow new admissions under reserved prefixes.",
+                  "If the reserved prefix list changes, old admissions remain valid but future admissions must follow the new policy (explicit versioning)."
+                ],
+                "fail_closed": "Treat unauthorized reserved prefix usage as a security defect; do not admit.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/admission.rs",
+                  "crates/apm2-core/src/cac/dcp_index.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0022",
+              "title": "DCP index projection is deterministic and collision-detecting",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The DCP index (stable-ID to content hash mapping) MUST be a deterministic replayable projection from ledger/CAC admission events. Stable ID collisions MUST be detected and MUST fail closed.",
+                "acceptance": [
+                  "Registering the same stable_id with a different content_hash causes an explicit collision error.",
+                  "Registering identical entries is idempotent (no-op).",
+                  "Index iteration order is deterministic (e.g., sorted by stable_id)."
+                ],
+                "rationale": "Stable IDs are an address space; collisions are integrity failures and cannot be resolved by policy guesswork.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "edge_cases": [
+                  "If a collision is detected during replay, the daemon MUST freeze the affected scope and require human intervention.",
+                  "If an entry is deprecated, resolve() returns None and consumers must treat as missing."
+                ],
+                "fail_closed": "Do not return an arbitrary mapping for a colliding stable_id.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/dcp_index.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0026",
+              "title": "DCP entries enforce dependency existence and bounds",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When registering a DCP entry, all declared dependencies MUST already exist in the index (or be explicitly admitted in the same atomic transaction), and dependencies MUST not be deprecated. The dependency list MUST be bounded (<= 128).",
+                "acceptance": [
+                  "Registration rejects entries whose dependencies are missing.",
+                  "Registration rejects entries referencing deprecated dependencies.",
+                  "Registration rejects entries whose dependency list length exceeds 128.",
+                  "Error includes the first missing/deprecated dependency stable ID."
+                ],
+                "rationale": "Dependency closure is required for deterministic context pack compilation and to prevent dangling references.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "edge_cases": [
+                  "For bootstrap bundles, a single atomic admission may register multiple entries; dependency checks may be performed against the batch union.",
+                  "If dependency existence is temporarily unknown due to partial replay, the system must fail closed (freeze) rather than register partial entries."
+                ],
+                "fail_closed": "Do not register the entry; do not allow resolution to return partial dependency sets.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/dcp_index.rs"
+                ],
+                "theory_refs": [
+                  "LAW-02",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Stable IDs are resolved through a deterministic index projected from admission/ledger events.\nThe index must be collision-detecting, must enforce dependency closure, and must handle deprecation explicitly.\n\nReserved namespaces exist for bootstrap and internal control-plane artifacts.\n"
+        },
+        {
+          "type": "section",
+          "title": "4. Hermetic consumption and deterministic ArtifactFetch",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0003",
+              "title": "Hermetic consumption with deterministic reads",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Consumption holons MUST complete tasks using only preauthorized stable-ID fetches\nplus actuation tools. Discretionary context discovery MUST be denied and emit defects.\nRun receipts MUST capture context_pack_miss and sufficiency; misses MUST gate consumption.",
+                "acceptance": [
+                  "Discretionary read emits PolicyViolation and DefectRecord",
+                  "Pack compilation resolves all dependencies and pins content hashes",
+                  "RunReceipt schema includes miss count and sufficiency flag",
+                  "Pack miss triggers DefectRecord and run failure unless escalated"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0003 (PRD REQ-0003).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0011",
+              "title": "ArtifactFetch tool protocol",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The system MUST provide an ArtifactFetch tool for deterministic retrieval by stable\nID or content hash. Policy MUST enforce allowlisted reads in consumption mode.\nContent-hash-only fetches MUST be denied in consumption mode.",
+                "acceptance": [
+                  "Tool request schema includes stable_id and content_hash optional parameters",
+                  "Tool response includes hash and optional inline content",
+                  "Fetch of non-allowlisted stable_id returns PolicyViolation",
+                  "Content-hash-only fetch in consumption mode returns PolicyViolation"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0011 (PRD REQ-0011).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0015",
+              "title": "RunReceipt emission",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Consumption runs MUST emit RunReceipt capturing context_pack_miss, sufficiency,\nand budget usage. Pack misses MUST trigger DefectRecord emission and run failure\nby default unless explicitly in escalation-allowed mode.",
+                "acceptance": [
+                  "RunReceipt schema includes miss_count field",
+                  "RunReceipt schema includes sufficiency boolean",
+                  "RunReceipt includes budget delta quantities",
+                  "context_pack_miss > 0 emits UNPLANNED_CONTEXT_READ defect and fails run"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0015 (PRD REQ-0015).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Consumption holons must operate under hermetic policy: only preauthorized deterministic context reads are allowed.\nThe ArtifactFetch tool is the sole deterministic retrieval mechanism, constrained by allowlists and policy.\n\nRun receipts must capture context sufficiency and pack misses; pack misses gate completion unless explicitly escalated.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. ContextPack compilation and budgets",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0012",
+              "title": "ContextPack compilation",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The system MUST compile ContextPackSpec into ContextPackManifest with derived artifacts.\nCompilation MUST deep-pin transitive dependencies. Compilation MUST be deterministic\ngiven resolved inputs and target profile. Budgets MUST be enforced.",
+                "acceptance": [
+                  "apm2 pack compile produces manifest from spec",
+                  "Manifest includes all dependency stable_ids with content_hashes",
+                  "Same inputs produce identical manifest and derived artifacts",
+                  "Pack exceeding budget fails compilation"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0012 (PRD REQ-0012).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0023",
+              "title": "ContextPack compilation is cycle-safe and deterministic",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ContextPack compilation MUST perform transitive dependency resolution, MUST detect dependency cycles, and MUST emit a deterministic manifest whose entries are sorted by stable_id.",
+                "acceptance": [
+                  "Compilation fails with CycleDetected and includes a cycle path.",
+                  "Manifest entries are sorted deterministically (stable_id order).",
+                  "Given identical inputs (spec + index), compilation produces byte-identical manifest output."
+                ],
+                "rationale": "Hermetic consumption requires fully pinned dependency sets; cycles and nondeterminism break replayability.",
+                "domain": [
+                  "correctness",
+                  "performance",
+                  "security"
+                ],
+                "edge_cases": [
+                  "If a dependency is missing or deprecated, compilation MUST fail (no partial packs).",
+                  "If dependency count exceeds MAX_DEPENDENCIES, compilation MUST fail deterministically."
+                ],
+                "fail_closed": "Reject pack compilation; produce a defect receipt explaining the missing/cycle/budget violation.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/compiler.rs"
+                ],
+                "theory_refs": [
+                  "LAW-02",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0024",
+              "title": "Budget enforcement uses typed quantities and rejects unit mismatch",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All budget constraints and measured usage MUST be represented as typed quantities with explicit units. Arithmetic operations MUST reject unit mismatch and must not overflow.",
+                "acceptance": [
+                  "Quantity parsing rejects invalid units.",
+                  "Arithmetic between quantities with different units yields a UnitMismatch error.",
+                  "Overflow/underflow in arithmetic is handled via checked operations returning errors (no panics)."
+                ],
+                "rationale": "Prevents cross-unit bugs (Mars Climate Orbiter class) and ensures deterministic budget enforcement.",
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "edge_cases": [
+                  "If a budget dimension is unspecified (None), it is treated as unbounded for that dimension only; other dimensions still enforced.",
+                  "If a measurement cannot be computed deterministically (e.g., token estimation differs), the system must choose a conservative upper bound or fail closed."
+                ],
+                "fail_closed": "Reject compilation/consumption when units are invalid or arithmetic fails.",
+                "code_refs": [
+                  "crates/apm2-core/src/cac/pack_spec.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-02"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "ContextPacks compile stable-ID rooted dependency closures into deterministic manifests for hermetic consumption.\nCompilation must deep-pin all dependencies to hashes, detect cycles, and enforce multi-dimensional budgets.\n"
+        },
+        {
+          "type": "section",
+          "title": "6. Target profiles, deterministic exports, and non-normative rendering",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0005",
+              "title": "Target interoperability without drift",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Target profiles MUST define rendering, retrieval, and delivery constraints independent\nof model intelligence. Target payloads MUST be compiled deterministically from CAC\nsources and MUST NOT be treated as normative. Export manifests MUST provide provenance.",
+                "acceptance": [
+                  "TargetProfile schema includes budget, rendering, and retrieval policies",
+                  "Exports from identical inputs produce byte-identical trees",
+                  "ExportManifest includes source stable_ids and content hashes",
+                  "Conformance test report passes for all target profiles"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0005 (PRD REQ-0005).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0013",
+              "title": "Target delivery determinism",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Target delivery rendering MUST be deterministic and constrained by target profile.\nExports MUST be byte-identical for identical inputs. Generated files MUST embed\nprovenance. Conformance tests MUST be required.",
+                "acceptance": [
+                  "Same source artifacts produce byte-identical export tree",
+                  "Export respects rendering policy from TargetProfile",
+                  "Markdown files include provenance in YAML frontmatter",
+                  "ExportReceipt includes conformance test report reference"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0013 (PRD REQ-0013).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Target profiles define how CAC artifacts are rendered and delivered to external systems (e.g., LLM prompt packs, Markdown exports).\nRendered exports are **derived** (non-normative) and must be reproducible from CAC sources.\n"
+        },
+        {
+          "type": "section",
+          "title": "7. Capability manifests and hermetic selftests (AAT integration)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0006",
+              "title": "Messaging-native control plane compatibility",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAC actions (admission, compilation, export, selftest) MUST be reflected in kernel\nmessages with hash references. Holons MUST be able to negotiate capabilities and\nretrieve required context via stable IDs referenced in messages.",
+                "acceptance": [
+                  "EvidencePublished events include dcp_id, artifact_kind, schema_id metadata",
+                  "Agent obtains CapabilityManifest by stable_id and verifies AATReceipt",
+                  "ArtifactFetch accepts stable_id from message metadata"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0006 (PRD REQ-0006).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0014",
+              "title": "AAT/selftest gating",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The system MUST generate CapabilityManifest from the apm2 binary. Selftests MUST\nbe hermetic and bounded. AATReceipt MUST be required for critical cutovers and\nagent planning gates.",
+                "acceptance": [
+                  "apm2 capabilities --json produces manifest matching actual behavior",
+                  "AAT suites complete within max_duration_ms budget",
+                  "Cutover fails without recent passing AATReceipt",
+                  "Agent verifies receipt hash in CapabilityManifest before planning"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0014 (PRD REQ-0014).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0011::REQ-0007",
+              "title": "Measurable throughput and quality gains",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The system MUST provide measurable improvements: unplanned tool calls trending toward\nzero, PR cycle time improving after adoption, and AAT receipts gating critical operations.",
+                "acceptance": [
+                  "Metrics dashboard shows monotonic decrease in unplanned reads",
+                  "WorkEvent timeline analysis shows reduced median cycle time",
+                  "Cutover and agent planning require passing AATReceipt"
+                ],
+                "rationale": "Imported from legacy CAC-REQ-0007 (PRD REQ-0007).",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "scope": {
+                  "subsystem": "cac",
+                  "artifact_kinds": [
+                    "rfc",
+                    "policy",
+                    "schema",
+                    "context_pack",
+                    "target_profile",
+                    "ticket"
+                  ]
+                },
+                "theory_refs": [
+                  "LAW-02",
+                  "LAW-03",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "CAC makes capabilities queryable and testable: the kernel must provide a capability manifest and hermetic selftests (AAT)\nso agents can plan against verified features rather than implicit assumptions.\n"
+        },
+        {
+          "type": "section",
+          "title": "8. Edge cases and failure posture",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "CAC is a *security boundary* because it governs what agents may read and what the kernel considers normative control input.\n\nDefault failure posture is **fail closed**:\n* unknown schema/version,\n* unknown fields in artifacts,\n* hash mismatch,\n* reserved namespace misuse,\n* dependency holes/cycles,\n* budget exceed,\n* or freeze-check uncertainty\n\nmust all reject admission/compilation/consumption rather than attempting best-effort behavior.\n\nWall-clock timestamps in receipts are *observability metadata only*; authoritative ordering is provided by the ledger and HTF.\n"
+        },
+        {
+          "type": "section",
+          "title": "9. Traceability to implementation",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Primary implementation surfaces:\n\n* Admission pipeline + receipts: `crates/apm2-core/src/cac/admission.rs`\n* Validator + CAC profile limits: `crates/apm2-core/src/cac/validator.rs`\n* Patch engine: `crates/apm2-core/src/cac/patch_engine.rs`\n* DCP index: `crates/apm2-core/src/cac/dcp_index.rs`\n* Context pack compiler: `crates/apm2-core/src/cac/compiler.rs`\n* Target profiles + exports: `crates/apm2-core/src/cac/target_profile.rs`, `crates/apm2-core/src/cac/export.rs`\n"
+        }
+      ]
+    }
+  }
+}

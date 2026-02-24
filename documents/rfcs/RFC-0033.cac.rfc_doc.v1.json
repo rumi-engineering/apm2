@@ -1,0 +1,893 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0033",
+    "title": "Ledger + CAS + Daemon Persistence Contract",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0033",
+    "labels": [
+      "ledger",
+      "cas",
+      "persistence",
+      "truth_plane",
+      "append_only",
+      "hash_chain",
+      "signatures",
+      "migration",
+      "no_dual_impl",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0001",
+        "note": "Replaces legacy kernel architecture RFC for persistence semantics; aligns to current apm2-daemon + apm2-core ledger implementation."
+      },
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0018 (HEF Phase 1)",
+        "note": "Absorbs persistence-related semantics (ledger/CAS) into a single truth-plane RFC; HEF becomes a derived FAC concern."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0016",
+        "note": "LedgerTime and time envelopes follow HTF authority model."
+      },
+      {
+        "kind": "AFFECTS",
+        "ref": "dcp://apm2.dev/rfc/RFC-0032",
+        "note": "FAC uses ledger/CAS for work events, evidence, receipts."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0033",
+      "notes": "New spine RFC consolidating ledger+CAS semantics and migration guards based on current implementation."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0033: Ledger + CAS + Daemon Persistence Contract",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and authority boundaries",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC specifies the **authoritative persistence substrate** for APM2:\n\n* **CAS** — durable content-addressed storage for arbitrary bytes (evidence, CAC artifacts, bundles).\n* **Ledger** — append-only, hash-chained, signed event log that references CAS objects and provides LedgerTime ordering.\n* **Daemon persistence contract** — the daemon is the sole writer; startup must validate schema/migration and enforce no dual-truth planes.\n\nThis RFC is the truth-plane foundation used by:\n* CAC admission and DCP index (RFC-0011),\n* HSI receipts and authority seals (RFC-0020),\n* FAC event fabric and admission gating (RFC-0032),\n* HTF LedgerTime semantics (RFC-0016).\n"
+        },
+        {
+          "type": "section",
+          "title": "1. Content-addressed storage (CAS)",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0001",
+              "title": "CAS uses BLAKE3 content addressing with hash verification",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The Content-Addressed Storage (CAS) subsystem MUST address objects by the BLAKE3 hash of their exact bytes. CAS MUST verify that any stored or retrieved bytes match their claimed hash.",
+                "acceptance": [
+                  "CAS put computes BLAKE3(bytes) and returns the lowercase hex digest (64 chars) as the object key.",
+                  "CAS get verifies that BLAKE3(retrieved_bytes) == requested hash before returning to caller.",
+                  "CAS rejects invalid hash strings (non-hex or wrong length) before attempting filesystem access."
+                ],
+                "rationale": "Hash verification is the integrity boundary for all evidence and control artifacts.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If hash verification fails, the object is treated as corrupted; CAS returns an integrity error and MAY quarantine the on-disk blob.",
+                  "If the filesystem returns fewer bytes than expected (short read), treat as corruption and fail closed."
+                ],
+                "fail_closed": "Never return bytes that do not verify to the requested hash.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs",
+                  "crates/apm2-core/src/crypto/hash.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0002",
+              "title": "CAS filesystem safety: no symlinks, no traversal, locked-down permissions",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS storage MUST be safe against path traversal and symlink attacks. All CAS directories MUST be created with restrictive permissions (0700) and must reject symlink components.",
+                "acceptance": [
+                  "CAS init creates `objects/` and `metadata/` with 0700 (owner-only) permissions.",
+                  "CAS rejects any resolved path containing symlinks or non-canonical components.",
+                  "CAS enforces that all writes occur under the configured root directory and never follow symlinks."
+                ],
+                "rationale": "CAS stores authoritative evidence; symlink/traversal vulnerabilities are integrity and privilege-escalation risks.",
+                "domain": [
+                  "security",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If the CAS root is not a directory or has unsafe permissions, daemon startup fails.",
+                  "If existing directories have broader permissions, startup fails or tightens them under policy."
+                ],
+                "fail_closed": "Refuse to initialize CAS if safety checks fail.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs",
+                  "crates/apm2-daemon/src/fs_safe.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0003",
+              "title": "CAS writes are atomic and crash-consistent",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS writes MUST be atomic: a put operation either makes the full object visible at its final path or not at all. Partial writes MUST not become visible as valid objects.",
+                "acceptance": [
+                  "CAS writes to a unique temp file in `objects/.tmp/` and atomically renames to final object path.",
+                  "Temp files are fsynced (or equivalent) before rename under durability policy.",
+                  "If a crash occurs mid-write, recovery process removes temp files and does not treat them as objects."
+                ],
+                "rationale": "Atomicity is required to keep content hashes meaningful and to preserve ledger referential integrity.",
+                "domain": [
+                  "correctness",
+                  "reliability",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If rename fails due to cross-device boundaries, CAS rejects configuration (root must be single filesystem).",
+                  "Concurrent writes of the same hash are allowed; exactly one final object may exist and its bytes must verify."
+                ],
+                "fail_closed": "On any I/O or atomicity uncertainty, treat operation as failed and do not emit a reference to the object.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0004",
+              "title": "CAS enforces per-object and total size limits",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS MUST enforce a maximum object size and a maximum total store size, and MUST fail closed when limits would be exceeded.",
+                "acceptance": [
+                  "CAS rejects put operations where bytes_len > max_object_size_bytes.",
+                  "CAS maintains a persistent total_size counter and rejects put operations that would exceed max_total_size_bytes.",
+                  "Size accounting is crash-consistent and monotone with respect to successful puts."
+                ],
+                "rationale": "Prevents unbounded disk consumption and ensures predictable resource envelopes for admission and evidence publication.",
+                "domain": [
+                  "security",
+                  "reliability",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If total_size metadata is missing or corrupted, CAS recomputes total size by scanning objects, then persists corrected metadata.",
+                  "If disk is full mid-write, CAS aborts and cleans up temp files; total_size must not be incremented."
+                ],
+                "fail_closed": "Reject writes that exceed limits; do not attempt partial eviction unless explicitly configured.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0005",
+              "title": "CAS read/write APIs are bounded and streaming-safe",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS MUST provide bounded streaming-safe interfaces for get/put. Callers must not be forced to materialize arbitrarily large blobs in memory.",
+                "acceptance": [
+                  "CAS provides a read stream or chunked read API for large objects.",
+                  "CAS enforces maximum bytes read per request and maximum concurrent open file handles under policy.",
+                  "CAS rejects requests that would exceed configured bounds."
+                ],
+                "rationale": "Prevents memory exhaustion and file descriptor exhaustion under adversarial workloads.",
+                "domain": [
+                  "security",
+                  "performance",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If the caller requests an object larger than allowed, CAS fails with a specific TooLarge error.",
+                  "If concurrency limits are exceeded, CAS fails with Backpressure and caller must retry under FAC policy."
+                ],
+                "fail_closed": "Do not degrade into unbounded reads/writes."
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0006",
+              "title": "CAS deduplication is idempotent and collision-detecting",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS MUST be idempotent: storing the same bytes multiple times yields the same hash and does not corrupt state. If a hash collision is detected (existing object bytes do not match claimed hash), CAS MUST treat it as corruption and fail closed.",
+                "acceptance": [
+                  "put(bytes) returns the same hash for identical bytes across runs.",
+                  "If an object with the same hash already exists, CAS verifies its bytes and treats put as deduplicated success.",
+                  "If existing bytes under a hash do not verify, CAS returns an integrity error and does not overwrite the object."
+                ],
+                "rationale": "Idempotency is required for replay and concurrent admission; collision detection is required for integrity.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "storage"
+                ],
+                "fail_closed": "Do not overwrite or return unverified objects.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0007",
+              "title": "CAS total_size metadata is crash-safe and consistent",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "CAS MUST maintain a persistent `total_size` metadata value that is updated atomically with successful object writes and is resilient to crashes.",
+                "acceptance": [
+                  "total_size is stored in `metadata/total_size` and parsed as a u64.",
+                  "CAS updates total_size only after the object has been durably renamed into place.",
+                  "On startup, CAS loads total_size; if missing/corrupt, it recomputes by scanning objects and persists the corrected value."
+                ],
+                "domain": [
+                  "reliability",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If concurrent writers exist (should not in production), total_size updates must be guarded by a file lock or serialized at process level.",
+                  "If recomputation scanning exceeds a time budget, daemon may refuse to start rather than running with unknown quotas."
+                ],
+                "fail_closed": "If total_size cannot be trusted and cannot be recomputed, refuse further writes.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0008",
+              "title": "CAS supports garbage collection only under explicit reachability policy",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "If CAS implements garbage collection/eviction, it MUST only delete objects proven unreachable by the authoritative ledger (or explicit pin set), and it MUST be crash-safe and auditable.",
+                "acceptance": [
+                  "GC operates on a reachability set derived from ledger artifact_refs (and explicit pins).",
+                  "GC emits an audit log or receipt listing deleted object hashes and byte counts.",
+                  "GC never deletes objects referenced by any non-pruned ledger event."
+                ],
+                "rationale": "Uncontrolled GC can destroy evidence and make ledger replay impossible.",
+                "domain": [
+                  "reliability",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If reachability computation cannot complete, GC must not run.",
+                  "If GC encounters unreadable objects, it must quarantine them rather than silently deleting."
+                ],
+                "fail_closed": "Skip GC on uncertainty."
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "CAS stores raw bytes keyed by hash. It is used for:\n\n* CAC canonical artifact bytes,\n* evidence artifacts (AAT logs, build outputs),\n* large bundle payloads referenced from ledger events.\n\nCAS is a security boundary; file-system safety is mandatory.\n"
+        },
+        {
+          "type": "section",
+          "title": "2. Ledger: append-only signed hash chain",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0010",
+              "title": "Ledger is append-only with hash-chain linking",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The ledger MUST be append-only and MUST cryptographically link events via a hash chain: each event stores `prev_hash` equal to the previous event's `event_hash`, and `event_hash` is computed from canonical event bytes.",
+                "acceptance": [
+                  "Genesis prev_hash is all-zero 32-byte hash; all subsequent events set prev_hash to previous event_hash.",
+                  "event_hash = EventHasher::hash_event(payload, prev_hash) using BLAKE3 with domain separation.",
+                  "Ledger insertion verifies provided prev_hash/event_hash when present; mismatch fails."
+                ],
+                "rationale": "Hash-chain linking provides tamper-evidence and establishes authoritative ordering (LedgerTime).",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "If legacy rows lack hash-chain material, they are treated as compatibility-only and must not be used as chain anchors for new events.",
+                  "If an insertion attempt uses a prev_hash that does not match ledger tip, insertion fails with a deterministic error."
+                ],
+                "fail_closed": "Reject events that would break the chain; do not auto-rewrite prev_hash.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs",
+                  "crates/apm2-core/src/crypto/hash.rs"
+                ],
+                "theory_refs": [
+                  "LAW-03",
+                  "INV-F-01",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0011",
+              "title": "Ledger events are signed and signatures are verifiable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each ledger event MUST carry a digital signature covering its canonical hash-chain material. Signatures MUST be verifiable using the actor's verifying key under the active trust hierarchy policy.",
+                "acceptance": [
+                  "Ledger storage computes signature = sign(event_hash) using Ed25519 (or policy-defined signer).",
+                  "Verification rejects signatures with invalid length or invalid curve points.",
+                  "Key rotation receipts are stored and replayable; verification uses the correct key for the event epoch."
+                ],
+                "rationale": "Signatures provide authenticity and non-repudiation for ledger writes.",
+                "domain": [
+                  "security",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "If an HSM is configured, signing keys never leave HSM boundary; software fallback is allowed only in non-T1 environments.",
+                  "If signature verification fails during replay, the ledger is treated as corrupted and the daemon must freeze writes."
+                ],
+                "fail_closed": "Reject unverifiable events and freeze/stop rather than continuing with untrusted history.",
+                "code_refs": [
+                  "crates/apm2-core/src/crypto/mod.rs",
+                  "crates/apm2-core/src/ledger/storage.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0014",
+              "title": "Ledger events reference CAS objects via explicit artifact_refs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When a ledger event refers to external bytes (evidence artifacts, CAC documents, bundles), it MUST do so via CAS content hashes recorded in `artifact_refs` (or equivalent). Consumers MUST verify referenced CAS objects by hash before use.",
+                "acceptance": [
+                  "events table includes schema_digest and canonicalizer metadata so payload canonicalization is replayable.",
+                  "artifact_refs table stores (event_id, artifact_hash, artifact_type, path_hint) for referenced objects.",
+                  "Consumer code verifies CAS object hash prior to interpreting bytes."
+                ],
+                "rationale": "Separates large blobs from ledger while keeping referential integrity and replayability.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "ledger",
+                  "storage"
+                ],
+                "edge_cases": [
+                  "If an artifact_ref points to a missing CAS object, the event is considered incomplete; projections must fail closed or quarantine.",
+                  "If path_hint is present, it is non-normative and must not affect hash verification or lookup semantics."
+                ],
+                "fail_closed": "Never interpret an event whose referenced bytes cannot be retrieved and verified.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/schema.sql",
+                  "crates/apm2-daemon/src/cas/mod.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0018",
+              "title": "Ledger events carry canonicalizer and schema digests",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each ledger event MUST record the schema digest and canonicalizer metadata used for its payload, so that payload interpretation is replayable and verifiable.",
+                "acceptance": [
+                  "events table includes schema_digest, canonicalizer_id, canonicalizer_version columns.",
+                  "Canonical event hashing includes payload bytes exactly as stored (canonical bytes).",
+                  "If schema_digest is missing, event insertion fails (or is restricted to explicit legacy compat mode)."
+                ],
+                "rationale": "Without schema/canonicalizer pinning, ledger replay cannot be trusted or reproduced.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "During migration, legacy rows may have NULL schema_digest/canonicalizer fields; they are compatibility-only and must not anchor new semantics.",
+                  "If canonicalizer is upgraded, new events must record new canonicalizer_version; mixed versions are allowed but explicit."
+                ],
+                "fail_closed": "Reject events with missing schema/canonicalizer metadata in canonical mode.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/schema.sql",
+                  "crates/apm2-core/src/ledger/storage.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-02"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0019",
+              "title": "Ledger writes are transactional across events and artifact_refs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "In canonical mode, insertion of an event and its associated artifact_refs MUST occur in a single database transaction. A transaction must not commit an event without its declared artifact references (or vice versa).",
+                "acceptance": [
+                  "Ledger emit uses a BEGIN/COMMIT transaction that includes inserting into events and artifact_refs.",
+                  "On any error inserting artifact_refs, the transaction rolls back and the event is not visible.",
+                  "Foreign key constraints are enabled so artifact_refs.event_id always references an existing events.seq_id."
+                ],
+                "rationale": "Maintains referential integrity and prevents dangling references.",
+                "domain": [
+                  "correctness",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "If foreign key constraints are disabled or unsupported, daemon must refuse to start in canonical mode.",
+                  "If artifact_refs is empty, the event may still commit; absence of artifact_refs is explicit."
+                ],
+                "fail_closed": "Rollback and return error on any partial insert failure.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/schema.sql",
+                  "crates/apm2-core/src/ledger/storage.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0023",
+              "title": "SQLite durability and safety pragmas are enforced",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The ledger's SQLite configuration MUST enable foreign keys and WAL mode, and MUST use a durability policy appropriate for append-only truth (at minimum: WAL + synchronous=NORMAL + secure_delete=ON).",
+                "acceptance": [
+                  "schema.sql sets PRAGMA foreign_keys=ON and PRAGMA journal_mode=WAL.",
+                  "LedgerStorage exposes verify_wal_mode and startup checks it (or asserts configured).",
+                  "secure_delete is ON so deleted pages are scrubbed."
+                ],
+                "rationale": "Ensures concurrent reads and reduces corruption risk; secure_delete reduces data remanence.",
+                "domain": [
+                  "security",
+                  "reliability",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "If WAL mode cannot be enabled (filesystem limitation), daemon must refuse to start in canonical mode.",
+                  "If the operator changes PRAGMAs, daemon should detect and warn/fail under policy."
+                ],
+                "fail_closed": "Reject unsafe DB modes.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/schema.sql",
+                  "crates/apm2-core/src/ledger/storage.rs::verify_wal_mode"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0024",
+              "title": "Read-only ledger readers are safe and cannot write",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any concurrent ledger reader connections MUST be opened read-only and MUST not allow writes. Read-only connections MUST determine read mode independently and must fail closed on schema ambiguity.",
+                "acceptance": [
+                  "LedgerReader uses SQLITE_OPEN_READ_ONLY and SQLITE_OPEN_NO_MUTEX flags.",
+                  "LedgerReader calls determine_read_mode and fails on ambiguity.",
+                  "No code path exposes a writable DB handle outside the daemon write context."
+                ],
+                "rationale": "Prevents accidental dual writers and preserves single-writer semantics.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "ledger"
+                ],
+                "edge_cases": [
+                  "If the ledger is in-memory, open_reader must fail with a clear Unsupported error."
+                ],
+                "fail_closed": "Reject attempts to open writable readers.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs::open_reader"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The ledger is the authoritative event log. It provides:\n\n* tamper-evidence (hash chaining),\n* authenticity (signatures),\n* ordering (LedgerTime),\n* and referential integrity to CAS objects.\n\nAll authority-relevant state is derived from ledger events and verified CAS objects.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. Migration, freeze guards, and no-dual-truth enforcement",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0012",
+              "title": "Ledger storage mode migration is idempotent and fail-closed",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Ledger schema migration from legacy tables to canonical `events` table MUST be idempotent, and the system MUST fail closed on ambiguous schema state.",
+                "acceptance": [
+                  "Startup runs `ensure_schema_current()` and then determines read mode using deterministic rules.",
+                  "If legacy schema is present but incomplete/malformed, the system fails with LedgerSchemaMismatch.",
+                  "If both legacy and canonical schemas appear active (ambiguous), the system fails with LedgerSchemaAmbiguous."
+                ],
+                "rationale": "Dual-schema ambiguity is a split-brain truth plane and violates the 'no dual implementations' invariant.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "migration"
+                ],
+                "fail_closed": "Abort startup or refuse ledger operations on ambiguity.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs::determine_read_mode",
+                  "crates/apm2-daemon/src/ledger.rs::ensure_ledger_migrated"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0013",
+              "title": "Legacy ledger writes are frozen after migration cutover",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "After the system migrates to the canonical events table, all writes to legacy tables MUST be frozen. Any attempt to write legacy rows MUST be rejected and surfaced as a defect.",
+                "acceptance": [
+                  "A `ledger_freeze_guard` row is set to `frozen=1` and is checked before any legacy write path.",
+                  "freeze_legacy_writes is idempotent and can be called multiple times safely.",
+                  "If legacy writes are attempted, the operation fails and logs a warning."
+                ],
+                "rationale": "This enforces the 'update in place' invariant and prevents silent divergence between old and new ledgers.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "migration"
+                ],
+                "edge_cases": [
+                  "If the freeze guard table is missing, startup must treat that as schema mismatch and fail closed.",
+                  "If the system is in legacy-only mode (pre-migration), freeze is not applied, but migration is expected before LIVING status."
+                ],
+                "fail_closed": "Reject legacy writes; do not attempt to mirror them into new schema.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/ledger.rs::freeze_legacy_writes",
+                  "crates/apm2-core/src/ledger/storage.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0022",
+              "title": "No dual-truth plane for ledger history",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "There MUST be exactly one authoritative ledger history at runtime. Compatibility views (legacy_compat) may exist only as read-only projections and must not accept writes.",
+                "acceptance": [
+                  "Legacy compat view projects event_hash and prev_hash as NULL and does not accept inserts.",
+                  "determine_read_mode fails on ambiguous state rather than enabling both.",
+                  "Freeze guard prevents any path that would write legacy tables after cutover."
+                ],
+                "rationale": "This is the concrete enforcement of the system-wide 'no dual implementations' invariant.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "governance"
+                ],
+                "fail_closed": "Abort on ambiguity.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs::determine_read_mode"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "The system explicitly enforces the global invariant: **no dual implementations / no dual truth plane**.\n\nThe migration from legacy tables to canonical events is handled by deterministic read-mode determination and a freeze guard\nthat prevents legacy writes after cutover.\n"
+        },
+        {
+          "type": "section",
+          "title": "4. Single-writer daemon contract and storage path hygiene",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0016",
+              "title": "Daemon is the sole ledger writer; all writes are serialized",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "In production, the daemon MUST be the sole writer to the ledger. Ledger write operations MUST be serialized (single-writer) and must not allow concurrent conflicting tip updates.",
+                "acceptance": [
+                  "CLI and agents interact with ledger exclusively through daemon HSI routes.",
+                  "LedgerStorage uses a single connection pool and uses transactions to serialize event inserts.",
+                  "Insertion verifies prev_hash against ledger tip and rejects conflicts."
+                ],
+                "rationale": "Single-writer semantics simplify correctness and enforce a single source of truth.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "edge_cases": [
+                  "Test harnesses may use in-memory ledger implementations, but production must not run multiple writer daemons against the same ledger path.",
+                  "If multiple daemons are accidentally started, a filesystem lock or exclusive DB lock should prevent concurrent writers."
+                ],
+                "fail_closed": "If exclusive writer lock cannot be acquired, daemon refuses to start.",
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs",
+                  "crates/apm2-daemon/src/ledger.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0020",
+              "title": "Ledger and CAS paths are scoped per sandbox and non-shareable across trust tiers",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Ledger database path and CAS root MUST be scoped per sandbox/environment and MUST NOT be shared across trust tiers without explicit policy and quarantine boundaries.",
+                "acceptance": [
+                  "Config contains explicit ledger_path and cas_root parameters; defaults are under a per-user sandbox directory.",
+                  "Daemon refuses to start if paths point to world-writable locations.",
+                  "Quarantine store exists for untrusted blobs and is isolated from main CAS."
+                ],
+                "rationale": "Prevents cross-tier contamination and avoids unintentional multi-writer access to shared stores.",
+                "domain": [
+                  "security",
+                  "governance"
+                ],
+                "edge_cases": [
+                  "If an operator intentionally points two environments at the same path, the daemon must detect and refuse under policy.",
+                  "If sandbox directory cannot be created with safe permissions, startup fails."
+                ],
+                "fail_closed": "Refuse to start with unsafe storage paths.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/cas/mod.rs",
+                  "crates/apm2-daemon/src/quarantine_store.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Production deployments use a single writer daemon per ledger path.\nStorage paths are sandbox-scoped and must not be shared across trust tiers.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. Derived views are replayable projections",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0015",
+              "title": "Projections are derived and rebuildable; Git is a projection",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any derived view (work state, projections, GitHub mirror, indexes) MUST be replayable from the ledger + CAS. Derived views MUST NOT be treated as sources of authority.",
+                "acceptance": [
+                  "Projection stores can be deleted and rebuilt from ledger history without loss of truth.",
+                  "FAC treats Git as a projection: merge state is validated against ledger receipts, not git metadata.",
+                  "Any view store includes a version and can be invalidated if schema changes."
+                ],
+                "rationale": "Single truth plane reduces split-brain risk and makes recovery feasible.",
+                "domain": [
+                  "correctness",
+                  "governance"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Any view or index (including Git projection) is derived and rebuildable from ledger + CAS.\n"
+        },
+        {
+          "type": "section",
+          "title": "6. Startup integrity checks, auditability, and observability",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0017",
+              "title": "Startup performs integrity checks and fails closed on corruption",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "On startup, the daemon MUST validate ledger schema state and perform integrity checks sufficient to detect obvious corruption (schema mismatch, invalid hash lengths, missing freeze guard, etc.).",
+                "acceptance": [
+                  "Startup validates the existence and shape of required tables for the active storage mode.",
+                  "Startup validates that any non-NULL event_hash values are 32 bytes.",
+                  "Startup runs migration checks and then freezes legacy writes when in canonical mode."
+                ],
+                "rationale": "Starting in a corrupted state risks producing new events that make recovery impossible.",
+                "domain": [
+                  "security",
+                  "reliability"
+                ],
+                "edge_cases": [
+                  "If legacy compat view exists but canonical schema is incomplete, treat as schema mismatch.",
+                  "If integrity checks are expensive, they may be sampled or limited, but must at least validate tip hash length and freeze guard."
+                ],
+                "fail_closed": "Refuse to start or refuse writes until corruption is addressed.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/ledger.rs",
+                  "crates/apm2-core/src/ledger/storage.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0021",
+              "title": "All ledger/CAS operations are auditable via receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Operations that mutate ledger or CAS state MUST emit receipts or deterministic logs sufficient to audit what changed.",
+                "acceptance": [
+                  "Admission receipts reference CAS hashes and ledger seq_id/event_hash where applicable.",
+                  "CAS store emits structured logs including object hash and byte length on successful writes.",
+                  "Ledger emit returns the inserted seq_id and event_hash to caller."
+                ],
+                "rationale": "Auditable mutation is required for FAC gate receipts and for incident response.",
+                "domain": [
+                  "observability",
+                  "security",
+                  "correctness"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0033::REQ-0025",
+              "title": "Ledger statistics are bounded and non-authoritative",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "Ledger may expose statistics (counts, db_size_bytes) for observability. These statistics MUST be bounded in cost and MUST NOT be used for authority decisions.",
+                "acceptance": [
+                  "stats() uses O(1) SQL aggregates (COUNT, MAX) and PRAGMA page_count/page_size.",
+                  "No gate or admission path depends on stats() results to decide correctness/security outcomes."
+                ],
+                "rationale": "Stats are useful but should not become an authority surface that can be manipulated.",
+                "domain": [
+                  "observability",
+                  "performance"
+                ],
+                "code_refs": [
+                  "crates/apm2-core/src/ledger/storage.rs::stats"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Startup must validate schema and detect obvious corruption. Mutations must be auditable.\nObservability is supported but is non-authoritative.\n"
+        },
+        {
+          "type": "section",
+          "title": "7. Traceability to implementation",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Primary implementation surfaces:\n\n* CAS: `crates/apm2-daemon/src/cas/*`\n* Filesystem hardening: `crates/apm2-daemon/src/fs_safe.rs`\n* Ledger schema + storage: `crates/apm2-core/src/ledger/schema.sql`, `crates/apm2-core/src/ledger/storage.rs`\n* Daemon migration + freeze guard: `crates/apm2-daemon/src/ledger.rs`\n* Cryptographic primitives: `crates/apm2-core/src/crypto/*`\n"
+        }
+      ]
+    }
+  }
+}

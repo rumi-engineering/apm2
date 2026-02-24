@@ -1,6 +1,7 @@
 //! Evidence gates (fmt, clippy, doc, test, native checks) for FAC push
 //! pipeline.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1363,8 +1364,289 @@ fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, Pat
     Ok((apm2_home.to_path_buf(), fac_root.to_path_buf()))
 }
 
-fn resolve_evidence_test_command_override(test_command_override: Option<&[String]>) -> Vec<String> {
-    test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoGateExecutionScope {
+    FullWorkspace,
+    ScopedPackages(Vec<String>),
+    NoCargoImpact,
+}
+
+impl CargoGateExecutionScope {
+    fn summary(&self) -> String {
+        match self {
+            Self::FullWorkspace => "full_workspace".to_string(),
+            Self::ScopedPackages(packages) => {
+                format!("scoped_packages({})", packages.join(","))
+            },
+            Self::NoCargoImpact => "no_cargo_impact".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CargoMetadataPackage {
+    name: String,
+    manifest_path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CargoMetadataDocument {
+    packages: Vec<CargoMetadataPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct Phase2GateSpec {
+    gate_name: &'static str,
+    command: Vec<String>,
+    skip_reason: Option<&'static str>,
+}
+
+fn resolve_cargo_gate_execution_scope(workspace_root: &Path) -> CargoGateExecutionScope {
+    resolve_cargo_gate_execution_scope_with(workspace_root)
+        .unwrap_or(CargoGateExecutionScope::FullWorkspace)
+}
+
+fn resolve_cargo_gate_execution_scope_with(
+    workspace_root: &Path,
+) -> Result<CargoGateExecutionScope, String> {
+    let package_dirs = resolve_workspace_package_dirs(workspace_root)?;
+    let diff_range = resolve_cargo_scope_diff_range(workspace_root)?;
+    let changed_paths = load_changed_paths(workspace_root, &diff_range)?;
+    Ok(classify_cargo_gate_scope(&changed_paths, &package_dirs))
+}
+
+fn resolve_workspace_package_dirs(workspace_root: &Path) -> Result<Vec<(String, String)>, String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute cargo metadata: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "failed to resolve workspace package metadata: {}",
+            if stderr.is_empty() {
+                "cargo metadata returned non-zero status".to_string()
+            } else {
+                stderr
+            }
+        ));
+    }
+    let metadata: CargoMetadataDocument = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse cargo metadata output: {err}"))?;
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut dirs = metadata
+        .packages
+        .into_iter()
+        .filter_map(|package| {
+            let manifest = PathBuf::from(package.manifest_path);
+            let relative_manifest = manifest
+                .strip_prefix(&canonical_workspace_root)
+                .ok()
+                .or_else(|| manifest.strip_prefix(workspace_root).ok())?;
+            let relative_dir = relative_manifest.parent()?;
+            let dir = relative_dir.to_string_lossy().replace('\\', "/");
+            if dir.is_empty() {
+                return None;
+            }
+            Some((dir, package.name))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort_by(|left, right| {
+        right
+            .0
+            .len()
+            .cmp(&left.0.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(dirs)
+}
+
+fn resolve_cargo_scope_diff_range(workspace_root: &Path) -> Result<String, String> {
+    let mut base_ref = None;
+    for candidate in ["origin/main", "main"] {
+        let probe = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{candidate}^{{commit}}"),
+            ])
+            .current_dir(workspace_root)
+            .output()
+            .map_err(|err| format!("failed to execute git rev-parse: {err}"))?;
+        if probe.status.success() {
+            base_ref = Some(candidate.to_string());
+            break;
+        }
+    }
+    let resolved_base_ref = base_ref.unwrap_or_else(|| "HEAD^".to_string());
+    let merge_base = Command::new("git")
+        .args(["merge-base", "HEAD", &resolved_base_ref])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute git merge-base: {err}"))?;
+    if !merge_base.status.success() {
+        return Err(format!(
+            "failed to resolve merge-base against `{resolved_base_ref}`"
+        ));
+    }
+    let base = String::from_utf8_lossy(&merge_base.stdout)
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        return Err("git merge-base returned an empty base commit".to_string());
+    }
+    Ok(format!("{base}..HEAD"))
+}
+
+fn load_changed_paths(workspace_root: &Path, diff_range: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=ACMR", diff_range])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute git diff for cargo scope: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "failed to resolve changed files for cargo scope: {}",
+            if stderr.is_empty() {
+                "git diff returned non-zero status".to_string()
+            } else {
+                stderr
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn classify_cargo_gate_scope(
+    changed_paths: &[String],
+    package_dirs: &[(String, String)],
+) -> CargoGateExecutionScope {
+    if changed_paths.is_empty() {
+        return CargoGateExecutionScope::NoCargoImpact;
+    }
+    let mut packages = BTreeSet::new();
+    for path in changed_paths {
+        if path_requires_full_workspace(path) {
+            return CargoGateExecutionScope::FullWorkspace;
+        }
+        if path_is_non_cargo_impact(path) {
+            continue;
+        }
+        if let Some(package_name) = package_for_path(path, package_dirs) {
+            packages.insert(package_name.to_string());
+            continue;
+        }
+        return CargoGateExecutionScope::FullWorkspace;
+    }
+    if packages.is_empty() {
+        CargoGateExecutionScope::NoCargoImpact
+    } else {
+        CargoGateExecutionScope::ScopedPackages(packages.into_iter().collect())
+    }
+}
+
+fn path_requires_full_workspace(path: &str) -> bool {
+    if matches!(
+        path,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "rust-toolchain.toml"
+            | "rustfmt.toml"
+            | ".config/nextest.toml"
+    ) {
+        return true;
+    }
+    path.starts_with(".cargo/") || path.starts_with("proto/") || path.ends_with("/Cargo.toml")
+}
+
+fn path_is_non_cargo_impact(path: &str) -> bool {
+    if matches!(
+        path,
+        "AGENTS.md" | "README.md" | "SECURITY.md" | "DAEMON.md" | "LICENSE-APACHE" | "LICENSE-MIT"
+    ) {
+        return true;
+    }
+    path.starts_with("documents/")
+        || path.starts_with("deploy/")
+        || path.starts_with(".github/")
+        || path.starts_with("contrib/")
+        || path.starts_with("evidence/")
+}
+
+fn package_for_path<'a>(path: &str, package_dirs: &'a [(String, String)]) -> Option<&'a str> {
+    let normalized = path.replace('\\', "/");
+    for (dir, package_name) in package_dirs {
+        if normalized == *dir || normalized.starts_with(&format!("{dir}/")) {
+            return Some(package_name);
+        }
+    }
+    None
+}
+
+fn append_scope_package_args(command: &mut Vec<String>, scope: &CargoGateExecutionScope) {
+    match scope {
+        CargoGateExecutionScope::ScopedPackages(packages) if !packages.is_empty() => {
+            for package in packages {
+                command.push("-p".to_string());
+                command.push(package.clone());
+            }
+        },
+        _ => command.push("--workspace".to_string()),
+    }
+}
+
+fn build_doc_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec!["cargo".to_string(), "doc".to_string()];
+    append_scope_package_args(&mut command, scope);
+    command.push("--no-deps".to_string());
+    command
+}
+
+fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec!["cargo".to_string(), "clippy".to_string()];
+    append_scope_package_args(&mut command, scope);
+    command.extend([
+        "--all-targets".to_string(),
+        "--all-features".to_string(),
+        "--".to_string(),
+        "-D".to_string(),
+        "warnings".to_string(),
+    ]);
+    command
+}
+
+fn build_scoped_nextest_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec![
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+    ];
+    append_scope_package_args(&mut command, scope);
+    command.extend([
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ]);
+    command
+}
+
+fn resolve_evidence_test_command_with_scope(
+    test_command_override: Option<&[String]>,
+    scope: &CargoGateExecutionScope,
+) -> Vec<String> {
+    test_command_override.map_or_else(|| build_scoped_nextest_command(scope), <[_]>::to_vec)
 }
 
 fn resolve_evidence_test_command_environment(
@@ -1551,6 +1833,16 @@ fn write_cached_gate_log_marker(
         "info: gate={gate_name} result reused from cache (reason={reuse_reason}) attestation_digest={}\n",
         attestation_digest.unwrap_or("unknown")
     );
+    let _ = crate::commands::fac_permissions::write_fac_file_with_mode(log_path, marker.as_bytes());
+    StreamStats {
+        bytes_written: marker.len() as u64,
+        bytes_total: marker.len() as u64,
+        was_truncated: false,
+    }
+}
+
+fn write_skipped_gate_log_marker(log_path: &Path, gate_name: &str, reason: &str) -> StreamStats {
+    let marker = format!("info: gate={gate_name} skipped (reason={reason})\n");
     let _ = crate::commands::fac_permissions::write_fac_file_with_mode(log_path, marker.as_bytes());
     StreamStats {
         bytes_written: marker.len() as u64,
@@ -1897,24 +2189,35 @@ pub(super) fn run_evidence_gates_with_lane_context(
         (None, None, None)
     };
 
-    // Fastest-first ordering for expensive cargo gates. Keep cheap checks
-    // ahead of heavier analysis to minimize wasted compute on early failure.
-    let gates: &[(&str, &[&str])] = &[
-        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
-        (
-            "clippy",
-            &[
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
+    let cargo_scope = resolve_cargo_gate_execution_scope(workspace_root);
+    if emit_human_logs {
+        eprintln!("fac gates: cargo execution scope={}", cargo_scope.summary());
+    }
+    let skip_cargo_heavy_gates = matches!(cargo_scope, CargoGateExecutionScope::NoCargoImpact);
+
+    // Fastest-first ordering for cargo-backed gates. We always keep rustfmt
+    // active; doc/clippy/test are scoped or skipped based on cargo impact.
+    let phase2_gate_specs = vec![
+        Phase2GateSpec {
+            gate_name: "rustfmt",
+            command: vec![
+                "cargo".to_string(),
+                "fmt".to_string(),
+                "--all".to_string(),
+                "--check".to_string(),
             ],
-        ),
+            skip_reason: None,
+        },
+        Phase2GateSpec {
+            gate_name: "doc",
+            command: build_doc_gate_command(&cargo_scope),
+            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
+        },
+        Phase2GateSpec {
+            gate_name: "clippy",
+            command: build_clippy_gate_command(&cargo_scope),
+            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
+        },
     ];
 
     let mut evidence_lines = Vec::new();

@@ -1,0 +1,72 @@
+{
+  "schema": "apm2.release_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "release.document",
+  "meta": {
+    "stable_id": "dcp://apm2.releases/doc/readme@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/releases/README.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "APM2 Release Infrastructure",
+    "overview": "APM2 uses a three-channel release pipeline with artifact promotion. Binaries are built once at the dev stage and promoted unchanged through beta and stable channels, ensuring consistency and traceability.",
+    "channels_at_a_glance": [
+      { "channel": "Dev", "trigger": "Merge to `main`", "tag_format": "`dev` (rolling)", "security": "SHA256 checksums", "audience": "Developers, AI agents" },
+      { "channel": "Beta", "trigger": "Manual dispatch", "tag_format": "`vX.Y.Z-beta.N`", "security": "SHA256 checksums", "audience": "Early adopters" },
+      { "channel": "Stable", "trigger": "release-plz PR merge", "tag_format": "`vX.Y.Z`", "security": "Sigstore + SLSA L3", "audience": "Production users" }
+    ],
+    "quick_links": {
+      "release_documentation": [
+        { "title": "Release Channels", "path": "documents/releases/RELEASE_CHANNELS.cac.json" },
+        { "title": "Artifact Promotion", "path": "documents/releases/ARTIFACT_PROMOTION.cac.json" },
+        { "title": "Distribution & Verification", "path": "documents/releases/DISTRIBUTION.cac.json" }
+      ],
+      "security_documentation": [
+        { "title": "Signing & Verification", "path": "documents/security/SIGNING_AND_VERIFICATION.cac.json" },
+        { "title": "Release Procedure", "path": "documents/security/RELEASE_PROCEDURE.cac.json" }
+      ]
+    },
+    "release_artifacts": [
+      { "artifact": "apm2-linux-x86_64", "description": "Linux x86_64 binary" },
+      { "artifact": "apm2-linux-aarch64", "description": "Linux ARM64 binary" },
+      { "artifact": "apm2-linux-x86_64-daemon", "description": "Daemon binary (x86_64)" },
+      { "artifact": "apm2-linux-aarch64-daemon", "description": "Daemon binary (ARM64)" },
+      { "artifact": "checksums-sha256.txt", "description": "SHA256 checksums for all binaries" },
+      { "artifact": "*.sig", "description": "Cosign signatures (stable only)" },
+      { "artifact": "*.pem", "description": "Signing certificates (stable only)" },
+      { "artifact": "sbom.spdx.json", "description": "Software bill of materials (stable only)" },
+      { "artifact": "provenance.intoto.jsonl", "description": "SLSA L3 provenance (stable only)" }
+    ],
+    "quick_start": {
+      "production_use": {
+        "description": "Download the latest stable release",
+        "commands": [
+          "curl -LO https://github.com/USER/apm2/releases/latest/download/apm2-linux-x86_64",
+          "chmod +x apm2-linux-x86_64",
+          "curl -LO https://github.com/USER/apm2/releases/latest/download/apm2-linux-x86_64.sig",
+          "curl -LO https://github.com/USER/apm2/releases/latest/download/apm2-linux-x86_64.pem",
+          "cosign verify-blob --certificate apm2-linux-x86_64.pem --signature apm2-linux-x86_64.sig --certificate-identity-regexp 'https://github.com/.*/apm2/.*' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' apm2-linux-x86_64"
+        ]
+      },
+      "development_testing": {
+        "description": "Download the latest dev build",
+        "commands": [
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/apm2-linux-x86_64",
+          "chmod +x apm2-linux-x86_64",
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/checksums-sha256.txt",
+          "sha256sum -c checksums-sha256.txt --ignore-missing"
+        ]
+      }
+    }
+  }
+}
