@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeStarted};
+//! use apm2_holon::{EpisodeCompleted, EpisodeCompletionReason, EpisodeStarted};
 //!
 //! // Create an episode started event
 //! let started = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000)
@@ -161,7 +161,7 @@ impl EpisodeStarted {
     /// Creates a new episode started event with ID validation.
     ///
     /// This is the recommended constructor for external callers. It validates
-    /// all ID fields according to [`validate_id`] rules.
+    /// all ID fields according to `validate_id` rules.
     ///
     /// # Errors
     ///
@@ -173,7 +173,7 @@ impl EpisodeStarted {
     /// # Example
     ///
     /// ```rust
-    /// use apm2_holon::ledger::EpisodeStarted;
+    /// use apm2_holon::EpisodeStarted;
     ///
     /// let event = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000)
     ///     .expect("valid IDs");
@@ -223,7 +223,7 @@ impl EpisodeStarted {
     ///
     /// # Preconditions
     ///
-    /// All ID arguments must satisfy [`validate_id`] rules:
+    /// All ID arguments must satisfy `validate_id` rules:
     /// - Not empty
     /// - At most 256 bytes
     /// - No `/` or null bytes

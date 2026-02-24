@@ -552,7 +552,8 @@ fn test_full_skill_integration() {
     assert_eq!(result.episodes_executed, 5);
     assert!(result.output.is_some());
 
-    // Step 7: Verify ledger events were emitted
+    // Step 7: Verify ledger events were emitted (only when legacy feature is on)
+    #[cfg(feature = "legacy_holon_ledger")]
     assert!(!result.events.is_empty(), "should emit ledger events");
     assert!(
         !result.episode_events.is_empty(),

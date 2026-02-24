@@ -18,9 +18,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::ledger::{
-//!     EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted,
-//! };
+//! use apm2_holon::{EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted};
 //!
 //! // Record episode start - use try_new for validated construction
 //! let started = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000)
@@ -43,10 +41,20 @@
 mod chain;
 mod events;
 
+// Shared chain types: always available (used by spawn.rs, core_ledger_adapter,
+// etc.)
+// When the legacy feature is disabled, only `LedgerEvent` is needed
+// within the crate (for `SpawnResult.events` type). The rest are only
+// needed by tests (core_ledger_adapter tests).
+#[cfg(not(feature = "legacy_holon_ledger"))]
+pub(crate) use chain::LedgerEvent;
+// When the legacy feature is enabled, all chain types are fully public.
+#[cfg(feature = "legacy_holon_ledger")]
 pub use chain::{
-    ChainError, EpisodeOutcome, EventHash, EventHashError, EventType, LedgerEvent,
-    LedgerEventBuilder, LedgerValidationError, current_timestamp_ns, verify_chain,
+    ChainError, EpisodeOutcome, EventType, LedgerEvent, LedgerEventBuilder, LedgerValidationError,
+    current_timestamp_ns, verify_chain,
 };
+pub use chain::{EventHash, EventHashError};
 pub use events::{
     EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, MAX_GOAL_SPEC_LENGTH,
     MAX_ID_LENGTH, validate_goal_spec, validate_id,

@@ -102,7 +102,20 @@ pub mod core_ledger_adapter;
 pub mod defect;
 pub mod episode;
 pub mod error;
+/// Legacy holon ledger types (event chain, hash chain verification).
+///
+/// **Deprecation (TCK-00670 / HL-002):** Direct use of this module for
+/// persistence is deprecated. New code should use [`core_ledger_adapter`]
+/// to write holon events into the `apm2-core` ledger substrate.
+///
+/// When the `legacy_holon_ledger` feature is enabled the module is `pub`
+/// for migration reads and replay verification. Otherwise it is
+/// `pub(crate)` — internal types like `EpisodeEvent`, `validate_id`, and
+/// `EventHash` remain available within the crate.
+#[cfg(feature = "legacy_holon_ledger")]
 pub mod ledger;
+#[cfg(not(feature = "legacy_holon_ledger"))]
+pub(crate) mod ledger;
 pub mod orchestration;
 pub mod receipt;
 pub mod resource;
@@ -119,6 +132,8 @@ mod tests;
 // Re-export main types at crate root for convenience
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
+#[cfg(feature = "core-ledger")]
+pub use core_ledger_adapter::CoreLedgerWriter;
 pub use core_ledger_adapter::{
     CoreLedgerAdapterError, FinalitySignal, HexDigest, HolonEventEnvelope, ReplayStats,
 };
@@ -131,9 +146,16 @@ pub use episode::{
     EpisodeLoopResult,
 };
 pub use error::HolonError;
+// Legacy ledger types (chain verification, lifecycle events) are only
+// re-exported when the `legacy_holon_ledger` feature is enabled.
+#[cfg(feature = "legacy_holon_ledger")]
+pub use ledger::{ChainError, EpisodeOutcome, EventType, LedgerEvent, verify_chain};
+// Shared ledger types (episode events, validation, hashes) are always
+// re-exported. These are needed by downstream consumers regardless of
+// whether legacy ledger event persistence is enabled.
 pub use ledger::{
-    ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
-    EpisodeStarted, EventHash, EventHashError, EventType, LedgerEvent, verify_chain,
+    EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, EventHash,
+    EventHashError, MAX_GOAL_SPEC_LENGTH, MAX_ID_LENGTH,
 };
 pub use orchestration::{
     BlockedReasonCode, IterationCompleted, IterationOutcome, OrchestrationConfig,
@@ -155,6 +177,8 @@ pub use traits::Holon;
 pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
+    #[cfg(feature = "core-ledger")]
+    pub use crate::core_ledger_adapter::CoreLedgerWriter;
     pub use crate::core_ledger_adapter::{
         CoreLedgerAdapterError, FinalitySignal, HexDigest, HolonEventEnvelope, ReplayStats,
     };
@@ -167,9 +191,10 @@ pub mod prelude {
         EpisodeLoopResult,
     };
     pub use crate::error::HolonError;
+    #[cfg(feature = "legacy_holon_ledger")]
+    pub use crate::ledger::{ChainError, EpisodeOutcome, EventType, LedgerEvent, verify_chain};
     pub use crate::ledger::{
-        ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
-        EpisodeStarted, EventHash, EventType, LedgerEvent, verify_chain,
+        EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, EventHash,
     };
     pub use crate::orchestration::{
         BlockedReasonCode, IterationCompleted, IterationOutcome, OrchestrationConfig,

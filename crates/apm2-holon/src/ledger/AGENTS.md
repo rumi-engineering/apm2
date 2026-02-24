@@ -325,10 +325,11 @@ const MAX_SIGNATURE_LEN: usize = 128;
 
 ## Examples
 
-### Building a Hash Chain
+### Building a Hash Chain (requires `legacy_holon_ledger` feature)
 
 ```rust
-use apm2_holon::ledger::{EventType, LedgerEvent, verify_chain};
+// Requires: features = ["legacy_holon_ledger"]
+use apm2_holon::{EventType, LedgerEvent, verify_chain};
 
 let genesis = LedgerEvent::builder()
     .event_id("evt-001")
@@ -354,10 +355,10 @@ let second = LedgerEvent::builder()
 assert!(verify_chain(&[genesis, second]).is_ok());
 ```
 
-### Recording Episode Lifecycle
+### Recording Episode Lifecycle (always available)
 
 ```rust
-use apm2_holon::ledger::{
+use apm2_holon::{
     EpisodeStarted, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent,
 };
 

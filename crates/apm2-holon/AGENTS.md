@@ -1276,8 +1276,10 @@ pub struct ReplayStats {
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `core-ledger` | Yes | Enables `apm2-core` dependency for concrete ledger integration |
-| `legacy_holon_ledger` | No | Preserves old holon ledger chain for migration reads |
+| `core-ledger` | Yes | Enables `apm2-core` dependency for concrete ledger integration (`CoreLedgerWriter`) |
+| `legacy_holon_ledger` | No | Preserves old holon ledger chain for migration reads; gates `pub mod ledger` visibility and legacy type re-exports (`LedgerEvent`, `EventType`, `verify_chain`, etc.) |
+
+**Module visibility:** When `legacy_holon_ledger` is disabled (default), the `ledger` module is `pub(crate)` -- internal types like `LedgerEvent` remain available within the crate but are not part of the public API. Shared types (`EpisodeEvent`, `EpisodeStarted`, `EpisodeCompleted`, `EpisodeCompletionReason`, `EventHash`, `EventHashError`, `MAX_ID_LENGTH`, `MAX_GOAL_SPEC_LENGTH`) are always re-exported from the crate root regardless of feature flags.
 
 ---
 
