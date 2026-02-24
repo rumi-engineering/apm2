@@ -328,18 +328,21 @@ fn gate_attestation_digest(
 
 /// Compute a toolchain fingerprint from `rustc --version --verbose` output.
 ///
-/// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc
-/// is not available (fail-closed: different key from any real toolchain).
-pub(super) fn compute_toolchain_fingerprint() -> String {
-    // Use CWD="/" to ensure rustup resolves the default toolchain regardless of
-    // where the caller is invoked from.  Without this, rustup picks up the
-    // nearest rust-toolchain.toml (e.g. nightly from the repo root) while the
-    // worker process runs from $HOME and always gets the stable toolchain,
-    // producing a different fingerprint and a V3 gate-cache lookup miss.
-    let output = std::process::Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .current_dir("/")
-        .output();
+/// The probe is pinned to the workspace-declared toolchain when
+/// `rust-toolchain(.toml)` exists, avoiding stable/nightly drift between
+/// contexts that would otherwise poison cache locality.
+///
+/// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc is
+/// not available (fail-closed: different key from any real toolchain).
+pub(super) fn compute_toolchain_fingerprint_for_workspace(workspace_root: &Path) -> String {
+    let mut command = std::process::Command::new("rustc");
+    command.args(["--version", "--verbose"]);
+    if let Some(toolchain) =
+        super::policy_loader::resolve_workspace_rustup_toolchain(workspace_root)
+    {
+        command.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    let output = command.output();
     let version_bytes = match &output {
         Ok(o) if o.status.success() => &o.stdout[..],
         _ => b"unknown-toolchain",
@@ -348,6 +351,13 @@ pub(super) fn compute_toolchain_fingerprint() -> String {
     hasher.update(b"apm2.fac.toolchain_fingerprint:");
     hasher.update(version_bytes);
     format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+/// Compute toolchain fingerprint using the current process working directory as
+/// workspace hint.
+pub(super) fn compute_toolchain_fingerprint() -> String {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    compute_toolchain_fingerprint_for_workspace(&workspace_root)
 }
 
 /// Compute a v3 compound key from the evidence pipeline context.
@@ -362,13 +372,14 @@ pub(super) fn compute_toolchain_fingerprint() -> String {
 /// `rfc0029_receipt_bound` flags on each `V3GateResult`, validated by
 /// `check_reuse()`.
 pub(super) fn compute_v3_compound_key(
+    workspace_root: &Path,
     sha: &str,
     fac_policy: &FacPolicyV1,
     sandbox_hardening_hash: &str,
     network_policy_hash: &str,
 ) -> Option<V3CompoundKey> {
     let policy_hash = apm2_core::fac::compute_policy_hash(fac_policy).ok()?;
-    let toolchain = compute_toolchain_fingerprint();
+    let toolchain = compute_toolchain_fingerprint_for_workspace(workspace_root);
     V3CompoundKey::new(
         sha,
         &policy_hash,
@@ -1266,8 +1277,13 @@ fn build_pipeline_test_command(
     // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
     // to maintain lock/env coupling (round 2 fix: was previously hardcoded
     // to lane-00).
-    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
-    apply_lane_compiler_cache_env(&mut policy_env, lane_dir)?;
+    super::policy_loader::apply_review_lane_environment(
+        &mut policy_env,
+        lane_dir,
+        workspace_root,
+        &ambient,
+    )?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir, workspace_root)?;
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
@@ -1322,11 +1338,17 @@ fn build_pipeline_test_command(
 pub(super) fn apply_lane_compiler_cache_env(
     policy_env: &mut std::collections::BTreeMap<String, String>,
     lane_dir: &Path,
+    workspace_root: &Path,
 ) -> Result<(), String> {
-    let toolchain_fingerprint = compute_toolchain_fingerprint();
+    let (_, fac_root) = resolve_pipeline_roots_from_lane_dir(lane_dir)?;
+    let toolchain_fingerprint = compute_toolchain_fingerprint_for_workspace(workspace_root);
     let target_dir_name = apm2_core::fac::fingerprint_short_hex(&toolchain_fingerprint)
         .map_or_else(|| "target".to_string(), |hex16| format!("target-{hex16}"));
-    let cargo_target_dir = lane_dir.join(target_dir_name);
+    let workspace_cache_key = workspace_target_cache_key(workspace_root);
+    let cargo_target_dir = fac_root
+        .join("target_cache")
+        .join(workspace_cache_key)
+        .join(target_dir_name);
     fs::create_dir_all(&cargo_target_dir).map_err(|err| {
         format!(
             "cannot create lane CARGO_TARGET_DIR {}: {err}",
@@ -1339,6 +1361,16 @@ pub(super) fn apply_lane_compiler_cache_env(
         cargo_target_dir.to_string_lossy().into_owned(),
     );
     Ok(())
+}
+
+fn workspace_target_cache_key(workspace_root: &Path) -> String {
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac.workspace_target_cache.v1:");
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    format!("ws-{}", hasher.finalize().to_hex())
 }
 
 fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -1775,7 +1807,10 @@ fn resolve_evidence_gate_progress_callback(
 ///   by the caller's `LaneLockGuard` to maintain lock/env coupling and prevent
 ///   concurrent access races (e.g., with `apm2 fac doctor --fix` lane
 ///   remediation).
-fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, String> {
+fn build_gate_policy_env(
+    lane_dir: &Path,
+    workspace_root: &Path,
+) -> Result<Vec<(String, String)>, String> {
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for gate env policy enforcement".to_string())?;
     let fac_root = apm2_home.join("private/fac");
@@ -1791,8 +1826,13 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
     // Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
-    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
-    apply_lane_compiler_cache_env(&mut policy_env, lane_dir)?;
+    super::policy_loader::apply_review_lane_environment(
+        &mut policy_env,
+        lane_dir,
+        workspace_root,
+        &ambient,
+    )?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir, workspace_root)?;
 
     Ok(policy_env.into_iter().collect())
 }
@@ -2200,7 +2240,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     // native gate checks, preventing ambient secret leakage.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
@@ -2255,6 +2295,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let fac_root = apm2_home.join("private/fac");
             let fac_policy = load_or_create_pipeline_policy(&fac_root).ok()?;
             let compound_key = compute_v3_compound_key(
+                workspace_root,
                 sha,
                 &fac_policy,
                 sandbox_hardening_hash,
@@ -3021,7 +3062,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     // TCK-00526: Build policy-filtered environment for ALL gates.
     // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
     // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
     // Pass the policy-filtered environment so policy-introduced SCCACHE_*
@@ -3055,6 +3096,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
     // TCK-00541: Build v3 compound key and load v3 cache (with v2 fallback).
     let v3_compound_key = compute_v3_compound_key(
+        workspace_root,
         sha,
         &load_or_create_pipeline_policy(
             &apm2_core::github::resolve_apm2_home()
@@ -4182,18 +4224,24 @@ mod tests {
     #[test]
     fn lane_compiler_cache_env_sets_incremental_and_lane_target_dir() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let lane_dir = temp_dir.path().join("lane-00");
+        let lane_dir = temp_dir.path().join("apm2/private/fac/lanes/lane-00");
+        let workspace_root = temp_dir.path().join("workspace");
         std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace dir");
         let mut env = std::collections::BTreeMap::new();
 
-        apply_lane_compiler_cache_env(&mut env, &lane_dir).expect("compiler cache env");
+        apply_lane_compiler_cache_env(&mut env, &lane_dir, &workspace_root)
+            .expect("compiler cache env");
 
         assert_eq!(env.get("CARGO_INCREMENTAL").map(String::as_str), Some("1"));
         let target_dir = env
             .get("CARGO_TARGET_DIR")
             .expect("CARGO_TARGET_DIR must be set");
         let target_path = std::path::Path::new(target_dir);
-        assert!(target_path.starts_with(&lane_dir));
+        assert!(
+            target_path.starts_with(temp_dir.path().join("apm2/private/fac/target_cache")),
+            "target dir must be fac-level shared cache: {target_dir}"
+        );
         assert!(target_path.is_dir());
         assert!(
             target_path
@@ -4746,6 +4794,7 @@ mod tests {
         );
 
         let compound_key = compute_v3_compound_key(
+            &workspace_root,
             sha,
             &fac_policy,
             sandbox_hardening_hash,

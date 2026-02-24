@@ -1,5 +1,9 @@
 # AGENTS — Behavior Registry
 
+## CRITICAL PRINCIPLES 
+
+This rule always applies: you are responsible for maintaining the standards and patterns of this code base. You must never apply a band-aid solution. Always think deeply about the root cause and take the time to identify the root cause solution. Read @documents/prompts/instruction.alien_coding.v1.json.
+
 All Rust module behavior context lives in `AGENTS.json` files co-located with
 source code. Each file conforms to the `apm2.agents_context.v1` schema and maps
 stable behavior IDs (`BEH-<NAMESPACE>-<NNN>`) back to the RFC system specs that

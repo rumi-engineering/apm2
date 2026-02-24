@@ -3962,7 +3962,7 @@ fn run_execute_phase(
     // allowlist), replacing the previous ambient-inherit approach.
     let default_nextest_command = build_nextest_command();
     let mut test_command_environment =
-        compute_nextest_test_environment(&policy, &apm2_home, test_parallelism)?;
+        compute_nextest_test_environment(workspace_root, &policy, &apm2_home, test_parallelism)?;
     let mut bounded = false;
 
     // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
@@ -4178,6 +4178,7 @@ fn run_execute_phase(
         // `fac gates` path. This ensures consistent cache behavior across
         // all execution entry points (pipeline and manual).
         let v3_compound_key = compute_v3_compound_key(
+            workspace_root,
             &sha,
             &load_or_create_gate_policy(&fac_root)?,
             &sandbox_hardening_hash,
@@ -4415,6 +4416,7 @@ fn normalize_quick_test_gate(gates: &mut Vec<GateResult>) {
 }
 
 fn compute_nextest_test_environment(
+    workspace_root: &Path,
     policy: &FacPolicyV1,
     apm2_home: &std::path::Path,
     test_parallelism: u32,
@@ -4430,8 +4432,13 @@ fn compute_nextest_test_environment(
     // under $APM2_HOME/private/fac/lanes/lane-00.
     let fac_root = apm2_home.join("private/fac");
     let lane_dir = fac_root.join("lanes/lane-00");
-    super::policy_loader::apply_review_lane_environment(&mut policy_env, &lane_dir, &ambient)?;
-    super::evidence::apply_lane_compiler_cache_env(&mut policy_env, &lane_dir)?;
+    super::policy_loader::apply_review_lane_environment(
+        &mut policy_env,
+        &lane_dir,
+        workspace_root,
+        &ambient,
+    )?;
+    super::evidence::apply_lane_compiler_cache_env(&mut policy_env, &lane_dir, workspace_root)?;
 
     // Throughput-profile vars (NEXTEST_TEST_THREADS, CARGO_BUILD_JOBS) take
     // precedence over ambient values but env_set overrides in the policy
@@ -8181,6 +8188,7 @@ time.sleep(20)\n",
             apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
         let network_policy_hash = gate_network_policy.content_hash_hex();
         let compound_key = compute_v3_compound_key(
+            &repo,
             &run1.sha,
             &fac_policy,
             &sandbox_hardening_hash,
