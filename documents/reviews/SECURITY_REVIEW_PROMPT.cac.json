@@ -24,23 +24,23 @@
     "inputs": ["OPTIONAL_CONTEXT"],
     "outputs": ["FindingsProjection", "DecisionProjection"],
     "commands": {
-      "description": "The reviewer uses exactly 3 CLI commands via `cargo run -p apm2-cli --`. This ensures the workspace-built binary is used, not a stale global install. No other commands are needed.",
-      "binary_prefix": "cargo run -p apm2-cli --",
-      "prepare": "cargo run -p apm2-cli -- fac review prepare",
-      "finding": "cargo run -p apm2-cli -- fac review finding --type security --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\"",
-      "verdict": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict <approve|deny> --reason \"...\""
+      "description": "The reviewer uses exactly 3 CLI commands via the global `apm2` binary. No other commands are needed.",
+      "binary_prefix": "apm2",
+      "prepare": "apm2 fac review prepare --pr $PR_NUMBER --sha $HEAD_SHA",
+      "finding": "apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA --type security --severity <BLOCKER|MAJOR|MINOR|NIT> --summary \"...\" --risk \"...\" --impact \"...\" --location \"...\" --body \"...\"",
+      "verdict": "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA --dimension security --verdict <approve|deny> --reason \"...\""
     },
     "constraints": {
       "forbidden_operations": [
-        "If you're testing local changes, remember not to use the $PATH installed `apm2` — use `cargo run -p apm2-cli --` so the workspace-built binary is used.",
-        "NEVER pass --sha to any command. The CLI auto-derives the SHA from the PR identity.",
+        "Use the globally installed `apm2` binary for all review commands.",
+        "ALWAYS pass --pr $PR_NUMBER --sha $HEAD_SHA when running prepare/finding/verdict commands.",
         "All interactions with the repository MUST be read-only. Do not modify any files.",
         "NEVER paste raw command output into finding fields (summary, risk, impact, body). Finding fields must contain your original analysis text only."
       ],
       "invariants": [
         "Every execution path MUST terminate with exactly one verdict set call.",
-        "SHA is managed by the CLI — the reviewer never tracks, stores, or references it.",
-        "ALWAYS use `cargo run -p apm2-cli --` instead of bare `apm2`. The workspace binary contains the code under review; a globally installed binary may be stale and missing fields or fixes from the current PR.",
+        "The reviewer MUST bind every command to $PR_NUMBER and $HEAD_SHA from the prompt context.",
+        "ALWAYS use the globally installed `apm2` binary for review commands.",
         "Backwards compatibility is expressly and intentionally NEVER required unless specifically called out as a requirement in a work object. Do NOT file findings for missing backwards-compat shims, re-exports, deprecated aliases, or migration paths unless a linked ticket or RFC explicitly mandates them.",
         "Do NOT run or check cargo fmt, clippy, cargo test, or cargo doc. All code under FAC review has already passed every automated gate (fmt, clippy -D warnings, test, doc) before reaching the reviewer. These are verified automatically and are never part of the security review scope. Spend zero time on formatting, lint, or test-execution concerns — focus exclusively on security analysis."
       ]
@@ -82,18 +82,18 @@
           "id": "STEP_1_PREPARE",
           "purpose": "Discover the CLI surface and materialize local review inputs.",
           "steps": [
-            {"action": "command", "run": "cargo run -p apm2-cli -- fac review prepare --help"},
-            {"action": "command", "run": "cargo run -p apm2-cli -- fac review finding --help"},
-            {"action": "command", "run": "cargo run -p apm2-cli -- fac review verdict set --help"},
+            {"action": "command", "run": "apm2 fac review prepare --help"},
+            {"action": "command", "run": "apm2 fac review finding --help"},
+            {"action": "command", "run": "apm2 fac review verdict set --help"},
             {
               "action": "command",
-              "run": "cargo run -p apm2-cli -- fac review prepare",
+              "run": "apm2 fac review prepare --pr $PR_NUMBER --sha $HEAD_SHA",
               "capture_as": "prepare_json"
             },
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history"]
             },
             {
               "action": "on_failure",
@@ -113,6 +113,10 @@
             },
             {"action": "use_captured", "from": "diff_content", "purpose": "Full PR diff from prepare output"},
             {"action": "use_captured", "from": "commit_history_content", "purpose": "Commit history from prepare output"},
+            {
+              "action": "fallback_rule",
+              "rule": "If `diff_content` or `commit_history_content` includes an inline-omission marker from prepare output, read full content from `diff_path` and `commit_history_path` before analysis."
+            },
             {
               "action": "read_module_agents",
               "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."
@@ -146,7 +150,7 @@
           },
           "emit_rule": {
             "action": "For each finding, classify severity (BLOCKER, MAJOR, MINOR, NIT) and call:",
-            "command": "cargo run -p apm2-cli -- fac review finding --type security --severity <severity> --summary \"<one-line>\" --risk \"<threat and exploit path>\" --impact \"<blast radius and consequences>\" --location \"<file:line or module>\" --body \"<detailed description and required remediation>\"",
+            "command": "apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA --type security --severity <severity> --summary \"<one-line>\" --risk \"<threat and exploit path>\" --impact \"<blast radius and consequences>\" --location \"<file:line or module>\" --body \"<detailed description and required remediation>\"",
             "quality_rules": [
               "Each finding MUST include: summary, risk (threat + exploit path), impact (blast radius), location, and body (remediation).",
               "If a handler has authority-bearing side effects but lacks AJC lifecycle enforcement, emit a MAJOR finding.",
@@ -164,14 +168,14 @@
               "if": "blocker_count == 0 AND major_count == 0",
               "then": {
                 "action": "command",
-                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict approve --reason \"PASS: no blocker or major findings\""
+                "run": "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA --dimension security --verdict approve --reason \"PASS: no blocker or major findings\""
               }
             },
             {
               "if": "blocker_count > 0 OR major_count > 0",
               "then": {
                 "action": "command",
-                "run": "cargo run -p apm2-cli -- fac review verdict set --dimension security --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\""
+                "run": "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA --dimension security --verdict deny --reason \"FAIL: <blocker_count> blocker, <major_count> major findings\""
               }
             }
           ],
