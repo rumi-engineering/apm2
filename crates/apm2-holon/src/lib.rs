@@ -92,6 +92,13 @@
 
 pub mod artifact;
 pub mod context;
+/// Core ledger adapter: writes holon events into apm2-core ledger+CAS
+/// substrate (TCK-00670 / HL-001).
+///
+/// This module is always compiled (the envelope types and mapping functions
+/// are pure data with no apm2-core dependency). The `core-ledger` feature
+/// gates the concrete `apm2-core` integration paths used at runtime.
+pub mod core_ledger_adapter;
 pub mod defect;
 pub mod episode;
 pub mod error;
@@ -112,6 +119,9 @@ mod tests;
 // Re-export main types at crate root for convenience
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
+pub use core_ledger_adapter::{
+    CoreLedgerAdapterError, FinalitySignal, HolonEventEnvelope, ReplayVerification,
+};
 pub use defect::{
     DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal,
     SignalType,
@@ -145,6 +155,9 @@ pub use traits::Holon;
 pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
+    pub use crate::core_ledger_adapter::{
+        CoreLedgerAdapterError, FinalitySignal, HolonEventEnvelope, ReplayVerification,
+    };
     pub use crate::defect::{
         DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity,
         DefectSignal, SignalType,
