@@ -8724,7 +8724,14 @@ type PrivilegedPcacRevalidationInputs = (u64, [u8; 32], [u8; 32], [u8; 32]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkIdResolutionMode {
+    /// Require authoritative lease->work mapping and enforce hint equality
+    /// when a `work_id_hint` is supplied.
     StrictLeaseMapping,
+    /// Require authoritative lease->work mapping but ignore `work_id_hint`
+    /// equality. Used for governance flows where a governing lease authorizes
+    /// mutation of a different target work item (for example OpenWork and
+    /// ClaimWorkV2 target transitions).
+    LeaseMappingOnly,
 }
 
 /// Lifecycle selectors returned from privileged PCAC enforcement.
@@ -10891,8 +10898,8 @@ impl PrivilegedDispatcher {
     /// cross-role policy confusion in multi-role `ClaimWorkV2` flows.
     ///
     /// If `work_id_hint` is provided, it must exactly match the authoritative
-    /// lease->work mapping (constant-time comparison). No fallback lookups are
-    /// allowed.
+    /// lease->work mapping (constant-time comparison) when mode is
+    /// `StrictLeaseMapping`.
     ///
     /// Fail-closed behavior:
     /// - Missing lease->work mapping (and no valid hint) => Tier4, fallback
@@ -10984,13 +10991,14 @@ impl PrivilegedDispatcher {
         work_id_hint: Option<&str>,
         work_id_resolution_mode: WorkIdResolutionMode,
     ) -> Result<(String, WorkClaim), String> {
-        let _ = work_id_resolution_mode;
         let Some(work_id) = self.lease_validator.get_lease_work_id(lease_id) else {
             return Err(format!(
                 "[{INV_FAC_WORK_BIND_001}] work_id missing for lease '{lease_id}'"
             ));
         };
-        if let Some(hint) = work_id_hint {
+        if work_id_resolution_mode == WorkIdResolutionMode::StrictLeaseMapping
+            && let Some(hint) = work_id_hint
+        {
             let hint_matches = hint.len() == work_id.len()
                 && bool::from(hint.as_bytes().ct_eq(work_id.as_bytes()));
             if !hint_matches {
@@ -15626,7 +15634,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(&spec.work_id),
-                WorkIdResolutionMode::StrictLeaseMapping,
+                WorkIdResolutionMode::LeaseMappingOnly,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -15644,7 +15652,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(&spec.work_id),
             spec_hash_bytes,
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::LeaseMappingOnly,
         );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
@@ -15723,7 +15731,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(&spec.work_id),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::LeaseMappingOnly,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
@@ -16168,7 +16176,7 @@ impl PrivilegedDispatcher {
             match self.derive_privileged_pcac_revalidation_inputs(
                 &request.lease_id,
                 Some(&request.work_id),
-                WorkIdResolutionMode::StrictLeaseMapping,
+                WorkIdResolutionMode::LeaseMappingOnly,
             ) {
                 Ok(values) => values,
                 Err(error) => {
@@ -16195,7 +16203,7 @@ impl PrivilegedDispatcher {
             &request.lease_id,
             Some(&request.work_id),
             claim_content_hash,
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::LeaseMappingOnly,
         );
         let pcac_risk_tier = Self::map_fac_risk_tier_to_pcac(risk_tier);
 
@@ -16270,7 +16278,7 @@ impl PrivilegedDispatcher {
             &pcac_input,
             &request.lease_id,
             Some(&request.work_id),
-            WorkIdResolutionMode::StrictLeaseMapping,
+            WorkIdResolutionMode::LeaseMappingOnly,
             join_freshness_tick,
             join_time_envelope_ref,
             join_ledger_anchor,
