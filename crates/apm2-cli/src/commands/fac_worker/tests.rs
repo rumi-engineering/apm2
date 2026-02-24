@@ -1706,13 +1706,9 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
     let claimed_path = queue_root.join(CLAIMED_DIR).join("gates-test.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-test.json";
-    let claimed_lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claimed_path)
-        .expect("open claimed lock file");
 
     let spec = make_receipt_test_spec();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
     let boundary_trace = ChannelBoundaryTrace {
         passed: true,
         defect_count: 0,
@@ -1736,7 +1732,7 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
         &spec,
         &claimed_path,
         claimed_file_name,
-        claimed_lock_file,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1782,6 +1778,20 @@ fn test_execute_queued_gates_job_binds_sandbox_hardening_hash_in_denial_receipt(
     );
 }
 
+fn build_claimed_lock_guard_for_test(claimed_path: &Path, job_id: &str) -> ClaimedJobLockGuardV1 {
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(claimed_path)
+        .expect("open claimed lock file");
+    fs2::FileExt::lock_exclusive(&lock_file).expect("acquire claimed lock");
+    ClaimedJobLockGuardV1::from_claimed_lock(
+        job_id.to_string(),
+        claimed_path.to_path_buf(),
+        lock_file,
+    )
+}
+
 #[test]
 fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_transition() {
     let _override_guard = FacReviewApiOverrideGuard::install(
@@ -1802,11 +1812,6 @@ fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_tr
         .join("gates-lifecycle-illegal.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-lifecycle-illegal.json";
-    let claimed_lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claimed_path)
-        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -1843,12 +1848,13 @@ fn test_execute_queued_gates_job_denies_when_lifecycle_replay_returns_illegal_tr
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
-        claimed_lock_file,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -1901,11 +1907,6 @@ fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
         .join("gates-lease-binding.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-lease-binding.json";
-    let claimed_lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claimed_path)
-        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -1944,12 +1945,13 @@ fn test_execute_queued_gates_job_passes_lease_binding_to_gates_worker() {
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
     let toolchain_fp = format!("b3-256:{}", "a".repeat(64));
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
-        claimed_lock_file,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -2004,11 +2006,6 @@ fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
         .join("gates-failure-summary.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-failure-summary.json";
-    let claimed_lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claimed_path)
-        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -2045,12 +2042,13 @@ fn test_execute_queued_gates_job_denied_reason_includes_gate_failure_summary() {
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
-        claimed_lock_file,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,
@@ -2098,11 +2096,6 @@ fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
         .join("gates-bounded-reason.json");
     fs::write(&claimed_path, b"{}").expect("seed claimed file");
     let claimed_file_name = "gates-bounded-reason.json";
-    let claimed_lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&claimed_path)
-        .expect("open claimed lock file");
 
     let repo_root = PathBuf::from(repo_toplevel_for_tests());
     let current_head = resolve_workspace_head(&repo_root).expect("resolve workspace head");
@@ -2139,12 +2132,13 @@ fn test_execute_queued_gates_job_denied_reason_is_utf8_safe_and_bounded() {
     let tuple_digest = CanonicalizerTupleV1::from_current().compute_digest();
     let hardening_hash = apm2_core::fac::SandboxHardeningProfile::default().content_hash_hex();
     let network_hash = apm2_core::fac::NetworkPolicy::deny().content_hash_hex();
+    let claimed_lock_guard = build_claimed_lock_guard_for_test(&claimed_path, &spec.job_id);
 
     let outcome = execute_queued_gates_job(
         &spec,
         &claimed_path,
         claimed_file_name,
-        claimed_lock_file,
+        &claimed_lock_guard,
         &queue_root,
         &fac_root,
         &boundary_trace,

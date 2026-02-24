@@ -421,6 +421,10 @@ pub(super) fn build_job_receipt(
     bytes_backend: Option<&str>,
     // TCK-00538: Optional toolchain fingerprint.
     toolchain_fingerprint: Option<&str>,
+    // TCK-00640: Claimed lock continuity evidence markers.
+    claimed_lock_continuity_v1: Option<bool>,
+    claimed_lock_acquired_at_epoch_ms: Option<u64>,
+    claimed_lock_release_phase: Option<&str>,
 ) -> Result<FacJobReceiptV1, String> {
     let mut builder = FacJobReceiptV1Builder::new(
         format!("wkr-{}-{}", spec.job_id, current_timestamp_epoch_secs()),
@@ -487,6 +491,15 @@ pub(super) fn build_job_receipt(
     if let Some(backend) = bytes_backend {
         builder = builder.bytes_backend(backend);
     }
+    if let Some(flag) = claimed_lock_continuity_v1 {
+        builder = builder.claimed_lock_continuity_v1(flag);
+    }
+    if let Some(epoch_ms) = claimed_lock_acquired_at_epoch_ms {
+        builder = builder.claimed_lock_acquired_at_epoch_ms(epoch_ms);
+    }
+    if let Some(phase) = claimed_lock_release_phase {
+        builder = builder.claimed_lock_release_phase(phase);
+    }
 
     builder
         .try_build()
@@ -535,6 +548,9 @@ pub(super) fn emit_job_receipt_internal(
         None,                  // stop_revoke_admission
         bytes_backend,         // TCK-00546: bytes_backend
         toolchain_fingerprint, // TCK-00538: toolchain fingerprint
+        None,                  // claimed_lock_continuity_v1
+        None,                  // claimed_lock_acquired_at_epoch_ms
+        None,                  // claimed_lock_release_phase
     )?;
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt).map_err(|err| {
@@ -637,11 +653,139 @@ pub(super) fn commit_claimed_job_via_pipeline(
     // TCK-00538: Optional toolchain fingerprint for receipt binding.
     toolchain_fingerprint: Option<&str>,
 ) -> Result<PathBuf, ReceiptPipelineError> {
+    commit_claimed_job_via_pipeline_impl(
+        fac_root,
+        queue_root,
+        spec,
+        claimed_path,
+        claimed_file_name,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        policy_hash,
+        containment,
+        observed_cost,
+        sandbox_hardening_hash,
+        network_policy_hash,
+        stop_revoke_admission,
+        bytes_backend,
+        toolchain_fingerprint,
+        None,
+    )
+}
+
+/// Commit a claimed job via pipeline while preserving claimed-lock continuity
+/// from claim through terminal transition (CLCK).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn commit_claimed_job_via_pipeline_with_guard(
+    fac_root: &Path,
+    queue_root: &Path,
+    spec: &FacJobSpecV1,
+    claimed_path: &Path,
+    claimed_file_name: &str,
+    claimed_lock_guard: &ClaimedJobLockGuardV1,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
+    stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
+    bytes_backend: Option<&str>,
+    toolchain_fingerprint: Option<&str>,
+) -> Result<PathBuf, ReceiptPipelineError> {
+    commit_claimed_job_via_pipeline_impl(
+        fac_root,
+        queue_root,
+        spec,
+        claimed_path,
+        claimed_file_name,
+        outcome,
+        denial_reason,
+        reason,
+        rfc0028_channel_boundary,
+        eio29_queue_admission,
+        eio29_budget_admission,
+        patch_digest,
+        canonicalizer_tuple_digest,
+        policy_hash,
+        containment,
+        observed_cost,
+        sandbox_hardening_hash,
+        network_policy_hash,
+        stop_revoke_admission,
+        bytes_backend,
+        toolchain_fingerprint,
+        Some(claimed_lock_guard),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_claimed_job_via_pipeline_impl(
+    fac_root: &Path,
+    queue_root: &Path,
+    spec: &FacJobSpecV1,
+    claimed_path: &Path,
+    claimed_file_name: &str,
+    outcome: FacJobOutcome,
+    denial_reason: Option<DenialReasonCode>,
+    reason: &str,
+    rfc0028_channel_boundary: Option<&ChannelBoundaryTrace>,
+    eio29_queue_admission: Option<&JobQueueAdmissionTrace>,
+    eio29_budget_admission: Option<&FacBudgetAdmissionTrace>,
+    patch_digest: Option<&str>,
+    canonicalizer_tuple_digest: Option<&str>,
+    policy_hash: &str,
+    containment: Option<&apm2_core::fac::containment::ContainmentTrace>,
+    observed_cost: Option<apm2_core::economics::cost_model::ObservedJobCost>,
+    sandbox_hardening_hash: Option<&str>,
+    network_policy_hash: Option<&str>,
+    stop_revoke_admission: Option<&apm2_core::economics::queue_admission::StopRevokeAdmissionTrace>,
+    bytes_backend: Option<&str>,
+    toolchain_fingerprint: Option<&str>,
+    claimed_lock_guard: Option<&ClaimedJobLockGuardV1>,
+) -> Result<PathBuf, ReceiptPipelineError> {
     let terminal_state = outcome_to_terminal_state(outcome).ok_or_else(|| {
         ReceiptPipelineError::ReceiptPersistFailed(format!(
             "non-terminal outcome {outcome:?} cannot be committed"
         ))
     })?;
+
+    if let Some(guard) = claimed_lock_guard {
+        if guard.job_id() != spec.job_id {
+            return Err(ReceiptPipelineError::ReceiptPersistFailed(format!(
+                "claimed lock guard job_id mismatch: guard={}, spec={}",
+                guard.job_id(),
+                spec.job_id,
+            )));
+        }
+        if guard.lock_acquisition_method() != CLAIMED_LOCK_ACQUISITION_METHOD_FLOCK_EXCLUSIVE {
+            return Err(ReceiptPipelineError::ReceiptPersistFailed(format!(
+                "claimed lock guard method mismatch: expected {}, got {}",
+                CLAIMED_LOCK_ACQUISITION_METHOD_FLOCK_EXCLUSIVE,
+                guard.lock_acquisition_method(),
+            )));
+        }
+        if guard.claimed_path() != claimed_path {
+            return Err(ReceiptPipelineError::ReceiptPersistFailed(format!(
+                "claimed lock guard path mismatch: guard={}, callsite={}",
+                guard.claimed_path().display(),
+                claimed_path.display(),
+            )));
+        }
+    }
 
     let receipt = build_job_receipt(
         spec,
@@ -662,6 +806,9 @@ pub(super) fn commit_claimed_job_via_pipeline(
         stop_revoke_admission,
         bytes_backend,
         toolchain_fingerprint,
+        claimed_lock_guard.map(|_| true),
+        claimed_lock_guard.map(ClaimedJobLockGuardV1::lock_acquired_at_epoch_ms),
+        claimed_lock_guard.map(|_| CLAIMED_LOCK_RELEASE_PHASE_POST_TERMINAL_COMMIT),
     )
     .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
@@ -674,20 +821,44 @@ pub(super) fn commit_claimed_job_via_pipeline(
     // commit (the receipt is still valid but will be treated as unsigned
     // for cache-reuse decisions, which is fail-closed).
     let result = match fac_key_material::load_or_generate_persistent_signer(fac_root) {
-        Ok(signer) => pipeline.commit_signed(
-            &receipt,
-            claimed_path,
-            claimed_file_name,
-            terminal_state,
-            &signer,
-            "fac-worker",
-        )?,
+        Ok(signer) => {
+            if let Some(guard) = claimed_lock_guard {
+                pipeline.commit_signed_with_claimed_lock(
+                    guard.lock_file(),
+                    &receipt,
+                    claimed_path,
+                    claimed_file_name,
+                    terminal_state,
+                    &signer,
+                    "fac-worker",
+                )?
+            } else {
+                pipeline.commit_signed(
+                    &receipt,
+                    claimed_path,
+                    claimed_file_name,
+                    terminal_state,
+                    &signer,
+                    "fac-worker",
+                )?
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "cannot load signing key for receipt signing (falling back to unsigned)"
             );
-            pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?
+            if let Some(guard) = claimed_lock_guard {
+                pipeline.commit_with_claimed_lock(
+                    guard.lock_file(),
+                    &receipt,
+                    claimed_path,
+                    claimed_file_name,
+                    terminal_state,
+                )?
+            } else {
+                pipeline.commit(&receipt, claimed_path, claimed_file_name, terminal_state)?
+            }
         },
     };
 

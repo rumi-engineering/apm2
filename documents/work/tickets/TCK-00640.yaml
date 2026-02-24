@@ -40,6 +40,10 @@ ticket_meta:
     - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
     - Run FAC review machine-spec snapshot fast check before queued gates; fail closed when `documents/reviews/fac_review_state_machine.cac.json` is stale relative to code-generated spec
     - Preserve queue claim lock ownership through terminal transition commit paths so no second worker can re-claim mid-transition
+    - Enforce CLCK single-owner lock lifecycle (`claim -> execute -> terminal_commit -> release`) via `ClaimedJobLockGuardV1` across worker and orchestrator terminal paths
+    - Add guarded receipt pipeline commit APIs that skip lock reacquire when a live claimed lock guard is supplied; keep legacy pipeline commit for non-worker callers
+    - Bind claimed-lock continuity evidence into terminal receipts (`claimed_lock_continuity_v1`, `claimed_lock_acquired_at_epoch_ms`, `claimed_lock_release_phase`)
+    - Ensure control-lane `stop_revoke` terminal commits use the same claimed lock guard continuity contract as non-control-lane jobs
     - Enforce case-insensitive `(work_id, pr_number, commit_sha)` uniqueness for `work.pr_associated` in both legacy and canonical sqlite schemas
     out_of_scope:
     - Daemon-side CI processor transitions (separate ticket)
@@ -71,6 +75,10 @@ ticket_meta:
     - "Work-claim schema now includes `idx_work_claims_lease_id` to keep fallback lookup deterministic and performant."
     - "Work status runtime-binding branch now uses clippy-clean `lease_id.is_empty()` guard ordering (no behavior change)."
     - "Worker claimed-lock handling now retains the lock through terminal queue transition to close TOCTOU re-claim races."
+    - "Claimed lock continuity is now modeled as `ClaimedJobLockGuardV1` and threaded from atomic claim through all worker/orchestrator terminal commit paths."
+    - "Receipt pipeline now supports guarded commit APIs (`commit_with_claimed_lock`, `commit_signed_with_claimed_lock`) that do not perform secondary lock acquisition."
+    - "Terminal job receipts now carry CLCK continuity evidence fields for audit (`claimed_lock_continuity_v1`, `claimed_lock_acquired_at_epoch_ms`, `claimed_lock_release_phase`)."
+    - "Control-lane stop_revoke path now retains and uses the same claimed lock guard for terminal commit as regular lanes."
     - "`work.pr_associated` tuple uniqueness now normalizes commit SHA case via case-insensitive partial unique indexes for both legacy and canonical sqlite event tables."
     - "Gates/warm pipeline-commit failures now stay fail-closed in `claimed/` for reconcile recovery (no authority-token requeue replay loops)."
     - "One-shot worker cycles (`run_fac_worker(..., once=true)`) now skip queue watcher and watchdog thread startup, preventing in-process thread/inotify accumulation during inline `fac push` fallback."
@@ -90,6 +98,8 @@ ticket_meta:
     - "`cargo test -p apm2-daemon sqlite_lease_validator_ -- --nocapture`"
     - "`cargo test -p apm2-daemon sqlite_work_registry_schema_creates_lease_lookup_index -- --nocapture`"
     - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
+    - "`cargo test -p apm2-core test_commit_with_claimed_lock_succeeds_with_outer_lock_held -- --nocapture`"
+    - "`cargo test -p apm2-core test_commit_fails_fast_when_claimed_file_lock_is_busy -- --nocapture`"
     - "`cargo test -p apm2-cli one_shot_worker_skips_background_runtime_primitives -- --nocapture`"
     - "`cargo test -p apm2-cli gates_wait_machine -- --nocapture`"
     - "`cargo test -p apm2-cli fac_review_machine_spec_guard -- --nocapture`"
@@ -110,6 +120,8 @@ ticket_meta:
     - Projection-backed work identity recovery no longer fails on extension fields in current session envelopes.
     - CLI does not emit work transitions; CI/system actors remain the only sources of CI transitions.
     - Queue terminal transitions are serialized by retaining the claimed lock until transition commit completion.
+    - Worker/orchestrator terminal commits use guarded pipeline APIs and perform no secondary claimed-file lock acquisition while guard continuity is active.
+    - Terminal receipts produced from guarded commit paths include CLCK evidence fields required for continuity audit.
     - One-shot inline worker fallback cannot leak long-lived watcher/watchdog runtime primitives across retries.
     - PR association idempotency is robust to commit SHA case variants in both legacy and canonical ledger storage.
     - Fast-check phase fails before queued gates when FAC review machine-spec snapshot drift is present.

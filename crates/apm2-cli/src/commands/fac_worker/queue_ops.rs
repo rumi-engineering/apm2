@@ -117,7 +117,7 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
     file_name: &str,
     fac_root: &Path,
     dual_write_enabled: bool,
-) -> Result<(PathBuf, fs::File), String> {
+) -> Result<(PathBuf, ClaimedJobLockGuardV1), String> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
@@ -175,11 +175,13 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
     // the (now claimed) file for dual-write lifecycle event emission.
     // Both deserialization and emission failures are warn-and-continue:
     // the filesystem claim is authoritative during QL-003 staged migration.
+    let mut claimed_job_id = file_name.trim_end_matches(".json").to_string();
     if dual_write_enabled {
         match read_bounded(&claimed_path, MAX_JOB_SPEC_SIZE)
             .and_then(|bytes| deserialize_job_spec(&bytes).map_err(|err| err.to_string()))
         {
             Ok(spec) => {
+                claimed_job_id.clone_from(&spec.job_id);
                 if let Err(err) = fac_queue_lifecycle_dual_write::emit_job_claimed(
                     fac_root,
                     &spec,
@@ -205,7 +207,13 @@ pub(super) fn claim_pending_job_with_exclusive_lock(
         }
     }
 
-    Ok((claimed_path, claimed_lock_file))
+    let claimed_lock_guard = ClaimedJobLockGuardV1::from_claimed_lock(
+        claimed_job_id,
+        claimed_path.clone(),
+        claimed_lock_file,
+    );
+
+    Ok((claimed_path, claimed_lock_guard))
 }
 
 pub(super) fn release_claimed_job_to_pending(

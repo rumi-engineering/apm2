@@ -46,7 +46,7 @@ enum LanePreparedOutcome {
 struct ClaimedContext {
     claimed_path: PathBuf,
     claimed_file_name: String,
-    claimed_lock_file: fs::File,
+    claimed_lock_guard: ClaimedJobLockGuardV1,
     boundary_trace: ChannelBoundaryTrace,
     queue_trace: JobQueueAdmissionTrace,
     budget_trace: Option<FacBudgetAdmissionTrace>,
@@ -102,20 +102,6 @@ pub(super) struct WorkerOrchestrator {
     lane_acquired: Option<LaneAcquiredContext>,
     lease_persisted: Option<LeasePersistedContext>,
     staged_outcome: Option<JobOutcome>,
-}
-
-fn release_claimed_lock_for_terminal_transition(
-    claimed_lock_file: &mut Option<fs::File>,
-    job_id: &str,
-    phase: &str,
-) {
-    if claimed_lock_file.take().is_some() {
-        tracing::debug!(
-            job_id,
-            phase,
-            "released claimed-file lock before terminal queue transition"
-        );
-    }
 }
 
 fn emit_failed_lifecycle_event_before_denied_move(
@@ -828,7 +814,7 @@ impl WorkerOrchestrator {
 
             // Atomic claim via rename.
             let claimed_dir = queue_root.join(CLAIMED_DIR);
-            let (claimed_path, _claimed_lock_file) = match claim_pending_job_with_exclusive_lock(
+            let (claimed_path, claimed_lock_guard) = match claim_pending_job_with_exclusive_lock(
                 path,
                 &claimed_dir,
                 &file_name,
@@ -849,12 +835,13 @@ impl WorkerOrchestrator {
             // PCAC consume.
             if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
                 let reason = format!("PCAC consume failed: {e}");
-                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
                     spec,
                     &claimed_path,
                     &claimed_file_name,
+                    &claimed_lock_guard,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::PcacConsumeFailed),
                     &reason,
@@ -930,6 +917,7 @@ impl WorkerOrchestrator {
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 queue_root,
                 fac_root,
                 &boundary_trace,
@@ -1812,7 +1800,7 @@ impl WorkerOrchestrator {
         // lifecycle so runtime reconcile's flock probe cannot reclaim actively
         // executing jobs.
         let claimed_dir = queue_root.join(CLAIMED_DIR);
-        let (claimed_path, claimed_lock_file) = match claim_pending_job_with_exclusive_lock(
+        let (claimed_path, claimed_lock_guard) = match claim_pending_job_with_exclusive_lock(
             path,
             &claimed_dir,
             &file_name,
@@ -1836,12 +1824,13 @@ impl WorkerOrchestrator {
         if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
             let reason = format!("PCAC consume failed: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::PcacConsumeFailed),
                 &reason,
@@ -1873,7 +1862,7 @@ impl WorkerOrchestrator {
         IdlePhaseOutcome::Advanced(Box::new(ClaimedContext {
             claimed_path,
             claimed_file_name,
-            claimed_lock_file,
+            claimed_lock_guard,
             boundary_trace,
             queue_trace,
             budget_trace,
@@ -1902,7 +1891,7 @@ impl WorkerOrchestrator {
         let ClaimedContext {
             claimed_path,
             claimed_file_name,
-            claimed_lock_file,
+            claimed_lock_guard,
             boundary_trace,
             queue_trace,
             budget_trace,
@@ -1920,7 +1909,7 @@ impl WorkerOrchestrator {
                 spec,
                 &claimed_path,
                 &claimed_file_name,
-                claimed_lock_file,
+                &claimed_lock_guard,
                 queue_root,
                 fac_root,
                 &boundary_trace,
@@ -1988,7 +1977,7 @@ impl WorkerOrchestrator {
             claimed: ClaimedContext {
                 claimed_path,
                 claimed_file_name,
-                claimed_lock_file,
+                claimed_lock_guard,
                 boundary_trace,
                 queue_trace,
                 budget_trace,
@@ -2025,14 +2014,13 @@ impl WorkerOrchestrator {
         let ClaimedContext {
             claimed_path,
             claimed_file_name,
-            claimed_lock_file,
+            claimed_lock_guard,
             boundary_trace,
             queue_trace,
             budget_trace,
             sbx_hash,
             resolved_net_hash,
         } = claimed;
-        let mut claimed_lock_file = Some(claimed_lock_file);
         if let Err(error) = run_preflight(
             fac_root,
             &lane_mgr,
@@ -2041,17 +2029,13 @@ impl WorkerOrchestrator {
         ) {
             let reason = format!("preflight failed: {error:?}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            release_claimed_lock_for_terminal_transition(
-                &mut claimed_lock_file,
-                &spec.job_id,
-                "lane_prepared_preflight_denied",
-            );
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::InsufficientDiskSpace),
                 &reason,
@@ -2089,17 +2073,13 @@ impl WorkerOrchestrator {
             Err(e) => {
                 let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-                release_claimed_lock_for_terminal_transition(
-                    &mut claimed_lock_file,
-                    &spec.job_id,
-                    "lane_prepared_profile_load_denied",
-                );
-                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
                     spec,
                     &claimed_path,
                     &claimed_file_name,
+                    &claimed_lock_guard,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::ValidationFailed),
                     &reason,
@@ -2179,17 +2159,13 @@ impl WorkerOrchestrator {
             Err(e) => {
                 let reason = format!("failed to create lane lease: {e}");
                 // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-                release_claimed_lock_for_terminal_transition(
-                    &mut claimed_lock_file,
-                    &spec.job_id,
-                    "lane_prepared_lease_build_denied",
-                );
-                if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
                     spec,
                     &claimed_path,
                     &claimed_file_name,
+                    &claimed_lock_guard,
                     FacJobOutcome::Denied,
                     Some(DenialReasonCode::ValidationFailed),
                     &reason,
@@ -2221,17 +2197,13 @@ impl WorkerOrchestrator {
         if let Err(e) = lane_lease.persist(&lane_dir) {
             let reason = format!("failed to persist lane lease: {e}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            release_claimed_lock_for_terminal_transition(
-                &mut claimed_lock_file,
-                &spec.job_id,
-                "lane_prepared_lease_persist_denied",
-            );
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2261,18 +2233,13 @@ impl WorkerOrchestrator {
         }
 
         let lane_workspace = lane_mgr.lane_dir(&acquired_lane_id).join("workspace");
-        let Some(claimed_lock_file) = claimed_lock_file else {
-            return LanePreparedOutcome::Done(JobOutcome::skipped(
-                "claimed lock released unexpectedly before lane prepared success",
-            ));
-        };
 
         LanePreparedOutcome::Advanced(Box::new(LeasePersistedContext {
             acquired: LaneAcquiredContext {
                 claimed: ClaimedContext {
                     claimed_path,
                     claimed_file_name,
-                    claimed_lock_file,
+                    claimed_lock_guard,
                     boundary_trace,
                     queue_trace,
                     budget_trace,
@@ -2325,22 +2292,13 @@ impl WorkerOrchestrator {
         let ClaimedContext {
             claimed_path,
             claimed_file_name,
-            claimed_lock_file,
+            claimed_lock_guard,
             boundary_trace,
             queue_trace,
             budget_trace,
             sbx_hash,
             resolved_net_hash,
         } = claimed;
-        let mut claimed_lock_file = Some(claimed_lock_file);
-        // Once the RUNNING lane lease is persisted, queue reconcile suppresses this
-        // job via lane active-job sets. Release the claimed lock before any terminal
-        // commit path to avoid self-deadlock in the receipt pipeline lock probe.
-        release_claimed_lock_for_terminal_transition(
-            &mut claimed_lock_file,
-            &spec.job_id,
-            "lane_lease_persisted_execution_phase",
-        );
 
         let job_wall_start = Instant::now();
         let lane_workspace = persisted_lane_workspace;
@@ -2370,6 +2328,7 @@ impl WorkerOrchestrator {
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 queue_root,
                 fac_root,
                 &boundary_trace,
@@ -2401,12 +2360,13 @@ impl WorkerOrchestrator {
             let reason = format!("mirror ensure failed: {e}");
             let _ = LaneLeaseV1::remove(&lane_dir);
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2460,12 +2420,13 @@ impl WorkerOrchestrator {
                 // failure.
             }
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2525,12 +2486,13 @@ impl WorkerOrchestrator {
                 // the job has a terminal receipt.
             }
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 reason,
@@ -2749,12 +2711,13 @@ impl WorkerOrchestrator {
                             "worker: WARNING: lane cleanup during patch hardening denial failed for {acquired_lane_id}: {cleanup_err}"
                         );
                     }
-                    if let Err(commit_err) = commit_claimed_job_via_pipeline(
+                    if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                         fac_root,
                         queue_root,
                         spec,
                         &claimed_path,
                         &claimed_file_name,
+                        &claimed_lock_guard,
                         FacJobOutcome::Denied,
                         Some(DenialReasonCode::PatchHardeningDenied),
                         &denial_reason,
@@ -2812,12 +2775,13 @@ impl WorkerOrchestrator {
                 // failure.
             }
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-            if let Err(commit_err) = commit_claimed_job_via_pipeline(
+            if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 FacJobOutcome::Denied,
                 Some(DenialReasonCode::ValidationFailed),
                 &reason,
@@ -2987,6 +2951,7 @@ impl WorkerOrchestrator {
                 spec,
                 &claimed_path,
                 &claimed_file_name,
+                &claimed_lock_guard,
                 queue_root,
                 fac_root,
                 signer,
@@ -3061,12 +3026,13 @@ impl WorkerOrchestrator {
         write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
 
         // TCK-00538: Include toolchain fingerprint in the completed job receipt.
-        if let Err(commit_err) = commit_claimed_job_via_pipeline(
+        if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
             spec,
             &claimed_path,
             &claimed_file_name,
+            &claimed_lock_guard,
             FacJobOutcome::Completed,
             None,
             "completed",

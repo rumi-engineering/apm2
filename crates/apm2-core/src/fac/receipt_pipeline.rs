@@ -491,95 +491,35 @@ impl ReceiptWritePipeline {
         file_name: &str,
         terminal_state: TerminalState,
     ) -> Result<CommitResult, ReceiptPipelineError> {
-        // Validate file_name confinement before any mutation (CTR-1504).
-        validate_file_name(file_name)?;
+        self.commit_internal(receipt, claimed_path, file_name, terminal_state, None, None)
+    }
 
-        let content_hash = compute_job_receipt_content_hash(receipt);
-        let expected_receipt_path = self.receipts_dir.join(format!("{content_hash}.json"));
-        let dest_dir = self.queue_root.join(terminal_state.dir_name());
-
-        // S11: Acquire advisory lock on claimed file BEFORE receipt write.
-        // This serializes worker commit against reconciler/file movers.
-        let claimed_file = match open_claimed_file_for_lock(claimed_path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(existing_terminal_path) =
-                    find_existing_terminal_job_path(&dest_dir, file_name)
-                {
-                    if expected_receipt_path.exists() {
-                        tracing::warn!(
-                            job_id = %receipt.job_id,
-                            claimed_path = %claimed_path.display(),
-                            terminal_path = %existing_terminal_path.display(),
-                            "claimed file already moved before lock acquisition; treating commit as idempotent success"
-                        );
-                        return Ok(CommitResult {
-                            receipt_path: expected_receipt_path,
-                            content_hash,
-                            job_terminal_path: existing_terminal_path,
-                        });
-                    }
-                }
-
-                return Err(ReceiptPipelineError::JobMoveFailed {
-                    from: claimed_path.to_string_lossy().to_string(),
-                    to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!("claimed file missing before lock acquisition: {e}"),
-                });
-            },
-            Err(e) => {
-                return Err(ReceiptPipelineError::JobMoveFailed {
-                    from: claimed_path.to_string_lossy().to_string(),
-                    to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!("failed to open claimed file for locking: {e}"),
-                });
-            },
-        };
-        if !try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
-            ReceiptPipelineError::JobMoveFailed {
-                from: claimed_path.to_string_lossy().to_string(),
-                to: dest_dir.to_string_lossy().to_string(),
-                reason: format!("failed to acquire advisory lock on claimed file: {e}"),
-            }
-        })? {
-            return Err(ReceiptPipelineError::JobMoveFailed {
-                from: claimed_path.to_string_lossy().to_string(),
-                to: dest_dir.to_string_lossy().to_string(),
-                reason: format!(
-                    "claimed file is already locked after {CLAIMED_LOCK_WAIT_TIMEOUT_MS}ms timeout"
-                ),
-            });
-        }
-        let _claimed_lock_guard = claimed_file;
-
-        // Step 1: Persist the receipt (content-addressed, idempotent).
-        let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
-            .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
-
-        // Step 2: Update receipt index (best-effort, non-authoritative).
-        // Index failure does not block the commit. On failure, delete the
-        // stale index to force rebuild on next read.
-        if let Err(e) = ReceiptIndexV1::incremental_update(&self.receipts_dir, receipt) {
-            tracing::warn!(error = %e, "receipt pipeline index update failed");
-            let index_path = ReceiptIndexV1::index_path(&self.receipts_dir);
-            let _ = std::fs::remove_file(&index_path);
-        }
-
-        // Step 3: Move job file to terminal directory (commit point).
-        let job_terminal_path =
-            move_job_to_terminal(claimed_path, &dest_dir, file_name).map_err(|reason| {
-                ReceiptPipelineError::TornState {
-                    job_id: receipt.job_id.clone(),
-                    receipt_path: receipt_path.clone(),
-                    reason,
-                }
-            })?;
-
-        Ok(CommitResult {
-            receipt_path,
-            content_hash,
-            job_terminal_path,
-        })
+    /// Execute the atomic commit protocol using a caller-owned claimed-file
+    /// lock guard (CLCK).
+    ///
+    /// This path intentionally skips lock reacquisition and relies on the
+    /// caller-held lock continuity invariant from claim through commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptPipelineError`] when receipt persistence, index update
+    /// fallout handling, or terminal move fails.
+    pub fn commit_with_claimed_lock(
+        &self,
+        claimed_lock_file: &File,
+        receipt: &FacJobReceiptV1,
+        claimed_path: &Path,
+        file_name: &str,
+        terminal_state: TerminalState,
+    ) -> Result<CommitResult, ReceiptPipelineError> {
+        self.commit_internal(
+            receipt,
+            claimed_path,
+            file_name,
+            terminal_state,
+            None,
+            Some(claimed_lock_file),
+        )
     }
 
     /// Execute the atomic commit protocol with receipt signing (TCK-00576).
@@ -607,6 +547,56 @@ impl ReceiptWritePipeline {
         signer: &crate::crypto::Signer,
         signer_id: &str,
     ) -> Result<CommitResult, ReceiptPipelineError> {
+        self.commit_internal(
+            receipt,
+            claimed_path,
+            file_name,
+            terminal_state,
+            Some((signer, signer_id)),
+            None,
+        )
+    }
+
+    /// Execute signed commit with a caller-owned claimed-file lock guard.
+    ///
+    /// This is the CLCK signed variant and MUST be used by FAC worker paths
+    /// that already own the claimed-file lock from claim-time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptPipelineError`] for the same error conditions as
+    /// [`commit_signed`](Self::commit_signed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_signed_with_claimed_lock(
+        &self,
+        claimed_lock_file: &File,
+        receipt: &FacJobReceiptV1,
+        claimed_path: &Path,
+        file_name: &str,
+        terminal_state: TerminalState,
+        signer: &crate::crypto::Signer,
+        signer_id: &str,
+    ) -> Result<CommitResult, ReceiptPipelineError> {
+        self.commit_internal(
+            receipt,
+            claimed_path,
+            file_name,
+            terminal_state,
+            Some((signer, signer_id)),
+            Some(claimed_lock_file),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn commit_internal(
+        &self,
+        receipt: &FacJobReceiptV1,
+        claimed_path: &Path,
+        file_name: &str,
+        terminal_state: TerminalState,
+        signer: Option<(&crate::crypto::Signer, &str)>,
+        claimed_lock_file: Option<&File>,
+    ) -> Result<CommitResult, ReceiptPipelineError> {
         // Validate file_name confinement before any mutation (CTR-1504).
         validate_file_name(file_name)?;
 
@@ -614,74 +604,106 @@ impl ReceiptWritePipeline {
         let expected_receipt_path = self.receipts_dir.join(format!("{content_hash}.json"));
         let dest_dir = self.queue_root.join(terminal_state.dir_name());
 
-        // S11: Acquire advisory lock on claimed file BEFORE receipt write.
-        let claimed_file = match open_claimed_file_for_lock(claimed_path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(existing_terminal_path) =
-                    find_existing_terminal_job_path(&dest_dir, file_name)
-                {
-                    if expected_receipt_path.exists() {
-                        tracing::warn!(
-                            job_id = %receipt.job_id,
-                            claimed_path = %claimed_path.display(),
-                            terminal_path = %existing_terminal_path.display(),
-                            "claimed file already moved before lock acquisition; treating signed commit as idempotent success"
-                        );
-                        return Ok(CommitResult {
-                            receipt_path: expected_receipt_path,
-                            content_hash,
-                            job_terminal_path: existing_terminal_path,
-                        });
-                    }
+        if let Some(lock_file) = claimed_lock_file {
+            if !claimed_path.exists() {
+                if let Some(idempotent) = maybe_idempotent_success(
+                    receipt,
+                    claimed_path,
+                    &dest_dir,
+                    file_name,
+                    &expected_receipt_path,
+                    &content_hash,
+                    signer.is_some(),
+                ) {
+                    return Ok(idempotent);
                 }
-
                 return Err(ReceiptPipelineError::JobMoveFailed {
                     from: claimed_path.to_string_lossy().to_string(),
                     to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!("claimed file missing before lock acquisition: {e}"),
+                    reason: "claimed file missing while caller-provided lock guard was active"
+                        .to_string(),
                 });
-            },
-            Err(e) => {
-                return Err(ReceiptPipelineError::JobMoveFailed {
-                    from: claimed_path.to_string_lossy().to_string(),
-                    to: dest_dir.to_string_lossy().to_string(),
-                    reason: format!("failed to open claimed file for locking: {e}"),
-                });
-            },
-        };
-        if !try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
-            ReceiptPipelineError::JobMoveFailed {
-                from: claimed_path.to_string_lossy().to_string(),
-                to: dest_dir.to_string_lossy().to_string(),
-                reason: format!("failed to acquire advisory lock on claimed file: {e}"),
             }
-        })? {
-            return Err(ReceiptPipelineError::JobMoveFailed {
-                from: claimed_path.to_string_lossy().to_string(),
-                to: dest_dir.to_string_lossy().to_string(),
-                reason: format!(
-                    "claimed file is already locked after {CLAIMED_LOCK_WAIT_TIMEOUT_MS}ms timeout"
-                ),
-            });
+            let metadata =
+                lock_file
+                    .metadata()
+                    .map_err(|e| ReceiptPipelineError::JobMoveFailed {
+                        from: claimed_path.to_string_lossy().to_string(),
+                        to: dest_dir.to_string_lossy().to_string(),
+                        reason: format!("failed to stat caller-provided claimed lock file: {e}"),
+                    })?;
+            if !metadata.is_file() {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: "caller-provided claimed lock handle is not a regular file".to_string(),
+                });
+            }
+        } else {
+            // Legacy path: acquire advisory lock on claimed file BEFORE receipt
+            // write. This serializes commit against reconciler/file movers.
+            let claimed_file = match open_claimed_file_for_lock(claimed_path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(idempotent) = maybe_idempotent_success(
+                        receipt,
+                        claimed_path,
+                        &dest_dir,
+                        file_name,
+                        &expected_receipt_path,
+                        &content_hash,
+                        signer.is_some(),
+                    ) {
+                        return Ok(idempotent);
+                    }
+                    return Err(ReceiptPipelineError::JobMoveFailed {
+                        from: claimed_path.to_string_lossy().to_string(),
+                        to: dest_dir.to_string_lossy().to_string(),
+                        reason: format!("claimed file missing before lock acquisition: {e}"),
+                    });
+                },
+                Err(e) => {
+                    return Err(ReceiptPipelineError::JobMoveFailed {
+                        from: claimed_path.to_string_lossy().to_string(),
+                        to: dest_dir.to_string_lossy().to_string(),
+                        reason: format!("failed to open claimed file for locking: {e}"),
+                    });
+                },
+            };
+            if !try_acquire_claimed_lock_with_timeout(&claimed_file).map_err(|e| {
+                ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!("failed to acquire advisory lock on claimed file: {e}"),
+                }
+            })? {
+                return Err(ReceiptPipelineError::JobMoveFailed {
+                    from: claimed_path.to_string_lossy().to_string(),
+                    to: dest_dir.to_string_lossy().to_string(),
+                    reason: format!(
+                        "claimed file is already locked after {CLAIMED_LOCK_WAIT_TIMEOUT_MS}ms timeout"
+                    ),
+                });
+            }
+            let _claimed_lock_guard = claimed_file;
         }
-        let _claimed_lock_guard = claimed_file;
 
         // Step 1: Persist the receipt (content-addressed, idempotent).
         let receipt_path = persist_content_addressed_receipt(&self.receipts_dir, receipt)
             .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
-        // Step 1b (TCK-00576): Persist signed envelope alongside receipt.
-        // Non-fatal: if signing fails, the receipt is still valid but
-        // downstream verification will treat the missing envelope as
-        // fail-closed (no cache reuse for unsigned receipts).
-        let envelope = sign_receipt(&content_hash, signer, signer_id);
-        if let Err(e) = persist_signed_envelope(&self.receipts_dir, &envelope) {
-            tracing::warn!(
-                error = %e,
-                content_hash = %content_hash,
-                "signed receipt envelope persistence failed (non-fatal)"
-            );
+        if let Some((signer, signer_id)) = signer {
+            // Step 1b (TCK-00576): Persist signed envelope alongside receipt.
+            // Non-fatal: if signing fails, the receipt is still valid but
+            // downstream verification treats missing envelope as fail-closed.
+            let envelope = sign_receipt(&content_hash, signer, signer_id);
+            if let Err(e) = persist_signed_envelope(&self.receipts_dir, &envelope) {
+                tracing::warn!(
+                    error = %e,
+                    content_hash = %content_hash,
+                    "signed receipt envelope persistence failed (non-fatal)"
+                );
+            }
         }
 
         // Step 2: Update receipt index (best-effort, non-authoritative).
@@ -1078,6 +1100,34 @@ fn try_acquire_claimed_lock_with_timeout(file: &File) -> std::io::Result<bool> {
     }
 }
 
+fn maybe_idempotent_success(
+    receipt: &FacJobReceiptV1,
+    claimed_path: &Path,
+    dest_dir: &Path,
+    file_name: &str,
+    expected_receipt_path: &Path,
+    content_hash: &str,
+    signed_commit: bool,
+) -> Option<CommitResult> {
+    let existing_terminal_path = find_existing_terminal_job_path(dest_dir, file_name)?;
+    if !expected_receipt_path.exists() {
+        return None;
+    }
+
+    tracing::warn!(
+        job_id = %receipt.job_id,
+        claimed_path = %claimed_path.display(),
+        terminal_path = %existing_terminal_path.display(),
+        signed_commit,
+        "claimed file already moved before lock acquisition; treating commit as idempotent success"
+    );
+    Some(CommitResult {
+        receipt_path: expected_receipt_path.to_path_buf(),
+        content_hash: content_hash.to_string(),
+        job_terminal_path: existing_terminal_path,
+    })
+}
+
 /// Locate an already-moved terminal job path for idempotent commit handling.
 ///
 /// Returns either the exact destination filename or a collision-safe filename
@@ -1259,6 +1309,9 @@ mod tests {
             node_fingerprint: None,
             toolchain_fingerprint: None,
             observed_usage: None,
+            claimed_lock_continuity_v1: None,
+            claimed_lock_acquired_at_epoch_ms: None,
+            claimed_lock_release_phase: None,
             timestamp_secs: 1000,
             content_hash: String::new(),
         };
@@ -1417,6 +1470,44 @@ mod tests {
         assert!(
             claimed_path.exists(),
             "claimed file must remain in place when commit cannot acquire lock"
+        );
+    }
+
+    #[test]
+    fn test_commit_with_claimed_lock_succeeds_with_outer_lock_held() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let receipts_dir = tmp.path().join("receipts");
+        let queue_root = tmp.path().join("queue");
+        let claimed_path = setup_claimed_job(&queue_root, "job-guarded-commit");
+
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&claimed_path)
+            .expect("open claimed for lock");
+        crate::fac::flock_util::acquire_exclusive_blocking(&lock_file)
+            .expect("acquire outer claimed lock");
+
+        let pipeline = ReceiptWritePipeline::new(receipts_dir, queue_root);
+        let receipt = make_receipt("job-guarded-commit", FacJobOutcome::Completed);
+        let result = pipeline
+            .commit_with_claimed_lock(
+                &lock_file,
+                &receipt,
+                &claimed_path,
+                "job-guarded-commit.json",
+                TerminalState::Completed,
+            )
+            .expect("guarded commit should succeed while lock is held");
+
+        let competing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&result.job_terminal_path)
+            .expect("open terminal path for competing lock");
+        assert!(
+            !try_acquire_exclusive_nonblocking(&competing).expect("lock probe should not error"),
+            "terminal inode lock should still be held by guarded lock owner"
         );
     }
 
