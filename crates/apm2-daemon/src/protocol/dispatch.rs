@@ -20004,7 +20004,14 @@ impl PrivilegedDispatcher {
             .get_event_by_changeset_identity(work_id, changeset_digest_hex)?;
         let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
         let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
-        let timestamp_ns = payload.get("timestamp_ns")?.as_u64()?;
+        // Legacy/malformed payload compatibility: timestamp_ns may be absent
+        // in persisted JSON while still present on the signed event record.
+        // Prefer payload field when available, otherwise fall back to the
+        // canonical event timestamp.
+        let timestamp_ns = payload
+            .get("timestamp_ns")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(event.timestamp_ns);
         Some((event.event_id, persisted_cas_hash, timestamp_ns))
     }
 
@@ -33918,6 +33925,80 @@ mod tests {
             assert_eq!(
                 changeset_count, 1,
                 "semantic duplicate must not create duplicate changeset events"
+            );
+        }
+
+        #[test]
+        fn test_publish_changeset_replay_accepts_legacy_payload_without_timestamp_field() {
+            let (dispatcher, cas) = make_dispatcher_with_cas();
+            let ctx = privileged_ctx();
+            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
+
+            let bundle_bytes = make_bundle_json("cs-replay-legacy-timestamp");
+            let bundle: ChangeSetBundleV1 =
+                serde_json::from_slice(&bundle_bytes).expect("bundle fixture should decode");
+            let changeset_digest_hex = hex::encode(bundle.changeset_digest);
+            let persisted_cas_hash = cas
+                .store(&bundle_bytes)
+                .expect("bundle should store in CAS")
+                .hash;
+            let persisted_cas_hash_hex = hex::encode(persisted_cas_hash);
+
+            let legacy_payload = serde_json::json!({
+                "event_type": "changeset_published",
+                "work_id": work_id,
+                "changeset_digest": changeset_digest_hex,
+                "cas_hash": persisted_cas_hash_hex,
+                "actor_id": "actor:test-legacy",
+                // Intentionally omitted: "timestamp_ns"
+            });
+            let seeded_event = SignedLedgerEvent {
+                event_id: "EVT-test-legacy-changeset-replay".to_string(),
+                event_type: "changeset_published".to_string(),
+                work_id: work_id.clone(),
+                actor_id: "actor:test-legacy".to_string(),
+                payload: serde_json::to_vec(&legacy_payload)
+                    .expect("legacy payload should serialize"),
+                signature: vec![0u8; 64],
+                timestamp_ns: 42_000_000,
+            };
+            dispatcher
+                .event_emitter
+                .inject_raw_event(seeded_event.clone());
+
+            let response = dispatcher
+                .dispatch(
+                    &encode_publish_changeset_request(&PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        lease_id,
+                        bundle_bytes,
+                    }),
+                    &ctx,
+                )
+                .expect("publish should succeed");
+
+            match response {
+                PrivilegedResponse::PublishChangeSet(resp) => {
+                    assert_eq!(
+                        resp.event_id, seeded_event.event_id,
+                        "replay must reuse persisted event when payload omits timestamp_ns"
+                    );
+                    assert_eq!(
+                        resp.cas_hash, persisted_cas_hash_hex,
+                        "replay must return persisted CAS binding"
+                    );
+                },
+                other => panic!("Expected PublishChangeSet replay response, got: {other:?}"),
+            }
+
+            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
+            let changeset_count = events
+                .iter()
+                .filter(|e| e.event_type == "changeset_published")
+                .count();
+            assert_eq!(
+                changeset_count, 1,
+                "legacy replay payload must not produce duplicate changeset events"
             );
         }
 
