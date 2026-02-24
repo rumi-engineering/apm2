@@ -176,6 +176,97 @@ fn resolve_head_for_path(path: &Path) -> Result<String, String> {
     Ok(sha.to_ascii_lowercase())
 }
 
+fn detached_worktree_root_for_home(home: &Path) -> PathBuf {
+    home.join("review_worktrees")
+}
+
+fn detached_worktree_path_for_sha(home: &Path, expected_sha: &str) -> PathBuf {
+    detached_worktree_root_for_home(home).join(expected_sha)
+}
+
+fn git_commit_object_exists(expected_sha: &str) -> Result<bool, String> {
+    let object_ref = format!("{expected_sha}^{{commit}}");
+    let output = Command::new("git")
+        .args(["cat-file", "-e", &object_ref])
+        .output()
+        .map_err(|err| format!("failed to execute `git cat-file -e {object_ref}`: {err}"))?;
+    Ok(output.status.success())
+}
+
+fn remove_detached_worktree(path: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute `git worktree remove --force {}`: {err}",
+                path.display()
+            )
+        })?;
+    if output.status.success() || !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).map_err(|err| {
+        format!(
+            "failed to remove stale detached worktree {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn materialize_detached_worktree_for_sha(expected_sha: &str) -> Result<Option<PathBuf>, String> {
+    if !git_commit_object_exists(expected_sha)? {
+        return Ok(None);
+    }
+
+    let home = apm2_home_dir()?;
+    let detached_root = detached_worktree_root_for_home(&home);
+    fac_permissions::ensure_dir_with_mode(&detached_root).map_err(|err| {
+        format!(
+            "failed to create detached worktree root {}: {err}",
+            detached_root.display()
+        )
+    })?;
+    let detached_path = detached_worktree_path_for_sha(&home, expected_sha);
+
+    if detached_path.exists() {
+        if resolve_head_for_path(&detached_path)
+            .is_ok_and(|sha| sha.eq_ignore_ascii_case(expected_sha))
+        {
+            return Ok(Some(detached_path));
+        }
+        remove_detached_worktree(&detached_path)?;
+    }
+
+    let output = Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&detached_path)
+        .arg(expected_sha)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute `git worktree add --detach {} {expected_sha}`: {err}",
+                detached_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        if detached_path.exists()
+            && resolve_head_for_path(&detached_path)
+                .is_ok_and(|sha| sha.eq_ignore_ascii_case(expected_sha))
+        {
+            return Ok(Some(detached_path));
+        }
+        return Err(format!(
+            "`git worktree add --detach {}` failed: {}",
+            detached_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(Some(detached_path))
+}
+
 pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, String> {
     super::types::validate_expected_head_sha(expected_sha)?;
     let expected_sha = expected_sha.to_ascii_lowercase();
@@ -209,6 +300,14 @@ pub(super) fn resolve_worktree_for_sha(expected_sha: &str) -> Result<PathBuf, St
             cwd.display()
         );
         return Ok(cwd);
+    }
+
+    if let Some(detached_path) = materialize_detached_worktree_for_sha(&expected_sha)? {
+        eprintln!(
+            "WARNING: no active worktree found for sha={expected_sha}; using detached worktree {}",
+            detached_path.display()
+        );
+        return Ok(detached_path);
     }
 
     Err(format!(
@@ -1690,6 +1789,7 @@ fn spawn_detached_review(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::Duration;
@@ -1699,8 +1799,9 @@ mod tests {
         build_systemd_setenv_args, dispatch_single_review_for_home_with_spawn,
         dispatch_single_review_for_home_with_spawn_force,
         dispatch_single_review_for_home_with_spawn_force_workspace_and_lock,
-        first_existing_dispatch_executable, run_state_has_live_runtime_handle,
-        strip_deleted_executable_suffix, write_pending_dispatch_for_home,
+        first_existing_dispatch_executable, resolve_head_for_path, resolve_worktree_for_sha,
+        run_state_has_live_runtime_handle, strip_deleted_executable_suffix,
+        write_pending_dispatch_for_home,
     };
     use crate::commands::fac_review::state::{
         get_process_start_time, load_review_run_state_for_home, review_run_state_path_for_home,
@@ -1711,6 +1812,22 @@ mod tests {
         TERMINAL_DISPATCH_LOCK_TIMEOUT, TERMINAL_SHA_DRIFT_SUPERSEDED,
         TERMINAL_STALE_HEAD_AMBIGUITY,
     };
+
+    fn git_checked(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
     fn sample_run_state(pid: Option<u32>) -> ReviewRunState {
         ReviewRunState {
@@ -1904,6 +2021,60 @@ mod tests {
         assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
 
         cleanup_children(&spawned_children);
+    }
+
+    #[test]
+    fn resolve_worktree_for_sha_materializes_detached_sha_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo dir");
+        git_checked(&repo, &["init"]);
+        git_checked(&repo, &["config", "user.email", "test@example.com"]);
+        git_checked(&repo, &["config", "user.name", "Test User"]);
+
+        fs::write(repo.join("file.txt"), "first\n").expect("write first file");
+        git_checked(&repo, &["add", "file.txt"]);
+        git_checked(&repo, &["commit", "-m", "first"]);
+        let first_sha = git_checked(&repo, &["rev-parse", "HEAD"]);
+
+        fs::write(repo.join("file.txt"), "second\n").expect("write second file");
+        git_checked(&repo, &["add", "file.txt"]);
+        git_checked(&repo, &["commit", "-m", "second"]);
+        let second_sha = git_checked(&repo, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            first_sha, second_sha,
+            "fixture requires two distinct commits"
+        );
+
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("switch to repo cwd");
+
+        let resolved = resolve_worktree_for_sha(&first_sha).expect("resolve detached worktree");
+        let resolved_sha = resolve_head_for_path(&resolved).expect("resolve detached head");
+        let apm2_home = crate::commands::fac_review::types::apm2_home_dir().expect("apm2 home");
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        assert_eq!(
+            resolved_sha.to_ascii_lowercase(),
+            first_sha.to_ascii_lowercase(),
+            "detached worktree must point at requested sha"
+        );
+        assert!(
+            resolved.starts_with(&apm2_home),
+            "detached worktree should live under APM2 home"
+        );
+        assert_ne!(
+            resolved, repo,
+            "resolver should not return cwd when cwd head does not match requested sha"
+        );
+
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&resolved)
+            .status();
     }
 
     #[test]
