@@ -249,24 +249,21 @@ impl WorkObjectProjection {
         let mut next_seq_id = 1u64;
 
         for (_, event) in ordered {
-            let reducer_events = match translate_signed_event(
-                event,
-                &mut opened_work_ids,
-                &mut next_seq_id,
-            ) {
-                Ok(events) => events,
-                Err(error) if should_skip_pr_associated_replay_error(&event.event_type, &error) => {
-                    warn!(
-                        event_id = %event.event_id,
-                        event_type = %event.event_type,
-                        work_id = %event.work_id,
-                        error = %error,
-                        "Skipping non-replayable work.pr_associated event during projection rebuild"
-                    );
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+            let reducer_events =
+                match translate_signed_event(event, &mut opened_work_ids, &mut next_seq_id) {
+                    Ok(events) => events,
+                    Err(error) if should_skip_non_replayable_signed_event(event, &error) => {
+                        warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            work_id = %event.work_id,
+                            error = %error,
+                            "Skipping non-replayable signed event during projection rebuild"
+                        );
+                        continue;
+                    },
+                    Err(error) => return Err(error),
+                };
             let mut skip_source_event = false;
             for reducer_event in &reducer_events {
                 if let Err(error) = self.apply_reducer_event(reducer_event) {
@@ -695,6 +692,78 @@ fn should_skip_pr_associated_replay_error(event_type: &str, error: &WorkProjecti
         ),
         _ => false,
     }
+}
+
+fn is_legacy_work_transitioned_payload_shape(payload: &[u8], expected_work_id: &str) -> bool {
+    if payload.first() != Some(&b'{') {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(object) = parsed.as_object() else {
+        return false;
+    };
+
+    if object.contains_key("session_id")
+        || object.contains_key("actor_id")
+        || object.contains_key("payload")
+    {
+        return false;
+    }
+
+    let Some(work_id) = object
+        .get("work_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if work_id.is_empty() || work_id != expected_work_id {
+        return false;
+    }
+
+    let has_from_state = object
+        .get("from_state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_to_state = object
+        .get("to_state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_from_state || !has_to_state {
+        return false;
+    }
+
+    object
+        .get("previous_transition_count")
+        .is_none_or(|value| value.as_u64().is_some() || value.as_i64().is_some())
+}
+
+fn should_skip_legacy_work_transitioned_replay_error(
+    event: &SignedLedgerEvent,
+    error: &WorkProjectionError,
+) -> bool {
+    if event.event_type != "work_transitioned" {
+        return false;
+    }
+    match error {
+        WorkProjectionError::InvalidPayload { reason, .. } => {
+            if !(reason.contains("session envelope") || reason.contains("session_id")) {
+                return false;
+            }
+            is_legacy_work_transitioned_payload_shape(&event.payload, &event.work_id)
+        },
+        _ => false,
+    }
+}
+
+fn should_skip_non_replayable_signed_event(
+    event: &SignedLedgerEvent,
+    error: &WorkProjectionError,
+) -> bool {
+    should_skip_pr_associated_replay_error(&event.event_type, error)
+        || should_skip_legacy_work_transitioned_replay_error(event, error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1684,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_rejects_legacy_work_transitioned_payload_shape() {
+    fn rebuild_skips_legacy_work_transitioned_payload_shape() {
         let mut projection = WorkObjectProjection::new();
         let legacy_transition = signed_event(
             "work_transitioned",
@@ -1699,9 +1768,32 @@ mod tests {
             1_000,
         );
 
-        let err = projection
+        projection
             .rebuild_from_signed_events(&[legacy_transition])
-            .expect_err("legacy work events must fail-closed");
+            .expect("legacy transition payload should be skipped, not fatal");
+        assert!(
+            projection.get_work("W-legacy-001").is_none(),
+            "legacy transition payload skip must not materialize reducer state"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_non_legacy_work_transitioned_payload_shape() {
+        let mut projection = WorkObjectProjection::new();
+        let malformed_transition = signed_event(
+            "work_transitioned",
+            "W-malformed-001",
+            serde_json::to_vec(&serde_json::json!({
+                "event_type": "work_transitioned",
+                "payload": "00"
+            }))
+            .expect("malformed transition payload should encode"),
+            1_001,
+        );
+
+        let err = projection
+            .rebuild_from_signed_events(&[malformed_transition])
+            .expect_err("non-legacy malformed transition payload must fail closed");
         assert!(
             matches!(
                 err,
@@ -1709,7 +1801,7 @@ mod tests {
                     if event_type == "work_transitioned"
                         && reason.contains("session envelope")
             ),
-            "legacy transition payload shape must be rejected"
+            "only known legacy transition payload shape may be skipped"
         );
     }
 
