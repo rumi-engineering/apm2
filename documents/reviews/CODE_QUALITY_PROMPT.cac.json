@@ -137,7 +137,7 @@
           "id": "STEP_3_ANALYZE_AND_EMIT",
           "purpose": "Apply required reasoning modes to the diff, emit each finding immediately.",
           "modes_of_reasoning": {
-            "instruction": "Apply ALL three modes below to every changed module, type, function, and invariant in the diff. The rust-standards references encode the specific quality dimensions — these modes tell you HOW to reason about them.",
+            "instruction": "Apply ALL three modes below to every changed module, type, function, and invariant in the diff.",
             "modes": [
               {
                 "mode": "documents/skills/modes-of-reasoning/assets/06-constraint-satisfiability.json",

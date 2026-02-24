@@ -170,10 +170,6 @@
             "note": "Security review and assurance expectations."
           },
           {
-            "file": "documents/security/SECURITY_POLICY.cac.json",
-            "note": "Normative security policy constraints."
-          },
-          {
             "file": "documents/security/SIGNING_AND_VERIFICATION.cac.json",
             "note": "Authenticity, signing, and verification requirements."
           },
@@ -305,7 +301,6 @@
         "documents/security/RELEASE_PROCEDURE.cac.json",
         "documents/security/SECRETS_MANAGEMENT.cac.json",
         "documents/security/SECURITY_CHECKLIST.cac.json",
-        "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/SIGNING_AND_VERIFICATION.cac.json",
         "documents/security/THREAT_MODEL.cac.json",
         "documents/security/consensus-runbook.cac.json"

@@ -38,6 +38,18 @@
         "description": "APM2 PRD Volume v1"
       },
       {
+        "schema_id": "apm2.capability_manifest.v1.schema",
+        "file": "apm2.capability_manifest.v1.schema.json",
+        "format": "json",
+        "description": "APM2 Capability Manifest v1 (migrated from schemas/cac/capability_manifest.schema.json)"
+      },
+      {
+        "schema_id": "apm2.changeset_bundle.v1.schema",
+        "file": "apm2.changeset_bundle.v1.schema.json",
+        "format": "json",
+        "description": "APM2 ChangeSetBundleV1: canonical diff bundle stored in CAS"
+      },
+      {
         "schema_id": "cac.aat_receipt.v1.schema",
         "file": "cac.aat_receipt.v1.schema.json",
         "format": "json",
