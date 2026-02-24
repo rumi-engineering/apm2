@@ -11,7 +11,7 @@
       "security"
     ],
     "source_of_truth_refs": [
-      "documents/work/tickets/TCK-00604.yaml",
+      "documents/work/tickets/TCK-00604.json",
       "documents/reviews/SECURITY_REVIEW_PROMPT.cac.json",
       "documents/reviews/CODE_QUALITY_PROMPT.cac.json"
     ],
