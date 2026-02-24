@@ -339,6 +339,34 @@ pub(super) fn spawn_queue_watch_thread(
     )
 }
 
+const TOOLCHAIN_PROBE_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_HOME",
+    "RUSTC",
+    "CARGO",
+];
+
+/// Build the environment map used for startup toolchain fingerprint probes.
+///
+/// FAC gates often run with lane-scoped `HOME`; forwarding rustup variables
+/// keeps `rustc` probes stable under lane execution while preserving the
+/// default-deny shape (explicit allowlist only).
+fn build_toolchain_probe_env() -> std::collections::BTreeMap<String, String> {
+    let mut probe_env = std::collections::BTreeMap::new();
+    for key in TOOLCHAIN_PROBE_ENV_KEYS {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            probe_env.insert((*key).to_string(), value);
+        }
+    }
+    probe_env
+}
+
 /// Runs the FAC worker, returning an exit code.
 ///
 /// The worker scans the pending queue, validates each job spec against
@@ -755,16 +783,7 @@ pub(super) fn run_fac_worker_impl(
     // Cache validation: re-derive fingerprint from stored raw_versions and
     // compare (INV-TC-004). If mismatch, recompute fresh.
     let toolchain_fingerprint: String = {
-        let mut probe_env = std::collections::BTreeMap::new();
-        if let Ok(path) = std::env::var("PATH") {
-            probe_env.insert("PATH".to_string(), path);
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            probe_env.insert("HOME".to_string(), home);
-        }
-        if let Ok(user) = std::env::var("USER") {
-            probe_env.insert("USER".to_string(), user);
-        }
+        let probe_env = build_toolchain_probe_env();
 
         // Step 1: Try loading cache (bounded read, O_NOFOLLOW via
         // fac_secure_io::read_bounded).
