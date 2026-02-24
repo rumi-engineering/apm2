@@ -2924,6 +2924,60 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         None
     }
 
+    fn has_work_pr_association_tuple(
+        &self,
+        work_id: &str,
+        pr_number: u64,
+        commit_sha: &str,
+    ) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        let Ok(pr_number_i64) = i64::try_from(pr_number) else {
+            return false;
+        };
+
+        let legacy_hit = conn
+            .query_row(
+                "SELECT 1 \
+                 FROM ledger_events \
+                 WHERE work_id = ?1 \
+                   AND event_type = 'work.pr_associated' \
+                   AND json_extract(CAST(payload AS TEXT), '$.pr_number') = ?2 \
+                   AND lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) = lower(?3) \
+                 LIMIT 1",
+                params![work_id, pr_number_i64, commit_sha],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+        if legacy_hit {
+            return true;
+        }
+
+        if !self.is_frozen_internal() {
+            return false;
+        }
+
+        conn.query_row(
+            "SELECT 1 \
+             FROM events \
+             WHERE session_id = ?1 \
+               AND event_type = 'work.pr_associated' \
+               AND json_extract(CAST(payload AS TEXT), '$.pr_number') = ?2 \
+               AND lower(json_extract(CAST(payload AS TEXT), '$.commit_sha')) = lower(?3) \
+             LIMIT 1",
+            params![work_id, pr_number_i64, commit_sha],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
     /// TCK-00637 SECURITY FIX (Findings 5/8): Bounded SQL query for the
     /// most recent `work_transitioned` event matching a `rationale_code`.
     /// Uses `json_extract` at the database level to avoid O(N)
@@ -9069,6 +9123,111 @@ mod tests {
             work_pr_count, 1,
             "Exactly one canonical work.pr_associated row must exist"
         );
+    }
+
+    #[test]
+    fn tck_00639_has_work_pr_association_tuple_uses_semantic_tuple_lookup() {
+        let emitter = test_emitter();
+
+        let legacy_work_id = "W-PR-LOOKUP-LEGACY-001";
+        let legacy_pr_number = 910_u64;
+        let legacy_commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            legacy_work_id,
+            legacy_pr_number,
+            legacy_commit_sha,
+        );
+        let legacy_envelope = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": legacy_work_id,
+            "actor_id": "actor-legacy",
+            "payload": hex::encode(legacy_payload),
+            "pr_number": legacy_pr_number,
+            "commit_sha": legacy_commit_sha,
+        });
+
+        emitter
+            .emit_session_event_with_envelope(
+                legacy_work_id,
+                "work.pr_associated",
+                &legacy_envelope,
+                "actor-legacy",
+                1_000_000_000,
+            )
+            .expect("legacy work.pr_associated insert should succeed");
+
+        assert!(emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            legacy_commit_sha
+        ));
+        assert!(emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            &legacy_commit_sha.to_ascii_uppercase()
+        ));
+        assert!(!emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number + 1,
+            legacy_commit_sha
+        ));
+        assert!(!emitter.has_work_pr_association_tuple(
+            legacy_work_id,
+            legacy_pr_number,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+
+        {
+            let guard = emitter
+                .conn
+                .lock()
+                .expect("sqlite lock should be available");
+            apm2_core::ledger::init_canonical_schema(&guard)
+                .expect("canonical schema init should succeed");
+            apm2_core::ledger::migrate_legacy_ledger_events(&guard)
+                .expect("legacy event migration should succeed");
+            emitter
+                .freeze_legacy_writes(&guard)
+                .expect("freeze should succeed");
+        }
+
+        let canonical_work_id = "W-PR-LOOKUP-CANONICAL-001";
+        let canonical_pr_number = 911_u64;
+        let canonical_commit_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let canonical_payload = apm2_core::work::helpers::work_pr_associated_payload(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_sha,
+        );
+        let canonical_envelope = serde_json::json!({
+            "event_type": "work.pr_associated",
+            "session_id": canonical_work_id,
+            "actor_id": "actor-canonical",
+            "payload": hex::encode(canonical_payload),
+            "pr_number": canonical_pr_number,
+            "commit_sha": canonical_commit_sha,
+        });
+
+        emitter
+            .emit_session_event_with_envelope(
+                canonical_work_id,
+                "work.pr_associated",
+                &canonical_envelope,
+                "actor-canonical",
+                2_000_000_000,
+            )
+            .expect("canonical work.pr_associated insert should succeed");
+
+        assert!(emitter.has_work_pr_association_tuple(
+            canonical_work_id,
+            canonical_pr_number,
+            canonical_commit_sha
+        ));
+        assert!(emitter.has_work_pr_association_tuple(
+            canonical_work_id,
+            canonical_pr_number,
+            &canonical_commit_sha.to_ascii_uppercase()
+        ));
     }
 
     /// Regression: `get_event_by_evidence_identity` on
