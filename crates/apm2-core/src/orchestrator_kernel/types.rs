@@ -1,10 +1,79 @@
 //! Shared types for orchestrator kernel runtimes.
 
+use crate::orchestrator_kernel::ledger_tailer::CursorEvent;
+
+/// Marker trait for cursor types usable by the orchestrator kernel.
+///
+/// `KernelCursor` encodes the minimal contract for a ledger-specific cursor:
+///
+/// - **`Ord`**: the kernel uses `Ord` to determine event ordering and cursor
+///   progression.  The total order MUST be consistent with the ledger reader's
+///   returned order.
+/// - **`Clone + Default`**: cursors are duplicated and zero-initialised at
+///   kernel start.
+/// - **Serde round-trip**: cursors are durably persisted by `CursorStore`
+///   implementations.
+/// - **`Debug + Send + Sync + 'static`**: standard kernel threading and
+///   diagnostics requirements.
+///
+/// # Choosing a cursor
+///
+/// | Ledger kind              | Recommended cursor                     |
+/// |--------------------------|----------------------------------------|
+/// | Timestamp + event-id     | [`CompositeCursor`]                    |
+/// | Monotonic sequence / WAL | Custom `struct SeqCursor(u64)`         |
+/// | BFT commit index         | Custom `struct CommitCursor { .. }`    |
+///
+/// The kernel itself is agnostic to cursor semantics; it only requires `Ord`.
+pub trait KernelCursor:
+    Clone
+    + Default
+    + Ord
+    + serde::Serialize
+    + serde::de::DeserializeOwned
+    + std::fmt::Debug
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+/// Blanket implementation: every type satisfying the super-trait bounds
+/// automatically implements `KernelCursor`.
+impl<T> KernelCursor for T where
+    T: Clone
+        + Default
+        + Ord
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static
+{
+}
+
+/// Convenience alias: `CompositeCursor` is the default cursor for
+/// timestamp + event-id ledgers.
+pub type DefaultCursor = CompositeCursor;
+
 /// Durable composite cursor `(timestamp_ns, event_id)`.
 ///
 /// This cursor shape avoids skip-on-collision bugs when multiple events share
-/// the same timestamp.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+/// the same timestamp.  It is the default cursor implementation for ledgers
+/// that expose `(timestamp_ns, event_id)` ordering.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CompositeCursor {
     /// Monotonic event timestamp in nanoseconds since Unix epoch.
@@ -29,6 +98,15 @@ pub struct EventEnvelope<Payload = Vec<u8>> {
     pub timestamp_ns: u64,
     /// Opaque payload bytes.
     pub payload: Payload,
+}
+
+impl<Payload> CursorEvent<CompositeCursor> for EventEnvelope<Payload> {
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.timestamp_ns,
+            event_id: self.event_id.clone(),
+        }
+    }
 }
 
 /// Domain execution outcome for a single intent.

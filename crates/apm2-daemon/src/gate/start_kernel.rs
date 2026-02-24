@@ -214,13 +214,12 @@ struct GateStartObservedEvent {
     publication: Option<ChangesetPublication>,
 }
 
-impl CursorEvent for GateStartObservedEvent {
-    fn timestamp_ns(&self) -> u64 {
-        self.timestamp_ns
-    }
-
-    fn event_id(&self) -> &str {
-        &self.cursor_event_id
+impl CursorEvent<CompositeCursor> for GateStartObservedEvent {
+    fn cursor(&self) -> CompositeCursor {
+        CompositeCursor {
+            timestamp_ns: self.timestamp_ns,
+            event_id: self.cursor_event_id.clone(),
+        }
     }
 }
 
@@ -392,6 +391,7 @@ enum GateStartLedgerReader {
 }
 
 impl LedgerReader<GateStartObservedEvent> for GateStartLedgerReader {
+    type Cursor = CompositeCursor;
     type Error = String;
 
     async fn poll(
@@ -648,7 +648,7 @@ enum GateStartCursorStore {
     Memory(MemoryGateStartCursorStore),
 }
 
-impl CursorStore for GateStartCursorStore {
+impl CursorStore<CompositeCursor> for GateStartCursorStore {
     type Error = String;
 
     async fn load(&self) -> Result<CompositeCursor, Self::Error> {

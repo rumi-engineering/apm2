@@ -67,6 +67,11 @@
           "id": "INV-CQ-006",
           "description": "Do NOT run or check cargo fmt, clippy, cargo test, or cargo doc. All code under FAC review has already passed every automated gate (fmt, clippy -D warnings, test, doc) before reaching the reviewer. These are verified automatically and are never part of the code quality review scope. Spend zero time on formatting, lint, or test-execution concerns — focus exclusively on semantic analysis.",
           "criticality": "PROCESS"
+        },
+        {
+          "id": "INV-CQ-007",
+          "description": "Any persisted monotonic timestamp (Instant-derived values stored in SQLite, files, or other durable storage) MUST have an explicit rebase-on-load path that recalculates deadlines from a wall-clock anchor (e.g. GateLease.expires_at). Persisted monotonic values MUST NOT trigger irreversible actions (timeouts, denials, state transitions) solely due to monotonic epoch rewind after process restart. Grep anchors: observed_monotonic_ns, deadline_monotonic_ns, MONO_EPOCH, Instant::now.",
+          "criticality": "CORRECTNESS"
         }
       ]
     },
