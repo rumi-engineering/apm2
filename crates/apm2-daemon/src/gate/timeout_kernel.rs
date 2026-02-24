@@ -2069,9 +2069,11 @@ fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), Str
     let (lease_value, decode_context) = payload_json
         .get("full_lease")
         .cloned()
-        .map(|value| (value, "full_lease"))
         // Legacy persisted shape stored GateLease fields at top-level.
-        .unwrap_or_else(|| (payload_json.clone(), "legacy_top_level"));
+        .map_or_else(
+            || (payload_json.clone(), "legacy_top_level"),
+            |value| (value, "full_lease"),
+        );
     let lease: GateLease = serde_json::from_value(lease_value).map_err(|e| {
         format!("failed to decode gate_lease_issued payload ({decode_context}): {e}")
     })?;
