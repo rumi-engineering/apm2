@@ -4136,7 +4136,7 @@ fn resolve_ticket_alias_to_work_id_via_daemon(
     Ok(Some(response.work_id))
 }
 
-fn work_current_projection_fallback_requested(
+const fn work_current_projection_fallback_requested(
     lease_filter: Option<&str>,
     session_filter: Option<&str>,
 ) -> bool {
