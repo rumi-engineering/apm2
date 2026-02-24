@@ -399,12 +399,18 @@ pub(super) fn apply_gates_job_lifecycle_events(
     })
 }
 
-fn release_claimed_lock_before_terminal_transition(job_id: &str, phase: &str) {
-    tracing::debug!(
-        job_id,
-        phase,
-        "retaining claimed-file lock until terminal queue transition completes"
-    );
+fn release_claimed_lock_before_terminal_transition(
+    claimed_lock_file: &mut Option<fs::File>,
+    job_id: &str,
+    phase: &str,
+) {
+    if claimed_lock_file.take().is_some() {
+        tracing::debug!(
+            job_id,
+            phase,
+            "released claimed-file lock before terminal queue transition"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,7 +418,7 @@ pub(super) fn execute_queued_gates_job(
     spec: &FacJobSpecV1,
     claimed_path: &Path,
     claimed_file_name: &str,
-    _claimed_lock_file: fs::File,
+    claimed_lock_file: fs::File,
     queue_root: &Path,
     fac_root: &Path,
     boundary_trace: &ChannelBoundaryTrace,
@@ -429,12 +435,14 @@ pub(super) fn execute_queued_gates_job(
     // TCK-00538: Toolchain fingerprint computed at worker startup.
     toolchain_fingerprint: Option<&str>,
 ) -> JobOutcome {
+    let mut claimed_lock_file = Some(claimed_lock_file);
     let job_wall_start = Instant::now();
     let options = match parse_gates_job_options(spec) {
         Ok(options) => options,
         Err(reason) => {
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
                 &spec.job_id,
                 "gates_parse_options_denied",
             );
@@ -482,6 +490,7 @@ pub(super) fn execute_queued_gates_job(
             );
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
                 &spec.job_id,
                 "gates_resolve_head_denied",
             );
@@ -525,7 +534,11 @@ pub(super) fn execute_queued_gates_job(
             spec.source.head_sha
         );
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        release_claimed_lock_before_terminal_transition(&spec.job_id, "gates_head_mismatch_denied");
+        release_claimed_lock_before_terminal_transition(
+            &mut claimed_lock_file,
+            &spec.job_id,
+            "gates_head_mismatch_denied",
+        );
         if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
@@ -579,6 +592,7 @@ pub(super) fn execute_queued_gates_job(
             let reason = format!("failed to execute gates in workspace: {err}");
             // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
                 &spec.job_id,
                 "gates_execution_error_denied",
             );
@@ -624,6 +638,7 @@ pub(super) fn execute_queued_gates_job(
         if let Err(err) = lifecycle_update_result {
             let reason = format!("gates passed but lifecycle update failed: {err}");
             release_claimed_lock_before_terminal_transition(
+                &mut claimed_lock_file,
                 &spec.job_id,
                 "gates_lifecycle_update_denied",
             );
@@ -663,7 +678,11 @@ pub(super) fn execute_queued_gates_job(
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
         // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-        release_claimed_lock_before_terminal_transition(&spec.job_id, "gates_completed_commit");
+        release_claimed_lock_before_terminal_transition(
+            &mut claimed_lock_file,
+            &spec.job_id,
+            "gates_completed_commit",
+        );
         if let Err(commit_err) = commit_claimed_job_via_pipeline(
             fac_root,
             queue_root,
@@ -744,7 +763,11 @@ pub(super) fn execute_queued_gates_job(
         _ => truncate_receipt_reason(&base_reason),
     };
     // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-    release_claimed_lock_before_terminal_transition(&spec.job_id, "gates_failed_denied_commit");
+    release_claimed_lock_before_terminal_transition(
+        &mut claimed_lock_file,
+        &spec.job_id,
+        "gates_failed_denied_commit",
+    );
     if let Err(commit_err) = commit_claimed_job_via_pipeline(
         fac_root,
         queue_root,
@@ -2032,7 +2055,7 @@ mod lock_lifecycle_tests {
     use super::release_claimed_lock_before_terminal_transition;
 
     #[test]
-    fn claimed_lock_is_retained_until_terminal_transition_finishes() {
+    fn claimed_lock_is_released_when_terminal_transition_begins() {
         let tmp = tempdir().expect("tempdir should be created");
         let lock_path = tmp.path().join("claimed.lock");
         let claimed_file = OpenOptions::new()
@@ -2045,24 +2068,23 @@ mod lock_lifecycle_tests {
         claimed_file
             .lock_exclusive()
             .expect("claimed lock should be acquired");
+        let mut claimed_lock_file = Some(claimed_file);
 
-        release_claimed_lock_before_terminal_transition("job-lock-test", "before_commit");
+        release_claimed_lock_before_terminal_transition(
+            &mut claimed_lock_file,
+            "job-lock-test",
+            "before_commit",
+        );
 
         let competing_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .expect("competing lock file should open");
-        let competing_lock = competing_file.try_lock_exclusive();
         assert!(
-            competing_lock.is_err(),
-            "competing lock acquisition must fail while claimed lock is retained"
+            competing_file.try_lock_exclusive().is_ok(),
+            "competing lock acquisition must succeed after claimed lock release"
         );
-
-        drop(claimed_file);
-        competing_file
-            .try_lock_exclusive()
-            .expect("lock should release after claimed handle drop");
         let _ = competing_file.unlock();
     }
 }
