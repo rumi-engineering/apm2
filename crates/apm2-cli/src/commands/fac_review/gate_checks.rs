@@ -656,7 +656,7 @@ fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String
         serde_json::from_slice(&bytes).map_err(|err| format!("invalid JSON: {err}"))?;
 
     let mut errors = Vec::new();
-    let expected_prefix = "cargo run -p apm2-cli --";
+    let expected_prefix = "apm2";
 
     let payload = value.get("payload").and_then(Value::as_object);
     if payload.is_none() {
@@ -679,13 +679,13 @@ fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String
         .and_then(|commands| commands.get("binary_prefix"))
         .and_then(Value::as_str);
     if binary_prefix != Some(expected_prefix) {
-        errors.push("commands.binary_prefix must equal 'cargo run -p apm2-cli --'".to_string());
+        errors.push("commands.binary_prefix must equal 'apm2'".to_string());
     }
 
     let required = [
-        ("prepare", "cargo run -p apm2-cli -- fac review prepare"),
-        ("finding", "cargo run -p apm2-cli -- fac review finding"),
-        ("verdict", "cargo run -p apm2-cli -- fac review verdict set"),
+        ("prepare", "apm2 fac review prepare"),
+        ("finding", "apm2 fac review finding"),
+        ("verdict", "apm2 fac review verdict set"),
     ];
     for (name, prefix) in required {
         let command = commands
@@ -717,14 +717,18 @@ fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String
     }
     let forbidden_ops_text = forbidden_ops_text.unwrap_or_default();
 
-    if !forbidden_ops_text.contains("--sha") {
-        errors.push("constraints.forbidden_operations must explicitly forbid --sha".to_string());
+    if !forbidden_ops_text.contains("$pr_number") || !forbidden_ops_text.contains("$head_sha") {
+        errors.push(
+            "constraints.forbidden_operations must require $PR_NUMBER/$HEAD_SHA command binding"
+                .to_string(),
+        );
     }
-    if !forbidden_ops_text.contains("auto-derives the sha")
-        && !forbidden_ops_text.contains("sha is managed by the cli")
+    if forbidden_ops_text.contains("never pass --sha")
+        || forbidden_ops_text.contains("auto-derives the sha")
     {
         errors.push(
-            "constraints.forbidden_operations must declare CLI-managed SHA binding".to_string(),
+            "constraints.forbidden_operations must not require implicit SHA auto-derivation"
+                .to_string(),
         );
     }
 
@@ -751,8 +755,13 @@ fn validate_prompt_identity_constraints(prompt_path: &Path) -> Result<Vec<String
         errors.push("constraints.invariants must be an array".to_string());
     }
     let invariants_text = invariants_text.unwrap_or_default();
-    if !invariants_text.contains("sha is managed by the cli") {
-        errors.push("constraints.invariants must include 'SHA is managed by the CLI'".to_string());
+    if !(invariants_text.contains("sha is managed by the cli")
+        || (invariants_text.contains("$pr_number") && invariants_text.contains("$head_sha")))
+    {
+        errors.push(
+            "constraints.invariants must include SHA-binding guidance (CLI-managed SHA or $PR_NUMBER/$HEAD_SHA binding)"
+                .to_string(),
+        );
     }
 
     Ok(errors)
@@ -1239,17 +1248,17 @@ mod tests {
         let prompt = r#"{
   "payload": {
     "commands": {
-      "binary_prefix": "cargo run -p apm2-cli --",
-      "prepare": "cargo run -p apm2-cli -- fac review prepare",
-      "finding": "cargo run -p apm2-cli -- fac review finding",
-      "verdict": "cargo run -p apm2-cli -- fac review verdict set"
+      "binary_prefix": "apm2",
+      "prepare": "apm2 fac review prepare --pr $PR_NUMBER --sha $HEAD_SHA",
+      "finding": "apm2 fac review finding --pr $PR_NUMBER --sha $HEAD_SHA",
+      "verdict": "apm2 fac review verdict set --pr $PR_NUMBER --sha $HEAD_SHA"
     },
     "constraints": {
       "forbidden_operations": [
-        "Do not pass --sha manually; CLI auto-derives the SHA and SHA is managed by the CLI."
+        "Always pass --pr $PR_NUMBER --sha $HEAD_SHA when running prepare/finding/verdict."
       ],
       "invariants": [
-        "SHA is managed by the CLI"
+        "Bind commands using $PR_NUMBER and $HEAD_SHA."
       ]
     }
   }
