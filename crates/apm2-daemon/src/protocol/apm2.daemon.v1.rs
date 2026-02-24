@@ -636,8 +636,11 @@ pub struct PublishChangeSetRequest {
     /// Work identifier this changeset belongs to.
     #[prost(string, tag = "1")]
     pub work_id: ::prost::alloc::string::String,
+    /// Lease identifier proving authority for this work mutation.
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
     /// Serialized ChangeSetBundleV1 (canonical JSON bytes).
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", tag = "3")]
     pub bundle_bytes: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response confirming changeset publication.

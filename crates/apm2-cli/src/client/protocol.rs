@@ -2203,6 +2203,7 @@ impl OperatorClient {
     /// # Arguments
     ///
     /// * `work_id` - Work identifier this changeset belongs to
+    /// * `lease_id` - Governing lease for this work mutation
     /// * `bundle_bytes` - Serialized `ChangeSetBundleV1` (canonical JSON)
     ///
     /// # Errors
@@ -2214,10 +2215,12 @@ impl OperatorClient {
     pub async fn publish_changeset(
         &mut self,
         work_id: &str,
+        lease_id: &str,
         bundle_bytes: Vec<u8>,
     ) -> Result<PublishChangeSetResponse, ProtocolClientError> {
         let request = PublishChangeSetRequest {
             work_id: work_id.to_string(),
+            lease_id: lease_id.to_string(),
             bundle_bytes,
         };
         let request_bytes = encode_publish_changeset_request(&request);

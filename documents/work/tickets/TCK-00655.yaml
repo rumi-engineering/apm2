@@ -56,3 +56,18 @@ ticket_meta:
     - Test coverage is sufficient to block promotion on drift against RFC-0032 invariants.
   notes:
     verification: Prefer black-box tests using operator protocol and CLI binaries rather than calling internal Rust modules directly.
+
+fac_security_contract:
+  source: documents/work/tickets/FAC_SECURITY_MODEL_INVARIANTS_V1.yaml
+  profile: FAC-RFC0032-BASELINE
+  required_invariants:
+    - INV-FAC-TRUTH-001
+    - INV-FAC-WORK-BIND-001
+    - INV-FAC-CLAIM-BIND-001
+    - INV-FAC-ACTOR-BIND-001
+    - INV-FAC-IDEMP-001
+    - INV-FAC-EVID-001
+  enforcement_requirements:
+    - Any new requirement, code path, or test added under this ticket must map to one or more required_invariants.
+    - Any invariant relaxation requires explicit amendment in this ticket and the shared security model document.
+    - Reviewer denial is expected for invariant-unmapped behavior changes.
