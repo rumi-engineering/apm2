@@ -1919,6 +1919,44 @@ fn enforce_authoritative_pr_work_binding(
     ))
 }
 
+fn refresh_existing_pr_number_for_preflight_with<FFind, FBinding>(
+    candidate_work_id: &str,
+    find_pr_number: FFind,
+    resolve_binding: FBinding,
+) -> Result<u32, String>
+where
+    FFind: FnOnce() -> u32,
+    FBinding: FnOnce(Option<u32>) -> Result<Option<PrBodyWorkBinding>, String>,
+{
+    let refreshed_pr_number = find_pr_number();
+    if let Some(pr_number) = (refreshed_pr_number > 0).then_some(refreshed_pr_number) {
+        let authoritative_binding = resolve_binding(Some(pr_number)).map_err(|err| {
+            format!("failed to resolve authoritative work binding for PR #{pr_number}: {err}")
+        })?;
+        enforce_authoritative_pr_work_binding(
+            Some(pr_number),
+            authoritative_binding.as_ref(),
+            candidate_work_id,
+        )
+        .map_err(|err| {
+            format!("authoritative PR work binding refresh failed for PR #{pr_number}: {err}")
+        })?;
+    }
+    Ok(refreshed_pr_number)
+}
+
+fn refresh_existing_pr_number_for_preflight(
+    owner_repo: &str,
+    branch: &str,
+    candidate_work_id: &str,
+) -> Result<u32, String> {
+    refresh_existing_pr_number_for_preflight_with(
+        candidate_work_id,
+        || find_existing_pr(owner_repo, branch),
+        |pr_number| resolve_authoritative_pr_work_binding(owner_repo, pr_number),
+    )
+}
+
 fn is_active_push_fallback_status(status: &str) -> bool {
     match status.trim().to_ascii_uppercase().as_str() {
         // Current canonical work states surfaced by daemon work projection,
@@ -3049,7 +3087,29 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
     if let Err(err) = validate_head_stability_for_gates(&sha, &current_head) {
         fail_with_attempt!("fac_push_head_drift_detected", err);
     }
-    let existing_pr_number = attempt_pr_number;
+    let existing_pr_number = match refresh_existing_pr_number_for_preflight(repo, &branch, &work_id)
+    {
+        Ok(value) => value,
+        Err(err) => {
+            fail_with_attempt!("fac_push_work_association_preflight_refresh_failed", err);
+        },
+    };
+    if existing_pr_number != attempt_pr_number {
+        emit_stage(
+            "work_association_preflight_pr_refreshed",
+            serde_json::json!({
+                "cached_pr_number": attempt_pr_number,
+                "current_pr_number": existing_pr_number,
+                "changed": true,
+            }),
+        );
+        human_log!(
+            "fac push: refreshed branch PR mapping before preflight (cached #{}, current #{})",
+            attempt_pr_number,
+            existing_pr_number
+        );
+        attempt_pr_number = existing_pr_number;
+    }
     if existing_pr_number > 0 {
         let work_association_preflight_started = Instant::now();
         emit_stage(
@@ -4209,6 +4269,58 @@ ticket_alias: ticket-640
                 .expect_err("mismatched candidate must fail closed");
         assert!(err.contains("existing PR #805"));
         assert!(err.contains("W-TCK-00640-R2"));
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_skips_binding_when_no_pr_exists() {
+        let mut resolve_called = false;
+        let refreshed = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 0,
+            |_| {
+                resolve_called = true;
+                Ok(None)
+            },
+        )
+        .expect("no PR mapping should resolve cleanly");
+        assert_eq!(refreshed, 0);
+        assert!(
+            !resolve_called,
+            "binding resolver must not run without a PR"
+        );
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_revalidates_authoritative_binding() {
+        let refreshed = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 805,
+            |_| {
+                Ok(Some(PrBodyWorkBinding {
+                    work_id: "W-TCK-00640-R2".to_string(),
+                    ticket_alias: Some("TCK-00640".to_string()),
+                }))
+            },
+        )
+        .expect("authoritative binding should validate");
+        assert_eq!(refreshed, 805);
+    }
+
+    #[test]
+    fn refresh_existing_pr_number_for_preflight_with_rejects_mismatched_binding() {
+        let err = refresh_existing_pr_number_for_preflight_with(
+            "W-TCK-00640-R2",
+            || 805,
+            |_| {
+                Ok(Some(PrBodyWorkBinding {
+                    work_id: "W-TCK-00999".to_string(),
+                    ticket_alias: Some("TCK-00999".to_string()),
+                }))
+            },
+        )
+        .expect_err("mismatched authoritative binding must fail closed");
+        assert!(err.contains("authoritative PR work binding refresh failed"));
+        assert!(err.contains("PR #805"));
     }
 
     #[test]
