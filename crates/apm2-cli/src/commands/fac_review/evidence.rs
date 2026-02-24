@@ -29,8 +29,8 @@ use super::bounded_test_runner::{
 };
 use super::ci_status::{CiStatus, PrBodyStatusUpdater};
 use super::gate_attestation::{
-    GateResourcePolicy, build_nextest_command, compute_gate_attestation,
-    gate_command_for_attestation, short_digest,
+    FAST_GATES_NEXTEST_PROFILE, GateResourcePolicy, build_nextest_command,
+    compute_gate_attestation, gate_command_for_attestation, short_digest,
 };
 use super::gate_cache::{CacheSource, GateCache, ReuseDecision};
 use super::gate_checks;
@@ -1703,7 +1703,10 @@ fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
     ];
     append_scope_package_args(&mut command, scope);
     command.extend([
-        "--all-targets".to_string(),
+        "--lib".to_string(),
+        "--bins".to_string(),
+        "--tests".to_string(),
+        "--examples".to_string(),
         "--all-features".to_string(),
         "--".to_string(),
         "-D".to_string(),
@@ -1751,7 +1754,7 @@ fn build_scoped_nextest_command(scope: &CargoGateExecutionScope) -> Vec<String> 
         "--config-file".to_string(),
         ".config/nextest.toml".to_string(),
         "--profile".to_string(),
-        "ci".to_string(),
+        FAST_GATES_NEXTEST_PROFILE.to_string(),
     ]);
     command
 }
@@ -3152,21 +3155,18 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
     // Fastest-first ordering for expensive cargo gates. Keep cheap checks
     // ahead of heavier analysis to minimize wasted compute on early failure.
-    let gates: &[(&str, &[&str])] = &[
-        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
+    // Use the same command builders as local `fac gates` so attestation/caching
+    // semantics stay aligned across both execution paths.
+    let gates_scope = CargoGateExecutionScope::FullWorkspace;
+    let gates: Vec<(String, Vec<String>)> = vec![
         (
-            "clippy",
-            &[
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
-            ],
+            "rustfmt".to_string(),
+            build_rustfmt_gate_command(&gates_scope),
+        ),
+        ("doc".to_string(), build_doc_gate_command(&gates_scope)),
+        (
+            "clippy".to_string(),
+            build_clippy_gate_command(&gates_scope),
         ),
     ];
 
@@ -3402,7 +3402,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     // TCK-00574 BLOCKER fix: Build bounded gate commands for non-test gates
     // to enforce network-deny in the pipeline path (always full mode).
     #[allow(clippy::type_complexity)]
-    let pipeline_bounded_gate_specs: Vec<(&str, Vec<String>, Vec<(String, String)>)> = {
+    let pipeline_bounded_gate_specs: Vec<(String, Vec<String>, Vec<(String, String)>)> = {
         let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
             "cannot resolve APM2_HOME for pipeline gate network policy enforcement".to_string()
         })?;
@@ -3411,8 +3411,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let gate_network_policy =
             apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
         let mut specs = Vec::new();
-        for &(gate_name, cmd_args) in gates {
-            let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+        for (gate_name, gate_cmd) in &gates {
             let bounded = build_systemd_bounded_gate_command(
                 workspace_root,
                 BoundedTestLimits {
@@ -3422,7 +3421,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     pids_max: DEFAULT_TEST_PIDS_MAX,
                     cpu_quota: "200%",
                 },
-                &gate_cmd,
+                gate_cmd,
                 None,
                 &gate_env,
                 fac_policy.sandbox_hardening.clone(),
@@ -3434,13 +3433,14 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                      (network deny enforcement requires systemd-run): {err}"
                 )
             })?;
-            specs.push((gate_name, bounded.command, bounded.environment));
+            specs.push((gate_name.clone(), bounded.command, bounded.environment));
         }
         specs
     };
 
     // Phase 2: cargo fmt/doc/clippy.
-    for (idx, &(gate_name, _cmd_args)) in gates.iter().enumerate() {
+    for (idx, (gate_name, _cmd_args)) in gates.iter().enumerate() {
+        let gate_name = gate_name.as_str();
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
