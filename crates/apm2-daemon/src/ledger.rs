@@ -4856,6 +4856,11 @@ impl SqliteWorkRegistry {
              ON work_claims(work_id, role)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_work_claims_lease_id \
+             ON work_claims(lease_id)",
+            [],
+        )?;
         Ok(())
     }
 }
@@ -5227,6 +5232,64 @@ impl SqliteLeaseValidator {
             .optional()
     }
 
+    fn distinct_work_claim_binding_count(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<u64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM (\
+                SELECT work_id, actor_id \
+                FROM work_claims \
+                WHERE lease_id = ?1 \
+                GROUP BY work_id, actor_id\
+            )",
+            params![lease_id],
+            |row| row.get(0),
+        )
+    }
+
+    fn latest_work_claim_lease_binding(
+        conn: &Connection,
+        lease_id: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let distinct_bindings = Self::distinct_work_claim_binding_count(conn, lease_id)?;
+        if distinct_bindings > 1 {
+            warn!(
+                lease_id = %lease_id,
+                distinct_bindings,
+                "lease fallback denied: multiple distinct work_claim bindings found for lease"
+            );
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT work_id, actor_id FROM work_claims \
+             WHERE lease_id = ?1 \
+             ORDER BY rowid DESC LIMIT 1",
+            params![lease_id],
+            |row| {
+                let work_id: String = row.get(0)?;
+                let actor_id: String = row.get(1)?;
+                Ok((work_id, actor_id))
+            },
+        )
+        .optional()
+        .map(|binding| {
+            binding.filter(|(work_id, actor_id)| {
+                let work_ok = !work_id.trim().is_empty();
+                let actor_ok = !actor_id.trim().is_empty();
+                if !work_ok || !actor_ok {
+                    warn!(
+                        lease_id = %lease_id,
+                        work_ok,
+                        actor_ok,
+                        "lease fallback denied: invalid empty work/actor binding in work_claims"
+                    );
+                }
+                work_ok && actor_ok
+            })
+        })
+    }
+
     fn canonicalize_lease_payload(payload: &serde_json::Value) -> Result<Vec<u8>, String> {
         let payload_json = payload.to_string();
         let canonical_payload = canonicalize_json(&payload_json)
@@ -5540,13 +5603,25 @@ impl LeaseValidator for SqliteLeaseValidator {
         } else {
             None
         };
-        let payload_bytes = Self::select_newest_by_timestamp(legacy_payload, canonical_payload)?;
+        if let Some(payload_bytes) =
+            Self::select_newest_by_timestamp(legacy_payload, canonical_payload)
+        {
+            let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+            if let Some(actor_id) = payload
+                .get("executor_actor_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                return Some(actor_id);
+            }
+        }
 
-        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        payload
-            .get("executor_actor_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
+        // Migration fallback: recover executor actor from persisted work claim
+        // rows when no canonical gate lease payload is available.
+        Self::latest_work_claim_lease_binding(&conn, lease_id)
+            .ok()
+            .flatten()
+            .map(|(_, actor_id)| actor_id)
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -5717,7 +5792,16 @@ impl LeaseValidator for SqliteLeaseValidator {
             None
         };
 
-        Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup)
+        if let Some(work_id) = Self::select_newest_by_timestamp(legacy_lookup, canonical_lookup) {
+            return Some(work_id);
+        }
+
+        // Migration fallback: recover lease->work binding from persisted work
+        // claim rows when no canonical gate lease event exists yet.
+        Self::latest_work_claim_lease_binding(&conn, lease_id)
+            .ok()
+            .flatten()
+            .map(|(work_id, _)| work_id)
     }
 
     // Full leases are persisted in signed ledger rows. Reads remain
@@ -10177,6 +10261,157 @@ mod tests {
                 .get_claim_age_for_role(&claim.work_id, claim.role)
                 .is_none(),
             "clear_claim_age must remove age metadata after success"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_fallback_resolves_work_claim_binding() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let claim = crate::protocol::dispatch::WorkClaim {
+            work_id: "W-fallback-lease-001".to_string(),
+            lease_id: "L-fallback-lease-001".to_string(),
+            actor_id: "actor:fallback".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: test_policy_resolution(),
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
+            permeability_receipt: None,
+        };
+        registry
+            .register_claim(claim.clone())
+            .expect("register fallback claim");
+
+        assert_eq!(
+            validator.get_lease_work_id(&claim.lease_id),
+            Some(claim.work_id.clone()),
+            "lease validator should recover lease->work binding from persisted work_claims when no gate_lease_issued event exists"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(&claim.lease_id),
+            Some(claim.actor_id.clone()),
+            "lease validator should recover executor actor from persisted work_claims when no lease payload exists"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_authoritative_lease_precedes_fallback() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let lease_id = "L-authoritative-lease-001";
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-claim-fallback-001".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:claim-fallback".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register fallback claim");
+
+        validator.register_lease_with_executor(
+            lease_id,
+            "W-authoritative-001",
+            "gate-test",
+            "actor:authoritative",
+        );
+
+        assert_eq!(
+            validator.get_lease_work_id(lease_id),
+            Some("W-authoritative-001".to_string()),
+            "authoritative gate lease event should override work_claim fallback binding"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(lease_id),
+            Some("actor:authoritative".to_string()),
+            "authoritative gate lease payload should override fallback actor binding"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_lease_validator_fallback_denies_ambiguous_work_claim_bindings() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteLedgerEventEmitter::init_schema_for_test(&conn)
+            .expect("initialize ledger schema for lease validator");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+
+        let shared = Arc::new(Mutex::new(conn));
+        let registry = SqliteWorkRegistry::new(Arc::clone(&shared));
+        let validator = SqliteLeaseValidator::new(Arc::clone(&shared));
+
+        let lease_id = "L-ambiguous-fallback-001";
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-ambiguous-a".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:ambiguous-a".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register first fallback claim");
+        registry
+            .register_claim(crate::protocol::dispatch::WorkClaim {
+                work_id: "W-ambiguous-b".to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "actor:ambiguous-b".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: test_policy_resolution(),
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+                permeability_receipt: None,
+            })
+            .expect("register second fallback claim");
+
+        assert_eq!(
+            validator.get_lease_work_id(lease_id),
+            None,
+            "fallback must fail closed when lease_id maps to multiple distinct work_claim bindings"
+        );
+        assert_eq!(
+            validator.get_lease_executor_actor_id(lease_id),
+            None,
+            "executor actor lookup must fail closed on ambiguous fallback bindings"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_work_registry_schema_creates_lease_lookup_index() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        SqliteWorkRegistry::init_schema(&conn).expect("initialize work registry schema");
+        let has_index: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'index' AND name = 'idx_work_claims_lease_id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index existence query should succeed");
+        assert!(
+            has_index,
+            "work_claims schema must include idx_work_claims_lease_id for lease fallback lookups"
         );
     }
 }
