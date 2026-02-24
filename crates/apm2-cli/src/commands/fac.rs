@@ -4142,7 +4142,7 @@ fn unresolved_work_current_alias_message(ticket_alias: &str) -> String {
     format!(
         "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
          Refusing projection fallback to prevent cross-ticket misbinding. \
-         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.json --lease-id <LEASE_ID>`, \
+         Remediation: run `apm2 fac work open --from-ticket <work-scope.json> --lease-id <LEASE_ID>`, \
          then claim it (or provide explicit `--ticket-alias`)."
     )
 }
@@ -7711,7 +7711,7 @@ mod tests {
             "work",
             "open",
             "--from-ticket",
-            "documents/work/tickets/RFC-0032::REQ-0268.json",
+            "work-scope.json",
             "--lease-id",
             "L-governing-001",
         ]);

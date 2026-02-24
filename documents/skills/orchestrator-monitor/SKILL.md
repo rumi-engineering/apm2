@@ -139,9 +139,7 @@ decision_tree:
             For `recommended_action.action=dispatch_implementor`, run `recommended_action.command`
             to retrieve current findings, then dispatch one fresh implementor with
             `/implementor-default <WORK_IDENTIFIER>` where WORK_IDENTIFIER is:
-              - the canonical work_id (`W-...`) if no YAML file exists for this work, or
-              - the TCK alias (`TCK-xxxxx`) if a ticket file exists at
-                `documents/work/tickets/<alias>.json`, or
+              - the canonical work_id (`W-...`), or
               - the PR context if resolving from an open PR.
             Include `@documents/skills/implementor-default/SKILL.md`, work identifier,
             and worktree path in the warm handoff payload.
@@ -308,20 +306,20 @@ operational_playbook:
       observed_via: "A PR number appears for the first time in `apm2 fac doctor` output during this session"
       action: "Enqueue `apm2 fac warm` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
 
-    - trigger: "Operator reports new work (bug or feature) with no existing YAML file"
-      observed_via: "Operator describes work to be done; no TCK YAML file exists at documents/work/tickets/ and no existing work object is found via `apm2 fac work current`"
+    - trigger: "Operator reports new work (bug or feature) with no existing work object"
+      observed_via: "Operator describes work to be done; no existing work object is found via `apm2 fac work current`"
       action: |
-        Work creation currently requires a canonical work object materialized via
-        `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>`.
-        Inline creation without a YAML file is NOT yet implemented in the CLI.
+        Work creation requires a canonical work object materialized via
+        `apm2 fac work open --from-ticket <work-scope.json> --lease-id <lease_id>`.
+        Inline creation without a work scope file is NOT yet implemented in the CLI.
         Resolution options in priority order:
         (1) Check whether a work object already exists in the daemon for this scope:
             run `apm2 fac work current` or ask operator for the work_id. If found,
-            proceed directly with the W-... work_id — no YAML needed.
-        (2) If no work object exists: operator must create a minimal ticket file at
-            documents/work/tickets/<NEW_ID>.json with at minimum:
-              ticket_meta.ticket.id, ticket_meta.ticket.title, work_type
-            then run `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>` to materialize it.
+            proceed directly with the W-... work_id.
+        (2) If no work object exists: operator must create a minimal work scope JSON
+            file (any path) with at minimum: id, title, work_type, and requirement_ids
+            (RFC::REQ identifiers), then run
+            `apm2 fac work open --from-ticket <path> --lease-id <lease_id>` to materialize it.
         (3) Do NOT dispatch an implementor until a canonical work object is confirmed
             in the daemon. Dispatching without work identity is a BLOCKED escalation.
 
