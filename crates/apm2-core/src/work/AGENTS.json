@@ -1,0 +1,102 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/work",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-WORK-001",
+      "kind": "invariant",
+      "title": "Terminal states (Completed, Aborted) allow no further transitions",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-002",
+      "kind": "invariant",
+      "title": "spec_snapshot_hash is immutable after creation",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-003",
+      "kind": "invariant",
+      "title": "transition_count monotonically increases on each transition",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-004",
+      "kind": "invariant",
+      "title": "evidence_bundle_hash and evidence_ids populated only on completion",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-005",
+      "kind": "invariant",
+      "title": "WorkReducer is deterministic: same event sequence produces identical state",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-006",
+      "kind": "invariant",
+      "title": "Only events with event_type starting with work. are processed",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-007",
+      "kind": "invariant",
+      "title": "Discriminant values on WorkState are stable for semver compatibility",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-008",
+      "kind": "safety",
+      "title": "parse() rejects unknown state and type strings fail-closed",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-WORK-009",
+      "kind": "invariant",
+      "title": "gate_receipt_id MUST NOT contain merge receipt identifiers (merge-receipt- prefix)",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-010",
+      "kind": "invariant",
+      "title": "merge_receipt_id when non-empty MUST start with merge-receipt- (positive allowlist)",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-011",
+      "kind": "invariant",
+      "title": "pr_number set only via WorkPrAssociated event from pre-CI states (Claimed/InProgress)",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-012",
+      "kind": "safety",
+      "title": "Stage-bound digest admission is fail-closed for CI transitions and work.completed",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-013",
+      "kind": "safety",
+      "title": "Receipt events bound to stale digests are never admitted into gate/review projections",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-014",
+      "kind": "invariant",
+      "title": "identity_chain_defects bounded by MAX_IDENTITY_CHAIN_DEFECTS (1000) ring buffer",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-015",
+      "kind": "invariant",
+      "title": "Defect CAS hashes use length-prefixed BLAKE3 to prevent byte-shifting collisions",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-WORK-016",
+      "kind": "safety",
+      "title": "CI-gated transitions require authorized rationale codes and authorized actor ID",
+      "rfc": ["RFC-0032"]
+    }
+  ]
+}

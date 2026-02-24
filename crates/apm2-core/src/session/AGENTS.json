@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/session",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SESSION-001",
+      "kind": "invariant",
+      "title": "Sessions can only transition from Running to terminal states (Terminated, Quarantined)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-002",
+      "kind": "invariant",
+      "title": "restart_attempt must be strictly monotonically increasing across session restarts",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-003",
+      "kind": "invariant",
+      "title": "entropy_consumed is monotonically non-decreasing within a session lifecycle",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-004",
+      "kind": "invariant",
+      "title": "Terminal states preserve last_restart_attempt for monotonicity enforcement",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-005",
+      "kind": "invariant",
+      "title": "Quarantine triggers evaluated in priority: entropy > violations > crash loop > signals",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-006",
+      "kind": "invariant",
+      "title": "Entropy consumed uses saturating arithmetic to prevent overflow",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-007",
+      "kind": "invariant",
+      "title": "remaining() returns budget.saturating_sub(consumed)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-008",
+      "kind": "invariant",
+      "title": "SessionReducer is deterministic: same event sequence produces identical final state",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-009",
+      "kind": "invariant",
+      "title": "State counts: len() == active_count() + terminated_count() + quarantined_count()",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-SESSION-010",
+      "kind": "safety",
+      "title": "is_signal_restartable() returns false for SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/syscall",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SYSCALL-001",
+      "kind": "invariant",
+      "title": "Workspace root canonicalized at construction time to an absolute symlink-resolved path",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-002",
+      "kind": "safety",
+      "title": "No file operation may access paths outside workspace_root after symlink resolution",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-003",
+      "kind": "invariant",
+      "title": "hash_before is None only for newly created files; hash_after is always populated",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-004",
+      "kind": "invariant",
+      "title": "Write and edit operations use temp-file-and-rename for atomic modifications",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-005",
+      "kind": "invariant",
+      "title": "Every SyscallError variant maps to a unique error_code() string",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-006",
+      "kind": "invariant",
+      "title": "is_retryable() returns true only for transient failures (Io, Timeout)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-007",
+      "kind": "safety",
+      "title": "Path traversal sequences (..) are rejected before any I/O",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-008",
+      "kind": "safety",
+      "title": "Symlink resolution depth bounded by MAX_SYMLINK_DEPTH (40)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-009",
+      "kind": "safety",
+      "title": "Read operations use O_NOFOLLOW on Unix to prevent symlink swap TOCTOU attacks",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SYSCALL-010",
+      "kind": "safety",
+      "title": "Read, write, and edit operations enforce configurable maximum content sizes",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

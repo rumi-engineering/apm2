@@ -1,0 +1,186 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/economics",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-ECON-001",
+      "kind": "invariant",
+      "title": "Profile hash is deterministic: BTreeMap construction order does not affect hash",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-002",
+      "kind": "invariant",
+      "title": "Profile payload is domain-separated: BLAKE3(prefix || canonical_json)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-003",
+      "kind": "invariant",
+      "title": "Budget matrix keys bounded to 15 maximum entries (3 risk tiers x 5 intent classes)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-004",
+      "kind": "invariant",
+      "title": "CAS round-trip is lossless: load_from_cas(store_in_cas(profile)) returns identical",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-005",
+      "kind": "invariant",
+      "title": "Only Current profiles are admitted for evaluation; Stale and Unresolved deny",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-006",
+      "kind": "safety",
+      "title": "Fail-closed: all unknown, missing, stale, or corrupt profile states return Deny",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-007",
+      "kind": "invariant",
+      "title": "Admission traces are deterministic for identical inputs",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-008",
+      "kind": "invariant",
+      "title": "Exceedance checks ordered: tokens, tool calls, time, I/O bytes; first reported",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-009",
+      "kind": "safety",
+      "title": "Zero profile hash always returns Deny with reason economics_profile_hash_zero",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-010",
+      "kind": "safety",
+      "title": "Queue admission: all unknown/missing/stale temporal authority states deny fail-closed",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0004"]
+    },
+    {
+      "id": "BEH-CORE-ECON-011",
+      "kind": "invariant",
+      "title": "Stop/revoke and control lanes preserve declared tick floors and reserved capacity",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0004"]
+    },
+    {
+      "id": "BEH-CORE-ECON-012",
+      "kind": "invariant",
+      "title": "Anti-entropy is pull-only; push requests unconditionally denied",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0004"]
+    },
+    {
+      "id": "BEH-CORE-ECON-013",
+      "kind": "invariant",
+      "title": "Lane backlog and total queue capacity hard-capped (4096 and 16384)",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0004"]
+    },
+    {
+      "id": "BEH-CORE-ECON-014",
+      "kind": "safety",
+      "title": "Envelope signature comparison uses constant-time equality (subtle::ConstantTimeEq)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-015",
+      "kind": "safety",
+      "title": "All protocol-boundary String and Vec fields use bounded serde deserializers",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-016",
+      "kind": "safety",
+      "title": "NoOpVerifier gated behind cfg(test)/feature=unsafe_no_verify; not in default builds",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-017",
+      "kind": "invariant",
+      "title": "Cost model: every known job kind has a deterministic cost estimate",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-018",
+      "kind": "invariant",
+      "title": "Calibration never increases cost estimates beyond initial conservative defaults",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-019",
+      "kind": "invariant",
+      "title": "Unknown job kinds receive the most conservative (largest) estimate",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-020",
+      "kind": "invariant",
+      "title": "All cost model arithmetic uses checked/saturating operations; EWMA uses u128",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-ECON-021",
+      "kind": "safety",
+      "title": "Replay-recovery: all unknown/missing/stale/unsigned states deny fail-closed",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0005"]
+    },
+    {
+      "id": "BEH-CORE-ECON-022",
+      "kind": "invariant",
+      "title": "Domain-separated signatures prevent cross-receipt-type replay",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0005"]
+    },
+    {
+      "id": "BEH-CORE-ECON-023",
+      "kind": "safety",
+      "title": "Optimization gates: NaN values in statistical fields denied fail-closed",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0006"]
+    },
+    {
+      "id": "BEH-CORE-ECON-024",
+      "kind": "invariant",
+      "title": "Authority surface must monotonically decrease for production FAC roles",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0008"]
+    },
+    {
+      "id": "BEH-CORE-ECON-025",
+      "kind": "invariant",
+      "title": "Disclosure-control gates execute BEFORE authority-surface gates",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0007"]
+    },
+    {
+      "id": "BEH-CORE-ECON-026",
+      "kind": "safety",
+      "title": "Projection continuity: all unknown/missing/unsigned states deny fail-closed",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0009"]
+    },
+    {
+      "id": "BEH-CORE-ECON-027",
+      "kind": "invariant",
+      "title": "Reconstruction requires erasure decode, BFT quorum, and trust snapshot digest match",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0010"]
+    },
+    {
+      "id": "BEH-CORE-ECON-028",
+      "kind": "invariant",
+      "title": "BFT quorum threshold is ceil(2n/3); insufficient signers deny fail-closed",
+      "rfc": ["RFC-0029"],
+      "req": ["RFC-0029#REQ-0010"]
+    }
+  ]
+}
