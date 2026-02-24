@@ -3,7 +3,7 @@
     "prds/": "Customer-centric requirements defining problems, solution goals, scope, and success metrics.",
     "rfcs/": "Technical specifications detailing design decisions, trust boundaries, and implementation plans.",
     "standards/": "Project-wide normative definitions for documents, protocols, and data structures.",
-    "standards/schemas/": "YAML structural definitions for validating project documents and metadata.",
+    "schemas/": "Consolidated schema registry. All CAC JSON schemas and YAML structural definitions for the APM2 project.",
     "standards/enums/": "Strongly typed constants for document status, roles, and classifications.",
     "standards/instructions/": "Normative standards for authoring and formatting agent-executable instruction fragments.",
     "standards/cac/": "Context-as-Code manifests for environment state, volumes, and workspace definitions.",

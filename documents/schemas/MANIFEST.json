@@ -1,0 +1,270 @@
+{
+  "schema": "apm2.schema_manifest.v1",
+  "schema_version": "1.0.0",
+  "kind": "schema.manifest",
+  "meta": {
+    "stable_id": "dcp://apm2.schemas/MANIFEST@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "description": "Canonical schema registry. All CAC and YAML schemas for the APM2 project.",
+    "schemas": [
+      {
+        "schema_id": "01_evidence_artifact.schema",
+        "file": "01_evidence_artifact.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for evidence artifact"
+      },
+      {
+        "schema_id": "02_requirement.schema",
+        "file": "02_requirement.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for requirement"
+      },
+      {
+        "schema_id": "03_quality_coverage.schema",
+        "file": "03_quality_coverage.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for quality coverage"
+      },
+      {
+        "schema_id": "04_ticket_meta.schema",
+        "file": "04_ticket_meta.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for ticket meta"
+      },
+      {
+        "schema_id": "05_waiver.schema",
+        "file": "05_waiver.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for waiver"
+      },
+      {
+        "schema_id": "06_gate_review.schema",
+        "file": "06_gate_review.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for gate review"
+      },
+      {
+        "schema_id": "07_prd_meta.schema",
+        "file": "07_prd_meta.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for prd meta"
+      },
+      {
+        "schema_id": "08_rfc_meta.schema",
+        "file": "08_rfc_meta.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for rfc meta"
+      },
+      {
+        "schema_id": "09_routing_profile.schema",
+        "file": "09_routing_profile.schema.yaml",
+        "format": "yaml",
+        "description": "YAML schema for routing profile"
+      },
+      {
+        "schema_id": "apm2.prd.cac.v1.schema",
+        "file": "apm2.prd.cac.v1.schema.json",
+        "format": "json",
+        "description": "APM2 PRD: Context-as-Code (CAC) v1"
+      },
+      {
+        "schema_id": "apm2.prd.volume.v1.schema",
+        "file": "apm2.prd.volume.v1.schema.json",
+        "format": "json",
+        "description": "APM2 PRD Volume v1"
+      },
+      {
+        "schema_id": "cac.aat_receipt.v1.schema",
+        "file": "cac.aat_receipt.v1.schema.json",
+        "format": "json",
+        "description": "CAC AATReceipt v1"
+      },
+      {
+        "schema_id": "cac.admission_receipt.v1.schema",
+        "file": "cac.admission_receipt.v1.schema.json",
+        "format": "json",
+        "description": "CAC AdmissionReceipt v1"
+      },
+      {
+        "schema_id": "cac.artifact.envelope.v1.schema",
+        "file": "cac.artifact.envelope.v1.schema.json",
+        "format": "json",
+        "description": "CAC Artifact Envelope v1"
+      },
+      {
+        "schema_id": "cac.budget_profile.v1.schema",
+        "file": "cac.budget_profile.v1.schema.json",
+        "format": "json",
+        "description": "CAC BudgetProfile v1"
+      },
+      {
+        "schema_id": "cac.bundle_manifest.v1.schema",
+        "file": "cac.bundle_manifest.v1.schema.json",
+        "format": "json",
+        "description": "CAC BundleManifest v1"
+      },
+      {
+        "schema_id": "cac.canonicalizer_vectors.v1.schema",
+        "file": "cac.canonicalizer_vectors.v1.schema.json",
+        "format": "json",
+        "description": "CAC CanonicalizerVectors v1"
+      },
+      {
+        "schema_id": "cac.capabilities_manifest.v1.schema",
+        "file": "cac.capabilities_manifest.v1.schema.json",
+        "format": "json",
+        "description": "CAC CapabilityManifest v1"
+      },
+      {
+        "schema_id": "cac.changeset_report.v1.schema",
+        "file": "cac.changeset_report.v1.schema.json",
+        "format": "json",
+        "description": "CAC ChangeSetReport v1"
+      },
+      {
+        "schema_id": "cac.clock_profile.v1.schema",
+        "file": "cac.clock_profile.v1.schema.json",
+        "format": "json",
+        "description": "CAC ClockProfile v1"
+      },
+      {
+        "schema_id": "cac.common.v1.schema",
+        "file": "cac.common.v1.schema.json",
+        "format": "json",
+        "description": "CAC Common Types v1"
+      },
+      {
+        "schema_id": "cac.context_pack_manifest.v1.schema",
+        "file": "cac.context_pack_manifest.v1.schema.json",
+        "format": "json",
+        "description": "CAC ContextPackManifest v1"
+      },
+      {
+        "schema_id": "cac.context_pack_spec.v1.schema",
+        "file": "cac.context_pack_spec.v1.schema.json",
+        "format": "json",
+        "description": "CAC ContextPackSpec v1"
+      },
+      {
+        "schema_id": "cac.defect_record.v1.schema",
+        "file": "cac.defect_record.v1.schema.json",
+        "format": "json",
+        "description": "CAC DefectRecord v1"
+      },
+      {
+        "schema_id": "cac.export_manifest.v1.schema",
+        "file": "cac.export_manifest.v1.schema.json",
+        "format": "json",
+        "description": "CAC ExportManifest v1"
+      },
+      {
+        "schema_id": "cac.glossary_graph.v1.schema",
+        "file": "cac.glossary_graph.v1.schema.json",
+        "format": "json",
+        "description": "Glossary Graph"
+      },
+      {
+        "schema_id": "cac.holon_contract.v1.schema",
+        "file": "cac.holon_contract.v1.schema.json",
+        "format": "json",
+        "description": "CAC HolonContract v1"
+      },
+      {
+        "schema_id": "cac.instruction_spec.v1.schema",
+        "file": "cac.instruction_spec.v1.schema.json",
+        "format": "json",
+        "description": "CAC InstructionSpec v1 (compact)"
+      },
+      {
+        "schema_id": "cac.patch_record.v1.schema",
+        "file": "cac.patch_record.v1.schema.json",
+        "format": "json",
+        "description": "CAC PatchRecord v1"
+      },
+      {
+        "schema_id": "cac.policy_profile.v1.schema",
+        "file": "cac.policy_profile.v1.schema.json",
+        "format": "json",
+        "description": "CAC PolicyProfile v1"
+      },
+      {
+        "schema_id": "cac.reasoning_mode.v1.schema",
+        "file": "cac.reasoning_mode.v1.schema.json",
+        "format": "json",
+        "description": "CAC Reasoning Mode v1"
+      },
+      {
+        "schema_id": "cac.reasoning_selector.v1.schema",
+        "file": "cac.reasoning_selector.v1.schema.json",
+        "format": "json",
+        "description": "CAC Reasoning Selector v1"
+      },
+      {
+        "schema_id": "cac.requirement.v1.schema",
+        "file": "cac.requirement.v1.schema.json",
+        "format": "json",
+        "description": "CAC Requirement Object v1"
+      },
+      {
+        "schema_id": "cac.rfc_doc.v1.schema",
+        "file": "cac.rfc_doc.v1.schema.json",
+        "format": "json",
+        "description": "CAC RFC Document V1"
+      },
+      {
+        "schema_id": "cac.run_receipt.v1.schema",
+        "file": "cac.run_receipt.v1.schema.json",
+        "format": "json",
+        "description": "CAC RunReceipt v1"
+      },
+      {
+        "schema_id": "cac.schema_definition.v1.schema",
+        "file": "cac.schema_definition.v1.schema.json",
+        "format": "json",
+        "description": "CAC SchemaDefinition Artifact v1"
+      },
+      {
+        "schema_id": "cac.skill_spec.v1.schema",
+        "file": "cac.skill_spec.v1.schema.json",
+        "format": "json",
+        "description": "CAC SkillSpec v1"
+      },
+      {
+        "schema_id": "cac.target_profile.v1.schema",
+        "file": "cac.target_profile.v1.schema.json",
+        "format": "json",
+        "description": "CAC TargetProfile v1"
+      },
+      {
+        "schema_id": "cac.time_envelope.v1.schema",
+        "file": "cac.time_envelope.v1.schema.json",
+        "format": "json",
+        "description": "CAC TimeEnvelope v1"
+      },
+      {
+        "schema_id": "cac.time_sync_observation.v1.schema",
+        "file": "cac.time_sync_observation.v1.schema.json",
+        "format": "json",
+        "description": "CAC TimeSyncObservation v1"
+      },
+      {
+        "schema_id": "cac.vendor_profile.v1.schema",
+        "file": "cac.vendor_profile.v1.schema.json",
+        "format": "json",
+        "description": "CAC VendorProfile v1"
+      }
+    ]
+  }
+}

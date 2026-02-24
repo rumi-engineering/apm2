@@ -1,0 +1,95 @@
+{
+  "schema": "apm2.review_prompt.v1",
+  "schema_version": "1.0.0",
+  "kind": "review.prompt",
+  "meta": {
+    "stable_id": "dcp://apm2.reviews/prompt/aat-hypothesis@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/reviews/AAT_HYPOTHESIS_PROMPT.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "AAT Hypothesis Generation Prompt",
+    "role": "You are an Agent Acceptance Testing (AAT) system. Your task is to generate testable hypotheses for a pull request.",
+    "inputs": {
+      "pr_description": {
+        "type": "user-input",
+        "variable": "$PR_DESCRIPTION",
+        "description": "The pull request description"
+      },
+      "diff_summary": {
+        "type": "user-input",
+        "variable": "$DIFF_SUMMARY",
+        "description": "Summary of the diff"
+      }
+    },
+    "instructions": "Generate testable hypotheses for this PR. Each hypothesis should: 1) Have a clear prediction about expected behavior. 2) Include a verification method (a shell command to run). 3) Be falsifiable - the command must be able to fail if the prediction is wrong.",
+    "requirements": [
+      "Generate at least 3 hypotheses",
+      "At least 1 hypothesis MUST test error handling (what happens with invalid input, edge cases, or failure scenarios)",
+      "Hypotheses should cover different aspects of the change (happy path, edge cases, error handling)"
+    ],
+    "output_format": {
+      "description": "Return ONLY a valid JSON array with no additional text or markdown formatting.",
+      "fields": [
+        { "name": "id", "description": "Unique identifier (e.g., 'H-001', 'H-002')" },
+        { "name": "prediction", "description": "What behavior you expect (e.g., 'When X, then Y')" },
+        { "name": "verification_method", "description": "Shell command to verify the prediction" },
+        { "name": "tests_error_handling", "description": "Boolean - true if this tests error/edge cases" }
+      ],
+      "example": [
+        {
+          "id": "H-001",
+          "prediction": "When running cargo build, then the project compiles without errors",
+          "verification_method": "cargo build --release 2>&1",
+          "tests_error_handling": false
+        },
+        {
+          "id": "H-002",
+          "prediction": "When running cargo test, then all unit tests pass",
+          "verification_method": "cargo test --workspace 2>&1",
+          "tests_error_handling": false
+        },
+        {
+          "id": "H-003",
+          "prediction": "When providing invalid input, then the command returns a non-zero exit code with error message",
+          "verification_method": "cargo xtask aat invalid-url 2>&1; echo \"Exit code: $?\"",
+          "tests_error_handling": true
+        }
+      ]
+    },
+    "guidelines": {
+      "happy_path": [
+        "Test the main functionality that was added or changed",
+        "Verify the feature works as documented",
+        "Use commands from the PR's Usage section if available"
+      ],
+      "edge_cases": [
+        "Test boundary conditions (empty input, maximum values, etc.)",
+        "Test with unusual but valid inputs",
+        "Verify behavior matches documented limitations"
+      ],
+      "error_handling": [
+        "Test with invalid inputs that should be rejected",
+        "Test with missing required arguments",
+        "Verify error messages are helpful and actionable"
+      ]
+    },
+    "important_notes": [
+      "Verification commands should be idempotent (safe to run multiple times)",
+      "Commands should exit with code 0 on success, non-zero on failure",
+      "Avoid commands that modify state unless necessary for the test",
+      "Prefer commands that can run in the repository root directory",
+      "If the PR adds a new command, include hypotheses that test that specific command"
+    ]
+  }
+}

@@ -1,8 +1,0 @@
-prd_evidence_artifacts_readme:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
-  description: "PRD evidence artifact definition files (one artifact per file). Filenames MUST be <evidence_id>.yaml."
-  required_conventions:
-    - "Root key MUST be prd_evidence_artifact."
-    - "prd_evidence_artifact.id MUST match filename."
-    - "prd_evidence_artifact MUST conform to standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema."

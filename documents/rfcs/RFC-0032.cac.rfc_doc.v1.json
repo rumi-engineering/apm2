@@ -1,0 +1,1343 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0032",
+    "title": "Kernel-Native Forge Admission Cycle (FAC) vNext",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0032",
+    "labels": [
+      "fac",
+      "admission",
+      "automation",
+      "gates",
+      "receipts",
+      "work",
+      "quarantine",
+      "projection",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0032/RFC-0032.cac.rfc_doc.v1.json (narrative)",
+        "note": "Replaces narrative-only RFC-0032 with structured requirements suitable for gating."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0033",
+        "note": "FAC uses ledger/CAS as truth plane and evidence store."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0011",
+        "note": "FAC uses CAC for policy artifacts, context packs, and deterministic context consumption."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0016",
+        "note": "FAC uses HTF ticks for leases and expiry semantics."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0020",
+        "note": "FAC uses HSI for protocol/identity/capability enforcement."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0031",
+        "note": "FAC enforces RFC lint and spine governance invariants."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0032",
+      "notes": "Re-specified FAC as a structured requirement set and aligned to current fac/ledger/cas modules; removed narrative-only format."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0032: Kernel-Native Forge Admission Cycle (FAC) vNext",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and boundary",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC specifies the **Kernel-Native Forge Admission Cycle (FAC) vNext**: the fully automated (policy-governed) mechanism by which\nchangesets, normative artifacts, and work products are admitted into the authoritative substrate.\n\nFAC is the integration layer across:\n* CAC (RFC-0011) for artifacts, context packs, and policy objects,\n* HTF (RFC-0016) for authoritative time/leases,\n* HSI (RFC-0020) for protocol, identity, and capability control,\n* Ledger + CAS (RFC-0033) for truth and evidence persistence,\n* RFC spine governance (RFC-0031) for planning correctness.\n\nFAC provides:\n* work lifecycle management (WorkObjects, WorkGraph),\n* evidence publication and gate receipts,\n* actuation token gating for side effects (merge/push),\n* quarantine/freeze on integrity violations,\n* replay-based recovery.\n"
+        },
+        {
+          "type": "section",
+          "title": "1. Truth plane and evidence model",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0001",
+              "title": "Ledger-native authority; Git and views are projections",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC MUST treat the ledger (plus verified CAS objects) as the sole source of authority. Git repositories, working trees, CI logs, and in-memory scheduler state are projections derived from the ledger and MUST NOT be authoritative.",
+                "acceptance": [
+                  "All FAC state transitions are representable as ledger events with deterministic payload schemas.",
+                  "Any projection divergence is detected by comparing derived state to ledger receipts; divergence triggers quarantine/freeze.",
+                  "FAC can reconstruct work state from ledger history without relying on git metadata."
+                ],
+                "rationale": "Prevents split-brain between planning and execution; enables replay and recovery.",
+                "domain": [
+                  "correctness",
+                  "governance",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0015",
+                  "RFC-0033::REQ-0010"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0003",
+              "title": "Evidence artifacts are CAS objects referenced by hash in ledger",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any evidence (logs, test results, bundles, rendered context packs, gate receipts) MUST be stored as CAS objects and referenced from ledger events by content hash.",
+                "acceptance": [
+                  "Evidence publication writes bytes to CAS and records artifact_refs for the emitting ledger event.",
+                  "Consumers verify CAS hashes before interpreting evidence bytes.",
+                  "Evidence objects are immutable once referenced."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0001",
+                  "RFC-0033::REQ-0014"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0004",
+              "title": "Gate receipts are structured, canonical, and replayable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each FAC gate (AAT, RFC lint, build, security scan, etc.) MUST emit a structured GateReceipt that is canonicalizable, includes a TimeEnvelope, and is stored in CAS with a ledger reference.",
+                "acceptance": [
+                  "GateReceipt schema is pinned by schema_hash and recorded in ledger event metadata.",
+                  "GateReceipt includes: work_id, gate_id, input_commit_hash/tree_hash, result (pass/fail), and TimeEnvelope.",
+                  "Re-running the same gate on the same inputs yields a receipt that is semantically equivalent (allowing non-authoritative fields like wall time)."
+                ],
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0002",
+                  "RFC-0033::REQ-0014",
+                  "RFC-0011::REQ-0028"
+                ],
+                "edge_cases": [
+                  "If a gate produces large outputs, only digests and pointers are stored in the receipt; raw outputs go to CAS as separate artifacts.",
+                  "If gate execution is interrupted, it emits a partial receipt only if explicitly marked as incomplete and treated as failure by policy."
+                ],
+                "fail_closed": "Missing or unverifiable gate receipts are treated as gate failure.",
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0032",
+              "title": "All FAC artifacts are canonicalized before hashing/signing",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All FAC artifacts that are hashed, signed, or referenced by hash (receipts, specs, manifests) MUST be canonicalized to deterministic bytes before hashing.",
+                "acceptance": [
+                  "Canonicalization rules are pinned by canonicalizer_id/version.",
+                  "Hashing uses canonical bytes, not raw serialization output.",
+                  "Test vectors exist for key artifact canonicalizations."
+                ],
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0010",
+                  "RFC-0011::REQ-0009"
+                ],
+                "theory_refs": [
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Defines the authority model: ledger + CAS are truth; evidence is immutable and hash-addressed; receipts are structured and replayable."
+        },
+        {
+          "type": "section",
+          "title": "2. Work lifecycle, WorkGraph, and WorkContext",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0002",
+              "title": "Work objects have stable IDs and monotone state machine",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each WorkObject MUST have a globally unique stable identifier and MUST evolve through a monotone state machine. State transitions MUST be explicit ledger events; implicit transitions are forbidden.",
+                "acceptance": [
+                  "WorkObject ID format is stable and collision-resistant (e.g., uuidv7 or hash-derived).",
+                  "A finite set of WorkState values exists and transitions are defined (Opened -> Claimed -> InProgress -> Review -> Merged -> Closed, etc.).",
+                  "Any attempt to apply an undefined transition fails with a deterministic error."
+                ],
+                "domain": [
+                  "correctness",
+                  "governance"
+                ],
+                "edge_cases": [
+                  "Idempotent re-application of the same transition event is allowed only if it does not change state (exact duplicate).",
+                  "Concurrent conflicting transitions are resolved by ledger ordering; invalid transitions after ordering are rejected."
+                ],
+                "fail_closed": "Reject invalid transitions; do not 'skip' states.",
+                "code_refs": [
+                  "crates/apm2-core/src/work/state.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-02",
+                  "LAW-01"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0008",
+              "title": "WorkGraph is explicit and acyclic",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Work dependencies MUST be represented as an explicit WorkGraph with typed edges. The WorkGraph MUST be acyclic unless a specific RFC permits cycles for a specific edge type.",
+                "acceptance": [
+                  "WorkGraph updates are ledger events with deterministic payload schema.",
+                  "Graph validation rejects cycles for default edge types.",
+                  "Graph queries are replayable projections from ledger events."
+                ],
+                "domain": [
+                  "correctness",
+                  "planning"
+                ],
+                "edge_cases": [
+                  "If a cycle is detected during replay, the daemon must freeze affected work scope and require repair.",
+                  "If two edges are added concurrently, ledger ordering defines final graph; invalid edge addition is rejected."
+                ],
+                "fail_closed": "Reject cycle-producing updates.",
+                "theory_refs": [
+                  "INV-F-02",
+                  "LAW-02"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0009",
+              "title": "WorkContext is append-only and hash-addressed",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "WorkContext updates (context pack bindings, decisions, requirements mappings) MUST be append-only events referencing CAC artifacts by hash. WorkContext MUST be reconstructable solely from ledger + CAS.",
+                "acceptance": [
+                  "WorkContext events reference CAC artifact hashes (context packs, target profiles) via artifact_refs.",
+                  "Context pack compilation receipts are stored and referenced.",
+                  "Work execution uses pinned context packs; discretionary reads are forbidden in consumption mode."
+                ],
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0011::REQ-0003",
+                  "RFC-0033::REQ-0014"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "LAW-02"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0010",
+              "title": "Episodes are the unit of execution with explicit envelopes",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Work execution occurs in Episodes. Each Episode has an envelope binding work_id, input snapshot hashes, budgets, and stop conditions. Episode envelopes and outcomes are recorded as ledger events with receipts.",
+                "acceptance": [
+                  "EpisodeStart and EpisodeEnd events exist and are replayable.",
+                  "Episode envelope includes context pack hash(es), code commit/tree hash, and budget limits.",
+                  "If an episode crashes, the system records an EpisodeAbort event or marks the episode incomplete on replay."
+                ],
+                "domain": [
+                  "correctness",
+                  "reliability",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0004",
+                  "RFC-0016::REQ-0002"
+                ],
+                "edge_cases": [
+                  "Duplicate EpisodeStart is idempotent only if it matches exactly; otherwise it's a conflict.",
+                  "EpisodeEnd without EpisodeStart is invalid and causes quarantine or freeze."
+                ],
+                "fail_closed": "Do not treat partial episodes as success; require explicit closure."
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0019",
+              "title": "FAC planning cites requirement IDs from spine RFCs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any FAC ticket/work item that proposes system behavior changes MUST cite requirement IDs from the living RFC spine and must not cite deprecated RFCs as normative.",
+                "acceptance": [
+                  "WorkSpec includes a list of requirement IDs (traceability) that the work intends to satisfy or modify.",
+                  "Tooling rejects WorkSpecs that cite HISTORICAL RFCs without a supersedence path.",
+                  "Review gates check requirement traceability completeness."
+                ],
+                "domain": [
+                  "governance",
+                  "planning"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0008",
+                  "RFC-0031::REQ-0004"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0027",
+              "title": "Concurrent works must resolve conflicts explicitly via work graph and merge policy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When multiple works modify overlapping surfaces, FAC must resolve conflicts explicitly via the work graph and merge policy. Silent last-write-wins merges are forbidden for authority-relevant files.",
+                "acceptance": [
+                  "WorkGraph expresses ordering constraints (depends_on) for overlapping changes.",
+                  "Merge gate detects conflicts for protected paths and requires explicit resolution receipts.",
+                  "Protected path list is policy-defined (HSI, HTF, ledger/CAS, CAC, FAC)."
+                ],
+                "domain": [
+                  "correctness",
+                  "governance",
+                  "security"
+                ],
+                "theory_refs": [
+                  "INV-F-02",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Work is the unit of planning and admission. Work state and dependencies are explicit.\nWorkContext binds the context and policy inputs used for execution, so the work is replayable and auditable.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. Gates, review, waivers, and defects",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0004",
+              "title": "Gate receipts are structured, canonical, and replayable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each FAC gate (AAT, RFC lint, build, security scan, etc.) MUST emit a structured GateReceipt that is canonicalizable, includes a TimeEnvelope, and is stored in CAS with a ledger reference.",
+                "acceptance": [
+                  "GateReceipt schema is pinned by schema_hash and recorded in ledger event metadata.",
+                  "GateReceipt includes: work_id, gate_id, input_commit_hash/tree_hash, result (pass/fail), and TimeEnvelope.",
+                  "Re-running the same gate on the same inputs yields a receipt that is semantically equivalent (allowing non-authoritative fields like wall time)."
+                ],
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0002",
+                  "RFC-0033::REQ-0014",
+                  "RFC-0011::REQ-0028"
+                ],
+                "edge_cases": [
+                  "If a gate produces large outputs, only digests and pointers are stored in the receipt; raw outputs go to CAS as separate artifacts.",
+                  "If gate execution is interrupted, it emits a partial receipt only if explicitly marked as incomplete and treated as failure by policy."
+                ],
+                "fail_closed": "Missing or unverifiable gate receipts are treated as gate failure.",
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0005",
+              "title": "AAT (selftests) gate is mandatory for authority-relevant changes",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Changes that affect kernel authority surfaces (HSI, HTF, ledger/CAS, CAC, FAC itself) MUST pass hermetic AAT/selftests before admission.",
+                "acceptance": [
+                  "FAC determines whether a changeset is authority-relevant via path/rule mapping and enforces AAT gate accordingly.",
+                  "AAT runs hermetically (no network) unless explicitly permitted under policy and risk tier.",
+                  "AAT outputs are stored as evidence and referenced from the gate receipt."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0011::REQ-0014",
+                  "RFC-0031::REQ-0009"
+                ],
+                "theory_refs": [
+                  "LAW-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0006",
+              "title": "RFC lint is an admission gate for normative artifact changes",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any changeset that modifies normative artifacts (`documents/rfcs/**`, schema bundles, CAC policy) MUST pass RFC lint and CAC validation gates.",
+                "acceptance": [
+                  "RFC lint runs and produces a GateReceipt referencing defect IDs when it fails.",
+                  "CAC admission validation runs for modified CAC artifacts and produces AdmissionReceipts.",
+                  "FAC refuses merge if lint/validation receipts are missing."
+                ],
+                "domain": [
+                  "governance",
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0002",
+                  "RFC-0031::REQ-0009",
+                  "RFC-0011::REQ-0016"
+                ],
+                "theory_refs": [
+                  "INV-F-02",
+                  "LAW-01"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0028",
+              "title": "Review is a gate with explicit reviewer identity and receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Human or automated review is represented as a gate with explicit reviewer identity, scope, and decision receipts. Review receipts are stored in CAS and referenced from ledger.",
+                "acceptance": [
+                  "ReviewReceipt schema includes reviewer_id, decision, and referenced evidence/gate receipts.",
+                  "ReviewReceipt includes TimeEnvelope and is canonicalized.",
+                  "Admission requires review receipt for policy-defined path scopes."
+                ],
+                "domain": [
+                  "governance",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0009",
+                  "RFC-0033::REQ-0014"
+                ],
+                "theory_refs": [
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0029",
+              "title": "Gate waivers are explicit, scoped, and auditable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any waiver or override of a gate MUST be explicit, narrowly scoped, and auditable via a waiver receipt. Waivers must not be implicit or silent.",
+                "acceptance": [
+                  "WaiverReceipt includes gate_id, scope, reason, reviewer_id, and expiry (tick-based).",
+                  "Waivers are recorded in ledger and referenced from the admission decision.",
+                  "Expired waivers are not honored."
+                ],
+                "domain": [
+                  "security",
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0013"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0030",
+              "title": "Defects are structured and link to violated requirements",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any FAC failure that blocks admission MUST produce a structured defect that links to violated requirement IDs and includes deterministic defect IDs.",
+                "acceptance": [
+                  "Defect object includes: defect_id, severity, requirement_ids, evidence pointers, and remediation hints.",
+                  "Defects are stored in CAS and referenced by ledger events for failed steps.",
+                  "Repeated detection of the same defect yields the same defect_id (deterministic)."
+                ],
+                "domain": [
+                  "observability",
+                  "correctness",
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0014"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0033",
+              "title": "All admission-critical receipts include TimeEnvelope",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any receipt that gates admission (GateReceipt, ReviewReceipt, WaiverReceipt, MergeReceipt, QuarantineReceipt) MUST include a TimeEnvelope.",
+                "acceptance": [
+                  "Receipt schemas include a TimeEnvelope field.",
+                  "TimeEnvelope is validated and drift-checked on receive (HSI)."
+                ],
+                "domain": [
+                  "security",
+                  "time",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0002",
+                  "RFC-0020::REQ-0018"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0035",
+              "title": "FAC supports RFC modifications via explicit RFC change receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Modifying a LIVING RFC requires an RFCChangeReceipt that includes: affected RFC IDs, requirement IDs changed/added/removed, and migration implications.",
+                "acceptance": [
+                  "RFCChangeReceipt is emitted for changes under `documents/rfcs/**`.",
+                  "Receipt lists changed requirement IDs and indicates whether changes are breaking.",
+                  "Breaking changes include an explicit migration plan reference."
+                ],
+                "domain": [
+                  "governance",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0004",
+                  "RFC-0031::REQ-0006"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "FAC gates are first-class: they produce receipts, are stored in CAS, and are referenced from ledger.\nReview and waivers are also gates with explicit receipts.\nDefects link to violated requirements and provide deterministic identifiers.\n"
+        },
+        {
+          "type": "section",
+          "title": "4. Execution resources: lanes, leases, budgets, and bounded economics",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0011",
+              "title": "Exclusive lane acquisition uses tick-based leases",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Execution lanes (worker slots) MUST be acquired via exclusive leases with tick-based expiry (HTF). Lease acquisition and renewal MUST be recorded and replayable.",
+                "acceptance": [
+                  "LaneLease includes expiry_tick and renewal policy.",
+                  "Lease checks use monotonic ticks (not wall time).",
+                  "If a lease expires, the lane is considered lost and any in-flight work must stop or re-acquire."
+                ],
+                "domain": [
+                  "security",
+                  "correctness",
+                  "time"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0013"
+                ],
+                "edge_cases": [
+                  "If monotonic tick cannot be obtained, leases are treated as expired.",
+                  "If lease renewal races, only one renewal succeeds by ledger ordering."
+                ],
+                "fail_closed": "Treat ambiguous leases as invalid; stop actuation.",
+                "theory_refs": [
+                  "LAW-15",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0012",
+              "title": "Actuation tokens are minted only after preflight gates and are scope-limited",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any side-effectful action (merge, push, deploy, write privileged stores) requires an ActuationToken minted by the kernel after preflight gates pass. Tokens are scope-limited, tick-expiring, and non-replayable.",
+                "acceptance": [
+                  "ActuationToken issuance is a ledger event referencing gate receipts that justified issuance.",
+                  "Tokens include expiry_tick and are validated against monotonic tick at use time.",
+                  "Token use is single-use and recorded (spent) in the ledger."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0013",
+                  "RFC-0033::REQ-0010"
+                ],
+                "edge_cases": [
+                  "If token spend event fails to persist, token use must be treated as failed (do not perform side effect).",
+                  "If token is presented after expiry_tick, reject."
+                ],
+                "fail_closed": "No side effect without a valid unspent token.",
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0024",
+              "title": "FAC scheduler and broker enforce bounded resources",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC scheduler/broker must enforce bounded resources: max concurrent jobs, per-job budgets, bounded queues, and backpressure.",
+                "acceptance": [
+                  "Lane count and concurrency limits are policy-defined and enforced.",
+                  "Queue insertion fails with Backpressure when full; does not drop silently.",
+                  "Budgets are enforced during execution (CPU, memory, tokens) with deterministic measurement or conservative bounds."
+                ],
+                "domain": [
+                  "reliability",
+                  "performance",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0011::REQ-0024"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0038",
+              "title": "FAC enforces bounded economics for retries and anti-entropy",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Retries, anti-entropy reconciliation, and repair loops MUST be bounded by policy budgets to prevent runaway costs.",
+                "acceptance": [
+                  "Retry budgets are enforced per work and per gate.",
+                  "Anti-entropy processes have explicit max work per tick window.",
+                  "Exceeding budgets emits defects and halts further retries without operator intervention."
+                ],
+                "domain": [
+                  "reliability",
+                  "performance"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0013",
+                  "RFC-0011::REQ-0024"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Execution is capacity-constrained. Lanes are leased, budgets are enforced, and retries are bounded.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. Merge/projection, actuation, and quarantine",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0012",
+              "title": "Actuation tokens are minted only after preflight gates and are scope-limited",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any side-effectful action (merge, push, deploy, write privileged stores) requires an ActuationToken minted by the kernel after preflight gates pass. Tokens are scope-limited, tick-expiring, and non-replayable.",
+                "acceptance": [
+                  "ActuationToken issuance is a ledger event referencing gate receipts that justified issuance.",
+                  "Tokens include expiry_tick and are validated against monotonic tick at use time.",
+                  "Token use is single-use and recorded (spent) in the ledger."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0013",
+                  "RFC-0033::REQ-0010"
+                ],
+                "edge_cases": [
+                  "If token spend event fails to persist, token use must be treated as failed (do not perform side effect).",
+                  "If token is presented after expiry_tick, reject."
+                ],
+                "fail_closed": "No side effect without a valid unspent token.",
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0013",
+              "title": "Merge/projection is verified against ledger receipts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC MUST verify that the merge/projection result (git commit/tree) matches the inputs validated by gates. If mismatch is detected, FAC MUST quarantine and block admission.",
+                "acceptance": [
+                  "Gate receipts include the input tree hash and/or commit hash.",
+                  "Merge step recomputes output tree hash and compares against expected.",
+                  "On mismatch, FAC emits a QuarantineReceipt and freezes the affected scope."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0015"
+                ],
+                "edge_cases": [
+                  "If git metadata is missing or cannot be computed deterministically, treat as mismatch.",
+                  "If remote merge (GitHub) is used, FAC must verify the fetched merge commit against expected tree hash."
+                ],
+                "fail_closed": "Quarantine on mismatch.",
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0014",
+              "title": "Quarantine is mandatory on integrity violations",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC MUST quarantine (isolate + freeze) on integrity violations: hash mismatches, missing receipts, signature failures, schema ambiguity, or untrusted projections. Quarantine is a deliberate containment state requiring explicit recovery steps.",
+                "acceptance": [
+                  "Quarantine events are recorded in ledger with reason codes and evidence pointers.",
+                  "While quarantined, admission actions that would change authority state are denied.",
+                  "Recovery requires explicit operator receipt or a defined automated recovery gate."
+                ],
+                "domain": [
+                  "security",
+                  "reliability"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0020",
+                  "RFC-0011::REQ-0025"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0034",
+              "title": "Merge receipts bind source and destination hashes",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "A successful merge/admission MUST emit a MergeReceipt that binds: work_id, source commit/tree hash, destination commit/tree hash, and referenced gate/review receipts.",
+                "acceptance": [
+                  "MergeReceipt is stored in CAS and referenced in a ledger event.",
+                  "MergeReceipt includes both pre-merge and post-merge tree hashes and the actuation token spend reference.",
+                  "If merge is squashed or rebased, receipt includes mapping from source commits to final commit."
+                ],
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0014"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Merge/projection is a side effect and is therefore actuation-token gated.\nProjections are verified against receipts. Integrity violations trigger quarantine.\n"
+        },
+        {
+          "type": "section",
+          "title": "6. Policy pinning, automation levels, and external integrations",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0018",
+              "title": "Policy inputs are CAC artifacts pinned by hash",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All policies that govern FAC (gate definitions, risk tiers, budgets, allowlists) MUST be CAC artifacts pinned by hash and admitted via CAC. Policy evaluation must be replayable.",
+                "acceptance": [
+                  "Policy artifacts are stored in CAS and referenced by ledger events / receipts.",
+                  "FAC records the policy hash used for each gate decision in GateReceipt metadata.",
+                  "If policy artifacts are missing, FAC fails closed for affected operations."
+                ],
+                "domain": [
+                  "security",
+                  "governance",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0011::REQ-0016",
+                  "RFC-0011::REQ-0021"
+                ],
+                "fail_closed": "Reject operations that depend on unavailable policy.",
+                "theory_refs": [
+                  "INV-F-03",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0031",
+              "title": "External systems integration is capability-gated and logged",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any integration with external systems (GitHub API, package registries, cloud services) must be capability-gated, logged, and risk-tiered.",
+                "acceptance": [
+                  "Capabilities required for external calls are explicit and minted by policy.",
+                  "Calls are logged with redaction; responses are stored as evidence when they affect admission.",
+                  "If network is unavailable and the call is required, admission fails closed."
+                ],
+                "domain": [
+                  "security",
+                  "reliability"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0029",
+                  "RFC-0020::REQ-0030"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0037",
+              "title": "Automation level is explicit and gated by risk tier",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC automation level (fully automated vs human-in-the-loop) is controlled by policy and risk tier. High-risk operations require higher attestation floors and may require human review receipts.",
+                "acceptance": [
+                  "Policy defines attestation floor per operation and path scope.",
+                  "HSI risk tier is used to constrain permissible operations.",
+                  "Gate receipts record the attestation floor used."
+                ],
+                "domain": [
+                  "security",
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0033",
+                  "RFC-0020::REQ-0034"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0039",
+              "title": "FAC is hermetic by default and compatible with offline operation",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "FAC SHOULD be able to execute core admission steps hermetically and offline, except where external integrations are explicitly required by policy.",
+                "acceptance": [
+                  "Core gates (RFC lint, AAT, build) can run without network.",
+                  "If external integration is required, FAC produces a clear dependency receipt showing what external call was needed."
+                ],
+                "domain": [
+                  "reliability",
+                  "security"
+                ],
+                "theory_refs": [
+                  "LAW-20"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "All governing policies are CAC artifacts pinned by hash. Automation level is risk-tiered.\nExternal integrations are capability-gated and logged.\n"
+        },
+        {
+          "type": "section",
+          "title": "7. Hermetic execution and context firewall",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0020",
+              "title": "Consumption mode: no discretionary context reads during execution",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "During execution episodes in consumption mode, holons MUST NOT perform discretionary context reads. All required context must be provided via pinned context packs and ArtifactFetch allowlists.",
+                "acceptance": [
+                  "Execution environment enforces context firewall; unauthorized file/network reads are blocked or audited as defects.",
+                  "ArtifactFetch requests are allowlisted and deterministic.",
+                  "Gate receipts capture any context pack misses or unauthorized context access attempts."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0011::REQ-0003",
+                  "RFC-0020::REQ-0030"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0022",
+              "title": "Git operations are hardened and non-interactive",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any git operations performed by FAC MUST be non-interactive, must disable hooks, and must validate repository paths to prevent traversal/injection.",
+                "acceptance": [
+                  "FAC uses a hardened git wrapper that sets safe environment variables and disables hooks.",
+                  "Repository path inputs are canonicalized and restricted to sandbox directories.",
+                  "Remote URLs are allowlisted by policy; unknown remotes are rejected."
+                ],
+                "domain": [
+                  "security",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If git binary is missing or version is unsupported, gate fails and admission blocks.",
+                  "If repository is in a dirty state, FAC either cleans deterministically or fails closed (policy)."
+                ],
+                "fail_closed": "Treat any git hardening failure as admission failure."
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0023",
+              "title": "Build outputs used for gates are reproducible or pinned",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any build artifacts used as gate inputs MUST be either reproducible (byte-identical) or pinned by content hash and stored in CAS. Unpinned ephemeral build outputs must not be used for authority decisions.",
+                "acceptance": [
+                  "Build gates record input sources and output artifact hashes.",
+                  "If build outputs differ across runs, the gate records nondeterminism and fails or quarantines under policy."
+                ],
+                "domain": [
+                  "correctness",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0001"
+                ],
+                "theory_refs": [
+                  "INV-F-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Execution should be hermetic by default. Discretionary reads are forbidden in consumption mode.\nBuild artifacts used for gates must be reproducible or pinned.\n"
+        },
+        {
+          "type": "section",
+          "title": "8. Replay-based recovery, idempotency, and broker uniqueness",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0015",
+              "title": "FAC operations are idempotent with explicit conflict semantics",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC operations (admission steps, gate runs, event emissions) MUST be idempotent or have explicit conflict semantics. Replays must not create duplicate side effects.",
+                "acceptance": [
+                  "Event emission includes idempotency keys (e.g., work_id + step_id + input_hash) and detects duplicates.",
+                  "Gates can be re-run; receipts are deduplicated by (gate_id, input_hash) when policy permits.",
+                  "Side effects (merge/push) are guarded by actuation tokens and are single-use."
+                ],
+                "domain": [
+                  "correctness",
+                  "reliability",
+                  "security"
+                ],
+                "edge_cases": [
+                  "If a duplicate is detected but the prior receipt is missing, treat as inconsistency and quarantine."
+                ],
+                "fail_closed": "On ambiguity, do not perform side effects; require repair.",
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0016",
+              "title": "FAC state is replayable and derived from ledger events",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC scheduler/broker state MUST be reconstructable from ledger events and verified CAS objects. In-memory state is a cache only.",
+                "acceptance": [
+                  "A deterministic reducer exists that rebuilds FAC state from ledger history.",
+                  "Broker can recover after crash by replaying events and rehydrating leases/tokens.",
+                  "No essential state exists only in RAM."
+                ],
+                "domain": [
+                  "correctness",
+                  "reliability"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0015",
+                  "RFC-0033::REQ-0010"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0017",
+              "title": "Single broker orchestrator per lane; conflicts fail closed",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "For any lane, there MUST be at most one active orchestrator/broker instance issuing leases and scheduling work. Conflicts (multiple brokers) must be detected and fail closed.",
+                "acceptance": [
+                  "Broker acquires an exclusive lock/lease on lane state before scheduling.",
+                  "If lock cannot be acquired, broker does not proceed.",
+                  "Detection of competing brokers triggers freeze/quarantine event."
+                ],
+                "domain": [
+                  "security",
+                  "reliability"
+                ],
+                "edge_cases": [
+                  "In distributed mode, broker lease coordination uses ledger events as the arbitration source."
+                ],
+                "fail_closed": "Do not run multiple brokers concurrently.",
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0025",
+              "title": "Crash recovery is replay-based; no implicit rollback heuristics",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "On crash or restart, FAC must recover by replaying ledger events and revalidating leases/tokens as needed. Implicit rollback heuristics based on wall-clock time are forbidden.",
+                "acceptance": [
+                  "Recovery reads ledger history and reconstructs in-flight episodes.",
+                  "Any in-flight episode without a closing event is marked aborted and requires rerun.",
+                  "Lease validity is reevaluated using monotonic ticks after restart (with epoch considerations)."
+                ],
+                "domain": [
+                  "reliability",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0016::REQ-0013",
+                  "RFC-0033::REQ-0015"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "LAW-03"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "FAC is crash-safe by replaying ledger events. Operations are idempotent or conflict-explicit.\nBroker uniqueness prevents double scheduling.\n"
+        },
+        {
+          "type": "section",
+          "title": "9. Governance invariants and legacy elimination",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0007",
+              "title": "FAC enforces in-place migrations and deletion of deprecated paths",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC plans and gates MUST enforce the global invariant: in-place migrations with deletion of deprecated code paths. If an RFC introduces a migration, the admission cycle must include evidence that deprecated paths were removed or frozen.",
+                "acceptance": [
+                  "FAC checks for migration plans containing explicit deletion milestones.",
+                  "Gate receipts include checks for forbidden legacy code paths (e.g., legacy ledger writes).",
+                  "If a deprecated path is still reachable, FAC blocks admission."
+                ],
+                "domain": [
+                  "governance",
+                  "security",
+                  "correctness"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0006",
+                  "RFC-0033::REQ-0013"
+                ],
+                "theory_refs": [
+                  "INV-F-01",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0026",
+              "title": "No legacy adapters for pre-spine RFC formats in FAC gates",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "FAC tooling MUST NOT rely on legacy RFC formats (multi-file YAML frames, PRD bindings). Any remaining adapters are removed or fail closed.",
+                "acceptance": [
+                  "RFC lint gate consumes only `cac.rfc_doc.v1` JSON RFCs for LIVING RFCs.",
+                  "If a legacy RFC is encountered in a path that should be LIVING, the gate fails with a defect."
+                ],
+                "domain": [
+                  "governance",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0001",
+                  "RFC-0031::REQ-0005"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0036",
+              "title": "Superseded RFCs cannot be cited as normative in new WorkSpecs",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "WorkSpecs and planning artifacts must not cite superseded/HISTORICAL RFCs as normative requirements.",
+                "acceptance": [
+                  "WorkSpec validation rejects references to RFCs with status HISTORICAL unless the reference is explicitly marked as background.",
+                  "If a superseded requirement is cited, tooling suggests the replacement requirement via the supersedence graph."
+                ],
+                "domain": [
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0031::REQ-0007"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "FAC enforces in-place migrations, eliminates legacy adapters, and prevents superseded RFCs from re-entering planning inputs.\n"
+        },
+        {
+          "type": "section",
+          "title": "10. Pulse notifications and human-readable summaries",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0021",
+              "title": "Pulse notifications are emitted for work and gate events",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "FAC SHOULD emit pulse notifications for significant events (work state transitions, gate completion, quarantine) so subscribers can react without polling. Pulse ACLs must restrict visibility by capability.",
+                "acceptance": [
+                  "Daemon publishes PulseEvent messages for configured event types.",
+                  "Pulse ACL evaluator enforces topic-level access control.",
+                  "Pulse events contain hashes/pointers, not raw sensitive data."
+                ],
+                "domain": [
+                  "reliability",
+                  "observability",
+                  "security"
+                ],
+                "depends_on": [
+                  "RFC-0020::REQ-0029"
+                ],
+                "code_refs": [
+                  "crates/apm2-daemon/src/protocol/pulse_outbox.rs",
+                  "crates/apm2-daemon/src/protocol/pulse_acl.rs"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0032::REQ-0040",
+              "title": "FAC produces human-readable summaries derived from receipts",
+              "children": [],
+              "data": {
+                "level": "SHOULD",
+                "statement": "FAC SHOULD produce human-readable admission summaries (for review) that are derived from receipts and do not introduce new authority.",
+                "acceptance": [
+                  "Summaries reference receipt hashes/IDs.",
+                  "Summaries can be regenerated deterministically from ledger history."
+                ],
+                "domain": [
+                  "observability",
+                  "governance"
+                ],
+                "depends_on": [
+                  "RFC-0033::REQ-0015"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Pulse notifications provide event-driven updates. Human summaries are derived from receipts and are non-authoritative.\n"
+        },
+        {
+          "type": "section",
+          "title": "11. Traceability to implementation",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Primary implementation surfaces:\n\n* FAC core: `crates/apm2-core/src/fac/*`\n* Work model: `crates/apm2-core/src/work/*`\n* Broker/scheduler: `crates/apm2-core/src/fac/broker/*`, `crates/apm2-core/src/fac/scheduler/*`\n* Daemon FAC endpoints (HSI routes): `crates/apm2-daemon/src/dispatch/*`\n* Evidence + receipts storage: `crates/apm2-daemon/src/cas/*`, `crates/apm2-core/src/ledger/*`\n"
+        }
+      ]
+    }
+  }
+}

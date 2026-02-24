@@ -1,7 +1,0 @@
-command_shells:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_COMMAND_SHELL_V1"
-  values:
-    - "bash"
-    - "sh"
-    - "pwsh"

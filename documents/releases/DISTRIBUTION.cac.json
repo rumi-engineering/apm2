@@ -1,0 +1,122 @@
+{
+  "schema": "apm2.release_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "release.document",
+  "meta": {
+    "stable_id": "dcp://apm2.releases/doc/distribution@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/releases/DISTRIBUTION.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "Distribution",
+    "overview": "This document describes how users can obtain APM2 releases and verify their integrity.",
+    "download_locations": {
+      "github_releases": {
+        "description": "All channels are distributed through GitHub Releases (primary).",
+        "channels": [
+          { "channel": "Stable (latest)", "url_pattern": "https://github.com/USER/apm2/releases/latest/download/apm2-linux-x86_64" },
+          { "channel": "Stable (specific)", "url_pattern": "https://github.com/USER/apm2/releases/download/v0.2.0/apm2-linux-x86_64" },
+          { "channel": "Beta", "url_pattern": "https://github.com/USER/apm2/releases/download/v0.2.0-beta.1/apm2-linux-x86_64" },
+          { "channel": "Dev", "url_pattern": "https://github.com/USER/apm2/releases/download/dev/apm2-linux-x86_64" }
+        ]
+      },
+      "available_binaries": [
+        { "platform": "Linux x86_64", "binary_name": "apm2-linux-x86_64", "daemon_name": "apm2-linux-x86_64-daemon" },
+        { "platform": "Linux ARM64", "binary_name": "apm2-linux-aarch64", "daemon_name": "apm2-linux-aarch64-daemon" }
+      ],
+      "crates_io": {
+        "description": "Stable releases are published to crates.io.",
+        "commands": ["cargo install apm2-cli", "cargo install apm2-daemon"]
+      }
+    },
+    "verification": {
+      "dev_and_beta": {
+        "description": "Dev and beta releases provide SHA256 checksums for integrity verification.",
+        "commands": [
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/apm2-linux-x86_64",
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/checksums-sha256.txt",
+          "sha256sum -c checksums-sha256.txt --ignore-missing"
+        ]
+      },
+      "stable_sigstore": {
+        "description": "Stable releases include Sigstore signatures that cryptographically prove the artifacts came from the official GitHub Actions build.",
+        "prerequisites": "Install cosign: go install github.com/sigstore/cosign/v2/cmd/cosign@latest",
+        "full_verification_commands": [
+          "curl -LO ${BASE_URL}/apm2-linux-x86_64",
+          "curl -LO ${BASE_URL}/apm2-linux-x86_64.sig",
+          "curl -LO ${BASE_URL}/apm2-linux-x86_64.pem",
+          "cosign verify-blob --certificate apm2-linux-x86_64.pem --signature apm2-linux-x86_64.sig --certificate-identity-regexp 'https://github.com/.*/apm2/.*' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' apm2-linux-x86_64"
+        ],
+        "what_verification_proves": [
+          "Authenticity: The binary was signed by GitHub Actions",
+          "Integrity: The binary has not been modified since signing",
+          "Origin: The signature came from the APM2 repository's workflow",
+          "Non-repudiation: The signing event is recorded in Rekor transparency log"
+        ]
+      },
+      "slsa_provenance": {
+        "description": "For additional supply chain security, verify SLSA provenance.",
+        "commands": [
+          "go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest",
+          "curl -LO ${BASE_URL}/provenance.intoto.jsonl",
+          "slsa-verifier verify-artifact --provenance-path provenance.intoto.jsonl --source-uri github.com/USER/apm2 apm2-linux-x86_64"
+        ]
+      }
+    },
+    "quick_download_scripts": {
+      "latest_stable_verified": "#!/bin/bash\nset -euo pipefail\nREPO=\"USER/apm2\"\nBINARY=\"apm2-linux-x86_64\"\nBASE_URL=\"https://github.com/${REPO}/releases/latest/download\"\ncurl -fLO \"${BASE_URL}/${BINARY}\"\ncurl -fLO \"${BASE_URL}/${BINARY}.sig\"\ncurl -fLO \"${BASE_URL}/${BINARY}.pem\"\ncosign verify-blob --certificate \"${BINARY}.pem\" --signature \"${BINARY}.sig\" --certificate-identity-regexp \"https://github.com/.*/apm2/.*\" --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \"${BINARY}\"\nchmod +x \"${BINARY}\"\nmv \"${BINARY}\" ~/.local/bin/apm2\nrm -f \"${BINARY}.sig\" \"${BINARY}.pem\"\necho \"Installed apm2 to ~/.local/bin/apm2\"",
+      "latest_dev_checksum": "#!/bin/bash\nset -euo pipefail\nREPO=\"USER/apm2\"\nBINARY=\"apm2-linux-x86_64\"\nBASE_URL=\"https://github.com/${REPO}/releases/download/dev\"\ncurl -fLO \"${BASE_URL}/${BINARY}\"\ncurl -fLO \"${BASE_URL}/checksums-sha256.txt\"\nsha256sum -c checksums-sha256.txt --ignore-missing\nchmod +x \"${BINARY}\"\nmv \"${BINARY}\" ~/.local/bin/apm2\nrm -f checksums-sha256.txt\necho \"Installed apm2 (dev) to ~/.local/bin/apm2\""
+    },
+    "channel_recommendations": [
+      { "scenario": "Production deployment", "channel": "Stable", "reason": "Full security guarantees, tested" },
+      { "scenario": "Security-sensitive environment", "channel": "Stable + verify signatures", "reason": "Cryptographic proof of origin" },
+      { "scenario": "Testing upcoming features", "channel": "Beta", "reason": "Pre-release validation" },
+      { "scenario": "Integration testing", "channel": "Beta or Dev", "reason": "Early access to changes" },
+      { "scenario": "Developing APM2", "channel": "Dev", "reason": "Latest changes" },
+      { "scenario": "AI agent in worktree", "channel": "Dev", "reason": "Fastest iteration" },
+      { "scenario": "Automated CI/CD", "channel": "Stable (pinned version)", "reason": "Reproducibility" }
+    ],
+    "artifact_manifest": {
+      "stable_release_contents": [
+        "apm2-linux-x86_64", "apm2-linux-x86_64.sig", "apm2-linux-x86_64.pem",
+        "apm2-linux-aarch64", "apm2-linux-aarch64.sig", "apm2-linux-aarch64.pem",
+        "apm2-linux-x86_64-daemon", "apm2-linux-x86_64-daemon.sig", "apm2-linux-x86_64-daemon.pem",
+        "apm2-linux-aarch64-daemon", "apm2-linux-aarch64-daemon.sig", "apm2-linux-aarch64-daemon.pem",
+        "checksums-sha256.txt", "sbom.spdx.json", "provenance.intoto.jsonl"
+      ],
+      "dev_beta_release_contents": [
+        "apm2-linux-x86_64", "apm2-linux-aarch64",
+        "apm2-linux-x86_64-daemon", "apm2-linux-aarch64-daemon",
+        "checksums-sha256.txt"
+      ]
+    },
+    "troubleshooting": {
+      "signature_verification_failed": {
+        "certificate_expired": "Sigstore certificates are short-lived (10 minutes). Verification checks the Rekor transparency log to confirm the signature was created while valid. Ensure you have a recent version of cosign.",
+        "identity_mismatch": "Check repository name in --certificate-identity-regexp and OIDC issuer is https://token.actions.githubusercontent.com"
+      },
+      "checksum_mismatch": [
+        "Re-download the file (partial download?)",
+        "Check you downloaded from the correct release",
+        "Verify the checksums file itself hasn't been tampered with"
+      ],
+      "download_failed": "GitHub rate limits anonymous downloads. Use GitHub CLI: gh release download dev --repo USER/apm2 --pattern 'apm2-linux-x86_64'"
+    },
+    "related_documentation": [
+      "documents/releases/RELEASE_CHANNELS.cac.json",
+      "documents/releases/ARTIFACT_PROMOTION.cac.json",
+      "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+      "documents/security/RELEASE_PROCEDURE.cac.json"
+    ]
+  }
+}

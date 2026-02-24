@@ -1,9 +1,0 @@
-work_templates_readme:
-  schema_version: "2026-01-24"
-  template_version: "2026-01-24"
-  description: "Engineering ticket templates (atomic). Each ticket is a single YAML file containing all metadata, scope, plan, and criteria."
-  required_files_per_ticket:
-    - "<ticket_id>.yaml"
-  determinism_notes:
-    - "Ticket YAML is the single source of truth for all ticket content."
-    - "All scope, plan, criteria, and notes are embedded in the YAML file."

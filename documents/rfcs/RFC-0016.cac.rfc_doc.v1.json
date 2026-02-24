@@ -1,0 +1,698 @@
+{
+  "schema": "cac.rfc_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "rfc.document",
+  "meta": {
+    "id": "RFC-0016",
+    "title": "Holonic Time Fabric (HTF): Four-Clock Authority Model",
+    "stable_id": "dcp://apm2.dev/rfc/RFC-0016",
+    "labels": [
+      "htf",
+      "time",
+      "security_boundary",
+      "clockprofile",
+      "hlc",
+      "ticks",
+      "lifecycle:LIVING",
+      "spine"
+    ],
+    "relationships": [
+      {
+        "kind": "SUPERSEDES",
+        "ref": "documents/rfcs/RFC-0016 (legacy YAML frames + requirement YAMLs)",
+        "note": "Consolidates HTF into single CAC RFC doc; legacy YAML requirements become non-authoritative."
+      },
+      {
+        "kind": "REFERENCES",
+        "ref": "crates/apm2-daemon/src/htf/clock.rs",
+        "note": "Current clock implementation with monotonic tick regression detection and HLC drift bounds."
+      },
+      {
+        "kind": "DEPENDS_ON",
+        "ref": "dcp://apm2.dev/rfc/RFC-0033",
+        "note": "LedgerTime is defined relative to the append-only ledger."
+      },
+      {
+        "kind": "AFFECTS",
+        "ref": "dcp://apm2.dev/rfc/RFC-0020",
+        "note": "HSI handshake/time validation depends on ClockProfile and HLC bounds."
+      }
+    ],
+    "provenance": {
+      "actor_id": "APM2-DOC-GOV",
+      "work_id": "RFC-0016",
+      "notes": "Converted HTF legacy requirement YAMLs into structured requirements; augmented with code-level invariants from current clock implementation."
+    }
+  },
+  "payload": {
+    "root": {
+      "type": "rfc",
+      "title": "RFC-0016: Holonic Time Fabric (HTF) — Four-Clock Authority Model",
+      "children": [
+        {
+          "type": "section",
+          "title": "0. Scope and boundary",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "This RFC defines the **Holonic Time Fabric (HTF)**: the authoritative time semantics for APM2.\n\nHTF exists because a single scalar timestamp is not safe or sufficient at APM2's trust boundaries.\nHTF explicitly separates clocks by authority:\n\n* LedgerTime (L): authoritative ordering within a ledger (truth plane).\n* MonotonicTicks (M): authoritative local durations/expiry.\n* CausalTime (C / HLC): advisory causality across nodes.\n* BoundedWallTime (W): human-facing wall time expressed as an interval with uncertainty.\n\nHTF is consumed by:\n* Ledger + CAS + daemon (RFC-0033)\n* HSI handshake and protocol validation (RFC-0020)\n* Forge Admission Cycle (RFC-0032) for TTL/lease/gate timing\n"
+        },
+        {
+          "type": "section",
+          "title": "1. Four-clock model and authority matrix",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0001",
+              "title": "Four-clock model",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HTF defines four clocks with explicit semantics and authority boundaries:\n- LedgerTime (L): authoritative ordering/truth within a ledger.\n- MonotonicTicks (M): authoritative durations/expiry on a node.\n- CausalTime (C/HLC): advisory causality/correlation across nodes.\n- BoundedWallTime (W): human-facing wall time as a bounded interval.",
+                "acceptance": [
+                  "Each clock has a defined type, fields, and semantics.",
+                  "Authority matrix explicitly defines allowed/forbidden uses per clock.",
+                  "Wall time is never authoritative for ordering or expiry."
+                ],
+                "rationale": "Collapsing time into a single timestamp creates replay non-determinism and\nenables time-manipulation attacks. Separate clocks prevent accidental misuse\nby making authority explicit and mechanically enforceable.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-03",
+                  "LAW-05",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0016",
+              "title": "LedgerTime is derived from ledger boundaries, not from wall-clock stamps",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "LedgerTime (L) MUST be derived from ledger boundaries (event sequence/hash chain) and MUST NOT treat wall-clock timestamps as authoritative. Wall timestamps may be included as metadata but must not define ordering.",
+                "acceptance": [
+                  "Ledger events have an explicit sequence/prev_hash relationship that defines ordering.",
+                  "Any UI or API that presents event time distinguishes between ledger ordering and wall time metadata.",
+                  "Replay and verification use ledger ordering, not timestamps."
+                ],
+                "rationale": "Ledger truth is append-only and tamper-evident; timestamps are not.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "time"
+                ],
+                "theory_refs": [
+                  "LAW-03",
+                  "INV-F-01"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Defines the four clocks and forbids accidental use of wall time as authority."
+        },
+        {
+          "type": "section",
+          "title": "2. TimeEnvelope on boundary-critical artifacts",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0002",
+              "title": "TimeEnvelope is mandatory on critical artifacts",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "All critical receipts/events include TimeEnvelopeV1, either embedded or\nreferenced via time_envelope_ref. Each TimeEnvelope pins a governed\nClockProfile by content hash.",
+                "acceptance": [
+                  "Critical events/receipts include TimeEnvelopeV1 (embedded or referenced).",
+                  "TimeEnvelope pins ClockProfile by content hash.",
+                  "Canonicalization vectors exist and are verified in CI for TimeEnvelopeV1 and ClockProfileV1."
+                ],
+                "rationale": "Time must be auditable and replay-stable. By requiring envelopes on\ncritical artifacts, the system can verify ordering/expiry decisions and\nreproduce metrics and audits from ledger+CAS.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-01",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0012",
+              "title": "TimeEnvelope canonicalization is deterministic",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "TimeEnvelope fields (ledger time, monotonic tick, causal time, wall interval) MUST be canonicalized before hashing/signing. Canonicalization MUST be deterministic across platforms.",
+                "acceptance": [
+                  "TimeEnvelope has a canonical byte representation with explicit field ordering and unit encoding.",
+                  "Hashing/signing of TimeEnvelope uses canonical bytes; no ambient serialization settings are allowed.",
+                  "Test vectors exist for canonicalization across at least two platforms/architectures."
+                ],
+                "rationale": "TimeEnvelope is boundary-critical metadata; non-determinism breaks replay and signature validation.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If a field is optional (e.g., causal time disabled), canonicalization must encode explicit absence unambiguously.",
+                  "If wall interval is unknown, canonicalization must encode that explicitly rather than using zero."
+                ],
+                "fail_closed": "Reject signing/verifying artifacts with non-canonical TimeEnvelope encoding.",
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-20"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0017",
+              "title": "Time is treated as adversarial input across trust boundaries",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Across trust boundaries, all time-related inputs (wall time, causal time, claimed expiry) MUST be treated as adversarial. Validation MUST enforce bounds and must not allow peers to unilaterally extend validity windows.",
+                "acceptance": [
+                  "Remote HLC is drift-validated (REQ-0010).",
+                  "Lease/expiry claims from peers are validated against local monotonic ticks and policy bounds.",
+                  "TimeEnvelope fields received over the network are canonicalized and validated before use."
+                ],
+                "rationale": "Time manipulation is a common bypass vector for TTLs, leases, and ordering-based invariants.",
+                "domain": [
+                  "security",
+                  "time"
+                ],
+                "fail_closed": "Reject or quarantine messages with invalid time envelopes under the applicable risk tier.",
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "A TimeEnvelope is mandatory metadata for boundary-critical artifacts (gate receipts, ledger events, lease-bearing capability grants, etc.).\nIt binds the relevant clock readings at the moment of emission and makes authority explicit.\n"
+        },
+        {
+          "type": "section",
+          "title": "3. Monotonic ticks, TTLs, and deadlines",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0003",
+              "title": "Tick-based TTLs and deadlines",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Lease validity, timeouts, retry/backoff windows, circuit breakers, and\nquarantine TTLs are enforced using MonotonicTicks (M) and/or TimeEnvelope\ncontainment checks. Wall time is never authoritative for these decisions.\n\nReducers never consult runtime clocks; time flows only via recorded\nenvelopes and tick values provided as data.",
+                "acceptance": [
+                  "No privileged code path uses wall time for expiry/timeout/backoff decisions.",
+                  "Lease expiry checks use ticks/envelopes and are unaffected by wall time changes.",
+                  "Reducers do not call now(); replay determinism holds."
+                ],
+                "rationale": "Using wall time for expiry or timeouts enables time manipulation and breaks\ndeterminism under replay. Monotonic ticks provide stable local duration\nsemantics, and envelopes record the authoritative tick windows.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-01",
+                  "LAW-04",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0008",
+              "title": "Monotonic tick must never regress; regression is a hard fault",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "The local monotonic tick (MonotonicTicks/M) MUST be monotone non-decreasing for the lifetime of a daemon process. If a regression is detected, the system MUST treat it as a serious fault: reject time-dependent operations and surface a defect.",
+                "acceptance": [
+                  "Clock implementation detects regression by comparing current_tick to an atomic last_tick and returns ClockRegression on decrease.",
+                  "Regression emits a warning suitable for defect recording.",
+                  "Operations requiring monotonic time (leases, TTL checks, TimeEnvelope validation) fail when ClockRegression is raised."
+                ],
+                "rationale": "Tick regression implies VM time travel or clock source failure; continuing would violate TTL/security assumptions.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If regression is detected during non-critical operations (metrics), it may be logged but must not be used for authority decisions.",
+                  "If regression is transient, the daemon still must fail closed until explicitly restarted or recovered under a documented procedure."
+                ],
+                "fail_closed": "Reject time-authoritative operations; do not 'clamp' silently.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::now_mono_tick"
+                ],
+                "theory_refs": [
+                  "LAW-15",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0013",
+              "title": "Leases and TTLs are evaluated against monotonic ticks, not wall time",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any lease, TTL, or deadline that gates authority MUST be expressed and evaluated in MonotonicTicks (M). Wall time may be used only for display and logging.",
+                "acceptance": [
+                  "Lease objects include expiry_tick (or equivalent) in tick units.",
+                  "Evaluation uses now_mono_tick and rejects if monotonic clock errors.",
+                  "No authority path compares SystemTime::now to a TTL."
+                ],
+                "rationale": "Wall time is adversarial and non-monotone; ticks provide monotone local authority for expiry.",
+                "domain": [
+                  "security",
+                  "time",
+                  "correctness"
+                ],
+                "edge_cases": [
+                  "If the process restarts, tick epoch resets; leases must include an epoch identifier or be reissued under the new epoch.",
+                  "If tick_rate_hz is changed, existing leases must be invalidated or migrated with explicit conversion under policy."
+                ],
+                "fail_closed": "If tick cannot be obtained or validated, treat leases as expired and deny operations.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::now_mono_tick"
+                ],
+                "theory_refs": [
+                  "LAW-15",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0009",
+              "title": "Tick rate and epoch semantics are explicit and pinned in ClockProfile",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HTF MUST define a tick rate (Hz) and epoch semantics that are pinned in a `ClockProfile`. All TimeEnvelopes and ledger-time derivations MUST reference the active ClockProfile hash so that tick interpretation is unambiguous.",
+                "acceptance": [
+                  "ClockProfile includes tick_rate_hz, default_epoch, ledger_id, ledger_namespace, and policy identifiers.",
+                  "ClockProfile has a deterministic profile_hash derived from canonical bytes of the profile.",
+                  "HSI handshake includes the profile_hash to prevent cross-node tick-rate mismatch."
+                ],
+                "rationale": "Without a pinned tick rate/profile, ticks are just numbers and can be misinterpreted across nodes.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If tick_rate_hz changes across versions, profile_hash must change and handshake must reject mismatched peers (or isolate by risk tier).",
+                  "If profile_hash cannot be computed deterministically, the clock must not start."
+                ],
+                "fail_closed": "Reject cross-node interactions and time-envelope validation if profile hash mismatch or missing.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::ClockConfig",
+                  "crates/apm2-daemon/src/protocol/handshake.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "MonotonicTicks are the sole authority for TTL/expiry decisions on a node.\nTick regressions are treated as hard faults.\n"
+        },
+        {
+          "type": "section",
+          "title": "4. CausalTime and bounded HLC",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0004",
+              "title": "CausalTime stamping at message boundaries",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Any cross-node or inter-holon message boundary carries a CausalTime (HLC)\nstamp. Receivers update their local HLC state using the HLC receive\nalgorithm and emit defects on monotonicity violations.\n\nCausalTime is used only for correlation/cause tracing; it is not\nauthoritative for protocol ordering or expiry.",
+                "acceptance": [
+                  "Messages include HLC stamps when messaging exists.",
+                  "Receivers update HLC state and preserve happens-before.",
+                  "HLC regressions emit defects and may quarantine senders by policy."
+                ],
+                "rationale": "Federation requires a causality stamp to stitch traces and detect anomalies\nwithout relying on cross-node wall time comparisons.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0010",
+              "title": "Hybrid Logical Clock drift is bounded and validated on receive",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When HLC is enabled, the daemon MUST validate remote HLC inputs as adversarial. Remote wall_ns values that exceed local physical time by more than a configured bound MUST be rejected.",
+                "acceptance": [
+                  "receive_hlc rejects remote timestamps whose wall_ns > physical_now + MAX_HLC_OFFSET_NS with HlcDriftExceeded.",
+                  "The drift bound is a constant or policy-controlled value; it is not silently widened at runtime.",
+                  "On rejection, the daemon records a security defect and does not advance local HLC to the remote value."
+                ],
+                "rationale": "Prevents malicious peers from pushing local time arbitrarily far into the future, which can break TTL and causality logic.",
+                "domain": [
+                  "security",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If wall clock is unavailable (SystemTime error), physical_now is treated as 0; receive_hlc must then be conservative and likely reject remote time unless it is also near 0.",
+                  "If HLC is disabled, any attempt to use HLC functions must error (HlcNotEnabled) and callers must fall back to tick-only semantics."
+                ],
+                "fail_closed": "Reject remote time inputs outside bounds; do not partially update local state.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::receive_hlc"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0014",
+              "title": "CausalTime stamping occurs at message boundaries and is advisory only",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When enabled, causal timestamps (HLC) MUST be stamped on outbound messages and processed on inbound messages to provide advisory causal ordering. CausalTime MUST NOT be used as authoritative ordering or expiry.",
+                "acceptance": [
+                  "Outbound protocol frames include optional HLC timestamp fields.",
+                  "Inbound frames are processed via receive_hlc with drift validation.",
+                  "Code review/lints ensure CausalTime is not used for ledger ordering or TTL checks."
+                ],
+                "rationale": "HLC provides useful causality correlation but is not a source of authority across untrusted boundaries.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If HLC is disabled, messages omit causal time; downstream must handle absence without substituting wall time.",
+                  "If remote causal time is rejected, the message may still be processed under risk-tier policy, but local HLC must not advance to the remote value."
+                ],
+                "fail_closed": "Do not treat missing/invalid causal time as zero; treat as absent.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::now_hlc",
+                  "crates/apm2-daemon/src/htf/clock.rs::receive_hlc"
+                ],
+                "theory_refs": [
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "HLC provides advisory causality across nodes. Remote HLC input is adversarial and must be drift-validated.\n"
+        },
+        {
+          "type": "section",
+          "title": "5. Bounded wall time and human-time prohibition in normative artifacts",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0005",
+              "title": "Bounded wall time is interval-bounded and non-authoritative",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "When wall time is recorded, it is represented as a bounded interval\n(t_min_utc_ns, t_max_utc_ns) with a declared source and confidence.\n\nThe interval width must not exceed the bound declared in ClockProfile.\nWall time is never used for authority decisions.",
+                "acceptance": [
+                  "Wall time, when present, is an interval with explicit bounds.",
+                  "Interval width is validated against ClockProfile.max_wall_uncertainty_ns.",
+                  "No authority decision consumes wall time."
+                ],
+                "rationale": "Human-facing timestamps are useful, but raw wall time is not safe as a\nprotocol input. Representing wall time as a bounded interval makes\nuncertainty explicit and prevents accidental authority use.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-05",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0011",
+              "title": "Bounded wall time is an interval with explicit uncertainty",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "BoundedWallTime MUST be represented as an interval `[t_min, t_max]` with an explicit maximum uncertainty bound. It MUST NOT be used as authority for ordering, expiry, or gate timing.",
+                "acceptance": [
+                  "ClockConfig includes max_wall_uncertainty_ns and wall_time_source identifiers.",
+                  "Bounded wall time is exposed as a bounded interval (not a scalar).",
+                  "Any code path that uses wall time for TTL/ordering is rejected by lint/tests."
+                ],
+                "rationale": "Scalar wall timestamps invite accidental authority use; representing uncertainty makes misuse obvious.",
+                "domain": [
+                  "security",
+                  "correctness",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If the wall time source is best-effort, uncertainty must be wide; this reduces usability but preserves correctness.",
+                  "If wall time cannot be obtained, bounded wall time may be omitted or set to an explicit 'unknown' interval; callers must handle."
+                ],
+                "fail_closed": "If bounded wall time is required for a human-facing output but unavailable, return an explicit 'unknown' rather than a bogus scalar.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::ClockConfig"
+                ],
+                "theory_refs": [
+                  "LAW-05",
+                  "INV-F-05"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0006",
+              "title": "No human-time units in normative artifacts by default",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Normative artifacts (PRDs, RFCs, skills, laws, and policy documents) must\nnot introduce human-time units by default.\n\nHuman time is permitted only in explicit external-facing contexts.\nAn escape hatch exists for externally-scoped statements, but it must be\nmechanically detectable and auditable.",
+                "acceptance": [
+                  "Doc-lint rejects human-time units in scoped normative directories.",
+                  "Escape hatch exists for explicit external-facing contexts only.",
+                  "Metrics primary indexing uses ledger windows and tick deltas; wall time is a bounded overlay."
+                ],
+                "rationale": "Human time units in normative docs inevitably become authority inputs.\nThey also drift under interpretation and undermine replayable reasoning.\n\nHTF forces internal semantics to be expressed in ledger windows and ticks.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Wall time is treated as an interval with explicit uncertainty and is non-authoritative.\nNormative artifacts should avoid human-time units by default to prevent accidental authority use.\n"
+        },
+        {
+          "type": "section",
+          "title": "6. ClockProfile governance and cross-node compatibility",
+          "children": [
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0007",
+              "title": "ClockProfile governance",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "Each node publishes a governed ClockProfileV1 referenced by hash in\nTimeEnvelopeV1. Policies can restrict acceptable profiles by risk tier.\n\nPhase 2+ may attach attestation evidence to ClockProfile and require it for\nhigh-risk operations.",
+                "acceptance": [
+                  "ClockProfile is a governed CAC artifact and is pinned by hash in TimeEnvelope.",
+                  "Policies may restrict acceptable profiles by risk tier.",
+                  "Attestation field exists as a Phase 2+ extension hook."
+                ],
+                "rationale": "Time envelopes are only meaningful when the clock assumptions are pinned.\nClockProfile governance enables risk-tier controls and prevents silent drift\nin time source semantics.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "scope": {
+                  "subsystem": "htf"
+                },
+                "theory_refs": [
+                  "LAW-05",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0009",
+              "title": "Tick rate and epoch semantics are explicit and pinned in ClockProfile",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "HTF MUST define a tick rate (Hz) and epoch semantics that are pinned in a `ClockProfile`. All TimeEnvelopes and ledger-time derivations MUST reference the active ClockProfile hash so that tick interpretation is unambiguous.",
+                "acceptance": [
+                  "ClockProfile includes tick_rate_hz, default_epoch, ledger_id, ledger_namespace, and policy identifiers.",
+                  "ClockProfile has a deterministic profile_hash derived from canonical bytes of the profile.",
+                  "HSI handshake includes the profile_hash to prevent cross-node tick-rate mismatch."
+                ],
+                "rationale": "Without a pinned tick rate/profile, ticks are just numbers and can be misinterpreted across nodes.",
+                "domain": [
+                  "correctness",
+                  "security",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If tick_rate_hz changes across versions, profile_hash must change and handshake must reject mismatched peers (or isolate by risk tier).",
+                  "If profile_hash cannot be computed deterministically, the clock must not start."
+                ],
+                "fail_closed": "Reject cross-node interactions and time-envelope validation if profile hash mismatch or missing.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::ClockConfig",
+                  "crates/apm2-daemon/src/protocol/handshake.rs"
+                ],
+                "theory_refs": [
+                  "INV-F-03",
+                  "LAW-15"
+                ]
+              },
+              "body": ""
+            },
+            {
+              "type": "requirement",
+              "id": "RFC-0016::REQ-0015",
+              "title": "ClockProfile governance is policy-driven and auditable",
+              "children": [],
+              "data": {
+                "level": "MUST",
+                "statement": "ClockProfile parameters that affect authority (tick rate, uncertainty bounds, sources) MUST be controlled by explicit policy and MUST be auditable via receipts and ledger events.",
+                "acceptance": [
+                  "ClockProfile includes build_fingerprint and profile_policy_id.",
+                  "Any ClockProfile change emits a ledger event or admission receipt referencing the new profile hash.",
+                  "Peers reject interactions if required clock profile constraints are not met."
+                ],
+                "rationale": "Clock parameters are part of the security boundary; they must not drift silently.",
+                "domain": [
+                  "security",
+                  "governance",
+                  "time"
+                ],
+                "edge_cases": [
+                  "If policy cannot be loaded (CAC failure), the daemon must fall back to a safe default profile or refuse to start depending on risk tier.",
+                  "If build_fingerprint changes but policy does not, profile hash still changes; consumers must treat that as a distinct profile."
+                ],
+                "fail_closed": "If clock profile is not loadable/verifiable, refuse time-authoritative operations.",
+                "code_refs": [
+                  "crates/apm2-daemon/src/htf/clock.rs::ClockConfig",
+                  "crates/apm2-daemon/src/htf/clock.rs::profile_hash"
+                ],
+                "theory_refs": [
+                  "INV-F-05",
+                  "LAW-01"
+                ]
+              },
+              "body": ""
+            }
+          ],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Clock parameters are part of the security boundary; they are governed by explicit policy and are surfaced via a ClockProfile hash.\n"
+        },
+        {
+          "type": "section",
+          "title": "7. Traceability to implementation",
+          "children": [],
+          "data": {
+            "heading_level": 2
+          },
+          "body": "Primary implementation surfaces:\n\n* Daemon clock: `crates/apm2-daemon/src/htf/clock.rs`\n* Core HTF types: `crates/apm2-core/src/htf/*`\n* Protocol handshake includes clock profile identifiers: `crates/apm2-daemon/src/protocol/handshake.rs`\n"
+        }
+      ]
+    }
+  }
+}

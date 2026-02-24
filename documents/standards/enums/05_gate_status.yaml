@@ -1,9 +1,0 @@
-
-gate_status:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_GATE_STATUS_V1"
-  values:
-    - "BLOCKED"
-    - "PENDING"
-    - "PASSED"
-    - "WAIVED"

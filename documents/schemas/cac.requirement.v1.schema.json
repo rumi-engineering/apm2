@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dcp://apm2.dev/schema/cac.requirement.v1",
+  "title": "CAC Requirement Object v1",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "title",
+    "children",
+    "data"
+  ],
+  "properties": {
+    "type": {
+      "const": "requirement"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^RFC-[0-9]{4}::REQ-[0-9]{4}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "children": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/node"
+      },
+      "maxItems": 512
+    },
+    "data": {
+      "$ref": "#/$defs/requirementData"
+    }
+  },
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": [
+        "type",
+        "title",
+        "children"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "children": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "requirementData": {
+      "type": "object",
+      "required": [
+        "level",
+        "statement",
+        "acceptance"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "MUST",
+            "SHOULD",
+            "MAY",
+            "MUST_NOT",
+            "SHOULD_NOT"
+          ]
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 32768
+        },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "maxItems": 512
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 65536
+        },
+        "domain": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "maxItems": 32
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 128
+          },
+          "maxItems": 256
+        },
+        "edge_cases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "maxItems": 256
+        },
+        "fail_closed": {
+          "type": "string",
+          "maxLength": 8192
+        },
+        "falsification": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "maxItems": 256
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 256
+        },
+        "code_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "maxItems": 256
+        },
+        "theory_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "maxItems": 64
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

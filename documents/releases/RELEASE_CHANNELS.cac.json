@@ -1,0 +1,135 @@
+{
+  "schema": "apm2.release_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "release.document",
+  "meta": {
+    "stable_id": "dcp://apm2.releases/doc/release-channels@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/releases/RELEASE_CHANNELS.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "Release Channels",
+    "overview": "APM2 uses three release channels to balance rapid iteration with stability and security. Flow: main branch -> Dev Channel (automatic) -> Beta Channel (manual) -> Stable Channel (release-plz).",
+    "channels": {
+      "dev": {
+        "description": "The dev channel provides bleeding-edge builds for developers and AI agents working with APM2.",
+        "properties": {
+          "trigger": "Every merge to `main` branch",
+          "tag": "`dev` (rolling, overwritten on each build)",
+          "build_time_target": "<5 minutes",
+          "tests": "Full test suite runs before artifacts are created",
+          "security": "SHA256 checksums only",
+          "audience": "AI agents, developers, worktree testing"
+        },
+        "characteristics": [
+          "Fast iteration: New builds available within minutes of merge",
+          "Rolling tag: The `dev` tag always points to the latest build",
+          "Full test coverage: All CI gates must pass before merge",
+          "No signatures: Checksums provide integrity verification only",
+          "Potentially unstable: May contain breaking changes or bugs"
+        ],
+        "use_cases": [
+          "AI agents that need the latest features",
+          "Development environments and worktrees",
+          "Integration testing against latest changes",
+          "Rapid prototyping"
+        ]
+      },
+      "beta": {
+        "description": "The beta channel provides pre-release builds for early adopters and integration testing.",
+        "properties": {
+          "trigger": "Manual workflow dispatch",
+          "tag": "`vX.Y.Z-beta.N` (e.g., `v0.2.0-beta.1`)",
+          "tests": "None (promoted from dev without rebuild)",
+          "security": "SHA256 checksums only",
+          "audience": "Early adopters, integration testing"
+        },
+        "characteristics": [
+          "Promotion-based: Same binaries as dev, no rebuild",
+          "Semantic versioning: Beta tags indicate the target stable version",
+          "Manual gating: Maintainer must explicitly promote",
+          "Pre-release period: Time for community testing before stable",
+          "Checksum verification: Proves artifacts match dev build"
+        ],
+        "use_cases": [
+          "Testing upcoming stable releases before general availability",
+          "Validating compatibility with downstream projects",
+          "Early access to new features",
+          "Regression testing before stable promotion"
+        ],
+        "creating_beta_release": [
+          "Navigate to Actions > Beta Release workflow",
+          "Click 'Run workflow'",
+          "Enter the target version (e.g., `0.2.0-beta.1`)",
+          "The workflow downloads dev artifacts and creates the beta release"
+        ]
+      },
+      "stable": {
+        "description": "The stable channel provides production-ready releases with full security guarantees.",
+        "properties": {
+          "trigger": "release-plz PR merged (creates tag automatically)",
+          "tag": "`vX.Y.Z` (e.g., `v0.2.0`)",
+          "tests": "None (promoted from beta without rebuild)",
+          "security": "Sigstore keyless signing + SLSA L3 provenance",
+          "audience": "Production users"
+        },
+        "characteristics": [
+          "Full security: Sigstore signatures and SLSA provenance",
+          "Automated changelog: release-plz generates release notes from commits",
+          "Promotion-based: Same binaries as beta (and dev)",
+          "crates.io publishing: Automatically published to crates.io",
+          "Long-term support: Stable releases receive security fixes"
+        ],
+        "security_features": [
+          "Sigstore signatures (`.sig` files): Keyless cryptographic signatures",
+          "Signing certificates (`.pem` files): Prove GitHub Actions origin",
+          "SLSA L3 provenance: Attestation of build origin and process",
+          "SBOM: Software bill of materials for dependency transparency"
+        ],
+        "creating_stable_release": [
+          "release-plz runs on every push to `main`",
+          "It creates/updates a release PR with version bumps and changelog",
+          "When the release PR is merged, release-plz creates a version tag",
+          "The tag triggers the release workflow"
+        ]
+      }
+    },
+    "channel_comparison": [
+      { "aspect": "Trigger", "dev": "Auto (merge)", "beta": "Manual", "stable": "Auto (release-plz)" },
+      { "aspect": "Tag style", "dev": "Rolling `dev`", "beta": "`vX.Y.Z-beta.N`", "stable": "`vX.Y.Z`" },
+      { "aspect": "Rebuild", "dev": "Yes (fresh build)", "beta": "No (promoted)", "stable": "No (promoted)" },
+      { "aspect": "Test suite", "dev": "Run before build", "beta": "Inherited", "stable": "Inherited" },
+      { "aspect": "Checksums", "dev": "Yes", "beta": "Yes", "stable": "Yes" },
+      { "aspect": "Signatures", "dev": "No", "beta": "No", "stable": "Yes (Sigstore)" },
+      { "aspect": "SLSA provenance", "dev": "No", "beta": "No", "stable": "Yes (L3)" },
+      { "aspect": "SBOM", "dev": "No", "beta": "No", "stable": "Yes" },
+      { "aspect": "crates.io", "dev": "No", "beta": "No", "stable": "Yes" },
+      { "aspect": "Stability", "dev": "Unstable", "beta": "Pre-release", "stable": "Production-ready" }
+    ],
+    "choosing_a_channel": [
+      { "use_case": "Running in production", "recommended": "Stable" },
+      { "use_case": "Testing upcoming release", "recommended": "Beta" },
+      { "use_case": "Developing APM2 features", "recommended": "Dev" },
+      { "use_case": "AI agent in worktree", "recommended": "Dev" },
+      { "use_case": "Integration testing", "recommended": "Beta or Dev" },
+      { "use_case": "Security-sensitive deployment", "recommended": "Stable (verify signatures)" }
+    ],
+    "workflow_files": [
+      { "workflow": "CI", "file": ".github/workflows/ci.yml", "purpose": "Tests and gates" },
+      { "workflow": "Dev Release", "file": ".github/workflows/dev-release.yml", "purpose": "Dev channel builds" },
+      { "workflow": "Beta Release", "file": ".github/workflows/beta-release.yml", "purpose": "Beta promotion" },
+      { "workflow": "Stable Release", "file": ".github/workflows/release.yml", "purpose": "Stable release + signing" },
+      { "workflow": "Release-plz", "file": ".github/workflows/release-plz.yml", "purpose": "Automated version management" }
+    ]
+  }
+}

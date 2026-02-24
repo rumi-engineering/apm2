@@ -1,0 +1,150 @@
+{
+  "schema": "apm2.release_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "release.document",
+  "meta": {
+    "stable_id": "dcp://apm2.releases/doc/artifact-promotion@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "replaces": "documents/releases/ARTIFACT_PROMOTION.md",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-DOC-GOVERNANCE",
+      "work_id": "TCK-00680-docs-overhaul"
+    }
+  },
+  "payload": {
+    "title": "Artifact Promotion",
+    "overview": "APM2 uses a 'build once, promote twice' model where binary artifacts are built only at the dev stage and promoted unchanged through beta and stable channels.",
+    "promotion_flow": {
+      "description": "PR merged to main -> DEV STAGE -> BETA STAGE -> STABLE STAGE",
+      "stages": [
+        {
+          "name": "DEV STAGE",
+          "actions": [
+            "Build binaries for all platforms",
+            "Run full test suite",
+            "Generate SHA256 checksums",
+            "Create release with `dev` tag"
+          ]
+        },
+        {
+          "name": "BETA STAGE",
+          "trigger": "Manual workflow dispatch",
+          "actions": [
+            "Download artifacts from dev release",
+            "Verify checksums match",
+            "Create release with `vX.Y.Z-beta.N` tag",
+            "NO REBUILD - same bytes as dev"
+          ]
+        },
+        {
+          "name": "STABLE STAGE",
+          "trigger": "release-plz creates tag",
+          "actions": [
+            "Download artifacts from beta release",
+            "Verify checksums match",
+            "Sign with Sigstore (keyless)",
+            "Generate SLSA L3 provenance",
+            "Generate SBOM",
+            "Create release with `vX.Y.Z` tag",
+            "Publish to crates.io",
+            "NO REBUILD - same bytes as beta/dev"
+          ]
+        }
+      ]
+    },
+    "why_promotion": {
+      "consistency": "The exact same bytes that passed all tests in dev reach production users in stable. There is no risk of subtle differences from separate builds.",
+      "speed": "Promotion is fast because there is no compilation. Beta and stable releases complete in seconds, not minutes.",
+      "traceability": "Checksums prove artifact identity across all channels: Dev checksum = Beta checksum = Stable checksum (before signing).",
+      "test_once_trust_everywhere": "Tests run at the dev stage. Since artifacts are promoted unchanged, test results apply to all channels."
+    },
+    "promotion_workflow": {
+      "dev_to_beta": {
+        "trigger": "Maintainer triggers a beta release",
+        "steps": [
+          "Download: Fetch all artifacts from the `dev` release",
+          "Verify: Compare checksums against dev release manifest",
+          "Tag: Create `vX.Y.Z-beta.N` release with same artifacts",
+          "Document: Auto-generate release notes from commits"
+        ]
+      },
+      "beta_to_stable": {
+        "trigger": "release-plz creates a version tag",
+        "steps": [
+          "Download: Fetch all artifacts from the latest beta",
+          "Verify: Compare checksums against beta release manifest",
+          "Sign: Apply Sigstore keyless signatures to all binaries",
+          "Attest: Generate SLSA L3 provenance attestation",
+          "SBOM: Generate software bill of materials",
+          "Release: Create `vX.Y.Z` release with all artifacts",
+          "Publish: Upload crates to crates.io"
+        ]
+      }
+    },
+    "verification": {
+      "checksum_consistency": {
+        "description": "To verify that beta artifacts match dev",
+        "commands": [
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/checksums-sha256.txt && mv checksums-sha256.txt dev-checksums.txt",
+          "curl -LO https://github.com/USER/apm2/releases/download/v0.2.0-beta.1/checksums-sha256.txt && mv checksums-sha256.txt beta-checksums.txt",
+          "diff dev-checksums.txt beta-checksums.txt"
+        ]
+      },
+      "binary_comparison": {
+        "description": "To verify byte-for-byte identity",
+        "commands": [
+          "curl -LO https://github.com/USER/apm2/releases/download/dev/apm2-linux-x86_64 && mv apm2-linux-x86_64 apm2-dev",
+          "curl -LO https://github.com/USER/apm2/releases/download/v0.2.0-beta.1/apm2-linux-x86_64 && mv apm2-linux-x86_64 apm2-beta",
+          "sha256sum apm2-dev apm2-beta"
+        ]
+      }
+    },
+    "artifacts_per_stage": [
+      { "artifact": "Binary executables", "dev": "Built", "beta": "Promoted", "stable": "Promoted" },
+      { "artifact": "checksums-sha256.txt", "dev": "Generated", "beta": "Copied", "stable": "Copied" },
+      { "artifact": "*.sig (signatures)", "dev": "-", "beta": "-", "stable": "Generated" },
+      { "artifact": "*.pem (certificates)", "dev": "-", "beta": "-", "stable": "Generated" },
+      { "artifact": "sbom.spdx.json", "dev": "-", "beta": "-", "stable": "Generated" },
+      { "artifact": "provenance.intoto.jsonl", "dev": "-", "beta": "-", "stable": "Generated" }
+    ],
+    "security_implications": {
+      "build_environment_consistency": [
+        "Single build environment to secure and audit",
+        "Consistent compiler flags across all channels",
+        "Reproducibility concerns limited to one stage"
+      ],
+      "trust_chain": "Tests pass in CI -> Dev build created -> Checksum locks content -> Beta promoted (checksum verified) -> Stable promoted (checksum verified, then signed) -> Users verify signature + provenance",
+      "signing_comparison": [
+        { "property": "Integrity", "checksum_dev_beta": true, "signature_stable": true },
+        { "property": "Origin proof", "checksum_dev_beta": false, "signature_stable": true },
+        { "property": "Tamper evidence", "checksum_dev_beta": "Limited", "signature_stable": "Strong (Rekor log)" },
+        { "property": "Non-repudiation", "checksum_dev_beta": false, "signature_stable": true }
+      ]
+    },
+    "rollback_and_recovery": {
+      "hotfix_flow": [
+        "Fix is merged to `main`",
+        "New dev build is created automatically",
+        "Maintainer promotes to beta for quick testing",
+        "release-plz creates new stable tag",
+        "Hotfix release goes through full promotion chain"
+      ],
+      "skip_beta_emergency": "In extreme cases, a release-plz stable release can be created directly from main without explicit beta testing. This is discouraged but the automation supports it."
+    },
+    "implementation_details": {
+      "artifact_storage": "Artifacts are stored as GitHub Release assets. Each release contains the same set of files, with stable releases having additional signature files.",
+      "workflow_triggers": [
+        { "event": "Push to main", "workflow": "CI + Dev Release", "result": "Tests run, dev release created" },
+        { "event": "Manual dispatch", "workflow": "Beta Release", "result": "Artifacts promoted to beta" },
+        { "event": "release-plz tag", "workflow": "Stable Release", "result": "Artifacts signed and released" }
+      ],
+      "checksum_format": "The checksums-sha256.txt file uses the standard format compatible with `sha256sum -c` for verification."
+    }
+  }
+}

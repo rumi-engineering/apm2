@@ -1,0 +1,427 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00680"
+    title: "Docs overhaul: CAC migration, RFC flattening, schema consolidation, cac-spec relocation, and fac push performance"
+    status: "OPEN"
+    severity: "major"
+    component: "docs/cac"
+    tags: ["docs-overhaul", "cac-migration", "documents", "instruction-specs", "runbooks", "reviews",
+           "releases", "rfc-flatten", "schema-consolidation", "cac-spec", "performance", "fac-push",
+           "agents-json", "behavior-ids"]
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0011"
+    requirements:
+      - "RFC-0011 establishes Context-as-Code as the canonical format for all agent-executable documents."
+      - "fac push end-to-end wall time must be reduced to an acceptable baseline for development iteration velocity."
+    evidence_artifacts: []
+  custody:
+    agent_roles: ["AGENT_DOC_AUTHOR", "AGENT_IMPLEMENTER", "AGENT_REVIEWER"]
+    responsibility_domains: ["DOMAIN_DOCUMENTATION", "DOMAIN_CAC", "DOMAIN_FAC", "DOMAIN_PUSH", "DOMAIN_GITHUB"]
+  dependencies:
+    tickets: []
+  supersedes:
+    - "TCK-00681"
+
+problem_statement: |
+  Two parallel problems drive this ticket:
+
+  1. Document format debt: agent-executable documents are spread across incompatible
+     formats (.md, multi-file YAML, flat JSON) with no consistent CAC envelope. The
+     CAC spec itself (documents/standards/cac/) has no canonical home now that the
+     RFC directory is flattening. Schemas are split across two directories. RFC
+     subdirectories are multi-file YAML when the canonical format is a single
+     .cac.rfc_doc.v1.json per RFC.
+
+  2. fac push performance: `apm2 fac push` is unacceptably slow. The command resolves
+     work binding, pushes to remote, creates or updates a PR, blocks on evidence gates,
+     synchronizes ruleset projection, and dispatches reviews — a pipeline with significant
+     latency that has grown without a dedicated performance pass. No profiling baseline
+     exists. The command is used on every implementation cycle, so its latency directly
+     multiplies agent iteration cost.
+
+scope:
+  in_scope:
+    # ── DOC MIGRATION ─────────────────────────────────────────────────────────
+
+    - id: "DOC-001"
+      title: "Migrate documents/releases/*.md to CAC JSON format"
+      detail: |
+        Convert the four release documents to .cac.json:
+          - ARTIFACT_PROMOTION.md
+          - DISTRIBUTION.md
+          - README.md
+          - RELEASE_CHANNELS.md
+        Update AGENTS.md routing (documents/AGENTS.md) to reference new paths.
+
+    - id: "DOC-002"
+      title: "Migrate documents/reviews/*.md to CAC JSON format"
+      detail: |
+        Convert review prompt documents to .cac.json:
+          - AAT_HYPOTHESIS_PROMPT.md → AAT_HYPOTHESIS_PROMPT.cac.json
+          - REVIEW_GATE_WAIVER_FLOW.md → REVIEW_GATE_WAIVER_FLOW.cac.json
+        Update all cross-document references.
+
+    - id: "DOC-003"
+      title: "Migrate documents/runbooks/*.md to CAC JSON format"
+      detail: |
+        Convert runbook documents to .cac.json:
+          - fac-local-operations.md
+          - fac-systemd-services.md
+
+    - id: "DOC-004"
+      title: "Migrate documents/standards/instructions/*.md to CAC JSON format"
+      detail: |
+        Convert AGENT_INSTRUCTION_AUTHORING_STANDARD.md to .cac.json.
+        This document defines how instructions are authored — it should itself
+        be a canonical CAC artifact.
+
+    - id: "DOC-005"
+      title: "Bring documents/prompts/*.json into full CAC compliance"
+      detail: |
+        The instruction specs in documents/prompts/ already use CAC-like schemas
+        (cac.instruction_spec.v1) but may lack:
+          - canonicalizer block in meta
+          - stable_id / provenance fields
+          - schema_version alignment with current CAC spec
+        Audit each file and align to the current CAC standard. Files:
+          - instruction.abstraction_discovery.v1.json
+          - instruction.alien_coding.v1.json
+          - instruction.alien_engineering_protocol.v1.json
+          - instruction.alien_prompting.v1.json
+          - instruction.alien_security.v1.json
+          - instruction.business_strategy_protocol.v1.json
+          - instruction.rfc_0021_refinement.alien_engineering_protocol.v1.json
+
+    - id: "DOC-006"
+      title: "Audit and remove outdated content across all migrated documents"
+      detail: |
+        For each document migrated, audit for:
+          - References to deprecated APIs, removed subcommands, or old file paths
+          - RFC references to superseded designs
+          - Version numbers, dates, or status fields that are stale
+          - Duplicate or contradictory content already covered by a newer document
+        Remove or correct all stale content identified.
+
+    - id: "DOC-007"
+      title: "Update AGENTS.md routing table to reflect new CAC paths"
+      detail: |
+        After migration, update all AGENTS.md files that reference the migrated
+        documents (especially documents/AGENTS.md and the root AGENTS.md) to
+        point to the new .cac.json paths instead of .md paths.
+        Add replaces: fields in each new .cac.json pointing to the old .md path.
+
+    # ── RFC RESTRUCTURING ─────────────────────────────────────────────────────
+
+    - id: "DOC-008"
+      title: "Flatten documents/rfcs/ to a flat JSON-at-root layout"
+      detail: |
+        Current state (as of 2026-02-24):
+          - RFC-0031 and RFC-0032 are already new-format: each dir contains a single
+            RFC-NNNN.cac.rfc_doc.v1.json file.
+          - RFC-0001 through RFC-0021, RFC-0027 through RFC-0029 are old-format:
+            multi-file YAML split across 00_meta.yaml, 01_..., evidence_artifacts/,
+            requirements/, reviews/, and loose .md appendices.
+          - RFC-0022 through RFC-0026, RFC-0030 are seed stubs (seed.md only).
+          - Several flat JSON files already created and untracked in the worktree:
+            RFC-0011, RFC-0016, RFC-0020, RFC-0031, RFC-0032, RFC-0033.
+
+        Target layout: documents/rfcs/ is a flat directory. Each RFC is a single
+        file named RFC-NNNN.cac.rfc_doc.v1.json at the rfcs/ root. No subdirectories.
+
+        Steps:
+          1. Stage already-created untracked flat JSON files.
+          2. For RFC-0031 and RFC-0032: git rm the subdirectory (flat JSON already at root).
+          3. For each old-format RFC: merge all YAML sections and any notable .md
+             appendices into a single RFC-NNNN.cac.rfc_doc.v1.json. Fold evidence
+             artifacts and requirements into the JSON payload. Remove old directory.
+          4. For seed stubs (RFC-0022 through RFC-0026, RFC-0030): convert seed.md to
+             a minimal RFC-NNNN.cac.rfc_doc.v1.json with status SEED. Remove directory.
+          5. Remove the rfcs/template/ directory (superseded by cac.rfc_doc.v1 schema).
+          6. Update all cross-references in AGENTS.md routing tables.
+
+    # ── SCHEMA CONSOLIDATION ──────────────────────────────────────────────────
+
+    - id: "DOC-009"
+      title: "Consolidate all CAC schemas to documents/schemas/"
+      detail: |
+        Schemas are currently split across two locations:
+          - documents/standards/schemas/ — 9 YAML schemas for work artifacts
+            (tickets, evidence, requirements, gate reviews, PRD/RFC meta, etc.)
+          - documents/standards/cac/schemas/ — 28 JSON schemas for CAC artifacts
+          - documents/rfcs/cac.requirement.v1.schema.json — stray schema at rfcs/ root
+
+        Target: a single canonical schema registry at documents/schemas/ containing
+        all schemas regardless of format, with a MANIFEST.json index.
+
+        Steps:
+          1. Create documents/schemas/ directory.
+          2. git mv all files from documents/standards/cac/schemas/ → documents/schemas/
+          3. git mv all files from documents/standards/schemas/ → documents/schemas/
+          4. Move stray documents/rfcs/cac.requirement.v1.schema.json → documents/schemas/
+          5. Write documents/schemas/MANIFEST.json indexing every schema by schema_id,
+             file, format, and description.
+          6. Update all cross-references (AGENTS.md, CAC volumes, ticket template).
+          7. Remove now-empty documents/standards/cac/schemas/ and
+             documents/standards/schemas/ directories.
+
+    # ── CAC SPEC RELOCATION ───────────────────────────────────────────────────
+
+    - id: "DOC-010"
+      title: "Relocate documents/standards/cac/ bulk content to documents/cac/"
+      detail: |
+        Current state: documents/standards/cac/ contains the expanded CAC
+        specification (volumes, workspace fragments, examples, build artifacts,
+        parallel design options). With schemas moving to documents/schemas/ and
+        RFCs flattening to single-file JSON, this content has no natural home
+        under standards/.
+
+        Target: documents/cac/ — a first-class top-level directory for the CAC
+        specification body, parallel to documents/rfcs/, documents/schemas/, etc.
+
+        Content to move (after schemas are extracted to DOC-009):
+          - documents/standards/cac/MANIFEST.json → documents/cac/MANIFEST.json
+          - documents/standards/cac/MASTER.json   → documents/cac/MASTER.json
+          - documents/standards/cac/volumes/      → documents/cac/volumes/
+          - documents/standards/cac/workspace/    → documents/cac/workspace/
+          - documents/standards/cac/examples/     → documents/cac/examples/
+          - documents/standards/cac/build/        → documents/cac/build/
+          - documents/standards/cac/parallel/     → documents/cac/parallel/
+
+        After move: documents/standards/cac/ is empty and can be removed.
+
+        Update all cross-references: AGENTS.md entries, any standards/schemas
+        that reference the old path, and internal cross-links in the volumes.
+
+    # ── AGENTS.md → CAC JSON MIGRATION ───────────────────────────────────────
+
+    - id: "DOC-011"
+      title: "Migrate all AGENTS.md files to machine-readable CAC JSON with behavior IDs"
+      detail: |
+        Current state: ~50+ AGENTS.md files across the repository (every crate and
+        module has one) are free-form Markdown. They describe module contracts,
+        invariants, public APIs, and agent routing instructions in prose. Code
+        comments sometimes duplicate or cross-reference this prose inline.
+
+        Target: every AGENTS.md is replaced by an AGENTS.json conforming to a new
+        schema (apm2.agents_context.v1). The schema defines machine-readable
+        "behavior IDs" — stable, namespaced identifiers for invariants, contracts,
+        roles, and routing rules. Code comments replace verbose inline explanations
+        with terse behavior ID references (e.g. `// [BEH-FAC-LANE-001]`), and
+        tooling can resolve the full description from AGENTS.json.
+
+        Design decisions (to be finalized in schema design step, see notes):
+          - Behavior IDs are globally unique, namespaced by module path
+            (e.g. BEH-FAC-LANE-001, BEH-CORE-CRYPTO-003)
+          - Each behavior entry has: id, title, kind (invariant | contract |
+            capability | routing_rule | stop_condition), description, and optional
+            traceability links to RFC requirements and ticket IDs
+          - AGENTS.json retains all routing/context-loading instructions from the
+            current AGENTS.md, structured under a routing: key
+          - The root AGENTS.md (context router) becomes AGENTS.json with the full
+            routing_table preserved as structured JSON (it already is JSON inside
+            a .md wrapper)
+          - A new schema file documents/schemas/apm2.agents_context.v1.schema.json
+            defines the format
+
+        Scope of files to migrate (from AGENTS.md map in root AGENTS.md):
+          All ~50 entries in the agents_md_map, including:
+          - Root AGENTS.md (the context router)
+          - All crates/apm2-*/AGENTS.md
+          - All crates/apm2-*/src/**/AGENTS.md
+          - documents/AGENTS.md, documents/theory/AGENTS.md,
+            documents/work/tickets/AGENTS.md
+
+        Steps:
+          1. Finalize apm2.agents_context.v1 schema (separate design step — see notes)
+          2. Write documents/schemas/apm2.agents_context.v1.schema.json
+          3. For each AGENTS.md: convert prose to structured JSON, assign behavior
+             IDs to each invariant/contract/capability, preserve all routing rules
+          4. Replace each AGENTS.md with AGENTS.json in the same directory
+          5. Update all cross-references that use AGENTS.md paths
+          6. Update the agents_md_map in root AGENTS.json to reference .json paths
+          7. Optionally: add a thin AGENTS.md shim in each dir that says
+             "see AGENTS.json" if human-readable fallback is desired — but
+             default-deny: remove .md unless there is a concrete reason to keep it
+
+    # ── FAC PUSH PERFORMANCE ─────────────────────────────────────────────────
+
+    - id: "PERF-001"
+      title: "Instrument fac push with wall-time spans for each major phase"
+      detail: |
+        Add structured timing instrumentation (tracing spans or explicit wall-clock
+        measurements emitted to stderr/log) covering each phase:
+          - work binding resolution (daemon IPC)
+          - git push to remote
+          - PR create/update (GitHub API)
+          - ruleset projection sync (GitHub API)
+          - evidence gate blocking loop
+          - review dispatch
+        Establish a reproducible baseline before making any changes.
+
+    - id: "PERF-002"
+      title: "Parallelize independent GitHub API calls"
+      detail: |
+        Audit the push pipeline for GitHub API calls that are currently sequential
+        but have no data dependency on each other. Candidates include:
+          - ruleset sync and PR body update happening sequentially
+          - status check reads that could be batched or pipelined
+        Convert independent calls to concurrent tokio tasks (join! / FuturesUnordered).
+
+    - id: "PERF-003"
+      title: "Eliminate or bound unnecessary sleeps and polling intervals"
+      detail: |
+        Audit all `tokio::time::sleep`, poll loops, and retry backoff sequences in
+        the push path (push.rs, readiness.rs, lifecycle.rs, github_projection.rs).
+        For each:
+          - replace fixed sleeps with event-driven waits where possible
+          - tighten poll intervals to the minimum safe value
+          - cap retry counts and surface timeouts as errors rather than hanging
+
+    - id: "PERF-004"
+      title: "Parallelize work binding resolution with git push"
+      detail: |
+        Work binding resolution (daemon IPC round-trip) and `git push` are likely
+        independent. If binding resolution does not need to complete before the
+        push, issue both concurrently and join before the PR step.
+
+    - id: "PERF-005"
+      title: "Cache GitHub App token across push sub-operations"
+      detail: |
+        If a new installation token is fetched for each GitHub API call within a
+        single push invocation, consolidate to a single token fetch at startup and
+        thread it through. Token exchange adds 200-500ms per call.
+
+    - id: "PERF-006"
+      title: "Establish a push latency regression gate"
+      detail: |
+        After the optimizations land, add a timing assertion (or bench harness entry
+        under `apm2 fac bench`) that fails if fac push wall time on a no-op
+        (already-up-to-date) invocation exceeds a defined threshold. Prevents
+        silent regression.
+
+  out_of_scope:
+    - "Converting RFC content — only structure and format change, not substance"
+    - "Migrating SKILL.md files and their references/ directories — skills use a distinct SKILL.md format by design"
+    - "Migrating root-level human-readable docs (README.md, DAEMON.md, SECURITY.md, AGENTS.md) — these serve onboarding and remain as markdown"
+    - "Changes to FAC gate execution time (gate jobs run inside sandboxed lanes — separate concern)"
+    - "GitHub Actions CI runtime improvements"
+    - "Network latency between the compute host and GitHub API (infrastructure concern)"
+    - "Any behavioral changes to fac push semantics, evidence binding, or security invariants"
+    - "Any Rust code changes outside the fac push performance items"
+
+  affected_paths:
+    - "documents/releases/"
+    - "documents/reviews/"
+    - "documents/runbooks/"
+    - "documents/standards/instructions/"
+    - "documents/prompts/"
+    - "documents/rfcs/"
+    - "documents/schemas/  (new — canonical schema registry)"
+    - "documents/cac/  (new — canonical CAC spec body)"
+    - "documents/standards/cac/  (to be fully removed after DOC-009 + DOC-010)"
+    - "documents/standards/schemas/  (to be removed after DOC-009)"
+    - "documents/AGENTS.md"
+    - "AGENTS.md"
+    - "crates/apm2-cli/src/commands/fac_review/push.rs"
+    - "crates/apm2-cli/src/commands/fac_review/prepare.rs"
+    - "crates/apm2-cli/src/commands/fac_review/lifecycle.rs"
+    - "crates/apm2-cli/src/commands/fac_review/readiness.rs"
+    - "crates/apm2-cli/src/commands/fac_review/github_projection.rs"
+    - "crates/apm2-cli/src/commands/fac_review/github_reads.rs"
+    - "crates/apm2-cli/src/commands/fac_review/github_auth.rs"
+    - "AGENTS.md → AGENTS.json  (all ~50 locations — see agents_md_map in root AGENTS.md)"
+    - "documents/schemas/apm2.agents_context.v1.schema.json  (new)"
+
+plan:
+  steps:
+    - step: 1
+      action: "Audit each in-scope document for stale content and establish a migration checklist"
+    - step: 2
+      action: "Migrate documents/releases/*.md to .cac.json (DOC-001)"
+    - step: 3
+      action: "Migrate documents/reviews/*.md to .cac.json (DOC-002)"
+    - step: 4
+      action: "Migrate documents/runbooks/*.md to .cac.json (DOC-003)"
+    - step: 5
+      action: "Migrate documents/standards/instructions/AGENT_INSTRUCTION_AUTHORING_STANDARD.md to .cac.json (DOC-004)"
+    - step: 6
+      action: "Align documents/prompts/*.json canonicalizer and provenance blocks (DOC-005)"
+    - step: 7
+      action: "Flatten documents/rfcs/: stage untracked JSONs, git rm subdirs, convert seeds, remove template (DOC-008)"
+    - step: 8
+      action: "Create documents/schemas/, move all schemas from both source locations + stray file, write MANIFEST.json (DOC-009)"
+    - step: 9
+      action: "Create documents/cac/, git mv bulk CAC spec content from documents/standards/cac/ (DOC-010)"
+    - step: 10
+      action: "Update all AGENTS.md routing references to new paths (DOC-007)"
+    - step: 11
+      action: "Finalize apm2.agents_context.v1 schema design; write documents/schemas/apm2.agents_context.v1.schema.json (DOC-011 prerequisite)"
+    - step: 12
+      action: "Convert all ~50 AGENTS.md files to AGENTS.json; assign behavior IDs; remove .md files (DOC-011)"
+    - step: 13
+      action: "Instrument fac push with per-phase wall-time spans; record P50/P95 baseline (PERF-001)"
+    - step: 12
+      action: "Parallelize independent GitHub API calls (PERF-002)"
+    - step: 13
+      action: "Audit and tighten all sleep/poll loops (PERF-003)"
+    - step: 14
+      action: "Parallelize work binding + git push if safe (PERF-004)"
+    - step: 15
+      action: "Consolidate GitHub App token fetch (PERF-005)"
+    - step: 16
+      action: "Add latency regression gate to fac bench (PERF-006)"
+    - step: 17
+      action: "Update root AGENTS.json agents_md_map to reference all .json paths; verify no AGENTS.md references remain (DOC-011)"
+    - step: 18
+      action: "Re-run baseline; confirm fac push improvement; verify no broken cross-references (grep for old paths)"
+
+definition_of_done:
+  evidence_ids: []
+  criteria:
+    # Docs migration
+    - "All in-scope .md files have .cac.json replacements with schema, meta (stable_id, canonicalizer, provenance), and payload blocks"
+    - "Each migrated .cac.json includes replaces: pointing to the old .md path"
+    - "All documents/prompts/*.json pass audit: have stable_id, canonicalizer, and provenance fields"
+    - "No stale version numbers, removed CLI subcommands, or superseded RFC references remain in migrated docs"
+    # RFC flattening
+    - "documents/rfcs/ is flat: only RFC-NNNN.cac.rfc_doc.v1.json files, no subdirectories"
+    # Schema consolidation
+    - "documents/schemas/ exists and contains all schemas from both former locations plus the stray rfcs/ schema; MANIFEST.json indexes them"
+    - "documents/standards/cac/schemas/ and documents/standards/schemas/ are removed"
+    # CAC spec relocation
+    - "documents/cac/ exists with MASTER.json, volumes/, workspace/, examples/, build/, parallel/"
+    - "documents/standards/cac/ is fully removed"
+    # Cross-reference hygiene
+    - "All AGENTS.md routing tables updated to new paths"
+    - "grep for old paths (rfcs/RFC-NNNN/, standards/cac/, standards/schemas/) returns no active cross-references"
+    # AGENTS.json migration
+    - "apm2.agents_context.v1.schema.json exists in documents/schemas/"
+    - "All ~50 AGENTS.md files replaced by AGENTS.json conforming to the schema"
+    - "Every invariant/contract/capability in each AGENTS.json has a stable behavior ID"
+    - "No AGENTS.md files remain (or any kept have explicit justification in the ticket)"
+    - "Root AGENTS.json agents_md_map references .json paths for all entries"
+    # fac push performance
+    - "Baseline wall-time measurement exists for each fac push phase (pre-optimization)"
+    - "Post-optimization wall-time shows statistically significant improvement"
+    - "All existing fac push behavioral tests pass (no semantic regression)"
+    - "No new fixed sleeps introduced; all polling loops have documented rationale and bounded retries"
+    - "Latency regression gate added to fac bench harness or test suite"
+
+notes:
+  security: "default-deny, least privilege, fail-closed"
+  context: |
+    CAC format reference: documents/security/SECURITY_POLICY.cac.json
+    CAC spec (to be relocated): documents/standards/cac/ → documents/cac/
+    CAC standard: RFC-0011
+    Schema sources: documents/standards/cac/schemas/ (28 JSON), documents/standards/schemas/ (9 YAML)
+    fac push implementation: crates/apm2-cli/src/commands/fac_review/push.rs (~6200 lines)
+    CLI surface: apm2 fac push — resolves work binding, git push, PR create/update,
+      ruleset projection sync, evidence gate blocking, review dispatch.
+    Performance work must not relax any FAC security invariants or evidence binding guarantees.
+    Supersedes: TCK-00681 (fac push performance — merged into this ticket 2026-02-24)
+    Schema design for DOC-011 (apm2.agents_context.v1) is a prerequisite step that
+    must be finalized before AGENTS.md conversion begins. Schema design is tracked
+    as a collaborative design session, not a code change.
