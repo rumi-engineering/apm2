@@ -25,6 +25,18 @@ fn test_deterministic_ordering() {
 }
 
 #[test]
+fn one_shot_worker_skips_background_runtime_primitives() {
+    assert!(
+        !should_start_background_runtime(true),
+        "one-shot worker must not start long-lived watcher/watchdog runtime"
+    );
+    assert!(
+        should_start_background_runtime(false),
+        "continuous worker mode must retain watcher/watchdog runtime"
+    );
+}
+
+#[test]
 fn test_read_bounded_rejects_oversized() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file_path = dir.path().join("big.json");

@@ -23,6 +23,7 @@ delivery_notes:
     - "Baseline ledger-backed FAC job lifecycle events and reconciler plumbing have landed."
     - "Filesystem queue is now treated as a witnessed cache in the main execution path."
     - "Worker terminal queue transitions now retain claimed-lock ownership until commit completes, preventing cross-worker re-claim races during terminalization."
+    - "Inline one-shot worker fallback now skips long-lived queue watcher/watchdog runtime primitives, preventing inotify/thread accumulation (`EMFILE`) during repeated `fac push` retry cycles."
   remaining_focus:
     - "Operational wiring hardening (doctor/fix orchestration, stale-runtime detection, bounded reconciler guarantees under restart churn)."
     - "Final removal/deprecation path for manual/legacy queue repair entrypoints that conflict with ledger-authoritative behavior."

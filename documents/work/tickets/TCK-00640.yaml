@@ -36,6 +36,7 @@ ticket_meta:
     - Ensure migration fallback fails closed on ambiguous lease bindings and invalid empty bindings
     - Keep lease fallback lookup bounded and indexed (`work_claims.lease_id`) to avoid unbounded scans
     - Stream periodic progress diagnostics during `apm2 fac push` gate execution and publication steps
+    - Prevent one-shot inline worker fallback cycles from spawning persistent queue watcher/watchdog threads so `fac push` cannot leak inotify instances/threads under retries
     - Run authoritative PR-association compatibility preflight before expensive gate execution (fail fast on work_id/PR conflicts)
     - Preserve queue claim lock ownership through terminal transition commit paths so no second worker can re-claim mid-transition
     - Enforce case-insensitive `(work_id, pr_number, commit_sha)` uniqueness for `work.pr_associated` in both legacy and canonical sqlite schemas
@@ -53,6 +54,7 @@ ticket_meta:
     - Keep claimed lock file descriptor held until terminal queue mutation finishes
     - Harden PR-association tuple dedupe/indexes to normalize commit SHA case
     - Add/maintain regression tests for idempotent push replay and lease-mapping recovery in publication closures
+    - Keep one-shot worker runtime minimal (no long-lived background watcher/watchdog) to avoid EMFILE under repeated inline fallback cycles
   implementation_status:
     completed_in_this_pr:
     - "`apm2 fac push` requires canonical work binding for publication paths and enforces IMPLEMENTER_TERMINAL publication on every push attempt."
@@ -69,6 +71,7 @@ ticket_meta:
     - "Worker claimed-lock handling now retains the lock through terminal queue transition to close TOCTOU re-claim races."
     - "`work.pr_associated` tuple uniqueness now normalizes commit SHA case via case-insensitive partial unique indexes for both legacy and canonical sqlite event tables."
     - "Gates/warm pipeline-commit failures now stay fail-closed in `claimed/` for reconcile recovery (no authority-token requeue replay loops)."
+    - "One-shot worker cycles (`run_fac_worker(..., once=true)`) now skip queue watcher and watchdog thread startup, preventing in-process thread/inotify accumulation during inline `fac push` fallback."
   remaining_focus:
     - "Closure protocol: run `apm2 fac push` against active branch and iterate on reviewer findings until merge."
   verification_matrix:
@@ -83,6 +86,7 @@ ticket_meta:
     - "`cargo test -p apm2-daemon sqlite_lease_validator_ -- --nocapture`"
     - "`cargo test -p apm2-daemon sqlite_work_registry_schema_creates_lease_lookup_index -- --nocapture`"
     - "`cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture`"
+    - "`cargo test -p apm2-cli one_shot_worker_skips_background_runtime_primitives -- --nocapture`"
     - "`cargo test -p apm2-daemon tck_00639_work_pr_associated_unique_constraint_is_case_insensitive -- --nocapture`"
     - "`cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture`"
     full_package:
@@ -98,6 +102,7 @@ ticket_meta:
     - Projection-backed work identity recovery no longer fails on extension fields in current session envelopes.
     - CLI does not emit work transitions; CI/system actors remain the only sources of CI transitions.
     - Queue terminal transitions are serialized by retaining the claimed lock until transition commit completion.
+    - One-shot inline worker fallback cannot leak long-lived watcher/watchdog runtime primitives across retries.
     - PR association idempotency is robust to commit SHA case variants in both legacy and canonical ledger storage.
   notes:
     verification: Add a smoke test script that runs fac push on a dummy repo and confirms evidence markers exist via doctor/projection query.
