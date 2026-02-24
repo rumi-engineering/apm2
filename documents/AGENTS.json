@@ -17,13 +17,6 @@
       "rfc": ["RFC-0011"]
     },
     {
-      "id": "BEH-DOC-003",
-      "kind": "requirement",
-      "title": "Tickets use TCK-NNNNN.yaml single-file format",
-      "description": "Each ticket is a single YAML file containing all metadata, scope, plan, and criteria. No separate markdown files.",
-      "rfc": ["RFC-0011"]
-    },
-    {
       "id": "BEH-DOC-005",
       "kind": "requirement",
       "title": "Skills follow SKILL.md agent-native executable specification format",

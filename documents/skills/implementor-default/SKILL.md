@@ -51,31 +51,22 @@ decision_tree:
             Resolve scope using the following priority order. Do not guess; fail closed if
             no path resolves.
 
-            (a) JSON-backed ticket ($1 is a TCK alias or a ticket file exists at
-                `documents/work/tickets/$1.json`):
-                Read the full YAML file. The ticket structure is authoritative for:
-                binds (requirements + evidence artifacts), scope.in_scope (delivery
-                contract), scope.out_of_scope (hard boundary), and
-                definition_of_done.criteria (completion checklist).
-                Also run `apm2 fac work current` to confirm the daemon has a live
-                work object for this alias.
-
-            (b) Daemon-only work object ($1 is a canonical work_id starting with `W-`,
-                or a TCK alias that resolves via daemon but has no YAML file):
+            (a) Daemon work object ($1 is a canonical work_id starting with `W-`,
+                or a TCK alias that resolves via daemon):
                 Run `apm2 fac work current` (or `apm2 work status <work_id>`) to
                 retrieve the daemon-projected WorkSpecV1. Derive scope from
                 WorkSpecV1.title, .summary, .requirement_ids, and .rfc_id fields.
-                Read referenced requirement files directly from the repo using the
-                requirement_ids list. There is no YAML file to read.
+                Read referenced requirement nodes directly from the RFC JSON files
+                using the requirement_ids list.
 
-            (c) PR number provided ($1 looks like a PR number):
+            (b) PR number provided ($1 looks like a PR number):
                 Extract the work_id or ticket alias from the branch name or PR
-                description, then resolve via (a) or (b) above.
+                description, then resolve via (a) above.
 
-            (d) Nothing resolves: STOP with BLOCKED. State which resolution paths
+            (c) Nothing resolves: STOP with BLOCKED. State which resolution paths
                 were attempted and what each returned. Do not infer scope from the
                 branch name alone. Remediation: operator must create a canonical
-                work object first via `apm2 fac work open --from-ticket <json_path> --lease-id <lease_id>`.
+                work object first via `apm2 fac work open --from-ticket <work-scope.json> --lease-id <lease_id>`.
 
             In all cases: note custody.responsibility_domains —
             DOMAIN_SECURITY or DOMAIN_AUTHN_AUTHZ trigger mandatory fail-closed
