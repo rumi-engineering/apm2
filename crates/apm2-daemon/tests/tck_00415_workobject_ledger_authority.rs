@@ -49,6 +49,49 @@ fn emit_transition(
         .expect("work transition should persist");
 }
 
+fn emit_changeset_published(
+    emitter: &dyn LedgerEventEmitter,
+    work_id: &str,
+    changeset_digest: [u8; 32],
+    timestamp_ns: u64,
+) {
+    emitter
+        .emit_changeset_published(
+            work_id,
+            &changeset_digest,
+            &[0xCD; 32],
+            "actor:claimability",
+            timestamp_ns,
+        )
+        .expect("changeset_published should persist");
+}
+
+fn emit_gate_receipt_collected(
+    emitter: &dyn LedgerEventEmitter,
+    work_id: &str,
+    changeset_digest: [u8; 32],
+    timestamp_ns: u64,
+) {
+    let payload_envelope = serde_json::json!({
+        "payload": "",
+        "work_id": work_id,
+        "changeset_digest": hex::encode(changeset_digest),
+        "receipt_id": format!("receipt-{work_id}"),
+        "gate_type": "quality",
+    });
+
+    // Use work_id as session_id so envelope binding matches payload (CSID-004).
+    emitter
+        .emit_session_event_with_envelope(
+            work_id,
+            "gate.receipt_collected",
+            &payload_envelope,
+            "system:gate",
+            timestamp_ns,
+        )
+        .expect("gate receipt should persist");
+}
+
 fn status_snapshot(projection: &WorkObjectProjection) -> Vec<(String, String, u32)> {
     projection
         .list_work()
@@ -238,6 +281,7 @@ fn test_claimability_from_projection_only() {
     let emitter = Arc::new(apm2_daemon::protocol::StubLedgerEventEmitter::new());
     let authority =
         ProjectionWorkAuthority::new(Arc::clone(&emitter) as Arc<dyn LedgerEventEmitter>);
+    let digest_w2 = [0x42; 32];
 
     // Non-claimable work (CLAIMED).
     emit_transition(
@@ -281,6 +325,18 @@ fn test_claimability_from_projection_only() {
         2,
         "actor:claimability",
         1_000_000_300,
+    );
+    emit_changeset_published(
+        emitter.as_ref(),
+        "W-CLAIMABILITY-002",
+        digest_w2,
+        1_000_000_325,
+    );
+    emit_gate_receipt_collected(
+        emitter.as_ref(),
+        "W-CLAIMABILITY-002",
+        digest_w2,
+        1_000_000_350,
     );
     emit_transition(
         emitter.as_ref(),

@@ -52,7 +52,7 @@ use crate::episode::{
 use crate::evidence::keychain::{
     GitHubCredentialStore, KeychainError, MAX_SSH_AUTH_SOCK_LEN, MAX_TOKEN_SIZE, SshCredentialStore,
 };
-use crate::gate::{GateOrchestrator, MergeExecutor};
+use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor};
 use crate::governance::{
     GovernanceFreshnessConfig, GovernanceFreshnessMonitor, GovernancePolicyResolver,
 };
@@ -546,6 +546,10 @@ pub struct DispatcherState {
     session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
 
     /// Gate execution orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`]. Session termination only
+    /// triggers timeout polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
 
     /// Merge executor for autonomous merge after gate approval (TCK-00390).
@@ -1958,11 +1962,19 @@ impl DispatcherState {
     }
 
     /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// Gate start is publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`]. Session termination only
+    /// triggers lifecycle polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     #[must_use]
     pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
-        // Wire orchestrator into privileged dispatcher so PublishChangeSet can
-        // start gate lifecycle from authoritative changeset identity and
-        // DelegateSublease can issue strict-subset subleases.
+        // Wire orchestrator into session dispatcher so termination triggers
+        // gate lifecycle directly from the session dispatch path (Security
+        // BLOCKER 1 fix).
+        self.session_dispatcher
+            .set_gate_orchestrator(Arc::clone(&orchestrator));
+        // Wire orchestrator into privileged dispatcher so DelegateSublease
+        // can access the orchestrator for sublease issuance (Quality BLOCKER 4 fix).
         self.privileged_dispatcher = self
             .privileged_dispatcher
             .with_gate_orchestrator(Arc::clone(&orchestrator));
@@ -2030,6 +2042,23 @@ impl DispatcherState {
     #[must_use]
     pub const fn divergence_watchdog(&self) -> Option<&Arc<DivergenceWatchdog<SystemTimeSource>>> {
         self.divergence_watchdog.as_ref()
+    }
+
+    /// Polls lifecycle progression for active gate orchestrations.
+    ///
+    /// This is the production entry point that wires the
+    /// `GateOrchestrator` lifecycle polling into the daemon runtime.
+    /// It checks for timeout progression on already-active orchestrations.
+    /// Gate start is exclusively publication-driven via
+    /// [`GateOrchestrator::start_for_changeset`] (CSID-003).
+    ///
+    /// The caller is responsible for persisting the returned events to the
+    /// ledger.
+    ///
+    /// Returns `None` if no gate orchestrator is configured.
+    pub async fn poll_gate_lifecycle(&self) -> Option<Vec<GateOrchestratorEvent>> {
+        let orch = self.gate_orchestrator.as_ref()?;
+        Some(orch.poll_session_lifecycle().await)
     }
 
     /// Returns a reference to the privileged dispatcher.

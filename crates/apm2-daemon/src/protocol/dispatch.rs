@@ -1409,7 +1409,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Records a work item state transition in the ledger, enabling the FAC
     /// CLI (`apm2 fac work status`) to observe work lifecycle state changes
-    /// and downstream lifecycle automation to track state progression.
+    /// and the `GateOrchestrator` (TCK-00388) to trigger gate lifecycle.
     ///
     /// # Arguments
     ///
@@ -1437,8 +1437,9 @@ pub trait LedgerEventEmitter: Send + Sync {
 
     /// Emits a signed `SessionTerminated` event to the ledger (TCK-00395).
     ///
-    /// Records session termination in the ledger for lifecycle/accounting
-    /// observability.
+    /// Records session termination in the ledger, enabling the
+    /// `GateOrchestrator` (TCK-00388) to trigger gate lifecycle after
+    /// session completion.
     ///
     /// # Arguments
     ///
@@ -1735,7 +1736,8 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting session termination events to the
-/// ledger for lifecycle/accounting observability.
+/// ledger, enabling the `GateOrchestrator` to trigger gate lifecycle
+/// after session completion.
 ///
 /// # Note
 ///
@@ -4776,44 +4778,14 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        let canonical_from_state =
-            apm2_core::work::helpers::normalize_work_state_label(transition.from_state)
-                .ok_or_else(|| LedgerEventError::ValidationFailed {
-                    message: format!(
-                        "invalid from_state '{}' for work_transitioned payload",
-                        transition.from_state
-                    ),
-                })?;
-        let canonical_to_state = apm2_core::work::helpers::normalize_work_state_label(
-            transition.to_state,
-        )
-        .ok_or_else(|| LedgerEventError::ValidationFailed {
-            message: format!(
-                "invalid to_state '{}' for work_transitioned payload",
-                transition.to_state
-            ),
-        })?;
-
-        let reducer_payload = apm2_core::work::helpers::work_transitioned_payload_with_sequence(
-            transition.work_id,
-            canonical_from_state,
-            canonical_to_state,
-            transition.rationale_code,
-            transition.previous_transition_count,
-        );
-
-        // Transitional event envelope for `work_transitioned`.
-        // The projection layer now requires reducer protobuf payload wrapped in
-        // session-envelope JSON; legacy raw transition JSON is no longer valid.
-        // SECURITY: timestamp_ns remains in signed payload to prevent temporal
-        // malleability per LAW-09 (Temporal Pinning & Freshness).
+        // Build payload as JSON with work transition data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness)
         let payload_json = serde_json::json!({
             "event_type": "work_transitioned",
-            "session_id": transition.work_id,
-            "payload": hex::encode(&reducer_payload),
             "work_id": transition.work_id,
-            "from_state": canonical_from_state,
-            "to_state": canonical_to_state,
+            "from_state": transition.from_state,
+            "to_state": transition.to_state,
             "rationale_code": transition.rationale_code,
             "previous_transition_count": transition.previous_transition_count,
             "actor_id": transition.actor_id,
@@ -8289,17 +8261,12 @@ pub struct PrivilegedDispatcher {
     /// V1 scope checks in `handle_request_tool`.
     v1_manifest_store: Option<crate::protocol::session_dispatch::SharedV1ManifestStore>,
 
-    /// Gate orchestrator for FAC gate lifecycle wiring.
+    /// Gate orchestrator for sublease delegation (TCK-00340).
     ///
-    /// When present:
-    /// - `PublishChangeSet` starts gate lifecycle from authoritative
-    ///   `changeset_published` identity.
-    /// - `DelegateSublease` delegates signed sublease issuance with
-    ///   strict-subset validation.
-    ///
-    /// `DelegateSublease` fails closed when this is unset. `PublishChangeSet`
-    /// currently degrades to no-op gate start in test-only wiring where the
-    /// orchestrator is intentionally absent.
+    /// When present, `DelegateSublease` delegates to the orchestrator to
+    /// issue signed subleases with strict-subset validation. When `None`,
+    /// the handler returns an error indicating the orchestrator is not
+    /// configured.
     gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
 
     /// PCAC lifecycle gate for privileged authority-bearing handlers
@@ -10005,7 +9972,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the gate orchestrator for FAC gate lifecycle wiring.
+    /// Sets the gate orchestrator for sublease delegation (TCK-00340).
     #[must_use]
     pub fn with_gate_orchestrator(
         mut self,
@@ -17781,6 +17748,15 @@ impl PrivilegedDispatcher {
                 .iter()
                 .map(Self::dependency_diagnostic_to_proto)
                 .collect(),
+            // STEP_10: FAC identity chain surface fields.
+            // Populated from WorkAuthorityStatus when available.
+            latest_changeset_digest: authority_status.latest_changeset_digest.map(hex::encode),
+            changeset_published_event_id: authority_status.changeset_published_event_id.clone(),
+            bundle_cas_hash: authority_status.bundle_cas_hash.map(hex::encode),
+            gate_status: authority_status.gate_status.clone(),
+            review_status: authority_status.review_status.clone(),
+            merge_status: authority_status.merge_status.clone(),
+            identity_chain_defect_count: authority_status.identity_chain_defect_count,
         };
 
         let mut derived_adhoc_session_id: Option<String> = None;
@@ -19853,33 +19829,22 @@ impl PrivilegedDispatcher {
         };
 
         let changeset_digest_hex = hex::encode(computed_changeset_digest);
-        if let Some((replay_event_id, replay_cas_hash, replay_timestamp_ns)) =
+        if let Some((event_id, persisted_cas_hash)) =
             self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
         {
-            if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
-                &request.work_id,
-                computed_changeset_digest,
-                &replay_event_id,
-                replay_timestamp_ns,
-            ) {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("gate lifecycle start failed for replayed changeset: {error}"),
-                ));
-            }
             debug!(
                 work_id = %request.work_id,
                 changeset_digest = %changeset_digest_hex,
-                event_id = %replay_event_id,
+                event_id = %event_id,
                 "Idempotent replay ({INV_FAC_WORK_BIND_001}): returning existing \
                  ChangeSetPublished event"
             );
             return Ok(PrivilegedResponse::PublishChangeSet(
                 PublishChangeSetResponse {
                     changeset_digest: changeset_digest_hex,
-                    cas_hash: replay_cas_hash,
+                    cas_hash: persisted_cas_hash,
                     work_id: request.work_id,
-                    event_id: replay_event_id,
+                    event_id,
                 },
             ));
         }
@@ -19925,26 +19890,15 @@ impl PrivilegedDispatcher {
             Err(e) => {
                 // Race-safe idempotency fallback: if another writer persisted the
                 // same semantic event concurrently, replay the persisted binding.
-                if let Some((replay_event_id, replay_cas_hash, replay_timestamp_ns)) =
+                if let Some((event_id, persisted_cas_hash)) =
                     self.find_changeset_published_replay(&request.work_id, &changeset_digest_hex)
                 {
-                    if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
-                        &request.work_id,
-                        computed_changeset_digest,
-                        &replay_event_id,
-                        replay_timestamp_ns,
-                    ) {
-                        return Ok(PrivilegedResponse::error(
-                            PrivilegedErrorCode::CapabilityRequestRejected,
-                            format!("gate lifecycle start failed for replayed changeset: {error}"),
-                        ));
-                    }
                     return Ok(PrivilegedResponse::PublishChangeSet(
                         PublishChangeSetResponse {
                             changeset_digest: changeset_digest_hex,
-                            cas_hash: replay_cas_hash,
+                            cas_hash: persisted_cas_hash,
                             work_id: request.work_id,
-                            event_id: replay_event_id,
+                            event_id,
                         },
                     ));
                 }
@@ -19964,18 +19918,6 @@ impl PrivilegedDispatcher {
             "ChangeSetPublished: bundle stored in CAS and event emitted to ledger"
         );
 
-        if let Err(error) = self.start_gate_lifecycle_for_published_changeset(
-            &request.work_id,
-            computed_changeset_digest,
-            &signed_event.event_id,
-            timestamp_ns,
-        ) {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("gate lifecycle start failed for published changeset: {error}"),
-            ));
-        }
-
         Ok(PrivilegedResponse::PublishChangeSet(
             PublishChangeSetResponse {
                 changeset_digest: changeset_digest_hex,
@@ -19990,102 +19932,18 @@ impl PrivilegedDispatcher {
     /// `changeset_published` event.
     ///
     /// Matching key: `(work_id, changeset_digest)`. Response values are the
-    /// authoritative persisted `event_id`, `cas_hash`, and `timestamp_ns`.
+    /// authoritative persisted `event_id` and `cas_hash`.
     fn find_changeset_published_replay(
         &self,
         work_id: &str,
         changeset_digest_hex: &str,
-    ) -> Option<(String, String, u64)> {
+    ) -> Option<(String, String)> {
         let event = self
             .event_emitter
             .get_event_by_changeset_identity(work_id, changeset_digest_hex)?;
         let payload = serde_json::from_slice::<serde_json::Value>(&event.payload).ok()?;
         let persisted_cas_hash = payload.get("cas_hash")?.as_str()?.to_string();
-        // Legacy/malformed payload compatibility: timestamp_ns may be absent
-        // in persisted JSON while still present on the signed event record.
-        // Prefer payload field when available, otherwise fall back to the
-        // canonical event timestamp.
-        let timestamp_ns = payload
-            .get("timestamp_ns")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(event.timestamp_ns);
-        Some((event.event_id, persisted_cas_hash, timestamp_ns))
-    }
-
-    fn start_gate_lifecycle_for_published_changeset(
-        &self,
-        work_id: &str,
-        changeset_digest: [u8; 32],
-        source_event_id: &str,
-        source_timestamp_ns: u64,
-    ) -> Result<(), String> {
-        let Some(orchestrator) = &self.gate_orchestrator else {
-            debug!(
-                work_id = %work_id,
-                "Gate orchestrator not configured; skipping gate lifecycle start"
-            );
-            return Ok(());
-        };
-
-        // Preserve authoritative source timestamp for both fresh publications
-        // and replay candidates. Replay classification must happen before
-        // freshness inside the orchestrator, but stale replays must still be
-        // rejected when replay identity cache is no longer present.
-        let gate_start_timestamp_ms = source_timestamp_ns / 1_000_000;
-        let gate_start = crate::gate::GateStartInfo {
-            source_event_id: source_event_id.to_string(),
-            work_id: work_id.to_string(),
-            changeset_digest,
-            source_timestamp_ms: gate_start_timestamp_ms,
-        };
-
-        let start_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
-                handle.block_on(orchestrator.start_for_changeset(gate_start))
-            })
-        } else {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    format!("failed to create tokio runtime for gate orchestration: {e}")
-                })?;
-            runtime.block_on(orchestrator.start_for_changeset(gate_start))
-        };
-
-        let events = match start_result {
-            Ok((_gate_types, _executor_signers, events)) => events,
-            Err(crate::gate::GateOrchestratorError::ReplayDetected { .. }) => {
-                debug!(
-                    work_id = %work_id,
-                    source_event_id = %source_event_id,
-                    "Gate orchestration already started for this changeset"
-                );
-                return Ok(());
-            },
-            Err(error) => {
-                return Err(format!(
-                    "gate orchestrator rejected changeset start: {error}"
-                ));
-            },
-        };
-
-        for event in &events {
-            let fields = crate::gate::gate_event_persistence_fields(event);
-            let payload = serde_json::to_vec(event)
-                .map_err(|e| format!("failed to serialize gate orchestration event: {e}"))?;
-            self.event_emitter
-                .emit_session_event(
-                    work_id,
-                    fields.event_type,
-                    &payload,
-                    "orchestrator:gate-lifecycle",
-                    fields.timestamp_ns,
-                )
-                .map_err(|e| format!("failed to persist gate orchestration event: {e}"))?;
-        }
-
-        Ok(())
+        Some((event.event_id, persisted_cas_hash))
     }
 
     // =========================================================================
@@ -28838,6 +28696,18 @@ mod tests {
                     timestamp_ns: 1_000_000_100,
                 })
                 .expect("transition Claimed->InProgress should persist");
+            // CSID-004: A published changeset must exist before the projection
+            // admits an InProgress -> Review transition (fail-closed guard).
+            dispatcher
+                .event_emitter
+                .emit_changeset_published(
+                    "W-REVIEW-STATE-001",
+                    &[0x42; 32],
+                    &[0xCA; 32],
+                    "actor:implementer",
+                    1_000_000_150,
+                )
+                .expect("changeset_published should persist");
             dispatcher
                 .event_emitter
                 .emit_work_transitioned(&WorkTransition {
@@ -31304,8 +31174,8 @@ mod tests {
             let payload: serde_json::Value =
                 serde_json::from_slice(&event.payload).expect("valid JSON payload");
             assert_eq!(payload["event_type"], "work_transitioned");
-            assert_eq!(payload["from_state"], "OPEN");
-            assert_eq!(payload["to_state"], "CLAIMED");
+            assert_eq!(payload["from_state"], "Open");
+            assert_eq!(payload["to_state"], "Claimed");
             assert_eq!(payload["rationale_code"], "work_claimed_via_ipc");
             assert_eq!(payload["previous_transition_count"], 0);
             assert!(event.timestamp_ns > 0, "timestamp must be non-zero");
@@ -31372,16 +31242,16 @@ mod tests {
             // First transition: Open -> Claimed
             let first_payload: serde_json::Value =
                 serde_json::from_slice(&transition_events[0].payload).expect("valid JSON");
-            assert_eq!(first_payload["from_state"], "OPEN");
-            assert_eq!(first_payload["to_state"], "CLAIMED");
+            assert_eq!(first_payload["from_state"], "Open");
+            assert_eq!(first_payload["to_state"], "Claimed");
             assert_eq!(first_payload["rationale_code"], "work_claimed_via_ipc");
             assert_eq!(first_payload["previous_transition_count"], 0);
 
             // Second transition: Claimed -> InProgress
             let second_payload: serde_json::Value =
                 serde_json::from_slice(&transition_events[1].payload).expect("valid JSON");
-            assert_eq!(second_payload["from_state"], "CLAIMED");
-            assert_eq!(second_payload["to_state"], "IN_PROGRESS");
+            assert_eq!(second_payload["from_state"], "Claimed");
+            assert_eq!(second_payload["to_state"], "InProgress");
             assert_eq!(second_payload["rationale_code"], "episode_spawned_via_ipc");
             assert_eq!(second_payload["previous_transition_count"], 1);
 
@@ -32129,8 +31999,8 @@ mod tests {
 
             // Verify the transition has correct previous_transition_count
             let payload: serde_json::Value = serde_json::from_slice(&events[1].payload).unwrap();
-            assert_eq!(payload["from_state"], "OPEN");
-            assert_eq!(payload["to_state"], "CLAIMED");
+            assert_eq!(payload["from_state"], "Open");
+            assert_eq!(payload["to_state"], "Claimed");
             assert_eq!(payload["previous_transition_count"], 0);
         }
 
@@ -32192,8 +32062,8 @@ mod tests {
             assert_eq!(events[3].event_type, "work_transitioned");
 
             let payload: serde_json::Value = serde_json::from_slice(&events[3].payload).unwrap();
-            assert_eq!(payload["from_state"], "CLAIMED");
-            assert_eq!(payload["to_state"], "IN_PROGRESS");
+            assert_eq!(payload["from_state"], "Claimed");
+            assert_eq!(payload["to_state"], "InProgress");
             // previous_transition_count should be 1 (derived from ledger)
             assert_eq!(payload["previous_transition_count"], 1);
         }
@@ -33492,7 +33362,6 @@ mod tests {
     // TCK-00394: PublishChangeSet IPC endpoint tests
     // ========================================================================
     mod publish_changeset {
-        use apm2_core::crypto::Signer;
         use apm2_core::evidence::MemoryCas;
         use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 
@@ -33553,40 +33422,6 @@ mod tests {
             let dispatcher = PrivilegedDispatcher::new()
                 .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
             (dispatcher, cas)
-        }
-
-        fn make_dispatcher_with_cas_and_orchestrator() -> (PrivilegedDispatcher, Arc<MemoryCas>) {
-            let (dispatcher, cas) = make_dispatcher_with_cas();
-            let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
-                crate::gate::GateOrchestratorConfig::default(),
-                Arc::new(Signer::generate()),
-            ));
-            (dispatcher.with_gate_orchestrator(orchestrator), cas)
-        }
-
-        #[derive(Debug)]
-        struct FixedGateClock {
-            now_ms: u64,
-            monotonic: std::time::Instant,
-        }
-
-        impl FixedGateClock {
-            fn new(now_ms: u64) -> Self {
-                Self {
-                    now_ms,
-                    monotonic: std::time::Instant::now(),
-                }
-            }
-        }
-
-        impl crate::gate::Clock for FixedGateClock {
-            fn now_ms(&self) -> u64 {
-                self.now_ms
-            }
-
-            fn monotonic_now(&self) -> std::time::Instant {
-                self.monotonic
-            }
         }
 
         fn privileged_ctx() -> ConnectionContext {
@@ -33742,88 +33577,6 @@ mod tests {
         }
 
         #[test]
-        fn test_publish_changeset_starts_gate_lifecycle_from_changeset_identity() {
-            let (dispatcher, _cas) = make_dispatcher_with_cas_and_orchestrator();
-            let ctx = privileged_ctx();
-            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
-
-            let request = PublishChangeSetRequest {
-                work_id: work_id.clone(),
-                lease_id,
-                bundle_bytes: make_bundle_json("cs-gate-start-001"),
-            };
-            let response = dispatcher
-                .dispatch(&encode_publish_changeset_request(&request), &ctx)
-                .expect("publish should succeed");
-            assert!(
-                matches!(response, PrivilegedResponse::PublishChangeSet(_)),
-                "expected publish response, got: {response:?}"
-            );
-
-            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
-            let policy_events = events
-                .iter()
-                .filter(|event| event.event_type == "gate.policy_resolved")
-                .count();
-            let lease_events = events
-                .iter()
-                .filter(|event| event.event_type == "gate.lease_issued")
-                .count();
-            assert_eq!(
-                policy_events, 1,
-                "publish must emit exactly one gate.policy_resolved event"
-            );
-            assert_eq!(
-                lease_events, 3,
-                "publish must emit one gate.lease_issued event per configured gate"
-            );
-        }
-
-        #[test]
-        fn test_publish_changeset_replay_does_not_duplicate_gate_start_events() {
-            let (dispatcher, _cas) = make_dispatcher_with_cas_and_orchestrator();
-            let ctx = privileged_ctx();
-            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
-            let bundle_bytes = make_bundle_json("cs-gate-replay-001");
-
-            let first = PublishChangeSetRequest {
-                work_id: work_id.clone(),
-                lease_id: lease_id.clone(),
-                bundle_bytes: bundle_bytes.clone(),
-            };
-            let second = PublishChangeSetRequest {
-                work_id: work_id.clone(),
-                lease_id,
-                bundle_bytes,
-            };
-
-            let _ = dispatcher
-                .dispatch(&encode_publish_changeset_request(&first), &ctx)
-                .expect("first publish should succeed");
-            let _ = dispatcher
-                .dispatch(&encode_publish_changeset_request(&second), &ctx)
-                .expect("replayed publish should succeed");
-
-            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
-            let policy_events = events
-                .iter()
-                .filter(|event| event.event_type == "gate.policy_resolved")
-                .count();
-            let lease_events = events
-                .iter()
-                .filter(|event| event.event_type == "gate.lease_issued")
-                .count();
-            assert_eq!(
-                policy_events, 1,
-                "replayed publish must not duplicate gate.policy_resolved"
-            );
-            assert_eq!(
-                lease_events, 3,
-                "replayed publish must not duplicate gate.lease_issued events"
-            );
-        }
-
-        #[test]
         fn test_publish_changeset_idempotent() {
             let (dispatcher, _cas) = make_dispatcher_with_cas();
             let ctx = privileged_ctx();
@@ -33942,171 +33695,6 @@ mod tests {
             assert_eq!(
                 changeset_count, 1,
                 "semantic duplicate must not create duplicate changeset events"
-            );
-        }
-
-        #[test]
-        fn test_publish_changeset_replay_accepts_legacy_payload_without_timestamp_field() {
-            let (dispatcher, cas) = make_dispatcher_with_cas();
-            let ctx = privileged_ctx();
-            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
-
-            let bundle_bytes = make_bundle_json("cs-replay-legacy-timestamp");
-            let bundle: ChangeSetBundleV1 =
-                serde_json::from_slice(&bundle_bytes).expect("bundle fixture should decode");
-            let changeset_digest_hex = hex::encode(bundle.changeset_digest);
-            let persisted_cas_hash = cas
-                .store(&bundle_bytes)
-                .expect("bundle should store in CAS")
-                .hash;
-            let persisted_cas_hash_hex = hex::encode(persisted_cas_hash);
-
-            let legacy_payload = serde_json::json!({
-                "event_type": "changeset_published",
-                "work_id": work_id,
-                "changeset_digest": changeset_digest_hex,
-                "cas_hash": persisted_cas_hash_hex,
-                "actor_id": "actor:test-legacy",
-                // Intentionally omitted: "timestamp_ns"
-            });
-            let seeded_event = SignedLedgerEvent {
-                event_id: "EVT-test-legacy-changeset-replay".to_string(),
-                event_type: "changeset_published".to_string(),
-                work_id: work_id.clone(),
-                actor_id: "actor:test-legacy".to_string(),
-                payload: serde_json::to_vec(&legacy_payload)
-                    .expect("legacy payload should serialize"),
-                signature: vec![0u8; 64],
-                timestamp_ns: 42_000_000,
-            };
-            dispatcher
-                .event_emitter
-                .inject_raw_event(seeded_event.clone());
-
-            let response = dispatcher
-                .dispatch(
-                    &encode_publish_changeset_request(&PublishChangeSetRequest {
-                        work_id: work_id.clone(),
-                        lease_id,
-                        bundle_bytes,
-                    }),
-                    &ctx,
-                )
-                .expect("publish should succeed");
-
-            match response {
-                PrivilegedResponse::PublishChangeSet(resp) => {
-                    assert_eq!(
-                        resp.event_id, seeded_event.event_id,
-                        "replay must reuse persisted event when payload omits timestamp_ns"
-                    );
-                    assert_eq!(
-                        resp.cas_hash, persisted_cas_hash_hex,
-                        "replay must return persisted CAS binding"
-                    );
-                },
-                other => panic!("Expected PublishChangeSet replay response, got: {other:?}"),
-            }
-
-            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
-            let changeset_count = events
-                .iter()
-                .filter(|e| e.event_type == "changeset_published")
-                .count();
-            assert_eq!(
-                changeset_count, 1,
-                "legacy replay payload must not produce duplicate changeset events"
-            );
-        }
-
-        #[test]
-        fn test_publish_changeset_replay_rejects_stale_identity_when_replay_cache_missing() {
-            let fixed_now_ms = 2_000_000_000_000_u64;
-            let stale_source_ms = fixed_now_ms
-                .saturating_sub(crate::gate::MAX_SOURCE_EVENT_AGE_MS)
-                .saturating_sub(10_000);
-
-            let (dispatcher, cas) = make_dispatcher_with_cas();
-            let orchestrator = Arc::new(crate::gate::GateOrchestrator::with_clock(
-                crate::gate::GateOrchestratorConfig::default(),
-                Arc::new(Signer::generate()),
-                Arc::new(FixedGateClock::new(fixed_now_ms)),
-            ));
-            let dispatcher = dispatcher.with_gate_orchestrator(orchestrator);
-
-            let ctx = privileged_ctx();
-            let (work_id, lease_id) = claim_work(&dispatcher, &ctx);
-
-            let bundle_bytes = make_bundle_json("cs-replay-stale-reject");
-            let bundle: ChangeSetBundleV1 =
-                serde_json::from_slice(&bundle_bytes).expect("bundle fixture should decode");
-            let changeset_digest_hex = hex::encode(bundle.changeset_digest);
-            let persisted_cas_hash_hex = hex::encode(
-                cas.store(&bundle_bytes)
-                    .expect("bundle should store in CAS")
-                    .hash,
-            );
-
-            let replay_payload = serde_json::json!({
-                "event_type": "changeset_published",
-                "work_id": work_id,
-                "changeset_digest": changeset_digest_hex,
-                "cas_hash": persisted_cas_hash_hex,
-                "actor_id": "actor:test-stale",
-                "timestamp_ns": stale_source_ms.saturating_mul(1_000_000),
-            });
-            dispatcher
-                .event_emitter
-                .inject_raw_event(SignedLedgerEvent {
-                    event_id: "EVT-test-stale-replay-seed".to_string(),
-                    event_type: "changeset_published".to_string(),
-                    work_id: work_id.clone(),
-                    actor_id: "actor:test-stale".to_string(),
-                    payload: serde_json::to_vec(&replay_payload).expect("payload should serialize"),
-                    signature: vec![0u8; 64],
-                    timestamp_ns: stale_source_ms.saturating_mul(1_000_000),
-                });
-
-            let response = dispatcher
-                .dispatch(
-                    &encode_publish_changeset_request(&PublishChangeSetRequest {
-                        work_id: work_id.clone(),
-                        lease_id,
-                        bundle_bytes,
-                    }),
-                    &ctx,
-                )
-                .expect("request should complete with deterministic error response");
-
-            match response {
-                PrivilegedResponse::Error(err) => {
-                    assert_eq!(
-                        err.code,
-                        PrivilegedErrorCode::CapabilityRequestRejected as i32
-                    );
-                    assert!(
-                        err.message
-                            .contains("gate lifecycle start failed for replayed changeset"),
-                        "unexpected stale replay error message: {}",
-                        err.message
-                    );
-                    assert!(
-                        err.message.contains("stale gate-start event"),
-                        "stale replay rejection must preserve freshness violation semantics: {}",
-                        err.message
-                    );
-                },
-                other => panic!("Expected stale replay rejection, got: {other:?}"),
-            }
-
-            let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
-            let changeset_count = events
-                .iter()
-                .filter(|event| event.event_type == "changeset_published")
-                .count();
-            assert_eq!(
-                changeset_count, 1,
-                "stale replay rejection must not append duplicate changeset_published events"
             );
         }
 

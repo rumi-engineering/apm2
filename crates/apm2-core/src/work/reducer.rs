@@ -1,13 +1,14 @@
 //! Work lifecycle reducer implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::error::WorkError;
 use super::state::{Work, WorkState, WorkType};
-use crate::events::{WorkEvent, work_event};
+use crate::events::{DefectRecorded, DefectSource, WorkEvent, work_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
@@ -24,6 +25,18 @@ use crate::reducer::{Reducer, ReducerContext};
 /// to distinguish it from regular agent identities.
 pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 
+/// Receipt outcome for status derivation.
+///
+/// Distinguishes pass from fail so that `status_from_work` never conflates
+/// "digest present" with "outcome passed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiptOutcome {
+    /// The receipt represents a successful/passed result.
+    Passed,
+    /// The receipt represents a failed/blocked result.
+    Failed,
+}
+
 /// State maintained by the work reducer.
 ///
 /// Maps work IDs to their current state.
@@ -31,6 +44,32 @@ pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
 pub struct WorkReducerState {
     /// Map of work ID to work item.
     pub work_items: HashMap<String, Work>,
+    /// Latest authoritative changeset digest per work ID, derived from
+    /// `changeset_published` events.
+    pub latest_changeset_by_work: HashMap<String, [u8; 32]>,
+    /// Last observed CI-bound gate digest per work ID.
+    pub ci_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Outcome (pass/fail) of the last observed CI gate receipt per work ID.
+    pub ci_receipt_outcome_by_work: HashMap<String, ReceiptOutcome>,
+    /// Last observed review receipt digest per work ID.
+    pub review_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Outcome (pass/fail) of the last observed review receipt per work ID.
+    pub review_receipt_outcome_by_work: HashMap<String, ReceiptOutcome>,
+    /// Last observed merge receipt digest per work ID.
+    pub merge_receipt_digest_by_work: HashMap<String, [u8; 32]>,
+    /// Event ID of the `ChangeSetPublished` event that established the latest
+    /// changeset identity binding, keyed by work ID (`STEP_10`).
+    pub changeset_published_event_id_by_work: HashMap<String, String>,
+    /// CAS hash (32 bytes) of the `ChangeSetBundleV1` for the latest
+    /// changeset, keyed by work ID (`STEP_10`).
+    pub bundle_cas_hash_by_work: HashMap<String, [u8; 32]>,
+    /// Per-work-item cumulative defect count for identity-chain violations.
+    ///
+    /// Incremented whenever a defect is recorded (stale-digest, cross-work
+    /// injection). Unlike the global `identity_chain_defects` queue which
+    /// is bounded and drainable, this counter is monotonic and keyed by
+    /// `work_id` so that `WorkStatusResponse` can report per-item counts.
+    pub identity_chain_defect_count_by_work: HashMap<String, u32>,
 }
 
 impl WorkReducerState {
@@ -152,6 +191,15 @@ impl WorkReducerState {
     }
 }
 
+/// Maximum number of identity-chain defect records retained in memory.
+///
+/// When the buffer is at capacity, the oldest entry is evicted before
+/// appending a new one.  This prevents unbounded memory growth when
+/// `drain_identity_chain_defects()` is not called (or called
+/// infrequently) while a flood of stale-digest / cross-work injection
+/// events is processed.
+pub const MAX_IDENTITY_CHAIN_DEFECTS: usize = 1_000;
+
 /// Reducer for work lifecycle events.
 ///
 /// Processes work events and maintains the state of all work items.
@@ -169,6 +217,14 @@ impl WorkReducerState {
 #[derive(Debug, Default)]
 pub struct WorkReducer {
     state: WorkReducerState,
+    /// Structured defect records for identity-chain violations (`STEP_09`).
+    ///
+    /// Accumulated during event processing. Consumers should drain this
+    /// after each reduce cycle to persist defects via the ledger.
+    ///
+    /// Bounded by [`MAX_IDENTITY_CHAIN_DEFECTS`]; oldest entries are
+    /// evicted when at capacity (ring-buffer semantics via `VecDeque`).
+    identity_chain_defects: VecDeque<DefectRecorded>,
 }
 
 impl WorkReducer {
@@ -178,6 +234,532 @@ impl WorkReducer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drains accumulated identity-chain defect records (`STEP_09`).
+    ///
+    /// Consumers should call this after each reduce cycle to retrieve and
+    /// persist defect records via the ledger.
+    pub fn drain_identity_chain_defects(&mut self) -> Vec<DefectRecorded> {
+        std::mem::take(&mut self.identity_chain_defects).into()
+    }
+
+    /// Returns the number of pending identity-chain defects (global queue).
+    #[must_use]
+    pub fn identity_chain_defect_count(&self) -> usize {
+        self.identity_chain_defects.len()
+    }
+
+    /// Returns the cumulative identity-chain defect count for a specific
+    /// work item. Returns 0 if no defects have been recorded for `work_id`.
+    #[must_use]
+    pub fn identity_chain_defect_count_for_work(&self, work_id: &str) -> u32 {
+        self.state
+            .identity_chain_defect_count_by_work
+            .get(work_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Appends a defect record, evicting the oldest entry when the
+    /// buffer is at [`MAX_IDENTITY_CHAIN_DEFECTS`] capacity.
+    ///
+    /// O(1) amortised: `VecDeque::pop_front` and `push_back` are both
+    /// O(1).
+    ///
+    /// Also increments the per-work-item defect counter so that
+    /// `WorkStatusResponse` can report accurate per-item counts.
+    fn push_defect(&mut self, defect: DefectRecorded) {
+        // Increment per-work-item counter (monotonic, never evicted).
+        if !defect.work_id.is_empty() {
+            let count = self
+                .state
+                .identity_chain_defect_count_by_work
+                .entry(defect.work_id.clone())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        if self.identity_chain_defects.len() >= MAX_IDENTITY_CHAIN_DEFECTS {
+            self.identity_chain_defects.pop_front();
+        }
+        self.identity_chain_defects.push_back(defect);
+    }
+
+    /// Canonical merge receipt event types (explicit allowlist).
+    ///
+    /// Replaces substring matching to prevent cross-work state injection via
+    /// unreserved event types that contain `merge_receipt`.
+    const MERGE_RECEIPT_EVENT_TYPES: &'static [&'static str] = &[
+        "fac.merge_receipt.recorded",
+        "gate.merge_receipt_created",
+        "merge_receipt_recorded",
+        "merge_receipt_created",
+    ];
+
+    /// Records latest-digest projections from non-work events.
+    ///
+    /// This keeps stage-bound digest context available when processing
+    /// `work.transitioned` / `work.completed` boundaries.
+    ///
+    /// # Security
+    ///
+    /// Digest state updates are bound to `EventRecord.work_id` (the signed
+    /// envelope field), NOT the payload-extracted `work_id`. If the payload
+    /// `work_id` does not match the envelope `work_id`, a security warning
+    /// is logged and the event is skipped, preventing cross-work state
+    /// injection attacks.
+    fn observe_changeset_bound_event(&mut self, event: &EventRecord) {
+        let Some((payload_work_id, changeset_digest)) =
+            extract_work_id_and_digest_from_payload(&event.payload)
+        else {
+            return;
+        };
+
+        // Bind to signed envelope identity: use EventRecord.session_id as the
+        // authoritative work_id for state updates. Validate that payload
+        // work_id matches the envelope to prevent cross-work injection.
+        let envelope_work_id = &event.session_id;
+
+        // If the envelope work_id is empty (some legacy events), fall back to
+        // payload work_id but only for changeset_published (which populates
+        // the index). For all receipt types, require envelope binding.
+        let authoritative_work_id = if envelope_work_id.is_empty() {
+            if event.event_type == "changeset_published" {
+                payload_work_id
+            } else {
+                warn!(
+                    event_type = %event.event_type,
+                    payload_work_id = %payload_work_id,
+                    "digest-bound event skipped: empty envelope work_id on non-publication event"
+                );
+                return;
+            }
+        } else {
+            if payload_work_id != *envelope_work_id {
+                warn!(
+                    event_type = %event.event_type,
+                    envelope_work_id = %envelope_work_id,
+                    payload_work_id = %payload_work_id,
+                    defect_code = "CROSS_WORK_INJECTION_ATTEMPT",
+                    "SECURITY: digest-bound event skipped: payload work_id does not match \
+                     signed envelope work_id — possible cross-work state injection"
+                );
+                self.record_cross_work_injection_defect(
+                    &event.event_type,
+                    envelope_work_id,
+                    &payload_work_id,
+                    event.timestamp_ns,
+                );
+                return;
+            }
+            envelope_work_id.clone()
+        };
+
+        match event.event_type.as_str() {
+            "changeset_published" => {
+                self.record_changeset_published(event, authoritative_work_id, changeset_digest);
+            },
+            // CI transitions are driven by gate receipts (not lease issuance).
+            // Enforce latest-digest validation: only receipts whose digest
+            // matches work_latest_changeset are admissible (CSID-004).
+            // Stale receipts are silently ignored with a structured log.
+            //
+            // Gate receipt events always represent passed/collected outcomes.
+            "gate.receipt_collected"
+            | "gate_receipt_collected"
+            | "gate.receipt"
+            | "gate_receipt" => {
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
+                    self.state
+                        .ci_receipt_outcome_by_work
+                        .insert(authoritative_work_id.clone(), ReceiptOutcome::Passed);
+                    self.state
+                        .ci_receipt_digest_by_work
+                        .insert(authoritative_work_id, changeset_digest);
+                } else {
+                    self.record_stale_digest_defect(
+                        "gate_receipt",
+                        &event.event_type,
+                        &authoritative_work_id,
+                        changeset_digest,
+                    );
+                }
+            },
+            // Review receipts: `review_receipt_recorded` = passed,
+            // `review_blocked_recorded` = failed.
+            "review_receipt_recorded" | "review_blocked_recorded" => {
+                let outcome = if event.event_type == "review_blocked_recorded" {
+                    ReceiptOutcome::Failed
+                } else {
+                    ReceiptOutcome::Passed
+                };
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
+                    self.state
+                        .review_receipt_outcome_by_work
+                        .insert(authoritative_work_id.clone(), outcome);
+                    self.state
+                        .review_receipt_digest_by_work
+                        .insert(authoritative_work_id, changeset_digest);
+                } else {
+                    self.record_stale_digest_defect(
+                        "review_receipt",
+                        &event.event_type,
+                        &authoritative_work_id,
+                        changeset_digest,
+                    );
+                }
+            },
+            // Merge receipt events: explicit allowlist (no substring matching).
+            event_type if Self::MERGE_RECEIPT_EVENT_TYPES.contains(&event_type) => {
+                if self.is_digest_latest(&authoritative_work_id, changeset_digest) {
+                    self.state
+                        .merge_receipt_digest_by_work
+                        .insert(authoritative_work_id, changeset_digest);
+                } else {
+                    self.record_stale_digest_defect(
+                        "merge_receipt",
+                        event_type,
+                        &authoritative_work_id,
+                        changeset_digest,
+                    );
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Records a `changeset_published` event's digest, event ID, and CAS hash
+    /// into projection state (`STEP_10`).
+    fn record_changeset_published(
+        &mut self,
+        event: &EventRecord,
+        authoritative_work_id: String,
+        changeset_digest: [u8; 32],
+    ) {
+        self.state
+            .latest_changeset_by_work
+            .insert(authoritative_work_id.clone(), changeset_digest);
+        let event_id = event
+            .seq_id
+            .map_or_else(|| "unknown".to_string(), |s| format!("seq-{s}"));
+        self.state
+            .changeset_published_event_id_by_work
+            .insert(authoritative_work_id.clone(), event_id);
+        if let Some(cas_hash) = extract_cas_hash_from_payload(&event.payload) {
+            self.state
+                .bundle_cas_hash_by_work
+                .insert(authoritative_work_id, cas_hash);
+        }
+    }
+
+    /// Returns `true` when `incoming` matches the latest authoritative
+    /// changeset digest for `work_id`.
+    fn is_digest_latest(&self, work_id: &str, incoming: [u8; 32]) -> bool {
+        self.state
+            .latest_changeset_by_work
+            .get(work_id)
+            .is_some_and(|latest| *latest == incoming)
+    }
+
+    /// Records a structured identity-chain defect for a stale or unbound
+    /// changeset digest observation (`STEP_09`).
+    ///
+    /// Replaces warn-only logging with a machine-readable `DefectRecorded`
+    /// that is accumulated in `WorkReducer::identity_chain_defects`.
+    fn record_stale_digest_defect(
+        &mut self,
+        stage: &str,
+        event_type: &str,
+        work_id: &str,
+        incoming_digest: [u8; 32],
+    ) {
+        let latest = self
+            .state
+            .latest_changeset_by_work
+            .get(work_id)
+            .map_or_else(|| "unknown".to_string(), hex::encode);
+        warn!(
+            stage,
+            event_type,
+            work_id,
+            incoming_digest = %hex::encode(incoming_digest),
+            latest_digest = %latest,
+            "stale or unbound changeset digest ignored by work reducer"
+        );
+
+        let reason = format!(
+            "STALE_DIGEST:{stage}:{event_type}:{work_id}:incoming={},latest={latest}",
+            hex::encode(incoming_digest),
+        );
+        let cas_hash =
+            hash_defect_preimage(work_id.as_bytes(), &incoming_digest, reason.as_bytes());
+
+        // Deterministic defect ID derived from the CAS hash (first 16 bytes
+        // hex-encoded). This ensures replay consistency: the same inputs
+        // always produce the same defect_id, which is required because the
+        // WorkReducer must be a pure function of its input events.
+        let defect_id = format!("DEF-IDENTITY-CHAIN-{}", hex::encode(&cas_hash[..16]));
+
+        self.push_defect(DefectRecorded {
+            defect_id,
+            defect_type: "IDENTITY_CHAIN_STALE_DIGEST".to_string(),
+            cas_hash: cas_hash.to_vec(),
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: work_id.to_string(),
+            severity: "S2".to_string(),
+            detected_at: 0,
+            time_envelope_ref: None,
+        });
+    }
+
+    /// Records a structured defect for a cross-work injection attempt.
+    fn record_cross_work_injection_defect(
+        &mut self,
+        event_type: &str,
+        envelope_work_id: &str,
+        payload_work_id: &str,
+        detected_at_ns: u64,
+    ) {
+        let reason = format!(
+            "CROSS_WORK_INJECTION:{event_type}:envelope={envelope_work_id},payload={payload_work_id}",
+        );
+        let cas_hash = hash_defect_preimage(
+            envelope_work_id.as_bytes(),
+            payload_work_id.as_bytes(),
+            reason.as_bytes(),
+        );
+
+        // Deterministic defect ID derived from the CAS hash (first 16 bytes
+        // hex-encoded). Same rationale as `record_stale_digest_defect`.
+        let defect_id = format!("DEF-IDENTITY-CHAIN-{}", hex::encode(&cas_hash[..16]));
+
+        self.push_defect(DefectRecorded {
+            defect_id,
+            defect_type: "IDENTITY_CHAIN_CROSS_WORK_INJECTION".to_string(),
+            cas_hash: cas_hash.to_vec(),
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: envelope_work_id.to_string(),
+            severity: "S1".to_string(),
+            detected_at: detected_at_ns,
+            time_envelope_ref: None,
+        });
+    }
+
+    /// Returns the latest authoritative changeset digest for `work_id`.
+    fn latest_changeset_digest(&self, work_id: &str) -> Option<[u8; 32]> {
+        self.state.latest_changeset_by_work.get(work_id).copied()
+    }
+
+    /// Enforces stage-boundary transition guards with latest-digest admission.
+    ///
+    /// Two stage boundaries are guarded (CSID-004):
+    ///
+    /// 1. **CI transition** (`CiPending -> ReadyForReview/Blocked`): the most
+    ///    recent gate receipt digest must equal `work_latest_changeset`.
+    /// 2. **Review start** (`ReadyForReview -> Review`): a latest-digest review
+    ///    receipt must exist (ensuring review is bound to the current
+    ///    changeset). When no review receipt is available yet, the transition
+    ///    is allowed because the review receipt will be validated at
+    ///    completion/merge admission.
+    ///
+    /// Returns:
+    /// - `Ok(true)` when transition admission checks pass.
+    /// - `Ok(false)` when transition must be denied as stale/unbound.
+    /// - `Err(...)` for explicit unauthorized transition attempts.
+    fn enforce_stage_boundary_guards(
+        &mut self,
+        work_id: &str,
+        from_state: WorkState,
+        to_state: WorkState,
+        rationale: &str,
+        actor_id: &str,
+    ) -> Result<bool, WorkError> {
+        // ---- CI stage boundary ----
+        if from_state == WorkState::CiPending {
+            if rationale != "ci_passed" && rationale != "ci_failed" {
+                return Err(WorkError::CiGatedTransitionUnauthorized {
+                    from_state,
+                    to_state,
+                    rationale_code: rationale.to_string(),
+                });
+            }
+            if actor_id != CI_SYSTEM_ACTOR_ID {
+                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
+                    from_state,
+                    actor_id: actor_id.to_string(),
+                });
+            }
+            if matches!(to_state, WorkState::ReadyForReview | WorkState::Blocked) {
+                // Fail-closed: a published changeset MUST exist before any
+                // CI stage boundary transition is admitted (CSID-004).
+                let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        defect_code = "MISSING_CHANGESET_PUBLISHED",
+                        "ci transition denied: no changeset published for work (fail-closed)"
+                    );
+                    return Ok(false);
+                };
+                let Some(incoming_digest) =
+                    self.state.ci_receipt_digest_by_work.get(work_id).copied()
+                else {
+                    warn!(
+                        work_id,
+                        event_type = "work.transitioned",
+                        from_state = %from_state.as_str(),
+                        to_state = %to_state.as_str(),
+                        latest_digest = %hex::encode(latest_digest),
+                        "ci transition denied: no changeset-bound gate receipt observed"
+                    );
+                    return Ok(false);
+                };
+                if incoming_digest != latest_digest {
+                    self.record_stale_digest_defect(
+                        "ci_transition",
+                        "work.transitioned",
+                        work_id,
+                        incoming_digest,
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        // ---- Review start stage boundary (CSID-004) ----
+        //
+        // When transitioning to Review from ANY state (ReadyForReview,
+        // InProgress, etc.), verify that a latest changeset exists
+        // (fail-closed). If a review receipt has already been observed but
+        // its digest is stale, deny the transition (the review was for an
+        // older changeset and must be re-done).
+        //
+        // This guard covers both CI-gated workflows (ReadyForReview ->
+        // Review) and non-CI-gated workflows (InProgress -> Review).
+        if to_state == WorkState::Review {
+            // Fail-closed: a published changeset MUST exist before review
+            // start is admitted (CSID-004).
+            let Some(_latest_digest) = self.latest_changeset_digest(work_id) else {
+                warn!(
+                    work_id,
+                    event_type = "work.transitioned",
+                    from_state = %from_state.as_str(),
+                    to_state = %to_state.as_str(),
+                    defect_code = "MISSING_CHANGESET_PUBLISHED",
+                    "review start denied: no changeset published for work (fail-closed)"
+                );
+                return Ok(false);
+            };
+            // If a review receipt already exists but is stale, deny.
+            if let Some(review_digest) = self
+                .state
+                .review_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+            {
+                if !self.is_digest_latest(work_id, review_digest) {
+                    self.record_stale_digest_defect(
+                        "review_start",
+                        "work.transitioned",
+                        work_id,
+                        review_digest,
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Validates gate/merge receipt field separation for completion payloads.
+    fn validate_completion_receipt_fields(
+        work_id: &str,
+        event: &crate::events::WorkCompleted,
+    ) -> Result<(), WorkError> {
+        if event
+            .gate_receipt_id
+            .to_ascii_lowercase()
+            .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::MergeReceiptInGateReceiptField {
+                work_id: work_id.to_string(),
+                value: event.gate_receipt_id.clone(),
+            });
+        }
+
+        if !event.merge_receipt_id.is_empty()
+            && !event
+                .merge_receipt_id
+                .to_ascii_lowercase()
+                .starts_with("merge-receipt-")
+        {
+            return Err(WorkError::InvalidMergeReceiptId {
+                work_id: work_id.to_string(),
+                value: event.merge_receipt_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the digest context used for merge admission.
+    fn completion_incoming_digest(
+        &self,
+        work_id: &str,
+        merge_receipt_id: &str,
+    ) -> Option<[u8; 32]> {
+        if merge_receipt_id.is_empty() {
+            self.state
+                .review_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+        } else {
+            self.state
+                .merge_receipt_digest_by_work
+                .get(work_id)
+                .copied()
+        }
+    }
+
+    /// Enforces latest-digest merge admission. Returns `true` if admissible.
+    ///
+    /// Fail-closed: when no changeset has been published for this work (no
+    /// entry in `latest_changeset_by_work`), completion is denied. A published
+    /// changeset is required for merge admission (CSID-004).
+    fn completion_latest_digest_admitted(&mut self, work_id: &str, merge_receipt_id: &str) -> bool {
+        let Some(latest_digest) = self.latest_changeset_digest(work_id) else {
+            // Fail-closed: no changeset published — deny completion.
+            warn!(
+                work_id,
+                event_type = "work.completed",
+                defect_code = "MISSING_CHANGESET_PUBLISHED",
+                "work completion denied: no changeset published for work (fail-closed)"
+            );
+            return false;
+        };
+        let Some(incoming_digest) = self.completion_incoming_digest(work_id, merge_receipt_id)
+        else {
+            warn!(
+                work_id,
+                event_type = "work.completed",
+                latest_digest = %hex::encode(latest_digest),
+                merge_receipt_id = %merge_receipt_id,
+                "work completion denied: no admissible changeset-bound receipt observed"
+            );
+            return false;
+        };
+        if incoming_digest != latest_digest {
+            self.record_stale_digest_defect(
+                "merge_admission",
+                "work.completed",
+                work_id,
+                incoming_digest,
+            );
+            return false;
+        }
+        true
     }
 
     /// Handles a work opened event.
@@ -225,18 +807,18 @@ impl WorkReducer {
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
-        let work =
+        let current_work =
             self.state
                 .work_items
-                .get_mut(work_id)
+                .get(work_id)
                 .ok_or_else(|| WorkError::WorkNotFound {
                     work_id: work_id.clone(),
                 })?;
 
         // Verify work is not in a terminal state
-        if work.is_terminal() {
+        if current_work.is_terminal() {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: "work.transitioned".to_string(),
             });
         }
@@ -246,12 +828,12 @@ impl WorkReducer {
         let to_state = WorkState::parse(&event.to_state)?;
 
         // Verify the from_state matches current state
-        if work.state != from_state {
+        if current_work.state != from_state {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: format!(
                     "work.transitioned (expected from_state={}, got={})",
-                    work.state.as_str(),
+                    current_work.state.as_str(),
                     event.from_state
                 ),
             });
@@ -259,7 +841,7 @@ impl WorkReducer {
 
         // Replay protection: validate sequence via previous_transition_count
         // All transitions MUST provide the correct sequence to prevent replay attacks
-        let expected_count = work.transition_count;
+        let expected_count = current_work.transition_count;
         if event.previous_transition_count != expected_count {
             return Err(WorkError::SequenceMismatch {
                 work_id: work_id.clone(),
@@ -276,30 +858,23 @@ impl WorkReducer {
             });
         }
 
-        // Security check: CI-gated transitions require both:
-        // 1. Authorized rationale codes (ci_passed/ci_failed)
-        // 2. Authorized actor ID (system:ci-processor)
-        // This prevents agents from bypassing CI gating by directly emitting
-        // WorkTransitioned events.
-        if from_state == WorkState::CiPending {
-            // Check rationale code
-            let rationale = &event.rationale_code;
-            if rationale != "ci_passed" && rationale != "ci_failed" {
-                return Err(WorkError::CiGatedTransitionUnauthorized {
-                    from_state,
-                    to_state,
-                    rationale_code: rationale.clone(),
-                });
-            }
-
-            // Check actor ID - only the CI system processor can sign these events
-            if actor_id != CI_SYSTEM_ACTOR_ID {
-                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
-                    from_state,
-                    actor_id: actor_id.to_string(),
-                });
-            }
+        if !self.enforce_stage_boundary_guards(
+            work_id,
+            from_state,
+            to_state,
+            &event.rationale_code,
+            actor_id,
+        )? {
+            return Ok(());
         }
+
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
 
         // Apply the transition
         work.state = to_state;
@@ -323,18 +898,18 @@ impl WorkReducer {
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
-        let work =
+        let current_work =
             self.state
                 .work_items
-                .get_mut(work_id)
+                .get(work_id)
                 .ok_or_else(|| WorkError::WorkNotFound {
                     work_id: work_id.clone(),
                 })?;
 
         // Can only complete from Review state
-        if work.state != WorkState::Review {
+        if current_work.state != WorkState::Review {
             return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
+                from_state: current_work.state.as_str().to_string(),
                 event_type: "work.completed".to_string(),
             });
         }
@@ -362,28 +937,18 @@ impl WorkReducer {
         // Together these two checks enforce bidirectional domain separation
         // at the reducer boundary.
 
-        if event
-            .gate_receipt_id
-            .to_ascii_lowercase()
-            .starts_with("merge-receipt-")
-        {
-            return Err(WorkError::MergeReceiptInGateReceiptField {
-                work_id: work_id.clone(),
-                value: event.gate_receipt_id,
-            });
+        Self::validate_completion_receipt_fields(work_id, &event)?;
+        if !self.completion_latest_digest_admitted(work_id, &event.merge_receipt_id) {
+            return Ok(());
         }
 
-        if !event.merge_receipt_id.is_empty()
-            && !event
-                .merge_receipt_id
-                .to_ascii_lowercase()
-                .starts_with("merge-receipt-")
-        {
-            return Err(WorkError::InvalidMergeReceiptId {
-                work_id: work_id.clone(),
-                value: event.merge_receipt_id,
-            });
-        }
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
 
         // Apply completion (all deny gates passed — safe to mutate)
         work.state = WorkState::Completed;
@@ -566,6 +1131,8 @@ impl Reducer for WorkReducer {
     }
 
     fn apply(&mut self, event: &EventRecord, _ctx: &ReducerContext) -> Result<(), Self::Error> {
+        self.observe_changeset_bound_event(event);
+
         // Only handle work events
         if !event.event_type.starts_with("work.") {
             return Ok(());
@@ -597,6 +1164,134 @@ impl Reducer for WorkReducer {
 
     fn reset(&mut self) {
         self.state = WorkReducerState::default();
+        self.identity_chain_defects.clear();
+    }
+}
+
+/// Computes a canonical BLAKE3 hash over length-prefixed variable fields.
+///
+/// Each field is preceded by its `u32` little-endian length, preventing
+/// byte-shifting collisions that arise from raw concatenation of
+/// variable-length inputs (e.g., `"ab" || "cd"` vs `"a" || "bcd"`).
+///
+/// This function is used for defect CAS hashes in both
+/// `WorkReducer::record_stale_digest_defect` and
+/// `WorkReducer::record_cross_work_injection_defect`, and is also
+/// available for use by gate-start defect builders.
+#[must_use]
+pub fn hash_defect_preimage(field_a: &[u8], field_b: &[u8], field_c: &[u8]) -> [u8; 32] {
+    /// Writes a `u32` little-endian length prefix for `data`, saturating at
+    /// `u32::MAX` for fields that exceed 4 GiB (which should never occur for
+    /// defect preimages, but we never truncate silently).
+    fn write_length_prefixed(hasher: &mut blake3::Hasher, data: &[u8]) {
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(data);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    write_length_prefixed(&mut hasher, field_a);
+    write_length_prefixed(&mut hasher, field_b);
+    write_length_prefixed(&mut hasher, field_c);
+    *hasher.finalize().as_bytes()
+}
+
+/// Maximum payload size (in bytes) for event payloads before JSON
+/// deserialization. Prevents denial-of-service via oversized `SQLite` payloads
+/// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
+const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
+
+/// Extracts the `cas_hash` field from a `changeset_published` payload.
+///
+/// Only called after size validation in `observe_changeset_bound_event`,
+/// so the double-parse is limited to `changeset_published` events only.
+fn extract_cas_hash_from_payload(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let cas_hash_value = value.get("cas_hash")?;
+    decode_digest_value(cas_hash_value)
+}
+
+/// Extracts `(work_id, changeset_digest)` from a JSON event payload.
+///
+/// Returns `None` if the payload exceeds `MAX_PAYLOAD_BYTES` (1 MiB), is not
+/// valid JSON, or does not contain both `work_id` (string) and
+/// `changeset_digest` (hex string or byte array) at any nesting level.
+///
+/// This is the authoritative extraction function used by the reducer to
+/// populate digest-bound projections (`ci_receipt_digest_by_work`,
+/// `review_receipt_digest_by_work`, etc.). Event producers MUST include
+/// both fields for their events to be admissible.
+pub fn extract_work_id_and_digest_from_payload(payload: &[u8]) -> Option<(String, [u8; 32])> {
+    // BLOCKER 1 (Security): Enforce strict max size BEFORE deserialization to
+    // prevent DoS via oversized payloads exhausting daemon memory.
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        warn!(
+            payload_size = payload.len(),
+            max = MAX_PAYLOAD_BYTES,
+            "payload too large for digest extraction, skipping deserialization"
+        );
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    find_work_id_and_digest(&value)
+}
+
+fn find_work_id_and_digest(value: &serde_json::Value) -> Option<(String, [u8; 32])> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let (Some(work_id), Some(changeset_value)) = (
+                map.get("work_id").and_then(serde_json::Value::as_str),
+                map.get("changeset_digest"),
+            ) {
+                if let Some(digest) = decode_digest_value(changeset_value) {
+                    return Some((work_id.to_string(), digest));
+                }
+            }
+            for nested in map.values() {
+                if let Some(found) = find_work_id_and_digest(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                if let Some(found) = find_work_id_and_digest(nested) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        _ => None,
+    }
+}
+
+fn decode_digest_value(value: &serde_json::Value) -> Option<[u8; 32]> {
+    match value {
+        serde_json::Value::String(hex_value) => {
+            let raw = hex::decode(hex_value).ok()?;
+            if raw.len() != 32 {
+                return None;
+            }
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&raw);
+            Some(digest)
+        },
+        serde_json::Value::Array(values) => {
+            if values.len() != 32 {
+                return None;
+            }
+            let mut digest = [0u8; 32];
+            for (idx, item) in values.iter().enumerate() {
+                let byte = u8::try_from(item.as_u64()?).ok()?;
+                digest[idx] = byte;
+            }
+            Some(digest)
+        },
+        _ => None,
     }
 }
 
@@ -777,5 +1472,118 @@ pub mod helpers {
             event: Some(work_event::Event::PrAssociated(pr_associated)),
         };
         event.encode_to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_IDENTITY_CHAIN_DEFECTS, MAX_PAYLOAD_BYTES, WorkReducer,
+        extract_work_id_and_digest_from_payload, hash_defect_preimage,
+    };
+    use crate::events::{DefectRecorded, DefectSource};
+
+    #[test]
+    fn oversized_payload_returns_none_not_oom() {
+        let oversized = vec![0u8; MAX_PAYLOAD_BYTES + 1];
+        let result = extract_work_id_and_digest_from_payload(&oversized);
+        assert!(result.is_none(), "oversized payload must be rejected");
+    }
+
+    #[test]
+    fn payload_within_limit_is_parsed() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "work_id": "W-1",
+            "changeset_digest": hex::encode([0x42; 32]),
+        }))
+        .expect("serialize");
+        assert!(payload.len() <= MAX_PAYLOAD_BYTES);
+        let result = extract_work_id_and_digest_from_payload(&payload);
+        assert!(result.is_some(), "valid payload should parse");
+        let (work_id, digest) = result.unwrap();
+        assert_eq!(work_id, "W-1");
+        assert_eq!(digest, [0x42; 32]);
+    }
+
+    // ---- BLOCKER fix: bounded identity_chain_defects ----
+
+    #[test]
+    fn identity_chain_defects_bounded_at_max() {
+        let mut reducer = WorkReducer::new();
+        let total = MAX_IDENTITY_CHAIN_DEFECTS + 5;
+
+        #[allow(clippy::cast_possible_truncation)]
+        for i in 0..total {
+            let defect = DefectRecorded {
+                defect_id: format!("DEF-{i}"),
+                defect_type: "TEST".to_string(),
+                cas_hash: vec![(i & 0xFF) as u8],
+                source: DefectSource::ProjectionTamper as i32,
+                work_id: "W-1".to_string(),
+                severity: "S2".to_string(),
+                detected_at: i as u64,
+                time_envelope_ref: None,
+            };
+            reducer.push_defect(defect);
+        }
+
+        assert_eq!(
+            reducer.identity_chain_defect_count(),
+            MAX_IDENTITY_CHAIN_DEFECTS,
+            "defect buffer must not exceed MAX_IDENTITY_CHAIN_DEFECTS"
+        );
+
+        // Oldest entries (0..5) were evicted; first remaining is DEF-5
+        let drained = reducer.drain_identity_chain_defects();
+        assert_eq!(drained.len(), MAX_IDENTITY_CHAIN_DEFECTS);
+        assert_eq!(drained[0].defect_id, "DEF-5");
+        assert_eq!(
+            drained[MAX_IDENTITY_CHAIN_DEFECTS - 1].defect_id,
+            format!("DEF-{}", total - 1)
+        );
+    }
+
+    #[test]
+    fn drain_returns_vec_and_clears_buffer() {
+        let mut reducer = WorkReducer::new();
+        reducer.push_defect(DefectRecorded {
+            defect_id: "DEF-0".to_string(),
+            defect_type: "TEST".to_string(),
+            cas_hash: vec![0],
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: "W-1".to_string(),
+            severity: "S2".to_string(),
+            detected_at: 0,
+            time_envelope_ref: None,
+        });
+        let drained = reducer.drain_identity_chain_defects();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(reducer.identity_chain_defect_count(), 0);
+    }
+
+    // ---- MAJOR fix: canonical length-prefixed hashing ----
+
+    #[test]
+    fn hash_defect_preimage_is_collision_resistant() {
+        // Without length prefixes, "ab" || "cd" || "" == "a" || "bcd" || ""
+        // With length prefixes these MUST differ.
+        let h1 = hash_defect_preimage(b"ab", b"cd", b"");
+        let h2 = hash_defect_preimage(b"a", b"bcd", b"");
+        assert_ne!(
+            h1, h2,
+            "length-prefixed hashing must prevent byte-shifting collisions"
+        );
+
+        // Also verify a second boundary shift.
+        let h3 = hash_defect_preimage(b"abc", b"d", b"");
+        assert_ne!(h1, h3);
+        assert_ne!(h2, h3);
+    }
+
+    #[test]
+    fn hash_defect_preimage_is_deterministic() {
+        let h1 = hash_defect_preimage(b"work-1", &[0xAA; 32], b"reason");
+        let h2 = hash_defect_preimage(b"work-1", &[0xAA; 32], b"reason");
+        assert_eq!(h1, h2, "same inputs must produce the same hash");
     }
 }
