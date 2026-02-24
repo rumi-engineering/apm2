@@ -1598,168 +1598,6 @@ impl GateOrchestrator {
     }
 
     // =========================================================================
-    // Daemon Runtime Entry Point (BLOCKER 1)
-    // =========================================================================
-
-    /// Daemon runtime hook for session termination notifications.
-    ///
-    /// This is the entry point that the daemon runtime calls when a session
-    /// terminates. It orchestrates the full gate lifecycle:
-    ///
-    /// 1. Starts gate orchestration via `handle_session_terminated`
-    /// 2. Checks for timed-out gates and processes them
-    /// 3. Returns all emitted events for ledger persistence
-    ///
-    /// The daemon runtime should call this method when it receives a
-    /// `SessionTerminated` event from the ledger. The full ledger
-    /// subscription integration is deferred to TCK-00390 (merge
-    /// automation), but this method provides the clear, testable entry
-    /// point that wires the orchestrator into the daemon lifecycle.
-    ///
-    /// # Example Integration
-    ///
-    /// ```rust,ignore
-    /// // In daemon startup:
-    /// let orchestrator = Arc::new(GateOrchestrator::new(config, signer));
-    ///
-    /// // When a session terminates:
-    /// let (gate_types, events) = orchestrator
-    ///     .on_session_terminated(session_info)
-    ///     .await?;
-    ///
-    /// // Persist events to ledger
-    /// for event in events {
-    ///     ledger.append(event).await?;
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns `GateOrchestratorError` if orchestration setup fails.
-    pub async fn on_session_terminated(
-        &self,
-        info: SessionTerminatedInfo,
-    ) -> Result<
-        (
-            Vec<GateType>,
-            HashMap<GateType, Arc<Signer>>,
-            Vec<GateOrchestratorEvent>,
-        ),
-        GateOrchestratorError,
-    > {
-        let work_id = info.work_id.clone();
-
-        // Step 1: Start gate orchestration (returns per-invocation events).
-        let (gate_types, executor_signers, mut events) =
-            self.handle_session_terminated(info).await?;
-
-        // Step 2: Check for any immediately timed-out gates (e.g., zero timeout).
-        let timed_out = self.check_timeouts().await;
-        for (tid, gt) in timed_out {
-            if tid == work_id {
-                // Best-effort: ignore errors from timeout handling since the
-                // orchestration is already set up.
-                if let Ok((_outcomes, timeout_events)) = self.handle_gate_timeout(&tid, gt).await {
-                    events.extend(timeout_events);
-                }
-            }
-        }
-
-        info!(
-            work_id = %work_id,
-            gate_count = gate_types.len(),
-            event_count = events.len(),
-            "Session termination handled by orchestrator"
-        );
-
-        Ok((gate_types, executor_signers, events))
-    }
-
-    // =========================================================================
-    // Autonomous Gate Execution (Quality BLOCKER 2)
-    // =========================================================================
-
-    /// Drives the autonomous gate execution lifecycle for a terminated session.
-    ///
-    /// This is the production entry point that performs the full gate
-    /// lifecycle autonomously:
-    ///
-    /// 1. Calls [`on_session_terminated`](Self::on_session_terminated) to set
-    ///    up the orchestration (policy resolution + lease issuance)
-    /// 2. Records executor spawned events for each gate type using the adapter
-    ///    profile from the gate type configuration
-    /// 3. Returns all accumulated events for ledger persistence
-    ///
-    /// The actual executor process spawn + receipt collection is handled by
-    /// the daemon's episode runtime (TCK-00390). This method provides the
-    /// orchestrator-side bookkeeping that transitions gates from `LeaseIssued`
-    /// to `Running`, making the orchestration state visible to status queries
-    /// and timeout sweeps.
-    ///
-    /// # Gate Executor Episode IDs
-    ///
-    /// Each gate executor is assigned an episode ID of the form
-    /// `gate-exec-{gate_id}-{work_id}`. The daemon runtime uses this to
-    /// correlate executor process lifecycle events back to the orchestration.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GateOrchestratorError` if orchestration setup or executor
-    /// spawn recording fails.
-    pub async fn drive_gate_execution(
-        &self,
-        info: SessionTerminatedInfo,
-    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
-        let work_id = info.work_id.clone();
-
-        // Step 1: Set up orchestration (policy + leases).
-        let (gate_types, _executor_signers, mut events) = self.on_session_terminated(info).await?;
-
-        // Step 2: Record executor spawned for each gate type.
-        // In production, the daemon runtime would spawn actual executor
-        // processes here using the adapter profiles. We record the spawn
-        // events to transition gates to Running state.
-        for &gate_type in &gate_types {
-            let episode_id = format!("gate-exec-{}-{}", gate_type.as_gate_id(), work_id);
-
-            match self
-                .record_executor_spawned(&work_id, gate_type, &episode_id)
-                .await
-            {
-                Ok(spawn_events) => {
-                    info!(
-                        work_id = %work_id,
-                        gate_type = %gate_type,
-                        episode_id = %episode_id,
-                        adapter_profile = %gate_type.adapter_profile_id(),
-                        "Autonomous gate executor recorded"
-                    );
-                    events.extend(spawn_events);
-                },
-                Err(e) => {
-                    // Gate may have already timed out (e.g., zero timeout
-                    // config). Log and continue with remaining gates.
-                    warn!(
-                        work_id = %work_id,
-                        gate_type = %gate_type,
-                        error = %e,
-                        "Failed to record executor spawn (gate may have timed out)"
-                    );
-                },
-            }
-        }
-
-        info!(
-            work_id = %work_id,
-            gate_count = gate_types.len(),
-            event_count = events.len(),
-            "Autonomous gate execution lifecycle driven"
-        );
-
-        Ok(events)
-    }
-
-    // =========================================================================
     // Internal Methods
     // =========================================================================
 
@@ -2308,6 +2146,39 @@ mod tests {
         let (_gate_types, executor_signers, _events) =
             orch.handle_session_terminated(info).await.unwrap();
         executor_signers
+    }
+
+    /// Helper: reproduce the historical "start + immediate timeout sweep +
+    /// spawn bookkeeping" behavior without wrapper APIs.
+    async fn start_and_record_spawns(
+        orch: &GateOrchestrator,
+        info: SessionTerminatedInfo,
+    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
+        let work_id = info.work_id.clone();
+        let (gate_types, _executor_signers, mut events) =
+            orch.handle_session_terminated(info).await?;
+
+        for (timed_work_id, gate_type) in orch.check_timeouts().await {
+            if timed_work_id == work_id {
+                if let Ok((_outcomes, timeout_events)) =
+                    orch.handle_gate_timeout(&timed_work_id, gate_type).await
+                {
+                    events.extend(timeout_events);
+                }
+            }
+        }
+
+        for &gate_type in &gate_types {
+            let episode_id = format!("gate-exec-{}-{}", gate_type.as_gate_id(), work_id);
+            if let Ok(spawn_events) = orch
+                .record_executor_spawned(&work_id, gate_type, &episode_id)
+                .await
+            {
+                events.extend(spawn_events);
+            }
+        }
+
+        Ok(events)
     }
 
     /// Helper: build a valid receipt signed with the correct executor signer.
@@ -3030,15 +2901,15 @@ mod tests {
     }
 
     // =========================================================================
-    // BLOCKER 3: Daemon Runtime Integration Tests
+    // BLOCKER 3: Lifecycle Integration Tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_on_session_terminated_returns_gates_and_events() {
+    async fn test_handle_session_terminated_returns_gates_and_events() {
         let orch = test_orchestrator();
         let info = test_session_info("work-daemon");
 
-        let (gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
+        let (gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -3054,15 +2925,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_session_terminated_handles_immediate_timeouts() {
+    async fn test_timeout_sweep_handles_immediate_timeouts() {
         let config = GateOrchestratorConfig {
             gate_timeout_ms: 0, // Instant timeout
             ..Default::default()
         };
         let orch = GateOrchestrator::new(config, test_signer());
-        let info = test_session_info("work-imm-timeout");
+        let work_id = "work-imm-timeout";
+        let info = test_session_info(work_id);
 
-        let (_gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, mut events) =
+            orch.handle_session_terminated(info).await.unwrap();
+        for (timed_work_id, gate_type) in orch.check_timeouts().await {
+            if timed_work_id == work_id {
+                let (_outcomes, timeout_events) = orch
+                    .handle_gate_timeout(&timed_work_id, gate_type)
+                    .await
+                    .unwrap();
+                events.extend(timeout_events);
+            }
+        }
 
         // Should have timeout events in addition to policy+lease events
         let timeout_count = events
@@ -3073,15 +2955,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_session_terminated_duplicate_rejected() {
+    async fn test_handle_session_terminated_duplicate_rejected() {
         let orch = test_orchestrator();
 
-        orch.on_session_terminated(test_session_info("work-dup2"))
+        orch.handle_session_terminated(test_session_info("work-dup2"))
             .await
             .unwrap();
 
         let result = orch
-            .on_session_terminated(test_session_info("work-dup2"))
+            .handle_session_terminated(test_session_info("work-dup2"))
             .await;
         assert!(result.is_err(), "expected ReplayDetected");
         let err = result.err().unwrap();
@@ -4176,33 +4058,29 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_drive_gate_execution_transitions_to_running() {
+    async fn test_start_and_spawn_transitions_to_running() {
         let orch = test_orchestrator();
         let info = test_session_info("work-drive");
 
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = start_and_record_spawns(&orch, info).await.unwrap();
 
         // Should have: 1 PolicyResolved + 3 LeaseIssued + 3 ExecutorSpawned = 7
-        assert_eq!(
-            events.len(),
-            7,
-            "Expected 7 events from drive_gate_execution"
-        );
+        assert_eq!(events.len(), 7, "Expected 7 events from setup + spawn flow");
 
         // Verify all gates are now in Running state.
         for gate_type in GateType::all() {
             let status = orch.gate_status("work-drive", gate_type).await.unwrap();
             assert!(
                 matches!(status, GateStatus::Running { .. }),
-                "Gate {gate_type} should be in Running state after drive_gate_execution"
+                "Gate {gate_type} should be in Running state after setup + spawn"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_drive_gate_execution_with_zero_timeout() {
-        // With zero timeout, gates time out immediately during on_session_terminated.
-        // drive_gate_execution should still succeed (executor spawns will fail
+    async fn test_start_and_spawn_with_zero_timeout() {
+        // With zero timeout, gates time out immediately during setup.
+        // Setup + spawn should still succeed (executor spawns will fail
         // because gates are already timed out, but that's best-effort).
         let config = GateOrchestratorConfig {
             gate_timeout_ms: 0,
@@ -4211,7 +4089,7 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         let info = test_session_info("work-drive-timeout");
 
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = start_and_record_spawns(&orch, info).await.unwrap();
 
         // Should have at least: 1 PolicyResolved + 3 LeaseIssued + 3 TimedOut = 7
         // Executor spawns fail because gates are already timed out.
@@ -4242,11 +4120,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drive_gate_execution_executor_events_have_adapter_profile() {
+    async fn test_start_and_spawn_executor_events_have_adapter_profile() {
         let orch = test_orchestrator();
         let info = test_session_info("work-drive-profile");
 
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = start_and_record_spawns(&orch, info).await.unwrap();
 
         // Check that executor spawned events have correct adapter profiles.
         let spawn_events: Vec<_> = events
@@ -4640,7 +4518,8 @@ mod tests {
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
         let info = test_session_info("work-cas-test");
-        let (_gate_types, _exec_signers, events) = orch.on_session_terminated(info).await.unwrap();
+        let (_gate_types, _exec_signers, events) =
+            orch.handle_session_terminated(info).await.unwrap();
 
         // Find a lease issuance event.
         let lease_event = events
@@ -4704,7 +4583,7 @@ mod tests {
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
         let info = test_session_info("work-delegate-cas");
-        let _ = orch.on_session_terminated(info).await.unwrap();
+        let _ = orch.handle_session_terminated(info).await.unwrap();
 
         let parent_lease = orch
             .gate_lease("work-delegate-cas", GateType::Quality)

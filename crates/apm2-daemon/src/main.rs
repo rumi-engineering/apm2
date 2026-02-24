@@ -1380,9 +1380,9 @@ async fn async_main(args: Args) -> Result<()> {
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
-    // and wired into the DispatcherState. When a session terminates, the dispatcher
-    // calls `notify_session_terminated` which delegates to the orchestrator. A
-    // background task polls for gate timeouts periodically.
+    // and wired into the DispatcherState. When a session terminates, the
+    // session dispatcher invokes the orchestrator directly from the terminate
+    // path. A background task polls for gate timeouts periodically.
     let gate_signer = Arc::new(
         Signer::from_bytes(&lifecycle_signing_key_bytes)
             .map_err(|e| anyhow::anyhow!("failed to derive gate signer from lifecycle key: {e}"))?,

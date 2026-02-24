@@ -52,7 +52,7 @@ use crate::episode::{
 use crate::evidence::keychain::{
     GitHubCredentialStore, KeychainError, MAX_SSH_AUTH_SOCK_LEN, MAX_TOKEN_SIZE, SshCredentialStore,
 };
-use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
+use crate::gate::{GateOrchestrator, MergeExecutor};
 use crate::governance::{
     GovernanceFreshnessConfig, GovernanceFreshnessMonitor, GovernancePolicyResolver,
 };
@@ -546,10 +546,6 @@ pub struct DispatcherState {
     session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
 
     /// Gate execution orchestrator for autonomous gate lifecycle (TCK-00388).
-    ///
-    /// When set, the dispatcher invokes
-    /// [`GateOrchestrator::on_session_terminated`] from the production
-    /// session termination path, returning ledger events for persistence.
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
 
     /// Merge executor for autonomous merge after gate approval (TCK-00390).
@@ -1962,10 +1958,6 @@ impl DispatcherState {
     }
 
     /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
-    ///
-    /// When set, [`notify_session_terminated`](Self::notify_session_terminated)
-    /// delegates to [`GateOrchestrator::on_session_terminated`], returning
-    /// ledger events for the caller to persist.
     #[must_use]
     pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
         // Wire orchestrator into session dispatcher so termination triggers
@@ -2042,27 +2034,6 @@ impl DispatcherState {
     #[must_use]
     pub const fn divergence_watchdog(&self) -> Option<&Arc<DivergenceWatchdog<SystemTimeSource>>> {
         self.divergence_watchdog.as_ref()
-    }
-
-    /// Notifies the gate orchestrator that a session has terminated.
-    ///
-    /// This is the production entry point that wires the
-    /// `GateOrchestrator` into the daemon runtime (Quality BLOCKER 4 fix).
-    /// The caller is responsible for persisting the returned events to the
-    /// ledger.
-    ///
-    /// Returns `None` if no gate orchestrator is configured.
-    ///
-    /// # Errors
-    ///
-    /// Returns the orchestrator error if gate setup fails.
-    pub async fn notify_session_terminated(
-        &self,
-        info: SessionTerminatedInfo,
-    ) -> Option<Result<Vec<GateOrchestratorEvent>, crate::gate::GateOrchestratorError>> {
-        let orch = self.gate_orchestrator.as_ref()?;
-        let result = orch.on_session_terminated(info).await;
-        Some(result.map(|(_gate_types, _signers, events)| events))
     }
 
     /// Returns a reference to the privileged dispatcher.

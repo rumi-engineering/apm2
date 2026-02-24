@@ -1220,9 +1220,9 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
     ///
     /// When set, session termination triggers gate orchestration via
-    /// [`GateOrchestrator::on_session_terminated`]. The returned events
-    /// are persisted to the ledger through the session dispatcher's
-    /// `ledger` emitter.
+    /// [`GateOrchestrator::handle_session_terminated`] plus an immediate
+    /// timeout sweep for that work item. The returned events are persisted
+    /// to the ledger through the session dispatcher's `ledger` emitter.
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
     /// Pre-actuation gate for stop/budget checks (TCK-00351).
     ///
@@ -10186,17 +10186,29 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         terminated_at_ms,
                     };
 
-                    // The orchestrator's on_session_terminated is async; use
-                    // block_in_place to call it from the sync dispatch path.
-                    // This is safe because the session dispatcher runs on a
-                    // Tokio worker thread.
+                    // Run orchestration from the synchronous dispatch path.
+                    // We set up leases first, then perform an immediate timeout
+                    // sweep scoped to this work_id.
                     let orch_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(orch.on_session_terminated(gate_info))
+                        tokio::runtime::Handle::current().block_on(async {
+                            let (_gate_types, _signers, mut events) =
+                                orch.handle_session_terminated(gate_info).await?;
+                            let timed_out = orch.check_timeouts().await;
+                            for (timed_work_id, gate_type) in timed_out {
+                                if timed_work_id == work_id {
+                                    if let Ok((_outcomes, timeout_events)) =
+                                        orch.handle_gate_timeout(&timed_work_id, gate_type).await
+                                    {
+                                        events.extend(timeout_events);
+                                    }
+                                }
+                            }
+                            Ok::<_, crate::gate::GateOrchestratorError>(events)
+                        })
                     });
 
                     match orch_result {
-                        Ok((_gate_types, _signers, events)) => {
+                        Ok(events) => {
                             // Persist gate orchestration events to ledger
                             // (fail-closed on persistence error).
                             if let Some(ref ledger) = self.ledger {
