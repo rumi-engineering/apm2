@@ -2442,7 +2442,7 @@ mod tests {
             terminated_at_ms: 0,
         };
         let _ = orchestrator
-            .handle_session_terminated(info)
+            .start_from_test_session(info)
             .await
             .expect("orchestration should start");
         let mut domain = GateTimeoutDomain::new(

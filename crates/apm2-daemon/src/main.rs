@@ -1381,9 +1381,9 @@ async fn async_main(args: Args) -> Result<()> {
     // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
-    // and wired into the DispatcherState. When a session terminates, the dispatcher
-    // calls `notify_session_terminated` which delegates to the orchestrator. A
-    // background task polls for gate timeouts periodically.
+    // and wired into the DispatcherState for lifecycle timeout polling.
+    // Gate start is publication-driven (`changeset_published` -> GateStartKernel
+    // -> `start_for_changeset`), and a background task polls gate timeouts.
     let gate_signer = Arc::new(
         Signer::from_bytes(&lifecycle_signing_key_bytes)
             .map_err(|e| anyhow::anyhow!("failed to derive gate signer from lifecycle key: {e}"))?,
@@ -1400,8 +1400,9 @@ async fn async_main(args: Args) -> Result<()> {
         GateOrchestrator::new(GateOrchestratorConfig::default(), gate_signer).with_cas(gate_cas),
     );
 
-    // Wire orchestrator into dispatcher state so session termination events
-    // trigger autonomous gate lifecycle (Quality BLOCKER 1).
+    // Wire orchestrator into dispatcher state for lifecycle timeout polling.
+    // Gate start is publication-driven via GateStartKernel
+    // (`changeset_published` -> `start_for_changeset`).
     let dispatcher_state = {
         // Unwrap the Arc, attach the orchestrator, and re-wrap.
         // Safety: we just created this Arc and hold the only reference.

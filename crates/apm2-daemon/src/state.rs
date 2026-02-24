@@ -52,7 +52,7 @@ use crate::episode::{
 use crate::evidence::keychain::{
     GitHubCredentialStore, KeychainError, MAX_SSH_AUTH_SOCK_LEN, MAX_TOKEN_SIZE, SshCredentialStore,
 };
-use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
+use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor};
 use crate::governance::{
     GovernanceFreshnessConfig, GovernanceFreshnessMonitor, GovernancePolicyResolver,
 };
@@ -2059,20 +2059,6 @@ impl DispatcherState {
     pub async fn poll_gate_lifecycle(&self) -> Option<Vec<GateOrchestratorEvent>> {
         let orch = self.gate_orchestrator.as_ref()?;
         Some(orch.poll_session_lifecycle().await)
-    }
-
-    /// Backwards-compatible wrapper that accepts `SessionTerminatedInfo`.
-    ///
-    /// Delegates to [`Self::poll_gate_lifecycle`]; the session info is
-    /// ignored because gate start is publication-driven (CSID-003).
-    #[deprecated(
-        note = "Use `poll_gate_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
-    )]
-    pub async fn notify_session_terminated(
-        &self,
-        _info: SessionTerminatedInfo,
-    ) -> Option<Result<Vec<GateOrchestratorEvent>, crate::gate::GateOrchestratorError>> {
-        self.poll_gate_lifecycle().await.map(Ok)
     }
 
     /// Returns a reference to the privileged dispatcher.

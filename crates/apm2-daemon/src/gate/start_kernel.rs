@@ -318,16 +318,42 @@ impl OrchestratorDomain<GateStartObservedEvent, GateStartIntent, String, GateSta
                             ..
                         } => {
                             let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
-                            if let Some(lease) =
+                            let Some(lease) =
                                 self.orchestrator.gate_lease(work_id, *gate_type).await
-                            {
-                                receipts.push(GateStartReceipt::GateLeaseIssued {
-                                    lease: Box::new(lease),
+                            else {
+                                let defect = build_gate_start_defect(
+                                    &intent.publication,
+                                    &format!(
+                                        "gate-start lease lookup failed (work_id={work_id}, gate_type={gate_type:?})",
+                                    ),
+                                    timestamp_ns,
+                                );
+                                receipts.push(GateStartReceipt::Defect {
+                                    defect,
                                     timestamp_ns,
                                 });
-                            } else {
-                                receipts.push(GateStartReceipt::OrchestratorEvent(event));
+                                continue;
+                            };
+                            if lease.changeset_digest != intent.publication.changeset_digest {
+                                let defect = build_gate_start_defect(
+                                    &intent.publication,
+                                    &format!(
+                                        "gate-start lease digest mismatch (work_id={work_id}, gate_type={gate_type:?}, observed={}, expected={})",
+                                        hex::encode(lease.changeset_digest),
+                                        hex::encode(intent.publication.changeset_digest),
+                                    ),
+                                    timestamp_ns,
+                                );
+                                receipts.push(GateStartReceipt::Defect {
+                                    defect,
+                                    timestamp_ns,
+                                });
+                                continue;
                             }
+                            receipts.push(GateStartReceipt::GateLeaseIssued {
+                                lease: Box::new(lease),
+                                timestamp_ns,
+                            });
                         },
                         _ => receipts.push(GateStartReceipt::OrchestratorEvent(event)),
                     }

@@ -1,5 +1,4 @@
 // AGENT-AUTHORED (TCK-00388)
-#![allow(deprecated)]
 //! TCK-00388: Gate execution orchestrator integration tests.
 //!
 //! This test module verifies the gate orchestrator's runtime wiring by
@@ -11,7 +10,7 @@
 //! - Event ordering invariant (`PolicyResolved` before `GateLeaseIssued`)
 //! - Receipt signature verification (BLOCKER 4)
 //! - Admission check before events (BLOCKER 2)
-//! - Lifecycle-only `on_session_terminated` timeout progression
+//! - Lifecycle-only timeout progression via `poll_session_lifecycle`
 //! - Fail-closed timeout semantics
 //!
 //! # Verification Commands
@@ -42,7 +41,7 @@ use apm2_core::crypto::Signer;
 use apm2_core::fac::{ChangesetPublication, GateReceiptBuilder};
 use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent,
-    GateType, SessionTerminatedInfo,
+    GateType,
 };
 use apm2_daemon::state::DispatcherState;
 
@@ -55,16 +54,6 @@ fn test_publication(work_id: &str, digest: [u8; 32]) -> ChangesetPublication {
         published_at_ms: 1_706_000_000,
         publisher_actor_id: "actor:publisher".to_string(),
         changeset_published_event_id: format!("evt-{work_id}"),
-    }
-}
-
-/// Helper: creates a test `SessionTerminatedInfo`.
-fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
-    SessionTerminatedInfo {
-        session_id: format!("session-{work_id}"),
-        work_id: work_id.to_string(),
-        changeset_digest: [0x42; 32],
-        terminated_at_ms: 0,
     }
 }
 
@@ -334,11 +323,8 @@ async fn tck_00388_fail_closed_timeout_semantics() {
 
     assert_eq!(gate_types.len(), 3);
 
-    // Session termination is lifecycle-only and drives timeout progression.
-    let (_gate_types, _signers, events) = orch
-        .on_session_terminated(test_session_info("work-integ-05"))
-        .await
-        .unwrap();
+    // Lifecycle polling advances timeout progression but never bootstraps gates.
+    let events = orch.poll_session_lifecycle().await;
 
     // All 3 gates should have timed out (instant timeout)
     let timeout_count = events
@@ -385,14 +371,11 @@ async fn tck_00388_dispatcher_state_wiring() {
         "gate_orchestrator should be present after with_gate_orchestrator"
     );
 
-    // Call notify_session_terminated through the dispatcher
-    let info = test_session_info("work-wiring");
-    let result = dispatcher.notify_session_terminated(info).await;
-
-    // Should return Some(Ok(events))
-    let events = result
-        .expect("should return Some when orchestrator is wired")
-        .expect("should succeed for valid session info");
+    // Poll lifecycle through the dispatcher.
+    let events = dispatcher
+        .poll_gate_lifecycle()
+        .await
+        .expect("should return Some when orchestrator is wired");
 
     // Session termination is lifecycle-only and MUST NOT start gates.
     assert!(
@@ -408,7 +391,7 @@ async fn tck_00388_dispatcher_state_wiring() {
 
 #[tokio::test]
 async fn tck_00388_dispatcher_state_without_orchestrator() {
-    // Without gate orchestrator, notify_session_terminated returns None
+    // Without gate orchestrator, lifecycle polling returns None.
     let dispatcher = DispatcherState::new(None);
 
     assert!(
@@ -416,8 +399,7 @@ async fn tck_00388_dispatcher_state_without_orchestrator() {
         "gate_orchestrator should be None by default"
     );
 
-    let info = test_session_info("work-no-orch");
-    let result = dispatcher.notify_session_terminated(info).await;
+    let result = dispatcher.poll_gate_lifecycle().await;
     assert!(
         result.is_none(),
         "should return None when no orchestrator is wired"

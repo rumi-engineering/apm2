@@ -259,11 +259,12 @@ pub struct GateOutcome {
 // Session Terminated Info
 // =============================================================================
 
-/// Information about a terminated session lifecycle event.
+/// Information about a terminated session lifecycle event used by legacy
+/// session-seeded unit tests.
 ///
-/// Session termination is retained for lifecycle/accounting surfaces, but gate
-/// orchestration is publication-driven via
+/// Production orchestration is publication-driven via
 /// [`GateOrchestrator::start_for_changeset`].
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct SessionTerminatedInfo {
     /// The session ID that terminated.
@@ -849,26 +850,6 @@ impl GateOrchestrator {
             changeset_published_event_id: info.session_id,
         })
         .await
-    }
-
-    /// Legacy test-only shim for session-seeded gate start.
-    ///
-    /// Production code must never start gates from session lifecycle hooks.
-    /// Unit tests that still model pre-CSID-003 behavior can use this helper
-    /// while gradually migrating to [`Self::start_for_changeset`].
-    #[cfg(test)]
-    pub(crate) async fn handle_session_terminated(
-        &self,
-        info: SessionTerminatedInfo,
-    ) -> Result<
-        (
-            Vec<GateType>,
-            HashMap<GateType, Arc<Signer>>,
-            Vec<GateOrchestratorEvent>,
-        ),
-        GateOrchestratorError,
-    > {
-        self.start_from_test_session(info).await
     }
 
     /// Returns the orchestrator's verifying key (for lease signature
@@ -1739,60 +1720,6 @@ impl GateOrchestrator {
         events
     }
 
-    /// Backwards-compatible wrapper for callers that still pass
-    /// `SessionTerminatedInfo`. Delegates to [`Self::poll_session_lifecycle`].
-    ///
-    /// Gate start is publication-driven through [`Self::start_for_changeset`].
-    /// This method only advances timeout lifecycle state on already-active
-    /// orchestrations and ignores the session info payload.
-    #[deprecated(
-        note = "Use `poll_session_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
-    )]
-    pub async fn on_session_terminated(
-        &self,
-        info: SessionTerminatedInfo,
-    ) -> Result<
-        (
-            Vec<GateType>,
-            HashMap<GateType, Arc<Signer>>,
-            Vec<GateOrchestratorEvent>,
-        ),
-        GateOrchestratorError,
-    > {
-        if info.work_id.is_empty() {
-            return Err(GateOrchestratorError::EmptyWorkId);
-        }
-        if info.work_id.len() > MAX_WORK_ID_LENGTH {
-            return Err(GateOrchestratorError::WorkIdTooLong {
-                actual: info.work_id.len(),
-                max: MAX_WORK_ID_LENGTH,
-            });
-        }
-
-        let events = self.poll_session_lifecycle().await;
-        Ok((Vec::new(), HashMap::new(), events))
-    }
-
-    // =========================================================================
-    // Autonomous Gate Execution (Quality BLOCKER 2)
-    // =========================================================================
-
-    /// Handles session lifecycle progression without starting new gates.
-    ///
-    /// Gate start is publication-driven through [`Self::start_for_changeset`].
-    /// This method only advances timeout lifecycle state on already-active
-    /// orchestrations.
-    #[deprecated(
-        note = "Use `poll_session_lifecycle()` instead; session termination no longer triggers gate start (CSID-003)"
-    )]
-    pub async fn drive_gate_execution(
-        &self,
-        _info: SessionTerminatedInfo,
-    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
-        let events = self.poll_session_lifecycle().await;
-        Ok(events)
-    }
-
     // =========================================================================
     // Internal Methods
     // =========================================================================
@@ -2381,7 +2308,7 @@ mod tests {
     ) -> HashMap<GateType, Arc<Signer>> {
         let info = test_session_info(work_id);
         let (_gate_types, executor_signers, _events) =
-            orch.handle_session_terminated(info).await.unwrap();
+            orch.start_from_test_session(info).await.unwrap();
         executor_signers
     }
 
@@ -2415,12 +2342,12 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_handle_session_terminated_issues_all_gates() {
+    async fn test_start_from_test_session_issues_all_gates() {
         let orch = test_orchestrator();
         let info = test_session_info("work-001");
 
         let (gate_types, _executor_signers, _events) =
-            orch.handle_session_terminated(info).await.unwrap();
+            orch.start_from_test_session(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -2434,7 +2361,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-002");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // First event must be PolicyResolved
         assert!(matches!(
@@ -2456,7 +2383,7 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
         let info = test_session_info("work-003");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-003", gate_type).await.unwrap();
@@ -2478,7 +2405,7 @@ mod tests {
             terminated_at_ms: 0,
         };
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-binding", gate_type).await.unwrap();
@@ -2494,7 +2421,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-004");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-004").await.unwrap();
         let policy_hash = resolution.resolved_policy_hash();
@@ -2513,7 +2440,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-005");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let events = orch
             .record_executor_spawned("work-005", GateType::Quality, "ep-001")
@@ -2614,7 +2541,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-008");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let (result, events) = orch
             .handle_gate_timeout("work-008", GateType::Aat)
@@ -2728,7 +2655,7 @@ mod tests {
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
@@ -2746,7 +2673,7 @@ mod tests {
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
@@ -2760,9 +2687,9 @@ mod tests {
         let info1 = test_session_info("work-dup");
         let info2 = test_session_info("work-dup");
 
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
-        let (gate_types, signers, events) = orch.handle_session_terminated(info2).await.unwrap();
+        let (gate_types, signers, events) = orch.start_from_test_session(info2).await.unwrap();
         assert!(gate_types.is_empty());
         assert!(signers.is_empty());
         assert!(events.is_empty());
@@ -2787,10 +2714,10 @@ mod tests {
             terminated_at_ms: 0,
         };
 
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
         // With composite key (work_id, changeset_digest), this should succeed.
-        let result = orch.handle_session_terminated(info2).await;
+        let result = orch.start_from_test_session(info2).await;
         assert!(
             result.is_ok(),
             "same work_id with different digest should be allowed"
@@ -2814,12 +2741,12 @@ mod tests {
             terminated_at_ms: 0,
         };
 
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
         // Same (work_id, changeset_digest) should be detected as replay/no-op.
         // Note: the idempotency key set provides this guard, returning
         // empty outputs instead of an error.
-        let result = orch.handle_session_terminated(info2).await;
+        let result = orch.start_from_test_session(info2).await;
         assert!(result.is_ok(), "duplicate should be no-op, not error");
         let (gate_types, _, events) = result.unwrap();
         assert!(
@@ -2837,15 +2764,15 @@ mod tests {
         };
         let orch = GateOrchestrator::new(config, test_signer());
 
-        orch.handle_session_terminated(test_session_info("work-a"))
+        orch.start_from_test_session(test_session_info("work-a"))
             .await
             .unwrap();
-        orch.handle_session_terminated(test_session_info("work-b"))
+        orch.start_from_test_session(test_session_info("work-b"))
             .await
             .unwrap();
 
         let result = orch
-            .handle_session_terminated(test_session_info("work-c"))
+            .start_from_test_session(test_session_info("work-c"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -2874,7 +2801,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-remove");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
 
         assert!(orch.remove_orchestration("work-remove").await);
@@ -2894,7 +2821,7 @@ mod tests {
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
         let info = test_session_info("work-domain");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // Verify that all leases have valid domain-separated signatures
         for gate_type in GateType::all() {
@@ -2922,7 +2849,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-consistency");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         let resolution = orch.policy_resolution("work-consistency").await.unwrap();
         let expected_hash = resolution.resolved_policy_hash();
@@ -2953,7 +2880,7 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         let info = test_session_info("work-temporal");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-temporal", gate_type).await.unwrap();
@@ -3025,7 +2952,7 @@ mod tests {
         };
 
         let err = orch
-            .handle_session_terminated(info)
+            .start_from_test_session(info)
             .await
             .err()
             .expect("expected error");
@@ -3047,7 +2974,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-per-inv");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // Events are returned from the call, not buffered
         assert!(!events.is_empty());
@@ -3060,7 +2987,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-events");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
         // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
         assert_eq!(events.len(), 4);
     }
@@ -3076,11 +3003,11 @@ mod tests {
         let info2 = test_session_info("work-no-events-dup");
 
         // First succeeds
-        let (_gate_types, _signers, events1) = orch.handle_session_terminated(info1).await.unwrap();
+        let (_gate_types, _signers, events1) = orch.start_from_test_session(info1).await.unwrap();
         assert!(!events1.is_empty());
 
         // Second call is idempotent no-op with empty outputs.
-        let (gate_types, signers, events2) = orch.handle_session_terminated(info2).await.unwrap();
+        let (gate_types, signers, events2) = orch.start_from_test_session(info2).await.unwrap();
         assert!(gate_types.is_empty());
         assert!(signers.is_empty());
         assert!(events2.is_empty());
@@ -3095,13 +3022,13 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
 
         // First succeeds
-        orch.handle_session_terminated(test_session_info("work-max-a"))
+        orch.start_from_test_session(test_session_info("work-max-a"))
             .await
             .unwrap();
 
         // Second fails - no events should be returned
         let result = orch
-            .handle_session_terminated(test_session_info("work-max-b"))
+            .start_from_test_session(test_session_info("work-max-b"))
             .await;
         assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
         let err = result.err().unwrap();
@@ -3124,7 +3051,7 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         let info = test_session_info("work-expire");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // With 0ms timeout, all gates should be timed out immediately
         let timed_out = orch.check_timeouts().await;
@@ -3136,19 +3063,16 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_on_session_terminated_returns_gates_and_events() {
+    async fn test_poll_session_lifecycle_returns_no_bootstrap_events() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-daemon");
-
-        let (gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
         // Lifecycle hook is session-only and must not start gates.
-        assert!(gate_types.is_empty());
         assert!(events.is_empty());
     }
 
     #[tokio::test]
-    async fn test_on_session_terminated_handles_immediate_timeouts() {
+    async fn test_poll_session_lifecycle_handles_immediate_timeouts() {
         let config = GateOrchestratorConfig {
             gate_timeout_ms: 0, // Instant timeout
             ..Default::default()
@@ -3156,12 +3080,10 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         // Seed an active orchestration via publication-driven start.
         let _ = orch
-            .handle_session_terminated(test_session_info("work-imm-timeout-seed"))
+            .start_from_test_session(test_session_info("work-imm-timeout-seed"))
             .await
             .unwrap();
-        let info = test_session_info("work-imm-timeout");
-
-        let (_gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
         // Lifecycle hook should sweep and emit timeout events for seeded gates.
         let timeout_count = events
@@ -3172,20 +3094,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_session_terminated_duplicate_rejected() {
+    async fn test_poll_session_lifecycle_is_idempotent() {
         let orch = test_orchestrator();
 
-        orch.on_session_terminated(test_session_info("work-dup2"))
-            .await
-            .unwrap();
-
-        let result = orch
-            .on_session_terminated(test_session_info("work-dup2"))
-            .await;
+        let events1 = orch.poll_session_lifecycle().await;
+        let events2 = orch.poll_session_lifecycle().await;
         assert!(
-            result.is_ok(),
+            events1.is_empty() && events2.is_empty(),
             "lifecycle-only hook should be idempotent and never replay-reject"
         );
+
+        orch.start_from_test_session(test_session_info("work-dup2"))
+            .await
+            .unwrap();
+        let _ = orch.poll_session_lifecycle().await;
     }
 
     // =========================================================================
@@ -3890,7 +3812,7 @@ mod tests {
         );
         let info = test_session_info("work-clock");
 
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
 
         // All events should use the mock clock's timestamp
         if let GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } = &events[0] {
@@ -3931,7 +3853,7 @@ mod tests {
             changeset_digest: [0xAA; 32],
             terminated_at_ms: 0,
         };
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
         // Remove the orchestration so work_id is free, but replay key persists.
         orch.remove_orchestration("work-replay-1").await;
@@ -3943,7 +3865,7 @@ mod tests {
             changeset_digest: [0xAA; 32],
             terminated_at_ms: 0,
         };
-        let (gate_types, signers, events) = orch.handle_session_terminated(info2).await.unwrap();
+        let (gate_types, signers, events) = orch.start_from_test_session(info2).await.unwrap();
         assert!(
             gate_types.is_empty() && signers.is_empty() && events.is_empty(),
             "Replay should return no-op outputs"
@@ -3960,7 +3882,7 @@ mod tests {
             // A very old timestamp (2024)
             terminated_at_ms: 1_704_067_200_000,
         };
-        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.start_from_test_session(info).await.unwrap();
         assert_eq!(events.len(), 4, "publication-wrapped start should succeed");
     }
 
@@ -3970,7 +3892,7 @@ mod tests {
         // terminated_at_ms: 0 should bypass the freshness check
         let info = test_session_info("work-fresh");
         assert_eq!(info.terminated_at_ms, 0);
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
         assert_eq!(orch.active_count().await, 1);
     }
 
@@ -3987,7 +3909,7 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         let info = test_session_info("work-poll");
 
-        orch.handle_session_terminated(info).await.unwrap();
+        orch.start_from_test_session(info).await.unwrap();
 
         // poll_timeouts should handle all 3 expired gates
         let events = orch.poll_timeouts().await;
@@ -4188,7 +4110,7 @@ mod tests {
 
         // This should NOT panic. The saturating_add prevents overflow.
         // The event is in the far future, so it won't be stale.
-        let result = orch.handle_session_terminated(info).await;
+        let result = orch.start_from_test_session(info).await;
         assert!(
             result.is_ok(),
             "Near-u64::MAX timestamp should not panic or be rejected as stale"
@@ -4208,7 +4130,7 @@ mod tests {
 
         // saturating_add(MAX_TERMINATED_AT_AGE_MS) should produce u64::MAX
         // (saturated), meaning the event is never considered stale.
-        let result = orch.handle_session_terminated(info).await;
+        let result = orch.start_from_test_session(info).await;
         assert!(
             result.is_ok(),
             "Exact u64::MAX timestamp should not panic or be rejected as stale"
@@ -4237,7 +4159,7 @@ mod tests {
             changeset_digest: [0x01; 32],
             terminated_at_ms: 0,
         };
-        orch.handle_session_terminated(info1).await.unwrap();
+        orch.start_from_test_session(info1).await.unwrap();
 
         // Remove it to free the slot.
         orch.remove_orchestration("work-bound-1").await;
@@ -4251,7 +4173,7 @@ mod tests {
             terminated_at_ms: 0,
         };
         let (gate_types, _signers, events) =
-            orch.handle_session_terminated(info1_replay).await.unwrap();
+            orch.start_from_test_session(info1_replay).await.unwrap();
         assert_eq!(gate_types.len(), GateType::all().len());
         assert!(!events.is_empty());
     }
@@ -4261,11 +4183,9 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_drive_gate_execution_transitions_to_running() {
+    async fn test_poll_session_lifecycle_transitions_to_running() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-drive");
-
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
         // Session lifecycle hook must not bootstrap gates.
         assert!(events.is_empty());
@@ -4273,7 +4193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drive_gate_execution_with_zero_timeout() {
+    async fn test_poll_session_lifecycle_with_zero_timeout() {
         // With zero timeout, pre-existing orchestrations time out during the
         // lifecycle sweep.
         let config = GateOrchestratorConfig {
@@ -4282,12 +4202,10 @@ mod tests {
         };
         let orch = GateOrchestrator::new(config, test_signer());
         let _ = orch
-            .handle_session_terminated(test_session_info("work-drive-timeout-seed"))
+            .start_from_test_session(test_session_info("work-drive-timeout-seed"))
             .await
             .unwrap();
-        let info = test_session_info("work-drive-timeout");
-
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
         // All seeded gates should time out and be reclaimed.
         assert_eq!(
@@ -4308,11 +4226,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drive_gate_execution_executor_events_have_adapter_profile() {
+    async fn test_poll_session_lifecycle_executor_events_have_adapter_profile() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-drive-profile");
-
-        let events = orch.drive_gate_execution(info).await.unwrap();
+        let events = orch.poll_session_lifecycle().await;
 
         // Session lifecycle progression must not emit executor-spawn events.
         let has_spawn_event = events
@@ -4698,7 +4614,7 @@ mod tests {
 
         let info = test_session_info("work-cas-test");
         let (_gate_types, _exec_signers, events) =
-            orch.handle_session_terminated(info).await.unwrap();
+            orch.start_from_test_session(info).await.unwrap();
 
         // Find a lease issuance event.
         let lease_event = events
@@ -4762,7 +4678,7 @@ mod tests {
             .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
 
         let info = test_session_info("work-delegate-cas");
-        let _ = orch.handle_session_terminated(info).await.unwrap();
+        let _ = orch.start_from_test_session(info).await.unwrap();
 
         let parent_lease = orch
             .gate_lease("work-delegate-cas", GateType::Quality)

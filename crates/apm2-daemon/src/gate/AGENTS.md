@@ -27,7 +27,7 @@ Consumes authoritative changeset publication identity and autonomously orchestra
 - [INV-GT03] Maximum gate types per orchestration bounded to `MAX_GATE_TYPES` (8).
 - [INV-GT04] Expired gate leases produce FAIL verdict (fail-closed timeouts).
 - [INV-GT05] Changeset digest in each lease matches the authoritative `ChangeSetPublished` digest.
-- [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). `on_session_terminated` is lifecycle-only (timeout polling) and deprecated.
+- [INV-GT12] Gate start entrypoint is `start_for_changeset` (CSID-003). Session lifecycle timeout progression is polled via `poll_session_lifecycle`; there is no session-termination gate-start entrypoint.
 - [INV-GT13] Idempotency key is `(work_id, changeset_digest)`, a pure function of authoritative publication inputs (CSID-003).
 - [INV-GT14] Orchestrations map keyed by `(work_id, changeset_digest)` composite key (CSID-003) but enforces a **one-active-per-work_id** invariant (latest changeset wins per RFC-0032). Starting `(work, digest2)` while `(work, digest1)` is active supersedes the old entry; starting the same `(work, digest1)` twice is denied. This ensures `find_by_work_id` helpers always resolve unambiguously.
 - [INV-GT15] Event payloads enforce `MAX_PAYLOAD_BYTES` (1 MiB) size limit BEFORE JSON deserialization to prevent memory exhaustion.
