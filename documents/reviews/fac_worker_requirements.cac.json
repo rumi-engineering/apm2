@@ -11,9 +11,6 @@
       "security"
     ],
     "source_of_truth_refs": [
-      "documents/work/tickets/TCK-00664.json",
-      "documents/work/tickets/TCK-00660.json",
-      "documents/work/tickets/TCK-00577.json",
       "documents/reviews/fac_review_requirements.cac.json",
       "documents/reviews/fac_review_state_machine.cac.json"
     ],
