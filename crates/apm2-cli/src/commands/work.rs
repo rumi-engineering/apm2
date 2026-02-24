@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
-/// Maximum ticket YAML file size (1 MiB) to prevent denial-of-service via
+/// Maximum ticket document file size (1 MiB) to prevent denial-of-service via
 /// oversized files.
 const MAX_TICKET_FILE_SIZE: u64 = 1_048_576;
 
@@ -64,9 +64,9 @@ pub enum WorkSubcommand {
     /// actor, role, and associated session information.
     Status(StatusArgs),
 
-    /// Open a new work item from a ticket YAML file (TCK-00635).
+    /// Open a new work item from a ticket document file (TCK-00635).
     ///
-    /// Imports a ticket YAML, converts it to a `WorkSpec`, canonicalizes
+    /// Imports a ticket document, converts it to a `WorkSpec`, canonicalizes
     /// the JSON, and sends to the daemon via the `OpenWork` RPC.
     Open(OpenArgs),
 }
@@ -140,7 +140,7 @@ pub struct StatusArgs {
 /// Arguments for `apm2 work open` (TCK-00635).
 #[derive(Debug, Args)]
 pub struct OpenArgs {
-    /// Path to the ticket YAML file to import as a `WorkSpec`.
+    /// Path to the ticket document file to import as a `WorkSpec`.
     #[arg(long, required = true)]
     pub from_ticket: String,
     /// Governing lease ID for PCAC lifecycle enforcement.
@@ -419,8 +419,8 @@ fn run_status(args: &StatusArgs, socket_path: &Path, json_output: bool) -> u8 {
 
 /// Execute the open command (TCK-00635).
 ///
-/// Reads a ticket YAML file, converts it to a `WorkSpec` JSON, canonicalizes
-/// it, and sends to the daemon via the `OpenWork` RPC.
+/// Reads a ticket document file, converts it to a `WorkSpec` JSON,
+/// canonicalizes it, and sends to the daemon via the `OpenWork` RPC.
 fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
     // CTR-1603: Bounded file read via file handle to prevent TOCTOU.
     // Open file first, then enforce size bound on the file handle itself
@@ -525,7 +525,7 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
         );
     }
 
-    // Parse YAML and convert to WorkSpec JSON
+    // Parse ticket document (YAML/JSON) and convert to WorkSpec JSON
     let work_spec_json = match ticket_yaml_to_work_spec_json(&yaml_content) {
         Ok(json) => json,
         Err(e) => {
@@ -592,17 +592,18 @@ fn run_open(args: &OpenArgs, socket_path: &Path, json_output: bool) -> u8 {
     }
 }
 
-/// Converts a ticket YAML string to a canonical `WorkSpec` JSON string.
+/// Converts a ticket document string to a canonical `WorkSpec` JSON string.
 ///
-/// Extracts fields from the ticket YAML structure and maps them to
+/// Extracts fields from the ticket document structure and maps them to
 /// the `apm2.work_spec.v1` schema.
 ///
 /// # Errors
 ///
-/// Returns a string error if the YAML is malformed or missing required fields.
+/// Returns a string error if the document is malformed or missing required
+/// fields.
 fn ticket_yaml_to_work_spec_json(yaml_content: &str) -> Result<String, String> {
     let yaml: serde_yaml::Value =
-        serde_yaml::from_str(yaml_content).map_err(|e| format!("YAML parse error: {e}"))?;
+        serde_yaml::from_str(yaml_content).map_err(|e| format!("ticket parse error: {e}"))?;
 
     // Navigate to ticket_meta
     let ticket_meta = yaml.get("ticket_meta").ok_or("missing 'ticket_meta' key")?;
@@ -960,7 +961,7 @@ mod tests {
     #[test]
     fn test_open_rejects_missing_file() {
         let args = OpenArgs {
-            from_ticket: "/nonexistent/ticket.yaml".to_string(),
+            from_ticket: "/nonexistent/ticket.json".to_string(),
             lease_id: "L-test-001".to_string(),
         };
         let socket_path = Path::new("/nonexistent/operator.sock");
@@ -972,7 +973,7 @@ mod tests {
         );
     }
 
-    /// Tests ticket YAML to `WorkSpec` JSON conversion.
+    /// Tests ticket document to `WorkSpec` JSON conversion.
     #[test]
     fn test_ticket_yaml_to_work_spec_json_basic() {
         let yaml = r"
@@ -986,7 +987,7 @@ ticket_meta:
 ";
 
         let result = ticket_yaml_to_work_spec_json(yaml);
-        assert!(result.is_ok(), "Should parse valid ticket YAML");
+        assert!(result.is_ok(), "Should parse valid ticket document");
 
         let json_str = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -1022,7 +1023,7 @@ ticket_meta:
         assert_eq!(p1["work_id"], "W-TCK-12345");
     }
 
-    /// Tests that ticket YAML conversion rejects missing required fields.
+    /// Tests that ticket document conversion rejects missing required fields.
     #[test]
     fn test_ticket_yaml_rejects_missing_ticket_id() {
         let yaml = r"
@@ -1034,7 +1035,7 @@ ticket_meta:
         assert!(result.is_err(), "Should reject missing ticket id");
     }
 
-    /// Tests that ticket YAML conversion rejects missing title.
+    /// Tests that ticket document conversion rejects missing title.
     #[test]
     fn test_ticket_yaml_rejects_missing_title() {
         let yaml = r"
@@ -1046,7 +1047,7 @@ ticket_meta:
         assert!(result.is_err(), "Should reject missing title");
     }
 
-    /// Tests that ticket YAML conversion handles missing binds gracefully.
+    /// Tests that ticket document conversion handles missing binds gracefully.
     #[test]
     fn test_ticket_yaml_handles_missing_binds() {
         let yaml = r"

@@ -3731,14 +3731,14 @@ fn dual_write_requirement_traceability() -> [RequirementTraceability; 4] {
     [
         RequirementTraceability {
             requirement_id: "QL-R3",
-            source_path: "documents/work/tickets/TCK-00669.yaml",
+            source_path: "documents/work/tickets/TCK-00669.json",
             source_anchor: "ledger projection wins; filesystem is repaired to match",
             expected_behavior: "ledger projection truth deterministically reconstructs queue lifecycle outcomes",
         },
         RequirementTraceability {
             requirement_id: "QL-003",
-            source_path: "crates/apm2-cli/src/commands/AGENTS.md",
-            source_anchor: "Queue lifecycle dual-write ordering",
+            source_path: "crates/apm2-cli/src/commands/fac_worker/queue_ops.rs",
+            source_anchor: "QL-003 staged migration: attempt lifecycle enqueue event first",
             expected_behavior: "queue lifecycle dual-write ordering mirrors queue mutation semantics",
         },
         RequirementTraceability {
