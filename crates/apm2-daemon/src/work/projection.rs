@@ -12,6 +12,7 @@ use ed25519_dalek::Verifier;
 use prost::Message;
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::protocol::dispatch::{
     LedgerEventEmitter, SignedLedgerEvent, WORK_CLAIMED_DOMAIN_PREFIX,
@@ -253,7 +254,24 @@ impl WorkObjectProjection {
 
         for (_, event) in ordered {
             let reducer_events =
-                translate_signed_event(event, &mut opened_work_ids, &mut next_seq_id)?;
+                match translate_signed_event(event, &mut opened_work_ids, &mut next_seq_id) {
+                    Ok(reducer_events) => reducer_events,
+                    Err(WorkProjectionError::InvalidPayload { event_type, reason })
+                        if event_type == "work.pr_associated" =>
+                    {
+                        // Legacy malformed work.pr_associated payloads must not
+                        // poison full projection rebuilds for all work
+                        // authority reads.
+                        warn!(
+                            event_id = %event.event_id,
+                            work_id = %event.work_id,
+                            reason = %reason,
+                            "Skipping malformed work.pr_associated event during projection rebuild"
+                        );
+                        continue;
+                    },
+                    Err(error) => return Err(error),
+                };
             for reducer_event in &reducer_events {
                 self.apply_reducer_event(reducer_event)?;
             }
@@ -1566,6 +1584,39 @@ mod tests {
             ),
             "non-JSON-prefixed payloads must fail on protobuf decode and never attempt envelope parsing"
         );
+    }
+
+    #[test]
+    fn rebuild_skips_malformed_work_pr_associated_payload() {
+        let mut projection = WorkObjectProjection::new();
+        let work_id = "W-skip-malformed-pr-associated";
+
+        let events = vec![
+            work_opened_event(work_id, 1_000),
+            signed_event(
+                "work.pr_associated",
+                work_id,
+                // Legacy malformed shape: no `payload` envelope field.
+                serde_json::to_vec(&serde_json::json!({
+                    "actor_id": "actor:test",
+                    "ajc_id": "AJC-invalid",
+                    "work_id": work_id,
+                    "pr_number": 42,
+                    "commit_sha": "0123456789abcdef0123456789abcdef01234567"
+                }))
+                .expect("malformed payload should serialize"),
+                1_001,
+            ),
+        ];
+
+        projection
+            .rebuild_from_signed_events(&events)
+            .expect("malformed work.pr_associated should be skipped, not poison projection");
+
+        let opened = projection
+            .get_work(work_id)
+            .expect("work.opened must remain projected even when malformed PR association exists");
+        assert_eq!(opened.state, WorkState::Open);
     }
 
     #[test]

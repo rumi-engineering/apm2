@@ -3007,6 +3007,19 @@ impl ProjectionWorker {
                         .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
+                Err(ProjectionWorkerError::InvalidPayload(reason)) => {
+                    // Poison payloads are not recoverable via retry; keep the
+                    // tailer making forward progress by acking this event and
+                    // preserving diagnostics in logs.
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %reason,
+                        "Skipping malformed WorkPrAssociated event (acknowledged)"
+                    );
+                    self.work_pr_tailer
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
+                        .await?;
+                },
                 Err(e) => {
                     warn!(
                         event_id = %event.event_id,
