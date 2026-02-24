@@ -33,7 +33,7 @@
       "actor_id": "HOLON-SECURITY-GOVERNANCE",
       "work_id": "DOC-SECURITY-UNIFIED-THEORY-0001",
       "notes": [
-        "Unified security theory synthesized from 9 operational security documents, 3 active waivers, RFC-0020 HSI constraints, and cross-domain invariant analysis.",
+        "Unified security theory synthesized from 9 operational security documents, RFC-0020 HSI constraints, and cross-domain invariant analysis.",
         "Every SEC-LAW traces to operational source documents. Every operational control traces to at least one SEC-LAW.",
         "Scale invariance validated: each law holds identically from 1 agent to 10^9 agents; only leverage changes.",
         "When this document conflicts with RFC-0020 or SECURITY_POLICY, those are the source of truth and this document MUST be updated."
@@ -107,7 +107,7 @@
         "SEC-THESIS-03": {
           "statement": "Ambiguity is adversarial — unknown, stale, or unverifiable state defaults to denial, not warning.",
           "implications": [
-            "Fail-closed is the universal default; fail-open requires explicit waiver.",
+            "Fail-closed is the universal default; fail-open is not permitted.",
             "Freshness is a machine-checkable policy, not best-effort.",
             "Stop uncertainty propagates denial within bounded latency."
           ],
@@ -233,42 +233,8 @@
       "evidence_retention": {
         "receipt_retention_days_min": 400,
         "defect_retention_days_min": 400,
-        "waiver_event_retention_days_min": 400,
         "immutability_requirement": "Evidence stores are append-only and content-addressed.",
         "missing_evidence_action": "DENY_AUTHORITY_AND_EMIT_DEFECT"
-      },
-      "waiver_policy": {
-        "max_duration_days": 30,
-        "max_extensions": 1,
-        "required_fields": [
-          "waiver_id",
-          "issued_at",
-          "issued_at_utc",
-          "expires",
-          "expires_at_utc",
-          "owner",
-          "approver",
-          "ticket_ref",
-          "justification",
-          "relaxed_laws",
-          "relaxed_controls",
-          "compensating_controls",
-          "blast_radius",
-          "condition",
-          "renewal_count",
-          "extended_from_waiver_id"
-        ],
-        "separation_of_duties_rule": "waiver_owner_must_not_equal_waiver_approver",
-        "timestamp_precision_rule": "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc_timestamps",
-        "forbidden_scopes": [
-          "waiver_cannot_disable_SEC-LAW-01_on_authority_paths",
-          "waiver_cannot_disable_tier3_plus_stop_uncertainty_deny",
-          "waiver_cannot_disable_SEC-LAW-05_decode_or_proof_bounds_on_authority_paths",
-          "waiver_cannot_disable_policy_root_dual_approval_or_epoch_monotonicity_controls"
-        ],
-        "auto_expiry_action": "DENY_PATH_AND_EMIT_SEC-DEFECT-14",
-        "date_consistency_rule": "issued_at_and_expires_must_match_the_date_portion_of_issued_at_utc_and_expires_at_utc",
-        "extension_validation_rule": "renewal_count_must_be_less_than_or_equal_to_max_extensions_and_extended_from_waiver_id_required_when_renewal_count_gt_0"
       },
       "risk_tier_mapping": {
         "unified_theory_to_daemon": {
@@ -623,7 +589,7 @@
         "name": "Fail-Closed Under Ambiguity",
         "effective_date": "2026-02-07",
         "status": "active",
-        "statement": "When the security state is unknown, stale, ambiguous, or unverifiable, the system denies actuation. Fail-open requires an explicit, time-bounded waiver with audit trail. 'Warn and continue' is not a valid security posture for authority-bearing paths.",
+        "statement": "When the security state is unknown, stale, ambiguous, or unverifiable, the system denies actuation. Fail-open is not permitted. 'Warn and continue' is not a valid security posture for authority-bearing paths.",
         "framing_provenance": [
           "boundary-centric",
           "economics-centric"
@@ -673,51 +639,27 @@
               "**Stop-state ambiguity:** Unknown stop state → deny actuation within 250ms.",
               "**Contract ambiguity:** Mismatched episode envelope → deny admission."
             ]
-          },
-          {
-            "rule": "Waiver discipline",
-            "desc": "Fail-open behavior requires explicit waiver (WVR-*) with bounded duration, named ownership, compensating controls, and ticket binding.",
-            "subrules": [
-              "**Time-bounded:** Waiver duration MUST be <= 30 days and extension count MUST be <= 1.",
-              "**Ownership:** Every waiver names owner, approver, and ticket_ref with security sign-off.",
-              "**Compensating controls:** Every waiver declares at least one active compensating control with measurable verification.",
-              "**Scoped:** Waivers apply to specific control IDs, not blanket relaxation."
-            ]
           }
         ],
         "verifier": {
           "predicate_id": "SEC-LAW-04-FAIL-CLOSED",
-          "acceptance_predicate": "∀ security_check c: (c.result ∈ {unknown, stale, ambiguous, unverifiable}) → actuation_denied(c) ∨ valid_waiver(c)",
+          "acceptance_predicate": "∀ security_check c: (c.result ∈ {unknown, stale, ambiguous, unverifiable}) → actuation_denied(c) (no exceptions)",
           "required_evidence": [
-            "check_result_log",
-            "denial_receipt_or_waiver_ref",
-            "waiver_expiry_validation",
-            "waiver_owner_and_approver",
-            "waiver_compensating_control_evidence"
+            "check_result_log"
           ],
           "machine_checks": [
-            "no_authority_path_on_ambiguous_check",
-            "waiver_not_expired",
-            "waiver_conditions_met",
-            "waiver_has_owner_and_ticket",
-            "waiver_duration_within_policy",
-            "waiver_compensating_control_active",
-            "waiver_bypass_logged_as_security_event"
+            "no_authority_path_on_ambiguous_check"
           ],
           "fail_closed": true
         },
         "scale_invariance": "Fail-closed is a local property enforced at each boundary crossing. It does not require global coordination. At 10^9 agents, each individual boundary independently denies on ambiguity — the guarantee composes by construction.",
         "failure_mode": [
           "warn_and_continue_on_stale_identity",
-          "expired_waiver_still_active",
-          "waiver_without_owner_or_compensating_controls",
           "silent_downgrade_of_verification_failure",
           "stop_uncertainty_not_denied_within_slo"
         ],
         "remediation_pattern": [
           "convert_warn_to_deny_on_authority_paths",
-          "automate_waiver_expiry_enforcement",
-          "auto_revoke_waivers_missing_required_fields",
           "emit_defect_on_verification_failure",
           "enforce_250ms_stop_uncertainty_deny"
         ]
@@ -1848,7 +1790,7 @@
         "reject_on": [
           "missing_required_field",
           "unknown_fields_on_authority_paths",
-          "wildcard_scope_without_explicit_waiver",
+          "wildcard_scope_unconditionally_rejected",
           "scope_widening_vs_parent_manifest",
           "expired_or_revoked_manifest"
         ]
@@ -2294,13 +2236,13 @@
       {
         "id": "SEC-DEFECT-05",
         "name": "FAIL_OPEN_ON_AMBIGUITY",
-        "description": "System proceeded with actuation despite unknown, stale, or unverifiable security state without valid waiver.",
+        "description": "System proceeded with actuation despite unknown, stale, or unverifiable security state.",
         "severity": "CRITICAL",
         "law_refs": [
           "SEC-LAW-04"
         ],
-        "detection": "Audit log showing actuation after ambiguous check result without waiver reference",
-        "remediation": "Convert warn-and-continue to deny, add waiver requirement for any fail-open path"
+        "detection": "Audit log showing actuation after ambiguous check result",
+        "remediation": "Convert warn-and-continue to deny on all fail-open paths"
       },
       {
         "id": "SEC-DEFECT-06",
@@ -2392,17 +2334,6 @@
         ],
         "detection": "Release verification audit detects missing DSSE/SLSA provenance, missing Rekor entry, or workflow/repository identity mismatch",
         "remediation": "Block release admission until signature, transparency, and provenance checks pass"
-      },
-      {
-        "id": "SEC-DEFECT-14",
-        "name": "WAIVER_GOVERNANCE_DRIFT",
-        "description": "Waiver bypass was executed without required owner/approver/ticket metadata, compensating controls, or policy-bounded duration.",
-        "severity": "HIGH",
-        "law_refs": [
-          "SEC-LAW-04"
-        ],
-        "detection": "Waiver registry audit finds missing required fields, excessive TTL, or inactive compensating controls",
-        "remediation": "Auto-revoke invalid waiver, deny affected authority paths, and require governance re-approval"
       },
       {
         "id": "SEC-DEFECT-15",
@@ -2506,7 +2437,7 @@
       {
         "id": "SEC-DEFECT-23",
         "name": "DEPENDENCY_POISONING_ADMISSION",
-        "description": "A release or runtime artifact admitted dependencies with unverifiable provenance, disallowed licenses, or known vulnerabilities without an approved waiver.",
+        "description": "A release or runtime artifact admitted dependencies with unverifiable provenance, disallowed licenses, or known vulnerabilities.",
         "severity": "CRITICAL",
         "law_refs": [
           "SEC-LAW-02",
@@ -3224,140 +3155,6 @@
         ]
       }
     },
-    "waiver_registry": {
-      "note": "Active waivers are exceptional, time-bounded relaxations with explicit accountability. Missing required metadata invalidates the waiver and reverts behavior to fail-closed denial.",
-      "policy": {
-        "max_duration_days": 30,
-        "max_extensions": 1,
-        "required_fields": [
-          "waiver_id",
-          "issued_at",
-          "issued_at_utc",
-          "expires",
-          "expires_at_utc",
-          "owner",
-          "approver",
-          "ticket_ref",
-          "justification",
-          "relaxed_laws",
-          "relaxed_controls",
-          "compensating_controls",
-          "blast_radius",
-          "condition",
-          "renewal_count",
-          "extended_from_waiver_id"
-        ],
-        "validation_checks": [
-          "owner_must_not_equal_approver",
-          "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc",
-          "ticket_ref_must_be_open_and_security_approved",
-          "issued_at_and_expires_must_match_utc_date_portions",
-          "renewal_count_must_be_within_policy_limits"
-        ],
-        "enforcement": "waiver_missing_required_field_or_expired => deny_authority_path_and_emit_SEC-DEFECT-14",
-        "separation_of_duties_rule": "waiver_owner_must_not_equal_waiver_approver",
-        "timestamp_precision_rule": "issued_at_utc_and_expires_at_utc_must_be_rfc3339_utc_timestamps",
-        "date_consistency_rule": "issued_at_and_expires_must_match_the_date_portion_of_issued_at_utc_and_expires_at_utc",
-        "extension_validation_rule": "renewal_count_must_be_less_than_or_equal_to_max_extensions_and_extended_from_waiver_id_required_when_renewal_count_gt_0",
-        "forbidden_scopes": [
-          "waiver_cannot_disable_SEC-LAW-01_on_authority_paths",
-          "waiver_cannot_disable_tier3_plus_stop_uncertainty_deny",
-          "waiver_cannot_disable_SEC-LAW-05_decode_or_proof_bounds_on_authority_paths",
-          "waiver_cannot_disable_policy_root_dual_approval_or_epoch_monotonicity_controls"
-        ],
-        "auto_expiry_action": "DENY_PATH_AND_EMIT_SEC-DEFECT-14"
-      },
-      "active_waivers": [
-        {
-          "waiver_id": "WVR-0101",
-          "title": "Transitional governance freshness bypass",
-          "issued_at": "2026-02-07",
-          "issued_at_utc": "2026-02-07T00:00:00Z",
-          "owner": "platform-security",
-          "approver": "HOLON-SECURITY-GOVERNANCE",
-          "ticket_ref": "TCK-00612",
-          "justification": "Avoid deadlock during temporary governance resolver migration while preserving non-actuation safety.",
-          "relaxed_laws": [
-            "SEC-LAW-04",
-            "SEC-LAW-06"
-          ],
-          "relaxed_controls": [
-            "SP-INV-006",
-            "SP-RUNTIME-002"
-          ],
-          "compensating_controls": [
-            "require_dual_signature_for_governance_head_changes",
-            "force_read_only_mode_for_tier2_plus_when_freshness_unverifiable"
-          ],
-          "blast_radius": "single_cell_non_actuation_governance_resolution_only",
-          "renewal_count": 0,
-          "expires": "2026-03-09",
-          "expires_at_utc": "2026-03-09T23:59:59Z",
-          "condition": "Only when governance_transitional_resolver=true and no authority-bearing actuation is performed.",
-          "telemetry_requirements": [
-            "emit_security_waiver_event_each_use",
-            "hourly_report_of_waiver_hit_count"
-          ],
-          "extended_from_waiver_id": null
-        },
-        {
-          "waiver_id": "WVR-0102",
-          "title": "Deferred pre-actuation budget enforcement",
-          "issued_at": "2026-02-07",
-          "issued_at_utc": "2026-02-07T00:00:00Z",
-          "owner": "runtime-security",
-          "approver": "HOLON-SECURITY-GOVERNANCE",
-          "ticket_ref": "TCK-00613",
-          "justification": "Short-lived migration bridge while replacing deferred budget tracker with pre-actuation enforcement.",
-          "relaxed_laws": [
-            "SEC-LAW-09"
-          ],
-          "relaxed_controls": [
-            "SP-RUNTIME-006"
-          ],
-          "compensating_controls": [
-            "enforce_parser_and_proof_bounds_with_strict_deny",
-            "enforce_per_relay_rate_limit_even_when_budget_tracker_deferred"
-          ],
-          "blast_radius": "tier0_tier1_non_actuation_sync_only",
-          "renewal_count": 0,
-          "expires": "2026-03-09",
-          "expires_at_utc": "2026-03-09T23:59:59Z",
-          "condition": "Only for non-authority-bearing synchronization when BudgetTracker::deferred() sentinel is present and bound in receipt.",
-          "forbidden_effects": [
-            "no_tier2_plus_actuation",
-            "no_relaxation_of_revocation_wins_merge"
-          ],
-          "extended_from_waiver_id": null
-        },
-        {
-          "waiver_id": "WVR-0103",
-          "title": "Deferred identity proof CAS dereference",
-          "issued_at": "2026-02-07",
-          "issued_at_utc": "2026-02-07T00:00:00Z",
-          "owner": "identity-security",
-          "approver": "HOLON-SECURITY-GOVERNANCE",
-          "ticket_ref": "TCK-00614",
-          "justification": "Temporary developer-mode accommodation while full CAS dereference reliability fixes are rolled out.",
-          "relaxed_laws": [
-            "SEC-LAW-05"
-          ],
-          "relaxed_controls": [
-            "SP-ID-001"
-          ],
-          "compensating_controls": [
-            "require_signature_validation_and_trust_chain_check",
-            "block_release_and_tier2_plus_actuation_if_full_cas_dereference_fails"
-          ],
-          "blast_radius": "developer_mode_and_read_only_identity_checks",
-          "renewal_count": 0,
-          "expires": "2026-03-01",
-          "expires_at_utc": "2026-03-01T23:59:59Z",
-          "condition": "Shape-only hash validation allowed only in developer-mode read-only flows; never for release or authority-bearing actuation.",
-          "extended_from_waiver_id": null
-        }
-      ]
-    },
     "scale_invariance_validation": {
       "note": "Each security law is validated for scale invariance: does the semantic contract hold identically from 1 agent to 10^9?",
       "validation_evidence_requirements": [
@@ -3472,6 +3269,7 @@
           "falsification": "Demonstrate that advisory stop signals (non-governance-primitive) prevent runaway autonomous execution in adversarial conditions."
         }
       ]
-    }
+    },
+    "security_defect_catalog": []
   }
 }

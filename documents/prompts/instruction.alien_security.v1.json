@@ -184,18 +184,6 @@
           {
             "file": "documents/security/consensus-runbook.cac.json",
             "note": "Consensus security operations and failure handling."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0101.json",
-            "note": "Current security exception context."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0102.json",
-            "note": "Current security exception context."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0103.json",
-            "note": "Current security exception context."
           }
         ],
         "tools": [
@@ -311,9 +299,6 @@
       "Please read all theory and security artifacts before synthesis — the security corpus provides essential context for grounded proposals.",
       [
         "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
         "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/INCIDENT_RESPONSE.cac.json",
         "documents/security/NETWORK_DEFENSE.cac.json",
@@ -323,10 +308,7 @@
         "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/SIGNING_AND_VERIFICATION.cac.json",
         "documents/security/THREAT_MODEL.cac.json",
-        "documents/security/consensus-runbook.cac.json",
-        "documents/work/waivers/WVR-0101.json",
-        "documents/work/waivers/WVR-0102.json",
-        "documents/work/waivers/WVR-0103.json"
+        "documents/security/consensus-runbook.cac.json"
       ]
     ],
     "reading_expansion_policy": {

@@ -24,13 +24,6 @@
       "rfc": ["RFC-0011"]
     },
     {
-      "id": "BEH-DOC-004",
-      "kind": "requirement",
-      "title": "Waivers use WVR-XXXX.yaml format with justification and expiration",
-      "description": "Approved deviation requests with justification, scope, and expiration criteria.",
-      "rfc": ["RFC-0011"]
-    },
-    {
       "id": "BEH-DOC-005",
       "kind": "requirement",
       "title": "Skills follow SKILL.md agent-native executable specification format",

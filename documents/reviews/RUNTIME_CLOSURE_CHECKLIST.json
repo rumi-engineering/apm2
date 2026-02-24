@@ -2,7 +2,7 @@
   "schema": "apm2.runtime_closure_checklist.v1",
   "schema_version": "1.0.0",
   "gate_id": "GATE-RUNTIME-CLOSURE-TCK-00406",
-  "description": "Security/QCP runtime-closure checklist. Security-module diffs must include authoritative production callsite diffs unless an active waiver is present.",
+  "description": "Security/QCP runtime-closure checklist. Security-module diffs must include authoritative production callsite diffs.",
   "applies_when": {
     "label_set": ["SECURITY", "QCP=YES"],
     "env_flags": ["APM2_SECURITY_QCP", "SECURITY_QCP"]
@@ -27,10 +27,4 @@
       ]
     }
   ],
-  "waiver": {
-    "directory": "documents/work/waivers",
-    "required_gate_id": "GATE-RUNTIME-CLOSURE-TCK-00406",
-    "allowed_status": ["ACTIVE", "APPROVED"],
-    "expiry_fields": ["expires", "expiration_date"]
-  }
 }
