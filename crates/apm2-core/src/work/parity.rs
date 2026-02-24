@@ -1387,28 +1387,7 @@ fn parse_u32(
 }
 
 fn normalize_state(raw_state: &str) -> Option<String> {
-    let compact = raw_state
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect::<String>()
-        .to_ascii_uppercase();
-
-    let normalized = match compact.as_str() {
-        "OPEN" => "OPEN",
-        "CLAIMED" => "CLAIMED",
-        "INPROGRESS" => "IN_PROGRESS",
-        "REVIEW" => "REVIEW",
-        "NEEDSINPUT" => "NEEDS_INPUT",
-        "NEEDSADJUDICATION" => "NEEDS_ADJUDICATION",
-        "COMPLETED" => "COMPLETED",
-        "ABORTED" => "ABORTED",
-        "CIPENDING" => "CI_PENDING",
-        "READYFORREVIEW" => "READY_FOR_REVIEW",
-        "BLOCKED" => "BLOCKED",
-        _ => return None,
-    };
-
-    Some(normalized.to_string())
+    crate::work::helpers::normalize_work_state_label(raw_state).map(ToString::to_string)
 }
 
 fn classify_transition(from_state: &str, to_state: &str) -> TransitionClass {

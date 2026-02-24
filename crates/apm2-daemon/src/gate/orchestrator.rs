@@ -923,6 +923,21 @@ impl GateOrchestrator {
         let now_ms = self.clock.now_ms();
         let monotonic_now = self.clock.monotonic_now();
 
+        // Security MAJOR 1: Compute idempotency key for replay detection.
+        let idempotency_key = IdempotencyKey::from_info(&info);
+
+        // Replay-first admission: exact replay identities are resolved before
+        // freshness checks so old-but-idempotent retries cannot be rejected as
+        // stale. Freshness remains enforced for truly new admissions below.
+        {
+            let seen_keys = self.seen_idempotency_keys.read().await;
+            if seen_keys.contains(&idempotency_key) {
+                return Err(GateOrchestratorError::ReplayDetected {
+                    work_id: info.work_id.clone(),
+                });
+            }
+        }
+
         // Security MAJOR 1: Freshness check - reject stale gate-start events.
         // This prevents replayed starts from older lifecycles after restart.
         // Security BLOCKER 2 FIX: Use saturating_add to prevent u64 overflow on
@@ -940,9 +955,6 @@ impl GateOrchestrator {
                 });
             }
         }
-
-        // Security MAJOR 1: Compute idempotency key for replay detection.
-        let idempotency_key = IdempotencyKey::from_info(&info);
 
         // Step 1: Resolve policy for the changeset.
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
@@ -3797,6 +3809,35 @@ mod tests {
         assert!(
             matches!(err, GateOrchestratorError::StaleSourceEvent { .. }),
             "Old gate-start event should be rejected as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_replay_is_classified_as_replay_before_freshness() {
+        let orch = test_orchestrator();
+        let initial = GateStartInfo {
+            source_event_id: "evt-stale-replay-initial".to_string(),
+            work_id: "work-stale-replay".to_string(),
+            changeset_digest: [0x77; 32],
+            source_timestamp_ms: 0,
+        };
+        orch.start_for_changeset(initial).await.unwrap();
+        orch.remove_orchestration("work-stale-replay").await;
+
+        let replay_with_old_timestamp = GateStartInfo {
+            source_event_id: "evt-stale-replay-retry".to_string(),
+            work_id: "work-stale-replay".to_string(),
+            changeset_digest: [0x77; 32],
+            source_timestamp_ms: 1_704_067_200_000,
+        };
+        let err = orch
+            .start_for_changeset(replay_with_old_timestamp)
+            .await
+            .err()
+            .expect("expected replay error");
+        assert!(
+            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
+            "replayed identities must be replay-classified before freshness checks"
         );
     }
 
