@@ -1,0 +1,89 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/orchestrator_kernel",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-OK-001",
+      "kind": "requirement",
+      "title": "All ledger-tailing orchestrators MUST use orchestrator_kernel",
+      "description": "Any new orchestration loop that reads the ledger incrementally and produces durable receipts MUST use the orchestrator_kernel. Hand-rolled observe/plan/execute/receipt loops are a MAJOR code-quality finding. This is the canonical control-loop abstraction enforcing the four-phase Observe→Plan→Execute→Receipt contract.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-002",
+      "kind": "invariant",
+      "title": "Observe phase reads strictly after durable cursor; no re-processing",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-003",
+      "kind": "invariant",
+      "title": "Cursor advanced only after receipt persisted for same span (INV-OK-01)",
+      "description": "Cursor advancement must never happen before receipt durability for the same observed span. The cursor is persisted to a durable store before each tick completes.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-004",
+      "kind": "invariant",
+      "title": "Plan phase is pure: same cursor+input → same intents (INV-OK-02)",
+      "description": "Given identical cursor state and ledger input, the Plan phase MUST produce identical intents. No randomness, wall-clock reads, or external side-effects are permitted in Plan.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-005",
+      "kind": "safety",
+      "title": "In-doubt effects resolved Deny-by-default before success receipt (INV-OK-03)",
+      "description": "An effect that is in-doubt (Unknown state in the journal) MUST be resolved via `resolve_in_doubt` before the kernel emits a success receipt. The default resolution for unknown effects is Deny (fail-closed). Domain-specific reconciliation is allowed only when it can guarantee at-most-once semantics.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-006",
+      "kind": "invariant",
+      "title": "Per-tick work bounded by observe_limit/execute_limit (INV-OK-04)",
+      "description": "Every tick is bounded by TickConfig::observe_limit and TickConfig::execute_limit. Unbounded loops inside a tick are forbidden.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-007",
+      "kind": "safety",
+      "title": "All storage I/O on async paths MUST use spawn_blocking (INV-OK-05)",
+      "description": "All storage I/O (SQLite, CAS, etc.) accessed from async tick paths MUST be offloaded via `tokio::task::spawn_blocking` or equivalent. Direct rusqlite calls on the tokio thread pool are forbidden.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-008",
+      "kind": "invariant",
+      "title": "CompositeCursor event_id zero-padded to 20 digits (canonical-{seq:020})",
+      "description": "event_id MUST be zero-padded to 20 digits so that lexicographic order matches sequence order. Unpadded forms break cursor ordering for seq_id >= 10.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-009",
+      "kind": "safety",
+      "title": "Monotonic timestamps MUST NOT be stored durably or trigger irreversible actions",
+      "description": "Instant-derived (monotonic) timestamps are process-local and MUST NOT be stored as durable truth. They MUST NOT trigger irreversible actions (timeouts, denials, state transitions) after a process restart, because the monotonic epoch resets on restart. If persisted for caching, they MUST be rebased on load using a wall-clock anchor (e.g. GateLease.expires_at). See ObservedLeaseState::rebase in gate/timeout_kernel.rs as the reference implementation.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-010",
+      "kind": "requirement",
+      "title": "Daemon orchestrators MUST use orchestrator_runtime adapters",
+      "description": "Daemon orchestrators use the orchestrator_runtime adapter kit in crates/apm2-daemon/src/orchestrator_runtime/ keyed by orchestrator_id. Required adapters: SqliteCursorStore (table orchestrator_kernel_cursors), SqliteIntentStore (table orchestrator_kernel_intents), SqliteEffectJournal (table orchestrator_kernel_effect_journal).",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-011",
+      "kind": "safety",
+      "title": "Per-orchestrator sqlite tables for cursor/intent/effect journal are forbidden",
+      "description": "Creating new per-orchestrator sqlite tables or .sqlite files for cursor, intent, or effect journal concerns is forbidden. All such storage MUST go through the shared orchestrator_runtime adapters.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-OK-012",
+      "kind": "safety",
+      "title": "Cursor types MUST NOT be mixed across LedgerReader instances",
+      "description": "The cursor type is fixed by the LedgerReader::Cursor associated type. Mixing cursor types (e.g. CompositeCursor and sequence cursor) across readers in the same kernel instance is forbidden.",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

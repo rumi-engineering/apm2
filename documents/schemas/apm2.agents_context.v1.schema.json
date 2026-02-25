@@ -43,8 +43,7 @@
         },
         "title": {
           "type": "string",
-          "description": "Short, imperative title (≤80 chars). This is what appears in code comment hover and tooling output.",
-          "maxLength": 80
+          "description": "Short, imperative title. Referenced in code comments and surfaced by jq queries over the behavior registry."
         },
         "description": {
           "type": "string",
