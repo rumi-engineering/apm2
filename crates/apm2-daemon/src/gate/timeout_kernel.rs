@@ -318,8 +318,14 @@ impl GateTimeoutKernel {
                 TimeoutTerminalChecker::Sqlite(SqliteTimeoutTerminalChecker::new(Arc::clone(conn)))
             },
         );
-        let domain = GateTimeoutDomain::new(orchestrator, observed_lease_store, terminal_checker)
-            .map_err(GateTimeoutKernelError::Init)?;
+        // Offload GateTimeoutDomain::new to spawn_blocking because load_all()
+        // performs synchronous rusqlite I/O (INV-CQ-OK-003).
+        let domain = tokio::task::spawn_blocking(move || {
+            GateTimeoutDomain::new(orchestrator, observed_lease_store, terminal_checker)
+        })
+        .await
+        .map_err(|e| GateTimeoutKernelError::Init(format!("spawn_blocking join failed: {e}")))?
+        .map_err(GateTimeoutKernelError::Init)?;
 
         Ok(Self {
             domain,
