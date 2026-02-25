@@ -289,8 +289,7 @@ fn fetch_work_scope(owner_repo: &str, pr_number: u32) -> Option<WorkScopeContext
     let actual_ref = fetch_pr_head_ref(owner_repo, pr_number)?;
     if yaml_branch != actual_ref {
         eprintln!(
-            "warn: work_scope trust gate: branch field '{}' in PR body does not match actual head ref '{}'; skipping work scope enrichment",
-            yaml_branch, actual_ref
+            "warn: work_scope trust gate: branch field '{yaml_branch}' in PR body does not match actual head ref '{actual_ref}'; skipping work scope enrichment"
         );
         return None;
     }
