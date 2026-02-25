@@ -139,29 +139,30 @@ impl GateStartKernel {
             })??;
         }
 
-        let cursor_store = if let Some(conn) = sqlite_conn {
-            GateStartCursorStore::Sqlite(SqliteCursorStore::new(
-                Arc::clone(conn),
-                GATE_START_ORCHESTRATOR_ID,
-            ))
-        } else {
-            GateStartCursorStore::Memory(MemoryCursorStore::default())
-        };
+        let cursor_store = sqlite_conn.map_or_else(
+            || GateStartCursorStore::Memory(MemoryCursorStore::default()),
+            |conn| {
+                GateStartCursorStore::Sqlite(SqliteCursorStore::new(
+                    Arc::clone(conn),
+                    GATE_START_ORCHESTRATOR_ID,
+                ))
+            },
+        );
 
-        let intent_store = if let Some(conn) = sqlite_conn {
-            GateStartIntentStore::Sqlite(SqliteIntentStore::new(
-                Arc::clone(conn),
-                GATE_START_ORCHESTRATOR_ID,
-            ))
-        } else {
-            GateStartIntentStore::Memory(MemoryIntentStore::default())
-        };
+        let intent_store = sqlite_conn.map_or_else(
+            || GateStartIntentStore::Memory(MemoryIntentStore::default()),
+            |conn| {
+                GateStartIntentStore::Sqlite(SqliteIntentStore::new(
+                    Arc::clone(conn),
+                    GATE_START_ORCHESTRATOR_ID,
+                ))
+            },
+        );
 
-        let effect_journal = if let Some(conn) = sqlite_conn {
-            GateStartEffectJournal::new_shared(Arc::clone(conn))
-        } else {
-            GateStartEffectJournal::new_memory()
-        };
+        let effect_journal = sqlite_conn.map_or_else(
+            GateStartEffectJournal::new_memory,
+            GateStartEffectJournal::new_shared,
+        );
 
         Ok(Self {
             domain: GateStartDomain::new(orchestrator),
@@ -938,17 +939,17 @@ impl GateStartEffectJournal {
         init_orchestrator_runtime_schema(&conn)
             .map_err(|e| format!("failed to init shared orchestrator schema: {e}"))?;
         let conn = Arc::new(Mutex::new(conn));
-        Ok(Self::new_shared(conn))
+        Ok(Self::new_shared(&conn))
     }
 
-    fn new_shared(conn: Arc<Mutex<Connection>>) -> Self {
+    fn new_shared(conn: &Arc<Mutex<Connection>>) -> Self {
         Self {
             inner: GateStartEffectJournalInner::Sqlite(SqliteEffectJournal::new(
-                Arc::clone(&conn),
+                Arc::clone(conn),
                 GATE_START_ORCHESTRATOR_ID,
             )),
             #[cfg(test)]
-            conn,
+            conn: Arc::clone(conn),
         }
     }
 
@@ -1660,7 +1661,6 @@ fn migrate_legacy_gate_start_effect_journal(
             row.map_err(|e| format!("failed to decode legacy gate-start effect row: {e}"))?;
         let state = match legacy_state.as_str() {
             "completed" => "completed",
-            "started" | "unknown" => "unknown",
             _ => "unknown",
         };
         tx.execute(
