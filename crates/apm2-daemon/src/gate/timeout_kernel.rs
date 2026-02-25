@@ -194,34 +194,47 @@ impl EffectJournal<String> for TimeoutEffectJournalEnum {
 }
 
 impl GateTimeoutKernel {
-    /// Creates a new timeout kernel instance.
+    /// Creates a new timeout kernel instance (async production path).
+    ///
+    /// Offloads all blocking `SQLite` schema init and legacy migration work to
+    /// `tokio::task::spawn_blocking` (INV-CQ-OK-003). Only cheap in-memory
+    /// wiring remains on the async thread.
     ///
     /// When `sqlite_conn` is `Some`, this initializes the shared
     /// `orchestrator_kernel_*` schema, runs the legacy migration, and
     /// creates shared `SQLite` adapters. When `None`, in-memory adapters
     /// are used (for tests).
-    pub fn new(
+    pub async fn new_async(
         orchestrator: Arc<GateOrchestrator>,
         sqlite_conn: Option<&Arc<Mutex<Connection>>>,
         timeout_ledger_emitter: Option<SqliteLedgerEventEmitter>,
         fac_root: &Path,
         config: GateTimeoutKernelConfig,
     ) -> Result<Self, GateTimeoutKernelError> {
-        // Initialize shared schema and run legacy migration for SQLite mode.
+        // Offload blocking DB schema init and migration to spawn_blocking
+        // (INV-CQ-OK-003: no synchronous rusqlite on the async thread).
         if let Some(conn) = sqlite_conn {
-            let guard = conn
-                .lock()
-                .map_err(|e| GateTimeoutKernelError::Init(format!("lock poisoned: {e}")))?;
-            init_orchestrator_runtime_schema(&guard).map_err(|e| {
-                GateTimeoutKernelError::Init(format!("shared schema init failed: {e}"))
-            })?;
-            drop(guard);
-            migrate_legacy_cursor(conn).map_err(|e| {
-                GateTimeoutKernelError::Init(format!("cursor migration failed: {e}"))
-            })?;
-            migrate_legacy_intents(conn).map_err(|e| {
-                GateTimeoutKernelError::Init(format!("intent migration failed: {e}"))
-            })?;
+            let conn = Arc::clone(conn);
+            tokio::task::spawn_blocking(move || {
+                let guard = conn
+                    .lock()
+                    .map_err(|e| GateTimeoutKernelError::Init(format!("lock poisoned: {e}")))?;
+                init_orchestrator_runtime_schema(&guard).map_err(|e| {
+                    GateTimeoutKernelError::Init(format!("shared schema init failed: {e}"))
+                })?;
+                drop(guard);
+                migrate_legacy_cursor(&conn).map_err(|e| {
+                    GateTimeoutKernelError::Init(format!("cursor migration failed: {e}"))
+                })?;
+                migrate_legacy_intents(&conn).map_err(|e| {
+                    GateTimeoutKernelError::Init(format!("intent migration failed: {e}"))
+                })?;
+                Ok::<(), GateTimeoutKernelError>(())
+            })
+            .await
+            .map_err(|e| {
+                GateTimeoutKernelError::Init(format!("spawn_blocking join failed: {e}"))
+            })??;
         }
 
         let cursor_store = sqlite_conn.map_or_else(
@@ -245,34 +258,57 @@ impl GateTimeoutKernel {
         );
 
         let observed_lease_store = if let Some(conn) = sqlite_conn {
-            TimeoutObservedLeaseStore::Sqlite(
-                SqliteTimeoutObservedLeaseStore::new(Arc::clone(conn)).map_err(|e| {
-                    GateTimeoutKernelError::Init(format!("observed lease store setup failed: {e}"))
-                })?,
-            )
+            let conn = Arc::clone(conn);
+            let store =
+                tokio::task::spawn_blocking(move || SqliteTimeoutObservedLeaseStore::new(conn))
+                    .await
+                    .map_err(|e| {
+                        GateTimeoutKernelError::Init(format!("spawn_blocking join failed: {e}"))
+                    })?
+                    .map_err(|e| {
+                        GateTimeoutKernelError::Init(format!(
+                            "observed lease store setup failed: {e}"
+                        ))
+                    })?;
+            TimeoutObservedLeaseStore::Sqlite(store)
         } else {
             TimeoutObservedLeaseStore::Memory(MemoryTimeoutObservedLeaseStore::default())
         };
 
-        std::fs::create_dir_all(fac_root).map_err(|e| {
-            GateTimeoutKernelError::Init(format!(
-                "failed to create FAC root '{}': {e}",
-                fac_root.display()
-            ))
-        })?;
-
-        // Effect journal: use shared table via the main connection. Migrate
-        // from the legacy separate sqlite file if it exists.
+        // Offload blocking filesystem and SQLite migration to spawn_blocking
+        // (INV-CQ-OK-003).
+        let fac_root_owned = fac_root.to_path_buf();
         let effect_journal = if let Some(conn) = sqlite_conn {
-            let journal_path = fac_root.join("gate_timeout_effect_journal.sqlite");
-            migrate_legacy_effect_journal(conn, &journal_path).map_err(|e| {
-                GateTimeoutKernelError::Init(format!("effect journal migration failed: {e}"))
-            })?;
+            let conn_owned = Arc::clone(conn);
+            let fac_root_inner = fac_root_owned.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&fac_root_inner).map_err(|e| {
+                    GateTimeoutKernelError::Init(format!(
+                        "failed to create FAC root '{}': {e}",
+                        fac_root_inner.display()
+                    ))
+                })?;
+                let journal_path = fac_root_inner.join("gate_timeout_effect_journal.sqlite");
+                migrate_legacy_effect_journal(&conn_owned, &journal_path).map_err(|e| {
+                    GateTimeoutKernelError::Init(format!("effect journal migration failed: {e}"))
+                })?;
+                Ok::<(), GateTimeoutKernelError>(())
+            })
+            .await
+            .map_err(|e| {
+                GateTimeoutKernelError::Init(format!("spawn_blocking join failed: {e}"))
+            })??;
             TimeoutEffectJournalEnum::Sqlite(SqliteEffectJournal::new(
                 Arc::clone(conn),
                 GATE_TIMEOUT_ORCHESTRATOR_ID,
             ))
         } else {
+            std::fs::create_dir_all(&fac_root_owned).map_err(|e| {
+                GateTimeoutKernelError::Init(format!(
+                    "failed to create FAC root '{}': {e}",
+                    fac_root_owned.display()
+                ))
+            })?;
             TimeoutEffectJournalEnum::Memory(MemoryEffectJournal::new())
         };
 
@@ -903,38 +939,91 @@ impl SqliteTimeoutTerminalChecker {
     }
 
     fn has_terminal_row_in_legacy(conn: &Connection, lease_id: &str) -> Result<bool, String> {
+        // Check gate.timed_out events using json_extract for O(log N) lookup
+        // instead of the previous O(N) instr() full-table scan (FINDING-4 fix).
+        // Filter by event_type first (uses index), then json_extract on payload.
+        let timed_out: bool = conn
+            .query_row(
+                "SELECT 1 FROM ledger_events
+                 WHERE event_type = 'gate.timed_out'
+                   AND json_extract(payload, '$.lease_id') = ?1
+                 ORDER BY rowid DESC
+                 LIMIT 1",
+                params![lease_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| format!("failed to query legacy timed_out terminal: {e}"))?
+            .unwrap_or(false);
+        if timed_out {
+            return Ok(true);
+        }
+
+        // Check gate receipt events. Receipts may be JSON (json_extract) or
+        // protobuf (binary). Try json_extract first for O(log N) lookup on
+        // JSON payloads. If no JSON match, fall back to event_type-scoped
+        // instr() for protobuf payloads (still bounded by event_type filter).
+        for event_type in &["gate.receipt", "GateReceipt", "gate_receipt"] {
+            // JSON path first.
+            let json_found: bool = conn
+                .query_row(
+                    "SELECT 1 FROM ledger_events
+                     WHERE event_type = ?1
+                       AND json_extract(payload, '$.lease_id') = ?2
+                     ORDER BY rowid DESC
+                     LIMIT 1",
+                    params![event_type, lease_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(false);
+            if json_found {
+                return Ok(true);
+            }
+            // Protobuf fallback: instr() scoped by event_type + parse to confirm.
+            let proto_found = Self::check_receipt_protobuf_legacy(conn, event_type, lease_id)?;
+            if proto_found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Protobuf receipt fallback for legacy `ledger_events`. Scoped by
+    /// `event_type = ?` so the scan is bounded to receipt rows only.
+    fn check_receipt_protobuf_legacy(
+        conn: &Connection,
+        event_type: &str,
+        lease_id: &str,
+    ) -> Result<bool, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT event_type, payload
-                 FROM ledger_events
-                 WHERE event_type IN ('gate.timed_out', 'gate.receipt', 'GateReceipt', 'gate_receipt')
-                   AND instr(payload, ?1) > 0
-                 ORDER BY timestamp_ns DESC, event_id DESC
-                 LIMIT 256",
+                "SELECT payload FROM ledger_events
+                 WHERE event_type = ?1
+                   AND instr(payload, ?2) > 0
+                 ORDER BY rowid DESC
+                 LIMIT 16",
             )
-            .map_err(|e| format!("failed to prepare legacy terminal checker query: {e}"))?;
+            .map_err(|e| {
+                format!("failed to prepare legacy receipt protobuf fallback ({event_type}): {e}")
+            })?;
         let mut rows = stmt
-            .query(params![lease_id.as_bytes()])
-            .map_err(|e| format!("failed to execute legacy terminal checker query: {e}"))?;
+            .query(params![event_type, lease_id.as_bytes()])
+            .map_err(|e| {
+                format!("failed to execute legacy receipt protobuf fallback ({event_type}): {e}")
+            })?;
         while let Some(row) = rows
             .next()
-            .map_err(|e| format!("failed to iterate legacy terminal checker rows: {e}"))?
+            .map_err(|e| format!("failed to iterate legacy receipt protobuf rows: {e}"))?
         {
-            let event_type: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy terminal event_type: {e}"))?;
             let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy terminal payload: {e}"))?;
-            let matched = match event_type.as_str() {
-                "gate.timed_out" => parse_timed_out_lease_id(&payload)
-                    .map(|candidate| candidate == lease_id)
-                    .unwrap_or(false),
-                _ => parse_gate_receipt_lease_id(&payload)
-                    .map(|candidate| candidate == lease_id)
-                    .unwrap_or(false),
-            };
-            if matched {
+                .get(0)
+                .map_err(|e| format!("failed to decode legacy receipt protobuf payload: {e}"))?;
+            if parse_gate_receipt_lease_id(&payload)
+                .map(|candidate| candidate == lease_id)
+                .unwrap_or(false)
+            {
                 return Ok(true);
             }
         }
@@ -964,38 +1053,88 @@ impl SqliteTimeoutTerminalChecker {
             return Ok(false);
         }
 
+        // Check gate.timed_out using json_extract for O(log N) lookup instead
+        // of the previous O(N) instr() full-table scan (FINDING-4 fix).
+        let timed_out: bool = conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE event_type = 'gate.timed_out'
+                   AND json_extract(payload, '$.lease_id') = ?1
+                 ORDER BY rowid DESC
+                 LIMIT 1",
+                params![lease_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| format!("failed to query canonical timed_out terminal: {e}"))?
+            .unwrap_or(false);
+        if timed_out {
+            return Ok(true);
+        }
+
+        // Check gate receipt events. Receipts may be JSON or protobuf.
+        // Try json_extract first; fall back to event_type-scoped instr() for
+        // protobuf payloads.
+        for event_type in &["gate.receipt", "GateReceipt", "gate_receipt"] {
+            let json_found: bool = conn
+                .query_row(
+                    "SELECT 1 FROM events
+                     WHERE event_type = ?1
+                       AND json_extract(payload, '$.lease_id') = ?2
+                     ORDER BY rowid DESC
+                     LIMIT 1",
+                    params![event_type, lease_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(false);
+            if json_found {
+                return Ok(true);
+            }
+            // Protobuf fallback scoped by event_type.
+            let proto_found = Self::check_receipt_protobuf_canonical(conn, event_type, lease_id)?;
+            if proto_found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Protobuf receipt fallback for canonical `events` table. Scoped by
+    /// `event_type = ?` so the scan is bounded to receipt rows only.
+    fn check_receipt_protobuf_canonical(
+        conn: &Connection,
+        event_type: &str,
+        lease_id: &str,
+    ) -> Result<bool, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT event_type, payload
-                 FROM events
-                 WHERE event_type IN ('gate.timed_out', 'gate.receipt', 'GateReceipt', 'gate_receipt')
-                   AND instr(payload, ?1) > 0
-                 ORDER BY timestamp_ns DESC, seq_id DESC
-                 LIMIT 256",
+                "SELECT payload FROM events
+                 WHERE event_type = ?1
+                   AND instr(payload, ?2) > 0
+                 ORDER BY rowid DESC
+                 LIMIT 16",
             )
-            .map_err(|e| format!("failed to prepare canonical terminal checker query: {e}"))?;
+            .map_err(|e| {
+                format!("failed to prepare canonical receipt protobuf fallback ({event_type}): {e}")
+            })?;
         let mut rows = stmt
-            .query(params![lease_id.as_bytes()])
-            .map_err(|e| format!("failed to execute canonical terminal checker query: {e}"))?;
+            .query(params![event_type, lease_id.as_bytes()])
+            .map_err(|e| {
+                format!("failed to execute canonical receipt protobuf fallback ({event_type}): {e}")
+            })?;
         while let Some(row) = rows
             .next()
-            .map_err(|e| format!("failed to iterate canonical terminal checker rows: {e}"))?
+            .map_err(|e| format!("failed to iterate canonical receipt protobuf rows: {e}"))?
         {
-            let event_type: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode canonical terminal event_type: {e}"))?;
             let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode canonical terminal payload: {e}"))?;
-            let matched = match event_type.as_str() {
-                "gate.timed_out" => parse_timed_out_lease_id(&payload)
-                    .map(|candidate| candidate == lease_id)
-                    .unwrap_or(false),
-                _ => parse_gate_receipt_lease_id(&payload)
-                    .map(|candidate| candidate == lease_id)
-                    .unwrap_or(false),
-            };
-            if matched {
+                .get(0)
+                .map_err(|e| format!("failed to decode canonical receipt protobuf payload: {e}"))?;
+            if parse_gate_receipt_lease_id(&payload)
+                .map(|candidate| candidate == lease_id)
+                .unwrap_or(false)
+            {
                 return Ok(true);
             }
         }
@@ -1500,59 +1639,9 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
         )
         .map_err(|e| format!("intent migration: failed to count target rows: {e}"))?;
     if target_count >= legacy_count {
-        // Target has enough rows, but validate existing pending rows are well-formed.
-        // Only scan pending rows for this orchestrator_id (bounded, not full-table).
-        let malformed_keys: Vec<(String, String)> = {
-            let mut stmt = guard
-                .prepare(
-                    "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
-                     WHERE orchestrator_id = ?1 AND state = 'pending'
-                     ORDER BY created_at_ns ASC, intent_key ASC",
-                )
-                .map_err(|e| {
-                    format!("intent migration: failed to prepare validation query: {e}")
-                })?;
-            let rows = stmt
-                .query_map(params![GATE_TIMEOUT_ORCHESTRATOR_ID], |row| {
-                    let key: String = row.get(0)?;
-                    let json: String = row.get(1)?;
-                    Ok((key, json))
-                })
-                .map_err(|e| format!("intent migration: failed to query pending intents: {e}"))?;
-            let mut bad = Vec::new();
-            for row in rows {
-                let (key, json) =
-                    row.map_err(|e| format!("intent migration: failed to decode row: {e}"))?;
-                if serde_json::from_str::<GateTimeoutIntent>(&json).is_err() {
-                    bad.push((
-                        key,
-                        "malformed intent_json: failed to deserialize as GateTimeoutIntent"
-                            .to_string(),
-                    ));
-                }
-            }
-            bad
-        };
-        // Quarantine any malformed pending rows as 'blocked'.
-        if !malformed_keys.is_empty() {
-            let now_ns = epoch_now_ns_i64()?;
-            for (key, reason) in &malformed_keys {
-                guard
-                    .execute(
-                        "UPDATE orchestrator_kernel_intents
-                         SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
-                         WHERE orchestrator_id = ?1 AND intent_key = ?2",
-                        params![GATE_TIMEOUT_ORCHESTRATOR_ID, key, reason, now_ns],
-                    )
-                    .map_err(|e| {
-                        format!("intent migration: failed to quarantine malformed intent: {e}")
-                    })?;
-                tracing::warn!(
-                    intent_key = %key,
-                    "intent migration: quarantined malformed pending row: {reason}"
-                );
-            }
-        }
+        // Target has enough rows, but validate existing pending rows are
+        // well-formed and quarantine malformed ones via the shared helper.
+        quarantine_malformed_pending_intents(&guard)?;
         return Ok(()); // Target already has at least as many rows as legacy source.
     }
 
@@ -1672,6 +1761,71 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
             .map_err(|e| format!("intent migration: failed to commit transaction: {e}"))?;
 
         offset = offset.saturating_add(batch_len);
+    }
+
+    // Post-migration validation: scan all pending rows for this orchestrator
+    // and quarantine any that fail deserialization as GateTimeoutIntent. This
+    // prevents pre-existing malformed rows (from a prior bad migration) from
+    // poisoning dequeue_batch (FINDING-2 fix).
+    quarantine_malformed_pending_intents(&guard)?;
+
+    Ok(())
+}
+
+/// Scans all `pending` rows for `GATE_TIMEOUT_ORCHESTRATOR_ID` and
+/// quarantines (marks `blocked`) any row whose `intent_json` cannot be
+/// deserialized as `GateTimeoutIntent`. This is called after ALL migration
+/// branches to ensure no malformed rows survive.
+fn quarantine_malformed_pending_intents(
+    conn: &std::sync::MutexGuard<'_, Connection>,
+) -> Result<(), String> {
+    let malformed_keys: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1 AND state = 'pending'
+                 ORDER BY created_at_ns ASC, intent_key ASC",
+            )
+            .map_err(|e| {
+                format!("intent migration: failed to prepare post-migration validation query: {e}")
+            })?;
+        let rows = stmt
+            .query_map(params![GATE_TIMEOUT_ORCHESTRATOR_ID], |row| {
+                let key: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((key, json))
+            })
+            .map_err(|e| {
+                format!("intent migration: failed to query pending intents for validation: {e}")
+            })?;
+        let mut bad = Vec::new();
+        for row in rows {
+            let (key, json) =
+                row.map_err(|e| format!("intent migration: failed to decode validation row: {e}"))?;
+            if serde_json::from_str::<GateTimeoutIntent>(&json).is_err() {
+                bad.push((
+                    key,
+                    "malformed intent_json: failed to deserialize as GateTimeoutIntent".to_string(),
+                ));
+            }
+        }
+        bad
+    };
+    if !malformed_keys.is_empty() {
+        let now_ns = epoch_now_ns_i64()?;
+        for (key, reason) in &malformed_keys {
+            conn.execute(
+                "UPDATE orchestrator_kernel_intents
+                 SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![GATE_TIMEOUT_ORCHESTRATOR_ID, key, reason, now_ns],
+            )
+            .map_err(|e| format!("intent migration: failed to quarantine malformed intent: {e}"))?;
+            tracing::warn!(
+                intent_key = %key,
+                "post-migration validation: quarantined malformed pending row: {reason}"
+            );
+        }
     }
     Ok(())
 }
@@ -1953,6 +2107,12 @@ fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), Str
 }
 
 fn parse_timed_out_lease_id(payload: &[u8]) -> Result<String, String> {
+    if payload.len() > 65_536 {
+        return Err(format!(
+            "gate.timed_out payload length {} exceeds maximum (65536)",
+            payload.len()
+        ));
+    }
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode gate.timed_out payload json: {e}"))?;
     payload_json
@@ -1963,6 +2123,12 @@ fn parse_timed_out_lease_id(payload: &[u8]) -> Result<String, String> {
 }
 
 fn parse_gate_receipt_lease_id(payload: &[u8]) -> Result<String, String> {
+    if payload.len() > 65_536 {
+        return Err(format!(
+            "gate receipt payload length {} exceeds maximum (65536)",
+            payload.len()
+        ));
+    }
     if let Ok(receipt) = LedgerGateReceipt::decode(payload) {
         if !receipt.lease_id.is_empty() {
             return Ok(receipt.lease_id);
@@ -1979,6 +2145,12 @@ fn parse_gate_receipt_lease_id(payload: &[u8]) -> Result<String, String> {
 }
 
 fn parse_all_completed_work_id(payload: &[u8]) -> Result<String, String> {
+    if payload.len() > 65_536 {
+        return Err(format!(
+            "gate.all_completed payload length {} exceeds maximum (65536)",
+            payload.len()
+        ));
+    }
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode gate.all_completed payload json: {e}"))?;
     payload_json

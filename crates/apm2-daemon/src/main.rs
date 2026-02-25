@@ -1473,13 +1473,14 @@ async fn async_main(args: Args) -> Result<()> {
             GateStartKernelConfig::default(),
         )
         .map_err(|e| anyhow::anyhow!("failed to initialize gate start kernel: {e}"))?;
-        let timeout_kernel = GateTimeoutKernel::new(
+        let timeout_kernel = GateTimeoutKernel::new_async(
             Arc::clone(&orch),
             sqlite_conn.as_ref(),
             timeout_ledger_emitter,
             &fac_root,
             GateTimeoutKernelConfig::default(),
         )
+        .await
         .map_err(|e| anyhow::anyhow!("failed to initialize gate timeout kernel: {e}"))?;
 
         // MAJOR-1 fix: Create a daemon-level FacBroker and

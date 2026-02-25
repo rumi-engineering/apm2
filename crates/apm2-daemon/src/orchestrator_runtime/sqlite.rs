@@ -171,6 +171,9 @@ impl<C: KernelCursor> SqliteCursorStore<C> {
                 self.orchestrator_id
             )
         })?;
+        // FINDING-6: enforce MAX_JSON_BYTES on the write side to prevent
+        // oversized cursor payloads from entering the store.
+        validate_json_size(&json, "cursor store save")?;
         let now_ns = epoch_now_ns_i64()?;
         let guard = self
             .conn
@@ -274,6 +277,9 @@ where
                 let key = intent.intent_key();
                 let json = serde_json::to_string(intent)
                     .map_err(|e| format!("failed to encode intent json: {e}"))?;
+                // FINDING-6: enforce MAX_JSON_BYTES on the write side to
+                // prevent oversized payloads from entering the store.
+                validate_json_size(&json, "intent store enqueue")?;
                 let rows = tx
                     .execute(
                         "INSERT OR IGNORE INTO orchestrator_kernel_intents
@@ -304,7 +310,7 @@ where
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let mut stmt = guard
             .prepare(
-                "SELECT intent_json FROM orchestrator_kernel_intents
+                "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
                  WHERE orchestrator_id = ?1 AND state = 'pending'
                  ORDER BY created_at_ns ASC, intent_key ASC
                  LIMIT ?2",
@@ -312,22 +318,69 @@ where
             .map_err(|e| format!("failed to prepare intent dequeue query: {e}"))?;
         let rows = stmt
             .query_map(params![&self.orchestrator_id, limit_i64], |row| {
-                row.get::<_, String>(0)
+                let key: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((key, json))
             })
             .map_err(|e| format!("failed to query pending intents: {e}"))?;
+
+        // Collect rows first so we can drop the statement borrow before
+        // executing quarantine UPDATEs on the same connection.
+        let collected: Vec<(String, String)> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to decode intent row: {e}"))?;
+        drop(stmt);
+
         let mut intents = Vec::new();
-        for row in rows {
-            let json = row.map_err(|e| format!("failed to decode intent row: {e}"))?;
-            validate_json_size(&json, "intent store dequeue")?;
-            let intent: I = serde_json::from_str(&json)
-                .map_err(|e| format!("failed to decode intent json: {e}"))?;
-            // BEH-DAEMON-OKRT-011: post-deserialization validation to reject
-            // malformed intents before they reach the domain execution path.
-            intent
-                .validate()
-                .map_err(|e| format!("intent post-deserialization validation failed: {e}"))?;
-            intents.push(intent);
+        let mut quarantine = Vec::new();
+
+        for (key, json) in &collected {
+            // Size check: quarantine oversized payloads instead of failing the
+            // entire batch (FINDING-5 fix).
+            if let Err(reason) = validate_json_size(json, "intent store dequeue") {
+                quarantine.push((key.as_str(), reason));
+                continue;
+            }
+            match serde_json::from_str::<I>(json) {
+                Ok(intent) => {
+                    // BEH-DAEMON-OKRT-011: post-deserialization validation to
+                    // reject malformed intents before they reach domain execution.
+                    if let Err(reason) = intent.validate() {
+                        let msg =
+                            format!("intent post-deserialization validation failed: {reason}");
+                        quarantine.push((key.as_str(), msg));
+                        continue;
+                    }
+                    intents.push(intent);
+                },
+                Err(e) => {
+                    let msg = format!("failed to decode intent json: {e}");
+                    quarantine.push((key.as_str(), msg));
+                },
+            }
         }
+
+        // Quarantine malformed rows as 'blocked' so they never stall the
+        // queue (FINDING-5: one bad row must not stall the entire batch).
+        if !quarantine.is_empty() {
+            let now_ns = epoch_now_ns_i64()?;
+            for (key, reason) in &quarantine {
+                guard
+                    .execute(
+                        "UPDATE orchestrator_kernel_intents
+                         SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
+                         WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                        params![&self.orchestrator_id, key, reason, now_ns],
+                    )
+                    .map_err(|e| format!("failed to quarantine malformed intent: {e}"))?;
+                tracing::warn!(
+                    orchestrator_id = %self.orchestrator_id,
+                    intent_key = %key,
+                    "dequeue_batch: quarantined malformed pending row: {reason}"
+                );
+            }
+        }
+
         Ok(intents)
     }
 
@@ -1055,7 +1108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_intent_store_rejects_oversized_json_on_dequeue() {
+    async fn test_intent_store_quarantines_oversized_json_on_dequeue() {
         let conn = test_conn();
 
         // Manually insert an oversized intent JSON directly into SQLite.
@@ -1074,16 +1127,40 @@ mod tests {
                 .expect("manual insert oversized intent");
         }
 
-        let store = SqliteIntentStore::<TestIntent>::new(conn, "orch-oversized-intent");
+        let store =
+            SqliteIntentStore::<TestIntent>::new(Arc::clone(&conn), "orch-oversized-intent");
+        // Dequeue must succeed (not stall) — the oversized row is quarantined,
+        // not returned in the batch (FINDING-5 fix).
         let result = store.dequeue_batch(10).await;
         assert!(
-            result.is_err(),
-            "dequeuing an oversized intent JSON must return Err, got: {result:?}"
+            result.is_ok(),
+            "dequeue_batch must not fail due to one bad row: {result:?}"
         );
-        let err = result.unwrap_err();
+        let batch = result.unwrap();
         assert!(
-            err.contains("MAX_JSON_BYTES"),
-            "error should reference MAX_JSON_BYTES: {err}"
+            batch.is_empty(),
+            "oversized row must not appear in dequeued batch, got {} items",
+            batch.len()
+        );
+
+        // Verify the row was quarantined as 'blocked'.
+        let guard = conn.lock().expect("lock");
+        let (state, reason): (String, Option<String>) = guard
+            .query_row(
+                "SELECT state, blocked_reason FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = 'orch-oversized-intent'
+                   AND intent_key = 'oversized-intent'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("quarantined row should still exist");
+        assert_eq!(
+            state, "blocked",
+            "oversized intent must be quarantined as blocked"
+        );
+        assert!(
+            reason.as_deref().unwrap_or("").contains("MAX_JSON_BYTES"),
+            "blocked_reason should reference MAX_JSON_BYTES: {reason:?}"
         );
     }
 
