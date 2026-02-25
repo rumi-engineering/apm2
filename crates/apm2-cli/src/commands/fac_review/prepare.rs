@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use apm2_core::fac::gh_command;
 use serde::Serialize;
 
 use super::github_reads::{fetch_pr_base_sha, fetch_pr_head_sha};
@@ -17,6 +18,7 @@ const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
 const PREPARE_INLINE_LINE_LIMIT: usize = 2_000;
 
 /// A single expanded requirement node extracted from an RFC document.
+/// Reserved for future use when work objects include requirement_ids.
 #[derive(Debug, Serialize)]
 struct RequirementNode {
     id: String,
@@ -27,9 +29,11 @@ struct RequirementNode {
 /// Work scope context embedded in the prepare summary.
 ///
 /// Present when the PR body contains a valid `apm2.fac_push_metadata.v1` block
-/// and the daemon work object and RFC requirement nodes are reachable.
-/// Absent (`null`) for external PRs or when any step fails (graceful
-/// degradation).
+/// AND the branch field in that block matches the PR's actual head branch
+/// (trust gate to prevent fork-PR metadata injection).
+///
+/// `requirement_ids` and `requirements` are reserved for future population
+/// once RFC-0032 work objects carry explicit requirements (post-TCK-00683).
 #[derive(Debug, Serialize)]
 struct WorkScopeContext {
     work_id: String,
@@ -185,92 +189,73 @@ fn extract_first_fenced_yaml_block(body: &str) -> Option<&str> {
     body.get(inner_start..inner_start.checked_add(close_offset)?)
 }
 
-/// Recursively walk a JSON value to find a node with `"type": "requirement"`
-/// and matching `"id"`.
-fn find_requirement_node<'a>(
-    json: &'a serde_json::Value,
-    id: &str,
-) -> Option<&'a serde_json::Value> {
-    match json {
-        serde_json::Value::Object(map) => {
-            let is_requirement = map
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|t| t == "requirement");
-            let id_matches = map
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|v| v == id);
-            if is_requirement && id_matches {
-                return Some(json);
-            }
-            for value in map.values() {
-                if let Some(found) = find_requirement_node(value, id) {
-                    return Some(found);
-                }
-            }
-            None
-        },
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Some(found) = find_requirement_node(item, id) {
-                    return Some(found);
-                }
-            }
-            None
-        },
-        _ => None,
+/// Fetch the actual head branch ref for a PR from the GitHub API.
+/// Uses `gh_command()` for FAC-hardened non-interactive access.
+fn fetch_pr_head_ref(owner_repo: &str, pr_number: u32) -> Option<String> {
+    let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--jq", ".head.ref"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let head_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head_ref.is_empty() || head_ref == "null" {
+        return None;
+    }
+    Some(head_ref)
 }
 
-/// Expand a single requirement ID into a [`RequirementNode`] by loading the
-/// corresponding RFC JSON document from the repository.
-fn expand_requirement_node(repo_root: &Path, requirement_id: &str) -> Option<RequirementNode> {
-    let (rfc_prefix, _) = requirement_id.split_once("::")?;
-    let rfc_path = repo_root
-        .join("documents")
-        .join("rfcs")
-        .join(format!("{rfc_prefix}.cac.rfc_doc.v1.json"));
-    let rfc_bytes = fs::read(&rfc_path).ok()?;
-    let rfc_json: serde_json::Value = serde_json::from_slice(&rfc_bytes).ok()?;
-    let node = find_requirement_node(&rfc_json, requirement_id)?;
-    let statement = node
-        .pointer("/data/statement")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let acceptance = node
-        .pointer("/data/acceptance")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    Some(RequirementNode {
-        id: requirement_id.to_string(),
-        statement,
-        acceptance,
+/// Fetch the PR body text from the GitHub API.
+/// Uses `gh_command()` for FAC-hardened non-interactive access.
+fn fetch_pr_body_text(owner_repo: &str, pr_number: u32) -> Option<String> {
+    let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
+    let output = gh_command()
+        .args(["api", &endpoint, "--jq", ".body"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(output.stdout).ok()?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(body)
+}
+
+/// Attempt to parse `RFC-XXXX` from a branch name of the form
+/// `ticket/RFC-XXXX/...`.
+fn parse_rfc_id_from_branch(branch: &str) -> Option<String> {
+    branch.split('/').find_map(|segment| {
+        if segment.starts_with("RFC-")
+            && segment.len() > 4
+            && segment[4..].chars().all(|c| c.is_ascii_digit())
+        {
+            Some(segment.to_string())
+        } else {
+            None
+        }
     })
 }
 
 /// Attempt to enrich prepare output with the work scope for this PR.
 ///
 /// Resolution steps:
-/// 1. Fetch PR body from GitHub API (`gh api
-///    /repos/{owner_repo}/pulls/{pr_number}`)
+/// 1. Fetch PR body from GitHub API via `gh_command()`
 /// 2. Parse the `apm2.fac_push_metadata.v1` YAML block -> extract `work_id`,
-///    `ticket_alias`
-/// 3. Call `apm2 fac work show --work-id <work_id> --json` subprocess -> get
-///    WorkSpecV1 JSON
-/// 4. Extract `requirement_ids` from work spec binds
-/// 5. Expand each requirement node from the corresponding RFC JSON
-/// 6. Return `Some(WorkScopeContext{...})`
+///    `ticket_alias`, `branch`
+/// 3. Fetch actual PR head ref via `gh_command()`, validate it matches the
+///    `branch` field from the YAML (trust gate against fork-PR injection)
+/// 4. Parse `rfc_id` from branch name
+/// 5. Return `Some(WorkScopeContext{...})` with empty `requirement_ids` and
+///    `requirements` (reserved for future population post-TCK-00683)
 ///
 /// Returns `None` on any failure -- graceful degradation for external PRs or
 /// offline mode.
-fn fetch_work_scope(
-    owner_repo: &str,
-    pr_number: u32,
-    repo_root: &Path,
-) -> Option<WorkScopeContext> {
-    let pr_body = fetch_pr_body(owner_repo, pr_number)?;
+fn fetch_work_scope(owner_repo: &str, pr_number: u32) -> Option<WorkScopeContext> {
+    let pr_body = fetch_pr_body_text(owner_repo, pr_number)?;
     let yaml_block = extract_first_fenced_yaml_block(&pr_body)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(yaml_block).ok()?;
 
@@ -286,74 +271,39 @@ fn fetch_work_scope(
         .get("work_id")
         .and_then(serde_yaml::Value::as_str)?
         .to_string();
+    if work_id.is_empty() {
+        return None;
+    }
     let ticket_alias = yaml_value
         .get("ticket_alias")
         .and_then(serde_yaml::Value::as_str)
         .map(String::from);
+    let yaml_branch = yaml_value
+        .get("branch")
+        .and_then(serde_yaml::Value::as_str)?
+        .to_string();
 
-    let (rfc_id, requirement_ids) = fetch_work_object_binds(&work_id)?;
+    // Trust gate: validate that the branch field in the YAML matches the
+    // actual PR head ref from GitHub. This prevents a fork PR from injecting
+    // a fake fac_push_metadata block pointing to a different work object.
+    let actual_ref = fetch_pr_head_ref(owner_repo, pr_number)?;
+    if yaml_branch != actual_ref {
+        eprintln!(
+            "warn: work_scope trust gate: branch field '{}' in PR body does not match actual head ref '{}'; skipping work scope enrichment",
+            yaml_branch, actual_ref
+        );
+        return None;
+    }
 
-    let requirements: Vec<RequirementNode> = requirement_ids
-        .iter()
-        .filter_map(|req_id| expand_requirement_node(repo_root, req_id))
-        .collect();
+    let rfc_id = parse_rfc_id_from_branch(&yaml_branch);
 
     Some(WorkScopeContext {
         work_id,
         ticket_alias,
         rfc_id,
-        requirement_ids,
-        requirements,
+        requirement_ids: vec![],
+        requirements: vec![],
     })
-}
-
-/// Fetch the PR body from the GitHub API via the `gh` CLI.
-fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Option<String> {
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &format!("/repos/{owner_repo}/pulls/{pr_number}"),
-            "--jq",
-            ".body",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let body = String::from_utf8(output.stdout).ok()?;
-    if body.trim().is_empty() {
-        return None;
-    }
-    Some(body)
-}
-
-/// Call `apm2 fac work show` to retrieve the work object and extract binds.
-///
-/// Returns `(rfc_id, requirement_ids)` on success.
-fn fetch_work_object_binds(work_id: &str) -> Option<(Option<String>, Vec<String>)> {
-    let output = Command::new("apm2")
-        .args(["fac", "work", "show", "--work-id", work_id, "--json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let requirement_ids: Vec<String> = json
-        .pointer("/work_spec/ticket_meta/binds/requirements")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let rfc_id = json
-        .pointer("/work_spec/ticket_meta/binds/rfc_id")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from);
-    Some((rfc_id, requirement_ids))
 }
 
 pub fn run_prepare(
@@ -423,7 +373,7 @@ pub fn run_prepare(
     let diff_lines = count_text_lines(&diff);
     let commit_history_lines = count_text_lines(&commit_history);
 
-    let work_scope = fetch_work_scope(&owner_repo, resolved_pr, &repo_root);
+    let work_scope = fetch_work_scope(&owner_repo, resolved_pr);
 
     let summary = PrepareSummary {
         schema: PREPARE_SCHEMA.to_string(),
@@ -909,7 +859,7 @@ mod tests {
     use super::{
         OwnedResolvedHead, PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content,
         cleanup_prepared_review_inputs_at, count_text_lines, ensure_prepare_head_alignment,
-        extract_first_fenced_yaml_block, find_requirement_node, prepared_review_dir_from_root,
+        extract_first_fenced_yaml_block, parse_rfc_id_from_branch, prepared_review_dir_from_root,
         resolve_base_ref_for_pr_with, resolve_head_sha_with, sha_is_locally_reachable,
     };
 
@@ -1424,69 +1374,22 @@ More text after the block.
     }
 
     #[test]
-    fn test_find_requirement_node_finds_nested_node() {
-        let rfc_json: serde_json::Value = serde_json::json!({
-            "type": "rfc_doc",
-            "children": [
-                {
-                    "type": "section",
-                    "children": [
-                        {
-                            "type": "requirement",
-                            "id": "RFC-0032::REQ-0041",
-                            "data": {
-                                "statement": "Test statement",
-                                "acceptance": ["criterion_a", "criterion_b"]
-                            }
-                        },
-                        {
-                            "type": "requirement",
-                            "id": "RFC-0032::REQ-0042",
-                            "data": {
-                                "statement": "Other statement",
-                                "acceptance": []
-                            }
-                        }
-                    ]
-                }
-            ]
-        });
+    fn test_extract_first_fenced_yaml_block_finds_push_metadata() {
+        let body = "some intro\n```yaml\nschema: apm2.fac_push_metadata.v1\nwork_id: W-TCK-12345\n```\nsome footer";
+        let yaml = extract_first_fenced_yaml_block(body).expect("yaml block");
+        assert!(yaml.contains("work_id: W-TCK-12345"));
+    }
 
-        let node = find_requirement_node(&rfc_json, "RFC-0032::REQ-0041")
-            .expect("must find nested requirement node");
+    #[test]
+    fn test_parse_rfc_id_from_branch_standard_format() {
         assert_eq!(
-            node.pointer("/data/statement")
-                .and_then(serde_json::Value::as_str),
-            Some("Test statement"),
-        );
-        assert_eq!(
-            node.pointer("/data/acceptance")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len),
-            Some(2),
+            parse_rfc_id_from_branch("ticket/RFC-0019/TCK-00685"),
+            Some("RFC-0019".to_string())
         );
     }
 
     #[test]
-    fn test_find_requirement_node_returns_none_for_missing_id() {
-        let rfc_json: serde_json::Value = serde_json::json!({
-            "type": "rfc_doc",
-            "children": [
-                {
-                    "type": "requirement",
-                    "id": "RFC-0032::REQ-0001",
-                    "data": {
-                        "statement": "Only requirement",
-                        "acceptance": []
-                    }
-                }
-            ]
-        });
-
-        let result = find_requirement_node(&rfc_json, "RFC-0032::REQ-9999");
-        assert!(
-            result.is_none(),
-            "must return None for unknown requirement ID"
-        );
+    fn test_parse_rfc_id_from_branch_no_rfc_returns_none() {
+        assert_eq!(parse_rfc_id_from_branch("feat/some-feature"), None);
     }
 }
