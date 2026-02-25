@@ -119,7 +119,7 @@
             },
             {
               "action": "read_module_agents",
-              "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.md (if it exists) in full. These contain module-specific invariants [INV-*] and contracts [CTR-*] whose violation constitutes a security finding."
+              "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.json (if it exists) in full. These files follow the apm2.agents_context.v1 schema (see documents/schemas/apm2.agents_context.v1.schema.json) and can be queried with jq — e.g. `jq '[.behaviors[] | select(.kind==\"safety\")]'`. They contain module-specific invariants and safety properties whose violation constitutes a security finding."
             },
             {
               "action": "selective_read",

@@ -10,6 +10,7 @@ stable behavior IDs (`BEH-<NAMESPACE>-<NNN>`) back to the RFC system specs that
 mandate them.
 
 **Schema:** [`documents/schemas/apm2.agents_context.v1.schema.json`](documents/schemas/apm2.agents_context.v1.schema.json)
+(This root `AGENTS.md` is the only Markdown file — module behavior files are always `AGENTS.json`.)
 
 ## Load all AGENTS.json files
 
