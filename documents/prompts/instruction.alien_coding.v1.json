@@ -522,6 +522,31 @@
                 "Replace scattered `validate/verify/is_valid` checks and boolean flags with boundary parsing into domain types (newtypes/enums/NonEmpty/Bounded). Make illegal states unrepresentable in State/Input/Effect."
             ]
         },
+        "orchestrator_kernel_doctrine": {
+            "scope": "Any orchestration loop that tails the ledger incrementally, plans intents, executes effects, and emits receipts.",
+            "mandatory_path": [
+                "MUST use apm2_core::orchestrator_kernel for the Observe->Plan->Execute->Receipt control loop.",
+                "Daemon implementations MUST use crates/apm2-daemon/src/orchestrator_runtime adapters for durable cursor, intent, and effect-journal storage.",
+                "MUST use crates/apm2-daemon/src/ledger_poll.rs for canonical+legacy merge polling and canonical event-id synthesis."
+            ],
+            "required_design_inputs": [
+                "Choose and document the KernelCursor type matching ledger ordering truth (CompositeCursor, sequence cursor, commit index cursor, etc.).",
+                "Declare a stable orchestrator_id constant; durability is keyed by orchestrator_id and changing it discards durable state continuity.",
+                "Define receipt/effect idempotency keys as pure functions of authoritative input references."
+            ],
+            "forbidden_patterns": [
+                "No bespoke observe/plan/execute/receipt loops outside orchestrator_kernel.",
+                "No per-orchestrator sqlite tables or sqlite sidecar files for cursor/intent/effect journal concerns.",
+                "No blocking rusqlite calls directly on async paths; use spawn_blocking or async wrappers only.",
+                "No persisted monotonic timestamps treated as durable authority truth. If cached durably, they MUST be rebased on load before decisions."
+            ],
+            "review_anchors": [
+                "run_tick, LedgerReader, OrchestratorDomain, ReceiptWriter",
+                "orchestrator_kernel_cursors, orchestrator_kernel_intents, orchestrator_kernel_effect_journal",
+                "poll_events_blocking, poll_events_async, canonical_event_id",
+                "observed_monotonic_ns, deadline_monotonic_ns, MONO_EPOCH, Instant::now"
+            ]
+        },
         "review_lenses": {
             "lens_1_state_is_sufficient_statistic": [
                 "Each State field has a justification as sufficient statistic.",

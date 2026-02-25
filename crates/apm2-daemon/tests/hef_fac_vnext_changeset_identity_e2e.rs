@@ -221,13 +221,14 @@ async fn hef_fac_vnext_changeset_identity_e2e() {
         Arc::new(Signer::generate()),
     ));
     let fac_root = TempDir::new().expect("create temp fac root");
-    let mut gate_start_kernel = GateStartKernel::new(
+    let mut gate_start_kernel = GateStartKernel::new_async(
         Arc::clone(&gate_orchestrator),
         Some(&sqlite),
         Some(kernel_emitter),
         fac_root.path(),
         GateStartKernelConfig::default(),
     )
+    .await
     .expect("create gate start kernel");
 
     let work_id = "W-hef-fac-vnext-csid-e2e";

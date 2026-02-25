@@ -100,6 +100,16 @@
         }
       ]
     },
+    "review_checklist": {
+      "title": "Orchestrator Kernel Doctrine Checklist",
+      "items": [
+        "If the PR adds a ledger-tailing control loop, verify it uses apm2_core::orchestrator_kernel (`run_tick`, `LedgerReader`, `OrchestratorDomain`, `ReceiptWriter`).",
+        "Reject new per-orchestrator sqlite tables/files for cursor/intent/effect journal concerns. Grep: `CREATE TABLE IF NOT EXISTS .*_cursor`, `CREATE TABLE IF NOT EXISTS .*_intent`, `effect_journal`, `Connection::open(`.",
+        "For daemon async paths, verify every rusqlite call is offloaded via `spawn_blocking` or adapter wrappers.",
+        "If code merges `ledger_events` + `events`, verify usage of `crates/apm2-daemon/src/ledger_poll.rs` and `canonical_event_id` helper.",
+        "For persisted monotonic values, verify explicit rebase-on-load before irreversible decisions. Grep: `observed_monotonic_ns`, `deadline_monotonic_ns`, `MONO_EPOCH`, `Instant::now`."
+      ]
+    },
     "references": [
       {"path": "@documents/theory/unified-theory-v2.json", "purpose": "Holonic model, truth/projection split, and verification-first behavior."},
       {"path": "@AGENTS.md", "purpose": "Global repository instructions."},

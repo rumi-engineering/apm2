@@ -4,12 +4,14 @@
 //! drives gate-start orchestration through the shared
 //! `apm2_core::orchestrator_kernel` harness.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use apm2_core::events::{DefectRecorded, DefectSource};
+use apm2_core::events::{DefectRecorded, DefectSource, Validate};
 use apm2_core::fac::{ChangeSetPublishedKernelEventPayload, ChangesetPublication, GateLease};
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, CursorStore, EffectExecutionState, EffectJournal,
@@ -20,9 +22,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent};
 use crate::ledger::SqliteLedgerEventEmitter;
-use crate::protocol::dispatch::LedgerEventEmitter;
+use crate::ledger_poll;
+use crate::orchestrator_runtime::sqlite::{
+    IntentKeyed, SqliteCursorStore, SqliteEffectJournal, SqliteIntentStore,
+    init_orchestrator_runtime_schema,
+};
+use crate::orchestrator_runtime::{MemoryCursorStore, MemoryEffectJournal, MemoryIntentStore};
+use crate::protocol::dispatch::{LedgerEventEmitter, SignedLedgerEvent};
 
 const GATE_START_CURSOR_KEY: i64 = 1;
+/// Durable namespace key for shared orchestrator runtime tables.
+/// Changing this value resets durable cursor/intent/effect continuity.
+const GATE_START_ORCHESTRATOR_ID: &str = "gate_start_kernel";
+const GATE_START_EFFECT_JOURNAL_LEGACY_FILE: &str = "gate_start_effect_journal.sqlite";
 const GATE_START_PERSISTOR_ACTOR_ID: &str = "orchestrator:gate-start-kernel";
 
 /// Maximum payload size (in bytes) for `changeset_published` events before JSON
@@ -30,26 +42,24 @@ const GATE_START_PERSISTOR_ACTOR_ID: &str = "orchestrator:gate-start-kernel";
 /// (up to 1 GiB) exhausting daemon memory during `serde_json::from_slice`.
 const MAX_PAYLOAD_BYTES: usize = 1_048_576; // 1 MiB
 
-/// Detect whether a persisted cursor `event_id` is in the legacy (pre-unified)
-/// format. Legacy cursors store raw event IDs without the `legacy:` or
-/// `canonical:` namespace prefix that the unified reader now emits.
+/// Detect whether a persisted cursor `event_id` is in the legacy gate-start
+/// namespace format.
 ///
-/// On upgrade, resuming from a legacy cursor value can cause the lexicographic
-/// comparison `cursor_event_id > last_cursor` to skip namespaced rows that sort
-/// before the raw value, permanently missing those events.
-///
-/// When a legacy cursor is detected, `load_with_conn` resets the cursor to the
-/// beginning. Re-processing is safe because the intent store's `state='done'`
-/// markers provide idempotent deduplication (CSID-003).
+/// Legacy gate-start cursor rows were namespaced as `legacy:<event_id>` or
+/// `canonical:<seq:020>`. The shared poller uses raw legacy IDs and canonical
+/// IDs in the form `canonical-<seq:020>`.
 fn is_legacy_cursor(event_id: &str) -> bool {
-    // An empty event_id is the default (no cursor persisted yet) — not legacy.
-    if event_id.is_empty() {
-        return false;
+    event_id.starts_with("legacy:") || event_id.starts_with("canonical:")
+}
+
+fn normalize_legacy_cursor_event_id(event_id: &str) -> String {
+    if let Some(raw) = event_id.strip_prefix("legacy:") {
+        return raw.to_string();
     }
-    // The unified reader emits `legacy:<event_id>` or `canonical:<seq>`.
-    // Any persisted cursor that lacks one of these prefixes is from a
-    // previous version and must be treated as legacy.
-    !event_id.starts_with("legacy:") && !event_id.starts_with("canonical:")
+    if let Some(seq) = event_id.strip_prefix("canonical:") {
+        return format!("canonical-{seq}");
+    }
+    event_id.to_string()
 }
 
 /// Kernel configuration for gate-start orchestration ticks.
@@ -89,47 +99,69 @@ pub struct GateStartKernel {
     intent_store: GateStartIntentStore,
     effect_journal: GateStartEffectJournal,
     receipt_writer: GateStartReceiptWriter,
+    sqlite_conn: Option<Arc<Mutex<Connection>>>,
     tick_config: TickConfig,
 }
 
 impl GateStartKernel {
     /// Creates a new gate-start kernel instance.
-    pub fn new(
+    pub async fn new_async(
         orchestrator: Arc<GateOrchestrator>,
         sqlite_conn: Option<&Arc<Mutex<Connection>>>,
         gate_start_ledger_emitter: Option<SqliteLedgerEventEmitter>,
         fac_root: &Path,
         config: GateStartKernelConfig,
     ) -> Result<Self, GateStartKernelError> {
+        if let Some(conn) = sqlite_conn {
+            std::fs::create_dir_all(fac_root).map_err(|e| {
+                GateStartKernelError::Init(format!(
+                    "failed to create FAC root '{}': {e}",
+                    fac_root.display()
+                ))
+            })?;
+            let conn = Arc::clone(conn);
+            let legacy_journal_path = fac_root.join(GATE_START_EFFECT_JOURNAL_LEGACY_FILE);
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.lock().map_err(|e| {
+                    GateStartKernelError::Init(format!("sqlite lock poisoned: {e}"))
+                })?;
+                init_orchestrator_runtime_schema(&guard).map_err(GateStartKernelError::Init)?;
+                drop(guard);
+                migrate_legacy_gate_start_cursor(&conn).map_err(GateStartKernelError::Init)?;
+                migrate_legacy_gate_start_intents(&conn).map_err(GateStartKernelError::Init)?;
+                migrate_legacy_gate_start_effect_journal(&conn, &legacy_journal_path)
+                    .map_err(GateStartKernelError::Init)?;
+                Ok::<(), GateStartKernelError>(())
+            })
+            .await
+            .map_err(|e| {
+                GateStartKernelError::Init(format!("spawn_blocking join failed for init: {e}"))
+            })??;
+        }
+
         let cursor_store = if let Some(conn) = sqlite_conn {
-            GateStartCursorStore::Sqlite(
-                SqliteGateStartCursorStore::new(Arc::clone(conn)).map_err(|e| {
-                    GateStartKernelError::Init(format!("cursor store setup failed: {e}"))
-                })?,
-            )
+            GateStartCursorStore::Sqlite(SqliteCursorStore::new(
+                Arc::clone(conn),
+                GATE_START_ORCHESTRATOR_ID,
+            ))
         } else {
-            GateStartCursorStore::Memory(MemoryGateStartCursorStore::default())
+            GateStartCursorStore::Memory(MemoryCursorStore::default())
         };
 
         let intent_store = if let Some(conn) = sqlite_conn {
-            GateStartIntentStore::Sqlite(
-                SqliteGateStartIntentStore::new(Arc::clone(conn)).map_err(|e| {
-                    GateStartKernelError::Init(format!("intent store setup failed: {e}"))
-                })?,
-            )
+            GateStartIntentStore::Sqlite(SqliteIntentStore::new(
+                Arc::clone(conn),
+                GATE_START_ORCHESTRATOR_ID,
+            ))
         } else {
-            GateStartIntentStore::Memory(MemoryGateStartIntentStore::default())
+            GateStartIntentStore::Memory(MemoryIntentStore::default())
         };
 
-        std::fs::create_dir_all(fac_root).map_err(|e| {
-            GateStartKernelError::Init(format!(
-                "failed to create FAC root '{}': {e}",
-                fac_root.display()
-            ))
-        })?;
-        let journal_path = fac_root.join("gate_start_effect_journal.sqlite");
-        let effect_journal =
-            GateStartEffectJournal::open(&journal_path).map_err(GateStartKernelError::Init)?;
+        let effect_journal = if let Some(conn) = sqlite_conn {
+            GateStartEffectJournal::new_shared(Arc::clone(conn))
+        } else {
+            GateStartEffectJournal::new_memory()
+        };
 
         Ok(Self {
             domain: GateStartDomain::new(orchestrator),
@@ -145,6 +177,7 @@ impl GateStartKernel {
             intent_store,
             effect_journal,
             receipt_writer: GateStartReceiptWriter::new(gate_start_ledger_emitter),
+            sqlite_conn: sqlite_conn.map(Arc::clone),
             tick_config: TickConfig {
                 observe_limit: config.observe_limit,
                 execute_limit: config.execute_limit,
@@ -177,25 +210,35 @@ impl GateStartKernel {
         &self,
         cutoff_ns: i64,
     ) -> Result<(usize, usize), GateStartKernelError> {
-        let intent_gc = match &self.intent_store {
-            GateStartIntentStore::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::gc_completed_before_with_conn(&conn, cutoff_ns)
-                })
-                .await
-                .map_err(|e| {
-                    GateStartKernelError::Tick(format!("spawn_blocking failed for intent GC: {e}"))
-                })?
-                .map_err(GateStartKernelError::Tick)?
-            },
-            GateStartIntentStore::Memory(_) => 0,
+        let Some(conn) = &self.sqlite_conn else {
+            return Ok((0, 0));
         };
+        let conn_for_intents = Arc::clone(conn);
+        let intent_gc = tokio::task::spawn_blocking(move || {
+            gc_shared_intents_before_with_conn(
+                &conn_for_intents,
+                GATE_START_ORCHESTRATOR_ID,
+                cutoff_ns,
+            )
+        })
+        .await
+        .map_err(|e| {
+            GateStartKernelError::Tick(format!("spawn_blocking failed for intent GC: {e}"))
+        })?
+        .map_err(GateStartKernelError::Tick)?;
 
-        let effect_gc = GateStartEffectJournal::gc_completed_before_with_conn(
-            &self.effect_journal.conn,
-            cutoff_ns,
-        )
+        let conn_for_effect = Arc::clone(conn);
+        let effect_gc = tokio::task::spawn_blocking(move || {
+            gc_shared_effect_journal_before_with_conn(
+                &conn_for_effect,
+                GATE_START_ORCHESTRATOR_ID,
+                cutoff_ns,
+            )
+        })
+        .await
+        .map_err(|e| {
+            GateStartKernelError::Tick(format!("spawn_blocking failed for effect GC: {e}"))
+        })?
         .map_err(GateStartKernelError::Tick)?;
 
         Ok((intent_gc, effect_gc))
@@ -223,7 +266,8 @@ impl CursorEvent<CompositeCursor> for GateStartObservedEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GateStartIntent {
     publication: ChangesetPublication,
     /// Monotonic sequence number assigned when the intent is first observed,
@@ -237,6 +281,27 @@ impl GateStartIntent {
             &self.publication.work_id,
             &self.publication.changeset_digest,
         )
+    }
+}
+
+impl IntentKeyed for GateStartIntent {
+    fn intent_key(&self) -> String {
+        self.key()
+    }
+}
+
+impl Validate for GateStartIntent {
+    fn validate(&self) -> Result<(), String> {
+        if self.publication.work_id.is_empty() {
+            return Err("GateStartIntent publication work_id must not be empty".to_string());
+        }
+        if self.publication.changeset_published_event_id.is_empty() {
+            return Err(
+                "GateStartIntent publication changeset_published_event_id must not be empty"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -400,15 +465,7 @@ impl LedgerReader<GateStartObservedEvent> for GateStartLedgerReader {
         limit: usize,
     ) -> Result<Vec<GateStartObservedEvent>, Self::Error> {
         match self {
-            Self::Sqlite(reader) => {
-                let conn = Arc::clone(&reader.conn);
-                let cursor = cursor.clone();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartLedgerReader::poll_with_conn(&conn, &cursor, limit)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for ledger poll: {e}"))?
-            },
+            Self::Sqlite(reader) => reader.poll(cursor, limit).await,
             Self::Memory(_reader) => Ok(Vec::new()),
         }
     }
@@ -424,9 +481,8 @@ impl SqliteGateStartLedgerReader {
         Self { conn }
     }
 
-    /// Static `poll` — callable from `spawn_blocking`.
-    fn poll_with_conn(
-        conn: &Arc<Mutex<Connection>>,
+    async fn poll(
+        &self,
         cursor: &CompositeCursor,
         limit: usize,
     ) -> Result<Vec<GateStartObservedEvent>, String> {
@@ -434,208 +490,20 @@ impl SqliteGateStartLedgerReader {
             return Ok(Vec::new());
         }
 
-        let limit_i64 =
-            i64::try_from(limit).map_err(|_| "observe limit exceeds i64 range".to_string())?;
         let cursor_ts_i64 = i64::try_from(cursor.timestamp_ns)
             .map_err(|_| "cursor timestamp exceeds i64 range".to_string())?;
-        let guard = conn
-            .lock()
-            .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
-        Self::query_changeset_published_unified(&guard, cursor_ts_i64, &cursor.event_id, limit_i64)
-    }
-
-    /// Instance poll for tests that use the reader directly.
-    #[cfg(test)]
-    fn poll(
-        &self,
-        cursor: &CompositeCursor,
-        limit: usize,
-    ) -> Result<Vec<GateStartObservedEvent>, String> {
-        Self::poll_with_conn(&self.conn, cursor, limit)
-    }
-
-    fn query_changeset_published_unified(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<GateStartObservedEvent>, String> {
-        let table_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        // Security: SELECT actor_id and work_id/session_id from both tables.
-        // Both `ledger_events` (work_id) and canonical `events` (session_id)
-        // tables have mandatory actor_id and work identity columns. These are
-        // the cryptographically verified envelope identities.
-        let query = if table_exists.is_some() {
-            // Ordering invariant:
-            // - Every observed event has a deterministic `cursor_event_id` namespaced by
-            //   source table (`legacy:` or `canonical:`).
-            // - Observe ordering is total by `(timestamp_ns, cursor_event_id)`.
-            // - The durable cursor stores this exact ordering key.
-            //
-            // This avoids mixed-table tie-break drift where legacy and
-            // canonical rows sharing a timestamp could be skipped when each
-            // table applied incompatible local ordering.
-            if cursor_event_id.is_empty() {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns,
-                        verified_actor_id, verified_work_id
-                 FROM (
-                   SELECT ('legacy:' || event_id) AS cursor_event_id,
-                          event_id AS source_event_id,
-                          payload,
-                          timestamp_ns,
-                          actor_id AS verified_actor_id,
-                          work_id AS verified_work_id
-                   FROM ledger_events
-                   WHERE event_type = 'changeset_published'
-                   UNION ALL
-                   SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
-                          ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
-                          payload,
-                          timestamp_ns,
-                          actor_id AS verified_actor_id,
-                          session_id AS verified_work_id
-                   FROM events
-                   WHERE event_type = 'changeset_published'
-                 )
-                 WHERE timestamp_ns > ?1
-                 ORDER BY timestamp_ns ASC, cursor_event_id ASC
-                 LIMIT ?2"
-            } else {
-                "SELECT cursor_event_id, source_event_id, payload, timestamp_ns,
-                        verified_actor_id, verified_work_id
-                 FROM (
-                   SELECT ('legacy:' || event_id) AS cursor_event_id,
-                          event_id AS source_event_id,
-                          payload,
-                          timestamp_ns,
-                          actor_id AS verified_actor_id,
-                          work_id AS verified_work_id
-                   FROM ledger_events
-                   WHERE event_type = 'changeset_published'
-                   UNION ALL
-                   SELECT ('canonical:' || printf('%020d', seq_id)) AS cursor_event_id,
-                          ('canonical-' || printf('%020d', seq_id)) AS source_event_id,
-                          payload,
-                          timestamp_ns,
-                          actor_id AS verified_actor_id,
-                          session_id AS verified_work_id
-                   FROM events
-                   WHERE event_type = 'changeset_published'
-                 )
-                 WHERE timestamp_ns > ?1
-                    OR (timestamp_ns = ?1 AND cursor_event_id > ?2)
-                 ORDER BY timestamp_ns ASC, cursor_event_id ASC
-                 LIMIT ?3"
-            }
-        } else if cursor_event_id.is_empty() {
-            "SELECT ('legacy:' || event_id) AS cursor_event_id,
-                    event_id AS source_event_id,
-                    payload,
-                    timestamp_ns,
-                    actor_id AS verified_actor_id,
-                    work_id AS verified_work_id
-             FROM ledger_events
-             WHERE event_type = 'changeset_published'
-               AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, cursor_event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT ('legacy:' || event_id) AS cursor_event_id,
-                    event_id AS source_event_id,
-                    payload,
-                    timestamp_ns,
-                    actor_id AS verified_actor_id,
-                    work_id AS verified_work_id
-             FROM ledger_events
-             WHERE event_type = 'changeset_published'
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND ('legacy:' || event_id) > ?2))
-             ORDER BY timestamp_ns ASC, cursor_event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare unified changeset query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute unified changeset query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate unified changeset rows: {e}"))?
-        {
-            let cursor_event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode unified cursor_event_id: {e}"))?;
-            let source_event_id: String = row
-                .get(1)
-                .map_err(|e| format!("failed to decode unified source_event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(2)
-                .map_err(|e| format!("failed to decode unified payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(3)
-                .map_err(|e| format!("failed to decode unified timestamp: {e}"))?;
-            let timestamp_ns =
-                u64::try_from(ts_i64).map_err(|_| "unified timestamp is negative".to_string())?;
-            // Security: Extract verified actor_id from ledger row envelope.
-            // Both legacy (actor_id) and canonical (actor_id) are NOT NULL.
-            let verified_actor_id: String = row
-                .get(4)
-                .map_err(|e| format!("failed to decode verified_actor_id: {e}"))?;
-            // Security MAJOR: Extract verified work_id from ledger row
-            // envelope (legacy: work_id, canonical: session_id).
-            let verified_work_id: String = row
-                .get(5)
-                .map_err(|e| format!("failed to decode verified_work_id: {e}"))?;
-            let publication = match parse_changeset_publication_payload(
-                &payload,
-                timestamp_ns,
-                &source_event_id,
-                &verified_actor_id,
-                &verified_work_id,
-            ) {
-                Ok(pub_ok) => Some(pub_ok),
-                Err(parse_err) => {
-                    // BLOCKER fix: Do NOT propagate parse errors with `?`.
-                    // Failing here would abort the entire poll, and the
-                    // orchestrator kernel would not advance the cursor past
-                    // this row — causing an infinite re-read deadlock.
-                    //
-                    // Instead: log the error, push a cursor-advancing event
-                    // with `publication = None` so the cursor moves past the
-                    // malformed row. The domain's `apply_events` skips None
-                    // publications.
-                    tracing::error!(
-                        cursor_event_id = %cursor_event_id,
-                        source_event_id = %source_event_id,
-                        verified_work_id = %verified_work_id,
-                        verified_actor_id = %verified_actor_id,
-                        payload_len = payload.len(),
-                        error = %parse_err,
-                        "DEFECT: malformed changeset_published row skipped \
-                         (cursor will advance past it)"
-                    );
-                    None
-                },
-            };
-            out.push(GateStartObservedEvent {
-                timestamp_ns,
-                cursor_event_id,
-                publication,
-            });
-        }
-        Ok(out)
+        let signed = ledger_poll::poll_events_async(
+            Arc::clone(&self.conn),
+            vec!["changeset_published".to_string()],
+            cursor_ts_i64,
+            cursor.event_id.clone(),
+            limit,
+        )
+        .await?;
+        Ok(signed
+            .into_iter()
+            .map(map_signed_event_to_observed)
+            .collect())
     }
 }
 
@@ -644,8 +512,8 @@ struct MemoryGateStartLedgerReader;
 
 #[derive(Debug)]
 enum GateStartCursorStore {
-    Sqlite(SqliteGateStartCursorStore),
-    Memory(MemoryGateStartCursorStore),
+    Sqlite(SqliteCursorStore<CompositeCursor>),
+    Memory(MemoryCursorStore<CompositeCursor>),
 }
 
 impl CursorStore<CompositeCursor> for GateStartCursorStore {
@@ -653,95 +521,71 @@ impl CursorStore<CompositeCursor> for GateStartCursorStore {
 
     async fn load(&self) -> Result<CompositeCursor, Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartCursorStore::load_with_conn(&conn)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for cursor load: {e}"))?
-            },
-            Self::Memory(store) => store.load(),
+            Self::Sqlite(store) => store.load().await,
+            Self::Memory(store) => store.load().await,
         }
     }
 
     async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                let cursor = cursor.clone();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartCursorStore::save_with_conn(&conn, &cursor)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for cursor save: {e}"))?
-            },
-            Self::Memory(store) => store.save(cursor),
+            Self::Sqlite(store) => store.save(cursor).await,
+            Self::Memory(store) => store.save(cursor).await,
         }
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SqliteGateStartCursorStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+#[cfg(test)]
 impl SqliteGateStartCursorStore {
     fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
         let guard = conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "CREATE TABLE IF NOT EXISTS gate_start_kernel_cursor (
-                    cursor_key INTEGER PRIMARY KEY CHECK (cursor_key = 1),
-                    timestamp_ns INTEGER NOT NULL,
-                    event_id TEXT NOT NULL
-                )",
-                [],
-            )
-            .map_err(|e| format!("failed to create gate_start_kernel_cursor: {e}"))?;
+        init_orchestrator_runtime_schema(&guard)
+            .map_err(|e| format!("failed to init shared orchestrator schema: {e}"))?;
         drop(guard);
         Ok(Self { conn })
     }
 
     /// Static `load` — callable from `spawn_blocking`.
     ///
-    /// Migration safety: if the persisted cursor has a legacy (pre-unified)
-    /// `event_id` format (no `legacy:`/`canonical:` prefix), the cursor is
-    /// reset to the default (start from beginning). Re-processing from the
-    /// beginning is safe because the intent store's `state='done'` markers
-    /// deduplicate already-completed events (CSID-003 idempotency).
+    /// Migration safety: persisted legacy cursor IDs from pre-shared poller
+    /// formats (`legacy:*` / `canonical:*`) are normalized to modern forms
+    /// (`<legacy-event-id>` / `canonical-<seq:020>`) on load.
     fn load_with_conn(conn: &Arc<Mutex<Connection>>) -> Result<CompositeCursor, String> {
         let guard = conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
-        let row: Option<(i64, String)> = guard
+        let row: Option<String> = guard
             .query_row(
-                "SELECT timestamp_ns, event_id
-                 FROM gate_start_kernel_cursor
-                 WHERE cursor_key = ?1",
-                params![GATE_START_CURSOR_KEY],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT cursor_json
+                 FROM orchestrator_kernel_cursors
+                 WHERE orchestrator_id = ?1",
+                params![GATE_START_ORCHESTRATOR_ID],
+                |r| r.get(0),
             )
             .optional()
             .map_err(|e| format!("failed to load gate-start cursor: {e}"))?;
-        let Some((timestamp_ns, event_id)) = row else {
+        let Some(cursor_json) = row else {
             return Ok(CompositeCursor::default());
         };
-        // Migration: detect pre-unified cursor format and reset to beginning.
-        // Legacy cursors used raw event IDs without the `legacy:` or
-        // `canonical:` namespace prefix. Resuming from such a cursor under
-        // the new unified ordering could permanently skip events.
-        if is_legacy_cursor(&event_id) {
-            return Ok(CompositeCursor::default());
+        if cursor_json.len() > 65_536 {
+            return Err(format!(
+                "gate-start cursor json too large: {} bytes > 65536",
+                cursor_json.len()
+            ));
         }
-        let timestamp_ns = u64::try_from(timestamp_ns)
-            .map_err(|_| "gate-start cursor timestamp is negative".to_string())?;
-        Ok(CompositeCursor {
-            timestamp_ns,
-            event_id,
-        })
+        let mut cursor: CompositeCursor = serde_json::from_str(&cursor_json)
+            .map_err(|e| format!("failed to decode gate-start cursor json: {e}"))?;
+        if is_legacy_cursor(&cursor.event_id) {
+            cursor.event_id = normalize_legacy_cursor_event_id(&cursor.event_id);
+        }
+        Ok(cursor)
     }
 
     /// Static `save` — callable from `spawn_blocking`.
@@ -749,52 +593,41 @@ impl SqliteGateStartCursorStore {
         conn: &Arc<Mutex<Connection>>,
         cursor: &CompositeCursor,
     ) -> Result<(), String> {
-        let timestamp_ns = i64::try_from(cursor.timestamp_ns)
-            .map_err(|_| "gate-start cursor timestamp exceeds i64 range".to_string())?;
+        let now_ns = epoch_now_ns_i64()?;
+        let mut normalized = cursor.clone();
+        if is_legacy_cursor(&normalized.event_id) {
+            normalized.event_id = normalize_legacy_cursor_event_id(&normalized.event_id);
+        }
+        let cursor_json = serde_json::to_string(&normalized)
+            .map_err(|e| format!("failed to encode gate-start cursor json: {e}"))?;
+        if cursor_json.len() > 65_536 {
+            return Err(format!(
+                "gate-start cursor json too large to persist: {} bytes > 65536",
+                cursor_json.len()
+            ));
+        }
         let guard = conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
         guard
             .execute(
-                "INSERT INTO gate_start_kernel_cursor (cursor_key, timestamp_ns, event_id)
+                "INSERT INTO orchestrator_kernel_cursors
+                     (orchestrator_id, cursor_json, updated_at_ns)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(cursor_key) DO UPDATE SET
-                   timestamp_ns = excluded.timestamp_ns,
-                   event_id = excluded.event_id",
-                params![GATE_START_CURSOR_KEY, timestamp_ns, &cursor.event_id],
+                 ON CONFLICT(orchestrator_id) DO UPDATE SET
+                     cursor_json = excluded.cursor_json,
+                     updated_at_ns = excluded.updated_at_ns",
+                params![GATE_START_ORCHESTRATOR_ID, cursor_json, now_ns],
             )
             .map_err(|e| format!("failed to save gate-start cursor: {e}"))?;
         Ok(())
     }
 }
 
-#[derive(Debug, Default)]
-struct MemoryGateStartCursorStore {
-    cursor: Mutex<CompositeCursor>,
-}
-
-impl MemoryGateStartCursorStore {
-    fn load(&self) -> Result<CompositeCursor, String> {
-        Ok(self
-            .cursor
-            .lock()
-            .map_err(|e| format!("memory cursor lock poisoned: {e}"))?
-            .clone())
-    }
-
-    fn save(&self, cursor: &CompositeCursor) -> Result<(), String> {
-        *self
-            .cursor
-            .lock()
-            .map_err(|e| format!("memory cursor lock poisoned: {e}"))? = cursor.clone();
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 enum GateStartIntentStore {
-    Sqlite(SqliteGateStartIntentStore),
-    Memory(MemoryGateStartIntentStore),
+    Sqlite(SqliteIntentStore<GateStartIntent>),
+    Memory(MemoryIntentStore<GateStartIntent>),
 }
 
 impl IntentStore<GateStartIntent, String> for GateStartIntentStore {
@@ -802,130 +635,54 @@ impl IntentStore<GateStartIntent, String> for GateStartIntentStore {
 
     async fn enqueue_many(&self, intents: &[GateStartIntent]) -> Result<usize, Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                let intents = intents.to_vec();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::enqueue_many_with_conn(&conn, &intents)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for enqueue_many: {e}"))?
-            },
-            Self::Memory(store) => store.enqueue_many(intents),
+            Self::Sqlite(store) => store.enqueue_many(intents).await,
+            Self::Memory(store) => store.enqueue_many(intents).await,
         }
     }
 
     async fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateStartIntent>, Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::dequeue_batch_with_conn(&conn, limit)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for dequeue_batch: {e}"))?
-            },
-            Self::Memory(store) => store.dequeue_batch(limit),
+            Self::Sqlite(store) => store.dequeue_batch(limit).await,
+            Self::Memory(store) => store.dequeue_batch(limit).await,
         }
     }
 
     async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                let key = key.clone();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::mark_done_with_conn(&conn, &key)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for mark_done: {e}"))?
-            },
-            Self::Memory(store) => store.mark_done(key),
+            Self::Sqlite(store) => store.mark_done(key).await,
+            Self::Memory(store) => store.mark_done(key).await,
         }
     }
 
     async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                let key = key.clone();
-                let reason = reason.to_string();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::mark_blocked_with_conn(&conn, &key, &reason)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for mark_blocked: {e}"))?
-            },
-            Self::Memory(store) => store.mark_blocked(key, reason),
+            Self::Sqlite(store) => store.mark_blocked(key, reason).await,
+            Self::Memory(store) => store.mark_blocked(key, reason).await,
         }
     }
 
     async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
         match self {
-            Self::Sqlite(store) => {
-                let conn = Arc::clone(&store.conn);
-                let key = key.clone();
-                let reason = reason.to_string();
-                tokio::task::spawn_blocking(move || {
-                    SqliteGateStartIntentStore::mark_retryable_with_conn(&conn, &key, &reason)
-                })
-                .await
-                .map_err(|e| format!("spawn_blocking failed for mark_retryable: {e}"))?
-            },
-            Self::Memory(store) => store.mark_retryable(key, reason),
+            Self::Sqlite(store) => store.mark_retryable(key, reason).await,
+            Self::Memory(store) => store.mark_retryable(key, reason).await,
         }
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SqliteGateStartIntentStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+#[cfg(test)]
 impl SqliteGateStartIntentStore {
     fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
         let guard = conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "CREATE TABLE IF NOT EXISTS gate_start_intents (
-                    intent_key TEXT PRIMARY KEY,
-                    publication_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('pending', 'done', 'blocked')),
-                    blocked_reason TEXT,
-                    created_at_ns INTEGER NOT NULL,
-                    updated_at_ns INTEGER NOT NULL,
-                    completed_at_ns INTEGER
-                )",
-                [],
-            )
-            .map_err(|e| format!("failed to create gate_start_intents: {e}"))?;
-        // Migration: add completed_at_ns column if the table predates the
-        // TTL-bounded GC change (the column may already exist).
-        let _ = guard.execute(
-            "ALTER TABLE gate_start_intents ADD COLUMN completed_at_ns INTEGER",
-            [],
-        );
-        // Migration: add observed_seq column for deterministic dequeue
-        // ordering by ledger observation order (Quality BLOCKER fix:
-        // prevents reordering same-work publications whose intent_key
-        // lexical order differs from publish order).
-        let _ = guard.execute(
-            "ALTER TABLE gate_start_intents ADD COLUMN observed_seq INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        // Replace the old index with one that orders by observed_seq for
-        // deterministic dequeue. The `created_at_ns` tiebreaker handles
-        // pre-migration rows that all have `observed_seq=0`.
-        let _ = guard.execute("DROP INDEX IF EXISTS idx_gate_start_intents_pending", []);
-        guard
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_gate_start_intents_pending_v2
-                 ON gate_start_intents(state, observed_seq, created_at_ns)",
-                [],
-            )
-            .map_err(|e| format!("failed to create idx_gate_start_intents_pending_v2: {e}"))?;
+        init_orchestrator_runtime_schema(&guard)
+            .map_err(|e| format!("failed to init shared orchestrator schema: {e}"))?;
         drop(guard);
         Ok(Self { conn })
     }
@@ -948,17 +705,24 @@ impl SqliteGateStartIntentStore {
             .unchecked_transaction()
             .map_err(|e| format!("failed to begin gate-start intent transaction: {e}"))?;
         let mut inserted = 0usize;
-        for intent in intents {
-            let key = intent.key();
-            let publication_json = serde_json::to_string(&intent.publication)
-                .map_err(|e| format!("failed to encode publication json: {e}"))?;
-            let observed_seq = i64::try_from(intent.observed_seq).unwrap_or(i64::MAX);
+        for (idx, intent) in intents.iter().enumerate() {
+            let key = intent.intent_key();
+            let intent_json = serde_json::to_string(intent)
+                .map_err(|e| format!("failed to encode gate-start intent json: {e}"))?;
+            let created_at_ns = now_ns.saturating_add(i64::try_from(idx).unwrap_or(i64::MAX));
             let rows = tx
                 .execute(
-                    "INSERT OR IGNORE INTO gate_start_intents
-                     (intent_key, publication_json, state, blocked_reason, created_at_ns, updated_at_ns, observed_seq)
-                     VALUES (?1, ?2, 'pending', NULL, ?3, ?4, ?5)",
-                    params![key, publication_json, now_ns, now_ns, observed_seq],
+                    "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                        (orchestrator_id, intent_key, intent_json, state,
+                         created_at_ns, updated_at_ns, blocked_reason)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL)",
+                    params![
+                        GATE_START_ORCHESTRATOR_ID,
+                        key,
+                        intent_json,
+                        created_at_ns,
+                        now_ns
+                    ],
                 )
                 .map_err(|e| format!("failed to enqueue gate-start intent: {e}"))?;
             inserted = inserted.saturating_add(rows);
@@ -996,45 +760,44 @@ impl SqliteGateStartIntentStore {
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let mut stmt = guard
             .prepare(
-                "SELECT publication_json, observed_seq
-                 FROM gate_start_intents
-                 WHERE state = 'pending'
-                 ORDER BY observed_seq ASC, created_at_ns ASC
-                 LIMIT ?1",
+                "SELECT intent_json
+                 FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1 AND state = 'pending'
+                 ORDER BY created_at_ns ASC, intent_key ASC
+                 LIMIT ?2",
             )
             .map_err(|e| format!("failed to prepare gate-start dequeue query: {e}"))?;
         let rows = stmt
-            .query_map(params![limit_i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            .query_map(params![GATE_START_ORCHESTRATOR_ID, limit_i64], |row| {
+                row.get::<_, String>(0)
             })
             .map_err(|e| format!("failed to query gate-start intents: {e}"))?;
 
         let mut intents = Vec::new();
         for row in rows {
-            let (publication_json, seq_i64) =
+            let intent_json =
                 row.map_err(|e| format!("failed to decode gate-start intent row: {e}"))?;
             // Defense-in-depth: enforce size limit on stored intent payloads.
-            if publication_json.len() > MAX_PAYLOAD_BYTES {
+            if intent_json.len() > MAX_PAYLOAD_BYTES {
                 return Err(format!(
                     "gate-start intent payload too large: {} bytes > {} max",
-                    publication_json.len(),
+                    intent_json.len(),
                     MAX_PAYLOAD_BYTES
                 ));
             }
-            let publication: ChangesetPublication = serde_json::from_str(&publication_json)
-                .map_err(|e| format!("failed to decode publication json: {e}"))?;
-            let observed_seq = u64::try_from(seq_i64).unwrap_or(0);
-            intents.push(GateStartIntent {
-                publication,
-                observed_seq,
-            });
+            let intent: GateStartIntent = serde_json::from_str(&intent_json)
+                .map_err(|e| format!("failed to decode gate-start intent json: {e}"))?;
+            intent
+                .validate()
+                .map_err(|e| format!("invalid gate-start intent from sqlite: {e}"))?;
+            intents.push(intent);
         }
         Ok(intents)
     }
 
     /// Static `mark_done` — callable from `spawn_blocking`.
     ///
-    /// Retains the intent row with `state = 'done'` and a `completed_at_ns`
+    /// Retains the intent row with `state = 'completed'` and an updated
     /// timestamp so that a crash between `mark_done` and cursor save still
     /// finds the durable completion marker on restart. Use
     /// [`gc_completed_before_with_conn`] to reclaim space (TTL-bounded GC).
@@ -1045,10 +808,10 @@ impl SqliteGateStartIntentStore {
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         guard
             .execute(
-                "UPDATE gate_start_intents
-                 SET state = 'done', completed_at_ns = ?2, updated_at_ns = ?2
-                 WHERE intent_key = ?1",
-                params![key, now_ns],
+                "UPDATE orchestrator_kernel_intents
+                 SET state = 'completed', blocked_reason = NULL, updated_at_ns = ?3
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![GATE_START_ORCHESTRATOR_ID, key, now_ns],
             )
             .map_err(|e| format!("failed to mark gate-start intent done: {e}"))?;
         Ok(())
@@ -1058,6 +821,7 @@ impl SqliteGateStartIntentStore {
     ///
     /// This is NOT part of the hot path — it runs infrequently to reclaim
     /// space without breaking restart idempotency.
+    #[cfg(test)]
     pub(crate) fn gc_completed_before_with_conn(
         conn: &Arc<Mutex<Connection>>,
         cutoff_ns: i64,
@@ -1067,55 +831,12 @@ impl SqliteGateStartIntentStore {
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let deleted = guard
             .execute(
-                "DELETE FROM gate_start_intents
-                 WHERE state = 'done' AND completed_at_ns < ?1",
-                params![cutoff_ns],
+                "DELETE FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1 AND state = 'completed' AND updated_at_ns < ?2",
+                params![GATE_START_ORCHESTRATOR_ID, cutoff_ns],
             )
             .map_err(|e| format!("failed to gc completed gate-start intents: {e}"))?;
         Ok(deleted)
-    }
-
-    /// Static `mark_blocked` — callable from `spawn_blocking`.
-    fn mark_blocked_with_conn(
-        conn: &Arc<Mutex<Connection>>,
-        key: &str,
-        reason: &str,
-    ) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "UPDATE gate_start_intents
-                 SET state = 'blocked', blocked_reason = ?2, updated_at_ns = ?3
-                 WHERE intent_key = ?1",
-                params![key, reason, now_ns],
-            )
-            .map_err(|e| format!("failed to mark gate-start intent blocked: {e}"))?;
-        Ok(())
-    }
-
-    /// Static `mark_retryable` — callable from `spawn_blocking`.
-    fn mark_retryable_with_conn(
-        conn: &Arc<Mutex<Connection>>,
-        key: &str,
-        _reason: &str,
-    ) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "UPDATE gate_start_intents
-                 SET state = 'pending', blocked_reason = NULL,
-                     created_at_ns = ?2, updated_at_ns = ?2
-                 WHERE intent_key = ?1",
-                params![key, now_ns],
-            )
-            .map_err(|e| format!("failed to mark gate-start intent retryable: {e}"))?;
-        Ok(())
     }
 
     /// Instance method for use in tests (delegates to static).
@@ -1137,6 +858,7 @@ impl SqliteGateStartIntentStore {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct MemoryGateStartIntentStore {
     pending: Mutex<VecDeque<GateStartIntent>>,
@@ -1144,6 +866,7 @@ struct MemoryGateStartIntentStore {
     intents: Mutex<HashMap<String, GateStartIntent>>,
 }
 
+#[cfg(test)]
 impl MemoryGateStartIntentStore {
     fn enqueue_many(&self, intents: &[GateStartIntent]) -> Result<usize, String> {
         let mut pending = self
@@ -1172,14 +895,6 @@ impl MemoryGateStartIntentStore {
         Ok(inserted)
     }
 
-    fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateStartIntent>, String> {
-        let pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        Ok(pending.iter().take(limit).cloned().collect())
-    }
-
     fn remove_pending(&self, key: &str) -> Result<(), String> {
         let mut pending = self
             .pending
@@ -1200,64 +915,56 @@ impl MemoryGateStartIntentStore {
             .insert(key.to_string(), "done".to_string());
         Ok(())
     }
-
-    fn mark_blocked(&self, key: &str, _reason: &str) -> Result<(), String> {
-        self.remove_pending(key)?;
-        self.states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "blocked".to_string());
-        Ok(())
-    }
-
-    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
-        self.states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "pending".to_string());
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        if pending.iter().any(|intent| intent.key() == key) {
-            return Ok(());
-        }
-        let intent = self
-            .intents
-            .lock()
-            .map_err(|e| format!("memory intent index lock poisoned: {e}"))?
-            .get(key)
-            .cloned()
-            .ok_or_else(|| format!("missing memory gate-start intent for key '{key}'"))?;
-        pending.push_back(intent);
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
 struct GateStartEffectJournal {
+    inner: GateStartEffectJournalInner,
+    #[cfg(test)]
     conn: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug)]
+enum GateStartEffectJournalInner {
+    Sqlite(SqliteEffectJournal),
+    Memory(MemoryEffectJournal),
+}
+
 impl GateStartEffectJournal {
+    #[cfg(test)]
     fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path)
-            .map_err(|e| format!("failed to open gate-start effect journal sqlite db: {e}"))?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gate_start_effect_journal_state (
-                intent_key TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'unknown')),
-                updated_at_ns INTEGER NOT NULL
-            )",
-            [],
-        )
-        .map_err(|e| format!("failed to create gate_start_effect_journal_state table: {e}"))?;
-        Ok(Self {
+            .map_err(|e| format!("failed to open gate-start effect journal db: {e}"))?;
+        init_orchestrator_runtime_schema(&conn)
+            .map_err(|e| format!("failed to init shared orchestrator schema: {e}"))?;
+        let conn = Arc::new(Mutex::new(conn));
+        Ok(Self::new_shared(conn))
+    }
+
+    fn new_shared(conn: Arc<Mutex<Connection>>) -> Self {
+        Self {
+            inner: GateStartEffectJournalInner::Sqlite(SqliteEffectJournal::new(
+                Arc::clone(&conn),
+                GATE_START_ORCHESTRATOR_ID,
+            )),
+            #[cfg(test)]
+            conn,
+        }
+    }
+
+    fn new_memory() -> Self {
+        let conn = Connection::open_in_memory().expect("memory effect journal db should open");
+        init_orchestrator_runtime_schema(&conn)
+            .expect("memory effect journal schema init should succeed");
+        Self {
+            inner: GateStartEffectJournalInner::Memory(MemoryEffectJournal::new()),
+            #[cfg(test)]
             conn: Arc::new(Mutex::new(conn)),
-        })
+        }
     }
 
     /// Static `load` — callable from `spawn_blocking`.
+    #[cfg(test)]
     fn load_state_with_conn(
         conn: &Arc<Mutex<Connection>>,
         key: &str,
@@ -1268,9 +975,9 @@ impl GateStartEffectJournal {
         guard
             .query_row(
                 "SELECT state
-                 FROM gate_start_effect_journal_state
-                 WHERE intent_key = ?1",
-                params![key],
+                 FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![GATE_START_ORCHESTRATOR_ID, key],
                 |row| row.get(0),
             )
             .optional()
@@ -1278,6 +985,7 @@ impl GateStartEffectJournal {
     }
 
     /// Static `upsert` — callable from `spawn_blocking`.
+    #[cfg(test)]
     fn upsert_state_with_conn(
         conn: &Arc<Mutex<Connection>>,
         key: &str,
@@ -1289,12 +997,13 @@ impl GateStartEffectJournal {
             .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
         guard
             .execute(
-                "INSERT INTO gate_start_effect_journal_state (intent_key, state, updated_at_ns)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(intent_key) DO UPDATE SET
+                "INSERT INTO orchestrator_kernel_effect_journal
+                     (orchestrator_id, intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(orchestrator_id, intent_key) DO UPDATE SET
                      state = excluded.state,
                      updated_at_ns = excluded.updated_at_ns",
-                params![key, state, updated_at_ns],
+                params![GATE_START_ORCHESTRATOR_ID, key, state, updated_at_ns],
             )
             .map_err(|e| {
                 format!("failed to upsert gate-start effect state='{state}' for key '{key}': {e}")
@@ -1302,24 +1011,9 @@ impl GateStartEffectJournal {
         Ok(())
     }
 
-    /// Static `delete` — callable from `spawn_blocking`.
-    fn delete_state_with_conn(conn: &Arc<Mutex<Connection>>, key: &str) -> Result<(), String> {
-        let guard = conn
-            .lock()
-            .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "DELETE FROM gate_start_effect_journal_state WHERE intent_key = ?1",
-                params![key],
-            )
-            .map_err(|e| {
-                format!("failed to delete gate-start effect state for key '{key}': {e}")
-            })?;
-        Ok(())
-    }
-
     /// Deletes completed effect journal rows older than `cutoff_ns`
     /// (TTL-bounded GC). Not part of the hot path.
+    #[cfg(test)]
     pub(crate) fn gc_completed_before_with_conn(
         conn: &Arc<Mutex<Connection>>,
         cutoff_ns: i64,
@@ -1329,9 +1023,9 @@ impl GateStartEffectJournal {
             .map_err(|e| format!("gate-start effect journal lock poisoned: {e}"))?;
         let deleted = guard
             .execute(
-                "DELETE FROM gate_start_effect_journal_state
-                 WHERE state = 'completed' AND updated_at_ns < ?1",
-                params![cutoff_ns],
+                "DELETE FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND state = 'completed' AND updated_at_ns < ?2",
+                params![GATE_START_ORCHESTRATOR_ID, cutoff_ns],
             )
             .map_err(|e| format!("failed to gc completed effect journal entries: {e}"))?;
         Ok(deleted)
@@ -1354,83 +1048,65 @@ impl EffectJournal<String> for GateStartEffectJournal {
     type Error = String;
 
     async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
-        let conn = Arc::clone(&self.conn);
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            let state = Self::load_state_with_conn(&conn, &key)?;
-            Ok(match state.as_deref() {
-                None => EffectExecutionState::NotStarted,
-                Some("completed") => EffectExecutionState::Completed,
-                Some(_) => EffectExecutionState::Unknown,
-            })
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for query_state: {e}"))?
+        match &self.inner {
+            GateStartEffectJournalInner::Sqlite(j) => j.query_state(key).await,
+            GateStartEffectJournalInner::Memory(j) => j.query_state(key).await,
+        }
     }
 
     async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
-        let conn = Arc::clone(&self.conn);
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            if matches!(
-                Self::load_state_with_conn(&conn, &key)?.as_deref(),
-                Some("completed")
-            ) {
-                return Ok(());
-            }
-            Self::upsert_state_with_conn(&conn, &key, "started", epoch_now_ns_i64()?)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for record_started: {e}"))?
+        match &self.inner {
+            GateStartEffectJournalInner::Sqlite(j) => j.record_started(key).await,
+            GateStartEffectJournalInner::Memory(j) => j.record_started(key).await,
+        }
     }
 
     async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
-        // Retain the 'completed' marker durably so that a crash between
-        // record_completed and cursor save still finds the completion state
-        // on restart (CSID-003 restart-safe idempotency). Use gc to reclaim.
-        let conn = Arc::clone(&self.conn);
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::upsert_state_with_conn(&conn, &key, "completed", epoch_now_ns_i64()?)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for record_completed: {e}"))?
+        match &self.inner {
+            GateStartEffectJournalInner::Sqlite(j) => j.record_completed(key).await,
+            GateStartEffectJournalInner::Memory(j) => j.record_completed(key).await,
+        }
     }
 
     async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
-        let conn = Arc::clone(&self.conn);
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            let state = Self::load_state_with_conn(&conn, &key)?;
-            match state.as_deref() {
-                Some("started") => Self::delete_state_with_conn(&conn, &key),
-                Some("completed") => Err(format!(
-                    "cannot mark gate-start effect retryable for completed key '{key}'"
-                )),
-                Some(other) => Err(format!(
-                    "cannot mark gate-start effect retryable from state '{other}' for key '{key}'"
-                )),
-                None => Err(format!(
-                    "cannot mark gate-start effect retryable for unknown key '{key}'"
-                )),
-            }
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for record_retryable: {e}"))?
+        match &self.inner {
+            GateStartEffectJournalInner::Sqlite(j) => j.record_retryable(key).await,
+            GateStartEffectJournalInner::Memory(j) => j.record_retryable(key).await,
+        }
     }
 
     async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
-        let conn = Arc::clone(&self.conn);
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::upsert_state_with_conn(&conn, &key, "unknown", epoch_now_ns_i64()?)?;
-            Ok(InDoubtResolution::Deny {
-                reason: "gate-start effect state is in-doubt; manual reconciliation required"
-                    .to_string(),
-            })
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for resolve_in_doubt: {e}"))?
+        match &self.inner {
+            GateStartEffectJournalInner::Sqlite(j) => j.resolve_in_doubt(key).await,
+            GateStartEffectJournalInner::Memory(j) => j.resolve_in_doubt(key).await,
+        }
+    }
+}
+
+fn map_signed_event_to_observed(event: SignedLedgerEvent) -> GateStartObservedEvent {
+    let publication = match parse_changeset_publication_payload(
+        &event.payload,
+        event.timestamp_ns,
+        &event.event_id,
+        &event.actor_id,
+        &event.work_id,
+    ) {
+        Ok(pub_ok) => Some(pub_ok),
+        Err(parse_err) => {
+            tracing::error!(
+                cursor_event_id = %event.event_id,
+                payload_len = event.payload.len(),
+                error = %parse_err,
+                "DEFECT: malformed changeset_published row skipped (cursor will advance past it)"
+            );
+            None
+        },
+    };
+
+    GateStartObservedEvent {
+        timestamp_ns: event.timestamp_ns,
+        cursor_event_id: event.event_id,
+        publication,
     }
 }
 
@@ -1735,6 +1411,324 @@ fn epoch_now_ns_i64() -> Result<i64, String> {
         .map_err(|_| "current epoch timestamp exceeds i64 range".to_string())
 }
 
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to detect table '{table_name}': {e}"))?;
+    Ok(exists.is_some())
+}
+
+fn migrate_legacy_gate_start_cursor(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("cursor migration lock poisoned: {e}"))?;
+
+    if !sqlite_table_exists(&guard, "gate_start_kernel_cursor")? {
+        return Ok(());
+    }
+
+    let already_migrated: i64 = guard
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_kernel_cursors WHERE orchestrator_id = ?1",
+            params![GATE_START_ORCHESTRATOR_ID],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("failed to count shared cursor rows: {e}"))?;
+    if already_migrated > 0 {
+        return Ok(());
+    }
+
+    let legacy_row: Option<(i64, String)> = guard
+        .query_row(
+            "SELECT timestamp_ns, event_id
+             FROM gate_start_kernel_cursor
+             WHERE cursor_key = ?1",
+            params![GATE_START_CURSOR_KEY],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read legacy gate-start cursor row: {e}"))?;
+
+    let Some((timestamp_ns_i64, event_id_raw)) = legacy_row else {
+        return Ok(());
+    };
+
+    let mut event_id = event_id_raw;
+    if is_legacy_cursor(&event_id) {
+        event_id = normalize_legacy_cursor_event_id(&event_id);
+    }
+    let timestamp_ns = u64::try_from(timestamp_ns_i64).unwrap_or(0);
+    let cursor_json = serde_json::to_string(&CompositeCursor {
+        timestamp_ns,
+        event_id,
+    })
+    .map_err(|e| format!("failed to encode shared gate-start cursor json: {e}"))?;
+    let now_ns = epoch_now_ns_i64()?;
+
+    guard
+        .execute(
+            "INSERT OR IGNORE INTO orchestrator_kernel_cursors
+                 (orchestrator_id, cursor_json, updated_at_ns)
+             VALUES (?1, ?2, ?3)",
+            params![GATE_START_ORCHESTRATOR_ID, cursor_json, now_ns],
+        )
+        .map_err(|e| format!("failed to migrate legacy gate-start cursor: {e}"))?;
+    Ok(())
+}
+
+fn migrate_legacy_gate_start_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("intent migration lock poisoned: {e}"))?;
+
+    if !sqlite_table_exists(&guard, "gate_start_intents")? {
+        return Ok(());
+    }
+
+    let already_migrated: i64 = guard
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_kernel_intents WHERE orchestrator_id = ?1",
+            params![GATE_START_ORCHESTRATOR_ID],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("failed to count shared gate-start intents: {e}"))?;
+    if already_migrated > 0 {
+        return Ok(());
+    }
+
+    let has_observed_seq = {
+        let mut stmt = guard
+            .prepare("PRAGMA table_info(gate_start_intents)")
+            .map_err(|e| format!("failed to inspect gate_start_intents schema: {e}"))?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("failed to enumerate gate_start_intents columns: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to decode gate_start_intents columns: {e}"))?;
+        cols.iter().any(|c| c == "observed_seq")
+    };
+
+    let query = if has_observed_seq {
+        "SELECT intent_key, publication_json, state, blocked_reason,
+                created_at_ns, updated_at_ns, observed_seq
+         FROM gate_start_intents
+         ORDER BY observed_seq ASC, created_at_ns ASC, intent_key ASC"
+    } else {
+        "SELECT intent_key, publication_json, state, blocked_reason,
+                created_at_ns, updated_at_ns, 0 AS observed_seq
+         FROM gate_start_intents
+         ORDER BY created_at_ns ASC, intent_key ASC"
+    };
+
+    let mut stmt = guard
+        .prepare(query)
+        .map_err(|e| format!("failed to prepare legacy gate_start_intents query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|e| format!("failed to read legacy gate_start_intents rows: {e}"))?;
+
+    let mut migrated_rows: Vec<(String, String, String, Option<String>, i64, i64)> = Vec::new();
+    for row in rows {
+        let (
+            _intent_key,
+            publication_json,
+            legacy_state,
+            blocked_reason,
+            created_at_ns,
+            updated_at_ns,
+            observed_seq_i64,
+        ) = row.map_err(|e| format!("failed to decode legacy gate_start_intents row: {e}"))?;
+        let publication: ChangesetPublication = serde_json::from_str(&publication_json)
+            .map_err(|e| format!("failed to decode legacy gate-start publication json: {e}"))?;
+        let observed_seq = u64::try_from(observed_seq_i64).unwrap_or(0);
+        let intent = GateStartIntent {
+            publication,
+            observed_seq,
+        };
+        let intent_key = intent.intent_key();
+        let intent_json = serde_json::to_string(&intent)
+            .map_err(|e| format!("failed to encode migrated gate-start intent json: {e}"))?;
+        let state = match legacy_state.as_str() {
+            "done" | "completed" => "completed",
+            "blocked" => "blocked",
+            _ => "pending",
+        }
+        .to_string();
+        migrated_rows.push((
+            intent_key,
+            intent_json,
+            state,
+            blocked_reason,
+            created_at_ns.max(0),
+            updated_at_ns.max(0),
+        ));
+    }
+    drop(stmt);
+
+    let tx = guard
+        .unchecked_transaction()
+        .map_err(|e| format!("failed to open migration transaction for gate-start intents: {e}"))?;
+    for (intent_key, intent_json, state, blocked_reason, created_at_ns, updated_at_ns) in
+        migrated_rows
+    {
+        tx.execute(
+            "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                (orchestrator_id, intent_key, intent_json, state,
+                 created_at_ns, updated_at_ns, blocked_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                GATE_START_ORCHESTRATOR_ID,
+                intent_key,
+                intent_json,
+                state,
+                created_at_ns,
+                updated_at_ns,
+                blocked_reason
+            ],
+        )
+        .map_err(|e| format!("failed to migrate legacy gate-start intent row: {e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("failed to commit legacy gate-start intent migration: {e}"))?;
+    Ok(())
+}
+
+fn migrate_legacy_gate_start_effect_journal(
+    conn: &Arc<Mutex<Connection>>,
+    legacy_journal_path: &Path,
+) -> Result<(), String> {
+    if !legacy_journal_path.exists() {
+        return Ok(());
+    }
+
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("effect journal migration lock poisoned: {e}"))?;
+    let already_migrated: i64 = guard
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal WHERE orchestrator_id = ?1",
+            params![GATE_START_ORCHESTRATOR_ID],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("failed to count shared gate-start effect rows: {e}"))?;
+    if already_migrated > 0 {
+        return Ok(());
+    }
+
+    let legacy_conn = Connection::open(legacy_journal_path)
+        .map_err(|e| format!("failed to open legacy gate-start effect journal: {e}"))?;
+    if !sqlite_table_exists(&legacy_conn, "gate_start_effect_journal_state")? {
+        return Ok(());
+    }
+
+    let mut legacy_stmt = legacy_conn
+        .prepare(
+            "SELECT intent_key, state, updated_at_ns
+             FROM gate_start_effect_journal_state",
+        )
+        .map_err(|e| format!("failed to prepare legacy gate-start effect query: {e}"))?;
+    let rows = legacy_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("failed to iterate legacy gate-start effect rows: {e}"))?;
+
+    let tx = guard.unchecked_transaction().map_err(|e| {
+        format!("failed to open shared effect migration transaction for gate-start: {e}")
+    })?;
+    for row in rows {
+        let (intent_key, legacy_state, updated_at_ns) =
+            row.map_err(|e| format!("failed to decode legacy gate-start effect row: {e}"))?;
+        let state = match legacy_state.as_str() {
+            "completed" => "completed",
+            "started" | "unknown" => "unknown",
+            _ => "unknown",
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
+                (orchestrator_id, intent_key, state, updated_at_ns)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                GATE_START_ORCHESTRATOR_ID,
+                intent_key,
+                state,
+                updated_at_ns.max(0)
+            ],
+        )
+        .map_err(|e| format!("failed to migrate gate-start effect row: {e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("failed to commit gate-start effect migration: {e}"))?;
+    drop(guard);
+
+    let migrated_path =
+        std::path::PathBuf::from(format!("{}.migrated", legacy_journal_path.display()));
+    if let Err(e) = std::fs::rename(legacy_journal_path, &migrated_path) {
+        tracing::warn!(
+            path = %legacy_journal_path.display(),
+            error = %e,
+            "gate-start: failed to rename legacy effect journal after migration"
+        );
+    }
+
+    Ok(())
+}
+
+fn gc_shared_intents_before_with_conn(
+    conn: &Arc<Mutex<Connection>>,
+    orchestrator_id: &str,
+    cutoff_ns: i64,
+) -> Result<usize, String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("intent GC lock poisoned: {e}"))?;
+    let deleted = guard
+        .execute(
+            "DELETE FROM orchestrator_kernel_intents
+             WHERE orchestrator_id = ?1 AND state = 'completed' AND updated_at_ns < ?2",
+            params![orchestrator_id, cutoff_ns],
+        )
+        .map_err(|e| format!("failed to GC shared orchestrator intents: {e}"))?;
+    Ok(deleted)
+}
+
+fn gc_shared_effect_journal_before_with_conn(
+    conn: &Arc<Mutex<Connection>>,
+    orchestrator_id: &str,
+    cutoff_ns: i64,
+) -> Result<usize, String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("effect journal GC lock poisoned: {e}"))?;
+    let deleted = guard
+        .execute(
+            "DELETE FROM orchestrator_kernel_effect_journal
+             WHERE orchestrator_id = ?1 AND state = 'completed' AND updated_at_ns < ?2",
+            params![orchestrator_id, cutoff_ns],
+        )
+        .map_err(|e| format!("failed to GC shared effect journal rows: {e}"))?;
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1766,6 +1760,7 @@ mod tests {
                         actor_id TEXT NOT NULL DEFAULT '',
                         work_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
+                        signature BLOB NOT NULL DEFAULT X'',
                         timestamp_ns INTEGER NOT NULL
                     )",
                     [],
@@ -1779,6 +1774,7 @@ mod tests {
                         actor_id TEXT NOT NULL DEFAULT '',
                         session_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
+                        signature BLOB,
                         timestamp_ns INTEGER NOT NULL
                     )",
                     [],
@@ -1805,7 +1801,7 @@ mod tests {
                 .execute(
                     "INSERT INTO ledger_events (event_id, event_type, actor_id, work_id, payload, timestamp_ns)
                      VALUES (?1, 'changeset_published', ?2, ?3, ?4, ?5)",
-                    rusqlite::params!["a-legacy", "actor:legacy", "work-legacy", legacy_payload, ts],
+                    rusqlite::params!["z-legacy", "actor:legacy", "work-legacy", legacy_payload, ts],
                 )
                 .expect("insert legacy changeset");
             guard
@@ -1818,34 +1814,46 @@ mod tests {
         }
 
         let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
-        let first = reader
-            .poll(&CompositeCursor::default(), 1)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let first = rt
+            .block_on(reader.poll(&CompositeCursor::default(), 1))
             .expect("first poll should succeed");
         assert_eq!(first.len(), 1);
-        assert_eq!(
-            first[0]
-                .publication
-                .as_ref()
-                .expect("valid publication")
-                .work_id,
-            "work-canonical"
-        );
+        let first_work_id = first[0]
+            .publication
+            .as_ref()
+            .expect("valid publication")
+            .work_id
+            .clone();
 
         let cursor = CompositeCursor {
             timestamp_ns: first[0].timestamp_ns,
             event_id: first[0].cursor_event_id.clone(),
         };
-        let second = reader
-            .poll(&cursor, 10)
+        let second = rt
+            .block_on(reader.poll(&cursor, 10))
             .expect("second poll should succeed");
         assert_eq!(second.len(), 1);
+        let second_work_id = second[0]
+            .publication
+            .as_ref()
+            .expect("valid publication")
+            .work_id
+            .clone();
+
+        assert_ne!(
+            first_work_id, second_work_id,
+            "second poll must return the other event at same timestamp"
+        );
+        let mut observed = vec![first_work_id, second_work_id];
+        observed.sort();
         assert_eq!(
-            second[0]
-                .publication
-                .as_ref()
-                .expect("valid publication")
-                .work_id,
-            "work-legacy"
+            observed,
+            vec!["work-canonical".to_string(), "work-legacy".to_string()],
+            "cursor progression must return both rows without skip"
         );
     }
 
@@ -1968,7 +1976,7 @@ mod tests {
     }
 
     /// CSID-003 restart-safe idempotency: after marking N intents done, the
-    /// `SQLite` intent table must retain the row with `state = 'done'` so
+    /// `SQLite` intent table must retain the row with `state = 'completed'` so
     /// that a crash before cursor save still finds the completion marker.
     #[test]
     fn sqlite_intent_store_mark_done_retains_durable_marker() {
@@ -1998,22 +2006,26 @@ mod tests {
         let pending = store.dequeue_batch(10).expect("dequeue");
         assert_eq!(pending.len(), 1, "one intent should be pending");
 
-        // Mark done — must UPDATE to 'done', not DELETE.
+        // Mark done — must UPDATE to 'completed', not DELETE.
         let key = super::gate_start_intent_key(&publication.work_id, &publication.changeset_digest);
         store.mark_done(&key).expect("mark done");
 
-        // Verify: the row exists with state = 'done'.
+        // Verify: the row exists with state = 'completed'.
         {
             let guard = conn.lock().expect("lock");
             let (count, state): (i64, String) = guard
                 .query_row(
-                    "SELECT COUNT(*), state FROM gate_start_intents WHERE intent_key = ?1",
-                    rusqlite::params![key],
+                    "SELECT COUNT(*), state FROM orchestrator_kernel_intents
+                     WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                    rusqlite::params![super::GATE_START_ORCHESTRATOR_ID, key],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .expect("query done intent");
             assert_eq!(count, 1, "intent row must be retained after mark_done");
-            assert_eq!(state, "done", "intent state must be 'done' after mark_done");
+            assert_eq!(
+                state, "completed",
+                "intent state must be 'completed' after mark_done"
+            );
         }
         // guard dropped — subsequent store methods can acquire the lock.
 
@@ -2028,7 +2040,7 @@ mod tests {
             "re-enqueue of done intent must be treated as duplicate"
         );
 
-        // Dequeue must return 0 pending (done rows are not pending).
+        // Dequeue must return 0 pending (completed rows are not pending).
         let pending2 = store.dequeue_batch(10).expect("dequeue after done");
         assert_eq!(pending2.len(), 0, "no pending intents after mark_done");
 
@@ -2041,7 +2053,12 @@ mod tests {
         let count_after_gc: i64 = conn
             .lock()
             .expect("lock for gc count")
-            .query_row("SELECT COUNT(*) FROM gate_start_intents", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1",
+                rusqlite::params![super::GATE_START_ORCHESTRATOR_ID],
+                |r| r.get(0),
+            )
             .expect("count query");
         assert_eq!(count_after_gc, 0, "intent table must be empty after GC");
     }
@@ -2165,8 +2182,9 @@ mod tests {
             .lock()
             .expect("lock")
             .query_row(
-                "SELECT COUNT(*) FROM gate_start_effect_journal_state",
-                [],
+                "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1",
+                rusqlite::params![super::GATE_START_ORCHESTRATOR_ID],
                 |r| r.get(0),
             )
             .expect("count query");
@@ -2177,35 +2195,35 @@ mod tests {
     }
 
     /// Tests for `is_legacy_cursor` — cursor format detection for migration
-    /// safety. Legacy cursors are raw event IDs without `legacy:` or
-    /// `canonical:` namespace prefix.
+    /// safety. Legacy cursors are old prefixed forms (`legacy:*` and
+    /// `canonical:*`).
     #[test]
-    fn is_legacy_cursor_detects_raw_event_ids() {
-        // Raw event IDs (no namespace prefix) are legacy.
+    fn is_legacy_cursor_rejects_raw_event_ids() {
+        // Raw event IDs are current shared-poller format and are not legacy.
         assert!(
-            is_legacy_cursor("evt-12345"),
-            "raw event ID without prefix is legacy"
+            !is_legacy_cursor("evt-12345"),
+            "raw event ID without prefix is not legacy"
         );
         assert!(
-            is_legacy_cursor("a-legacy"),
-            "raw event ID 'a-legacy' is legacy (despite containing 'legacy' substring)"
+            !is_legacy_cursor("a-legacy"),
+            "raw event ID 'a-legacy' is not legacy"
         );
         assert!(
-            is_legacy_cursor("uuid-style-event-id-abc"),
-            "UUID-style raw event ID is legacy"
+            !is_legacy_cursor("uuid-style-event-id-abc"),
+            "UUID-style raw event ID is not legacy"
         );
     }
 
     #[test]
-    fn is_legacy_cursor_accepts_namespaced_cursors() {
-        // Properly namespaced cursors are NOT legacy.
+    fn is_legacy_cursor_detects_namespaced_cursors() {
+        // Old prefixed cursors are legacy and must be normalized.
         assert!(
-            !is_legacy_cursor("legacy:evt-12345"),
-            "'legacy:' prefixed cursor is not legacy"
+            is_legacy_cursor("legacy:evt-12345"),
+            "'legacy:' prefixed cursor is legacy"
         );
         assert!(
-            !is_legacy_cursor("canonical:00000000000000000001"),
-            "'canonical:' prefixed cursor is not legacy"
+            is_legacy_cursor("canonical:00000000000000000001"),
+            "'canonical:' prefixed cursor is legacy"
         );
     }
 
@@ -2218,12 +2236,10 @@ mod tests {
         );
     }
 
-    /// Migration test: loading a cursor with a raw (pre-unified) event ID
-    /// resets to the default `CompositeCursor` (start from beginning).
-    /// Re-processing is idempotent via the intent store's `state='done'`
-    /// markers (CSID-003).
+    /// Raw cursor IDs are current shared-poller format and should be loaded
+    /// without rewriting to default.
     #[test]
-    fn sqlite_cursor_store_resets_legacy_cursor_to_beginning() {
+    fn sqlite_cursor_store_preserves_raw_cursor_ids() {
         use super::SqliteGateStartCursorStore;
 
         let conn = Arc::new(Mutex::new(
@@ -2231,29 +2247,23 @@ mod tests {
         ));
         let store = SqliteGateStartCursorStore::new(Arc::clone(&conn)).expect("init cursor store");
 
-        // Simulate a pre-unified cursor persisted by a previous version:
-        // raw event ID without `legacy:` or `canonical:` prefix.
-        let legacy_cursor = CompositeCursor {
+        let raw_cursor = CompositeCursor {
             timestamp_ns: 1_706_000_000_000_000_000,
             event_id: "raw-event-id-from-v1".to_string(),
         };
-        SqliteGateStartCursorStore::save_with_conn(&store.conn, &legacy_cursor)
-            .expect("save legacy cursor");
+        SqliteGateStartCursorStore::save_with_conn(&store.conn, &raw_cursor)
+            .expect("save raw cursor");
 
-        // Load must detect the legacy format and reset to default (beginning).
+        // Load preserves raw cursor IDs as-is.
         let loaded =
             SqliteGateStartCursorStore::load_with_conn(&store.conn).expect("load should succeed");
-        assert_eq!(
-            loaded,
-            CompositeCursor::default(),
-            "legacy cursor must be reset to default (start from beginning)"
-        );
+        assert_eq!(loaded, raw_cursor, "raw cursor IDs should be preserved");
     }
 
-    /// Verify that a cursor with the `legacy:` prefix is loaded correctly
-    /// (no reset).
+    /// Verify that a cursor with the `legacy:` prefix is normalized to the
+    /// shared-poller legacy event-id format (prefix removed).
     #[test]
-    fn sqlite_cursor_store_preserves_legacy_prefixed_cursor() {
+    fn sqlite_cursor_store_normalizes_legacy_prefixed_cursor() {
         use super::SqliteGateStartCursorStore;
 
         let conn = Arc::new(Mutex::new(
@@ -2275,15 +2285,15 @@ mod tests {
             "timestamp_ns must be preserved for valid cursor"
         );
         assert_eq!(
-            loaded.event_id, "legacy:evt-12345",
-            "event_id must be preserved for 'legacy:' prefixed cursor"
+            loaded.event_id, "evt-12345",
+            "legacy-prefixed event_id must be normalized to raw legacy event_id"
         );
     }
 
-    /// Verify that a cursor with the `canonical:` prefix is loaded correctly
-    /// (no reset).
+    /// Verify that a cursor with the `canonical:` prefix is normalized to
+    /// `canonical-<seq:020>`.
     #[test]
-    fn sqlite_cursor_store_preserves_canonical_prefixed_cursor() {
+    fn sqlite_cursor_store_normalizes_canonical_prefixed_cursor() {
         use super::SqliteGateStartCursorStore;
 
         let conn = Arc::new(Mutex::new(
@@ -2305,8 +2315,8 @@ mod tests {
             "timestamp_ns must be preserved for valid cursor"
         );
         assert_eq!(
-            loaded.event_id, "canonical:00000000000000000042",
-            "event_id must be preserved for 'canonical:' prefixed cursor"
+            loaded.event_id, "canonical-00000000000000000042",
+            "canonical-prefixed event_id must be normalized"
         );
     }
 
@@ -2350,6 +2360,7 @@ mod tests {
                         actor_id TEXT NOT NULL DEFAULT '',
                         work_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
+                        signature BLOB NOT NULL DEFAULT X'',
                         timestamp_ns INTEGER NOT NULL
                     )",
                     [],
@@ -2388,8 +2399,12 @@ mod tests {
         }
 
         let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
-        let results = reader
-            .poll(&CompositeCursor::default(), 10)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let results = rt
+            .block_on(reader.poll(&CompositeCursor::default(), 10))
             .expect("poll must not fail on malformed row");
 
         // Both rows should be returned — the malformed one with publication = None.
@@ -2436,6 +2451,7 @@ mod tests {
                         actor_id TEXT NOT NULL DEFAULT '',
                         work_id TEXT NOT NULL DEFAULT '',
                         payload BLOB NOT NULL,
+                        signature BLOB NOT NULL DEFAULT X'',
                         timestamp_ns INTEGER NOT NULL
                     )",
                     [],
@@ -2463,8 +2479,12 @@ mod tests {
         }
 
         let reader = SqliteGateStartLedgerReader::new(Arc::clone(&conn));
-        let results = reader
-            .poll(&CompositeCursor::default(), 10)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let results = rt
+            .block_on(reader.poll(&CompositeCursor::default(), 10))
             .expect("poll must succeed even when all rows are malformed");
 
         assert_eq!(results.len(), 2, "both malformed rows should be returned");

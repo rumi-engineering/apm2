@@ -1468,13 +1468,14 @@ async fn async_main(args: Args) -> Result<()> {
                 }
                 emitter
             });
-        let gate_start_kernel = GateStartKernel::new(
+        let gate_start_kernel = GateStartKernel::new_async(
             Arc::clone(&orch),
             sqlite_conn.as_ref(),
             gate_start_ledger_emitter,
             &fac_root,
             GateStartKernelConfig::default(),
         )
+        .await
         .map_err(|e| anyhow::anyhow!("failed to initialize gate start kernel: {e}"))?;
         let timeout_kernel = GateTimeoutKernel::new_async(
             Arc::clone(&orch),

@@ -221,6 +221,32 @@ CI to catch it — each CI round-trip wastes 10+ minutes.
 
 ---
 
+## 10. OrchestratorKernel Doctrine (No Bespoke Loops)
+
+Any daemon loop that tails the ledger and emits receipts/effects MUST use:
+
+- `apm2_core::orchestrator_kernel` for Observe->Plan->Execute->Receipt control flow
+- `crates/apm2-daemon/src/orchestrator_runtime` adapters for cursor/intent/effect journal storage
+- `crates/apm2-daemon/src/ledger_poll.rs` for canonical+legacy merged polling
+
+**Forbidden patterns (automatic MAJOR):**
+
+- Hand-rolled orchestration loops outside `orchestrator_kernel`
+- New per-orchestrator sqlite tables/files for cursor/intent/effect journal concerns
+- Hand-rolled merge SQL over both `ledger_events` and `events`
+- Blocking `rusqlite` calls on async paths without `spawn_blocking`
+
+**Monotonic durability rule (automatic MAJOR):**
+
+Persisted monotonic timestamps are process-local cache values only. They MUST be
+rebased on load against wall-clock authority before irreversible decisions.
+
+See:
+- `documents/architecture/orchestrator_kernel.md`
+- `documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md`
+
+---
+
 ## Quick Pre-Implementation Checklist
 
 Before writing code, verify your approach against these questions:
@@ -232,3 +258,4 @@ Before writing code, verify your approach against these questions:
 - [ ] Am I using #[serde(default)] on an enum? → Use custom deserializer instead
 - [ ] Are my tests using PrivilegedDispatcher::new()? → Use DispatcherState instead
 - [ ] Am I querying all events? → Use targeted SQL with ORDER BY rowid
+- [ ] Am I writing a ledger-tailing orchestrator? → Use orchestrator_kernel + orchestrator_runtime + ledger_poll
