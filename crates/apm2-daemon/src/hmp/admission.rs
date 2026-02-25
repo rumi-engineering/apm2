@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! HMP admission pipeline — cross-cell fact import and receipt issuance
-//! (TCK-00380, REQ-0034).
+//! (RFC-0020::REQ-0034, REQ-0034).
 //!
 //! This module implements the admission gate for cross-cell authoritative fact
 //! imports. It enforces the normative rule from RFC-0020 §2.4.0b: any cross-

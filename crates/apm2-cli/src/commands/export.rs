@@ -27,7 +27,7 @@ use clap::{Args, ValueEnum};
 /// large file inputs (per CTR-1603).
 const MAX_INPUT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-/// Exit codes for export commands per TCK-00143.
+/// Exit codes for export commands per RFC-0011::REQ-0005.
 pub mod exit_codes {
     /// Success exit code.
     pub const SUCCESS: u8 = 0;

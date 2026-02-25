@@ -30,10 +30,11 @@
 //! - [`messages`]: Protocol buffer message types ([`messages::Receipt`],
 //!   [`messages::TelemetryFrame`], etc.)
 //! - [`pulse_topic`]: HEF topic grammar and wildcard matching
-//!   ([`TopicPattern`], [`validate_topic`]) (RFC-0018, TCK-00301)
+//!   ([`TopicPattern`], [`validate_topic`]) (RFC-0018, RFC-0032::REQ-0097)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
 //! - [`session_token`]: Per-connection session tokens ([`SessionToken`],
-//!   [`TokenMinter`]) for authenticating session-scoped requests (TCK-00250)
+//!   [`TokenMinter`]) for authenticating session-scoped requests
+//!   (RFC-0032::REQ-0066)
 //!
 //! # Wire Format
 //!
@@ -89,7 +90,8 @@
 //! - Handshake required before message exchange
 //! - Version mismatch terminates connection
 
-/// Connection handler for dual-socket ProtocolServer control plane (TCK-00279).
+/// Connection handler for dual-socket ProtocolServer control plane
+/// (RFC-0032::REQ-0085).
 ///
 /// This module implements the connection handling logic including the mandatory
 /// Hello/HelloAck handshake as specified in DD-001/DD-008.
@@ -103,26 +105,27 @@ pub mod framing;
 pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
-/// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018, TCK-00302).
+/// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018,
+/// RFC-0032::REQ-0098).
 pub mod pulse_acl;
-/// HEF Pulse Outbox and Publisher (RFC-0018, TCK-00304).
+/// HEF Pulse Outbox and Publisher (RFC-0018, RFC-0032::REQ-0100).
 ///
 /// Implements the daemon-owned outbox that receives post-commit notifications
 /// from the ledger and publishes `PulseEvent` messages to matching subscribers.
 pub mod pulse_outbox;
 /// Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
-/// TCK-00301).
+/// RFC-0032::REQ-0097).
 pub mod pulse_topic;
 /// Resource governance and backpressure/drop policy for HEF Pulse Plane
-/// (RFC-0018, TCK-00303).
+/// (RFC-0018, RFC-0032::REQ-0099).
 pub mod resource_governance;
 pub mod server;
-/// Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252).
+/// Session-scoped endpoint dispatcher for RFC-0017 IPC (RFC-0032::REQ-0068).
 pub mod session_dispatch;
 pub mod session_token;
-/// Dual-socket manager for privilege separation (TCK-00249).
+/// Dual-socket manager for privilege separation (RFC-0032::REQ-0065).
 pub mod socket_manager;
-/// Topic derivation for Work and Gate events (RFC-0018, TCK-00305).
+/// Topic derivation for Work and Gate events (RFC-0018, RFC-0032::REQ-0101).
 ///
 /// Maps kernel events to pulse topics with deterministic derivation.
 pub mod topic_derivation;
@@ -136,18 +139,18 @@ pub use connection_handler::{HandshakeConfig, HandshakeResult, perform_handshake
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]
 pub use dispatch::{
-    // TCK-00394: ChangeSet publishing
+    // RFC-0032::REQ-0148: ChangeSet publishing
     CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX,
     // Core dispatcher types
     ConnectionContext,
-    // TCK-00253: Ledger event emitter types
+    // RFC-0032::REQ-0069: Ledger event emitter types
     LedgerEventEmitter,
     LedgerEventError,
-    // TCK-00416: Lifecycle authority bindings
+    // RFC-0032::REQ-0160: Lifecycle authority bindings
     MAX_BINDING_VIOLATIONS,
     MAX_LEDGER_EVENTS,
     MAX_WORK_CLAIMS,
-    // TCK-00253: Policy resolution and work claim types
+    // RFC-0032::REQ-0069: Policy resolution and work claim types
     PolicyResolution,
     PolicyResolutionError,
     PolicyResolver,
@@ -168,33 +171,33 @@ pub use dispatch::{
     WorkRegistryError,
     append_review_outcome_fields,
     append_transition_authority_fields,
-    // TCK-00253: Actor ID derivation
+    // RFC-0032::REQ-0069: Actor ID derivation
     derive_actor_id,
     derive_claim_transition_authority_bindings,
     derive_transition_authority_bindings,
     emit_authority_binding_defect,
-    // CTR-PROTO-012: Credential Management encoding (TCK-00343)
+    // CTR-PROTO-012: Credential Management encoding (RFC-0032::REQ-0133)
     encode_add_credential_request,
-    // TCK-00452: Auditor projection encoding
+    // RFC-0020::REQ-0040: Auditor projection encoding
     encode_auditor_launch_projection_request,
     // Request encoding helpers
     encode_claim_work_request,
-    // TCK-00635: OpenWork encoding
+    // RFC-0032::REQ-0263: OpenWork encoding
     encode_claim_work_v2_request,
     encode_consensus_byzantine_evidence_request,
     encode_consensus_metrics_request,
-    // TCK-00345: Consensus query encoding helpers
+    // RFC-0032::REQ-0135: Consensus query encoding helpers
     encode_consensus_status_request,
     encode_consensus_validators_request,
-    // TCK-00389: Review receipt ingestion encoding
+    // RFC-0032::REQ-0143: Review receipt ingestion encoding
     encode_ingest_review_receipt_request,
     encode_issue_capability_request,
     encode_list_credentials_request,
-    // TCK-00342: Process management encoding helpers
+    // RFC-0032::REQ-0132: Process management encoding helpers
     encode_list_processes_request,
     encode_login_credential_request,
     encode_open_work_request,
-    // TCK-00452: Orchestrator projection encoding
+    // RFC-0020::REQ-0040: Orchestrator projection encoding
     encode_orchestrator_launch_projection_request,
     encode_process_status_request,
     encode_publish_changeset_request,
@@ -234,15 +237,15 @@ pub use handshake::{
 };
 #[allow(unused_imports)]
 pub use messages::{
-    // CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+    // CTR-PROTO-012: Credential Management (RFC-0018, RFC-0032::REQ-0133)
     AddCredentialRequest,
     AddCredentialResponse,
     AuditorLaunchProjectionRequest,
     AuditorLaunchProjectionResponse,
     BoundedDecode,
-    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, RFC-0032::REQ-0096)
     BoundedWallInterval,
-    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+    // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, RFC-0032::REQ-0135)
     ByzantineEvidenceEntry,
     CanonicalBytes,
     Canonicalize,
@@ -270,30 +273,30 @@ pub use messages::{
     DEFAULT_MAX_REPEATED_FIELD_COUNT,
     DecodeConfig,
     DecodeError,
-    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, RFC-0032::REQ-0068)
     EmitEventRequest,
     EmitEventResponse,
     EntityRef,
     HefError,
     HefErrorCode,
     HlcStamp,
-    // TCK-00389: Review receipt ingestion messages
+    // RFC-0032::REQ-0143: Review receipt ingestion messages
     IngestReviewReceiptRequest,
     IngestReviewReceiptResponse,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
-    // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
+    // CTR-PROTO-009: Crash Recovery Signals (RFC-0032::REQ-0083)
     LeaseRevoked,
     LeaseRevokedReason,
     ListCredentialsRequest,
     ListCredentialsResponse,
-    // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+    // CTR-PROTO-011: Process Management Endpoints (RFC-0032::REQ-0132)
     ListProcessesRequest,
     ListProcessesResponse,
     LogEntry,
     LoginCredentialRequest,
     LoginCredentialResponse,
-    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
     OpenWorkRequest,
     OpenWorkResponse,
     OrchestratorLaunchProjectionRequest,
@@ -307,7 +310,7 @@ pub use messages::{
     ProcessStatusRequest,
     ProcessStatusResponse,
     ProjectionUncertaintyFlag,
-    // TCK-00394: ChangeSet publishing messages
+    // RFC-0032::REQ-0148: ChangeSet publishing messages
     PublishChangeSetRequest,
     PublishChangeSetResponse,
     PublishEvidenceRequest,
@@ -328,7 +331,7 @@ pub use messages::{
     RemoveCredentialResponse,
     RequestToolRequest,
     RequestToolResponse,
-    // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
     ResolveTicketAliasRequest,
     ResolveTicketAliasResponse,
     RestartProcessRequest,
@@ -362,11 +365,11 @@ pub use messages::{
     WorkListRequest,
     WorkListResponse,
     WorkRole,
-    // TCK-00344: Status query messages
+    // RFC-0032::REQ-0134: Status query messages
     WorkStatusRequest,
     WorkStatusResponse,
 };
-// CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
+// CTR-PROTO-010: HEF Pulse ACL (RFC-0018, RFC-0032::REQ-0098)
 #[allow(unused_imports)]
 pub use pulse_acl::{
     // Types
@@ -383,7 +386,7 @@ pub use pulse_acl::{
     validate_client_sub_id,
     validate_subscription_id,
 };
-// CTR-PROTO-010: HEF Pulse Outbox (RFC-0018, TCK-00304)
+// CTR-PROTO-010: HEF Pulse Outbox (RFC-0018, RFC-0032::REQ-0100)
 #[allow(unused_imports)]
 pub use pulse_outbox::{
     // Constants
@@ -399,7 +402,7 @@ pub use pulse_outbox::{
     // Factory
     create_commit_notification_channel,
 };
-// CTR-PROTO-010: HEF Topic Grammar (RFC-0018, TCK-00301)
+// CTR-PROTO-010: HEF Topic Grammar (RFC-0018, RFC-0032::REQ-0097)
 #[allow(unused_imports)]
 pub use pulse_topic::{
     // Constants
@@ -420,7 +423,7 @@ pub use pulse_topic::{
     validate_patterns,
     validate_topic,
 };
-// CTR-PROTO-010: HEF Resource Governance (RFC-0018, TCK-00303)
+// CTR-PROTO-010: HEF Resource Governance (RFC-0018, RFC-0032::REQ-0099)
 #[allow(unused_imports)]
 pub use resource_governance::{
     // Types
@@ -461,7 +464,7 @@ pub use socket_manager::{
     SocketManager, SocketManagerConfig, SocketType, default_operator_socket_path,
     default_session_socket_path,
 };
-// CTR-PROTO-010: HEF Topic Derivation (RFC-0018, TCK-00305)
+// CTR-PROTO-010: HEF Topic Derivation (RFC-0018, RFC-0032::REQ-0101)
 #[allow(unused_imports)]
 pub use topic_derivation::{
     // Types

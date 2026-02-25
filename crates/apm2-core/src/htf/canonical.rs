@@ -160,23 +160,63 @@ mod tests {
     #[test]
     #[cfg(feature = "test_vectors")]
     fn verify_vectors() {
-        use std::fs;
-        use std::path::PathBuf;
+        const CLOCK_PROFILE_V1_VECTORS: &str = r#"[
+  {
+    "description": "Basic ClockProfile v1",
+    "input": {
+      "profile_policy_id": "test-policy",
+      "tick_rate_hz": 1000000,
+      "monotonic_source": "CLOCK_MONOTONIC",
+      "hlc_enabled": true,
+      "wall_time_source": "BEST_EFFORT_NTP",
+      "max_wall_uncertainty_ns": 500000,
+      "build_fingerprint": "v1.0.0"
+    },
+    "canonical_json": "{\"build_fingerprint\":\"v1.0.0\",\"hlc_enabled\":true,\"max_wall_uncertainty_ns\":500000,\"monotonic_source\":\"CLOCK_MONOTONIC\",\"profile_policy_id\":\"test-policy\",\"tick_rate_hz\":1000000,\"wall_time_source\":\"BEST_EFFORT_NTP\"}",
+    "canonical_hash_hex": "f95fbe6008837f1a49d9f12371af2117ca9005e872d16247992a306463992169"
+  }
+]"#;
 
-        // Helper to load vectors
+        const TIME_ENVELOPE_V1_VECTORS: &str = r#"[
+  {
+    "description": "Basic TimeEnvelope v1",
+    "input": {
+      "clock_profile_hash": "f95fbe6008837f1a49d9f12371af2117ca9005e872d16247992a306463992169",
+      "hlc": {
+        "logical": 42,
+        "wall_ns": 1700000000000000000
+      },
+      "ledger_anchor": {
+        "ledger_id": "ledger-main",
+        "epoch": 10,
+        "seq": 200
+      },
+      "mono": {
+        "start_tick": 1000,
+        "end_tick": 2000,
+        "tick_rate_hz": 1000000,
+        "source": "CLOCK_MONOTONIC"
+      },
+      "wall": {
+        "t_min_utc_ns": 1700000000000000000,
+        "t_max_utc_ns": 1700000000100000000,
+        "source": "BEST_EFFORT_NTP",
+        "confidence": "high"
+      }
+    },
+    "canonical_json": "{\"clock_profile_hash\":\"f95fbe6008837f1a49d9f12371af2117ca9005e872d16247992a306463992169\",\"hlc\":{\"logical\":42,\"wall_ns\":1700000000000000000},\"ledger_anchor\":{\"epoch\":10,\"ledger_id\":\"ledger-main\",\"seq\":200},\"mono\":{\"end_tick\":2000,\"source\":\"CLOCK_MONOTONIC\",\"start_tick\":1000,\"tick_rate_hz\":1000000},\"wall\":{\"confidence\":\"high\",\"source\":\"BEST_EFFORT_NTP\",\"t_max_utc_ns\":1700000000100000000,\"t_min_utc_ns\":1700000000000000000}}",
+    "canonical_hash_hex": "80a43458eb4577d3b6dd78ec7911d4633181e742fb0226930927d2a830816957"
+  }
+]"#;
+
+        // Helper to load vectors from inline fixtures.
         fn load_vectors<T: serde::de::DeserializeOwned>(name: &str) -> Vec<VectorCase<T>> {
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent() // crates
-                .unwrap()
-                .parent() // workspace
-                .unwrap()
-                .to_path_buf();
-
-            let path = root.join("evidence/htf/vectors").join(name);
-            let content = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("failed to read vector file {}: {}", path.display(), e));
-
-            serde_json::from_str(&content).expect("failed to parse vectors")
+            let raw = match name {
+                "clock_profile_v1.json" => CLOCK_PROFILE_V1_VECTORS,
+                "time_envelope_v1.json" => TIME_ENVELOPE_V1_VECTORS,
+                _ => panic!("unknown HTF vector fixture set: {name}"),
+            };
+            serde_json::from_str(raw).expect("failed to parse vectors")
         }
 
         #[derive(serde::Deserialize)]

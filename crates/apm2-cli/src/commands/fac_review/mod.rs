@@ -2305,7 +2305,7 @@ fn run_doctor_wait_poll_loop(
                     DoctorWaitWakeReason::Timer,
                     false,
                 ) {
-                    // BF-002 (TCK-00626): Every 5th tick, use non-lightweight
+                    // BF-002 (RFC-0032::REQ-0257): Every 5th tick, use non-lightweight
                     // mode to detect externally-merged PRs via GitHub API.
                     let use_lightweight = tick % 5 != 0;
                     summary = run_doctor_inner(repo, pr_number, Vec::new(), use_lightweight);
@@ -2717,13 +2717,13 @@ fn run_doctor_inner(
             },
         }
     }
-    // BF-002 (TCK-00626): When running in non-lightweight mode, check if
+    // BF-002 (RFC-0032::REQ-0257): When running in non-lightweight mode, check if
     // the PR was merged on GitHub. If the local lifecycle projection hasn't
     // observed the merge, inject a merged event so the wait loop can detect
     // the terminal state.
     if !lightweight {
         if let Ok(Some(_merged_at)) = github_reads::fetch_pr_merged_at(owner_repo, pr_number) {
-            // BF-002 (TCK-00626 round 2): Use remote_head as authoritative SHA
+            // BF-002 (RFC-0032::REQ-0257 round 2): Use remote_head as authoritative SHA
             // for merge detection. Fall back to local_sha only if remote is
             // unavailable. Skip merge injection entirely if no valid SHA exists
             // (cannot verify lifecycle without a valid SHA).
@@ -2740,7 +2740,7 @@ fn run_doctor_inner(
                         source: "github_api_detection".to_string(),
                     },
                 ) {
-                    // BF-002 (TCK-00626 round 3): Propagate merge event
+                    // BF-002 (RFC-0032::REQ-0257 round 3): Propagate merge event
                     // application errors instead of silently dropping them.
                     // This surfaces SHA mismatches and state transition
                     // failures that could leave the lifecycle projection

@@ -1383,7 +1383,7 @@ impl EpisodeEnvelopeBuilder {
 }
 
 // ============================================================================
-// TCK-00350: EpisodeEnvelopeV1 — envelope with receipt binding fields
+// RFC-0020::REQ-0004: EpisodeEnvelopeV1 — envelope with receipt binding fields
 // ============================================================================
 
 /// V1 envelope that extends [`EpisodeEnvelope`] with receipt binding fields
@@ -1771,7 +1771,7 @@ impl EnvelopeBindings {
     }
 }
 
-/// Error type for `EpisodeEnvelopeV1` operations (TCK-00350).
+/// Error type for `EpisodeEnvelopeV1` operations (RFC-0020::REQ-0004).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeV1Error {
     /// Inner envelope construction failed.
@@ -3476,7 +3476,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00350: EpisodeEnvelopeV1 tests
+    // RFC-0020::REQ-0004: EpisodeEnvelopeV1 tests
     // ========================================================================
 
     /// Helper to create a minimal valid V1 envelope.

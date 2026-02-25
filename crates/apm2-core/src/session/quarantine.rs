@@ -1526,7 +1526,7 @@ mod tests {
     }
 }
 
-/// TCK-00243: Tick-based quarantine expiry tests (RFC-0016 HTF).
+/// RFC-0016::REQ-0003: Tick-based quarantine expiry tests (RFC-0016 HTF).
 ///
 /// These tests verify that quarantine validity is determined by monotonic
 /// ticks, not wall time, and that wall time changes do not affect quarantine
@@ -1542,7 +1542,8 @@ mod tck_00243 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// TCK-00243: Tick-based config constructor sets all fields correctly.
+    /// RFC-0016::REQ-0003: Tick-based config constructor sets all fields
+    /// correctly.
     #[test]
     fn tick_based_config_constructor() {
         // 5 minutes base = 300_000_000 ticks at 1MHz
@@ -1565,7 +1566,7 @@ mod tck_00243 {
         assert_eq!(config.max_duration, Duration::from_secs(86400));
     }
 
-    /// TCK-00243: Legacy config is not tick-based.
+    /// RFC-0016::REQ-0003: Legacy config is not tick-based.
     #[test]
     fn legacy_config_is_not_tick_based() {
         let config = QuarantineConfig::default();
@@ -1575,7 +1576,8 @@ mod tck_00243 {
         assert!(config.tick_rate_hz.is_none());
     }
 
-    /// TCK-00243: Tick-based duration calculation with exponential backoff.
+    /// RFC-0016::REQ-0003: Tick-based duration calculation with exponential
+    /// backoff.
     #[test]
     fn tick_based_duration_calculation() {
         let config = QuarantineConfig::with_ticks(
@@ -1602,14 +1604,14 @@ mod tck_00243 {
         assert_eq!(manager.calculate_duration_ticks(20), Some(100_000));
     }
 
-    /// TCK-00243: Legacy config returns None for tick duration.
+    /// RFC-0016::REQ-0003: Legacy config returns None for tick duration.
     #[test]
     fn legacy_config_duration_ticks_returns_none() {
         let manager = QuarantineManager::with_defaults();
         assert!(manager.calculate_duration_ticks(0).is_none());
     }
 
-    /// TCK-00243: Tick-based expiry is independent of wall time.
+    /// RFC-0016::REQ-0003: Tick-based expiry is independent of wall time.
     ///
     /// Verifies that changing wall time values does not affect quarantine
     /// validity when tick-based timing is used.
@@ -1638,7 +1640,7 @@ mod tck_00243 {
         assert_eq!(info.ticks_remaining(&tick(2500)), 0);
     }
 
-    /// TCK-00243: Tick-based expiry at exact boundary.
+    /// RFC-0016::REQ-0003: Tick-based expiry at exact boundary.
     #[test]
     fn tick_expiry_at_exact_boundary() {
         let info = QuarantineInfo::new_with_ticks(
@@ -1667,7 +1669,7 @@ mod tck_00243 {
         assert_eq!(info.ticks_remaining(&tick(2001)), 0);
     }
 
-    /// TCK-00243: SEC-CTRL-FAC-0015 legacy quarantine handling.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 legacy quarantine handling.
     ///
     /// Legacy quarantines without tick data should NOT be treated as expired
     /// by tick-only methods. Instead, callers should use the wall-clock
@@ -1699,7 +1701,8 @@ mod tck_00243 {
         assert_eq!(info.ticks_remaining(&tick(1500)), u64::MAX);
     }
 
-    /// TCK-00243: SEC-CTRL-FAC-0015 wall-clock fallback for legacy quarantines.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 wall-clock fallback for legacy
+    /// quarantines.
     ///
     /// Legacy quarantines should use wall-clock comparison when tick data is
     /// not available. This provides a migration path for existing quarantines.
@@ -1730,7 +1733,7 @@ mod tck_00243 {
         assert!(info.is_expired_at_tick_or_wall(&tick(1000), 3_000_000_000));
     }
 
-    /// TCK-00243: SEC-HTF-003 Tick rate mismatch fails closed.
+    /// RFC-0016::REQ-0003: SEC-HTF-003 Tick rate mismatch fails closed.
     ///
     /// When tick rates differ between current tick and quarantine expiry tick,
     /// the comparison is invalid. The method fails closed: returns `false`
@@ -1764,7 +1767,7 @@ mod tck_00243 {
         assert_eq!(info.ticks_remaining(&current_diff_rate), u64::MAX); // Infinite remaining
     }
 
-    /// TCK-00243: Injected ticks work correctly for testing.
+    /// RFC-0016::REQ-0003: Injected ticks work correctly for testing.
     ///
     /// Demonstrates that tests can use arbitrary tick values without
     /// needing real time sources.
@@ -1807,7 +1810,8 @@ mod tck_00243 {
         }
     }
 
-    /// TCK-00243: `QuarantineInfo::new_with_ticks` sets all fields correctly.
+    /// RFC-0016::REQ-0003: `QuarantineInfo::new_with_ticks` sets all fields
+    /// correctly.
     #[test]
     fn new_with_ticks_sets_all_fields() {
         let quarantined = tick(1000);
@@ -1840,8 +1844,8 @@ mod tck_00243 {
         assert!(!info.is_legacy());
     }
 
-    /// TCK-00243: Tick-based quarantine uses tick comparison, ignores wall
-    /// time.
+    /// RFC-0016::REQ-0003: Tick-based quarantine uses tick comparison, ignores
+    /// wall time.
     ///
     /// When tick data is present, `is_expired_at_tick_or_wall` uses tick
     /// comparison and ignores the wall time parameter.
@@ -1867,7 +1871,7 @@ mod tck_00243 {
         assert!(info.is_expired_at_tick_or_wall(&tick(2500), 1_500_000_000));
     }
 
-    /// TCK-00243: SEC-HTF-003 tick rate mismatch in combined method.
+    /// RFC-0016::REQ-0003: SEC-HTF-003 tick rate mismatch in combined method.
     ///
     /// When tick rates mismatch, the combined method also fails closed.
     /// Fail-closed for quarantine means returning `false` (NOT expired)
@@ -1892,7 +1896,7 @@ mod tck_00243 {
         assert!(!info.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
     }
 
-    /// TCK-00243: Quarantine until tick calculation.
+    /// RFC-0016::REQ-0003: Quarantine until tick calculation.
     #[test]
     fn quarantine_until_tick_calculation() {
         let current = tick(1000);
@@ -1904,7 +1908,7 @@ mod tck_00243 {
         assert_eq!(until.tick_rate_hz(), TICK_RATE_HZ);
     }
 
-    /// TCK-00243: Static tick-based expiry check.
+    /// RFC-0016::REQ-0003: Static tick-based expiry check.
     #[test]
     fn static_tick_expiry_check() {
         let until = tick(2000);
@@ -1935,7 +1939,7 @@ mod tck_00243 {
         ));
     }
 
-    /// TCK-00243: Serde roundtrip for tick-based quarantine info.
+    /// RFC-0016::REQ-0003: Serde roundtrip for tick-based quarantine info.
     #[test]
     fn tick_based_quarantine_info_serde_roundtrip() {
         let info = QuarantineInfo::new_with_ticks(
@@ -1960,7 +1964,8 @@ mod tck_00243 {
         assert!(!deserialized.is_legacy());
     }
 
-    /// TCK-00243: Legacy quarantine info serializes without tick fields.
+    /// RFC-0016::REQ-0003: Legacy quarantine info serializes without tick
+    /// fields.
     #[test]
     fn legacy_quarantine_info_serde_omits_tick_fields() {
         let info = QuarantineInfo::new(
@@ -1985,7 +1990,7 @@ mod tck_00243 {
         assert!(deserialized.quarantine_until_tick.is_none());
     }
 
-    /// TCK-00243: Tick-based config serializes tick fields.
+    /// RFC-0016::REQ-0003: Tick-based config serializes tick fields.
     #[test]
     fn tick_based_config_serde_roundtrip() {
         let config = QuarantineConfig::with_ticks(1000, 100_000, TICK_RATE_HZ, 2.5);
@@ -1999,7 +2004,7 @@ mod tck_00243 {
         assert_eq!(deserialized.tick_rate_hz, Some(TICK_RATE_HZ));
     }
 
-    /// TCK-00243: Config validation detects zero tick rate.
+    /// RFC-0016::REQ-0003: Config validation detects zero tick rate.
     #[test]
     fn config_validation_rejects_zero_tick_rate() {
         // Valid config
@@ -2023,7 +2028,8 @@ mod tck_00243 {
         assert_eq!(config.validate(), Err(QuarantineConfigError::ZeroTickRate));
     }
 
-    /// TCK-00243: Config validation detects incomplete tick configuration.
+    /// RFC-0016::REQ-0003: Config validation detects incomplete tick
+    /// configuration.
     #[test]
     fn config_validation_rejects_incomplete_tick_config() {
         // Only base_duration_ticks set
@@ -2062,7 +2068,8 @@ mod tck_00243 {
         );
     }
 
-    /// TCK-00243: Config validation accepts legacy config (no tick fields).
+    /// RFC-0016::REQ-0003: Config validation accepts legacy config (no tick
+    /// fields).
     #[test]
     fn config_validation_accepts_legacy_config() {
         let config = QuarantineConfig::default();
@@ -2070,14 +2077,14 @@ mod tck_00243 {
         assert!(config.validate().is_ok());
     }
 
-    /// TCK-00243: `with_ticks` constructor panics on zero tick rate.
+    /// RFC-0016::REQ-0003: `with_ticks` constructor panics on zero tick rate.
     #[test]
     #[should_panic(expected = "tick_rate_hz must be > 0")]
     fn with_ticks_panics_on_zero_tick_rate() {
         let _ = QuarantineConfig::with_ticks(1000, 100_000, 0, 2.0);
     }
 
-    /// TCK-00243: `deny_unknown_fields` rejects extra fields in
+    /// RFC-0016::REQ-0003: `deny_unknown_fields` rejects extra fields in
     /// `QuarantineConfig`.
     #[test]
     fn config_deny_unknown_fields() {
@@ -2096,7 +2103,7 @@ mod tck_00243 {
         assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
 
-    /// TCK-00243: `deny_unknown_fields` rejects extra fields in
+    /// RFC-0016::REQ-0003: `deny_unknown_fields` rejects extra fields in
     /// `QuarantineInfo`.
     #[test]
     fn info_deny_unknown_fields() {
@@ -2113,8 +2120,8 @@ mod tck_00243 {
         assert!(result.unwrap_err().to_string().contains("unknown field"));
     }
 
-    /// TCK-00243: DD-HTF-0001 `CLOCK_REGRESSION` defect emission on tick rate
-    /// mismatch.
+    /// RFC-0016::REQ-0003: DD-HTF-0001 `CLOCK_REGRESSION` defect emission on
+    /// tick rate mismatch.
     ///
     /// When tick rates differ, `check_quarantine_expired_at_tick` should return
     /// a `ClockRegressionDefect` for emission to the defect log.
@@ -2150,7 +2157,7 @@ mod tck_00243 {
         assert!(display.contains("1000000Hz"));
     }
 
-    /// TCK-00243: No defect when tick rates match.
+    /// RFC-0016::REQ-0003: No defect when tick rates match.
     #[test]
     fn no_defect_when_tick_rates_match() {
         let quarantine_until = HtfTick::new(2000, 1_000_000);
@@ -2166,7 +2173,7 @@ mod tck_00243 {
         assert!(defect.is_none());
     }
 
-    /// TCK-00243: `ClockRegressionDefect` serde roundtrip.
+    /// RFC-0016::REQ-0003: `ClockRegressionDefect` serde roundtrip.
     #[test]
     fn clock_regression_defect_serde_roundtrip() {
         let defect = ClockRegressionDefect::quarantine_expiry_mismatch(

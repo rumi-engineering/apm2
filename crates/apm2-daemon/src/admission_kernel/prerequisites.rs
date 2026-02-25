@@ -3,7 +3,7 @@
 //!
 //! These traits define the contracts that `AdmissionKernel` depends on for
 //! ledger trust verification, policy root resolution, and anti-rollback
-//! anchoring. Implementations are provided by TCK-00500; this module
+//! anchoring. Implementations are provided by RFC-0032::REQ-0175; this module
 //! defines only the trait interfaces and their associated types.
 //!
 //! # Fail-Closed Semantics
@@ -283,7 +283,7 @@ pub struct PolicyRootStateV1 {
 ///
 /// # Implementations
 ///
-/// Implementations are provided by TCK-00500. The kernel depends only
+/// Implementations are provided by RFC-0032::REQ-0175. The kernel depends only
 /// on this trait interface.
 ///
 /// # Fail-Closed Contract
@@ -307,7 +307,7 @@ pub trait LedgerTrustVerifier: Send + Sync {
 ///
 /// # Implementations
 ///
-/// Implementations are provided by TCK-00500.
+/// Implementations are provided by RFC-0032::REQ-0175.
 ///
 /// # Fail-Closed Contract
 ///

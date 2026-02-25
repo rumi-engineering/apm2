@@ -1,4 +1,4 @@
-//! Criterion benchmark for verifier cache amortization (TCK-00359).
+//! Criterion benchmark for verifier cache amortization (RFC-0020::REQ-0013).
 //!
 //! Demonstrates that cache reuse measurably reduces repeated identity
 //! verification cost (definition-of-done criterion for REQ-0013).

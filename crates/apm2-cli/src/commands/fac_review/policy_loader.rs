@@ -1,9 +1,9 @@
 //! Shared FAC policy loading and managed `CARGO_HOME` creation.
 //!
 //! Extracted from duplicate implementations in `evidence.rs` and `gates.rs`
-//! (TCK-00526). Both the gates path and the pipeline/evidence path use these
-//! helpers to load-or-create the FAC policy and ensure the managed `CARGO_HOME`
-//! directory exists.
+//! (RFC-0032::REQ-0185). Both the gates path and the pipeline/evidence path use
+//! these helpers to load-or-create the FAC policy and ensure the managed
+//! `CARGO_HOME` directory exists.
 //!
 //! ## Bounded read invariant (CTR-1603)
 //!
@@ -21,6 +21,7 @@ use std::os::unix::fs::DirBuilderExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 use apm2_core::fac::execution_backend::{ExecutionBackend, select_backend};
@@ -86,7 +87,8 @@ pub fn load_or_create_fac_policy(fac_root: &Path) -> Result<FacPolicyV1, String>
 
 /// Ensure the managed `CARGO_HOME` directory exists with restrictive
 /// permissions (0o700 in operator mode, 0o770 in system-mode, CTR-2611). This
-/// is a one-time setup for FAC-managed cargo home isolation (TCK-00526).
+/// is a one-time setup for FAC-managed cargo home isolation
+/// (RFC-0032::REQ-0185).
 ///
 /// Uses atomic creation (mkdir, handle `AlreadyExists`) to eliminate the
 /// TOCTOU window between existence checks and creation. Rejects symlinks
@@ -169,21 +171,61 @@ pub fn apply_stable_rustup_home_if_available(
     }
 }
 
+/// Apply deterministic `RUSTUP_TOOLCHAIN` selection for FAC gate execution.
+///
+/// Priority order:
+/// 1. existing `policy_env["RUSTUP_TOOLCHAIN"]` (when non-empty),
+/// 2. ambient `RUSTUP_TOOLCHAIN`,
+/// 3. repository `rust-toolchain.toml` / `rust-toolchain` channel.
+///
+/// This prevents ambient/default toolchain drift between worker contexts and
+/// avoids repeated rustup resolution work in gate subprocesses.
+pub fn apply_repo_rustup_toolchain_if_available(
+    policy_env: &mut BTreeMap<String, String>,
+    workspace_root: &Path,
+    ambient: &[(String, String)],
+) {
+    if policy_env
+        .get("RUSTUP_TOOLCHAIN")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+
+    if let Some(ambient_toolchain) = ambient_env_value(ambient, "RUSTUP_TOOLCHAIN")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        policy_env.insert(
+            "RUSTUP_TOOLCHAIN".to_string(),
+            ambient_toolchain.to_string(),
+        );
+        return;
+    }
+
+    if let Some(toolchain) = resolve_workspace_rustup_toolchain(workspace_root) {
+        policy_env.insert("RUSTUP_TOOLCHAIN".to_string(), toolchain);
+    }
+}
+
 /// Apply lane-local environment isolation for FAC review execution.
 ///
 /// This bundles the three required steps for deterministic, resilient lane
 /// execution:
 /// - ensure lane env directories exist with restricted permissions,
 /// - override HOME/TMP/XDG variables to the lane directory,
-/// - pin `RUSTUP_HOME` to a stable shared location when available.
+/// - pin `RUSTUP_HOME` to a stable shared location when available,
+/// - pin `RUSTUP_TOOLCHAIN` from ambient/workspace when available.
 pub fn apply_review_lane_environment(
     policy_env: &mut BTreeMap<String, String>,
     lane_dir: &Path,
+    workspace_root: &Path,
     ambient: &[(String, String)],
 ) -> Result<(), String> {
     ensure_lane_env_dirs(lane_dir)?;
     apply_lane_env_overrides(policy_env, lane_dir);
     apply_stable_rustup_home_if_available(policy_env, ambient);
+    apply_repo_rustup_toolchain_if_available(policy_env, workspace_root, ambient);
     Ok(())
 }
 
@@ -199,6 +241,26 @@ fn discover_stable_rustup_home(ambient: &[(String, String)]) -> Option<PathBuf> 
         .map(PathBuf::from)
         .map(|home| home.join(".rustup"))
         .and_then(validate_stable_rustup_home)
+        .or_else(discover_stable_rustup_home_via_rustup)
+}
+
+fn discover_stable_rustup_home_via_rustup() -> Option<PathBuf> {
+    let output = Command::new("rustup")
+        .args(["show", "home"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let home = stdout.trim();
+    if home.is_empty() {
+        return None;
+    }
+    validate_stable_rustup_home(PathBuf::from(home))
 }
 
 fn ambient_env_value<'a>(ambient: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -223,13 +285,47 @@ fn validate_stable_rustup_home(path: PathBuf) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// Resolve a pinned Rust toolchain channel from workspace files.
+///
+/// Supports both `rust-toolchain.toml` (`[toolchain].channel`) and legacy
+/// `rust-toolchain` plain-text channel files.
+pub fn resolve_workspace_rustup_toolchain(workspace_root: &Path) -> Option<String> {
+    let toml_path = workspace_root.join("rust-toolchain.toml");
+    if let Ok(contents) = fs::read_to_string(&toml_path) {
+        if let Ok(parsed) = toml::from_str::<toml::Value>(&contents) {
+            if let Some(channel) = parsed
+                .get("toolchain")
+                .and_then(|value| value.get("channel"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(channel.to_string());
+            }
+        }
+    }
+
+    let legacy_path = workspace_root.join("rust-toolchain");
+    if let Ok(contents) = fs::read_to_string(legacy_path) {
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
 /// Verify that an existing managed `CARGO_HOME` directory has restrictive
 /// permissions, is owned by the current runtime context (CTR-2611), and is
 /// not a symlink (INV-LANE-ENV-001).
 ///
 /// Delegates to the shared [`apm2_core::fac::verify_dir_permissions`]
-/// helper with a "managed `CARGO_HOME`" context label (TCK-00575 round 2
-/// NIT: deduplicated permission verification).
+/// helper with a "managed `CARGO_HOME`" context label (RFC-0032::REQ-0225 round
+/// 2 NIT: deduplicated permission verification).
 #[cfg(unix)]
 fn verify_cargo_home_permissions(cargo_home: &Path) -> Result<(), String> {
     apm2_core::fac::verify_dir_permissions(cargo_home, "managed CARGO_HOME")
@@ -472,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_stable_rustup_home_ignores_home_without_toolchains() {
+    fn apply_stable_rustup_home_ignores_invalid_candidate_without_toolchains() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rustup_home = dir.path().join("rustup");
         fs::create_dir_all(&rustup_home).expect("create rustup root");
@@ -486,8 +582,9 @@ mod tests {
         apply_stable_rustup_home_if_available(&mut env, &ambient);
 
         assert!(
-            !env.contains_key("RUSTUP_HOME"),
-            "RUSTUP_HOME should remain unset without a toolchains/ directory"
+            env.get("RUSTUP_HOME")
+                .is_none_or(|value| value != &rustup_home.to_string_lossy()),
+            "invalid rustup candidate without toolchains/ must not be selected"
         );
     }
 
@@ -496,6 +593,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let lane_dir = dir.path().join("lane-00");
         fs::create_dir_all(&lane_dir).expect("create lane dir");
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        fs::write(
+            workspace_root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly-2025-12-01\"\n",
+        )
+        .expect("write rust-toolchain.toml");
 
         let home = dir.path().join("home");
         let rustup_home = home.join(".rustup");
@@ -503,7 +607,7 @@ mod tests {
 
         let ambient = vec![("HOME".to_string(), home.to_string_lossy().to_string())];
         let mut env = BTreeMap::new();
-        apply_review_lane_environment(&mut env, &lane_dir, &ambient)
+        apply_review_lane_environment(&mut env, &lane_dir, &workspace_root, &ambient)
             .expect("apply review lane env");
 
         let lane_prefix = lane_dir.to_string_lossy();
@@ -516,5 +620,33 @@ mod tests {
             env.get("RUSTUP_HOME").map(String::as_str),
             Some(rustup_home.to_string_lossy().as_ref())
         );
+        assert_eq!(
+            env.get("RUSTUP_TOOLCHAIN").map(String::as_str),
+            Some("nightly-2025-12-01")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_rustup_toolchain_reads_legacy_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("rust-toolchain"), "stable\n").expect("write rust-toolchain");
+        assert_eq!(
+            resolve_workspace_rustup_toolchain(dir.path()),
+            Some("stable".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_repo_rustup_toolchain_prefers_ambient_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly-2025-12-01\"\n",
+        )
+        .expect("write rust-toolchain.toml");
+        let ambient = vec![("RUSTUP_TOOLCHAIN".to_string(), "stable".to_string())];
+        let mut env = BTreeMap::new();
+        apply_repo_rustup_toolchain_if_available(&mut env, dir.path(), &ambient);
+        assert_eq!(env.get("RUSTUP_TOOLCHAIN"), Some(&"stable".to_string()));
     }
 }

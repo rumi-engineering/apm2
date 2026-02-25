@@ -10,7 +10,7 @@
 //! - [INV-0001] An agent cannot execute privileged IPC operations
 //! - [TB-002] Privilege separation boundary: session connections blocked from
 //!   privileged handlers
-//! - [TCK-00253] Actor_id derived from credential, not user input
+//! - [RFC-0032::REQ-0069] Actor_id derived from credential, not user input
 //!
 //! # Message Flow
 //!
@@ -84,7 +84,7 @@ use super::messages::{
     BoundedDecode,
     ClaimWorkRequest,
     ClaimWorkResponse,
-    // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0265: ClaimWorkV2 (RFC-0032 Phase 2)
     ClaimWorkV2Request,
     ClaimWorkV2Response,
     ConsensusByzantineEvidenceRequest,
@@ -99,12 +99,12 @@ use super::messages::{
     CredentialAuthMethod as ProtoAuthMethod,
     CredentialProvider as ProtoProvider,
     DecodeConfig,
-    // TCK-00340: Sublease delegation types
+    // RFC-0032::REQ-0131: Sublease delegation types
     DelegateSubleaseRequest,
     DelegateSubleaseResponse,
     EndSessionRequest,
     EndSessionResponse,
-    // TCK-00389: Review receipt ingestion types
+    // RFC-0032::REQ-0143: Review receipt ingestion types
     IngestReviewReceiptRequest,
     IngestReviewReceiptResponse,
     IssueCapabilityRequest,
@@ -115,7 +115,7 @@ use super::messages::{
     ListProcessesResponse,
     LoginCredentialRequest,
     LoginCredentialResponse,
-    // TCK-00635: OpenWork (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
     OpenWorkRequest,
     OpenWorkResponse,
     OrchestratorLaunchProjectionRequest,
@@ -128,16 +128,16 @@ use super::messages::{
     ProcessStatusRequest,
     ProcessStatusResponse,
     ProjectionUncertaintyFlag,
-    // TCK-00394: ChangeSet publishing types
+    // RFC-0032::REQ-0148: ChangeSet publishing types
     PublishChangeSetRequest,
     PublishChangeSetResponse,
-    // TCK-00638: Work context entry publishing types
+    // RFC-0032::REQ-0266: Work context entry publishing types
     PublishWorkContextEntryRequest,
     PublishWorkContextEntryResponse,
-    // TCK-00645: Work loop profile publishing types
+    // RFC-0032::REQ-0270: Work loop profile publishing types
     PublishWorkLoopProfileRequest,
     PublishWorkLoopProfileResponse,
-    // TCK-00639: PR association recording types
+    // RFC-0032::REQ-0267: PR association recording types
     RecordWorkPrAssociationRequest,
     RecordWorkPrAssociationResponse,
     RefreshCredentialRequest,
@@ -150,7 +150,7 @@ use super::messages::{
     RemoveCredentialResponse,
     RequestUnfreezeRequest,
     RequestUnfreezeResponse,
-    // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: Ticket alias resolution (RFC-0032 Phase 1)
     ResolveTicketAliasRequest,
     ResolveTicketAliasResponse,
     RestartProcessRequest,
@@ -211,7 +211,7 @@ use crate::work::authority::{
 use crate::work::projection::{WORK_DIAGNOSTIC_REASON_BLOCKS_UNSATISFIED, WorkDependencySeverity};
 
 // ============================================================================
-// Ledger Event Emitter Interface (TCK-00253)
+// Ledger Event Emitter Interface (RFC-0032::REQ-0069)
 // ============================================================================
 
 /// A signed ledger event for persistence.
@@ -388,7 +388,7 @@ pub enum LedgerEventError {
         message: String,
     },
 
-    /// Validation failed (TCK-00307 MAJOR 4).
+    /// Validation failed (RFC-0032::REQ-0103 MAJOR 4).
     ///
     /// Per REQ-VAL-0001: All event payloads must be validated before emission
     /// to prevent denial-of-service via unbounded strings/bytes.
@@ -398,7 +398,7 @@ pub enum LedgerEventError {
     },
 
     /// Write rejected because the legacy `ledger_events` writer has been
-    /// frozen after RFC-0032 Phase 0 migration (TCK-00631).
+    /// frozen after RFC-0032 Phase 0 migration (RFC-0032::REQ-0260).
     ///
     /// Once `migrate_legacy_ledger_events` runs and
     /// `ledger_events_legacy_frozen` exists, all writes to `ledger_events`
@@ -424,7 +424,7 @@ impl std::fmt::Display for LedgerEventError {
 
 impl std::error::Error for LedgerEventError {}
 
-/// Error type for HTF timestamp generation (TCK-00289).
+/// Error type for HTF timestamp generation (RFC-0032::REQ-0091).
 ///
 /// # Security (Fail-Closed)
 ///
@@ -454,7 +454,7 @@ impl std::fmt::Display for HtfTimestampError {
 
 impl std::error::Error for HtfTimestampError {}
 
-/// Parameters for a work state transition event (TCK-00395).
+/// Parameters for a work state transition event (RFC-0032::REQ-0149).
 ///
 /// Bundles the parameters needed to emit a `WorkTransitioned` event to the
 /// ledger. This struct reduces the number of arguments passed to
@@ -477,7 +477,8 @@ pub struct WorkTransition<'a> {
     pub timestamp_ns: u64,
 }
 
-/// Typed budget bindings required by lifecycle authority contracts (TCK-00416).
+/// Typed budget bindings required by lifecycle authority contracts
+/// (RFC-0032::REQ-0160).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypedBudgetBindings {
     /// Maximum tokens permitted for the lifecycle step.
@@ -488,7 +489,8 @@ pub struct TypedBudgetBindings {
     pub max_wall_ms: u64,
 }
 
-/// Authority contract bound to authoritative lifecycle transitions (TCK-00416).
+/// Authority contract bound to authoritative lifecycle transitions
+/// (RFC-0032::REQ-0160).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransitionAuthorityBindings {
     /// Lease identifier delegating authority.
@@ -513,7 +515,7 @@ pub struct TransitionAuthorityBindings {
     pub policy_resolved_ref: String,
 }
 
-/// Parameters for a stop-flag mutation audit event (TCK-00351).
+/// Parameters for a stop-flag mutation audit event (RFC-0020::REQ-0005).
 ///
 /// This captures the immutable evidence payload for `UpdateStopFlags` so
 /// emergency/governance stop mutations are queryable from the ledger.
@@ -544,7 +546,7 @@ pub const MAX_PROJECTION_EVENTS: usize = 10_000;
 
 /// Trait for emitting signed events to the ledger.
 ///
-/// Per TCK-00253 acceptance criteria:
+/// Per RFC-0032::REQ-0069 acceptance criteria:
 /// - "`WorkClaimed` event signed and persisted"
 /// - "Ledger query returns signed event"
 ///
@@ -552,7 +554,7 @@ pub const MAX_PROJECTION_EVENTS: usize = 10_000;
 ///
 /// - `StubLedgerEventEmitter`: In-memory storage for testing
 /// - `DurableLedgerEventEmitter`: SQLite-backed persistence with HTF timestamps
-///   (TCK-00289)
+///   (RFC-0032::REQ-0091)
 pub trait LedgerEventEmitter: Send + Sync {
     /// Emits a signed `WorkClaimed` event to the ledger.
     ///
@@ -574,13 +576,15 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a signed `SessionStarted` event to the ledger (TCK-00289).
+    /// Emits a signed `SessionStarted` event to the ledger
+    /// (RFC-0032::REQ-0091).
     ///
-    /// Per TCK-00348, the `SessionStarted` event is the **authoritative**
-    /// record for contract binding metadata. When `contract_binding` is
-    /// `Some`, the binding fields (client/server hashes, mismatch waived,
-    /// risk tier) are included in the signed payload. Persistence failure
-    /// MUST be propagated as an error (fail-closed).
+    /// Per RFC-0020::REQ-0002, the `SessionStarted` event is the
+    /// **authoritative** record for contract binding metadata. When
+    /// `contract_binding` is `Some`, the binding fields (client/server
+    /// hashes, mismatch waived, risk tier) are included in the signed
+    /// payload. Persistence failure MUST be propagated as an error
+    /// (fail-closed).
     ///
     /// # Arguments
     ///
@@ -595,7 +599,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `identity_proof_profile_hash` - Active identity proof profile hash for
     ///   the session identity context (when available)
     /// * `selection_decision` - Adapter selection metadata when profile was
-    ///   chosen by policy (TCK-00400)
+    ///   chosen by policy (RFC-0032::REQ-0152)
     ///
     /// # Returns
     ///
@@ -619,7 +623,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a generic session event to the ledger (TCK-00290).
+    /// Emits a generic session event to the ledger (RFC-0032::REQ-0092).
     ///
     /// This method handles arbitrary session events from `EmitEvent` requests,
     /// preserving the actual `event_type` and payload from the request rather
@@ -689,8 +693,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// included in the top-level JSON envelope for database-level uniqueness
     /// enforcement.
     ///
-    /// TCK-00638 SECURITY FIX: The `evidence_id` is surfaced in the JSON
-    /// payload so that a partial UNIQUE index
+    /// RFC-0032::REQ-0266 SECURITY FIX: The `evidence_id` is surfaced in the
+    /// JSON payload so that a partial UNIQUE index
     /// (`json_extract(payload, '$.evidence_id') WHERE event_type =
     /// 'evidence.published'`) can enforce at-most-once semantics at the
     /// database level. Without this, concurrent `PublishWorkContextEntry`
@@ -735,7 +739,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// signing key used by this emitter instance.
     fn verifying_key(&self) -> ed25519_dalek::VerifyingKey;
 
-    /// Emits a signed `StopFlagsMutated` event to the ledger (TCK-00351).
+    /// Emits a signed `StopFlagsMutated` event to the ledger
+    /// (RFC-0020::REQ-0005).
     ///
     /// This records runtime stop-flag mutations performed by the privileged
     /// `UpdateStopFlags` endpoint.
@@ -744,7 +749,8 @@ pub trait LedgerEventEmitter: Send + Sync {
         mutation: &StopFlagsMutation<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a signed `DefectRecorded` event to the ledger (TCK-00307).
+    /// Emits a signed `DefectRecorded` event to the ledger
+    /// (RFC-0032::REQ-0103).
     fn emit_defect_recorded(
         &self,
         defect: &DefectRecorded,
@@ -1235,7 +1241,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// is matched against the protobuf payload's `evidence_id` field to
     /// identify the specific context entry.
     ///
-    /// Used for idempotency in `PublishWorkContextEntry` (TCK-00638).
+    /// Used for idempotency in `PublishWorkContextEntry` (RFC-0032::REQ-0266).
     fn get_event_by_evidence_identity(
         &self,
         work_id: &str,
@@ -1245,7 +1251,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         None
     }
 
-    /// Emits an episode lifecycle event to the ledger (TCK-00321).
+    /// Emits an episode lifecycle event to the ledger (RFC-0032::REQ-0115).
     ///
     /// Per REQ-0005, episode events must be streamed directly to the ledger
     /// as they occur, rather than buffered in memory. This enables:
@@ -1275,7 +1281,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a `ReviewReceiptRecorded` ledger event (TCK-00321).
+    /// Emits a `ReviewReceiptRecorded` ledger event (RFC-0032::REQ-0115).
     ///
     /// Per REQ-0005, receipt events must be emitted atomically at episode
     /// completion. This method:
@@ -1340,7 +1346,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
+    /// Emits a `ReviewBlockedRecorded` ledger event (RFC-0032::REQ-0143).
     ///
     /// Records a blocked review outcome in the ledger. This is emitted when
     /// an external reviewer reports that the review was blocked due to tool
@@ -1405,11 +1411,13 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// The number of `work_transitioned` events for the given work ID.
     fn get_work_transition_count(&self, work_id: &str) -> u32;
 
-    /// Emits a signed `WorkTransitioned` event to the ledger (TCK-00395).
+    /// Emits a signed `WorkTransitioned` event to the ledger
+    /// (RFC-0032::REQ-0149).
     ///
     /// Records a work item state transition in the ledger, enabling the FAC
     /// CLI (`apm2 fac work status`) to observe work lifecycle state changes
-    /// and the `GateOrchestrator` (TCK-00388) to trigger gate lifecycle.
+    /// and the `GateOrchestrator` (RFC-0032::REQ-0142) to trigger gate
+    /// lifecycle.
     ///
     /// # Arguments
     ///
@@ -1435,10 +1443,11 @@ pub trait LedgerEventEmitter: Send + Sync {
         transition: &WorkTransition<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a signed `SessionTerminated` event to the ledger (TCK-00395).
+    /// Emits a signed `SessionTerminated` event to the ledger
+    /// (RFC-0032::REQ-0149).
     ///
     /// Records session termination in the ledger, enabling the
-    /// `GateOrchestrator` (TCK-00388) to trigger gate lifecycle after
+    /// `GateOrchestrator` (RFC-0032::REQ-0142) to trigger gate lifecycle after
     /// session completion.
     ///
     /// # Arguments
@@ -1468,7 +1477,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Atomically emits a `WorkClaimed` event followed by a
-    /// `WorkTransitioned`(Open -> Claimed) event (TCK-00395).
+    /// `WorkTransitioned`(Open -> Claimed) event (RFC-0032::REQ-0149).
     ///
     /// # Atomicity Contract
     ///
@@ -1520,7 +1529,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     }
 
     /// Atomically emits a `SessionStarted` event followed by a
-    /// `WorkTransitioned`(Claimed -> `InProgress`) event (TCK-00395).
+    /// `WorkTransitioned`(Claimed -> `InProgress`) event (RFC-0032::REQ-0149).
     ///
     /// # Atomicity Contract
     ///
@@ -1582,7 +1591,8 @@ pub trait LedgerEventEmitter: Send + Sync {
         Ok(session_event)
     }
 
-    /// Emits an `EpisodeRunAttributed` event to the ledger (TCK-00330).
+    /// Emits an `EpisodeRunAttributed` event to the ledger
+    /// (RFC-0032::REQ-0123).
     ///
     /// This method records attribution for an episode run, binding:
     /// - `work_id`: The work item this run is associated with
@@ -1618,11 +1628,12 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a signed `ChangeSetPublished` event to the ledger (TCK-00394).
+    /// Emits a signed `ChangeSetPublished` event to the ledger
+    /// (RFC-0032::REQ-0148).
     ///
     /// Records that a changeset bundle was published to CAS and anchored in
-    /// the ledger, enabling downstream gate orchestration (TCK-00388) to
-    /// bind gate leases to the changeset.
+    /// the ledger, enabling downstream gate orchestration (RFC-0032::REQ-0142)
+    /// to bind gate leases to the changeset.
     ///
     /// # Arguments
     ///
@@ -1648,7 +1659,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a signed receipt with envelope bindings (TCK-00350).
+    /// Emits a signed receipt with envelope bindings (RFC-0020::REQ-0004).
     ///
     /// Per REQ-0004, all authoritative effect receipts MUST carry
     /// `envelope_hash`, `capability_manifest_hash`, and
@@ -1694,8 +1705,8 @@ pub trait LedgerEventEmitter: Send + Sync {
         })
     }
 
-    /// TCK-00631: Freeze legacy `ledger_events` writes and route future appends
-    /// to the canonical `events` table.
+    /// RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes and route
+    /// future appends to the canonical `events` table.
     ///
     /// Called by daemon startup after RFC-0032 Phase 0 migration.
     /// Default implementation is a no-op (for in-memory/stub emitters).
@@ -1706,25 +1717,29 @@ pub trait LedgerEventEmitter: Send + Sync {
 
 /// Domain separation prefix for `WorkClaimed` events.
 ///
-/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
+/// Per RFC-0017 and RFC-0032::REQ-0080: domain prefixes prevent cross-context
+/// replay.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
 /// Domain separation prefix for `DefectRecorded` events.
 pub const DEFECT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.defect_recorded:";
 
-/// Domain separation prefix for episode lifecycle events (TCK-00321).
+/// Domain separation prefix for episode lifecycle events (RFC-0032::REQ-0115).
 ///
-/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
+/// Per RFC-0017 and RFC-0032::REQ-0080: domain prefixes prevent cross-context
+/// replay.
 pub const EPISODE_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.episode:";
 
-/// Domain separation prefix for episode run attribution events (TCK-00330).
+/// Domain separation prefix for episode run attribution events
+/// (RFC-0032::REQ-0123).
 ///
-/// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
-/// This prefix is used for events that attribute episode runs to specific
-/// adapter profiles via their CAS hash.
+/// Per RFC-0017 and RFC-0032::REQ-0080: domain prefixes prevent cross-context
+/// replay. This prefix is used for events that attribute episode runs to
+/// specific adapter profiles via their CAS hash.
 pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attributed:";
 
-/// Domain separation prefix for `WorkTransitioned` ledger events (TCK-00395).
+/// Domain separation prefix for `WorkTransitioned` ledger events
+/// (RFC-0032::REQ-0149).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting work state transition events to the
@@ -1732,7 +1747,8 @@ pub const EPISODE_RUN_ATTRIBUTED_PREFIX: &[u8] = b"apm2.event.episode_run_attrib
 /// lifecycle state changes.
 pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitioned:";
 
-/// Domain separation prefix for `SessionTerminated` ledger events (TCK-00395).
+/// Domain separation prefix for `SessionTerminated` ledger events
+/// (RFC-0032::REQ-0149).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting session termination events to the
@@ -1746,7 +1762,8 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 /// This prefix is for ledger-level JCS-canonicalized JSON events.
 pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
 
-/// Domain separation prefix for `StopFlagsMutated` ledger events (TCK-00351).
+/// Domain separation prefix for `StopFlagsMutated` ledger events
+/// (RFC-0020::REQ-0005).
 pub const STOP_FLAGS_MUTATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.stop_flags_mutated:";
 
 /// Domain separation prefix for `gate_lease_issued` ledger events.
@@ -1758,11 +1775,12 @@ pub const GATE_LEASE_ISSUED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.gate_leas
 /// Ledger indexing key for daemon stop-flag mutation events.
 pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
 
-/// Domain separation prefix for `ChangeSetPublished` ledger events (TCK-00394).
+/// Domain separation prefix for `ChangeSetPublished` ledger events
+/// (RFC-0032::REQ-0148).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting changeset publication events to the
-/// ledger, enabling gate orchestration (TCK-00388) to bind gate leases
+/// ledger, enabling gate orchestration (RFC-0032::REQ-0142) to bind gate leases
 /// to published changesets.
 pub const CHANGESET_PUBLISHED_LEDGER_DOMAIN_PREFIX: &[u8] = CHANGESET_PUBLISHED_PREFIX;
 
@@ -1778,11 +1796,12 @@ pub const INV_FAC_PR_BIND_001: &str = "INV-FAC-PR-BIND-001";
 pub const WORK_PR_BINDING_CONFLICT_TAG: &str = "WORK_PR_BINDING_CONFLICT";
 
 // Note: `REVIEW_RECEIPT_RECORDED_PREFIX` is imported from `apm2_core::fac`
-// to ensure protocol compatibility across the daemon/core boundary (TCK-00321).
-// See `apm2_core::fac::domain_separator` for the canonical definition.
+// to ensure protocol compatibility across the daemon/core boundary
+// (RFC-0032::REQ-0115). See `apm2_core::fac::domain_separator` for the
+// canonical definition.
 
 /// Domain separation prefix for `ReviewBlockedRecorded` ledger events
-/// (TCK-00389).
+/// (RFC-0032::REQ-0143).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used when emitting review blocked events to the ledger.
@@ -1822,7 +1841,7 @@ fn is_ticket_alias_candidate(work_id: &str) -> bool {
 }
 
 /// Wire-framing overhead added on top of JSON-serialized `WorkClaim`
-/// size for queue-byte accounting (TCK-00568).
+/// size for queue-byte accounting (RFC-0032::REQ-0219).
 ///
 /// Accounts for envelope headers, length-prefix framing, and encoding
 /// differences between JSON and binary wire formats. This is an
@@ -1830,7 +1849,7 @@ fn is_ticket_alias_candidate(work_id: &str) -> bool {
 pub const CLAIM_WIRE_FRAMING_OVERHEAD_BYTES: usize = 128;
 
 /// Fallback byte estimate used when `WorkClaim` serialization fails
-/// (TCK-00568).
+/// (RFC-0032::REQ-0219).
 ///
 /// Set conservatively high so that a serialization failure does not
 /// silently undercount and bypass byte quotas (fail-closed).
@@ -1881,7 +1900,7 @@ pub const SUBLEASE_DELEGATION_SATISFIABILITY_BUDGET_TICKS: u64 =
 /// `SqliteLedgerEventEmitter::emit_session_started`, and
 /// `SqliteLedgerEventEmitter::emit_spawn_lifecycle`.
 ///
-/// TCK-00348: Includes contract binding fields when available.
+/// RFC-0020::REQ-0002: Includes contract binding fields when available.
 #[allow(clippy::too_many_arguments)]
 pub fn build_session_started_payload(
     session_id: &str,
@@ -2136,7 +2155,8 @@ pub fn derive_claim_transition_authority_bindings(
     )
 }
 
-/// Appends authority binding fields to a JSON event payload (TCK-00416).
+/// Appends authority binding fields to a JSON event payload
+/// (RFC-0032::REQ-0160).
 ///
 /// Used by transition emitters to embed complete binding references into
 /// signed ledger events.
@@ -2179,13 +2199,14 @@ pub fn append_transition_authority_fields(
 }
 
 /// Maximum number of authority binding violations collected per validation
-/// invocation before short-circuiting (TCK-00416).
+/// invocation before short-circuiting (RFC-0032::REQ-0160).
 ///
 /// Per bounded-resource-growth policy, a single validation pass never
 /// allocates more than this many violation strings.
 pub const MAX_BINDING_VIOLATIONS: usize = 32;
 
-/// Structured error for authority binding validation failures (TCK-00416).
+/// Structured error for authority binding validation failures
+/// (RFC-0032::REQ-0160).
 ///
 /// Captures all missing/invalid bindings in a single pass so the caller
 /// can emit a comprehensive defect record.
@@ -2207,7 +2228,7 @@ impl std::fmt::Display for TransitionAuthorityError {
 impl std::error::Error for TransitionAuthorityError {}
 
 /// Validates that all required authority bindings are present and
-/// CAS-resolvable at transition time (TCK-00416, REQ-HEF-0013).
+/// CAS-resolvable at transition time (RFC-0032::REQ-0160, REQ-HEF-0013).
 ///
 /// # Fail-Closed Semantics
 ///
@@ -2360,7 +2381,8 @@ pub fn validate_transition_authority_bindings(
     }
 }
 
-/// Review/projection outcome bindings required by REQ-HEF-0013 (TCK-00416).
+/// Review/projection outcome bindings required by REQ-HEF-0013
+/// (RFC-0032::REQ-0160).
 ///
 /// These bindings capture the evidence-index commitments that make review
 /// and projection outcomes replayable without ambient state.
@@ -2375,7 +2397,7 @@ pub struct ReviewOutcomeBindings {
 }
 
 /// Validates that review/projection outcome bindings are present and
-/// CAS-resolvable (TCK-00416, REQ-HEF-0013).
+/// CAS-resolvable (RFC-0032::REQ-0160, REQ-HEF-0013).
 ///
 /// # Fail-Closed Semantics
 ///
@@ -2441,7 +2463,7 @@ pub fn validate_review_outcome_bindings(
 }
 
 /// Derives review outcome bindings from receipt fields using domain-tagged
-/// hashing (TCK-00416).
+/// hashing (RFC-0032::REQ-0160).
 ///
 /// Each outcome binding hash is derived independently from the receipt's
 /// semantic source data using a unique domain prefix, ensuring no two
@@ -2494,7 +2516,7 @@ pub fn derive_review_outcome_bindings(
 }
 
 /// Stores review outcome binding artifacts in CAS so they are resolvable
-/// at validation time (TCK-00416).
+/// at validation time (RFC-0032::REQ-0160).
 ///
 /// This must be called BEFORE `validate_review_outcome_bindings` to ensure
 /// CAS-resolvability. The function stores domain-tagged preimages for each
@@ -2542,7 +2564,7 @@ pub fn store_review_outcome_artifacts(
 }
 
 /// Emits a structured defect event for authority binding violations
-/// (TCK-00416).
+/// (RFC-0032::REQ-0160).
 ///
 /// Per REQ-HEF-0013, missing/unresolved bindings produce hard failures WITH
 /// defect emission. This function builds and emits the `DefectRecorded` event.
@@ -2601,7 +2623,7 @@ pub fn emit_authority_binding_defect(
 }
 
 /// Stores authority binding artifacts in CAS so they are resolvable
-/// at validation time (TCK-00416).
+/// at validation time (RFC-0032::REQ-0160).
 ///
 /// This must be called BEFORE `validate_transition_authority_bindings`
 /// to ensure CAS-resolvability. The function stores:
@@ -2924,7 +2946,7 @@ pub fn seed_policy_artifacts_in_cas(
 }
 
 /// Handler-level authority binding validation for production transition paths
-/// (TCK-00416).
+/// (RFC-0032::REQ-0160).
 ///
 /// This combines CAS artifact storage and binding validation into one
 /// transactional call. ALL binding hashes (including policy-provided
@@ -3066,7 +3088,8 @@ pub fn validate_and_store_transition_authority(
     }
 }
 
-/// Appends review outcome binding fields to a JSON event payload (TCK-00416).
+/// Appends review outcome binding fields to a JSON event payload
+/// (RFC-0032::REQ-0160).
 pub fn append_review_outcome_fields(
     payload: &mut serde_json::Map<String, serde_json::Value>,
     bindings: &ReviewOutcomeBindings,
@@ -3196,7 +3219,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build canonical payload (deterministic JSON)
-        // TCK-00416: Derive authority bindings and embed in signed payload.
+        // RFC-0032::REQ-0160: Derive authority bindings and embed in signed payload.
         // This ensures transition authority fields are persisted in the
         // signed event and cannot be stripped post-signing.
         let mut payload_map = serde_json::Map::new();
@@ -3233,7 +3256,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             )),
         );
 
-        // TCK-00416 BLOCKER 3: Append transition authority binding fields
+        // RFC-0032::REQ-0160 BLOCKER 3: Append transition authority binding fields
         // to the signed payload. These are derived from the claim and
         // persisted in the event so they are audit-bound.
         if let Ok(authority_bindings) = derive_claim_transition_authority_bindings(claim) {
@@ -3256,7 +3279,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Sign the canonical bytes
         let signature = self.signing_key.sign(&canonical_bytes);
 
-        // TCK-00289: Use provided HTF-compliant timestamp from HolonicClock.
+        // RFC-0032::REQ-0091: Use provided HTF-compliant timestamp from HolonicClock.
         // The timestamp_ns parameter is now provided by the caller from
         // HolonicClock.now_hlc() ensuring RFC-0016 HTF compliance.
 
@@ -3456,7 +3479,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
-        // Domain prefix for generic session events (TCK-00290)
+        // Domain prefix for generic session events (RFC-0032::REQ-0092)
         const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
 
         // Generate unique event ID
@@ -3500,9 +3523,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             None
         };
 
-        // MAJOR 1 FIX (TCK-00290): Use JCS (RFC 8785) canonicalization for signing.
-        // This matches the production SqliteLedgerEventEmitter and ensures
-        // deterministic JSON representation per RFC-0016. Using
+        // MAJOR 1 FIX (RFC-0032::REQ-0092): Use JCS (RFC 8785) canonicalization for
+        // signing. This matches the production SqliteLedgerEventEmitter and
+        // ensures deterministic JSON representation per RFC-0016. Using
         // serde_json::to_vec is non-deterministic because it does not guarantee
         // key ordering.
         let payload_string = payload_json.to_string();
@@ -3537,7 +3560,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
             let (order, events) = &mut *guard;
 
-            // SECURITY (TCK-00635): Enforce at-most-one `work.opened` per
+            // SECURITY (RFC-0032::REQ-0263): Enforce at-most-one `work.opened` per
             // work_id, mirroring the SQLite partial unique index
             // `idx_work_opened_unique`. This prevents racing
             // `emit_session_event` calls from creating duplicate events
@@ -3561,7 +3584,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
                 }
             }
 
-            // TCK-00639 SECURITY FIX: Enforce at-most-one
+            // RFC-0032::REQ-0267 SECURITY FIX: Enforce at-most-one
             // `work.pr_associated` per semantic identity
             // `(work_id, pr_number, commit_sha)`, mirroring SQLite UNIQUE
             // index `idx_work_pr_associated_unique`.
@@ -3654,7 +3677,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         false
     }
 
-    /// TCK-00638 SECURITY FIX: In-memory enforcement of at-most-one
+    /// RFC-0032::REQ-0266 SECURITY FIX: In-memory enforcement of at-most-one
     /// `evidence.published` per `evidence_id`, mirroring the `SQLite` UNIQUE
     /// index `idx_evidence_published_unique` /
     /// `idx_canonical_evidence_published_unique`.
@@ -3862,7 +3885,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
-        // TCK-00307 MAJOR 4: Call validate() to enforce DoS protections
+        // RFC-0032::REQ-0103 MAJOR 4: Call validate() to enforce DoS protections
         defect
             .validate()
             .map_err(|e| LedgerEventError::ValidationFailed { message: e })?;
@@ -3870,7 +3893,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // TCK-00307 BLOCKER: Use JCS/JSON wire format (not ProtoBuf) to match
+        // RFC-0032::REQ-0103 BLOCKER: Use JCS/JSON wire format (not ProtoBuf) to match
         // SqliteLedgerEventEmitter and ensure consumer uniformity.
         // Include time_envelope_ref for temporal binding (MAJOR 1).
         let time_envelope_ref_hex = defect
@@ -4181,7 +4204,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         work_id: &str,
         entry_id: &str,
     ) -> Option<SignedLedgerEvent> {
-        // TCK-00638: First try O(1) lookup via the top-level evidence_id
+        // RFC-0032::REQ-0266: First try O(1) lookup via the top-level evidence_id
         // field in the JSON envelope (written by emit_evidence_published_event).
         // This mirrors the indexed SQL lookup in SqliteLedgerEventEmitter.
         let guard = self.events.read().expect("lock poisoned");
@@ -4371,7 +4394,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
         //
-        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // SECURITY (RFC-0020::REQ-0010 Fix 1): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing.
         let mut payload_map = serde_json::Map::new();
@@ -4418,7 +4441,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             serde_json::json!(time_envelope_ref),
         );
 
-        // TCK-00416 BLOCKER 3: Append review outcome binding fields to the
+        // RFC-0032::REQ-0160 BLOCKER 3: Append review outcome binding fields to the
         // signed payload using domain-tagged derivation.
         let outcome_bindings =
             derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
@@ -4438,8 +4461,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let payload_bytes = canonical_payload.as_bytes().to_vec();
 
         // Build canonical bytes for signing (domain prefix + JCS payload)
-        // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
-        // protocol compatibility across daemon/core boundary.
+        // RFC-0032::REQ-0115: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac
+        // for protocol compatibility across daemon/core boundary.
         let mut canonical_bytes =
             Vec::with_capacity(REVIEW_RECEIPT_RECORDED_PREFIX.len() + payload_bytes.len());
         canonical_bytes.extend_from_slice(REVIEW_RECEIPT_RECORDED_PREFIX);
@@ -4536,7 +4559,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // SECURITY (TCK-00356 Fix 2): identity_proof_hash is included in
+        // SECURITY (RFC-0020::REQ-0010 Fix 2): identity_proof_hash is included in
         // the signed payload so it is audit-bound and cannot be stripped
         // post-signing, matching the APPROVE path's payload binding.
         let mut payload_map = serde_json::Map::new();
@@ -4592,7 +4615,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             serde_json::json!(time_envelope_ref),
         );
 
-        // TCK-00416 BLOCKER 3: Append review outcome binding fields to the
+        // RFC-0032::REQ-0160 BLOCKER 3: Append review outcome binding fields to the
         // signed payload using domain-tagged derivation.
         let outcome_bindings =
             derive_review_outcome_bindings(changeset_digest, artifact_bundle_hash, receipt_id);
@@ -4687,8 +4710,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
-        // TCK-00330: adapter_profile_hash provides ledger attribution for profile-based
-        // auditing
+        // RFC-0032::REQ-0123: adapter_profile_hash provides ledger attribution for
+        // profile-based auditing
         let payload_json = serde_json::json!({
             "event_type": "episode_run_attributed",
             "work_id": work_id,
@@ -4792,7 +4815,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "timestamp_ns": transition.timestamp_ns,
         });
 
-        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        // RFC-0032::REQ-0149: Use JCS (RFC 8785) canonicalization for signing.
         let payload_string = payload_json.to_string();
         let canonical_payload =
             canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
@@ -4890,7 +4913,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "timestamp_ns": timestamp_ns,
         });
 
-        // TCK-00395: Use JCS (RFC 8785) canonicalization for signing.
+        // RFC-0032::REQ-0149: Use JCS (RFC 8785) canonicalization for signing.
         let payload_string = payload_json.to_string();
         let canonical_payload =
             canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
@@ -4986,7 +5009,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "timestamp_ns": timestamp_ns,
         });
 
-        // TCK-00394: Use JCS (RFC 8785) canonicalization for signing.
+        // RFC-0032::REQ-0148: Use JCS (RFC 8785) canonicalization for signing.
         let payload_string = payload_json.to_string();
         let canonical_payload =
             canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
@@ -5057,7 +5080,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         Ok(signed_event)
     }
 
-    /// TCK-00350: Emits a receipt with envelope bindings in the stub
+    /// RFC-0020::REQ-0004: Emits a receipt with envelope bindings in the stub
     /// implementation.
     #[allow(clippy::too_many_arguments)]
     fn emit_receipt_with_bindings(
@@ -5083,7 +5106,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Include bindings in the signed payload
-        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // SECURITY (RFC-0020::REQ-0010 Fix 1): identity_proof_hash is included in
         // the signed payload so it is audit-bound.
         let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
         let payload_json = serde_json::json!({
@@ -5182,7 +5205,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 }
 
 // ============================================================================
-// Policy Resolver Interface (TCK-00253)
+// Policy Resolver Interface (RFC-0032::REQ-0069)
 // ============================================================================
 
 use serde::{Deserialize, Serialize};
@@ -5365,14 +5388,14 @@ pub trait PolicyResolver: Send + Sync {
 /// Returns deterministic stub data. In production, this will be replaced
 /// with a real governance holon integration.
 ///
-/// # TCK-00255: Context Pack Sealing
+/// # RFC-0032::REQ-0071: Context Pack Sealing
 ///
 /// This stub demonstrates the sealing pattern required by RFC-0017:
 /// 1. Create a `ContextPackManifest` with work-specific entries
 /// 2. Call `seal()` to get the deterministic content hash
 /// 3. Return the seal hash in the `PolicyResolution.context_pack_hash`
 ///
-/// # TCK-00317: Role-Based Manifest Hash Resolution
+/// # RFC-0032::REQ-0111: Role-Based Manifest Hash Resolution
 ///
 /// Per DOD item 2 (Policy Resolution Bypass fix), this resolver now returns
 /// the canonical `reviewer_v0_manifest_hash()` for the Reviewer role. This
@@ -5393,7 +5416,7 @@ impl PolicyResolver for StubPolicyResolver {
         // Generate deterministic hash for policy
         let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
 
-        // TCK-00317: Return role-appropriate manifest hash
+        // RFC-0032::REQ-0111: Return role-appropriate manifest hash
         //
         // Per DOD item 2, the policy resolver must return the correct manifest
         // hash for each role. SpawnEpisode uses this hash to load the manifest
@@ -5429,12 +5452,12 @@ impl PolicyResolver for StubPolicyResolver {
             )
         };
 
-        // TCK-00255: Create and seal a context pack manifest
+        // RFC-0032::REQ-0071: Create and seal a context pack manifest
         // Uses the shared `build_policy_context_pack` helper so that
         // `seed_policy_artifacts_in_cas` can reproduce the same preimage.
         let context_pack = build_policy_context_pack(work_id, actor_id);
 
-        // TCK-00255: Call seal() to get the context pack hash
+        // RFC-0032::REQ-0071: Call seal() to get the context pack hash
         // This ensures the hash is deterministic and verifiable.
         let context_pack_hash =
             context_pack
@@ -5464,13 +5487,14 @@ impl PolicyResolver for StubPolicyResolver {
             context_pack_recipe_hash,
             resolved_risk_tier: 0, // Stub resolver: Tier0 default
             resolved_scope_baseline,
-            expected_adapter_profile_hash: None, // TODO(TCK-00399): populate from governance
+            expected_adapter_profile_hash: None, /* TODO(RFC-0032::REQ-0151): populate from
+                                                  * governance */
         })
     }
 }
 
 // ============================================================================
-// Permeability Receipt Resolver (TCK-00373)
+// Permeability Receipt Resolver (RFC-0020::REQ-0027)
 // ============================================================================
 
 /// Resolves an optional permeability receipt for a work claim.
@@ -5536,7 +5560,7 @@ impl PermeabilityReceiptResolver for StubPermeabilityReceiptResolver {
 }
 
 // ============================================================================
-// Work Registry Interface (TCK-00253)
+// Work Registry Interface (RFC-0032::REQ-0069)
 // ============================================================================
 
 /// A claimed work item with its associated metadata.
@@ -5560,19 +5584,19 @@ pub struct WorkClaim {
 
     /// Custody domains associated with the executor (for `SoD` validation).
     ///
-    /// Per TCK-00258, these are the domains assigned to the actor claiming
-    /// the work. For `GATE_EXECUTOR` roles, spawn will be rejected if these
-    /// domains overlap with author domains.
+    /// Per RFC-0032::REQ-0074, these are the domains assigned to the actor
+    /// claiming the work. For `GATE_EXECUTOR` roles, spawn will be rejected
+    /// if these domains overlap with author domains.
     pub executor_custody_domains: Vec<String>,
 
     /// Custody domains associated with changeset authors (for `SoD`
     /// validation).
     ///
-    /// Per TCK-00258, these are the domains of the actors who authored the
-    /// changeset being reviewed.
+    /// Per RFC-0032::REQ-0074, these are the domains of the actors who authored
+    /// the changeset being reviewed.
     pub author_custody_domains: Vec<String>,
 
-    /// TCK-00373: Optional permeability receipt for delegated spawns.
+    /// RFC-0020::REQ-0027: Optional permeability receipt for delegated spawns.
     ///
     /// When present, `handle_spawn_episode` routes through the
     /// delegated spawn gate for full consumption-binding verification
@@ -5584,7 +5608,7 @@ pub struct WorkClaim {
 
 impl WorkClaim {
     /// Returns a deterministic upper-bound byte estimate for queue-byte
-    /// accounting (TCK-00568).
+    /// accounting (RFC-0032::REQ-0219).
     ///
     /// Uses JSON serialization of the full claim to capture ALL fields
     /// (`policy_resolution`, `executor_custody_domains`,
@@ -5908,7 +5932,7 @@ impl WorkRegistry for StubWorkRegistry {
 }
 
 // ============================================================================
-// Actor ID Derivation (TCK-00253)
+// Actor ID Derivation (RFC-0032::REQ-0069)
 // ============================================================================
 
 /// Derives the authoritative actor ID from peer credentials.
@@ -5937,9 +5961,9 @@ impl WorkRegistry for StubWorkRegistry {
 ///
 /// # TODO
 ///
-/// - TCK-00253: `credential_signature` field is currently ignored. Integration
-///   with credential verification infrastructure will allow deriving `actor_id`
-///   from cryptographic identity rather than Unix UID/GID.
+/// - RFC-0032::REQ-0069: `credential_signature` field is currently ignored.
+///   Integration with credential verification infrastructure will allow
+///   deriving `actor_id` from cryptographic identity rather than Unix UID/GID.
 #[must_use]
 pub fn derive_actor_id(credentials: &PeerCredentials) -> String {
     // Create a fingerprint from UID and GID only (stable across requests)
@@ -6480,7 +6504,7 @@ fn validate_receipt_replay_bindings(
 /// - operator.sock: `is_privileged = true`
 /// - session.sock: `is_privileged = false`
 ///
-/// # TCK-00303: Connection Lifecycle Management
+/// # RFC-0032::REQ-0099: Connection Lifecycle Management
 ///
 /// The `connection_id` field is used to track connections in the subscription
 /// registry. When a connection closes, the connection handler MUST call
@@ -6498,14 +6522,14 @@ pub struct ConnectionContext {
     /// connections).
     session_id: Option<String>,
 
-    /// Connection ID for subscription registry tracking (TCK-00303).
+    /// Connection ID for subscription registry tracking (RFC-0032::REQ-0099).
     ///
     /// Generated once when the connection is established and used consistently
     /// across all subscribe/unsubscribe operations. Must be passed to
     /// `unregister_connection` when the connection closes to prevent leaks.
     connection_id: String,
 
-    /// Contract binding metadata from the handshake (TCK-00348).
+    /// Contract binding metadata from the handshake (RFC-0020::REQ-0002).
     ///
     /// Stored at connection time and threaded into `SessionStarted` events
     /// during `SpawnEpisode` so the authoritative record uses the real
@@ -6518,10 +6542,10 @@ pub struct ConnectionContext {
     /// This is persisted into `SessionStarted` payloads when present so
     /// session-open audit records bind to the verifier economics contract
     /// (REQ-0012). Full identity proof dereference wiring is deferred under
-    /// WVR-0103 / TCK-00361.
+    /// WVR-0103 / RFC-0020::REQ-0015.
     identity_proof_profile_hash: Option<[u8; 32]>,
 
-    /// Connection phase for session-typed state machine (TCK-00349).
+    /// Connection phase for session-typed state machine (RFC-0020::REQ-0003).
     ///
     /// Per REQ-0003, authority-bearing operations require valid session-state
     /// progression. The phase starts at `Connected`, advances to
@@ -6537,7 +6561,7 @@ pub struct ConnectionContext {
 impl ConnectionContext {
     /// Creates a new privileged connection context (operator socket).
     ///
-    /// # TCK-00303: Connection ID Generation
+    /// # RFC-0032::REQ-0099: Connection ID Generation
     ///
     /// The `connection_id` is generated from peer credentials (PID-based for
     /// operator connections) or a UUID if credentials are unavailable.
@@ -6554,7 +6578,7 @@ impl ConnectionContext {
             connection_id,
             contract_binding: None,
             identity_proof_profile_hash: None,
-            // TCK-00349: New connections start in Connected phase.
+            // RFC-0020::REQ-0003: New connections start in Connected phase.
             // Callers MUST advance to SessionOpen before dispatch.
             phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
         }
@@ -6562,7 +6586,7 @@ impl ConnectionContext {
 
     /// Creates a new session-scoped connection context (session socket).
     ///
-    /// # TCK-00303: Connection ID Generation
+    /// # RFC-0032::REQ-0099: Connection ID Generation
     ///
     /// The `connection_id` is generated from the session ID (if available)
     /// or peer credentials (PID-based), or a UUID if neither is available.
@@ -6587,7 +6611,7 @@ impl ConnectionContext {
             connection_id,
             contract_binding: None,
             identity_proof_profile_hash: None,
-            // TCK-00349: New connections start in Connected phase.
+            // RFC-0020::REQ-0003: New connections start in Connected phase.
             // Callers MUST advance to SessionOpen before dispatch.
             phase: crate::protocol::connection_handler::ConnectionPhase::Connected,
         }
@@ -6613,7 +6637,7 @@ impl ConnectionContext {
 
     /// Returns the connection ID for subscription registry tracking.
     ///
-    /// # TCK-00303: Connection Lifecycle
+    /// # RFC-0032::REQ-0099: Connection Lifecycle
     ///
     /// This ID must be passed to `unregister_connection` when the connection
     /// closes to free subscription registry slots and prevent `DoS` via
@@ -6623,7 +6647,8 @@ impl ConnectionContext {
         &self.connection_id
     }
 
-    /// Sets the contract binding metadata from the handshake (TCK-00348).
+    /// Sets the contract binding metadata from the handshake
+    /// (RFC-0020::REQ-0002).
     ///
     /// Called after `perform_handshake` succeeds. The binding is later
     /// threaded into `SessionStarted` events during `emit_spawn_lifecycle`.
@@ -6641,7 +6666,7 @@ impl ConnectionContext {
     ///
     /// Called from the production session-open path in `main.rs` when
     /// the active identity proof profile is resolved after handshake
-    /// (TCK-00358). Also used by test code to inject specific profile
+    /// (RFC-0020::REQ-0012). Also used by test code to inject specific profile
     /// hashes for verification. The spawn path emits a warning and
     /// falls back to the baseline SMT-256 10^12 profile hash if this
     /// method was not called at session-open time.
@@ -6665,13 +6690,14 @@ impl ConnectionContext {
         self.identity_proof_profile_hash.as_ref()
     }
 
-    /// Returns the current connection phase (TCK-00349).
+    /// Returns the current connection phase (RFC-0020::REQ-0003).
     #[must_use]
     pub const fn phase(&self) -> crate::protocol::connection_handler::ConnectionPhase {
         self.phase
     }
 
-    /// Advances the connection phase to `HandshakeComplete` (TCK-00349).
+    /// Advances the connection phase to `HandshakeComplete`
+    /// (RFC-0020::REQ-0003).
     ///
     /// Called after `perform_handshake` succeeds. Must be called before
     /// `advance_to_session_open`.
@@ -6687,7 +6713,7 @@ impl ConnectionContext {
         Ok(())
     }
 
-    /// Advances the connection phase to `SessionOpen` (TCK-00349).
+    /// Advances the connection phase to `SessionOpen` (RFC-0020::REQ-0003).
     ///
     /// Called after handshake completion, before entering the message
     /// dispatch loop. This is the gate that permits authority-bearing
@@ -6759,7 +6785,7 @@ impl ConnectionContext {
 ///
 /// # Consensus Query Tag Range (CTR-PROTO-011)
 ///
-/// Consensus query messages use tags 5-8 per RFC-0014/TCK-00345:
+/// Consensus query messages use tags 5-8 per RFC-0014/RFC-0032::REQ-0135:
 /// - 5 = `ConsensusStatus`
 /// - 6 = `ConsensusValidators`
 /// - 7 = `ConsensusByzantineEvidence`
@@ -6784,7 +6810,7 @@ pub enum PrivilegedMessageType {
     IssueCapability     = 3,
     /// Shutdown request (IPC-PRIV-004)
     Shutdown            = 4,
-    // --- Process Management (CTR-PROTO-011, TCK-00342) ---
+    // --- Process Management (CTR-PROTO-011, RFC-0032::REQ-0132) ---
     /// `ListProcesses` request (IPC-PRIV-005)
     ListProcesses       = 5,
     /// `ProcessStatus` request (IPC-PRIV-006)
@@ -6797,7 +6823,7 @@ pub enum PrivilegedMessageType {
     RestartProcess      = 9,
     /// `ReloadProcess` request (IPC-PRIV-010)
     ReloadProcess       = 10,
-    // --- Consensus Query Endpoints (CTR-PROTO-011, RFC-0014, TCK-00345) ---
+    // --- Consensus Query Endpoints (CTR-PROTO-011, RFC-0014, RFC-0032::REQ-0135) ---
     /// `ConsensusStatus` request (IPC-PRIV-011)
     ConsensusStatus     = 11,
     /// `ConsensusValidators` request (IPC-PRIV-012)
@@ -6806,19 +6832,19 @@ pub enum PrivilegedMessageType {
     ConsensusByzantineEvidence = 13,
     /// `ConsensusMetrics` request (IPC-PRIV-014)
     ConsensusMetrics    = 14,
-    /// `WorkStatus` request (IPC-PRIV-015, TCK-00344)
+    /// `WorkStatus` request (IPC-PRIV-015, RFC-0032::REQ-0134)
     WorkStatus          = 15,
-    /// `EndSession` request (IPC-PRIV-016, TCK-00395)
+    /// `EndSession` request (IPC-PRIV-016, RFC-0032::REQ-0149)
     EndSession          = 16,
-    /// `IngestReviewReceipt` request (IPC-PRIV-017, TCK-00389)
+    /// `IngestReviewReceipt` request (IPC-PRIV-017, RFC-0032::REQ-0143)
     IngestReviewReceipt = 17,
-    /// `UpdateStopFlags` request (IPC-PRIV-018, TCK-00351)
+    /// `UpdateStopFlags` request (IPC-PRIV-018, RFC-0020::REQ-0005)
     UpdateStopFlags     = 18,
-    /// `WorkList` request (IPC-PRIV-019, TCK-00415)
+    /// `WorkList` request (IPC-PRIV-019, RFC-0032::REQ-0159)
     WorkList            = 19,
-    /// `AuditorLaunchProjection` request (IPC-PRIV-020, TCK-00452)
+    /// `AuditorLaunchProjection` request (IPC-PRIV-020, RFC-0020::REQ-0040)
     AuditorLaunchProjection = 20,
-    // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
+    // --- Credential Management (CTR-PROTO-012, RFC-0018, RFC-0032::REQ-0133) ---
     /// `ListCredentials` request (IPC-PRIV-021)
     ListCredentials     = 21,
     /// `AddCredential` request (IPC-PRIV-022)
@@ -6831,7 +6857,8 @@ pub enum PrivilegedMessageType {
     SwitchCredential    = 25,
     /// `LoginCredential` request (IPC-PRIV-026)
     LoginCredential     = 26,
-    /// `OrchestratorLaunchProjection` request (IPC-PRIV-027, TCK-00452)
+    /// `OrchestratorLaunchProjection` request (IPC-PRIV-027,
+    /// RFC-0020::REQ-0040)
     OrchestratorLaunchProjection = 27,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
@@ -6840,36 +6867,36 @@ pub enum PrivilegedMessageType {
     UnsubscribePulse    = 66,
     /// `PulseEvent` notification (server->client, IPC-HEF-003)
     PulseEvent          = 68,
-    // --- ChangeSet Publishing (RFC-0018, TCK-00394) ---
+    // --- ChangeSet Publishing (RFC-0018, RFC-0032::REQ-0148) ---
     /// `PublishChangeSet` request (IPC-PRIV-017)
     PublishChangeSet    = 70,
-    // --- Sublease Delegation (RFC-0019, TCK-00340) ---
+    // --- Sublease Delegation (RFC-0019, RFC-0032::REQ-0131) ---
     /// `DelegateSublease` request (IPC-PRIV-072)
     DelegateSublease    = 72,
-    // --- Ledger Integrity Audit (TCK-00487) ---
+    // --- Ledger Integrity Audit (RFC-0020::REQ-0053) ---
     /// `VerifyLedgerChain` request (IPC-PRIV-073)
     VerifyLedgerChain   = 73,
-    // --- Projection Recovery (TCK-00469) ---
+    // --- Projection Recovery (RFC-0020::REQ-0051) ---
     /// `RegisterRecoveryEvidence` request (IPC-PRIV-074)
     RegisterRecoveryEvidence = 74,
     /// `RequestUnfreeze` request (IPC-PRIV-075)
     RequestUnfreeze     = 75,
-    // --- Work Lifecycle (RFC-0032, TCK-00635) ---
+    // --- Work Lifecycle (RFC-0032, RFC-0032::REQ-0263) ---
     /// `OpenWork` request (IPC-PRIV-076)
     OpenWork            = 28,
-    // --- Work Claim V2 (RFC-0032, TCK-00637) ---
+    // --- Work Claim V2 (RFC-0032, RFC-0032::REQ-0265) ---
     /// `ClaimWorkV2` request (IPC-PRIV-078)
     ClaimWorkV2         = 29,
-    // --- Work Context Publishing (RFC-0032, TCK-00638) ---
+    // --- Work Context Publishing (RFC-0032, RFC-0032::REQ-0266) ---
     /// `PublishWorkContextEntry` request (IPC-PRIV-077)
     PublishWorkContextEntry = 76,
-    // --- Work Loop Profile Publishing (RFC-0032, TCK-00645) ---
+    // --- Work Loop Profile Publishing (RFC-0032, RFC-0032::REQ-0270) ---
     /// `PublishWorkLoopProfile` request (IPC-PRIV-079)
     PublishWorkLoopProfile = 77,
-    // --- Work PR Association (RFC-0032, TCK-00639) ---
+    // --- Work PR Association (RFC-0032, RFC-0032::REQ-0267) ---
     /// `RecordWorkPrAssociation` request (IPC-PRIV-079)
     RecordWorkPrAssociation = 30,
-    // --- Ticket Alias Resolution (RFC-0032, TCK-00636) ---
+    // --- Ticket Alias Resolution (RFC-0032, RFC-0032::REQ-0264) ---
     /// `ResolveTicketAlias` request (IPC-PRIV-080)
     ResolveTicketAlias  = 31,
 }
@@ -6890,56 +6917,56 @@ impl PrivilegedMessageType {
             8 => Some(Self::StopProcess),
             9 => Some(Self::RestartProcess),
             10 => Some(Self::ReloadProcess),
-            // Consensus query tags (11-14, TCK-00345)
+            // Consensus query tags (11-14, RFC-0032::REQ-0135)
             11 => Some(Self::ConsensusStatus),
             12 => Some(Self::ConsensusValidators),
             13 => Some(Self::ConsensusByzantineEvidence),
             14 => Some(Self::ConsensusMetrics),
-            // TCK-00344: Work status query
+            // RFC-0032::REQ-0134: Work status query
             15 => Some(Self::WorkStatus),
-            // TCK-00395: EndSession for session termination
+            // RFC-0032::REQ-0149: EndSession for session termination
             16 => Some(Self::EndSession),
-            // TCK-00389: IngestReviewReceipt for external reviewer results
+            // RFC-0032::REQ-0143: IngestReviewReceipt for external reviewer results
             17 => Some(Self::IngestReviewReceipt),
-            // TCK-00351: stop flags update
+            // RFC-0020::REQ-0005: stop flags update
             18 => Some(Self::UpdateStopFlags),
-            // TCK-00415: projection-backed work listing
+            // RFC-0032::REQ-0159: projection-backed work listing
             19 => Some(Self::WorkList),
-            // TCK-00452: auditor projection
+            // RFC-0020::REQ-0040: auditor projection
             20 => Some(Self::AuditorLaunchProjection),
-            // Credential management tags (21-26, TCK-00343)
+            // Credential management tags (21-26, RFC-0032::REQ-0133)
             21 => Some(Self::ListCredentials),
             22 => Some(Self::AddCredential),
             23 => Some(Self::RemoveCredential),
             24 => Some(Self::RefreshCredential),
             25 => Some(Self::SwitchCredential),
             26 => Some(Self::LoginCredential),
-            // TCK-00452: orchestrator projection
+            // RFC-0020::REQ-0040: orchestrator projection
             27 => Some(Self::OrchestratorLaunchProjection),
-            // TCK-00635: OpenWork (RFC-0032 Phase 1)
+            // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
             28 => Some(Self::OpenWork),
-            // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
+            // RFC-0032::REQ-0265: ClaimWorkV2 (RFC-0032 Phase 2)
             29 => Some(Self::ClaimWorkV2),
-            // TCK-00639: RecordWorkPrAssociation (RFC-0032 Phase 2)
+            // RFC-0032::REQ-0267: RecordWorkPrAssociation (RFC-0032 Phase 2)
             30 => Some(Self::RecordWorkPrAssociation),
-            // TCK-00636: ResolveTicketAlias (RFC-0032 Phase 1)
+            // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
             31 => Some(Self::ResolveTicketAlias),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
             68 => Some(Self::PulseEvent),
-            // ChangeSet publishing (TCK-00394)
+            // ChangeSet publishing (RFC-0032::REQ-0148)
             70 => Some(Self::PublishChangeSet),
-            // Sublease delegation (TCK-00340)
+            // Sublease delegation (RFC-0032::REQ-0131)
             72 => Some(Self::DelegateSublease),
-            // Ledger integrity audit (TCK-00487)
+            // Ledger integrity audit (RFC-0020::REQ-0053)
             73 => Some(Self::VerifyLedgerChain),
-            // Projection recovery (TCK-00469)
+            // Projection recovery (RFC-0020::REQ-0051)
             74 => Some(Self::RegisterRecoveryEvidence),
             75 => Some(Self::RequestUnfreeze),
-            // Work context publishing (TCK-00638)
+            // Work context publishing (RFC-0032::REQ-0266)
             76 => Some(Self::PublishWorkContextEntry),
-            // Work loop profile publishing (TCK-00645)
+            // Work loop profile publishing (RFC-0032::REQ-0270)
             77 => Some(Self::PublishWorkLoopProfile),
             _ => None,
         }
@@ -7276,7 +7303,7 @@ pub enum PrivilegedResponse {
     IssueCapability(IssueCapabilityResponse),
     /// Successful Shutdown response.
     Shutdown(ShutdownResponse),
-    // --- Process Management (TCK-00342) ---
+    // --- Process Management (RFC-0032::REQ-0132) ---
     /// Successful `ListProcesses` response.
     ListProcesses(ListProcessesResponse),
     /// Successful `ProcessStatus` response.
@@ -7289,21 +7316,21 @@ pub enum PrivilegedResponse {
     RestartProcess(RestartProcessResponse),
     /// Successful `ReloadProcess` response.
     ReloadProcess(ReloadProcessResponse),
-    /// Successful `WorkStatus` response (TCK-00344).
+    /// Successful `WorkStatus` response (RFC-0032::REQ-0134).
     WorkStatus(WorkStatusResponse),
-    /// Successful `WorkList` response (TCK-00415).
+    /// Successful `WorkList` response (RFC-0032::REQ-0159).
     WorkList(WorkListResponse),
-    /// Successful `AuditorLaunchProjection` response (TCK-00452).
+    /// Successful `AuditorLaunchProjection` response (RFC-0020::REQ-0040).
     AuditorLaunchProjection(AuditorLaunchProjectionResponse),
-    /// Successful `OrchestratorLaunchProjection` response (TCK-00452).
+    /// Successful `OrchestratorLaunchProjection` response (RFC-0020::REQ-0040).
     OrchestratorLaunchProjection(OrchestratorLaunchProjectionResponse),
-    /// Successful `EndSession` response (TCK-00395).
+    /// Successful `EndSession` response (RFC-0032::REQ-0149).
     EndSession(EndSessionResponse),
-    /// Successful `IngestReviewReceipt` response (TCK-00389).
+    /// Successful `IngestReviewReceipt` response (RFC-0032::REQ-0143).
     IngestReviewReceipt(IngestReviewReceiptResponse),
-    /// Successful `UpdateStopFlags` response (TCK-00351).
+    /// Successful `UpdateStopFlags` response (RFC-0020::REQ-0005).
     UpdateStopFlags(UpdateStopFlagsResponse),
-    // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
+    // --- Credential Management (CTR-PROTO-012, RFC-0032::REQ-0133) ---
     /// Successful `ListCredentials` response.
     ListCredentials(ListCredentialsResponse),
     /// Successful `AddCredential` response.
@@ -7316,39 +7343,39 @@ pub enum PrivilegedResponse {
     SwitchCredential(SwitchCredentialResponse),
     /// Successful `LoginCredential` response.
     LoginCredential(LoginCredentialResponse),
-    /// Successful `SubscribePulse` response (TCK-00302).
+    /// Successful `SubscribePulse` response (RFC-0032::REQ-0098).
     SubscribePulse(SubscribePulseResponse),
-    /// Successful `UnsubscribePulse` response (TCK-00302).
+    /// Successful `UnsubscribePulse` response (RFC-0032::REQ-0098).
     UnsubscribePulse(UnsubscribePulseResponse),
-    /// Successful `ConsensusStatus` response (TCK-00345).
+    /// Successful `ConsensusStatus` response (RFC-0032::REQ-0135).
     ConsensusStatus(ConsensusStatusResponse),
-    /// Successful `ConsensusValidators` response (TCK-00345).
+    /// Successful `ConsensusValidators` response (RFC-0032::REQ-0135).
     ConsensusValidators(ConsensusValidatorsResponse),
-    /// Successful `ConsensusByzantineEvidence` response (TCK-00345).
+    /// Successful `ConsensusByzantineEvidence` response (RFC-0032::REQ-0135).
     ConsensusByzantineEvidence(ConsensusByzantineEvidenceResponse),
-    /// Successful `ConsensusMetrics` response (TCK-00345).
+    /// Successful `ConsensusMetrics` response (RFC-0032::REQ-0135).
     ConsensusMetrics(ConsensusMetricsResponse),
-    /// Successful `PublishChangeSet` response (TCK-00394).
+    /// Successful `PublishChangeSet` response (RFC-0032::REQ-0148).
     PublishChangeSet(PublishChangeSetResponse),
-    /// Successful `DelegateSublease` response (TCK-00340).
+    /// Successful `DelegateSublease` response (RFC-0032::REQ-0131).
     DelegateSublease(DelegateSubleaseResponse),
-    /// Successful `VerifyLedgerChain` response (TCK-00487).
+    /// Successful `VerifyLedgerChain` response (RFC-0020::REQ-0053).
     VerifyLedgerChain(VerifyLedgerChainResponse),
-    /// Successful `RegisterRecoveryEvidence` response (TCK-00469).
+    /// Successful `RegisterRecoveryEvidence` response (RFC-0020::REQ-0051).
     RegisterRecoveryEvidence(RegisterRecoveryEvidenceResponse),
-    /// Successful `RequestUnfreeze` response (TCK-00469).
+    /// Successful `RequestUnfreeze` response (RFC-0020::REQ-0051).
     RequestUnfreeze(RequestUnfreezeResponse),
-    /// Successful `OpenWork` response (TCK-00635).
+    /// Successful `OpenWork` response (RFC-0032::REQ-0263).
     OpenWork(OpenWorkResponse),
-    /// Successful `ClaimWorkV2` response (TCK-00637).
+    /// Successful `ClaimWorkV2` response (RFC-0032::REQ-0265).
     ClaimWorkV2(ClaimWorkV2Response),
-    /// Successful `PublishWorkContextEntry` response (TCK-00638).
+    /// Successful `PublishWorkContextEntry` response (RFC-0032::REQ-0266).
     PublishWorkContextEntry(PublishWorkContextEntryResponse),
-    /// Successful `PublishWorkLoopProfile` response (TCK-00645).
+    /// Successful `PublishWorkLoopProfile` response (RFC-0032::REQ-0270).
     PublishWorkLoopProfile(PublishWorkLoopProfileResponse),
-    /// Successful `RecordWorkPrAssociation` response (TCK-00639).
+    /// Successful `RecordWorkPrAssociation` response (RFC-0032::REQ-0267).
     RecordWorkPrAssociation(RecordWorkPrAssociationResponse),
-    /// Successful `ResolveTicketAlias` response (TCK-00636).
+    /// Successful `ResolveTicketAlias` response (RFC-0032::REQ-0264).
     ResolveTicketAlias(ResolveTicketAliasResponse),
     /// Error response.
     Error(PrivilegedError),
@@ -7374,7 +7401,7 @@ impl PrivilegedResponse {
     }
 
     /// Creates a budget-denied error response with a structured denial receipt
-    /// (TCK-00568, INV-CPRL-003).
+    /// (RFC-0032::REQ-0219, INV-CPRL-003).
     ///
     /// Extracts the `ControlPlaneDenialReceipt` from the `ProtocolError` and
     /// JSON-serializes it into the error message alongside the human-readable
@@ -7429,7 +7456,7 @@ impl PrivilegedResponse {
                 buf.push(PrivilegedMessageType::Shutdown.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
-            // Process Management (TCK-00342)
+            // Process Management (RFC-0032::REQ-0132)
             Self::ListProcesses(resp) => {
                 buf.push(PrivilegedMessageType::ListProcesses.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
@@ -7474,7 +7501,7 @@ impl PrivilegedResponse {
                 buf.push(PrivilegedMessageType::EndSession.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
-            // TCK-00389: IngestReviewReceipt
+            // RFC-0032::REQ-0143: IngestReviewReceipt
             Self::IngestReviewReceipt(resp) => {
                 buf.push(PrivilegedMessageType::IngestReviewReceipt.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
@@ -7483,7 +7510,7 @@ impl PrivilegedResponse {
                 buf.push(PrivilegedMessageType::UpdateStopFlags.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
-            // Credential Management (CTR-PROTO-012, TCK-00343)
+            // Credential Management (CTR-PROTO-012, RFC-0032::REQ-0133)
             Self::ListCredentials(resp) => {
                 buf.push(PrivilegedMessageType::ListCredentials.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
@@ -7590,7 +7617,7 @@ impl PrivilegedResponse {
 // ============================================================================
 
 // ============================================================================
-// TCK-00257: Gate Lease Validation
+// RFC-0032::REQ-0073: Gate Lease Validation
 // ============================================================================
 
 /// Maximum number of lease entries to store (CTR-1303: bounded capacity).
@@ -7689,7 +7716,7 @@ pub trait LeaseValidator: Send + Sync {
         work_id: &str,
     ) -> Result<(), LeaseValidationError>;
 
-    /// Returns the `executor_actor_id` bound to a lease (TCK-00389).
+    /// Returns the `executor_actor_id` bound to a lease (RFC-0032::REQ-0143).
     ///
     /// This is used by `IngestReviewReceipt` to validate that the reviewer
     /// identity matches the executor authorized by the gate lease.
@@ -7705,7 +7732,7 @@ pub trait LeaseValidator: Send + Sync {
     /// This method exists to support test fixtures.
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str);
 
-    /// Registers a gate lease with an executor actor ID (TCK-00389).
+    /// Registers a gate lease with an executor actor ID (RFC-0032::REQ-0143).
     ///
     /// This method exists to support test fixtures that need to verify
     /// reviewer identity against the lease's `executor_actor_id`.
@@ -7721,7 +7748,7 @@ pub trait LeaseValidator: Send + Sync {
         self.register_lease(lease_id, work_id, gate_id);
     }
 
-    /// Returns the `work_id` bound to a lease (TCK-00340).
+    /// Returns the `work_id` bound to a lease (RFC-0032::REQ-0131).
     ///
     /// Used by `handle_ingest_review_receipt` to resolve the work claim
     /// and its associated risk tier for attestation ratcheting.
@@ -7734,7 +7761,7 @@ pub trait LeaseValidator: Send + Sync {
         None
     }
 
-    /// Returns the full `GateLease` for a given lease ID (TCK-00340).
+    /// Returns the full `GateLease` for a given lease ID (RFC-0032::REQ-0131).
     ///
     /// Used by `DelegateSublease` to retrieve the parent lease for
     /// strict-subset validation and sublease issuance.
@@ -7759,7 +7786,8 @@ pub trait LeaseValidator: Send + Sync {
         None
     }
 
-    /// Registers a full `GateLease` for sublease delegation (TCK-00340).
+    /// Registers a full `GateLease` for sublease delegation
+    /// (RFC-0032::REQ-0131).
     ///
     /// This method exists to support test fixtures and production paths
     /// that need full lease objects for sublease delegation.
@@ -7800,8 +7828,8 @@ pub trait LeaseValidator: Send + Sync {
         Ok(None)
     }
 
-    /// TCK-00631: Freeze legacy `ledger_events` writes and route future
-    /// appends/reads to the canonical `events` table.
+    /// RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes and route
+    /// future appends/reads to the canonical `events` table.
     ///
     /// Called by daemon startup after RFC-0032 Phase 0 migration.
     /// Default implementation is a no-op (for in-memory/stub validators).
@@ -7831,7 +7859,7 @@ struct LeaseEntry {
     work_id: String,
     #[allow(dead_code)]
     gate_id: String,
-    /// The executor actor ID authorized by this lease (TCK-00389).
+    /// The executor actor ID authorized by this lease (RFC-0032::REQ-0143).
     executor_actor_id: String,
 }
 
@@ -7866,7 +7894,7 @@ pub struct StubLeaseValidator {
         std::collections::VecDeque<String>,
         std::collections::HashMap<String, LeaseEntry>,
     )>,
-    /// Full gate leases for sublease delegation (TCK-00340).
+    /// Full gate leases for sublease delegation (RFC-0032::REQ-0131).
     full_leases: std::sync::RwLock<std::collections::HashMap<String, FullLeaseEntry>>,
 }
 
@@ -8056,33 +8084,33 @@ impl LeaseValidator for StubLeaseValidator {
 /// - No privileged handler logic executes for non-privileged connections
 /// - Generic error messages prevent endpoint enumeration (TH-004)
 ///
-/// # TCK-00253 Additions
+/// # RFC-0032::REQ-0069 Additions
 ///
 /// - Policy resolver for governance delegation
 /// - Work registry for claim persistence
 /// - Ledger event emitter for signed event persistence
 /// - Actor ID derivation from credentials
 ///
-/// # TCK-00256 Additions
+/// # RFC-0032::REQ-0072 Additions
 ///
 /// - Episode runtime for lifecycle management
 /// - Session registry for session state persistence
 ///
-/// # TCK-00257 Additions
+/// # RFC-0032::REQ-0073 Additions
 ///
 /// - Lease validator for `GATE_EXECUTOR` spawn validation
 ///
-/// # TCK-00289 Additions
+/// # RFC-0032::REQ-0091 Additions
 ///
 /// - `HolonicClock` for HTF-compliant timestamps in `IssueCapability`
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
 
-    /// Policy resolver for governance delegation (TCK-00253).
+    /// Policy resolver for governance delegation (RFC-0032::REQ-0069).
     policy_resolver: Arc<dyn PolicyResolver>,
 
-    /// Work registry for claim persistence (TCK-00253).
+    /// Work registry for claim persistence (RFC-0032::REQ-0069).
     work_registry: Arc<dyn WorkRegistry>,
 
     /// Staleness threshold for no-evidence `ClaimWorkV2` partial-recovery
@@ -8092,10 +8120,10 @@ pub struct PrivilegedDispatcher {
     /// Older rows are purged as stale retry debris.
     claim_work_v2_stale_claim_timeout: Duration,
 
-    /// Ledger event emitter for signed event persistence (TCK-00253).
+    /// Ledger event emitter for signed event persistence (RFC-0032::REQ-0069).
     event_emitter: Arc<dyn LedgerEventEmitter>,
 
-    /// Shared projection-backed work authority (TCK-00415).
+    /// Shared projection-backed work authority (RFC-0032::REQ-0159).
     ///
     /// Instantiated once and reused across requests so that the internal
     /// event-count cache is effective. Without sharing, each request would
@@ -8103,29 +8131,31 @@ pub struct PrivilegedDispatcher {
     /// forcing a full O(N) ledger replay every time.
     work_authority: Arc<ProjectionWorkAuthority>,
 
-    /// Episode runtime for lifecycle management (TCK-00256).
+    /// Episode runtime for lifecycle management (RFC-0032::REQ-0072).
     episode_runtime: Arc<EpisodeRuntime>,
 
-    /// Session registry for session state persistence (TCK-00256).
+    /// Session registry for session state persistence (RFC-0032::REQ-0072).
     session_registry: Arc<dyn SessionRegistry>,
 
-    /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
+    /// Lease validator for `GATE_EXECUTOR` spawn validation
+    /// (RFC-0032::REQ-0073).
     lease_validator: Arc<dyn LeaseValidator>,
 
-    /// Token minter for session token generation (TCK-00287).
+    /// Token minter for session token generation (RFC-0032::REQ-0089).
     ///
     /// Shared with `SessionDispatcher` to ensure tokens minted during
     /// `SpawnEpisode` can be validated on session endpoints.
     token_minter: Arc<TokenMinter>,
 
-    /// Manifest store for capability manifest registration (TCK-00287).
+    /// Manifest store for capability manifest registration
+    /// (RFC-0032::REQ-0089).
     ///
     /// Shared with `SessionDispatcher` so that manifests registered during
     /// `SpawnEpisode` are accessible for tool request validation.
     manifest_store: Arc<InMemoryManifestStore>,
 
     /// CAS-backed manifest loader for capability manifest retrieval
-    /// (TCK-00317).
+    /// (RFC-0032::REQ-0111).
     ///
     /// Per DOD item 1 (CAS Storage & Hash Loading), manifests are stored in
     /// CAS and loaded by hash. The policy resolver returns the manifest hash,
@@ -8138,7 +8168,8 @@ pub struct PrivilegedDispatcher {
     /// - Missing manifests result in fail-closed rejection
     manifest_loader: Arc<dyn ManifestLoader>,
 
-    /// Prometheus metrics registry for daemon health observability (TCK-00268).
+    /// Prometheus metrics registry for daemon health observability
+    /// (RFC-0032::REQ-0084).
     ///
     /// When present, the dispatcher emits metrics for:
     /// - `session_spawned`: When `SpawnEpisode` succeeds
@@ -8161,7 +8192,7 @@ pub struct PrivilegedDispatcher {
     /// these metrics for binary protocol requests.
     metrics: Option<SharedMetricsRegistry>,
 
-    /// HTF-compliant clock for timestamps (TCK-00289).
+    /// HTF-compliant clock for timestamps (RFC-0032::REQ-0091).
     ///
     /// Used to generate RFC-0016 compliant timestamps for:
     /// - `IssueCapability` `granted_at` / `expires_at` fields
@@ -8176,14 +8207,14 @@ pub struct PrivilegedDispatcher {
     holonic_clock: Arc<HolonicClock>,
 
     /// Subscription registry for HEF Pulse Plane resource governance
-    /// (TCK-00303).
+    /// (RFC-0032::REQ-0099).
     ///
     /// Tracks per-connection subscription state and enforces limits per
     /// RFC-0018. Shared with `SessionDispatcher` to manage subscriptions
     /// across both operator and session sockets.
     subscription_registry: SharedSubscriptionRegistry,
 
-    /// Shared daemon state for process management (TCK-00342).
+    /// Shared daemon state for process management (RFC-0032::REQ-0132).
     ///
     /// When present, process management handlers (`ListProcesses`,
     /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
@@ -8192,12 +8223,12 @@ pub struct PrivilegedDispatcher {
     /// (for testing without full daemon context).
     daemon_state: Option<SharedState>,
 
-    /// Node ID for consensus status reporting (TCK-00345).
+    /// Node ID for consensus status reporting (RFC-0032::REQ-0135).
     ///
     /// Used in consensus query responses to identify this node.
     node_id: String,
 
-    /// Consensus subsystem state handle (TCK-00345).
+    /// Consensus subsystem state handle (RFC-0032::REQ-0135).
     ///
     /// When `Some`, consensus queries return real state data.
     /// When `None`, consensus queries return `CONSENSUS_NOT_CONFIGURED` error.
@@ -8210,7 +8241,7 @@ pub struct PrivilegedDispatcher {
     /// is considered "configured".
     consensus_state: Option<()>,
 
-    /// Credential store for secure credential persistence (TCK-00343).
+    /// Credential store for secure credential persistence (RFC-0032::REQ-0133).
     ///
     /// When present, credential management handlers (`ListCredentials`,
     /// `AddCredential`, `RemoveCredential`, `RefreshCredential`,
@@ -8221,14 +8252,14 @@ pub struct PrivilegedDispatcher {
     credential_store: Option<Arc<CredentialStore>>,
 
     /// Session telemetry store for tracking tool calls, events emitted,
-    /// and session start time (TCK-00384).
+    /// and session start time (RFC-0032::REQ-0138).
     ///
     /// When present, `SpawnEpisode` registers telemetry for new sessions
     /// with `started_at_ns` set to the current wall time. The store is
     /// shared with `SessionDispatcher` for counter updates and queries.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
 
-    /// Per-session tool broker registry (TCK-00401).
+    /// Per-session tool broker registry (RFC-0032::REQ-0153).
     ///
     /// When configured, `SpawnEpisode` initializes a broker scoped to the
     /// session capability manifest and registers it here. `RequestTool`
@@ -8246,14 +8277,15 @@ pub struct PrivilegedDispatcher {
     broker_github_store: Option<Arc<dyn GitHubCredentialStore>>,
     broker_ssh_store: Option<Arc<dyn SshCredentialStore>>,
 
-    /// Content-addressed store for `ChangeSet` bundle persistence (TCK-00394).
+    /// Content-addressed store for `ChangeSet` bundle persistence
+    /// (RFC-0032::REQ-0148).
     ///
     /// When present, `PublishChangeSet` stores the canonical bundle bytes in
     /// CAS and returns the content hash for ledger event binding. When `None`,
     /// the handler returns an error indicating CAS is not configured.
     cas: Option<Arc<dyn ContentAddressedStore>>,
 
-    /// Shared V1 manifest store for TCK-00352 scope enforcement.
+    /// Shared V1 manifest store for RFC-0020::REQ-0006 scope enforcement.
     ///
     /// Per Security Review MAJOR 2, `handle_spawn_episode` mints a V1
     /// capability manifest and registers it in this store. The
@@ -8261,7 +8293,7 @@ pub struct PrivilegedDispatcher {
     /// V1 scope checks in `handle_request_tool`.
     v1_manifest_store: Option<crate::protocol::session_dispatch::SharedV1ManifestStore>,
 
-    /// Gate orchestrator for sublease delegation (TCK-00340).
+    /// Gate orchestrator for sublease delegation (RFC-0032::REQ-0131).
     ///
     /// When present, `DelegateSublease` delegates to the orchestrator to
     /// issue signed subleases with strict-subset validation. When `None`,
@@ -8270,7 +8302,7 @@ pub struct PrivilegedDispatcher {
     gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
 
     /// PCAC lifecycle gate for privileged authority-bearing handlers
-    /// (TCK-00424).
+    /// (RFC-0020::REQ-0043).
     ///
     /// When present, `DelegateSublease` and `IngestReviewReceipt` can enforce
     /// join/revalidate/consume before authoritative state mutation.
@@ -8280,7 +8312,7 @@ pub struct PrivilegedDispatcher {
     privileged_pcac_policy: PrivilegedPcacPolicy,
 
     /// Per-session stop conditions store for pre-actuation gate enforcement
-    /// (TCK-00351 v4).
+    /// (RFC-0020::REQ-0005 v4).
     ///
     /// When present, `SpawnEpisode` registers stop conditions (from the
     /// episode envelope) for the new session. The `SessionDispatcher` holds
@@ -8299,34 +8331,36 @@ pub struct PrivilegedDispatcher {
     /// `record_failure()`.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 
-    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    /// RFC-0032::REQ-0151: Adapter registry for spawning agent CLI processes.
     ///
     /// When present, `handle_spawn_episode` loads the adapter profile from
     /// CAS, builds a `HarnessConfig`, and spawns the agent process via the
     /// appropriate `HarnessAdapter`.
     adapter_registry: Option<Arc<crate::episode::AdapterRegistry>>,
 
-    /// TCK-00400: Deterministic adapter selection policy state.
+    /// RFC-0032::REQ-0152: Deterministic adapter selection policy state.
     ///
     /// Stored behind a daemon-only mutex so spawn failures can update
     /// backoff/failure counters without exposing mutable selection state
     /// through IPC surfaces.
     adapter_selection_policy: Option<Arc<Mutex<AdapterSelectionPolicy>>>,
 
-    /// TCK-00400: Profile hashes currently eligible by runtime adapter support.
+    /// RFC-0032::REQ-0152: Profile hashes currently eligible by runtime adapter
+    /// support.
     adapter_available_profiles: BTreeSet<[u8; 32]>,
 
-    /// TCK-00400: Reverse lookup for profile hash -> profile ID.
+    /// RFC-0032::REQ-0152: Reverse lookup for profile hash -> profile ID.
     adapter_profile_ids_by_hash: HashMap<[u8; 32], String>,
 
-    /// TCK-00400: Dedicated CAS for adapter profile hash verification at
-    /// selection time. Separate from the publish/ingest `cas` field so that
-    /// `with_persistence` (no durable CAS) can still perform adapter selection
-    /// without inadvertently enabling `PublishChangeSet` (TCK-00412
-    /// fail-closed).
+    /// RFC-0032::REQ-0152: Dedicated CAS for adapter profile hash verification
+    /// at selection time. Separate from the publish/ingest `cas` field so
+    /// that `with_persistence` (no durable CAS) can still perform adapter
+    /// selection without inadvertently enabling `PublishChangeSet`
+    /// (RFC-0032::REQ-0158 fail-closed).
     adapter_profile_cas: Option<Arc<dyn ContentAddressedStore>>,
 
-    /// TCK-00373: Permeability receipt resolver for delegated claim binding.
+    /// RFC-0020::REQ-0027: Permeability receipt resolver for delegated claim
+    /// binding.
     ///
     /// During `ClaimWork`, the dispatcher queries this resolver to determine
     /// whether the actor operates under a delegated authority. When the
@@ -8334,7 +8368,7 @@ pub struct PrivilegedDispatcher {
     /// subsequently enforced by the delegated spawn gate.
     permeability_receipt_resolver: Arc<dyn PermeabilityReceiptResolver>,
 
-    /// TCK-00420: Alias reconciliation gate for promotion gating.
+    /// RFC-0032::REQ-0164: Alias reconciliation gate for promotion gating.
     ///
     /// During `SpawnEpisode`, the dispatcher invokes this gate to verify that
     /// alias/`work_id` projections are consistent before proceeding.
@@ -8348,11 +8382,12 @@ pub struct PrivilegedDispatcher {
     /// separate `ticket_alias` field. Real `TCK-*` style aliases must be
     /// registered by an operator layer or future policy resolver extension.
     ///
-    /// TODO(TCK-00425): Wire real ticket aliases through policy resolution
-    /// so `ClaimWork` can register true alias->work_id mappings.
+    /// TODO(RFC-0020::REQ-0044): Wire real ticket aliases through policy
+    /// resolution so `ClaimWork` can register true alias->work_id mappings.
     alias_reconciliation_gate: Arc<dyn AliasReconciliationGate>,
 
-    /// TCK-00469: Divergence watchdog for projection compromise recovery.
+    /// RFC-0020::REQ-0051: Divergence watchdog for projection compromise
+    /// recovery.
     ///
     /// When present, `RegisterRecoveryEvidence` and `RequestUnfreeze`
     /// handlers call through to the watchdog to register durable recovery
@@ -8361,14 +8396,14 @@ pub struct PrivilegedDispatcher {
     divergence_watchdog:
         Option<Arc<crate::projection::DivergenceWatchdog<crate::projection::SystemTimeSource>>>,
 
-    /// TCK-00565: Boundary identifier for token binding contract.
+    /// RFC-0032::REQ-0216: Boundary identifier for token binding contract.
     ///
     /// Loaded from FAC node identity at daemon startup. Used to populate
     /// `TokenBindingV1.boundary_id` when issuing channel context tokens.
     /// Defaults to `"apm2.fac.local"` when node identity is not configured.
     token_binding_boundary_id: String,
 
-    /// TCK-00565: FAC policy root digest for token binding contract.
+    /// RFC-0032::REQ-0216: FAC policy root digest for token binding contract.
     ///
     /// Set at startup from the admitted policy and updated if the policy is
     /// reloaded. Used to populate `TokenBindingV1.fac_policy_hash` when
@@ -8401,7 +8436,7 @@ pub struct PrivilegedDispatcher {
     ///   load(Acquire) in token issuance paths.
     admission_health_gate: AtomicBool,
 
-    /// TCK-00568: Control-plane budget tracker under a unified mutex.
+    /// RFC-0032::REQ-0219: Control-plane budget tracker under a unified mutex.
     ///
     /// All control-plane rate limit counters (token issuance, queue enqueue
     /// ops/bytes, bundle export bytes) and their configured limits are held
@@ -9141,7 +9176,7 @@ impl PrivilegedDispatcher {
             )]);
         }
 
-        // TCK-00568: Control-plane token issuance rate limit.
+        // RFC-0032::REQ-0219: Control-plane token issuance rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE any state mutation or
         // token issuance. Acquires the unified control-plane budget mutex
         // for atomic check-and-increment (fixes BLOCKER race condition
@@ -9197,7 +9232,7 @@ impl PrivilegedDispatcher {
             return Err(defects);
         }
 
-        // TCK-00565: Build TokenBindingV1 so the daemon dispatch path issues
+        // RFC-0032::REQ-0216: Build TokenBindingV1 so the daemon dispatch path issues
         // tokens with the full binding contract (policy hash, canonicalizer
         // tuple digest, boundary_id, issued/expiry ticks). Without this,
         // workers would reject the token as MissingTokenBinding.
@@ -9220,7 +9255,7 @@ impl PrivilegedDispatcher {
                         b.admitted_canonicalizer_tuple_digest,
                     )
                 });
-        // TCK-00567: intent is intentionally None for PrivilegedDispatcher.
+        // RFC-0032::REQ-0218: intent is intentionally None for PrivilegedDispatcher.
         // This dispatcher issues tokens for daemon session-level tool requests
         // (IPC boundary crossing), not for FAC queue job execution.  These
         // tokens do not flow through the intent-checking worker path
@@ -9234,7 +9269,7 @@ impl PrivilegedDispatcher {
             issued_at_tick: current_tick,
             expiry_tick: current_tick.saturating_add(DEFAULT_ENVELOPE_TTL_TICKS),
             intent: None,
-            // TCK-00566: Nonce is None here because the daemon-side token
+            // RFC-0032::REQ-0217: Nonce is None here because the daemon-side token
             // issuance path (session dispatch) does not go through the
             // FacBroker token-use ledger. Broker-side replay protection
             // applies only to broker-issued tokens via
@@ -9278,7 +9313,7 @@ impl PrivilegedDispatcher {
     /// testing.
     #[must_use]
     pub fn new() -> Self {
-        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // RFC-0032::REQ-0091: Create default HolonicClock for HTF-compliant timestamps
         // WARNING: This creates an internal clock which can cause RSK-2503
         // (Mixed Clock Domain Hazard) if used in production alongside other
         // components with their own clocks. Use with_shared_state or
@@ -9287,13 +9322,13 @@ impl PrivilegedDispatcher {
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
         );
-        // TCK-00303: Create subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create subscription registry for HEF resource governance
         let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00415: Create shared event emitter and work authority.
+        // RFC-0032::REQ-0159: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // RFC-0032::REQ-0164: Create alias reconciliation gate backed by shared emitter
         // and shared projection state.
         let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
             Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
@@ -9313,13 +9348,13 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
-            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            // RFC-0032::REQ-0111: Pre-seed CAS with reviewer v0 manifest
             manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock,
             subscription_registry,
             daemon_state: None,
-            // TCK-00345: Consensus state not configured in test mode
+            // RFC-0032::REQ-0135: Consensus state not configured in test mode
             node_id: "test-node".to_string(),
             consensus_state: None,
             credential_store: None,
@@ -9329,7 +9364,7 @@ impl PrivilegedDispatcher {
             broker_cas: None,
             broker_github_store: None,
             broker_ssh_store: None,
-            // TCK-00416: Default MemoryCas for authority binding validation in tests.
+            // RFC-0032::REQ-0160: Default MemoryCas for authority binding validation in tests.
             cas: Some(Arc::new(MemoryCas::default())),
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -9378,7 +9413,7 @@ impl PrivilegedDispatcher {
     /// testing.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
-        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // RFC-0032::REQ-0091: Create default HolonicClock for HTF-compliant timestamps
         // WARNING: This creates an internal clock which can cause RSK-2503
         // (Mixed Clock Domain Hazard) if used in production alongside other
         // components with their own clocks. Use with_shared_state or
@@ -9387,13 +9422,13 @@ impl PrivilegedDispatcher {
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
         );
-        // TCK-00303: Create subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create subscription registry for HEF resource governance
         let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00415: Create shared event emitter and work authority.
+        // RFC-0032::REQ-0159: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // RFC-0032::REQ-0164: Create alias reconciliation gate backed by shared emitter
         // and shared projection state.
         let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
             Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
@@ -9413,13 +9448,13 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
-            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            // RFC-0032::REQ-0111: Pre-seed CAS with reviewer v0 manifest
             manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock,
             subscription_registry,
             daemon_state: None,
-            // TCK-00345: Consensus state not configured in test mode
+            // RFC-0032::REQ-0135: Consensus state not configured in test mode
             node_id: "test-node".to_string(),
             consensus_state: None,
             credential_store: None,
@@ -9429,7 +9464,7 @@ impl PrivilegedDispatcher {
             broker_cas: None,
             broker_github_store: None,
             broker_ssh_store: None,
-            // TCK-00416: Default MemoryCas for authority binding validation in tests.
+            // RFC-0032::REQ-0160: Default MemoryCas for authority binding validation in tests.
             cas: Some(Arc::new(MemoryCas::default())),
             v1_manifest_store: None,
             gate_orchestrator: None,
@@ -9463,14 +9498,14 @@ impl PrivilegedDispatcher {
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
     ///
-    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    /// # RFC-0032::REQ-0091: Clock Injection (RSK-2503 Prevention)
     ///
     /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
     /// also used by other components in the system. This prevents the mixed
     /// clock domain hazard (RSK-2503) that would occur if each component
     /// created its own clock.
     ///
-    /// # TCK-00287: State Sharing
+    /// # RFC-0032::REQ-0089: State Sharing
     ///
     /// The `token_minter` and `manifest_store` parameters MUST be `Arc::clone`
     /// copies of the same instances used by `SessionDispatcher`. This ensures:
@@ -9510,9 +9545,9 @@ impl PrivilegedDispatcher {
         manifest_loader: Arc<dyn ManifestLoader>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
-        // TCK-00415: Shared work authority over the provided emitter.
+        // RFC-0032::REQ-0159: Shared work authority over the provided emitter.
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // RFC-0032::REQ-0164: Create alias reconciliation gate backed by shared emitter
         // and shared projection state.
         let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
             Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
@@ -9537,7 +9572,7 @@ impl PrivilegedDispatcher {
             holonic_clock: clock,
             subscription_registry,
             daemon_state: None,
-            // TCK-00345: Consensus state not configured by default
+            // RFC-0032::REQ-0135: Consensus state not configured by default
             node_id: "node-001".to_string(),
             consensus_state: None,
             credential_store: None,
@@ -9578,7 +9613,7 @@ impl PrivilegedDispatcher {
     /// Creates a new dispatcher with shared token minter and manifest store
     /// (PRODUCTION).
     ///
-    /// # TCK-00287: State Sharing
+    /// # RFC-0032::REQ-0089: State Sharing
     ///
     /// This constructor is used by `DispatcherState` to wire up shared
     /// dependencies between `PrivilegedDispatcher` and `SessionDispatcher`:
@@ -9589,7 +9624,7 @@ impl PrivilegedDispatcher {
     /// - `session_registry`: Uses the global daemon session registry instead of
     ///   an internal stub
     ///
-    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    /// # RFC-0032::REQ-0091: Clock Injection (RSK-2503 Prevention)
     ///
     /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
     /// also used by other components in the system. This prevents the mixed
@@ -9603,10 +9638,10 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
-        // TCK-00415: Create shared event emitter and work authority.
+        // RFC-0032::REQ-0159: Create shared event emitter and work authority.
         let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(StubLedgerEventEmitter::new());
         let work_authority = Arc::new(ProjectionWorkAuthority::new(Arc::clone(&event_emitter)));
-        // TCK-00420: Create alias reconciliation gate backed by shared emitter
+        // RFC-0032::REQ-0164: Create alias reconciliation gate backed by shared emitter
         // and shared projection state.
         let alias_reconciliation_gate: Arc<dyn AliasReconciliationGate> =
             Arc::new(ProjectionAliasReconciliationGate::new_with_projection(
@@ -9626,13 +9661,13 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter,
             manifest_store,
-            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            // RFC-0032::REQ-0111: Pre-seed CAS with reviewer v0 manifest
             manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock: clock,
             subscription_registry,
             daemon_state: None,
-            // TCK-00345: Consensus state not configured by default
+            // RFC-0032::REQ-0135: Consensus state not configured by default
             node_id: "node-001".to_string(),
             consensus_state: None,
             credential_store: None,
@@ -9705,7 +9740,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Resets all control-plane budget counters for a new budget window
-    /// (TCK-00568).
+    /// (RFC-0032::REQ-0219).
     ///
     /// Called at tick advancement boundaries by the daemon tick driver.
     /// Concurrent requests that are in-flight will observe the reset on
@@ -9728,7 +9763,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Updates the control-plane limits from an `EconomicsProfile`
-    /// (TCK-00568).
+    /// (RFC-0032::REQ-0219).
     ///
     /// Called when a new profile is loaded (startup or hot-reload). Replaces
     /// limits and resets counters to start a fresh budget window with the
@@ -9758,7 +9793,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Checks queue enqueue admission against control-plane budget
-    /// (TCK-00568).
+    /// (RFC-0032::REQ-0219).
     ///
     /// Acquires the control-plane budget mutex and performs a unified
     /// check-then-increment for both the operation count and byte count.
@@ -9777,7 +9812,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Checks bundle export admission against control-plane budget
-    /// (TCK-00568).
+    /// (RFC-0032::REQ-0219).
     ///
     /// Acquires the control-plane budget mutex and performs a unified
     /// check-then-increment. Returns `Ok(())` on admission, or `Err`
@@ -9794,7 +9829,7 @@ impl PrivilegedDispatcher {
             .map_err(budget_error_to_protocol_error)
     }
 
-    /// Sets the boundary ID for TCK-00565 token binding contract.
+    /// Sets the boundary ID for RFC-0032::REQ-0216 token binding contract.
     ///
     /// Called at daemon startup after loading node identity. Tokens issued
     /// through the dispatch path will include this `boundary_id` in their
@@ -9803,7 +9838,8 @@ impl PrivilegedDispatcher {
         self.token_binding_boundary_id = boundary_id;
     }
 
-    /// Sets the FAC policy root digest for TCK-00565 token binding contract.
+    /// Sets the FAC policy root digest for RFC-0032::REQ-0216 token binding
+    /// contract.
     ///
     /// Called at daemon startup after admitting the FAC policy. Tokens
     /// issued through the dispatch path will include this digest in their
@@ -9812,7 +9848,7 @@ impl PrivilegedDispatcher {
         self.token_binding_policy_digest = digest;
     }
 
-    /// Sets the daemon state for process management (TCK-00342).
+    /// Sets the daemon state for process management (RFC-0032::REQ-0132).
     ///
     /// When set, process management handlers (`ListProcesses`,
     /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
@@ -9824,7 +9860,8 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the credential store for credential management (TCK-00343).
+    /// Sets the credential store for credential management
+    /// (RFC-0032::REQ-0133).
     ///
     /// When set, credential management handlers (`ListCredentials`,
     /// `AddCredential`, `RemoveCredential`, `RefreshCredential`,
@@ -9838,7 +9875,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Sets the session telemetry store for tracking tool calls, events
-    /// emitted, and session start time (TCK-00384).
+    /// emitted, and session start time (RFC-0032::REQ-0138).
     ///
     /// When set, `SpawnEpisode` registers telemetry for new sessions. The
     /// store should be shared with `SessionDispatcher` for counter
@@ -9852,7 +9889,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the per-session broker registry (TCK-00401).
+    /// Sets the per-session broker registry (RFC-0032::REQ-0153).
     #[must_use]
     pub fn with_session_broker_registry(
         mut self,
@@ -9894,15 +9931,15 @@ impl PrivilegedDispatcher {
     }
 
     /// Sets the content-addressed store for changeset bundle persistence
-    /// (TCK-00394).
+    /// (RFC-0032::REQ-0148).
     ///
     /// When set, `PublishChangeSet` stores the canonical bundle bytes in CAS
     /// and returns the content hash for ledger event binding. This also wires
     /// the alias reconciliation gate to the same CAS backend so
     /// `ResolveTicketAlias`/`SpawnEpisode` promotion checks can resolve
     /// `ticket_alias -> work_id` from projection-backed `WorkSpec` documents
-    /// (TCK-00636). When not set, handlers return an error indicating CAS is
-    /// not configured.
+    /// (RFC-0032::REQ-0264). When not set, handlers return an error indicating
+    /// CAS is not configured.
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(Arc::clone(&cas));
@@ -9935,19 +9972,20 @@ impl PrivilegedDispatcher {
     }
 
     /// Sets the dedicated CAS for adapter profile hash verification
-    /// (TCK-00400).
+    /// (RFC-0032::REQ-0152).
     ///
     /// This CAS is used to verify that selected adapter profile hashes
     /// exist at dispatch time. It is intentionally separate from the
     /// publish/ingest CAS (`with_cas`) so that adapter selection can work
-    /// without enabling `PublishChangeSet` (TCK-00412 fail-closed).
+    /// without enabling `PublishChangeSet` (RFC-0032::REQ-0158 fail-closed).
     #[must_use]
     pub fn with_adapter_profile_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.adapter_profile_cas = Some(cas);
         self
     }
 
-    /// Sets the shared V1 manifest store (TCK-00352 Security Review MAJOR 2).
+    /// Sets the shared V1 manifest store (RFC-0020::REQ-0006 Security Review
+    /// MAJOR 2).
     ///
     /// When set, `handle_spawn_episode` mints a V1 capability manifest and
     /// registers it in this store. The `SessionDispatcher` holds a clone of
@@ -9962,7 +10000,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Sets the permeability receipt resolver for delegated claim binding
-    /// (TCK-00373).
+    /// (RFC-0020::REQ-0027).
     #[must_use]
     pub fn with_permeability_receipt_resolver(
         mut self,
@@ -9972,7 +10010,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the gate orchestrator for sublease delegation (TCK-00340).
+    /// Sets the gate orchestrator for sublease delegation (RFC-0032::REQ-0131).
     #[must_use]
     pub fn with_gate_orchestrator(
         mut self,
@@ -9982,7 +10020,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the privileged PCAC lifecycle gate (TCK-00424).
+    /// Sets the privileged PCAC lifecycle gate (RFC-0020::REQ-0043).
     #[must_use]
     pub fn with_pcac_lifecycle_gate(mut self, gate: Arc<crate::pcac::LifecycleGate>) -> Self {
         self.pcac_lifecycle_gate = Some(gate);
@@ -9997,14 +10035,15 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets privileged PCAC rollout policy flags (TCK-00424).
+    /// Sets privileged PCAC rollout policy flags (RFC-0020::REQ-0043).
     #[must_use]
     pub const fn with_privileged_pcac_policy(mut self, policy: PrivilegedPcacPolicy) -> Self {
         self.privileged_pcac_policy = policy;
         self
     }
 
-    /// Sets the divergence watchdog for projection recovery (TCK-00469).
+    /// Sets the divergence watchdog for projection recovery
+    /// (RFC-0020::REQ-0051).
     ///
     /// When set, `RegisterRecoveryEvidence` and `RequestUnfreeze` handlers
     /// call through to the watchdog to register durable recovery evidence
@@ -10018,7 +10057,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the per-session stop conditions store (TCK-00351 v4).
+    /// Sets the per-session stop conditions store (RFC-0020::REQ-0005 v4).
     ///
     /// When set, `SpawnEpisode` registers stop conditions from the episode
     /// envelope for each new session. The `SessionDispatcher` holds a clone
@@ -10052,7 +10091,8 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    /// Sets the adapter registry for spawning agent CLI processes
+    /// (RFC-0032::REQ-0151).
     #[must_use]
     pub fn with_adapter_registry(mut self, registry: Arc<crate::episode::AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
@@ -10060,13 +10100,13 @@ impl PrivilegedDispatcher {
     }
 
     /// Sets adapter-selection policy state, adapter availability, and the
-    /// dedicated CAS for profile hash verification (TCK-00400).
+    /// dedicated CAS for profile hash verification (RFC-0032::REQ-0152).
     ///
     /// `profile_cas` is the CAS instance used to verify that the selected
     /// adapter profile hash exists at dispatch time. This is intentionally
     /// separate from the `cas` field (used by `PublishChangeSet`) so that
     /// `with_persistence` can enable adapter selection without inadvertently
-    /// enabling publish/ingest operations (TCK-00412 fail-closed).
+    /// enabling publish/ingest operations (RFC-0032::REQ-0158 fail-closed).
     #[must_use]
     pub fn with_adapter_selection_policy(
         mut self,
@@ -10097,7 +10137,7 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Adds a metrics registry to the dispatcher (TCK-00268).
+    /// Adds a metrics registry to the dispatcher (RFC-0032::REQ-0084).
     ///
     /// When set, the dispatcher will emit metrics for:
     /// - `session_spawned`: When `SpawnEpisode` succeeds
@@ -10116,7 +10156,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Applies control-plane budget limits from an `EconomicsProfile`
-    /// (TCK-00568).
+    /// (RFC-0032::REQ-0219).
     ///
     /// If `limits` is `Some`, validates and applies the limits. If `None`,
     /// keeps the default limits (fail-safe — default limits are enforced).
@@ -10142,7 +10182,7 @@ impl PrivilegedDispatcher {
         &self.event_emitter
     }
 
-    /// Returns a reference to the shared work authority (TCK-00415).
+    /// Returns a reference to the shared work authority (RFC-0032::REQ-0159).
     ///
     /// The `ProjectionWorkAuthority` is instantiated once during dispatcher
     /// construction and shared across all work-related request handlers.
@@ -10151,7 +10191,8 @@ impl PrivilegedDispatcher {
         &self.work_authority
     }
 
-    /// Returns a reference to the alias reconciliation gate (TCK-00420).
+    /// Returns a reference to the alias reconciliation gate
+    /// (RFC-0032::REQ-0164).
     ///
     /// Used by integration tests to verify that the gate is wired into the
     /// dispatcher and produces expected reconciliation results.
@@ -10299,7 +10340,7 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00469: Projection Recovery Handlers
+    // RFC-0020::REQ-0051: Projection Recovery Handlers
     // =========================================================================
 
     /// Handles `RegisterRecoveryEvidence` requests (IPC-PRIV-074).
@@ -10813,7 +10854,7 @@ impl PrivilegedDispatcher {
 
     /// Returns a reference to the token minter.
     ///
-    /// # TCK-00287
+    /// # RFC-0032::REQ-0089
     ///
     /// This is used to share the token minter with `SessionDispatcher`.
     #[must_use]
@@ -10823,7 +10864,7 @@ impl PrivilegedDispatcher {
 
     /// Returns a reference to the manifest store.
     ///
-    /// # TCK-00287
+    /// # RFC-0032::REQ-0089
     ///
     /// This is used to share the manifest store with `SessionDispatcher`.
     #[must_use]
@@ -10831,7 +10872,7 @@ impl PrivilegedDispatcher {
         &self.manifest_store
     }
 
-    /// Returns a reference to the HTF-compliant clock (TCK-00289).
+    /// Returns a reference to the HTF-compliant clock (RFC-0032::REQ-0091).
     ///
     /// This is primarily for testing to verify clock behavior.
     #[must_use]
@@ -10839,9 +10880,9 @@ impl PrivilegedDispatcher {
         &self.holonic_clock
     }
 
-    /// Returns a reference to the subscription registry (TCK-00303).
+    /// Returns a reference to the subscription registry (RFC-0032::REQ-0099).
     ///
-    /// # TCK-00303
+    /// # RFC-0032::REQ-0099
     ///
     /// This is used to share the subscription registry with
     /// `SessionDispatcher`.
@@ -10851,7 +10892,7 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00289: HTF-Compliant Timestamp Generation
+    // RFC-0032::REQ-0091: HTF-Compliant Timestamp Generation
     // =========================================================================
 
     /// Returns an HTF-compliant timestamp in nanoseconds since epoch.
@@ -10879,14 +10920,15 @@ impl PrivilegedDispatcher {
     ///
     /// # Security (Fail-Closed)
     ///
-    /// Per RFC-0016 and TCK-00289 DOD, this method fails closed rather than
-    /// returning a fallback value like 0. Returning 0 would violate security
-    /// policy and allow operations to proceed with invalid timestamps.
+    /// Per RFC-0016 and RFC-0032::REQ-0091 DOD, this method fails closed rather
+    /// than returning a fallback value like 0. Returning 0 would violate
+    /// security policy and allow operations to proceed with invalid
+    /// timestamps.
     fn get_htf_timestamp_ns(&self) -> Result<u64, HtfTimestampError> {
         match self.holonic_clock.now_hlc() {
             Ok(hlc) => Ok(hlc.wall_ns),
             Err(e) => {
-                // TCK-00289: Fail-closed - do not return 0 as fallback.
+                // RFC-0032::REQ-0091: Fail-closed - do not return 0 as fallback.
                 // This is a security-critical operation that must not proceed
                 // with invalid timestamps.
                 warn!(error = %e, "HLC clock error - failing closed per RFC-0016");
@@ -11364,14 +11406,14 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00258: Custody Domain Resolution (`SoD` Enforcement)
+    // RFC-0032::REQ-0074: Custody Domain Resolution (`SoD` Enforcement)
     // =========================================================================
 
     /// Resolves custody domains for an actor.
     ///
-    /// Per TCK-00258, this method maps an actor ID to its custody domains
-    /// for `SoD` validation. In production, this would query the `KeyPolicy`
-    /// via a `CustodyDomainResolver` trait.
+    /// Per RFC-0032::REQ-0074, this method maps an actor ID to its custody
+    /// domains for `SoD` validation. In production, this would query the
+    /// `KeyPolicy` via a `CustodyDomainResolver` trait.
     ///
     /// # Stub Implementation
     ///
@@ -11407,9 +11449,9 @@ impl PrivilegedDispatcher {
 
     /// Resolves custody domains for changeset authors.
     ///
-    /// Per TCK-00258, this method retrieves the custody domains of all actors
-    /// who authored the changeset being reviewed. In production, this would
-    /// query the changeset metadata and `KeyPolicy`.
+    /// Per RFC-0032::REQ-0074, this method retrieves the custody domains of all
+    /// actors who authored the changeset being reviewed. In production,
+    /// this would query the changeset metadata and `KeyPolicy`.
     ///
     /// # Stub Implementation
     ///
@@ -11467,7 +11509,7 @@ impl PrivilegedDispatcher {
         frame: &Bytes,
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
-        // TCK-00349: Check session phase BEFORE any message processing.
+        // RFC-0020::REQ-0003: Check session phase BEFORE any message processing.
         // No authority-bearing IPC is permitted before SessionOpen.
         if !ctx.phase().allows_dispatch() {
             warn!(
@@ -11514,41 +11556,41 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::SpawnEpisode => self.handle_spawn_episode(payload, ctx),
             PrivilegedMessageType::IssueCapability => self.handle_issue_capability(payload, ctx),
             PrivilegedMessageType::Shutdown => self.handle_shutdown(payload, ctx),
-            // Process Management (TCK-00342)
+            // Process Management (RFC-0032::REQ-0132)
             PrivilegedMessageType::ListProcesses => self.handle_list_processes(payload),
             PrivilegedMessageType::ProcessStatus => self.handle_process_status(payload),
             PrivilegedMessageType::StartProcess => self.handle_start_process(payload),
             PrivilegedMessageType::StopProcess => self.handle_stop_process(payload),
             PrivilegedMessageType::RestartProcess => self.handle_restart_process(payload),
             PrivilegedMessageType::ReloadProcess => self.handle_reload_process(payload),
-            // Consensus Query Endpoints (TCK-00345)
+            // Consensus Query Endpoints (RFC-0032::REQ-0135)
             PrivilegedMessageType::ConsensusStatus => self.handle_consensus_status(payload),
             PrivilegedMessageType::ConsensusValidators => self.handle_consensus_validators(payload),
             PrivilegedMessageType::ConsensusByzantineEvidence => {
                 self.handle_consensus_byzantine_evidence(payload)
             },
             PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
-            // TCK-00344: Work status query
+            // RFC-0032::REQ-0134: Work status query
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
-            // TCK-00415: Projection-backed work listing
+            // RFC-0032::REQ-0159: Projection-backed work listing
             PrivilegedMessageType::WorkList => self.handle_work_list(payload, ctx),
-            // TCK-00452: Launch lineage projection for auditor consumers
+            // RFC-0020::REQ-0040: Launch lineage projection for auditor consumers
             PrivilegedMessageType::AuditorLaunchProjection => {
                 self.handle_auditor_launch_projection(payload, ctx)
             },
-            // TCK-00452: Launch liveness projection for orchestrator consumers
+            // RFC-0020::REQ-0040: Launch liveness projection for orchestrator consumers
             PrivilegedMessageType::OrchestratorLaunchProjection => {
                 self.handle_orchestrator_launch_projection(payload, ctx)
             },
-            // TCK-00395: EndSession for session termination with ledger event
+            // RFC-0032::REQ-0149: EndSession for session termination with ledger event
             PrivilegedMessageType::EndSession => self.handle_end_session(payload, ctx),
-            // TCK-00389: IngestReviewReceipt for external reviewer results
+            // RFC-0032::REQ-0143: IngestReviewReceipt for external reviewer results
             PrivilegedMessageType::IngestReviewReceipt => {
                 self.handle_ingest_review_receipt(payload, ctx)
             },
-            // TCK-00351: Runtime stop-flag mutation
+            // RFC-0020::REQ-0005: Runtime stop-flag mutation
             PrivilegedMessageType::UpdateStopFlags => self.handle_update_stop_flags(payload, ctx),
-            // Credential Management (CTR-PROTO-012, TCK-00343)
+            // Credential Management (CTR-PROTO-012, RFC-0032::REQ-0133)
             PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
             PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
             PrivilegedMessageType::RemoveCredential => self.handle_remove_credential(payload, ctx),
@@ -11557,7 +11599,7 @@ impl PrivilegedDispatcher {
             },
             PrivilegedMessageType::SwitchCredential => self.handle_switch_credential(payload, ctx),
             PrivilegedMessageType::LoginCredential => self.handle_login_credential(payload, ctx),
-            // HEF Pulse Plane (TCK-00302): Operator subscription handlers
+            // HEF Pulse Plane (RFC-0032::REQ-0098): Operator subscription handlers
             PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
             // PulseEvent is server-to-client only, reject if received from client
@@ -11565,104 +11607,104 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::PermissionDenied,
                 "PulseEvent is server-to-client only",
             )),
-            // TCK-00394: ChangeSet publishing for daemon-anchored submission
+            // RFC-0032::REQ-0148: ChangeSet publishing for daemon-anchored submission
             PrivilegedMessageType::PublishChangeSet => self.handle_publish_changeset(payload, ctx),
-            // TCK-00340: Sublease delegation for child holon authorization
+            // RFC-0032::REQ-0131: Sublease delegation for child holon authorization
             PrivilegedMessageType::DelegateSublease => self.handle_delegate_sublease(payload, ctx),
-            // TCK-00487: explicit full-chain operator verification
+            // RFC-0020::REQ-0053: explicit full-chain operator verification
             PrivilegedMessageType::VerifyLedgerChain => self.handle_verify_ledger_chain(payload),
-            // TCK-00469: Projection recovery handlers
+            // RFC-0020::REQ-0051: Projection recovery handlers
             PrivilegedMessageType::RegisterRecoveryEvidence => {
                 self.handle_register_recovery_evidence(payload, ctx)
             },
             PrivilegedMessageType::RequestUnfreeze => self.handle_request_unfreeze(payload, ctx),
-            // TCK-00635: OpenWork (RFC-0032 Phase 1)
+            // RFC-0032::REQ-0263: OpenWork (RFC-0032 Phase 1)
             PrivilegedMessageType::OpenWork => self.handle_open_work(payload, ctx),
-            // TCK-00637: ClaimWorkV2 (RFC-0032 Phase 2)
+            // RFC-0032::REQ-0265: ClaimWorkV2 (RFC-0032 Phase 2)
             PrivilegedMessageType::ClaimWorkV2 => self.handle_claim_work_v2(payload, ctx),
-            // TCK-00638: Work context entry publishing (RFC-0032 Phase 2)
+            // RFC-0032::REQ-0266: Work context entry publishing (RFC-0032 Phase 2)
             PrivilegedMessageType::PublishWorkContextEntry => {
                 self.handle_publish_work_context_entry(payload, ctx)
             },
-            // TCK-00645: Work loop profile publishing (RFC-0032 Phase 4)
+            // RFC-0032::REQ-0270: Work loop profile publishing (RFC-0032 Phase 4)
             PrivilegedMessageType::PublishWorkLoopProfile => {
                 self.handle_publish_work_loop_profile(payload, ctx)
             },
-            // TCK-00639: Work PR association (RFC-0032 Phase 2)
+            // RFC-0032::REQ-0267: Work PR association (RFC-0032 Phase 2)
             PrivilegedMessageType::RecordWorkPrAssociation => {
                 self.handle_record_work_pr_association(payload, ctx)
             },
-            // TCK-00636: Ticket alias resolution (RFC-0032 Phase 1)
+            // RFC-0032::REQ-0264: Ticket alias resolution (RFC-0032 Phase 1)
             PrivilegedMessageType::ResolveTicketAlias => {
                 self.handle_resolve_ticket_alias(payload, ctx)
             },
         };
 
-        // TCK-00268: Emit IPC request completion metrics
+        // RFC-0032::REQ-0084: Emit IPC request completion metrics
         if let Some(ref metrics) = self.metrics {
             let endpoint = match msg_type {
                 PrivilegedMessageType::ClaimWork => "ClaimWork",
                 PrivilegedMessageType::SpawnEpisode => "SpawnEpisode",
                 PrivilegedMessageType::IssueCapability => "IssueCapability",
                 PrivilegedMessageType::Shutdown => "Shutdown",
-                // Process Management (TCK-00342)
+                // Process Management (RFC-0032::REQ-0132)
                 PrivilegedMessageType::ListProcesses => "ListProcesses",
                 PrivilegedMessageType::ProcessStatus => "ProcessStatus",
                 PrivilegedMessageType::StartProcess => "StartProcess",
                 PrivilegedMessageType::StopProcess => "StopProcess",
                 PrivilegedMessageType::RestartProcess => "RestartProcess",
                 PrivilegedMessageType::ReloadProcess => "ReloadProcess",
-                // Consensus Query Endpoints (TCK-00345)
+                // Consensus Query Endpoints (RFC-0032::REQ-0135)
                 PrivilegedMessageType::ConsensusStatus => "ConsensusStatus",
                 PrivilegedMessageType::ConsensusValidators => "ConsensusValidators",
                 PrivilegedMessageType::ConsensusByzantineEvidence => "ConsensusByzantineEvidence",
                 PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
-                // TCK-00344
+                // RFC-0032::REQ-0134
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
-                // TCK-00415
+                // RFC-0032::REQ-0159
                 PrivilegedMessageType::WorkList => "WorkList",
-                // TCK-00452
+                // RFC-0020::REQ-0040
                 PrivilegedMessageType::AuditorLaunchProjection => "AuditorLaunchProjection",
                 PrivilegedMessageType::OrchestratorLaunchProjection => {
                     "OrchestratorLaunchProjection"
                 },
-                // TCK-00395
+                // RFC-0032::REQ-0149
                 PrivilegedMessageType::EndSession => "EndSession",
-                // TCK-00389
+                // RFC-0032::REQ-0143
                 PrivilegedMessageType::IngestReviewReceipt => "IngestReviewReceipt",
-                // TCK-00351
+                // RFC-0020::REQ-0005
                 PrivilegedMessageType::UpdateStopFlags => "UpdateStopFlags",
-                // Credential Management (CTR-PROTO-012, TCK-00343)
+                // Credential Management (CTR-PROTO-012, RFC-0032::REQ-0133)
                 PrivilegedMessageType::ListCredentials => "ListCredentials",
                 PrivilegedMessageType::AddCredential => "AddCredential",
                 PrivilegedMessageType::RemoveCredential => "RemoveCredential",
                 PrivilegedMessageType::RefreshCredential => "RefreshCredential",
                 PrivilegedMessageType::SwitchCredential => "SwitchCredential",
                 PrivilegedMessageType::LoginCredential => "LoginCredential",
-                // HEF Pulse Plane (TCK-00300)
+                // HEF Pulse Plane (RFC-0032::REQ-0096)
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
                 PrivilegedMessageType::PulseEvent => "PulseEvent",
-                // TCK-00394
+                // RFC-0032::REQ-0148
                 PrivilegedMessageType::PublishChangeSet => "PublishChangeSet",
-                // TCK-00340
+                // RFC-0032::REQ-0131
                 PrivilegedMessageType::DelegateSublease => "DelegateSublease",
-                // TCK-00487
+                // RFC-0020::REQ-0053
                 PrivilegedMessageType::VerifyLedgerChain => "VerifyLedgerChain",
-                // TCK-00469
+                // RFC-0020::REQ-0051
                 PrivilegedMessageType::RegisterRecoveryEvidence => "RegisterRecoveryEvidence",
                 PrivilegedMessageType::RequestUnfreeze => "RequestUnfreeze",
-                // TCK-00635
+                // RFC-0032::REQ-0263
                 PrivilegedMessageType::OpenWork => "OpenWork",
-                // TCK-00637
+                // RFC-0032::REQ-0265
                 PrivilegedMessageType::ClaimWorkV2 => "ClaimWorkV2",
-                // TCK-00638
+                // RFC-0032::REQ-0266
                 PrivilegedMessageType::PublishWorkContextEntry => "PublishWorkContextEntry",
-                // TCK-00645
+                // RFC-0032::REQ-0270
                 PrivilegedMessageType::PublishWorkLoopProfile => "PublishWorkLoopProfile",
-                // TCK-00639
+                // RFC-0032::REQ-0267
                 PrivilegedMessageType::RecordWorkPrAssociation => "RecordWorkPrAssociation",
-                // TCK-00636
+                // RFC-0032::REQ-0264
                 PrivilegedMessageType::ResolveTicketAlias => "ResolveTicketAlias",
             };
             let status = match &result {
@@ -11680,7 +11722,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `ClaimWork` requests (IPC-PRIV-001).
     ///
-    /// # TCK-00253 Implementation
+    /// # RFC-0032::REQ-0069 Implementation
     ///
     /// This handler implements the work claim flow per DD-001 and DD-002:
     ///
@@ -11724,9 +11766,9 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00253: Derive authoritative actor_id from credential (not user input)
-        // Per DD-001: "actor_id is a display hint; authoritative actor_id derived from
-        // credential"
+        // RFC-0032::REQ-0069: Derive authoritative actor_id from credential (not user
+        // input) Per DD-001: "actor_id is a display hint; authoritative
+        // actor_id derived from credential"
         let peer_creds = ctx
             .peer_credentials()
             .ok_or_else(|| ProtocolError::Serialization {
@@ -11745,7 +11787,7 @@ impl PrivilegedDispatcher {
         let work_id = generate_work_id();
         let lease_id = generate_lease_id();
 
-        // TCK-00253: Query governance for policy resolution
+        // RFC-0032::REQ-0069: Query governance for policy resolution
         // Per DD-002: "Daemon calls HOLON-KERNEL-GOVERNANCE for policy resolution"
         let mut policy_resolution = match self
             .policy_resolver
@@ -11773,7 +11815,7 @@ impl PrivilegedDispatcher {
         // signal, so refresh the governance probe watermark.
         self.record_governance_probe_success();
 
-        // TCK-00448: Resolve authoritative role/context lineage from CAS.
+        // RFC-0032::REQ-0169: Resolve authoritative role/context lineage from CAS.
         // Fail-closed on missing/unverifiable authority context.
         {
             let fallback_cas = MemoryCas::default();
@@ -11923,7 +11965,7 @@ impl PrivilegedDispatcher {
             "Work claimed with policy resolution"
         );
 
-        // TCK-00258: Extract custody domains for SoD validation
+        // RFC-0032::REQ-0074: Extract custody domains for SoD validation
         // For now, use a stub implementation that derives domain from actor_id
         // In production, this would query the KeyPolicy via CustodyDomainResolver
         let executor_custody_domains = match self.resolve_actor_custody_domains(&actor_id) {
@@ -11948,7 +11990,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00373 CQ MAJOR fix: Resolve permeability receipt for delegated
+        // RFC-0020::REQ-0027 CQ MAJOR fix: Resolve permeability receipt for delegated
         // claims. The resolver queries governance/store for active delegations
         // bound to this actor and policy root. When a receipt is returned, it
         // is stored on the WorkClaim and subsequently enforced by the delegated
@@ -11982,7 +12024,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00395: Clone actor_id before it is moved into WorkClaim,
+        // RFC-0032::REQ-0149: Clone actor_id before it is moved into WorkClaim,
         // as we need it later for emit_work_transitioned.
         let actor_id_for_transition = actor_id.clone();
 
@@ -11999,7 +12041,7 @@ impl PrivilegedDispatcher {
         };
 
         // =====================================================================
-        // TCK-00416: Lifecycle authority binding validation (ClaimWork)
+        // RFC-0032::REQ-0160: Lifecycle authority binding validation (ClaimWork)
         //
         // Per REQ-HEF-0013, authoritative transitions MUST carry valid
         // authority bindings. Derive bindings from the claim, store
@@ -12010,7 +12052,7 @@ impl PrivilegedDispatcher {
         // `with_persistence` path without `--cas-dir`), a temporary
         // MemoryCas is used. Authority binding validation only needs CAS
         // for hash-store-and-verify within the same request; it does NOT
-        // require durability. This preserves TCK-00412 fail-closed
+        // require durability. This preserves RFC-0032::REQ-0158 fail-closed
         // semantics for PublishChangeSet (which requires durable CAS).
         // =====================================================================
         {
@@ -12080,7 +12122,7 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00568: Control-plane queue enqueue rate limit.
+        // RFC-0032::REQ-0219: Control-plane queue enqueue rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE state mutation (register_claim).
         // SECURITY: Use serialization-based byte estimate that accounts for ALL
         // WorkClaim fields (policy_resolution, custody domains, permeability_receipt).
@@ -12102,24 +12144,24 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00253: Emit signed WorkClaimed + WorkTransitioned events atomically.
-        // Per acceptance criteria: "`WorkClaimed` event signed and persisted"
-        // The events are:
+        // RFC-0032::REQ-0069: Emit signed WorkClaimed + WorkTransitioned events
+        // atomically. Per acceptance criteria: "`WorkClaimed` event signed and
+        // persisted" The events are:
         // - Signed with the daemon's signing key (Ed25519)
         // - Includes work_id, lease_id, actor_id, role, and policy_resolved_ref
         // - Persisted to the append-only ledger for audit trail
         //
-        // TCK-00289: Use HTF-compliant timestamp from HolonicClock.
+        // RFC-0032::REQ-0091: Use HTF-compliant timestamp from HolonicClock.
         // Per RFC-0016, timestamps must come from the HTF clock source to ensure
         // monotonicity and causal ordering.
         //
-        // TCK-00395: Uses emit_claim_lifecycle for atomic dual-event emission.
+        // RFC-0032::REQ-0149: Uses emit_claim_lifecycle for atomic dual-event emission.
         // Both work_claimed and work_transitioned(Open->Claimed) are emitted
         // as a single atomic operation to prevent partial state commits.
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
-                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                // RFC-0032::REQ-0091: Fail-closed - do not proceed without valid timestamp
                 warn!(error = %e, "HTF timestamp generation failed - failing closed");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -12159,7 +12201,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Builds and initializes a per-session tool broker from manifest and
-    /// role-scoped allowlist policy (TCK-00401).
+    /// role-scoped allowlist policy (RFC-0032::REQ-0153).
     ///
     /// # Errors
     ///
@@ -12189,7 +12231,7 @@ impl PrivilegedDispatcher {
             broker = broker.with_cas(Arc::clone(cas));
         }
 
-        // TCK-00377: Wire the runtime precondition evaluator so the broker
+        // RFC-0020::REQ-0031: Wire the runtime precondition evaluator so the broker
         // performs real filesystem/git checks (FileExists, FileNotExists,
         // FileHashMatch via BLAKE3, GitCleanWorkingTree, GitRefAtCommit).
         // The evaluator is fail-closed: I/O errors and mismatches both
@@ -12247,7 +12289,7 @@ impl PrivilegedDispatcher {
     /// Returns `Some(warning)` if any rollback step failed (indicating
     /// partial failure), or `None` if rollback was clean.
     ///
-    /// # TCK-00384 BLOCKER 2
+    /// # RFC-0032::REQ-0138 BLOCKER 2
     ///
     /// All rollback operations are explicitly error-checked; none are
     /// silently discarded via `let _ = ...`.
@@ -12298,21 +12340,21 @@ impl PrivilegedDispatcher {
             self.manifest_store.remove(session_id);
         }
 
-        // 3a. TCK-00352 MAJOR 2 fix: Remove V1 manifest on rollback.
+        // 3a. RFC-0020::REQ-0006 MAJOR 2 fix: Remove V1 manifest on rollback.
         // Without this, a failed spawn leaves a stale V1 manifest that
         // could be matched by a recycled session ID (dangling reference).
         if let Some(ref v1_store) = self.v1_manifest_store {
             v1_store.remove(session_id);
         }
 
-        // 3a-ii. TCK-00351 v4: Remove stop conditions on rollback.
+        // 3a-ii. RFC-0020::REQ-0005 v4: Remove stop conditions on rollback.
         // Prevents a stale stop conditions entry from persisting for a
         // session that was never fully spawned.
         if let Some(ref store) = self.stop_conditions_store {
             store.remove(session_id);
         }
 
-        // 3a-iii. TCK-00401: Remove per-session broker on rollback.
+        // 3a-iii. RFC-0032::REQ-0153: Remove per-session broker on rollback.
         if let Some(ref store) = self.session_broker_registry {
             store.remove(session_id);
         }
@@ -12599,7 +12641,7 @@ impl PrivilegedDispatcher {
             return Ok((selected_hash, Some(decision)));
         }
 
-        // TODO(TCK-00397): differentiate per-role profiles post-rollout
+        // TODO(RFC-0032::REQ-0289): differentiate per-role profiles post-rollout
         let profile = match role {
             WorkRole::Implementer
             | WorkRole::GateExecutor
@@ -12739,7 +12781,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Builds a `HarnessConfig` from an adapter profile and spawn parameters
-    /// (TCK-00399).
+    /// (RFC-0032::REQ-0151).
     ///
     /// # Security
     ///
@@ -12856,7 +12898,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
-    /// # Security Contract (TCK-00257)
+    /// # Security Contract (RFC-0032::REQ-0073)
     ///
     /// - `GATE_EXECUTOR` role requires a valid `lease_id` that references a
     ///   `GateLeaseIssued` event in the ledger
@@ -12864,7 +12906,7 @@ impl PrivilegedDispatcher {
     /// - Non-`GATE_EXECUTOR` roles (`IMPLEMENTER`, `REVIEWER`) do not require
     ///   ledger lease validation (they use claim-based validation)
     ///
-    /// # TCK-00256 Implementation
+    /// # RFC-0032::REQ-0072 Implementation
     ///
     /// This handler implements the episode spawn flow per DD-001 and DD-002:
     ///
@@ -12888,8 +12930,8 @@ impl PrivilegedDispatcher {
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
-        // TCK-00319: Maximum path length constant (declared at function start per
-        // clippy)
+        // RFC-0032::REQ-0113: Maximum path length constant (declared at function start
+        // per clippy)
         const MAX_PATH_LENGTH: usize = 4096;
 
         let mut request = SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config)
@@ -12962,7 +13004,7 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00319: Validate workspace_root is provided
+        // RFC-0032::REQ-0113: Validate workspace_root is provided
         if request.workspace_root.is_empty() {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -12970,8 +13012,8 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00319: Validate workspace_root path length (prevent DoS via unbounded
-        // paths)
+        // RFC-0032::REQ-0113: Validate workspace_root path length (prevent DoS via
+        // unbounded paths)
         if request.workspace_root.len() > MAX_PATH_LENGTH {
             warn!(
                 workspace_root_len = request.workspace_root.len(),
@@ -12984,7 +13026,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00319: Validate workspace_root is an absolute path
+        // RFC-0032::REQ-0113: Validate workspace_root is an absolute path
         let workspace_path = std::path::Path::new(&request.workspace_root);
         if !workspace_path.is_absolute() {
             warn!(
@@ -12997,7 +13039,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00319: Validate workspace_root exists and is a directory
+        // RFC-0032::REQ-0113: Validate workspace_root exists and is a directory
         if !workspace_path.exists() {
             warn!(
                 workspace_root = %request.workspace_root,
@@ -13030,7 +13072,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00636 MAJOR fix: Resolve ticket aliases BEFORE any work_id-based
+        // RFC-0032::REQ-0264 MAJOR fix: Resolve ticket aliases BEFORE any work_id-based
         // lookup (lease validation, claim lookup, promotion checks), but only
         // when the caller provided an alias-like identifier.
         //
@@ -13081,7 +13123,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00257: GATE_EXECUTOR requires valid lease in ledger
+        // RFC-0032::REQ-0073: GATE_EXECUTOR requires valid lease in ledger
         // Per RFC-0017 IPC-PRIV-002, the lease must exist as a GateLeaseIssued event
         // and the work_id must match. This is a fail-closed check.
         if request.role == WorkRole::GateExecutor as i32 {
@@ -13106,7 +13148,7 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00256: Query work registry for PolicyResolvedForChangeSet
+        // RFC-0032::REQ-0072: Query work registry for PolicyResolvedForChangeSet
         // Fail-closed: spawn is only allowed if a valid policy resolution exists
         // for the work_id. This is established during ClaimWork.
         //
@@ -13137,7 +13179,7 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // TCK-00256: Validate role matches the claimed role
+        // RFC-0032::REQ-0072: Validate role matches the claimed role
         // Per DD-001, the role in the spawn request should match the claimed role
         if claim.role != request_role {
             warn!(
@@ -13199,7 +13241,7 @@ impl PrivilegedDispatcher {
         }
 
         // =====================================================================
-        // TCK-00373: Delegated spawn gate — consumption binding verification
+        // RFC-0020::REQ-0027: Delegated spawn gate — consumption binding verification
         //
         // BLOCKER 1: Mandatory binding both directions:
         //   - claim has receipt but request omits hash => reject
@@ -13407,7 +13449,7 @@ impl PrivilegedDispatcher {
             );
         }
 
-        // TCK-00351 BLOCKER 2: Validate caller-supplied stop conditions
+        // RFC-0020::REQ-0005 BLOCKER 2: Validate caller-supplied stop conditions
         // against an authoritative policy floor before persisting.
         let stop_policy = StopConditionPolicy::fail_closed_default();
         let resolved_stop_conditions = match stop_policy.validate_against_floor(
@@ -13429,7 +13471,7 @@ impl PrivilegedDispatcher {
         };
 
         // =====================================================================
-        // TCK-00258: SoD Custody Domain Validation
+        // RFC-0032::REQ-0074: SoD Custody Domain Validation
         //
         // Per REQ-DCP-0006, GATE_EXECUTOR spawns MUST enforce Separation of
         // Duties by rejecting when executor custody domains overlap with author
@@ -13449,7 +13491,7 @@ impl PrivilegedDispatcher {
                 .filter_map(|d| CustodyDomainId::new(d.clone()).ok())
                 .collect();
 
-            // TCK-00258: Fail-closed SoD validation for GATE_EXECUTOR.
+            // RFC-0032::REQ-0074: Fail-closed SoD validation for GATE_EXECUTOR.
             // If author domains cannot be resolved (empty), DENY the spawn.
             // The absence of author information MUST block, not allow, to prevent
             // attackers from bypassing SoD by using malformed work_ids.
@@ -13479,7 +13521,7 @@ impl PrivilegedDispatcher {
                     );
 
                     // Emit LeaseIssueDenied event for audit logging.
-                    // TCK-00289: Use HTF-compliant timestamp per RFC-0016.
+                    // RFC-0032::REQ-0091: Use HTF-compliant timestamp per RFC-0016.
                     // Fail-closed: if clock fails, we still reject the spawn (already
                     // doing that) but log at warning level instead of emitting event.
                     let timestamp_ns = match self.get_htf_timestamp_ns() {
@@ -13524,7 +13566,7 @@ impl PrivilegedDispatcher {
         }
 
         // =====================================================================
-        // TCK-00416: Lifecycle authority binding validation (SpawnEpisode)
+        // RFC-0032::REQ-0160: Lifecycle authority binding validation (SpawnEpisode)
         //
         // Per REQ-HEF-0013, authoritative transitions MUST carry valid
         // authority bindings. Derive bindings using the resolved stop
@@ -13611,14 +13653,14 @@ impl PrivilegedDispatcher {
         }
 
         // =====================================================================
-        // TCK-00420: Alias reconciliation promotion gate (fail-closed)
+        // RFC-0032::REQ-0164: Alias reconciliation promotion gate (fail-closed)
         //
         // Verify alias/work_id projection consistency BEFORE state mutation.
         // The gate checks that the work_id's alias binding matches the
         // canonical projection. Infrastructure errors (lock failures,
         // projection rebuild errors) also fail-closed per CTR-2617.
         //
-        // TCK-00636: Alias resolution already ran before any work_id lookup,
+        // RFC-0032::REQ-0264: Alias resolution already ran before any work_id lookup,
         // and request.work_id now holds the canonical work_id. The promotion
         // gate still uses the original request value as the ticket_alias field.
         // =====================================================================
@@ -13660,7 +13702,7 @@ impl PrivilegedDispatcher {
                 .check_promotion(&[binding], current_tick)
             {
                 Ok(result) => {
-                    // TCK-00636: With alias resolution wired, NotFound
+                    // RFC-0032::REQ-0264: With alias resolution wired, NotFound
                     // defects are still expected in identity-mapping
                     // fallback when the projection has not been populated
                     // with work events yet (e.g., first spawn, or when
@@ -13831,7 +13873,7 @@ impl PrivilegedDispatcher {
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = EphemeralHandle::generate();
 
-        // TCK-00406: Build authoritative V1 envelope and enforce spawn gate
+        // RFC-0020::REQ-0030: Build authoritative V1 envelope and enforce spawn gate
         // in the production dispatch path BEFORE any session-state mutation.
         let Some(envelope_risk_tier) =
             crate::episode::RiskTier::from_u8(claim.policy_resolution.resolved_risk_tier)
@@ -13978,8 +14020,8 @@ impl PrivilegedDispatcher {
 
         let authoritative_envelope_hash = authoritative_envelope.envelope_hash();
 
-        // TCK-00384 security fix: Transactional session + telemetry registration
-        // with guaranteed rollback on any failure path.
+        // RFC-0032::REQ-0138 security fix: Transactional session + telemetry
+        // registration with guaranteed rollback on any failure path.
         //
         // Registration order:
         //   1. Register session (may evict oldest entries for capacity).
@@ -14000,7 +14042,7 @@ impl PrivilegedDispatcher {
         // atomically consistent: either ALL succeed or NONE are committed.
 
         // Step 1: Persist session state (may evict oldest for capacity).
-        // TCK-00256: The episode_runtime can create/start episodes
+        // RFC-0032::REQ-0072: The episode_runtime can create/start episodes
         // asynchronously when needed.
         let session_state = SessionState {
             session_id: session_id.clone(),
@@ -14029,7 +14071,7 @@ impl PrivilegedDispatcher {
         // Step 2: Clean up telemetry for evicted sessions to prevent
         // orphaned entries and free capacity (policy convergence fix).
         //
-        // TCK-00384 security BLOCKER 1: Use `remove_and_return` to capture
+        // RFC-0032::REQ-0138 security BLOCKER 1: Use `remove_and_return` to capture
         // the evicted telemetry entries.  If a later spawn step fails, we
         // restore them alongside the session registry entries so that
         // rollback is complete (telemetry + session + manifest).
@@ -14137,11 +14179,11 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // Step 3b: Register stop conditions for the session (TCK-00351 v4).
+        // Step 3b: Register stop conditions for the session (RFC-0020::REQ-0005 v4).
         // The pre-actuation gate reads from this store to enforce
         // max_episodes / escalation_predicate limits.
         //
-        // TCK-00351 BLOCKER 1+2 FIX: Persist policy-validated stop
+        // RFC-0020::REQ-0005 BLOCKER 1+2 FIX: Persist policy-validated stop
         // conditions derived from authoritative request fields.
         if let Some(ref store) = self.stop_conditions_store {
             if let Err(e) = store.register(&session_id, resolved_stop_conditions) {
@@ -14179,7 +14221,7 @@ impl PrivilegedDispatcher {
         );
 
         // Step 4: Generate session token for client authentication.
-        // TCK-00287 BLOCKER 2: The token is HMAC-signed and bound to this
+        // RFC-0032::REQ-0089 BLOCKER 2: The token is HMAC-signed and bound to this
         // session's lease_id.
         //
         // NOTE: TokenMinter uses SystemTime for TTL calculation, which is
@@ -14255,7 +14297,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00317: Load capability manifest from CAS using hash from
+        // RFC-0032::REQ-0111: Load capability manifest from CAS using hash from
         // PolicyResolution.
         //
         // Per DOD item 1 (CAS Storage & Hash Loading):
@@ -14274,11 +14316,11 @@ impl PrivilegedDispatcher {
         let manifest = match self.manifest_loader.load_manifest(&manifest_hash) {
             Ok(m) => m,
             Err(e) => {
-                // TCK-00317: For Reviewer role, fail-closed if manifest not found
+                // RFC-0032::REQ-0111: For Reviewer role, fail-closed if manifest not found
                 // For other roles, fall back to minimal manifest until their
                 // manifests are stored in CAS.
                 if request_role == WorkRole::Reviewer {
-                    // TCK-00384 security fix: rollback session + telemetry on
+                    // RFC-0032::REQ-0138 security fix: rollback session + telemetry on
                     // manifest-load failure so bounded capacity is not leaked.
                     // Restore evicted sessions + telemetry so capacity is not
                     // lost.
@@ -14325,7 +14367,7 @@ impl PrivilegedDispatcher {
 
         self.manifest_store.register(&session_id, manifest.clone());
 
-        // TCK-00401: Build and register per-session broker in production path.
+        // RFC-0032::REQ-0153: Build and register per-session broker in production path.
         //
         // This enforces session-scoped capability/policy isolation and ensures
         // broker validator/policy are initialized before session spawn commits.
@@ -14364,12 +14406,12 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00352 Security Review MAJOR 2: Mint and register V1 manifest
+        // RFC-0020::REQ-0006 Security Review MAJOR 2: Mint and register V1 manifest
         // in the shared store so that SessionDispatcher can enforce V1 scope
         // checks (risk tier ceiling, host restrictions, envelope binding)
         // during handle_request_tool.
         if let Some(ref v1_store) = self.v1_manifest_store {
-            // TCK-00352 MAJOR 1 v3 fix: The scope baseline MUST come from
+            // RFC-0020::REQ-0006 MAJOR 1 v3 fix: The scope baseline MUST come from
             // an authoritative policy source (claim.policy_resolution), NOT
             // from the candidate manifest. Building the baseline from the
             // manifest itself makes the subset check tautological (the
@@ -14447,7 +14489,7 @@ impl PrivilegedDispatcher {
                 ));
             }
 
-            // TCK-00352 MAJOR 3 fix: Obtain mint token through the
+            // RFC-0020::REQ-0006 MAJOR 3 fix: Obtain mint token through the
             // governance-resolver authority path, not direct construction.
             // This centralizes minting authority to the policy resolver and
             // ensures the token is obtained through the approved channel.
@@ -14467,7 +14509,7 @@ impl PrivilegedDispatcher {
             )
             .unwrap_or(crate::episode::envelope::RiskTier::Tier4);
 
-            // TCK-00352 BLOCKER 2 fix: V1 minting failure is now a HARD
+            // RFC-0020::REQ-0006 BLOCKER 2 fix: V1 minting failure is now a HARD
             // DENY (fail-closed). When V1 controls are configured (v1_store
             // is Some), every session MUST have an active V1 manifest.
             // Continuing without one would leave the session without V1
@@ -14532,7 +14574,7 @@ impl PrivilegedDispatcher {
             "Capability manifest registered in shared store"
         );
 
-        // TCK-00268: Emit session_spawned metric
+        // RFC-0032::REQ-0084: Emit session_spawned metric
         if let Some(ref metrics) = self.metrics {
             let role_str = match request_role {
                 WorkRole::Implementer => "implementer",
@@ -14544,12 +14586,12 @@ impl PrivilegedDispatcher {
             metrics.daemon_metrics().session_spawned(role_str);
         }
 
-        // TCK-00289: Emit SessionStarted ledger event for audit trail.
+        // RFC-0032::REQ-0091: Emit SessionStarted ledger event for audit trail.
         // Per DOD: "ClaimWork/SpawnEpisode persist state and emit ledger events"
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
-                // TCK-00384 security fix: rollback session, telemetry, and
+                // RFC-0032::REQ-0138 security fix: rollback session, telemetry, and
                 // manifest on timestamp failure.  Also restore evicted
                 // sessions + telemetry so capacity is not permanently lost.
                 let rollback_warn = self.rollback_spawn(
@@ -14564,7 +14606,7 @@ impl PrivilegedDispatcher {
                 if let Some(ref rw) = rollback_warn {
                     warn!(rollback_errors = %rw, "Partial rollback failure during timestamp error recovery");
                 }
-                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                // RFC-0032::REQ-0091: Fail-closed - do not proceed without valid timestamp
                 warn!(error = %e, "HTF timestamp generation failed for SessionStarted - failing closed");
                 let msg = rollback_warn.map_or_else(
                     || format!("HTF timestamp error: {e}"),
@@ -14577,7 +14619,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00319: Create and start episode with workspace root.
+        // RFC-0032::REQ-0113: Create and start episode with workspace root.
         // This ensures that all file/execute operations are confined to the
         // workspace directory. The episode must be started BEFORE returning
         // to the client so that tool handlers are properly initialized.
@@ -14612,7 +14654,7 @@ impl PrivilegedDispatcher {
             }) {
                 Ok(id) => Some(id),
                 Err(e) => {
-                    // TCK-00384 security fix: rollback session, telemetry,
+                    // RFC-0032::REQ-0138 security fix: rollback session, telemetry,
                     // and manifest on episode creation failure.  Restore
                     // evicted sessions + telemetry so capacity is not lost.
                     let rollback_warn = self.rollback_spawn(
@@ -14659,7 +14701,7 @@ impl PrivilegedDispatcher {
             }
             #[cfg(not(test))]
             {
-                // TCK-00384 security fix: rollback session, telemetry,
+                // RFC-0032::REQ-0138 security fix: rollback session, telemetry,
                 // and manifest when no runtime is available.  Restore
                 // evicted sessions + telemetry so capacity is not lost.
                 let rollback_warn = self.rollback_spawn(
@@ -14686,7 +14728,7 @@ impl PrivilegedDispatcher {
             }
         };
 
-        // TCK-00395 Security BLOCKER 1: Write the episode_id back to the
+        // RFC-0032::REQ-0149 Security BLOCKER 1: Write the episode_id back to the
         // session in the registry. Without this write-back, EndSession cannot
         // resolve the episode binding and will skip runtime stop, allowing
         // the episode to continue running after session termination.
@@ -14702,7 +14744,7 @@ impl PrivilegedDispatcher {
                     "Failed to write episode_id back to session registry - failing closed"
                 );
 
-                // TCK-00384 review fix: unified post-start rollback stops
+                // RFC-0032::REQ-0138 review fix: unified post-start rollback stops
                 // the episode and cleans up session/telemetry/manifest.
                 let rollback_warn = self.rollback_spawn_with_episode_stop(
                     episode_id_opt.as_ref(),
@@ -14736,7 +14778,7 @@ impl PrivilegedDispatcher {
             );
         }
 
-        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // RFC-0032::REQ-0149 Security MAJOR 2: Fail closed when peer credentials are
         // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
         // ledger events (SessionStarted + WorkTransitioned), and recording
         // "unknown" as the actor identity would break the accountability chain.
@@ -14745,11 +14787,11 @@ impl PrivilegedDispatcher {
         // operations (adapter process spawn). Unauthorized requests must be
         // rejected before triggering subprocess spawn.
         //
-        // TCK-00384 review fix: Stop the running episode before returning on
+        // RFC-0032::REQ-0138 review fix: Stop the running episode before returning on
         // this failure path.  The original `?` operator would exit without
         // stopping the episode, leaking a running runtime episode.
         let Some(peer_creds) = ctx.peer_credentials() else {
-            // TCK-00384 review fix: unified post-start rollback stops the
+            // RFC-0032::REQ-0138 review fix: unified post-start rollback stops the
             // episode and cleans up session/telemetry/manifest.
             let rollback_warn = self.rollback_spawn_with_episode_stop(
                 episode_id_opt.as_ref(),
@@ -14773,7 +14815,7 @@ impl PrivilegedDispatcher {
         };
         let actor_id = derive_actor_id(peer_creds);
 
-        // TCK-00399: Spawn agent CLI process via adapter registry.
+        // RFC-0032::REQ-0151: Spawn agent CLI process via adapter registry.
         //
         // After the episode is created and Running, load the adapter profile
         // from CAS, build a HarnessConfig with template expansion, and spawn
@@ -14958,7 +15000,7 @@ impl PrivilegedDispatcher {
             self.record_adapter_profile_success(&adapter_profile_hash);
         }
 
-        // TCK-00358: Resolve identity proof profile hash for SessionStarted.
+        // RFC-0020::REQ-0012: Resolve identity proof profile hash for SessionStarted.
         // Primary path: the session-open handler in main.rs sets the profile
         // hash on the ConnectionContext during identity materialization.
         // Defensive fallback: if no context-bound value is set (e.g. direct
@@ -14980,10 +15022,11 @@ impl PrivilegedDispatcher {
                 Some,
             );
 
-        // TCK-00395: Emit SessionStarted + WorkTransitioned(Claimed->InProgress)
-        // atomically via emit_spawn_lifecycle. Both events are persisted as a
-        // single atomic operation to prevent partial state commits.
-        // TCK-00348: Thread contract binding into SessionStarted.
+        // RFC-0032::REQ-0149: Emit SessionStarted +
+        // WorkTransitioned(Claimed->InProgress) atomically via
+        // emit_spawn_lifecycle. Both events are persisted as a single atomic
+        // operation to prevent partial state commits. RFC-0020::REQ-0002:
+        // Thread contract binding into SessionStarted.
         if let Err(e) = self.event_emitter.emit_spawn_lifecycle(
             &session_id,
             &request.work_id,
@@ -14996,7 +15039,7 @@ impl PrivilegedDispatcher {
             identity_proof_profile_hash.as_ref(),
             selection_decision.as_ref(),
         ) {
-            // TCK-00384 review fix: unified post-start rollback stops the
+            // RFC-0032::REQ-0138 review fix: unified post-start rollback stops the
             // episode and cleans up session/telemetry/manifest.
             let rollback_warn = self.rollback_spawn_with_episode_stop(
                 episode_id_opt.as_ref(),
@@ -15041,7 +15084,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `IssueCapability` requests (IPC-PRIV-003).
     ///
-    /// # TCK-00289 Implementation
+    /// # RFC-0032::REQ-0091 Implementation
     ///
     /// This handler implements capability issuance with:
     /// 1. Session validation (must exist)
@@ -15088,7 +15131,7 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // 2. Validate lease/work wiring (TCK-00289).
+        // 2. Validate lease/work wiring (RFC-0032::REQ-0091).
         //
         // Resolve lease -> work via the authoritative lease validator first,
         // then resolve the exact `(work_id, lease_id)` claim row. This avoids
@@ -15145,11 +15188,12 @@ impl PrivilegedDispatcher {
         let _mono_tick = mono_tick.value();
 
         // For grant/expire times, use HLC Wall Time per RFC-0016.
-        // TCK-00289: Fail-closed - do not fall back to SystemTime if HLC disabled.
+        // RFC-0032::REQ-0091: Fail-closed - do not fall back to SystemTime if HLC
+        // disabled.
         let now_wall = match self.holonic_clock.now_hlc() {
             Ok(hlc) => hlc.wall_ns,
             Err(e) => {
-                // TCK-00289: Fail-closed - do not use SystemTime fallback
+                // RFC-0032::REQ-0091: Fail-closed - do not use SystemTime fallback
                 warn!(error = %e, "HLC clock error during IssueCapability - failing closed");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::PolicyResolutionFailed,
@@ -15169,7 +15213,7 @@ impl PrivilegedDispatcher {
 
         let capability_id = format!("C-{}", uuid::Uuid::new_v4());
 
-        // TCK-00268: Emit capability_granted metric
+        // RFC-0032::REQ-0084: Emit capability_granted metric
         if let Some(ref metrics) = self.metrics {
             let role_str = match WorkRole::try_from(session.role).unwrap_or(WorkRole::Unspecified) {
                 WorkRole::Implementer => "implementer",
@@ -15204,7 +15248,7 @@ impl PrivilegedDispatcher {
         ))
     }
 
-    /// Handles Shutdown requests (IPC-PRIV-004, TCK-00392).
+    /// Handles Shutdown requests (IPC-PRIV-004, RFC-0032::REQ-0146).
     ///
     /// Triggers graceful daemon shutdown by setting the atomic shutdown flag
     /// on `SharedState`. The main event loop detects this flag and initiates
@@ -15262,7 +15306,7 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Handles `UpdateStopFlags` requests (IPC-PRIV-018, TCK-00351).
+    /// Handles `UpdateStopFlags` requests (IPC-PRIV-018, RFC-0020::REQ-0005).
     ///
     /// Mutates the shared runtime stop flags used by pre-actuation gating.
     ///
@@ -15388,7 +15432,8 @@ impl PrivilegedDispatcher {
         ))
     }
 
-    /// Handles `WorkStatus` requests (IPC-PRIV-015, TCK-00344/TCK-00415).
+    /// Handles `WorkStatus` requests (IPC-PRIV-015,
+    /// RFC-0032::REQ-0134/RFC-0032::REQ-0159).
     ///
     /// Authority is projection-backed: lifecycle state is derived from ledger
     /// projection only. Session/claim registries provide supplementary runtime
@@ -15435,7 +15480,7 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Handles `WorkList` requests (IPC-PRIV-019, TCK-00415).
+    /// Handles `WorkList` requests (IPC-PRIV-019, RFC-0032::REQ-0159).
     ///
     /// Lists work items known to projection authority with bounded pagination.
     /// Server enforces `MAX_WORK_LIST_ROWS` regardless of client `limit`.
@@ -15489,7 +15534,7 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Handles `OpenWork` requests (IPC-PRIV-076, TCK-00635).
+    /// Handles `OpenWork` requests (IPC-PRIV-076, RFC-0032::REQ-0263).
     ///
     /// Opens a new work item by:
     /// 1. Bounded-decoding and validating the `WorkSpec` JSON
@@ -15880,7 +15925,7 @@ impl PrivilegedDispatcher {
         // key in `SignedLedgerEvent`, so we pass `spec.work_id` to ensure
         // `get_events_by_work_id` can find this event for idempotency.
         //
-        // SECURITY (TCK-00635 — Race-Safe Idempotency):
+        // SECURITY (RFC-0032::REQ-0263 — Race-Safe Idempotency):
         //
         // The database has partial unique indices on BOTH tables:
         // - `idx_work_opened_unique ON ledger_events(work_id) WHERE event_type =
@@ -16025,7 +16070,7 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Handles `ClaimWorkV2` requests (IPC-PRIV-078, TCK-00637).
+    /// Handles `ClaimWorkV2` requests (IPC-PRIV-078, RFC-0032::REQ-0265).
     ///
     /// Claims an EXISTING work item (opened via `OpenWork`). Does not create a
     /// new `work_id`. Transitions:
@@ -17332,7 +17377,8 @@ impl PrivilegedDispatcher {
         ))
     }
 
-    /// Handles `AuditorLaunchProjection` requests (IPC-PRIV-020, TCK-00452).
+    /// Handles `AuditorLaunchProjection` requests (IPC-PRIV-020,
+    /// RFC-0020::REQ-0040).
     ///
     /// Returns launch-lineage completeness and boundary-conformance indicators
     /// backed by authoritative receipt events.
@@ -17379,7 +17425,7 @@ impl PrivilegedDispatcher {
     }
 
     /// Handles `OrchestratorLaunchProjection` requests (IPC-PRIV-027,
-    /// TCK-00452).
+    /// RFC-0020::REQ-0040).
     ///
     /// Returns active-run/liveness projection fields for orchestrator control
     /// loops.
@@ -17624,7 +17670,8 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Returns the shared projection-backed work authority (TCK-00415).
+    /// Returns the shared projection-backed work authority
+    /// (RFC-0032::REQ-0159).
     ///
     /// The authority is instantiated once during dispatcher construction and
     /// reused across requests. Its internal event-count cache avoids
@@ -17845,10 +17892,10 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
-    // Session Termination Handler (TCK-00395)
+    // Session Termination Handler (RFC-0032::REQ-0149)
     // ========================================================================
 
-    /// Handles `EndSession` requests (IPC-PRIV-016, TCK-00395).
+    /// Handles `EndSession` requests (IPC-PRIV-016, RFC-0032::REQ-0149).
     ///
     /// Terminates an active session and emits a `SessionTerminated` ledger
     /// event. This is the authoritative path for session termination that
@@ -17936,7 +17983,7 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // RFC-0032::REQ-0149 Security MAJOR 2: Fail closed when peer credentials are
         // missing. Same pattern as ClaimWork (line 3631). EndSession emits
         // authoritative ledger events (SessionTerminated), and recording
         // "unknown" as the actor identity would break the accountability
@@ -17960,7 +18007,7 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00395 Quality v3 MAJOR: Use typed TerminationOutcome enum to
+        // RFC-0032::REQ-0149 Quality v3 MAJOR: Use typed TerminationOutcome enum to
         // determine exit code instead of free-form string matching.
         // When `outcome` is set (non-zero), it takes precedence over the
         // legacy `reason` string. Unspecified (0) falls back to string
@@ -18018,7 +18065,7 @@ impl PrivilegedDispatcher {
         };
 
         // Stop the runtime episode if we have a valid episode_id.
-        // TCK-00395 Security MAJOR 1: Fail closed on EpisodeId parse failure.
+        // RFC-0032::REQ-0149 Security MAJOR 1: Fail closed on EpisodeId parse failure.
         // Previously, a malformed/corrupted episode_id would silently skip
         // the runtime stop but still emit termination facts and clean up
         // registry state, leaving the runtime running without accountability.
@@ -18086,7 +18133,7 @@ impl PrivilegedDispatcher {
             &request.reason
         };
 
-        // TCK-00395: Emit SessionTerminated event to ledger.
+        // RFC-0032::REQ-0149: Emit SessionTerminated event to ledger.
         // This is the authoritative path for recording session termination.
         // Only emitted AFTER runtime stop succeeds (Security BLOCKER 2).
         if let Err(e) = self.event_emitter.emit_session_terminated(
@@ -18104,7 +18151,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00395 Quality BLOCKER 2: DO NOT emit
+        // RFC-0032::REQ-0149 Quality BLOCKER 2: DO NOT emit
         // WorkTransitioned(InProgress -> Completed) on EndSession.
         // The InProgress -> Completed transition violates core work-state
         // transition rules (state.rs only allows InProgress -> Review,
@@ -18117,12 +18164,12 @@ impl PrivilegedDispatcher {
         // (runtime stop + ledger emission) have succeeded. This prevents
         // the session from being orphaned if a downstream step fails.
         //
-        // TCK-00395 Security BLOCKER 2: Also remove the manifest entry
+        // RFC-0032::REQ-0149 Security BLOCKER 2: Also remove the manifest entry
         // to prevent retained session tokens from passing manifest lookup
         // in RequestTool after EndSession.
         self.manifest_store.remove(&request.session_id);
 
-        // TCK-00352 MAJOR 2 fix: Remove V1 manifest on EndSession.
+        // RFC-0020::REQ-0006 MAJOR 2 fix: Remove V1 manifest on EndSession.
         // Without this, a terminated session's V1 manifest remains in the
         // store. If a new session reuses the same ID (or a retained token
         // is replayed), the stale V1 manifest could incorrectly match,
@@ -18131,13 +18178,13 @@ impl PrivilegedDispatcher {
             v1_store.remove(&request.session_id);
         }
 
-        // TCK-00401: Remove per-session broker on EndSession to prevent stale
+        // RFC-0032::REQ-0153: Remove per-session broker on EndSession to prevent stale
         // capability/policy state from being reused by retained tokens.
         if let Some(ref broker_store) = self.session_broker_registry {
             broker_store.remove(&request.session_id);
         }
 
-        // TCK-00351 BLOCKER-2: `episode_count` is defined as completed
+        // RFC-0020::REQ-0005 BLOCKER-2: `episode_count` is defined as completed
         // episodes. Increment on termination (not spawn) to avoid
         // off-by-one self-deny on the first RequestTool.
         if let Some(ref store) = self.telemetry_store {
@@ -18146,7 +18193,7 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // TCK-00384 review fix: Clean up telemetry on EndSession to free
+        // RFC-0032::REQ-0138 review fix: Clean up telemetry on EndSession to free
         // capacity in the bounded store. Without this, repeated
         // spawn/end cycles exhaust MAX_TELEMETRY_SESSIONS and block new
         // spawns (DoS). Mirrors the cleanup in session_dispatch.rs:1421.
@@ -18154,7 +18201,7 @@ impl PrivilegedDispatcher {
             store.remove(&request.session_id);
         }
 
-        // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on EndSession
+        // RFC-0020::REQ-0005 BLOCKER 3 FIX: Clean up stop conditions on EndSession
         // to free capacity in the bounded store.  Without this, stop
         // conditions entries accumulate on every spawn/end cycle and are
         // never reclaimed, causing the store to reach capacity and reject
@@ -18189,10 +18236,11 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
-    // TCK-00389: IngestReviewReceipt Handler
+    // RFC-0032::REQ-0143: IngestReviewReceipt Handler
     // ========================================================================
 
-    /// Handles `IngestReviewReceipt` requests (IPC-PRIV-017, TCK-00389).
+    /// Handles `IngestReviewReceipt` requests (IPC-PRIV-017,
+    /// RFC-0032::REQ-0143).
     ///
     /// Ingests a review receipt from an external reviewer into the FAC ledger.
     /// Validates reviewer identity against the gate lease, verifies request
@@ -18292,11 +18340,11 @@ impl PrivilegedDispatcher {
         // REQ-0010: Identity-bearing authoritative requests MUST carry
         // proof-carrying pointers.
         //
-        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // SECURITY (RFC-0020::REQ-0010 Fix 1): Validate the identity proof hash using
         // the centralized validator which enforces non-zero commitment and
         // correct length. Phase 1 (pre-CAS transport) validates the hash as
         // a binding commitment; full proof dereference requires CAS
-        // integration (TCK-00359).
+        // integration (RFC-0020::REQ-0013).
         if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
         {
             return Ok(PrivilegedResponse::error(
@@ -18411,7 +18459,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // ---- Phase 1a (TCK-00408): CAS existence validation ----
+        // ---- Phase 1a (RFC-0032::REQ-0156): CAS existence validation ----
         // CAS is a hard requirement for review receipt ingestion (fail-closed).
         // Without CAS, artifact_bundle_hash cannot be verified, so we reject
         // the request rather than silently skipping validation.
@@ -18536,7 +18584,7 @@ impl PrivilegedDispatcher {
             claim_for_receipt.policy_resolution.capability_manifest_hash;
         let claim_context_pack_hash = claim_for_receipt.policy_resolution.context_pack_hash;
 
-        // ---- Phase 1c (TCK-00340): Attestation ratchet validation ----
+        // ---- Phase 1c (RFC-0032::REQ-0131): Attestation ratchet validation ----
         //
         // SECURITY (v5 Finding 4): Instead of hard-rejecting all non-Tier0
         // requests, consult the ratchet table first. The ratchet table
@@ -18645,7 +18693,7 @@ impl PrivilegedDispatcher {
         };
 
         // =====================================================================
-        // TCK-00416: Review outcome binding validation (IngestReviewReceipt)
+        // RFC-0032::REQ-0160: Review outcome binding validation (IngestReviewReceipt)
         //
         // Per REQ-HEF-0013, review outcomes MUST carry valid evidence-index
         // bindings. All three commitment hashes must be non-zero AND
@@ -19067,7 +19115,7 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
-    // Process Management Handlers (TCK-00342)
+    // Process Management Handlers (RFC-0032::REQ-0132)
     // ========================================================================
 
     /// Converts a `ProcessState` to the corresponding proto `ProcessStateEnum`
@@ -19538,7 +19586,7 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // Credential Management Handlers (CTR-PROTO-011, TCK-00343)
+    // Credential Management Handlers (CTR-PROTO-011, RFC-0032::REQ-0133)
     // =========================================================================
 
     /// Converts a protobuf `CredentialProvider` enum to a core `Provider`.
@@ -19628,7 +19676,7 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00394: ChangeSet Publishing (RFC-0018)
+    // RFC-0032::REQ-0148: ChangeSet Publishing (RFC-0018)
     // =========================================================================
 
     /// Handles `PublishChangeSet` requests (IPC-PRIV-017).
@@ -19747,7 +19795,7 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // TCK-00408: Actor ownership check — the authenticated caller must be
+        // RFC-0032::REQ-0156: Actor ownership check — the authenticated caller must be
         // the actor that owns the work claim. This prevents unauthorized actors
         // from publishing changesets against work items they don't own.
         let actor_matches = claim.actor_id.len() == actor_id.len()
@@ -19813,7 +19861,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00568: Control-plane bundle export rate limit.
+        // RFC-0032::REQ-0219: Control-plane bundle export rate limit.
         // INV-CPRL-002: Budget check occurs BEFORE any state mutation (CAS store).
         #[allow(clippy::cast_possible_truncation)]
         if let Err(e) = self.admit_bundle_export(request.bundle_bytes.len() as u64) {
@@ -19947,10 +19995,11 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00645: PublishWorkLoopProfile Handler (RFC-0032 Phase 4)
+    // RFC-0032::REQ-0270: PublishWorkLoopProfile Handler (RFC-0032 Phase 4)
     // =========================================================================
 
-    /// Handles `PublishWorkLoopProfile` requests (IPC-PRIV-079, TCK-00645).
+    /// Handles `PublishWorkLoopProfile` requests (IPC-PRIV-079,
+    /// RFC-0032::REQ-0270).
     ///
     /// Publishes a work loop profile to CAS and anchors it in the ledger via
     /// `evidence.published` with category `WORK_LOOP_PROFILE`.
@@ -20474,10 +20523,11 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00638: PublishWorkContextEntry Handler (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0266: PublishWorkContextEntry Handler (RFC-0032 Phase 2)
     // =========================================================================
 
-    /// Handles `PublishWorkContextEntry` requests (IPC-PRIV-076, TCK-00638).
+    /// Handles `PublishWorkContextEntry` requests (IPC-PRIV-076,
+    /// RFC-0032::REQ-0266).
     ///
     /// Publishes a work context entry to CAS and anchors it in the ledger via
     /// `evidence.published` with category `WORK_CONTEXT_ENTRY`.
@@ -20596,7 +20646,7 @@ impl PrivilegedDispatcher {
             ));
         };
 
-        // TCK-00638: Actor ownership check — the authenticated caller must be
+        // RFC-0032::REQ-0266: Actor ownership check — the authenticated caller must be
         // the actor that owns the work claim. Prevents unauthorized actors
         // from publishing context entries against work they don't own.
         if !Self::constant_time_str_eq(claim.actor_id.as_str(), actor_id.as_str()) {
@@ -20615,7 +20665,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00638: Lease ID validation — the provided lease_id must match
+        // RFC-0032::REQ-0266: Lease ID validation — the provided lease_id must match
         // the claim's lease_id. Uses constant-time comparison to prevent
         // timing side-channel attacks that could leak valid lease_id values.
         {
@@ -20698,7 +20748,7 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00638: Control-plane bundle export rate limit (consistent with
+        // RFC-0032::REQ-0266: Control-plane bundle export rate limit (consistent with
         // PublishChangeSet). Budget check occurs BEFORE any state mutation
         // (CAS store / ledger append).
         #[allow(clippy::cast_possible_truncation)]
@@ -20859,7 +20909,7 @@ impl PrivilegedDispatcher {
             ],
         );
 
-        // TCK-00638: Compute intent digest over the canonical bytes that
+        // RFC-0032::REQ-0266: Compute intent digest over the canonical bytes that
         // will be stored in CAS — NOT over the raw `request.entry_json`.
         // The daemon has already overwritten authoritative fields (entry_id,
         // actor_id, created_at_ns, source_session_id) on the entry struct,
@@ -20922,7 +20972,7 @@ impl PrivilegedDispatcher {
             Err(response) => return Ok(response),
         };
 
-        // TCK-00638: Idempotency check — AFTER PCAC lifecycle enforcement.
+        // RFC-0032::REQ-0266: Idempotency check — AFTER PCAC lifecycle enforcement.
         // If an evidence.published event with this entry_id already exists in
         // the ledger, return the existing response without emitting a duplicate
         // event. This prevents ledger bloat on retries.
@@ -20981,7 +21031,7 @@ impl PrivilegedDispatcher {
         let cas_hash_hex = hex::encode(cas_hash);
 
         // Emit evidence.published ledger event with category WORK_CONTEXT_ENTRY.
-        // TCK-00638: Include PCAC lifecycle artifacts in metadata for
+        // RFC-0032::REQ-0266: Include PCAC lifecycle artifacts in metadata for
         // RFC-0027 Law 7 (Evidence Sufficiency) compliance.
         let evidence_event_payload = {
             use prost::Message;
@@ -21029,7 +21079,7 @@ impl PrivilegedDispatcher {
             event.encode_to_vec()
         };
 
-        // TCK-00638 SECURITY FIX: Use `emit_evidence_published_event` which
+        // RFC-0032::REQ-0266 SECURITY FIX: Use `emit_evidence_published_event` which
         // surfaces the `evidence_id` in the JSON envelope for UNIQUE index
         // enforcement. The DB UNIQUE constraint on
         // `json_extract(payload, '$.evidence_id')` will reject concurrent
@@ -21312,7 +21362,7 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00639: RecordWorkPrAssociation Handler
+    // RFC-0032::REQ-0267: RecordWorkPrAssociation Handler
     // =========================================================================
 
     /// Maximum length of a commit SHA (40 lowercase hex characters).
@@ -21321,7 +21371,8 @@ impl PrivilegedDispatcher {
     /// Maximum length of an optional PR URL.
     const MAX_PR_URL_LENGTH: usize = 2048;
 
-    /// Handles `RecordWorkPrAssociation` requests (IPC-PRIV-079, TCK-00639).
+    /// Handles `RecordWorkPrAssociation` requests (IPC-PRIV-079,
+    /// RFC-0032::REQ-0267).
     ///
     /// Records a PR association for an existing work item by emitting a
     /// canonical `work.pr_associated` event. Optionally publishes a LINKOUT
@@ -21848,10 +21899,11 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00636: ResolveTicketAlias Handler (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: ResolveTicketAlias Handler (RFC-0032 Phase 1)
     // =========================================================================
 
-    /// Handles `ResolveTicketAlias` requests (IPC-PRIV-080, TCK-00636).
+    /// Handles `ResolveTicketAlias` requests (IPC-PRIV-080,
+    /// RFC-0032::REQ-0264).
     ///
     /// Resolves a ticket alias to a canonical `work_id` via projection state
     /// using [`AliasReconciliationGate::resolve_ticket_alias`]. Returns the
@@ -21942,10 +21994,10 @@ impl PrivilegedDispatcher {
     }
 
     // =========================================================================
-    // TCK-00340: DelegateSublease Handler
+    // RFC-0032::REQ-0131: DelegateSublease Handler
     // =========================================================================
 
-    /// Handles `DelegateSublease` requests (IPC-PRIV-072, TCK-00340).
+    /// Handles `DelegateSublease` requests (IPC-PRIV-072, RFC-0032::REQ-0131).
     ///
     /// Delegates a sublease from a parent gate lease to a child holon,
     /// validating strict-subset constraints before signing the sublease.
@@ -22018,11 +22070,11 @@ impl PrivilegedDispatcher {
         // REQ-0010: Identity-bearing authoritative requests MUST carry
         // proof-carrying pointers.
         //
-        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // SECURITY (RFC-0020::REQ-0010 Fix 1): Validate the identity proof hash using
         // the centralized validator which enforces non-zero commitment and
         // correct length. Phase 1 (pre-CAS transport) validates the hash as
         // a binding commitment; full proof dereference requires CAS
-        // integration (TCK-00359).
+        // integration (RFC-0020::REQ-0013).
         if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
         {
             return Ok(PrivilegedResponse::error(
@@ -22769,7 +22821,7 @@ impl PrivilegedDispatcher {
         // SECURITY (v5 Finding 3): The event actor MUST be the authenticated
         // caller (peer credentials), not caller-supplied delegatee identity.
         //
-        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in the
+        // SECURITY (RFC-0020::REQ-0010 Fix 1): identity_proof_hash is included in the
         // signed payload so proof-carrying bindings are audit-stable.
         let mut event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
@@ -23302,7 +23354,7 @@ impl PrivilegedDispatcher {
     ///
     /// Refreshes an OAuth credential by requesting a new token.
     /// Note: Automated OAuth refresh requires an external token endpoint,
-    /// which is out of scope for TCK-00343. This handler verifies the
+    /// which is out of scope for RFC-0032::REQ-0133. This handler verifies the
     /// profile exists in the store and returns an appropriate error.
     fn handle_refresh_credential(
         &self,
@@ -23343,7 +23395,7 @@ impl PrivilegedDispatcher {
                 }
 
                 // OAuth token refresh requires an external token endpoint, which
-                // is out of scope for TCK-00343. Return an informative error.
+                // is out of scope for RFC-0032::REQ-0133. Return an informative error.
                 Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CredentialRefreshNotSupported,
                     "OAuth token refresh requires an external token endpoint (not yet implemented)",
@@ -23431,8 +23483,9 @@ impl PrivilegedDispatcher {
     /// would generate an authorization URL. For API key flows, the key is
     /// provided directly in a subsequent `AddCredential` call.
     ///
-    /// Note: Full interactive OAuth flow is out of scope for TCK-00343.
-    /// This handler returns a stub response indicating the flow type.
+    /// Note: Full interactive OAuth flow is out of scope for
+    /// RFC-0032::REQ-0133. This handler returns a stub response indicating
+    /// the flow type.
     fn handle_login_credential(
         &self,
         payload: &[u8],
@@ -23450,7 +23503,7 @@ impl PrivilegedDispatcher {
         );
 
         // LoginCredential is an interactive flow that requires browser-based
-        // OAuth or terminal prompts. For TCK-00343, the credential store is
+        // OAuth or terminal prompts. For RFC-0032::REQ-0133, the credential store is
         // wired but interactive login flows remain as future work.
         let profile_id = request
             .profile_id
@@ -23479,7 +23532,7 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
-    // Consensus Query Handlers (TCK-00345)
+    // Consensus Query Handlers (RFC-0032::REQ-0135)
     // ========================================================================
 
     /// Maximum number of Byzantine evidence entries to return.
@@ -23488,7 +23541,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `ConsensusStatus` requests (IPC-PRIV-011).
     ///
-    /// # TCK-00345: Consensus Status Query
+    /// # RFC-0032::REQ-0135: Consensus Status Query
     ///
     /// Returns current consensus cluster status. If the consensus subsystem
     /// is not configured (single-node mode), returns `CONSENSUS_NOT_CONFIGURED`
@@ -23538,7 +23591,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `ConsensusValidators` requests (IPC-PRIV-012).
     ///
-    /// # TCK-00345: Validator List Query
+    /// # RFC-0032::REQ-0135: Validator List Query
     ///
     /// Returns list of validators in the consensus cluster. If the consensus
     /// subsystem is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
@@ -23573,7 +23626,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `ConsensusByzantineEvidence` requests (IPC-PRIV-013).
     ///
-    /// # TCK-00345: Byzantine Evidence Query
+    /// # RFC-0032::REQ-0135: Byzantine Evidence Query
     ///
     /// Returns list of detected Byzantine fault evidence. If the consensus
     /// subsystem is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
@@ -23615,7 +23668,7 @@ impl PrivilegedDispatcher {
 
     /// Handles `ConsensusMetrics` requests (IPC-PRIV-014).
     ///
-    /// # TCK-00345: Consensus Metrics Query
+    /// # RFC-0032::REQ-0135: Consensus Metrics Query
     ///
     /// Returns consensus metrics summary. If the consensus subsystem
     /// is not configured, returns `CONSENSUS_NOT_CONFIGURED` error.
@@ -23656,12 +23709,12 @@ impl PrivilegedDispatcher {
     }
 
     // ========================================================================
-    // HEF Pulse Plane Handlers (TCK-00302)
+    // HEF Pulse Plane Handlers (RFC-0032::REQ-0098)
     // ========================================================================
 
     /// Handles `SubscribePulse` requests from operator sockets (IPC-HEF-001).
     ///
-    /// # TCK-00302: Operator Full Taxonomy Access
+    /// # RFC-0032::REQ-0098: Operator Full Taxonomy Access
     ///
     /// Per DD-HEF-0004: "Operator connections may subscribe broadly."
     /// Operators can subscribe to any valid pattern including wildcards.
@@ -23675,7 +23728,8 @@ impl PrivilegedDispatcher {
     /// # Note: Subscription Registry
     ///
     /// Actual subscription registration and pulse delivery are handled by
-    /// TCK-00303 (resource governance) and TCK-00304 (outbox + publisher).
+    /// RFC-0032::REQ-0099 (resource governance) and RFC-0032::REQ-0100 (outbox
+    /// + publisher).
     fn handle_subscribe_pulse(
         &self,
         payload: &[u8],
@@ -23752,15 +23806,15 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // Generate subscription ID; use connection ID from context (TCK-00303)
+        // Generate subscription ID; use connection ID from context (RFC-0032::REQ-0099)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
-        // TCK-00303: Use connection_id from context for consistent tracking
+        // RFC-0032::REQ-0099: Use connection_id from context for consistent tracking
         // across the connection lifecycle. The connection handler will call
         // unregister_connection with this ID when the connection closes.
         let connection_id = ctx.connection_id();
 
-        // TCK-00303: Wire resource governance - register connection if not exists
-        // and add subscription with limit checks
+        // RFC-0032::REQ-0099: Wire resource governance - register connection if not
+        // exists and add subscription with limit checks
         if !accepted_patterns.is_empty() {
             // Parse accepted patterns into TopicPattern
             let mut parsed_patterns = Vec::new();
@@ -23873,13 +23927,13 @@ impl PrivilegedDispatcher {
 
     /// Handles `UnsubscribePulse` requests from operator sockets (IPC-HEF-002).
     ///
-    /// # TCK-00302: Unsubscribe Handling
+    /// # RFC-0032::REQ-0098: Unsubscribe Handling
     ///
     /// This handler validates the unsubscribe request and returns success.
     ///
     /// # Note: Subscription Registry
     ///
-    /// Actual subscription removal is handled by TCK-00303 (resource
+    /// Actual subscription removal is handled by RFC-0032::REQ-0099 (resource
     /// governance).
     fn handle_unsubscribe_pulse(
         &self,
@@ -23906,8 +23960,8 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // TCK-00303: Wire resource governance - remove subscription from registry
-        // Use connection_id from context for consistent tracking
+        // RFC-0032::REQ-0099: Wire resource governance - remove subscription from
+        // registry Use connection_id from context for consistent tracking
         let connection_id = ctx.connection_id();
 
         let removed = match self
@@ -23978,7 +24032,8 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes an `UpdateStopFlags` request to bytes for sending (TCK-00351).
+/// Encodes an `UpdateStopFlags` request to bytes for sending
+/// (RFC-0020::REQ-0005).
 #[must_use]
 pub fn encode_update_stop_flags_request(request: &UpdateStopFlagsRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::UpdateStopFlags.tag()];
@@ -23986,7 +24041,7 @@ pub fn encode_update_stop_flags_request(request: &UpdateStopFlagsRequest) -> Byt
     Bytes::from(buf)
 }
 
-/// Encodes an `EndSession` request to bytes for sending (TCK-00395).
+/// Encodes an `EndSession` request to bytes for sending (RFC-0032::REQ-0149).
 #[must_use]
 pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::EndSession.tag()];
@@ -23994,7 +24049,8 @@ pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes an `IngestReviewReceipt` request to bytes for sending (TCK-00389).
+/// Encodes an `IngestReviewReceipt` request to bytes for sending
+/// (RFC-0032::REQ-0143).
 #[must_use]
 pub fn encode_ingest_review_receipt_request(request: &IngestReviewReceiptRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::IngestReviewReceipt.tag()];
@@ -24002,7 +24058,8 @@ pub fn encode_ingest_review_receipt_request(request: &IngestReviewReceiptRequest
     Bytes::from(buf)
 }
 
-/// Encodes a `DelegateSublease` request to bytes for sending (TCK-00340).
+/// Encodes a `DelegateSublease` request to bytes for sending
+/// (RFC-0032::REQ-0131).
 #[must_use]
 pub fn encode_delegate_sublease_request(request: &DelegateSubleaseRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::DelegateSublease.tag()];
@@ -24019,7 +24076,7 @@ pub fn encode_verify_ledger_chain_request(request: &VerifyLedgerChainRequest) ->
 }
 
 // ============================================================================
-// Process Management Request Encoding (TCK-00342)
+// Process Management Request Encoding (RFC-0032::REQ-0132)
 // ============================================================================
 
 /// Encodes a `ListProcesses` request to bytes for sending.
@@ -24071,7 +24128,8 @@ pub fn encode_reload_process_request(request: &ReloadProcessRequest) -> Bytes {
 }
 
 // ============================================================================
-// CTR-PROTO-011: Consensus Query Request Encoding (RFC-0014, TCK-00345)
+// CTR-PROTO-011: Consensus Query Request Encoding (RFC-0014,
+// RFC-0032::REQ-0135)
 // ============================================================================
 
 /// Encodes a `ConsensusStatus` request to bytes for sending.
@@ -24136,7 +24194,7 @@ pub fn encode_consensus_metrics_request(request: &ConsensusMetricsRequest) -> By
     Bytes::from(buf)
 }
 
-/// Encodes a `WorkStatus` request to bytes for sending (TCK-00344).
+/// Encodes a `WorkStatus` request to bytes for sending (RFC-0032::REQ-0134).
 #[must_use]
 pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkStatus.tag()];
@@ -24144,7 +24202,7 @@ pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes a `WorkList` request to bytes for sending (TCK-00415).
+/// Encodes a `WorkList` request to bytes for sending (RFC-0032::REQ-0159).
 #[must_use]
 pub fn encode_work_list_request(request: &WorkListRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkList.tag()];
@@ -24153,7 +24211,7 @@ pub fn encode_work_list_request(request: &WorkListRequest) -> Bytes {
 }
 
 /// Encodes an `AuditorLaunchProjection` request to bytes for sending
-/// (TCK-00452).
+/// (RFC-0020::REQ-0040).
 #[must_use]
 pub fn encode_auditor_launch_projection_request(request: &AuditorLaunchProjectionRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::AuditorLaunchProjection.tag()];
@@ -24162,7 +24220,7 @@ pub fn encode_auditor_launch_projection_request(request: &AuditorLaunchProjectio
 }
 
 /// Encodes an `OrchestratorLaunchProjection` request to bytes for sending
-/// (TCK-00452).
+/// (RFC-0020::REQ-0040).
 #[must_use]
 pub fn encode_orchestrator_launch_projection_request(
     request: &OrchestratorLaunchProjectionRequest,
@@ -24173,10 +24231,11 @@ pub fn encode_orchestrator_launch_projection_request(
 }
 
 // =============================================================================
-// TCK-00394: ChangeSet Publishing Encoding (RFC-0018)
+// RFC-0032::REQ-0148: ChangeSet Publishing Encoding (RFC-0018)
 // =============================================================================
 
-/// Encodes a `PublishChangeSet` request to bytes for sending (TCK-00394).
+/// Encodes a `PublishChangeSet` request to bytes for sending
+/// (RFC-0032::REQ-0148).
 #[must_use]
 pub fn encode_publish_changeset_request(request: &PublishChangeSetRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::PublishChangeSet.tag()];
@@ -24185,7 +24244,7 @@ pub fn encode_publish_changeset_request(request: &PublishChangeSetRequest) -> By
 }
 
 /// Encodes a `PublishWorkContextEntry` request to bytes for sending
-/// (TCK-00638).
+/// (RFC-0032::REQ-0266).
 #[must_use]
 pub fn encode_publish_work_context_entry_request(
     request: &PublishWorkContextEntryRequest,
@@ -24196,7 +24255,7 @@ pub fn encode_publish_work_context_entry_request(
 }
 
 /// Encodes a `PublishWorkLoopProfile` request to bytes for sending
-/// (TCK-00645).
+/// (RFC-0032::REQ-0270).
 #[must_use]
 pub fn encode_publish_work_loop_profile_request(request: &PublishWorkLoopProfileRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::PublishWorkLoopProfile.tag()];
@@ -24205,7 +24264,7 @@ pub fn encode_publish_work_loop_profile_request(request: &PublishWorkLoopProfile
 }
 
 // =============================================================================
-// CTR-PROTO-012: Credential Management Encoding (RFC-0018, TCK-00343)
+// CTR-PROTO-012: Credential Management Encoding (RFC-0018, RFC-0032::REQ-0133)
 // =============================================================================
 
 /// Encodes a `ListCredentials` request to bytes for sending.
@@ -24256,7 +24315,7 @@ pub fn encode_login_credential_request(request: &LoginCredentialRequest) -> Byte
     Bytes::from(buf)
 }
 
-/// Encodes an `OpenWork` request to bytes for sending (TCK-00635).
+/// Encodes an `OpenWork` request to bytes for sending (RFC-0032::REQ-0263).
 ///
 /// The format is: `[tag: u8][payload: protobuf]`
 #[must_use]
@@ -24266,7 +24325,7 @@ pub fn encode_open_work_request(request: &OpenWorkRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes a `ClaimWorkV2` request to bytes for sending (TCK-00637).
+/// Encodes a `ClaimWorkV2` request to bytes for sending (RFC-0032::REQ-0265).
 ///
 /// The format is: `[tag: u8][payload: protobuf]`
 #[must_use]
@@ -24277,7 +24336,7 @@ pub fn encode_claim_work_v2_request(request: &ClaimWorkV2Request) -> Bytes {
 }
 
 /// Encodes a `RecordWorkPrAssociation` request to bytes for sending
-/// (TCK-00639).
+/// (RFC-0032::REQ-0267).
 ///
 /// The format is: `[tag: u8][payload: protobuf]`
 #[must_use]
@@ -24289,7 +24348,8 @@ pub fn encode_record_work_pr_association_request(
     Bytes::from(buf)
 }
 
-/// Encodes a `ResolveTicketAlias` request to bytes for sending (TCK-00636).
+/// Encodes a `ResolveTicketAlias` request to bytes for sending
+/// (RFC-0032::REQ-0264).
 #[must_use]
 pub fn encode_resolve_ticket_alias_request(request: &ResolveTicketAliasRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::ResolveTicketAlias.tag()];
@@ -24301,7 +24361,7 @@ pub fn encode_resolve_ticket_alias_request(request: &ResolveTicketAliasRequest) 
 mod tests {
     use super::*;
 
-    /// TCK-00319: Helper function to get a test workspace root.
+    /// RFC-0032::REQ-0113: Helper function to get a test workspace root.
     /// Uses /tmp which exists on all Unix systems.
     fn test_workspace_root() -> String {
         "/tmp".to_string()
@@ -24637,7 +24697,7 @@ mod tests {
             );
         }
 
-        /// TCK-00565: Daemon dispatch flow path MUST emit tokens with
+        /// RFC-0032::REQ-0216: Daemon dispatch flow path MUST emit tokens with
         /// `TokenBindingV1` (policy hash, canonicalizer tuple digest,
         /// `boundary_id`, issued/expiry ticks). Without this, workers deny
         /// the token as `MissingTokenBinding`.
@@ -24701,8 +24761,8 @@ mod tests {
     mod budget_denial_receipt_propagation {
         use super::*;
 
-        /// TCK-00568: Token issuance denial propagates structured receipt
-        /// through `ChannelBoundaryDefect`.
+        /// RFC-0032::REQ-0219: Token issuance denial propagates structured
+        /// receipt through `ChannelBoundaryDefect`.
         #[test]
         fn token_issuance_denial_includes_receipt_in_defect() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -24751,7 +24811,7 @@ mod tests {
             assert_eq!(receipt.requested_increment, 1);
         }
 
-        /// TCK-00568: `ClaimWork`/`PublishChangeSet` denial produces a
+        /// RFC-0032::REQ-0219: `ClaimWork`/`PublishChangeSet` denial produces a
         /// `PrivilegedResponse::Error` with JSON-serialized denial receipt
         /// in the message.
         #[test]
@@ -24792,7 +24852,7 @@ mod tests {
             }
         }
 
-        /// TCK-00568: `with_economics_control_plane_limits` applies
+        /// RFC-0032::REQ-0219: `with_economics_control_plane_limits` applies
         /// non-default limits at construction time.
         #[test]
         fn with_economics_control_plane_limits_applies_limits() {
@@ -24965,7 +25025,7 @@ mod tests {
     }
 
     // ========================================================================
-    // INT-001: Privileged endpoint routing (TCK-00251)
+    // INT-001: Privileged endpoint routing (RFC-0032::REQ-0067)
     // Test name matches verification command: cargo test -p apm2-daemon
     // privileged_routing
     // ========================================================================
@@ -25094,7 +25154,7 @@ mod tests {
                 pid: Some(12345),
             }));
 
-            // TCK-00256: First claim work to establish policy resolution
+            // RFC-0032::REQ-0072: First claim work to establish policy resolution
             let claim_request = ClaimWorkRequest {
                 actor_id: "test-actor".to_string(),
                 role: WorkRole::Implementer.into(),
@@ -25137,7 +25197,8 @@ mod tests {
                 pid: Some(12345),
             }));
 
-            // TCK-00289: Register a session and work claim for IssueCapability validation
+            // RFC-0032::REQ-0091: Register a session and work claim for IssueCapability
+            // validation
             let work_id = "W-TEST-001";
             let lease_id = "L-TEST-001";
             let session_id = "S-001";
@@ -25691,7 +25752,7 @@ mod tests {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
-        // TCK-00256: First claim work to establish policy resolution
+        // RFC-0032::REQ-0072: First claim work to establish policy resolution
         let claim_request = ClaimWorkRequest {
             actor_id: "test-actor".to_string(),
             role: WorkRole::Implementer.into(),
@@ -25740,7 +25801,8 @@ mod tests {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
-        // TCK-00289: Register a session and work claim for IssueCapability validation
+        // RFC-0032::REQ-0091: Register a session and work claim for IssueCapability
+        // validation
         let work_id = "W-TEST-001";
         let lease_id = "L-TEST-001";
         let session_id = "S-001";
@@ -25811,7 +25873,7 @@ mod tests {
             PrivilegedResponse::IssueCapability(resp) => {
                 assert!(!resp.capability_id.is_empty());
                 assert!(resp.capability_id.starts_with("C-")); // UUID-based ID
-                // TCK-00289: HTF-compliant timestamps from HolonicClock
+                // RFC-0032::REQ-0091: HTF-compliant timestamps from HolonicClock
                 // Per Definition of Done: "IssueCapability returns non-zero HTF-compliant
                 // timestamps"
                 assert!(
@@ -25951,8 +26013,8 @@ mod tests {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
-        // TCK-00253: Empty actor_id in request is OK (it's just a display hint)
-        // The authoritative actor_id is derived from credential
+        // RFC-0032::REQ-0069: Empty actor_id in request is OK (it's just a display
+        // hint) The authoritative actor_id is derived from credential
         let request = ClaimWorkRequest {
             actor_id: String::new(), // Empty is OK - we derive from credential
             role: WorkRole::Implementer.into(),
@@ -25997,7 +26059,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00253: Actor ID derived from credential tests
+    // RFC-0032::REQ-0069: Actor ID derived from credential tests
     // ========================================================================
     mod tck_00253 {
         use super::*;
@@ -26278,7 +26340,7 @@ mod tests {
             );
         }
 
-        /// TCK-00253: `WorkClaimed` event is signed and persisted.
+        /// RFC-0032::REQ-0069: `WorkClaimed` event is signed and persisted.
         ///
         /// Per acceptance criteria: "`WorkClaimed` event signed and persisted"
         /// This test verifies that:
@@ -26307,7 +26369,7 @@ mod tests {
             // Query events by work_id from the ledger
             let events = dispatcher.event_emitter.get_events_by_work_id(&work_id);
 
-            // TCK-00395 + TCK-00488: ClaimWork emits work_claimed,
+            // RFC-0032::REQ-0149 + RFC-0020::REQ-0054: ClaimWork emits work_claimed,
             // work_transitioned(Open->Claimed), and authoritative context
             // compilation witness telemetry.
             assert_eq!(
@@ -26348,7 +26410,7 @@ mod tests {
                 event.event_id.starts_with("EVT-"),
                 "Event ID should have EVT- prefix"
             );
-            // TCK-00289: HTF-compliant timestamps from HolonicClock
+            // RFC-0032::REQ-0091: HTF-compliant timestamps from HolonicClock
             // Per Definition of Done: timestamps must be non-zero HTF-compliant
             assert!(
                 event.timestamp_ns > 0,
@@ -26369,7 +26431,7 @@ mod tests {
             assert_eq!(queried_event.unwrap().event_id, event.event_id);
         }
 
-        /// TCK-00253: Ledger query returns signed event.
+        /// RFC-0032::REQ-0069: Ledger query returns signed event.
         ///
         /// Per acceptance criteria: "Ledger query returns signed event"
         #[test]
@@ -26458,7 +26520,7 @@ mod tests {
             _ => panic!("Expected ClaimWork response"),
         };
 
-        // TCK-00257: Register the lease for validation
+        // RFC-0032::REQ-0073: Register the lease for validation
         dispatcher
             .lease_validator()
             .register_lease(&lease_id, &work_id, "gate-build");
@@ -26534,7 +26596,7 @@ mod tests {
 
         match response {
             PrivilegedResponse::Error(err) => {
-                // TCK-00257: With lease validation, wrong lease_id fails at
+                // RFC-0032::REQ-0073: With lease validation, wrong lease_id fails at
                 // lease validation (GATE_LEASE_MISSING) before claim validation
                 assert_eq!(
                     err.code,
@@ -26716,7 +26778,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00257: ADV-004 Gate Lease Validation Tests
+    // RFC-0032::REQ-0073: ADV-004 Gate Lease Validation Tests
     // ========================================================================
 
     /// ADV-004: `GATE_EXECUTOR` spawn with unknown/unregistered `lease_id`
@@ -26952,10 +27014,10 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00256: SpawnEpisode with PolicyResolvedForChangeSet check
+    // RFC-0032::REQ-0072: SpawnEpisode with PolicyResolvedForChangeSet check
     // ========================================================================
 
-    /// TCK-00256: Spawn without policy resolution fails (fail-closed).
+    /// RFC-0032::REQ-0072: Spawn without policy resolution fails (fail-closed).
     ///
     /// Per acceptance criteria: "Spawn without policy resolution fails"
     /// This test verifies ADV-004 variant: attempting to spawn an episode
@@ -26997,7 +27059,7 @@ mod tests {
         }
     }
 
-    /// TCK-00256: Valid policy resolution allows spawn.
+    /// RFC-0032::REQ-0072: Valid policy resolution allows spawn.
     ///
     /// Per acceptance criteria: "Valid policy resolution allows spawn"
     /// This test verifies the integration flow: `ClaimWork` followed by
@@ -27070,7 +27132,7 @@ mod tests {
         }
     }
 
-    /// TCK-00256: `SpawnEpisode` with mismatched role fails.
+    /// RFC-0032::REQ-0072: `SpawnEpisode` with mismatched role fails.
     ///
     /// Per DD-001, the role in the spawn request should match the claimed role.
     /// This test verifies that attempting to spawn with a different role fails.
@@ -27126,7 +27188,7 @@ mod tests {
         }
     }
 
-    /// TCK-00256: `SpawnEpisode` returns policy resolution data.
+    /// RFC-0032::REQ-0072: `SpawnEpisode` returns policy resolution data.
     ///
     /// Verifies that the spawn response includes the capability manifest hash
     /// from the original policy resolution.
@@ -27276,15 +27338,15 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00258: SoD Enforcement Integration Tests
+    // RFC-0032::REQ-0074: SoD Enforcement Integration Tests
     //
     // These tests verify that Separation of Duties (SoD) is enforced when
     // spawning GATE_EXECUTOR episodes. The custody domain check prevents
     // actors from reviewing their own work (self-review attacks).
     // ========================================================================
 
-    /// TCK-00258: `GATE_EXECUTOR` spawn with overlapping custody domains is
-    /// denied.
+    /// RFC-0032::REQ-0074: `GATE_EXECUTOR` spawn with overlapping custody
+    /// domains is denied.
     ///
     /// This tests the fail-closed `SoD` enforcement: when the executor's
     /// custody domains overlap with the changeset author's domains, the
@@ -27373,7 +27435,8 @@ mod tests {
         }
     }
 
-    /// TCK-00258: `GATE_EXECUTOR` spawn with non-overlapping domains succeeds.
+    /// RFC-0032::REQ-0074: `GATE_EXECUTOR` spawn with non-overlapping domains
+    /// succeeds.
     ///
     /// This tests the happy path: when executor and author domains don't
     /// overlap, the spawn should succeed.
@@ -27390,7 +27453,7 @@ mod tests {
         // Executor domain: team-review (from actor_id team-review:alice)
         // Author domain: team-dev (from work_id W-team-dev-test123)
         //
-        // TCK-00416: Use non-zero hashes for capability_manifest_hash and
+        // RFC-0032::REQ-0160: Use non-zero hashes for capability_manifest_hash and
         // context_pack_hash (REQ-HEF-0013 mandates non-zero).
         let claim_non_overlap = WorkClaim {
             work_id: "W-team-dev-test456".to_string(),
@@ -27445,8 +27508,8 @@ mod tests {
         }
     }
 
-    /// TCK-00258: `GATE_EXECUTOR` spawn with empty author domains is denied
-    /// (fail-closed).
+    /// RFC-0032::REQ-0074: `GATE_EXECUTOR` spawn with empty author domains is
+    /// denied (fail-closed).
     ///
     /// This tests fail-closed semantics: if author domains cannot be resolved,
     /// the spawn must be rejected to prevent `SoD` bypass.
@@ -27517,7 +27580,7 @@ mod tests {
         }
     }
 
-    /// TCK-00258: Non-`GATE_EXECUTOR` roles skip `SoD` validation.
+    /// RFC-0032::REQ-0074: Non-`GATE_EXECUTOR` roles skip `SoD` validation.
     ///
     /// IMPLEMENTER and REVIEWER roles do not require `SoD` validation since
     /// they are not performing trust-critical gate operations.
@@ -27533,7 +27596,7 @@ mod tests {
         // Create a claim as IMPLEMENTER with overlapping domains
         // This would fail SoD for GATE_EXECUTOR, but IMPLEMENTER skips SoD
         //
-        // TCK-00416: Use non-zero hashes for capability_manifest_hash and
+        // RFC-0032::REQ-0160: Use non-zero hashes for capability_manifest_hash and
         // context_pack_hash (REQ-HEF-0013 mandates non-zero).
         let claim_implementer = WorkClaim {
             work_id: "W-team-alpha-impl123".to_string(),
@@ -27580,7 +27643,7 @@ mod tests {
         }
     }
 
-    /// Unit test for fail-closed ID resolution (TCK-00258).
+    /// Unit test for fail-closed ID resolution (RFC-0032::REQ-0074).
     ///
     /// Verifies that the internal resolver methods return errors for malformed
     /// IDs, rather than falling back to "UNIVERSAL".
@@ -27619,7 +27682,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00342: Process Management Handler Tests
+    // RFC-0032::REQ-0132: Process Management Handler Tests
     // ========================================================================
 
     /// Creates a `PrivilegedDispatcher` with a `DaemonState` containing
@@ -28221,7 +28284,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00344: WorkStatus Integration Tests
+    // RFC-0032::REQ-0134: WorkStatus Integration Tests
     // ========================================================================
 
     /// IT-00344: `WorkStatus` handler tests.
@@ -29334,7 +29397,8 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00384: Transactional spawn registration & telemetry lifecycle tests
+    // RFC-0032::REQ-0138: Transactional spawn registration & telemetry lifecycle
+    // tests
     //
     // These tests verify that:
     // 1. Telemetry is registered BEFORE session registry (no leaked entries)
@@ -29426,10 +29490,11 @@ mod tests {
             assert_eq!(store.len(), 1);
         }
 
-        /// TCK-00384 BLOCKER integration test: When a spawn is rejected due
-        /// to telemetry capacity, the session registry cardinality and content
-        /// MUST NOT change.  This verifies the transactional rollback path
-        /// through the actual `dispatch()` code path.
+        /// RFC-0032::REQ-0138 BLOCKER integration test: When a spawn is
+        /// rejected due to telemetry capacity, the session registry
+        /// cardinality and content MUST NOT change.  This verifies the
+        /// transactional rollback path through the actual `dispatch()`
+        /// code path.
         #[test]
         fn test_telemetry_at_capacity_rejects_spawn_with_no_leaked_session() {
             let store = Arc::new(SessionTelemetryStore::new());
@@ -29502,7 +29567,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 BLOCKER integration test: Assert that registry
+        /// RFC-0032::REQ-0138 BLOCKER integration test: Assert that registry
         /// cardinality and content are unchanged when a spawn is rejected
         /// due to telemetry capacity.
         ///
@@ -29760,8 +29825,9 @@ mod tests {
             );
         }
 
-        /// TCK-00384 Security BLOCKER: Verify that a failed spawn after
-        /// session + telemetry registration leaves no leaked state.
+        /// RFC-0032::REQ-0138 Security BLOCKER: Verify that a failed spawn
+        /// after session + telemetry registration leaves no leaked
+        /// state.
         ///
         /// This test simulates the rollback path: register a session and
         /// telemetry, then manually perform rollback (as the error paths do)
@@ -29812,7 +29878,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 Quality BLOCKER: Verify that rollback after spawn
+        /// RFC-0032::REQ-0138 Quality BLOCKER: Verify that rollback after spawn
         /// failure restores evicted sessions so capacity is not permanently
         /// lost.
         #[test]
@@ -29881,7 +29947,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 Security BLOCKER 1: Verify that rollback after a
+        /// RFC-0032::REQ-0138 Security BLOCKER 1: Verify that rollback after a
         /// post-eviction failure restores BOTH the evicted session AND its
         /// telemetry entry.
         #[test]
@@ -29993,7 +30059,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 Security MAJOR 1: Verify that rollback after a
+        /// RFC-0032::REQ-0138 Security MAJOR 1: Verify that rollback after a
         /// post-manifest-registration failure removes the stale manifest
         /// entry.
         #[test]
@@ -30055,7 +30121,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 Security BLOCKER 2: Verify that
+        /// RFC-0032::REQ-0138 Security BLOCKER 2: Verify that
         /// `PersistentSessionRegistry::remove_session` propagates
         /// persistence failures instead of silently swallowing them.
         #[test]
@@ -30097,8 +30163,9 @@ mod tests {
             assert!(result.unwrap().is_none());
         }
 
-        /// TCK-00384 review BLOCKER fix: `EndSession` removes telemetry so
-        /// repeated spawn/end cycles do not exhaust the bounded store.
+        /// RFC-0032::REQ-0138 review BLOCKER fix: `EndSession` removes
+        /// telemetry so repeated spawn/end cycles do not exhaust the
+        /// bounded store.
         ///
         /// This test performs multiple spawn -> `EndSession` cycles and asserts
         /// the telemetry cardinality returns to 0 after each end, proving
@@ -30189,8 +30256,9 @@ mod tests {
             }
         }
 
-        /// TCK-00384 review MAJOR fix: `update_episode_id` failure path
-        /// must invoke `rollback_spawn` with `remove_manifest=true`.
+        /// RFC-0032::REQ-0138 review MAJOR fix: `update_episode_id` failure
+        /// path must invoke `rollback_spawn` with
+        /// `remove_manifest=true`.
         ///
         /// Verifies the rollback function cleans up session, telemetry,
         /// and manifest when invoked with the same parameters as the
@@ -30269,9 +30337,9 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 2: Eviction cleans manifest entries for
-        /// evicted sessions.  Without this, the manifest store grows
-        /// unbounded under repeated over-capacity spawn attempts.
+        /// RFC-0032::REQ-0138 review MAJOR 2: Eviction cleans manifest entries
+        /// for evicted sessions.  Without this, the manifest store
+        /// grows unbounded under repeated over-capacity spawn attempts.
         ///
         /// This test fills the session registry to capacity, spawns one
         /// more session (triggering eviction), and verifies the evicted
@@ -30378,8 +30446,8 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 2: Manifest store cardinality is bounded
-        /// under repeated over-capacity spawn/eviction churn.
+        /// RFC-0032::REQ-0138 review MAJOR 2: Manifest store cardinality is
+        /// bounded under repeated over-capacity spawn/eviction churn.
         ///
         /// Performs 2x `MAX_SESSIONS` spawn cycles and verifies the manifest
         /// store never exceeds `MAX_SESSIONS` entries.
@@ -30439,7 +30507,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 1: Rollback after post-start failure
+        /// RFC-0032::REQ-0138 review MAJOR 1: Rollback after post-start failure
         /// restores evicted manifests alongside evicted sessions and
         /// telemetry.
         #[test]
@@ -30560,10 +30628,10 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 1: Regression test for post-start failure
-        /// paths.  The `peer_credentials` failure now returns a proper error
-        /// response (not a protocol error via `?`) and performs full
-        /// rollback of session, telemetry, and manifest.
+        /// RFC-0032::REQ-0138 review MAJOR 1: Regression test for post-start
+        /// failure paths.  The `peer_credentials` failure now returns a
+        /// proper error response (not a protocol error via `?`) and
+        /// performs full rollback of session, telemetry, and manifest.
         #[test]
         fn test_peer_credentials_failure_rolls_back_session_and_telemetry() {
             let store = Arc::new(SessionTelemetryStore::new());
@@ -30628,7 +30696,7 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 1: Regression test for the unified
+        /// RFC-0032::REQ-0138 review MAJOR 1: Regression test for the unified
         /// `rollback_spawn_with_episode_stop` helper.
         ///
         /// Verifies that the helper correctly rolls back session, telemetry,
@@ -30722,9 +30790,9 @@ mod tests {
             );
         }
 
-        /// TCK-00384 review MAJOR 1: Regression test verifying the unified
-        /// rollback helper restores evicted entries during post-start
-        /// failure recovery.
+        /// RFC-0032::REQ-0138 review MAJOR 1: Regression test verifying the
+        /// unified rollback helper restores evicted entries during
+        /// post-start failure recovery.
         ///
         /// Fills the registry to capacity, registers one more (evicting the
         /// oldest), then calls `rollback_spawn_with_episode_stop` and
@@ -30862,8 +30930,8 @@ mod tests {
             );
         }
 
-        /// TCK-00351 BLOCKER 1: Regression for non-atomic stop-condition
-        /// rollback.
+        /// RFC-0020::REQ-0005 BLOCKER 1: Regression for non-atomic
+        /// stop-condition rollback.
         ///
         /// Simulates: spawn -> eviction -> post-eviction failure -> rollback,
         /// and verifies the evicted session's original stop conditions are
@@ -30997,8 +31065,9 @@ mod tests {
             );
         }
 
-        /// TCK-00351 BLOCKER 2: caller tampering with permissive stop values
-        /// (`max_episodes=0`) is rejected by policy-floor validation.
+        /// RFC-0020::REQ-0005 BLOCKER 2: caller tampering with permissive stop
+        /// values (`max_episodes=0`) is rejected by policy-floor
+        /// validation.
         #[test]
         fn test_spawn_rejects_untrusted_max_episodes_zero() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -31123,13 +31192,13 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00395: Work lifecycle observability ledger events
+    // RFC-0032::REQ-0149: Work lifecycle observability ledger events
     // ========================================================================
     mod tck_00395_work_lifecycle_observability {
         use super::*;
 
-        /// TCK-00395: `ClaimWork` emits `WorkTransitioned`(Open -> Claimed)
-        /// event.
+        /// RFC-0032::REQ-0149: `ClaimWork` emits `WorkTransitioned`(Open ->
+        /// Claimed) event.
         #[test]
         fn claim_work_emits_work_transitioned_open_to_claimed() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -31181,8 +31250,8 @@ mod tests {
             assert!(event.timestamp_ns > 0, "timestamp must be non-zero");
         }
 
-        /// TCK-00395: `SpawnEpisode` emits `WorkTransitioned`(Claimed ->
-        /// `InProgress`) event.
+        /// RFC-0032::REQ-0149: `SpawnEpisode` emits `WorkTransitioned`(Claimed
+        /// -> `InProgress`) event.
         #[test]
         fn spawn_episode_emits_work_transitioned_claimed_to_in_progress() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -31290,7 +31359,7 @@ mod tests {
             );
         }
 
-        /// TCK-00395: `WorkTransitioned` events use domain-separated
+        /// RFC-0032::REQ-0149: `WorkTransitioned` events use domain-separated
         /// signatures.
         #[test]
         fn work_transitioned_uses_domain_separated_signatures() {
@@ -31319,7 +31388,7 @@ mod tests {
             );
         }
 
-        /// TCK-00395: `SessionTerminated` event uses domain-separated
+        /// RFC-0032::REQ-0149: `SessionTerminated` event uses domain-separated
         /// signatures.
         #[test]
         fn session_terminated_uses_domain_separated_signatures() {
@@ -31358,8 +31427,8 @@ mod tests {
             assert_eq!(payload["timestamp_ns"], 1_000_000_000);
         }
 
-        /// TCK-00395: Full lifecycle `ClaimWork` -> `SpawnEpisode` -> verify
-        /// all event types in ledger.
+        /// RFC-0032::REQ-0149: Full lifecycle `ClaimWork` -> `SpawnEpisode` ->
+        /// verify all event types in ledger.
         #[test]
         fn full_lifecycle_claim_spawn_verify_all_events() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -31450,8 +31519,8 @@ mod tests {
             }
         }
 
-        /// TCK-00395: `WorkTransitioned` and `SessionTerminated` domain
-        /// prefixes are unique.
+        /// RFC-0032::REQ-0149: `WorkTransitioned` and `SessionTerminated`
+        /// domain prefixes are unique.
         #[test]
         fn domain_prefixes_are_unique() {
             // All relevant domain prefixes must be unique
@@ -31490,7 +31559,8 @@ mod tests {
             }
         }
 
-        /// TCK-00395: `WorkTransitioned` events are queryable by `work_id`.
+        /// RFC-0032::REQ-0149: `WorkTransitioned` events are queryable by
+        /// `work_id`.
         #[test]
         fn work_transitioned_events_queryable_by_work_id() {
             let emitter = StubLedgerEventEmitter::new();
@@ -31553,7 +31623,7 @@ mod tests {
         }
 
         // ================================================================
-        // TCK-00395 v2: Regression tests for review findings
+        // RFC-0032::REQ-0149 v2: Regression tests for review findings
         // ================================================================
 
         /// FIX-BLOCKER: `EndSession` handler emits `SessionTerminated` ledger
@@ -32069,7 +32139,7 @@ mod tests {
         }
 
         // ================================================================
-        // TCK-00395 v3: Quality review v2 fixes
+        // RFC-0032::REQ-0149 v3: Quality review v2 fixes
         // ================================================================
 
         /// MAJOR 1: `EndSession` removes session from registry, preventing
@@ -32675,7 +32745,7 @@ mod tests {
         }
 
         // ================================================================
-        // TCK-00395 Security review v4 regression tests
+        // RFC-0032::REQ-0149 Security review v4 regression tests
         // ================================================================
 
         /// Security MAJOR 2: `EndSession` fails closed when peer credentials
@@ -33017,7 +33087,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00397: Spawn adapter profile hash binding tests
+    // RFC-0032::REQ-0289: Spawn adapter profile hash binding tests
     // ========================================================================
     mod tck_00397_adapter_profile_binding {
         use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
@@ -33204,10 +33274,11 @@ mod tests {
             );
         }
 
-        /// TCK-00358: Verify that the production spawn path (without explicit
-        /// `set_identity_proof_profile_hash`) emits the baseline identity
-        /// proof profile hash in the `SessionStarted` payload. This exercises
-        /// the fallback to `IdentityProofProfileV1::baseline_smt_10e12()` and
+        /// RFC-0020::REQ-0012: Verify that the production spawn path (without
+        /// explicit `set_identity_proof_profile_hash`) emits the
+        /// baseline identity proof profile hash in the `SessionStarted`
+        /// payload. This exercises the fallback to
+        /// `IdentityProofProfileV1::baseline_smt_10e12()` and
         /// proves REQ-0012 is met end-to-end without test-only injection.
         #[test]
         fn test_production_spawn_emits_baseline_identity_proof_profile_hash() {
@@ -33268,10 +33339,10 @@ mod tests {
             );
         }
 
-        /// TCK-00358 Round 2: Verify that the production session-open path
-        /// wires the identity proof profile hash into `ConnectionContext` and
-        /// that `SessionStarted` carries that hash rather than the spawn-time
-        /// baseline fallback.
+        /// RFC-0020::REQ-0012 Round 2: Verify that the production session-open
+        /// path wires the identity proof profile hash into
+        /// `ConnectionContext` and that `SessionStarted` carries that
+        /// hash rather than the spawn-time baseline fallback.
         ///
         /// This test uses a **non-baseline** profile hash to prove the value
         /// flows from the session-open wiring
@@ -33359,7 +33430,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00394: PublishChangeSet IPC endpoint tests
+    // RFC-0032::REQ-0148: PublishChangeSet IPC endpoint tests
     // ========================================================================
     mod publish_changeset {
         use apm2_core::evidence::MemoryCas;
@@ -33866,7 +33937,7 @@ mod tests {
 
         #[test]
         fn test_publish_changeset_rejects_no_cas() {
-            // Dispatcher starts WITH default MemoryCas (TCK-00416) so that
+            // Dispatcher starts WITH default MemoryCas (RFC-0032::REQ-0160) so that
             // ClaimWork authority binding validation can succeed. After claiming,
             // strip CAS to verify PublishChangeSet fail-closed when CAS absent.
             let dispatcher = PrivilegedDispatcher::new();
@@ -33931,7 +34002,8 @@ mod tests {
             );
         }
 
-        /// TCK-00408: Verify actor ownership check rejects non-owner callers.
+        /// RFC-0032::REQ-0156: Verify actor ownership check rejects non-owner
+        /// callers.
         ///
         /// A caller whose peer credentials produce a different `actor_id` than
         /// the work claim owner must be denied.
@@ -33998,7 +34070,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00638: PublishWorkContextEntry Tests (RFC-0032 Phase 2)
+    // RFC-0032::REQ-0266: PublishWorkContextEntry Tests (RFC-0032 Phase 2)
     // ========================================================================
     #[allow(clippy::redundant_clone)]
     mod publish_work_context_entry {
@@ -35116,7 +35188,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00639: RecordWorkPrAssociation Tests
+    // RFC-0032::REQ-0267: RecordWorkPrAssociation Tests
     // ========================================================================
     mod record_work_pr_association {
         use super::*;
@@ -36000,7 +36072,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00645: PublishWorkLoopProfile Tests (RFC-0032 Phase 4)
+    // RFC-0032::REQ-0270: PublishWorkLoopProfile Tests (RFC-0032 Phase 4)
     // ========================================================================
     #[allow(clippy::redundant_clone)]
     mod publish_work_loop_profile {
@@ -36438,7 +36510,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00389: IngestReviewReceipt Tests
+    // RFC-0032::REQ-0143: IngestReviewReceipt Tests
     // ========================================================================
     mod ingest_review_receipt {
         use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
@@ -36610,8 +36682,8 @@ mod tests {
         /// Creates a dispatcher with CAS, a registered lease, and a work claim
         /// at the specified risk tier. Used to test attestation ratcheting.
         ///
-        /// TCK-00408: CAS is now mandatory for ingest (fail-closed). The
-        /// standard test artifact bundle is pre-stored in CAS.
+        /// RFC-0032::REQ-0156: CAS is now mandatory for ingest (fail-closed).
+        /// The standard test artifact bundle is pre-stored in CAS.
         ///
         /// SECURITY (v6 Finding 1): Registers the lease executor as the
         /// identity derived from `test_peer_credentials()`, binding the test
@@ -36627,7 +36699,7 @@ mod tests {
             let peer_creds = test_peer_credentials();
             let executor_actor_id = derive_actor_id(&peer_creds);
 
-            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            // RFC-0032::REQ-0156: CAS is mandatory for ingest (fail-closed).
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
 
@@ -37339,7 +37411,7 @@ mod tests {
         }
 
         // =================================================================
-        // TCK-00340: Attestation enforcement tests
+        // RFC-0032::REQ-0131: Attestation enforcement tests
         // =================================================================
 
         #[test]
@@ -37503,7 +37575,7 @@ mod tests {
         }
 
         // ====================================================================
-        // TCK-00340: Risk-tier resolution integration tests
+        // RFC-0032::REQ-0131: Risk-tier resolution integration tests
         // ====================================================================
 
         #[test]
@@ -37655,7 +37727,7 @@ mod tests {
                 pid: Some(12345),
             };
             let executor_actor_id = derive_actor_id(&peer_creds);
-            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            // RFC-0032::REQ-0156: CAS is mandatory for ingest (fail-closed).
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
             let dispatcher = PrivilegedDispatcher::new()
@@ -38119,8 +38191,8 @@ mod tests {
             }
         }
 
-        /// TCK-00408: Verify CAS existence validation rejects review receipts
-        /// referencing artifact bundles that are not in CAS.
+        /// RFC-0032::REQ-0156: Verify CAS existence validation rejects review
+        /// receipts referencing artifact bundles that are not in CAS.
         #[test]
         fn test_ingest_review_receipt_rejects_missing_cas_artifact() {
             // Create dispatcher WITH CAS so the validation path is exercised
@@ -38304,7 +38376,7 @@ mod tests {
         }
 
         // ====================================================================
-        // TCK-00340: DelegateSublease IPC Integration Tests
+        // RFC-0032::REQ-0131: DelegateSublease IPC Integration Tests
         // ====================================================================
 
         /// Helper: build a dispatcher with a gate orchestrator and a registered
@@ -39183,7 +39255,7 @@ mod tests {
         }
 
         // =================================================================
-        // TCK-00469: Projection Recovery IPC Tests
+        // RFC-0020::REQ-0051: Projection Recovery IPC Tests
         // =================================================================
 
         #[test]
@@ -39205,7 +39277,7 @@ mod tests {
         }
 
         // =====================================================================
-        // TCK-00635: OpenWork tag, encoding, and handler tests
+        // RFC-0032::REQ-0263: OpenWork tag, encoding, and handler tests
         // =====================================================================
 
         #[test]
@@ -39926,7 +39998,7 @@ mod tests {
 
         #[test]
         fn test_open_work_concurrent_race_only_one_persisted() {
-            // SECURITY (TCK-00635): Prove that concurrent OpenWork requests
+            // SECURITY (RFC-0032::REQ-0263): Prove that concurrent OpenWork requests
             // for the same work_id result in exactly one persisted
             // `work.opened` event.
             //
@@ -40052,7 +40124,7 @@ mod tests {
 
         #[test]
         fn test_open_work_concurrent_race_different_hash_rejected() {
-            // SECURITY (TCK-00635): Prove that a concurrent OpenWork with a
+            // SECURITY (RFC-0032::REQ-0263): Prove that a concurrent OpenWork with a
             // different spec hash is correctly rejected via the UNIQUE
             // constraint fallback when the first request wins the race.
             use std::sync::Arc;
@@ -40771,7 +40843,7 @@ mod tests {
     }
 
     // =====================================================================
-    // TCK-00637: ClaimWorkV2 tag, encoding, and handler tests
+    // RFC-0032::REQ-0265: ClaimWorkV2 tag, encoding, and handler tests
     // =====================================================================
     mod claim_work_v2 {
         use super::*;
@@ -42636,7 +42708,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00448: Adversarial lineage denial tests
+    // RFC-0032::REQ-0169: Adversarial lineage denial tests
     // ========================================================================
     mod tck_00448_lineage_denials {
         use apm2_core::evidence::{ContentAddressedStore, MemoryCas};
@@ -42804,9 +42876,9 @@ mod tests {
         #[test]
         fn test_missing_role_spec_hash_denied() {
             let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
-                "W-TCK-00448-MISSING-ROLE",
+                "W-RFC-0032::REQ-0169-MISSING-ROLE",
                 "lease-tck-00448-missing-role",
-                "RR-TCK-00448-MISSING-ROLE",
+                "RR-RFC-0032::REQ-0169-MISSING-ROLE",
                 |_cas, policy| {
                     policy.role_spec_hash = [0u8; 32];
                 },
@@ -42853,9 +42925,9 @@ mod tests {
         #[test]
         fn test_mismatched_role_spec_hash_denied() {
             let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
-                "W-TCK-00448-MISMATCH-ROLE",
+                "W-RFC-0032::REQ-0169-MISMATCH-ROLE",
                 "lease-tck-00448-mismatch-role",
-                "RR-TCK-00448-MISMATCH-ROLE",
+                "RR-RFC-0032::REQ-0169-MISMATCH-ROLE",
                 |cas, policy| {
                     let wrong_hash = cas
                         .store(b"tck-00448-mismatched-role-spec")
@@ -42906,9 +42978,9 @@ mod tests {
         #[test]
         fn test_missing_context_pack_recipe_hash_denied() {
             let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
-                "W-TCK-00448-MISSING-RECIPE",
+                "W-RFC-0032::REQ-0169-MISSING-RECIPE",
                 "lease-tck-00448-missing-recipe",
-                "RR-TCK-00448-MISSING-RECIPE",
+                "RR-RFC-0032::REQ-0169-MISSING-RECIPE",
                 |_cas, policy| {
                     policy.context_pack_recipe_hash = [0u8; 32];
                 },
@@ -42956,12 +43028,12 @@ mod tests {
         #[test]
         fn test_stale_context_pack_recipe_hash_denied() {
             let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
-                "W-TCK-00448-STALE-RECIPE",
+                "W-RFC-0032::REQ-0169-STALE-RECIPE",
                 "lease-tck-00448-stale-recipe",
-                "RR-TCK-00448-STALE-RECIPE",
+                "RR-RFC-0032::REQ-0169-STALE-RECIPE",
                 |cas, policy| {
                     let stale_recipe = build_policy_context_pack_recipe(
-                        "W-TCK-00448-LEGACY",
+                        "W-RFC-0032::REQ-0169-LEGACY",
                         "actor:legacy",
                         policy.role_spec_hash,
                         policy.context_pack_hash,
@@ -43023,9 +43095,9 @@ mod tests {
         #[test]
         fn test_unknown_role_profile_denied() {
             let (dispatcher, ctx, request, work_id) = setup_receipt_lineage_fixture(
-                "W-TCK-00448-UNKNOWN-ROLE",
+                "W-RFC-0032::REQ-0169-UNKNOWN-ROLE",
                 "lease-tck-00448-unknown-role",
-                "RR-TCK-00448-UNKNOWN-ROLE",
+                "RR-RFC-0032::REQ-0169-UNKNOWN-ROLE",
                 |_cas, policy| {
                     policy.role_spec_hash =
                         *blake3::hash(b"tck-00448-unknown-role-profile").as_bytes();
@@ -43073,8 +43145,8 @@ mod tests {
         #[test]
         fn test_valid_lineage_accepted() {
             let (dispatcher, ctx, request, work_id) = setup_spawn_lineage_fixture(
-                "W-TCK-00448-VALID",
-                "L-TCK-00448-VALID",
+                "W-RFC-0032::REQ-0169-VALID",
+                "L-RFC-0032::REQ-0169-VALID",
                 |_cas, _policy| {},
             );
             let baseline_event_count = dispatcher
@@ -43118,7 +43190,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00340: Serde fail-closed default tests
+    // RFC-0032::REQ-0131: Serde fail-closed default tests
     // ========================================================================
     mod serde_fail_closed {
         use super::*;
@@ -43163,7 +43235,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00340: SQLite integration tests (production path)
+    // RFC-0032::REQ-0131: SQLite integration tests (production path)
     // ========================================================================
     mod sqlite_integration {
         use std::sync::{Arc, Mutex};
@@ -43186,7 +43258,7 @@ mod tests {
 
         /// Creates a `PrivilegedDispatcher` backed by real `SQLite`
         /// implementations for testing the production persistence path.
-        /// TCK-00408: CAS is now mandatory for ingest (fail-closed).
+        /// RFC-0032::REQ-0156: CAS is now mandatory for ingest (fail-closed).
         fn setup_sqlite_dispatcher() -> (
             PrivilegedDispatcher,
             ConnectionContext,
@@ -43219,7 +43291,7 @@ mod tests {
             let subscription_registry: SharedSubscriptionRegistry =
                 Arc::new(SubscriptionRegistry::with_defaults());
 
-            // TCK-00408: CAS is mandatory for ingest (fail-closed).
+            // RFC-0032::REQ-0156: CAS is mandatory for ingest (fail-closed).
             let cas = Arc::new(MemoryCas::default());
             cas.store(TEST_ARTIFACT_CONTENT).unwrap();
             let kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
@@ -44012,7 +44084,7 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            // TCK-00408: Use with_persistence_and_cas so CAS is wired —
+            // RFC-0032::REQ-0156: Use with_persistence_and_cas so CAS is wired —
             // IngestReviewReceipt now requires CAS (fail-closed).
             let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
             std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
@@ -45526,8 +45598,9 @@ mod tests {
         /// mapping permits `SelfSigned` attestation through the review
         /// receipt handler.
         ///
-        /// This test was added as part of TCK-00340 quality fix to prevent
-        /// regression where hardcoded Tier4 would block all production claims.
+        /// This test was added as part of RFC-0032::REQ-0131 quality fix to
+        /// prevent regression where hardcoded Tier4 would block all
+        /// production claims.
         #[test]
         fn test_governance_resolver_claim_then_ingest_review_receipt_production_path() {
             use std::os::unix::fs::PermissionsExt;
@@ -45544,7 +45617,7 @@ mod tests {
             let session_registry: Arc<dyn SessionRegistry> =
                 Arc::new(InMemorySessionRegistry::new());
 
-            // TCK-00408: Use with_persistence_and_cas — IngestReviewReceipt
+            // RFC-0032::REQ-0156: Use with_persistence_and_cas — IngestReviewReceipt
             // now requires CAS (fail-closed).
             let cas_dir = tempfile::tempdir().expect("tempdir for CAS");
             std::fs::set_permissions(cas_dir.path(), std::fs::Permissions::from_mode(0o700))
@@ -45664,7 +45737,7 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     panic!(
                         "IngestReviewReceipt MUST succeed for governance-resolved Tier1 claim \
-                         with SelfSigned attestation. Got error: {}. This is the TCK-00340 \
+                         with SelfSigned attestation. Got error: {}. This is the RFC-0032::REQ-0131 \
                          regression where hardcoded Tier4 blocked all production claims.",
                         err.message
                     );
@@ -45677,13 +45750,14 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00349: Session-typed state machine and fail-closed decoding tests
+    // RFC-0020::REQ-0003: Session-typed state machine and fail-closed decoding
+    // tests
     // ========================================================================
     mod tck_00349_session_state_machine {
         use super::*;
 
-        /// TCK-00349: Verify that `ConnectionContext` starts in `Connected`
-        /// phase.
+        /// RFC-0020::REQ-0003: Verify that `ConnectionContext` starts in
+        /// `Connected` phase.
         #[test]
         fn test_context_starts_in_connected_phase() {
             use crate::protocol::connection_handler::ConnectionPhase;
@@ -45697,7 +45771,8 @@ mod tests {
             assert!(!ctx.phase().allows_dispatch());
         }
 
-        /// TCK-00349: Verify full phase progression on `ConnectionContext`.
+        /// RFC-0020::REQ-0003: Verify full phase progression on
+        /// `ConnectionContext`.
         #[test]
         fn test_context_full_phase_progression() {
             use crate::protocol::connection_handler::ConnectionPhase;
@@ -45719,7 +45794,8 @@ mod tests {
             assert!(ctx.phase().allows_dispatch());
         }
 
-        /// TCK-00349: Verify that dispatch is rejected in Connected phase.
+        /// RFC-0020::REQ-0003: Verify that dispatch is rejected in Connected
+        /// phase.
         #[test]
         fn test_dispatch_rejected_in_connected_phase() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -45751,8 +45827,8 @@ mod tests {
             }
         }
 
-        /// TCK-00349: Verify that dispatch is rejected in `HandshakeComplete`
-        /// phase.
+        /// RFC-0020::REQ-0003: Verify that dispatch is rejected in
+        /// `HandshakeComplete` phase.
         #[test]
         fn test_dispatch_rejected_in_handshake_complete_phase() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -45784,7 +45860,8 @@ mod tests {
             }
         }
 
-        /// TCK-00349: Verify that dispatch succeeds in `SessionOpen` phase.
+        /// RFC-0020::REQ-0003: Verify that dispatch succeeds in `SessionOpen`
+        /// phase.
         #[test]
         fn test_dispatch_succeeds_in_session_open_phase() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -45810,7 +45887,8 @@ mod tests {
             );
         }
 
-        /// TCK-00349: Verify unknown tag is rejected as protocol error.
+        /// RFC-0020::REQ-0003: Verify unknown tag is rejected as protocol
+        /// error.
         #[test]
         fn test_unknown_tag_returns_protocol_error() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -45829,8 +45907,8 @@ mod tests {
             );
         }
 
-        /// TCK-00349: Verify `privileged_session_open` convenience constructor
-        /// creates context in correct phase.
+        /// RFC-0020::REQ-0003: Verify `privileged_session_open` convenience
+        /// constructor creates context in correct phase.
         #[test]
         fn test_privileged_session_open_constructor() {
             use crate::protocol::connection_handler::ConnectionPhase;
@@ -45844,8 +45922,8 @@ mod tests {
             assert!(ctx.is_privileged());
         }
 
-        /// TCK-00349: Verify `session_open` convenience constructor creates
-        /// context in correct phase.
+        /// RFC-0020::REQ-0003: Verify `session_open` convenience constructor
+        /// creates context in correct phase.
         #[test]
         fn test_session_open_constructor() {
             use crate::protocol::connection_handler::ConnectionPhase;
@@ -46017,7 +46095,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00352 v3 integration: SpawnEpisode with V1 store
+    // RFC-0020::REQ-0006 v3 integration: SpawnEpisode with V1 store
     // ========================================================================
     mod v3_spawn_episode_v1_integration {
         use std::sync::Arc;
@@ -46036,8 +46114,9 @@ mod tests {
             }))
         }
 
-        /// TCK-00352 MAJOR 1 v3 integration: `SpawnEpisode` with V1 store
-        /// enabled MUST reject when `resolved_scope_baseline` is `None`.
+        /// RFC-0020::REQ-0006 MAJOR 1 v3 integration: `SpawnEpisode` with V1
+        /// store enabled MUST reject when `resolved_scope_baseline` is
+        /// `None`.
         #[test]
         fn spawn_v1_rejects_none_scope_baseline_integration() {
             let v1_store = Arc::new(V1ManifestStore::new());
@@ -46045,7 +46124,7 @@ mod tests {
             let ctx = priv_ctx();
 
             // Pre-register claim with NO scope baseline
-            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            // RFC-0032::REQ-0160: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let policy_resolution = test_policy_resolution_with_lineage(
                 "W-V3-SCOPE-NONE",
                 "actor:test-impl",
@@ -46095,7 +46174,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 MAJOR 1 v3 integration: `SpawnEpisode` rejects a
+        /// RFC-0020::REQ-0006 MAJOR 1 v3 integration: `SpawnEpisode` rejects a
         /// manifest whose tools exceed the policy-resolved scope baseline.
         #[test]
         fn spawn_v1_rejects_scope_exceeding_policy_baseline() {
@@ -46109,7 +46188,7 @@ mod tests {
                 write_paths: Vec::new(),
                 shell_patterns: Vec::new(),
             };
-            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            // RFC-0032::REQ-0160: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-V3-SCOPE-NARROW",
                 "actor:test-reviewer",
@@ -46161,7 +46240,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 2 v3 integration: Risk tier ceiling comes
+        /// RFC-0020::REQ-0006 BLOCKER 2 v3 integration: Risk tier ceiling comes
         /// from `policy_resolution.resolved_risk_tier`, verified through
         /// the actual `SpawnEpisode` path with V1 store.
         #[test]
@@ -46178,7 +46257,7 @@ mod tests {
             };
 
             // Policy says Tier0 -- the V1 ceiling must be Tier0
-            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            // RFC-0032::REQ-0160: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-V3-RISK-CEIL",
                 "actor:test-reviewer",
@@ -46229,7 +46308,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 2 v3 integration: Invalid risk tier (255)
+        /// RFC-0020::REQ-0006 BLOCKER 2 v3 integration: Invalid risk tier (255)
         /// must fail closed to Tier4 through the actual `SpawnEpisode` path.
         #[test]
         fn spawn_v1_invalid_risk_tier_fails_to_tier4_integration() {
@@ -46244,7 +46323,7 @@ mod tests {
                 shell_patterns: reviewer.shell_allowlist.clone(),
             };
 
-            // TCK-00416: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
+            // RFC-0032::REQ-0160: Use non-zero hashes (REQ-HEF-0013 mandates non-zero).
             let mut policy_resolution = test_policy_resolution_with_lineage(
                 "W-V3-RISK-INV",
                 "actor:test-reviewer",
@@ -46302,7 +46381,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00399: build_harness_config tests
+    // RFC-0032::REQ-0151: build_harness_config tests
     // =========================================================================
 
     mod build_harness_config_tests {
@@ -46557,7 +46636,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00373: Delegated spawn gate dispatcher-level tests
+    // RFC-0020::REQ-0027: Delegated spawn gate dispatcher-level tests
     // =========================================================================
     mod delegated_spawn_gate {
         use super::*;
@@ -46608,8 +46687,9 @@ mod tests {
                 .unwrap()
         }
 
-        /// TCK-00373 BLOCKER 1: Claim carries `permeability_receipt` but
-        /// request omits `permeability_receipt_hash` => MUST reject.
+        /// RFC-0020::REQ-0027 BLOCKER 1: Claim carries `permeability_receipt`
+        /// but request omits `permeability_receipt_hash` => MUST
+        /// reject.
         #[test]
         fn delegated_claim_missing_request_receipt_hash_rejected() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -46676,8 +46756,8 @@ mod tests {
             }
         }
 
-        /// TCK-00373 BLOCKER 2: Context mismatch -- wrong `actor_id` in
-        /// consumption context causes scope binding rejection.
+        /// RFC-0020::REQ-0027 BLOCKER 2: Context mismatch -- wrong `actor_id`
+        /// in consumption context causes scope binding rejection.
         #[test]
         fn delegated_claim_actor_mismatch_rejected() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -46746,9 +46826,9 @@ mod tests {
             }
         }
 
-        /// TCK-00373 MAJOR: Valid delegated claim with matching receipt hash,
-        /// correct actor, and correct policy root => MUST accept (pass
-        /// through to subsequent validation stages).
+        /// RFC-0020::REQ-0027 MAJOR: Valid delegated claim with matching
+        /// receipt hash, correct actor, and correct policy root => MUST
+        /// accept (pass through to subsequent validation stages).
         #[test]
         fn delegated_claim_valid_receipt_accepted() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -46856,7 +46936,7 @@ mod tests {
                 .unwrap()
         }
 
-        /// TCK-00373 BLOCKER 1: Low-authority receipt used with a
+        /// RFC-0020::REQ-0027 BLOCKER 1: Low-authority receipt used with a
         /// high-risk-tier spawn MUST be rejected.
         ///
         /// The receipt carries `(Low, ReadOnly, Capped(100), ...)` but the
@@ -46931,7 +47011,7 @@ mod tests {
             }
         }
 
-        /// TCK-00373: Policy root mismatch between receipt and claim's
+        /// RFC-0020::REQ-0027: Policy root mismatch between receipt and claim's
         /// resolved policy hash => MUST reject.
         #[test]
         fn delegated_claim_policy_root_mismatch_rejected() {
@@ -47002,7 +47082,7 @@ mod tests {
             }
         }
 
-        /// TCK-00373 MAJOR 1: End-to-end claim->spawn success using
+        /// RFC-0020::REQ-0027 MAJOR 1: End-to-end claim->spawn success using
         /// `PermeabilityReceiptResolver` wiring.
         ///
         /// A dynamic resolver builds a valid receipt at claim-time using
@@ -47135,7 +47215,7 @@ mod tests {
             }
         }
 
-        /// TCK-00373 MAJOR 1 (failure path): When the receipt resolver
+        /// RFC-0020::REQ-0027 MAJOR 1 (failure path): When the receipt resolver
         /// returns an error during `ClaimWork`, the claim MUST be rejected
         /// (fail-closed).
         #[test]
@@ -47188,8 +47268,9 @@ mod tests {
             }
         }
 
-        /// TCK-00373 BLOCKER 1: Invalid risk tier (out of range 0-4) MUST
-        /// be rejected fail-closed, not mapped to a permissive ceiling.
+        /// RFC-0020::REQ-0027 BLOCKER 1: Invalid risk tier (out of range 0-4)
+        /// MUST be rejected fail-closed, not mapped to a permissive
+        /// ceiling.
         #[test]
         fn invalid_risk_tier_rejected_fail_closed() {
             let dispatcher = PrivilegedDispatcher::new();
@@ -47256,7 +47337,8 @@ mod tests {
     }
 
     // ========================================================================
-    // WorkClaim byte estimation regression tests (TCK-00568 security MAJOR fix)
+    // WorkClaim byte estimation regression tests (RFC-0032::REQ-0219 security MAJOR
+    // fix)
     // ========================================================================
 
     mod work_claim_byte_estimation {

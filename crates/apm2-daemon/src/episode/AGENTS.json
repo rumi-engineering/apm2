@@ -1,0 +1,84 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/episode",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-EPISODE-001",
+      "kind": "invariant",
+      "title": "Maximum concurrent episodes bounded at MAX_CONCURRENT_EPISODES (10,000)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-002",
+      "kind": "invariant",
+      "title": "All state transitions emit EpisodeEvent entries",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-003",
+      "kind": "invariant",
+      "title": "Terminal states (TERMINATED, QUARANTINED) have no outgoing transitions",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-004",
+      "kind": "invariant",
+      "title": "Episode IDs are unique within the runtime",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-005",
+      "kind": "invariant",
+      "title": "State timestamps are monotonically increasing",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-006",
+      "kind": "invariant",
+      "title": "Envelope is immutable after construction",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-007",
+      "kind": "invariant",
+      "title": "canonical_bytes() produces deterministic output for signing",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-008",
+      "kind": "safety",
+      "title": "Tool requests denied if capability manifest does not grant access",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-009",
+      "kind": "requirement",
+      "title": "Broker validates capability before invoking any handler",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-010",
+      "kind": "invariant",
+      "title": "PolicyMintToken is pub(crate) only; external crates cannot mint capabilities",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-011",
+      "kind": "requirement",
+      "title": "BudgetTracker charge() returns BudgetExhaustedError when limit reached",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-012",
+      "kind": "requirement",
+      "title": "Pre-actuation denial prevents side effects when budget is exhausted",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-EPISODE-013",
+      "kind": "invariant",
+      "title": "Once a path restriction is ratcheted, it cannot be relaxed",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

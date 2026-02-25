@@ -26,7 +26,7 @@ const QUARANTINE_DIR: &str = "quarantine";
 const LEGACY_QUARANTINE_DIR: &str = "quarantined";
 const CARGO_HOME_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_CARGO_HOME_DIR: &str = "cargo_home";
-/// Retention for managed sccache directory (TCK-00553).
+/// Retention for managed sccache directory (RFC-0032::REQ-0208).
 const SCCACHE_RETENTION_SECS: u64 = 30 * 24 * 3600;
 const FAC_SCCACHE_DIR: &str = "sccache";
 const FAC_RECEIPTS_DIR: &str = "receipts";
@@ -52,7 +52,7 @@ const MAX_TRAVERSAL_DEPTH: usize = 64;
 /// Used when `per_job_log_ttl_secs` is 0 (documented as "use default").
 const DEFAULT_PER_JOB_LOG_TTL_SECS: u64 = 7 * 24 * 3600;
 
-/// Configuration for per-lane log retention pruning (TCK-00571).
+/// Configuration for per-lane log retention pruning (RFC-0032::REQ-0221).
 ///
 /// Controls which job log directories are eligible for pruning based on
 /// TTL, keep-last-N count, and per-lane byte quota.
@@ -119,7 +119,7 @@ pub enum GcPlanError {
 /// # Errors
 ///
 /// Returns `GcPlanError::Io` when workspace inspection fails.
-#[allow(clippy::too_many_lines)] // TCK-00546: CAS blob pruning adds additional GC planning logic; extracting sub-functions would obscure the sequential plan construction flow.
+#[allow(clippy::too_many_lines)] // RFC-0032::REQ-0201: CAS blob pruning adds additional GC planning logic; extracting sub-functions would obscure the sequential plan construction flow.
 pub fn plan_gc(
     fac_root: &Path,
     lane_manager: &LaneManager,
@@ -138,7 +138,8 @@ pub fn plan_gc(
 /// Create a garbage-collection plan with explicit log retention policy.
 ///
 /// This is the extended version of [`plan_gc`] that accepts a
-/// [`LogRetentionConfig`] for per-lane log retention pruning (TCK-00571).
+/// [`LogRetentionConfig`] for per-lane log retention pruning
+/// (RFC-0032::REQ-0221).
 ///
 /// # Errors
 ///
@@ -175,7 +176,7 @@ pub fn plan_gc_with_log_retention(
         });
     }
 
-    // TCK-00553: Managed sccache cache directory GC.
+    // RFC-0032::REQ-0208: Managed sccache cache directory GC.
     let sccache_root = fac_root.join(FAC_SCCACHE_DIR);
     if sccache_root.exists() && is_stale_by_mtime(&sccache_root, SCCACHE_RETENTION_SECS, now_secs) {
         targets.push(GcTarget {
@@ -186,8 +187,8 @@ pub fn plan_gc_with_log_retention(
         });
     }
 
-    // TCK-00589 review fix: legacy evidence/ and legacy/ directories are NOT
-    // GC targets. The evidence/ directory is cleaned up by the migration
+    // RFC-0032::REQ-0239 review fix: legacy evidence/ and legacy/ directories are
+    // NOT GC targets. The evidence/ directory is cleaned up by the migration
     // itself (removed after all files are moved). The legacy/ directory
     // contains read-only migrated evidence that must be retained
     // indefinitely for audit purposes.
@@ -256,7 +257,7 @@ pub fn plan_gc_with_log_retention(
             },
         }
 
-        // TCK-00546: CAS blob pruning for `apm2_cas` backend digests.
+        // RFC-0032::REQ-0201: CAS blob pruning for `apm2_cas` backend digests.
         //
         // The explicit allowlist approach: only CAS objects whose digest
         // appeared in a receipt with `bytes_backend=apm2_cas` are
@@ -332,7 +333,7 @@ pub fn plan_gc_with_log_retention(
         }
     }
 
-    // TCK-00583: Receipt index compaction as a low-impact GC step.
+    // RFC-0032::REQ-0233: Receipt index compaction as a low-impact GC step.
     // Only schedule compaction if the index exists and has entries that
     // would be pruned. This avoids unnecessary I/O for empty/missing indexes.
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
@@ -346,7 +347,7 @@ pub fn plan_gc_with_log_retention(
         });
     }
 
-    // TCK-00571: Per-lane log retention pruning.
+    // RFC-0032::REQ-0221: Per-lane log retention pruning.
     //
     // CQ-MAJOR-1/3 fix: Only scan IDLE lanes for log retention pruning.
     // Active/running lanes must never have their logs pruned.
@@ -436,7 +437,7 @@ fn collect_idle_lane_targets(
 /// directory (CTR-1303, INV-RMTREE-009).
 const MAX_JOB_LOG_ENTRIES_PER_LANE: usize = 10_000;
 
-/// Collect per-lane log retention pruning targets (TCK-00571).
+/// Collect per-lane log retention pruning targets (RFC-0032::REQ-0221).
 ///
 /// For each **idle** lane (caller ensures only idle lane IDs are passed),
 /// scans the `logs/` directory for job log subdirectories, then applies
@@ -800,7 +801,7 @@ fn collect_stale_gate_cache_targets(fac_root: &Path, now_secs: u64, targets: &mu
         }
     }
 
-    // Gate cache v3 (TCK-00541): receipt-indexed cache store.
+    // Gate cache v3 (RFC-0032::REQ-0197): receipt-indexed cache store.
     // MAJOR fix (round 5): lock files (`.{index_key}.lock`) are excluded from
     // GC targeting. On Unix, unlinking a locked file removes the path without
     // releasing the existing flock — a second writer can recreate the path,
@@ -1013,7 +1014,7 @@ const fn effective_retention_seconds(value: u64, fallback: u64) -> u64 {
 /// This function records all per-target failures into `errors` and does not
 /// abort early.
 #[must_use]
-#[allow(clippy::too_many_lines)] // TCK-00583: receipt persistence error handling adds required branching for fail-closed audit evidence.
+#[allow(clippy::too_many_lines)] // RFC-0032::REQ-0233: receipt persistence error handling adds required branching for fail-closed audit evidence.
 pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let now = current_wall_clock_secs();
 
@@ -1021,9 +1022,9 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let mut errors = Vec::new();
 
     for target in &plan.targets {
-        // TCK-00583: Index compaction is handled separately from file deletion.
-        // The compaction step prunes stale entries in-place and persists the
-        // compacted index; it does not delete the index file.
+        // RFC-0032::REQ-0233: Index compaction is handled separately from file
+        // deletion. The compaction step prunes stale entries in-place and
+        // persists the compacted index; it does not delete the index file.
         if matches!(
             target.kind,
             crate::fac::gc_receipt::GcActionKind::IndexCompaction
@@ -1494,7 +1495,7 @@ fn is_recent_receipt(metadata: &std::fs::Metadata, now_secs: u64) -> bool {
 struct ReceiptBlobRefs {
     /// Hashes referenced by `fac_blobs_v1` or unspecified backend receipts.
     blob_hashes: HashSet<[u8; 32]>,
-    /// Hashes referenced by `apm2_cas` backend receipts (TCK-00546).
+    /// Hashes referenced by `apm2_cas` backend receipts (RFC-0032::REQ-0201).
     cas_hashes: HashSet<[u8; 32]>,
     /// Whether the scan was truncated (fail-closed for pruning).
     truncated: bool,
@@ -2422,7 +2423,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00541 round-5 MAJOR fix: GC must never target v3 lock files
+    // RFC-0032::REQ-0197 round-5 MAJOR fix: GC must never target v3 lock files
     // =========================================================================
 
     #[test]
@@ -2504,7 +2505,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00546 MAJOR-1: CAS pruning uses receipt-derived hashes as
+    // RFC-0032::REQ-0201 MAJOR-1: CAS pruning uses receipt-derived hashes as
     // authoritative keep-alive (fail-closed against legacy receipts)
     // =========================================================================
 
@@ -2680,7 +2681,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00546 NIT-1: record_cas_ref single-handle mtime update
+    // RFC-0032::REQ-0201 NIT-1: record_cas_ref single-handle mtime update
     // =========================================================================
 
     #[test]
@@ -2738,7 +2739,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00571: Per-lane log retention pruning tests
+    // RFC-0032::REQ-0221: Per-lane log retention pruning tests
     // =========================================================================
 
     /// Helper: create a fake job log directory under `logs_dir` with a

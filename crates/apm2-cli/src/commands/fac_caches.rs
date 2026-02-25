@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00592)
+// AGENT-AUTHORED (RFC-0032::REQ-0241)
 //! Explicit cache purge command: `apm2 fac caches nuke`.
 //!
 //! Provides a deterministic, operator-only mechanism to delete bulky FAC

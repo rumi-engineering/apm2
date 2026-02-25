@@ -348,7 +348,7 @@ fn run_blocking_evidence_gates(
         // Prefer worker execution when available, but do not hard-require it:
         // push must remain single-command operable for callers.
         require_external_worker: false,
-        // TCK-00577: Use the caller-provided write mode. Default is
+        // RFC-0032::REQ-0227: Use the caller-provided write mode. Default is
         // ServiceUserOnly; only bypass when --unsafe-local-write is
         // explicitly passed at the top-level FacCommand.
         write_mode,
@@ -427,7 +427,7 @@ fn apply_gate_lifecycle_events_with<F>(
 where
     F: FnMut(lifecycle::LifecycleEventKind) -> Result<(), String>,
 {
-    // TCK-00618: gate lifecycle projection must fail closed. Any illegal
+    // RFC-0032::REQ-0252: gate lifecycle projection must fail closed. Any illegal
     // transition aborts the sequence and bubbles the error to caller.
     for (event_name, event) in events {
         apply_event_fn(event.clone()).map_err(|err| {
@@ -992,7 +992,7 @@ where
             }
 
             if result.mode.eq_ignore_ascii_case("joined") {
-                // BF-001 (TCK-00626): For non-terminal "joined" results,
+                // BF-001 (RFC-0032::REQ-0257): For non-terminal "joined" results,
                 // verify the PID is still alive. A stale run-state with a
                 // dead PID should be treated as a dispatch that needs retry.
                 let is_terminal = dispatch_run_state_is_terminal(&result.run_state);
@@ -1020,7 +1020,7 @@ where
                 }
                 if !is_terminal {
                     if let Some(pid) = result.pid {
-                        // BF-001 (TCK-00626 round 3): Use process-identity
+                        // BF-001 (RFC-0032::REQ-0257 round 3): Use process-identity
                         // aware liveness check that compares the recorded
                         // proc_start_time against the current value in
                         // /proc/<pid>/stat. This prevents PID-reuse false
@@ -1755,7 +1755,7 @@ fn unresolved_push_alias_message(ticket_alias: &str) -> String {
     format!(
         "derived ticket alias `{ticket_alias}` did not resolve to a canonical work_id. \
          Refusing projection fallback to prevent cross-ticket misbinding. \
-         Remediation: run `apm2 fac work open --from-ticket documents/work/tickets/{ticket_alias}.yaml --lease-id <LEASE_ID>`, \
+         Remediation: run `apm2 fac work open --from-ticket <work-scope.json> --lease-id <LEASE_ID>`, \
          then claim it (or pass explicit `--work-id`)."
     )
 }
@@ -2782,7 +2782,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
         }
     };
 
-    // TCK-00596: Fail-fast credential gate for GitHub-facing push command.
+    // RFC-0032::REQ-0245: Fail-fast credential gate for GitHub-facing push command.
     // This ensures actionable errors before any git push or PR creation.
     if let Err(err) = apm2_core::fac::require_github_credentials() {
         let message = err.to_string();
@@ -3952,7 +3952,7 @@ pub(super) fn run_push(invocation: &PushInvocation<'_>) -> u8 {
             human_log!("WARNING: review dispatch failed: {e}");
             human_log!("  Reviewers are NOT running. Use:");
             human_log!("    apm2 fac doctor --pr {pr_number} --fix");
-            // BF-001 (TCK-00626): Emit structured dispatch_failed event so
+            // BF-001 (RFC-0032::REQ-0257): Emit structured dispatch_failed event so
             // the event stream captures the failure for automated recovery.
             if json_output {
                 let _ = emit_jsonl(&serde_json::json!({
@@ -4172,22 +4172,22 @@ mod tests {
     #[test]
     fn validate_explicit_ticket_alias_binding_accepts_matching_resolution() {
         let alias =
-            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-12345678"))
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", Some("W-12345678"))
                 .expect("matching alias resolution should be accepted");
-        assert_eq!(alias, "TCK-00640");
+        assert_eq!(alias, "TCK-02680");
     }
 
     #[test]
     fn validate_explicit_ticket_alias_binding_rejects_mismatched_resolution() {
         let err =
-            validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", Some("W-87654321"))
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", Some("W-87654321"))
                 .expect_err("mismatched alias resolution must fail closed");
         assert!(err.contains("`--work-id` mismatch"));
     }
 
     #[test]
     fn validate_explicit_ticket_alias_binding_rejects_unresolved_alias() {
-        let err = validate_explicit_ticket_alias_binding("W-12345678", "TCK-00640", None)
+        let err = validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", None)
             .expect_err("unresolved explicit alias must fail closed");
         assert!(err.contains("fail-closed"));
     }
@@ -4201,8 +4201,8 @@ mod tests {
 
     #[test]
     fn unresolved_push_alias_message_includes_fail_closed_guidance() {
-        let msg = unresolved_push_alias_message("TCK-00640");
-        assert!(msg.contains("TCK-00640"));
+        let msg = unresolved_push_alias_message("TCK-02680");
+        assert!(msg.contains("TCK-02680"));
         assert!(msg.contains("Refusing projection fallback"));
         assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
@@ -4214,8 +4214,8 @@ Some PR text
 
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-TCK-00640-R2
-ticket_alias: TCK-00640
+work_id: W-TCK-02680-R2
+ticket_alias: TCK-02680
 fac_push_metadata:
   commit_history: []
 ```
@@ -4223,8 +4223,8 @@ fac_push_metadata:
         let parsed = parse_pr_body_work_binding(body)
             .expect("valid pr metadata must parse")
             .expect("binding should be present");
-        assert_eq!(parsed.work_id, "W-TCK-00640-R2");
-        assert_eq!(parsed.ticket_alias.as_deref(), Some("TCK-00640"));
+        assert_eq!(parsed.work_id, "W-TCK-02680-R2");
+        assert_eq!(parsed.ticket_alias.as_deref(), Some("TCK-02680"));
     }
 
     #[test]
@@ -4232,11 +4232,11 @@ fac_push_metadata:
         let body = r"
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-TCK-00640
+work_id: W-TCK-02680
 ```
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-TCK-00640-R2
+work_id: W-TCK-02680-R2
 ```
 ";
         let err = parse_pr_body_work_binding(body)
@@ -4249,7 +4249,7 @@ work_id: W-TCK-00640-R2
         let body = r"
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-TCK-00640
+work_id: W-TCK-02680
 ticket_alias: ticket-640
 ```
 ";
@@ -4261,21 +4261,21 @@ ticket_alias: ticket-640
     #[test]
     fn enforce_authoritative_pr_work_binding_rejects_mismatched_candidate() {
         let authoritative = PrBodyWorkBinding {
-            work_id: "W-TCK-00640-R2".to_string(),
-            ticket_alias: Some("TCK-00640".to_string()),
+            work_id: "W-TCK-02680-R2".to_string(),
+            ticket_alias: Some("TCK-02680".to_string()),
         };
         let err =
-            enforce_authoritative_pr_work_binding(Some(805), Some(&authoritative), "W-TCK-00640")
+            enforce_authoritative_pr_work_binding(Some(805), Some(&authoritative), "W-TCK-02680")
                 .expect_err("mismatched candidate must fail closed");
         assert!(err.contains("existing PR #805"));
-        assert!(err.contains("W-TCK-00640-R2"));
+        assert!(err.contains("W-TCK-02680-R2"));
     }
 
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_skips_binding_when_no_pr_exists() {
         let mut resolve_called = false;
         let refreshed = refresh_existing_pr_number_for_preflight_with(
-            "W-TCK-00640-R2",
+            "W-TCK-02680-R2",
             || 0,
             |_| {
                 resolve_called = true;
@@ -4293,12 +4293,12 @@ ticket_alias: ticket-640
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_revalidates_authoritative_binding() {
         let refreshed = refresh_existing_pr_number_for_preflight_with(
-            "W-TCK-00640-R2",
+            "W-TCK-02680-R2",
             || 805,
             |_| {
                 Ok(Some(PrBodyWorkBinding {
-                    work_id: "W-TCK-00640-R2".to_string(),
-                    ticket_alias: Some("TCK-00640".to_string()),
+                    work_id: "W-TCK-02680-R2".to_string(),
+                    ticket_alias: Some("TCK-02680".to_string()),
                 }))
             },
         )
@@ -4309,7 +4309,7 @@ ticket_alias: ticket-640
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_rejects_mismatched_binding() {
         let err = refresh_existing_pr_number_for_preflight_with(
-            "W-TCK-00640-R2",
+            "W-TCK-02680-R2",
             || 805,
             |_| {
                 Ok(Some(PrBodyWorkBinding {
@@ -4350,16 +4350,16 @@ ticket_alias: ticket-640
     #[test]
     fn build_git_push_refspec_uses_captured_head_sha() {
         assert_eq!(
-            build_git_push_refspec("0123abcd", "ticket/RFC-0032/TCK-00640"),
-            "0123abcd:refs/heads/ticket/RFC-0032/TCK-00640"
+            build_git_push_refspec("0123abcd", "ticket/RFC-0032/TCK-02680"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-02680"
         );
     }
 
     #[test]
     fn build_git_push_refspec_normalizes_heads_prefix() {
         assert_eq!(
-            build_git_push_refspec("0123abcd", "refs/heads/ticket/RFC-0032/TCK-00640"),
-            "0123abcd:refs/heads/ticket/RFC-0032/TCK-00640"
+            build_git_push_refspec("0123abcd", "refs/heads/ticket/RFC-0032/TCK-02680"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-02680"
         );
     }
 
@@ -4547,7 +4547,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_prefers_requested_session_when_daemon_session_missing() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-TCK-00640",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             Some("S-requested-123".to_string()),
             Some("L-lease-123".to_string()),
@@ -4562,7 +4562,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_uses_daemon_session_when_not_requested() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-TCK-00640",
+            "W-TCK-02680",
             None,
             None,
             Some("L-lease-123".to_string()),
@@ -4577,7 +4577,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_derives_adhoc_session_when_missing() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-TCK-00640",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             None,
             Some("L-lease-123".to_string()),
@@ -4592,7 +4592,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_rejects_lease_mismatch() {
         let err = resolve_runtime_binding_from_inputs(
-            "W-TCK-00640",
+            "W-TCK-02680",
             Some("L-requested".to_string()),
             None,
             Some("L-daemon".to_string()),
@@ -4605,7 +4605,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_rejects_session_mismatch() {
         let err = resolve_runtime_binding_from_inputs(
-            "W-TCK-00640",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             Some("S-requested".to_string()),
             Some("L-lease-123".to_string()),
@@ -4648,17 +4648,17 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_accepts_valid_payload() {
-        let changeset = sample_changeset_response("W-TCK-00640");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-TCK-00640",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let handoff = sample_context_response("W-TCK-00640", "CTX-123");
-        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+        let handoff = sample_context_response("W-TCK-02680", "CTX-123");
+        let terminal = sample_context_response("W-TCK-02680", "CTX-456");
 
         validate_work_publication_chain_responses(
-            "W-TCK-00640",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4671,16 +4671,16 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_rejects_pr_number_mismatch() {
-        let changeset = sample_changeset_response("W-TCK-00640");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-TCK-00640",
+            "W-TCK-02680",
             999,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let terminal = sample_context_response("W-TCK-00640", "CTX-456");
+        let terminal = sample_context_response("W-TCK-02680", "CTX-456");
 
         let err = validate_work_publication_chain_responses(
-            "W-TCK-00640",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4694,16 +4694,16 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_rejects_non_context_entry_id() {
-        let changeset = sample_changeset_response("W-TCK-00640");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-TCK-00640",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let terminal = sample_context_response("W-TCK-00640", "bad-entry");
+        let terminal = sample_context_response("W-TCK-02680", "bad-entry");
 
         let err = validate_work_publication_chain_responses(
-            "W-TCK-00640",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4717,9 +4717,9 @@ ticket_alias: ticket-640
 
     #[test]
     fn derive_adhoc_session_id_is_deterministic_and_prefixed() {
-        let first = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
-        let second = derive_adhoc_session_id("W-TCK-00640", "L-lease-123");
-        let different = derive_adhoc_session_id("W-TCK-00640", "L-lease-456");
+        let first = derive_adhoc_session_id("W-TCK-02680", "L-lease-123");
+        let second = derive_adhoc_session_id("W-TCK-02680", "L-lease-123");
+        let different = derive_adhoc_session_id("W-TCK-02680", "L-lease-456");
 
         assert_eq!(
             first, second,
@@ -5307,8 +5307,8 @@ ticket_alias: ticket-640
     #[test]
     fn extract_tck_from_text_accepts_valid_pattern() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0018/TCK-00412"),
-            Some("TCK-00412".to_string())
+            extract_tck_from_text("ticket/RFC-0018/TCK-01580"),
+            Some("TCK-01580".to_string())
         );
     }
 
@@ -5316,22 +5316,22 @@ ticket_alias: ticket-640
     fn extract_tck_from_text_rejects_invalid_variants() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-412"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00412"), None);
-        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-004123"), None);
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-015803"), None);
     }
 
     #[test]
     fn resolve_tck_id_prefers_branch() {
         let worktree = Path::new("/tmp/apm2-TCK-99999");
-        let tck = resolve_tck_id("ticket/RFC-0018/TCK-00412", worktree)
+        let tck = resolve_tck_id("ticket/RFC-0018/TCK-01580", worktree)
             .expect("branch should provide tck");
-        assert_eq!(tck, "TCK-00412");
+        assert_eq!(tck, "TCK-01580");
     }
 
     #[test]
     fn resolve_tck_id_falls_back_to_worktree_name() {
-        let worktree = Path::new("/tmp/apm2-TCK-00444");
+        let worktree = Path::new("/tmp/apm2-TCK-01680");
         let tck = resolve_tck_id("feat/no-ticket", worktree).expect("worktree should provide tck");
-        assert_eq!(tck, "TCK-00444");
+        assert_eq!(tck, "TCK-01680");
     }
 
     #[test]
@@ -5357,9 +5357,9 @@ ticket_alias: ticket-640
     #[test]
     fn render_push_body_markdown_includes_work_identity_and_commit_history() {
         let rendered = render_push_body_markdown(
-            "W-TCK-00412",
-            Some("TCK-00412"),
-            "ticket/RFC-0018/TCK-00412",
+            "W-TCK-01580",
+            Some("TCK-01580"),
+            "ticket/RFC-0018/TCK-01580",
             &sample_commit_history(),
         )
         .expect("render push body");
@@ -5369,12 +5369,12 @@ ticket_alias: ticket-640
             .get("work_id")
             .and_then(serde_yaml::Value::as_str)
             .expect("work id");
-        assert_eq!(work_id, "W-TCK-00412");
+        assert_eq!(work_id, "W-TCK-01580");
         let ticket_alias = yaml
             .get("ticket_alias")
             .and_then(serde_yaml::Value::as_str)
             .expect("ticket alias");
-        assert_eq!(ticket_alias, "TCK-00412");
+        assert_eq!(ticket_alias, "TCK-01580");
 
         let history = yaml
             .get("fac_push_metadata")
@@ -5399,14 +5399,14 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_pr_metadata_prefers_resolved_ticket_alias_prefix() {
         let metadata = resolve_pr_metadata(
-            "ticket/RFC-0018/TCK-00412",
+            "ticket/RFC-0018/TCK-01580",
             Path::new("/tmp/apm2-no-ticket"),
             &sample_commit_history(),
-            "W-TCK-00412",
-            Some("TCK-00412"),
+            "W-TCK-01580",
+            Some("TCK-01580"),
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00412: second change");
+        assert_eq!(metadata.title, "TCK-01580: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         let history = yaml
             .get("fac_push_metadata")
@@ -5420,19 +5420,19 @@ ticket_alias: ticket-640
     fn resolve_pr_metadata_uses_branch_derived_alias_when_not_explicitly_supplied() {
         let metadata = resolve_pr_metadata(
             "feat/no-ticket",
-            Path::new("/tmp/apm2-TCK-00444"),
+            Path::new("/tmp/apm2-TCK-01680"),
             &sample_commit_history(),
-            "W-TCK-00444",
+            "W-TCK-01680",
             None,
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "TCK-00444: second change");
+        assert_eq!(metadata.title, "TCK-01680: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         assert_eq!(
             yaml.get("ticket_alias")
                 .and_then(serde_yaml::Value::as_str)
                 .expect("ticket alias"),
-            "TCK-00444"
+            "TCK-01680"
         );
     }
 

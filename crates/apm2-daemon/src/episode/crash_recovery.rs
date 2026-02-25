@@ -1,4 +1,4 @@
-//! Crash recovery wiring for daemon startup (TCK-00387).
+//! Crash recovery wiring for daemon startup (RFC-0032::REQ-0141).
 //!
 //! This module connects persistent session state to lease revocation and work
 //! cleanup. On daemon restart, it:
@@ -155,10 +155,11 @@ pub enum CrashRecoveryError {
 
 /// Collects all sessions from the session registry for recovery.
 ///
-/// Uses the `all_sessions_for_recovery()` trait method added in TCK-00387.
-/// For `PersistentSessionRegistry`, this returns sessions loaded from the
-/// state file. For `InMemorySessionRegistry`, this returns an empty vec
-/// (default implementation) since in-memory state doesn't survive restarts.
+/// Uses the `all_sessions_for_recovery()` trait method added in
+/// RFC-0032::REQ-0141. For `PersistentSessionRegistry`, this returns sessions
+/// loaded from the state file. For `InMemorySessionRegistry`, this returns an
+/// empty vec (default implementation) since in-memory state doesn't survive
+/// restarts.
 ///
 /// Returns a [`CollectedSessions`] that indicates whether truncation
 /// occurred, so the caller can decide whether to clear all sessions or

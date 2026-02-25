@@ -197,7 +197,7 @@ pub struct SessionStarted {
     /// Binds this event to verifiable HTF time.
     #[prost(message, optional, tag = "9")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.lifecycle topic routing.
     #[prost(string, tag = "10")]
@@ -215,7 +215,7 @@ pub struct SessionProgress {
     pub progress_type: ::prost::alloc::string::String,
     #[prost(uint64, tag = "4")]
     pub entropy_consumed: u64,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.lifecycle topic routing.
     #[prost(string, tag = "5")]
@@ -237,7 +237,7 @@ pub struct SessionTerminated {
     /// Binds this event to verifiable HTF time.
     #[prost(message, optional, tag = "5")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.lifecycle topic routing.
     #[prost(string, tag = "6")]
@@ -270,7 +270,7 @@ pub struct SessionQuarantined {
     /// Required for interpreting tick values as durations.
     #[prost(uint64, tag = "7")]
     pub tick_rate_hz: u64,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.lifecycle topic routing.
     #[prost(string, tag = "8")]
@@ -414,7 +414,7 @@ pub struct ToolRequested {
     pub tool_args_hash: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "5")]
     pub dedupe_key: ::prost::alloc::string::String,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.tool topic routing.
     #[prost(string, tag = "6")]
@@ -440,7 +440,7 @@ pub struct ToolDecided {
     /// Binds the decision receipt to verifiable HTF time.
     #[prost(message, optional, tag = "7")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.tool topic routing.
     #[prost(string, tag = "8")]
@@ -466,7 +466,7 @@ pub struct ToolExecuted {
     /// Binds the execution receipt to verifiable HTF time.
     #[prost(message, optional, tag = "5")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
-    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Episode ID for HEF topic derivation (RFC-0018, RFC-0032::REQ-0102).
     /// Empty string for non-episode sessions; populated from episode context.
     /// Enables episode.<episode_id>.tool topic routing.
     #[prost(string, tag = "6")]
@@ -594,7 +594,7 @@ pub struct LeaseConflict {
 }
 /// Emitted when a lease issuance is denied for security policy reasons.
 ///
-/// Per TCK-00258, this event is emitted when a SpawnEpisode request is
+/// Per RFC-0032::REQ-0074, this event is emitted when a SpawnEpisode request is
 /// rejected due to policy violations such as custody domain overlap (SoD).
 /// This provides an audit trail for denied lease requests.
 ///
@@ -1199,10 +1199,10 @@ pub struct PolicyResolvedForChangeSet {
     /// Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
     #[prost(bytes = "vec", tag = "11")]
     pub resolver_signature: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, TCK-00448).
+    /// BLAKE3 hash of the authoritative RoleSpecV2 contract (32 bytes, RFC-0032::REQ-0169).
     #[prost(bytes = "vec", tag = "12")]
     pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, TCK-00448).
+    /// BLAKE3 hash of the compiled ContextPackRecipe lineage artifact (32 bytes, RFC-0032::REQ-0169).
     #[prost(bytes = "vec", tag = "13")]
     pub context_pack_recipe_hash: ::prost::alloc::vec::Vec<u8>,
 }
@@ -1259,7 +1259,7 @@ pub struct GateReceipt {
     /// Present when gate execution is bound to a materialized hardening profile.
     #[prost(string, optional, tag = "15")]
     pub sandbox_hardening_hash: ::core::option::Option<::prost::alloc::string::String>,
-    /// BLAKE3 digest of the network policy used for gate execution (TCK-00574).
+    /// BLAKE3 digest of the network policy used for gate execution (RFC-0032::REQ-0224).
     /// Present when gate execution is bound to a materialized network policy.
     #[prost(string, optional, tag = "16")]
     pub network_policy_hash: ::core::option::Option<::prost::alloc::string::String>,
@@ -1273,7 +1273,7 @@ pub struct GateReceipt {
     /// Explicit pass/fail verdict declared by the gate executor.
     /// This is the authoritative verdict field - not derived from hash inspection.
     /// MUST be set by the executor; ambiguous payloads without an explicit verdict
-    /// are rejected at the admission boundary (TCK-00388 Quality BLOCKER 2).
+    /// are rejected at the admission boundary (RFC-0032::REQ-0142 Quality BLOCKER 2).
     #[prost(bool, tag = "13")]
     pub passed: bool,
 }
@@ -1910,15 +1910,15 @@ pub struct ReviewBlockedRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "7")]
     pub recorder_signature: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the CapabilityManifest in effect (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the CapabilityManifest in effect (32 bytes, RFC-0032::REQ-0119).
     /// Binds the blocked event to the authority under which the review was attempted.
     #[prost(bytes = "vec", tag = "8")]
     pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, RFC-0032::REQ-0119).
     /// Binds the blocked event to the context firewall configuration.
     #[prost(bytes = "vec", tag = "9")]
     pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, TCK-00448).
+    /// BLAKE3 hash of the RoleSpecV2 used during review (32 bytes, RFC-0032::REQ-0169).
     /// Binds the blocked event to the role specification used for the attempted run.
     #[prost(bytes = "vec", tag = "10")]
     pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
@@ -1955,15 +1955,15 @@ pub struct ReviewReceiptRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "6")]
     pub reviewer_signature: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the CapabilityManifest used during review (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the CapabilityManifest used during review (32 bytes, RFC-0032::REQ-0119).
     /// Binds the review to the authority under which it was performed.
     #[prost(bytes = "vec", tag = "7")]
     pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, TCK-00326).
+    /// BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, RFC-0032::REQ-0119).
     /// Binds the review to the context firewall configuration.
     #[prost(bytes = "vec", tag = "8")]
     pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
-    /// BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, TCK-00331).
+    /// BLAKE3 hash of the RoleSpecV1 used during review (32 bytes, RFC-0032::REQ-0124).
     /// Binds the review to the role specification for attribution and conformance verification.
     #[prost(bytes = "vec", tag = "9")]
     pub role_spec_hash: ::prost::alloc::vec::Vec<u8>,
@@ -2536,9 +2536,9 @@ pub enum ReviewBlockedReasonCode {
     ReviewBlockedReasonPolicyDenied = 7,
     /// Context miss detected.
     ReviewBlockedReasonContextMiss = 8,
-    /// Context pack not found in CAS (TCK-00326).
+    /// Context pack not found in CAS (RFC-0032::REQ-0119).
     ReviewBlockedReasonContextPackMissing = 9,
-    /// Context pack seal verification failed (TCK-00326).
+    /// Context pack seal verification failed (RFC-0032::REQ-0119).
     ReviewBlockedReasonContextPackInvalid = 10,
 }
 impl ReviewBlockedReasonCode {

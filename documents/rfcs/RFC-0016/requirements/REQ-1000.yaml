@@ -1,5 +1,0 @@
-rfc_requirement_template_placeholder:
-  schema_version: "2026-01-30"
-  note: |
-    This file exists because RFC-0016 was scaffolded from the RFC template.
-    RFC-0016 uses HTF-scoped requirements (REQ-HTF-xxxx) instead.

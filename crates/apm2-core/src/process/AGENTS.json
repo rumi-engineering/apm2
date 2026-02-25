@@ -1,0 +1,66 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/process",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-PROC-001",
+      "kind": "invariant",
+      "title": "Each ProcessId is globally unique (UUID v4)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-002",
+      "kind": "invariant",
+      "title": "ProcessSpec name and command are non-empty (enforced by builder)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-003",
+      "kind": "invariant",
+      "title": "ProcessSpec instances >= 1 (builder defaults 0 to 1)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-004",
+      "kind": "invariant",
+      "title": "State machine transitions are unidirectional (no cycles except via restart)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-005",
+      "kind": "invariant",
+      "title": "Stopped, Crashed, and Terminated are terminal states",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-006",
+      "kind": "invariant",
+      "title": "pid.is_some() iff state.is_running()",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-007",
+      "kind": "invariant",
+      "title": "child.is_some() iff process is actively running",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-008",
+      "kind": "invariant",
+      "title": "instance < spec.instances for all process handles",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-009",
+      "kind": "requirement",
+      "title": "stop() sends SIGTERM, then SIGKILL after timeout",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-PROC-010",
+      "kind": "safety",
+      "title": "start() fails if already running (InvalidState error)",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

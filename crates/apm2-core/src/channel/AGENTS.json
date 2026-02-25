@@ -1,0 +1,62 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/channel",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CHANNEL-001",
+      "kind": "invariant",
+      "title": "Only TypedToolIntent may drive authoritative actuation",
+      "description": "Only TypedToolIntent channel source is authoritative for actuation. All other sources produce ChannelBoundaryDefect.",
+      "rfc": ["RFC-0020", "RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-002",
+      "kind": "invariant",
+      "title": "All verification flags default to false (fail-closed)",
+      "description": "All boolean verification flags in ChannelBoundaryCheck default to false, enforcing fail-closed semantics.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-003",
+      "kind": "requirement",
+      "title": "Passing boundary check requires TypedToolIntent and all flags",
+      "description": "A passing boundary check requires source == TypedToolIntent AND all relevant verification flags true.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-004",
+      "kind": "invariant",
+      "title": "DeclassificationIntentScope defaults to Unknown (fail-closed)",
+      "description": "Default DeclassificationIntentScope is Unknown, which is fail-closed deny.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-005",
+      "kind": "invariant",
+      "title": "Policy and canonicalizer digests use constant-time comparison",
+      "description": "BoundaryFlowPolicyBinding digests must match admitted digests. All four digests must be non-zero. Comparison uses constant-time.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-006",
+      "kind": "safety",
+      "title": "Leakage and timing budget exceeded require quarantine",
+      "description": "LeakageBudgetExceeded and TimingChannelBudgetExceeded violation classes require quarantine.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-007",
+      "kind": "requirement",
+      "title": "Channel context token encodes full boundary state",
+      "description": "issue_channel_context_token encodes full boundary state. decode_channel_context_token validates schema, signature, lease binding, request binding, witness, and expiry.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-CHANNEL-008",
+      "kind": "requirement",
+      "title": "Intent field enforced fail-closed on token binding",
+      "description": "When expected_intent is Some, decode enforces exact match. Mismatch returns IntentMismatch error. Missing intent in token returns MissingIntent error.",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

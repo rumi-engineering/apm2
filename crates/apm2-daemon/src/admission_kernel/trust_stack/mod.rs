@@ -1,7 +1,7 @@
 // AGENT-AUTHORED
 //! Ledger trust stack: `RootTrustBundle`, trusted seals, checkpoint-bounded
 //! startup, and governance-derived `PolicyRootResolver` (RFC-0019 REQ-0028,
-//! TCK-00500).
+//! RFC-0032::REQ-0175).
 //!
 //! This module implements the concrete types behind the prerequisite trait
 //! interfaces defined in [`super::prerequisites`]:
@@ -584,7 +584,7 @@ struct VerifiedState {
     state: Option<ValidatedLedgerStateV1>,
 }
 
-/// Concrete implementation of [`LedgerTrustVerifier`] (TCK-00500).
+/// Concrete implementation of [`LedgerTrustVerifier`] (RFC-0032::REQ-0175).
 ///
 /// Performs checkpoint-bounded startup verification and provides validated
 /// ledger state for admission decisions.
@@ -1071,7 +1071,7 @@ struct PolicyRootCacheEntry {
     anchor_hash: Hash,
 }
 
-/// Governance-derived policy root resolver (TCK-00500).
+/// Governance-derived policy root resolver (RFC-0032::REQ-0175).
 ///
 /// Derives [`PolicyRootStateV1`] deterministically from governance-class
 /// events up to a given [`LedgerAnchorV1`].
@@ -1319,7 +1319,7 @@ impl PolicyRootResolver for GovernancePolicyRootResolver {
 }
 
 // =============================================================================
-// Anti-Rollback Anchor Providers (RFC-0019 REQ-0030, TCK-00502)
+// Anti-Rollback Anchor Providers (RFC-0019 REQ-0030, RFC-0032::REQ-0177)
 // =============================================================================
 
 /// Maximum length for the mechanism ID string in external anchor state.
@@ -1360,7 +1360,8 @@ struct PersistedAnchorStateV1 {
     proof_hash: Hash,
 }
 
-/// Durable anti-rollback anchor provider (RFC-0019 REQ-0030, TCK-00502).
+/// Durable anti-rollback anchor provider (RFC-0019 REQ-0030,
+/// RFC-0032::REQ-0177).
 ///
 /// Persists the external anchor state to a file using atomic write protocol
 /// (temp + rename). On `verify_committed()`, compares the requested anchor
@@ -1379,7 +1380,8 @@ struct PersistedAnchorStateV1 {
 /// - If the anchor state file is missing but a bootstrap receipt exists (anchor
 ///   was lost post-genesis), `latest()` and `verify_committed()` return
 ///   `TrustError::ExternalAnchorUnavailable` — NOT `NotInitialized` — denying
-///   fail-closed flows (TCK-00502 BLOCKER fix: bootstrap/outage distinction).
+///   fail-closed flows (RFC-0032::REQ-0177 BLOCKER fix: bootstrap/outage
+///   distinction).
 /// - If the requested anchor regresses relative to persisted state,
 ///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
 /// - If the anchor height matches but the event hash differs (fork),
@@ -1490,7 +1492,7 @@ impl DurableAntiRollbackAnchor {
         let initial_state = if state_path.exists() {
             Some(Self::load_state_from_file(&state_path, &mechanism_id)?)
         } else if bootstrap_receipt_exists {
-            // TCK-00502 BLOCKER fix: the bootstrap receipt exists but the
+            // RFC-0032::REQ-0177 BLOCKER fix: the bootstrap receipt exists but the
             // anchor state file is missing. This means the anchor was lost
             // after initial genesis commit (e.g., file deletion, disk
             // corruption). This is NOT a fresh install; it is an anchor
@@ -1560,7 +1562,7 @@ impl DurableAntiRollbackAnchor {
         // Atomic file write: serialize to temp, rename to final path.
         Self::atomic_write_state(&self.state_path, &new_state)?;
 
-        // TCK-00502 BLOCKER fix: persist bootstrap receipt on first
+        // RFC-0032::REQ-0177 BLOCKER fix: persist bootstrap receipt on first
         // successful commit. This receipt marks that the anchor has been
         // initialized at least once. If the anchor state file is later
         // lost/deleted, the bootstrap receipt prevents the provider from
@@ -1944,7 +1946,7 @@ impl super::prerequisites::AntiRollbackAnchor for DurableAntiRollbackAnchor {
     }
 }
 
-/// In-memory anti-rollback anchor provider for testing (TCK-00502).
+/// In-memory anti-rollback anchor provider for testing (RFC-0032::REQ-0177).
 ///
 /// Provides the same semantics as [`DurableAntiRollbackAnchor`] but without
 /// file-system persistence. Suitable for CI/integration testing.

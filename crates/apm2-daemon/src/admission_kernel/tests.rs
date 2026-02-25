@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Tests for `AdmissionKernel` plan/execute API (TCK-00492).
+//! Tests for `AdmissionKernel` plan/execute API (RFC-0032::REQ-0170).
 //!
 //! Coverage:
 //! - (a) missing policy-root denies for fail-closed tiers
@@ -1728,7 +1728,8 @@ fn test_join_input_uses_verifier_anchor_not_client_hash() {
 }
 
 // =============================================================================
-// QUALITY MAJOR 1 (TCK-00492): Zero-digest rejection for mandatory fields
+// QUALITY MAJOR 1 (RFC-0032::REQ-0170): Zero-digest rejection for mandatory
+// fields
 // =============================================================================
 
 #[test]
@@ -1810,7 +1811,7 @@ fn test_zero_revocation_head_hash_denied() {
 }
 
 // =============================================================================
-// QUALITY MAJOR 2 (TCK-00492): Zero provider_build_digest denial
+// QUALITY MAJOR 2 (RFC-0032::REQ-0170): Zero provider_build_digest denial
 // =============================================================================
 
 #[test]
@@ -1845,7 +1846,8 @@ fn test_zero_provider_build_digest_denied() {
 }
 
 // =============================================================================
-// SECURITY BLOCKER 2 (TCK-00492): Bounded deserialization for String fields
+// SECURITY BLOCKER 2 (RFC-0032::REQ-0170): Bounded deserialization for String
+// fields
 // =============================================================================
 
 #[test]
@@ -1895,7 +1897,8 @@ fn test_witness_seed_bounded_deserialization_rejects_oversized_provider_id() {
 }
 
 // =============================================================================
-// QUALITY MINOR 1 (TCK-00492): risk_tier and pcac_policy in canonical digest
+// QUALITY MINOR 1 (RFC-0032::REQ-0170): risk_tier and pcac_policy in canonical
+// digest
 // =============================================================================
 
 #[test]
@@ -1929,7 +1932,8 @@ fn test_canonical_request_digest_differs_by_pcac_policy() {
 }
 
 // =============================================================================
-// TCK-00493: AdmissionBundleV1 — sealed CAS bundle with no digest cycles
+// RFC-0032::REQ-0171: AdmissionBundleV1 — sealed CAS bundle with no digest
+// cycles
 // =============================================================================
 
 #[test]
@@ -2330,7 +2334,7 @@ fn test_monitor_tier_bundle_has_no_quarantine_actions() {
 }
 
 // =============================================================================
-// TCK-00493: AdmissionOutcomeIndexV1 — forward index (no digest cycle)
+// RFC-0032::REQ-0171: AdmissionOutcomeIndexV1 — forward index (no digest cycle)
 // =============================================================================
 
 #[test]
@@ -2457,7 +2461,8 @@ fn test_outcome_index_validation_rejects_zero_bundle_digest() {
 }
 
 // =============================================================================
-// TCK-00493: Digest cycle regression test — bundle never references receipts
+// RFC-0032::REQ-0171: Digest cycle regression test — bundle never references
+// receipts
 // =============================================================================
 
 #[test]
@@ -2522,7 +2527,7 @@ fn test_bundle_receipt_digest_cycle_regression() {
 }
 
 // =============================================================================
-// TCK-00493: CAC overlay digest cycle regression
+// RFC-0032::REQ-0171: CAC overlay digest cycle regression
 // =============================================================================
 
 #[test]
@@ -2564,7 +2569,7 @@ fn test_cac_overlay_digest_cycle_regression() {
 }
 
 // =============================================================================
-// TCK-00493: AdmitError::BundleSealFailure Display coverage
+// RFC-0032::REQ-0171: AdmitError::BundleSealFailure Display coverage
 // =============================================================================
 
 #[test]
@@ -2584,7 +2589,7 @@ fn test_admit_error_bundle_seal_failure_display() {
 }
 
 // =============================================================================
-// TCK-00493 fix: post_effect_witness_evidence_hashes in outcome index
+// RFC-0032::REQ-0171 fix: post_effect_witness_evidence_hashes in outcome index
 // =============================================================================
 
 #[test]
@@ -2654,7 +2659,7 @@ fn test_bundle_does_not_contain_post_effect_witness_evidence_hashes() {
 }
 
 // =============================================================================
-// TCK-00493 fix: bounded deserialization (visitor-based) tests
+// RFC-0032::REQ-0171 fix: bounded deserialization (visitor-based) tests
 // =============================================================================
 
 #[test]
@@ -2844,7 +2849,7 @@ fn test_bounded_vec_deser_accepts_valid_sized_collections() {
 }
 
 // =============================================================================
-// TCK-00497: Authoritative witness closure tests
+// RFC-0020::REQ-0058: Authoritative witness closure tests
 // =============================================================================
 
 /// Helper: build a valid monitor waiver for testing.
@@ -3831,7 +3836,7 @@ fn test_tck_00497_e2e_fail_closed_positive_path() {
 }
 
 // =============================================================================
-// TCK-00497 QUALITY MAJOR 3: Runtime-path regression tests
+// RFC-0020::REQ-0058 QUALITY MAJOR 3: Runtime-path regression tests
 //
 // These tests exercise the real plan/execute/finalize_post_effect_witness
 // flow via AdmissionResultV1, asserting:
@@ -4276,8 +4281,8 @@ fn test_tck_00497_witness_evidence_json_round_trip() {
 }
 
 // =============================================================================
-// TCK-00501 MAJOR 2: record_started must NOT be persisted before fallible
-// pre-effect steps (bundle validation). This test verifies that when
+// RFC-0032::REQ-0176 MAJOR 2: record_started must NOT be persisted before
+// fallible pre-effect steps (bundle validation). This test verifies that when
 // PCAC consume fails, the effect journal has NO Started entry.
 // =============================================================================
 
@@ -4349,7 +4354,7 @@ impl super::effect_journal::EffectJournal for TrackingEffectJournal {
 
 #[test]
 fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
-    // TCK-00501 regression test: when execute() fails (e.g., PCAC consume
+    // RFC-0032::REQ-0176 regression test: when execute() fails (e.g., PCAC consume
     // failure), no journal_binding is returned to the caller, so
     // record_started is never called. This validates that failed execute()
     // cannot produce orphaned Started entries.
@@ -4390,7 +4395,7 @@ fn test_tck_00501_consume_failure_does_not_leave_stale_started_entry() {
 fn test_tck_00501_successful_execute_returns_journal_binding() {
     // Positive test: verify that a successful execute() returns a
     // journal_binding that the caller can use to call record_started
-    // at the true pre-dispatch boundary (TCK-00501 SEC-MAJOR-1 fix).
+    // at the true pre-dispatch boundary (RFC-0032::REQ-0176 SEC-MAJOR-1 fix).
     //
     // execute() no longer calls record_started directly — instead it
     // exposes the binding in AdmissionResultV1 so the caller controls
@@ -4444,7 +4449,7 @@ fn test_tck_00501_successful_execute_returns_journal_binding() {
 }
 
 // =============================================================================
-// TCK-00501 MAJOR 1: idempotency key derivation test
+// RFC-0032::REQ-0176 MAJOR 1: idempotency key derivation test
 // =============================================================================
 
 #[test]
@@ -4488,7 +4493,7 @@ fn test_tck_00497_monitor_waiver_json_round_trip() {
 }
 
 // =============================================================================
-// TCK-00502: Anti-rollback anchor provider tests
+// RFC-0032::REQ-0177: Anti-rollback anchor provider tests
 // =============================================================================
 
 // ---- InMemoryAntiRollbackAnchor tests ----
@@ -5474,7 +5479,7 @@ fn test_tck_00502_effect_failure_does_not_advance_anchor() {
 }
 
 // =============================================================================
-// TCK-00502 round 4: Regression tests for finalize_anti_rollback on
+// RFC-0032::REQ-0177 round 4: Regression tests for finalize_anti_rollback on
 // EmitEvent and PublishEvidence handler paths.
 //
 // These tests verify the same anchor advancement contract that all three
@@ -5488,7 +5493,7 @@ fn test_tck_00502_effect_failure_does_not_advance_anchor() {
 /// sequential effects from different handler paths) each advance the
 /// anchor watermark monotonically.
 ///
-/// This regression test covers the TCK-00502 round 4 BLOCKER finding:
+/// This regression test covers the RFC-0032::REQ-0177 round 4 BLOCKER finding:
 /// `EmitEvent` and `PublishEvidence` must call `finalize_anti_rollback` after
 /// their respective effects, and each call must further advance the anchor.
 #[test]
@@ -5589,10 +5594,11 @@ fn test_tck_00502_sequential_finalize_advances_anchor_monotonically() {
 /// effects regardless of which handler calls it (`RequestTool`, `EmitEvent`,
 /// or `PublishEvidence`).
 ///
-/// Regression test for TCK-00502 round 4: the new `finalize_anti_rollback`
-/// calls in `EmitEvent` and `PublishEvidence` are gated on
-/// `admission_result.boundary_span.enforcement_tier`, which is `Monitor`
-/// for low-risk tiers. This test proves the monitor-tier no-op contract.
+/// Regression test for RFC-0032::REQ-0177 round 4: the new
+/// `finalize_anti_rollback` calls in `EmitEvent` and `PublishEvidence` are
+/// gated on `admission_result.boundary_span.enforcement_tier`, which is
+/// `Monitor` for low-risk tiers. This test proves the monitor-tier no-op
+/// contract.
 #[test]
 fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5665,7 +5671,8 @@ fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
 }
 
 // =============================================================================
-// TCK-00502 round 6: Bootstrap receipt, post-effect anchor, health probe
+// RFC-0032::REQ-0177 round 6: Bootstrap receipt, post-effect anchor, health
+// probe
 // =============================================================================
 
 /// Verifies that `DurableAntiRollbackAnchor` persists a bootstrap receipt

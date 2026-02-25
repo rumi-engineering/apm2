@@ -1387,8 +1387,9 @@ impl CapabilityProof {
 
     /// Performs full authority verification including ledger state checks.
     ///
-    /// This method provides complete verification as required by TCK-00200:
-    /// "Verification uses ledger state + signature chain"
+    /// This method provides complete verification as required by
+    /// RFC-0033::REQ-0059: "Verification uses ledger state + signature
+    /// chain"
     ///
     /// # Verification Steps
     ///
@@ -3312,7 +3313,7 @@ mod tck_00199_tests {
 }
 
 // =============================================================================
-// TCK-00200: Signature Verification Tests
+// RFC-0033::REQ-0059: Signature Verification Tests
 // =============================================================================
 
 #[cfg(test)]

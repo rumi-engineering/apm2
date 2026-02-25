@@ -5,13 +5,14 @@
 //! - [INV-JS-003] Validation is fail-closed.
 //! - [INV-JS-004] Boundary structs use `#[serde(deny_unknown_fields)]`.
 //! - [INV-JS-005] Policy-driven validation rejects disallowed `repo_id` values
-//!   and patch `bytes_backend` values (TCK-00579).
+//!   and patch `bytes_backend` values (RFC-0032::REQ-0229).
 //! - [INV-JS-006] Filesystem paths (absolute, Windows drive, UNC) are rejected
 //!   in all string fields to ensure `repo_id` remains a logical identifier
-//!   (TCK-00579).
+//!   (RFC-0032::REQ-0229).
 //! - [INV-JS-007] Control-lane `stop_revoke` jobs MUST carry `repo_id ==
 //!   "internal/control"` ([`CONTROL_LANE_REPO_ID`]).  Arbitrary repo IDs are
-//!   rejected fail-closed to prevent audit-trail corruption (TCK-00579).
+//!   rejected fail-closed to prevent audit-trail corruption
+//!   (RFC-0032::REQ-0229).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -112,7 +113,7 @@ pub const CONTROL_LANE_EXCEPTION_AUDITED: bool = true;
 pub const MAX_ALLOWED_INTENTS_SIZE: usize = 32;
 
 // ---------------------------------------------------------------------------
-// RFC-0028 Intent Taxonomy (TCK-00567)
+// RFC-0028 Intent Taxonomy (RFC-0032::REQ-0218)
 // ---------------------------------------------------------------------------
 
 /// RFC-0028 typed tool-intent class for FAC job authorization.
@@ -394,7 +395,7 @@ pub enum JobSpecError {
         actual: String,
     },
 
-    /// Token intent does not match the job kind (TCK-00567).
+    /// Token intent does not match the job kind (RFC-0032::REQ-0218).
     ///
     /// The broker-issued token was bound to a different intent than the one
     /// required by the job kind.  This is a fail-closed denial: a token
@@ -411,14 +412,14 @@ pub enum JobSpecError {
         expected_intent: String,
     },
 
-    /// The intent is not in the policy-allowed set (TCK-00567).
+    /// The intent is not in the policy-allowed set (RFC-0032::REQ-0218).
     #[error("intent not allowed by policy: {intent}")]
     IntentNotAllowed {
         /// The rejected intent.
         intent: String,
     },
 
-    /// The job kind does not map to any known intent (TCK-00567).
+    /// The job kind does not map to any known intent (RFC-0032::REQ-0218).
     #[error("unknown intent for job kind: {kind}")]
     UnknownIntentForKind {
         /// The job kind that has no intent mapping.
@@ -1022,7 +1023,7 @@ pub fn deserialize_job_spec(bytes: &[u8]) -> Result<FacJobSpecV1, JobSpecError> 
     })
 }
 
-// Policy-driven validation (TCK-00579)
+// Policy-driven validation (RFC-0032::REQ-0229)
 
 /// Policy-driven validation constraints for `FacJobSpecV1`.
 ///
@@ -1093,7 +1094,8 @@ impl Default for JobSpecValidationPolicy {
     }
 }
 
-/// Validates a `FacJobSpecV1` with policy-driven constraints (TCK-00579).
+/// Validates a `FacJobSpecV1` with policy-driven constraints
+/// (RFC-0032::REQ-0229).
 ///
 /// Performs all checks from [`validate_job_spec`] plus:
 /// 1. `repo_id` allowlist enforcement (if policy specifies one).
@@ -1132,7 +1134,7 @@ pub fn validate_job_spec_with_policy(
 }
 
 /// Validates a `stop_revoke` job spec with policy-driven constraints
-/// (TCK-00579).
+/// (RFC-0032::REQ-0229).
 ///
 /// Performs all checks from [`validate_job_spec_control_lane`] plus
 /// patch `bytes_backend` allowlist and filesystem path rejection.
@@ -2123,7 +2125,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00579: Policy-driven validation tests
+    // RFC-0032::REQ-0229: Policy-driven validation tests
     // =========================================================================
 
     #[test]
@@ -2738,7 +2740,7 @@ mod tests {
 
     // =========================================================================
     // Round 4 fix: enforce CONTROL_LANE_REPO_ID in control-lane validation
-    // (INV-JS-007, TCK-00579 security review finding)
+    // (INV-JS-007, RFC-0032::REQ-0229 security review finding)
     // =========================================================================
 
     #[test]
@@ -2886,7 +2888,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00567: Intent taxonomy — mapping and serde correctness
+    // RFC-0032::REQ-0218: Intent taxonomy — mapping and serde correctness
     // -----------------------------------------------------------------------
 
     #[test]

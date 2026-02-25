@@ -1,7 +1,7 @@
-// AGENT-AUTHORED (TCK-00586)
+// AGENT-AUTHORED (RFC-0032::REQ-0236)
 //! Queue scan lock: optional short-lived lease for scan ownership.
 //!
-//! Implements TCK-00586: multi-worker fairness and scan efficiency.
+//! Implements RFC-0032::REQ-0236: multi-worker fairness and scan efficiency.
 //! When multiple workers poll the same `queue/pending/` directory,
 //! redundant directory scans cause a CPU/IO stampede. This module
 //! provides an optional advisory `flock`-based scan lock so that at
@@ -813,7 +813,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Regression tests for security findings (TCK-00586 fix round)
+    // Regression tests for security findings (RFC-0032::REQ-0236 fix round)
     // ========================================================================
 
     /// Regression: `read_lock_metadata` must reject symlinks via `O_NOFOLLOW`

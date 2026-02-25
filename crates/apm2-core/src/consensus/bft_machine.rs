@@ -36,8 +36,8 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00186: BFT Library Evaluation Spike
-//! - TCK-00187: BFT State Machine Core
+//! - RFC-0033::REQ-0047: BFT Library Evaluation Spike
+//! - RFC-0033::REQ-0048: BFT State Machine Core
 //! - EVID-0007: Protocol phase transitions
 //!
 //! # Example

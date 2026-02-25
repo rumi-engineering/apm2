@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/cas",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-CAS-001",
+      "kind": "invariant",
+      "title": "Content is immutable after store; overwrite attempts rejected",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-002",
+      "kind": "invariant",
+      "title": "Content hash (BLAKE3) verified on both store and retrieve",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-003",
+      "kind": "invariant",
+      "title": "Per-artifact size bounded by max_artifact_size (default 100 MB)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-004",
+      "kind": "invariant",
+      "title": "Total storage bounded by max_total_size (default 10 GB)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-005",
+      "kind": "invariant",
+      "title": "Directories created with mode 0700 (owner-only access)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-006",
+      "kind": "safety",
+      "title": "Base path must be absolute, symlink-free, and owned by daemon UID",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-007",
+      "kind": "requirement",
+      "title": "store() writes to temp file and atomically renames for crash safety",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-008",
+      "kind": "requirement",
+      "title": "store() returns is_new: false for deduplicated content (idempotent)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-CAS-009",
+      "kind": "requirement",
+      "title": "All persistent file operations use fs_safe primitives",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

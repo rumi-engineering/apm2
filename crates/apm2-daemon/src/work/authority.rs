@@ -574,7 +574,7 @@ impl WorkAuthority for ProjectionWorkAuthority {
 }
 
 // ============================================================================
-// Alias Reconciliation Gate (TCK-00420)
+// Alias Reconciliation Gate (RFC-0032::REQ-0164)
 // ============================================================================
 
 /// Maximum observation window size in ticks. Prevents unbounded windows
@@ -631,8 +631,8 @@ pub const MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES: usize =
 /// real `TCK-*` alias-to-`work_id` mappings.
 ///
 /// Real alias bindings require the operator layer or policy resolver to
-/// supply the `ticket_alias` field. See `TODO(TCK-00425)` for the planned
-/// follow-up to wire real aliases through policy resolution.
+/// supply the `ticket_alias` field. See `TODO(RFC-0020::REQ-0044)` for the
+/// planned follow-up to wire real aliases through policy resolution.
 pub trait AliasReconciliationGate: Send + Sync {
     /// Runs alias reconciliation against the current projection state and
     /// returns whether promotion is permitted (zero defects).
@@ -674,7 +674,7 @@ pub trait AliasReconciliationGate: Send + Sync {
     /// work item, `Ok(None)` when no match is found, or `Err` on
     /// infrastructure failure or ambiguous resolution (fail-closed).
     ///
-    /// # TCK-00636: RFC-0032 Phase 1
+    /// # RFC-0032::REQ-0264: RFC-0032 Phase 1
     ///
     /// This method enables `--ticket-alias` -> `work_id` resolution via
     /// projections. The default implementation returns `Ok(None)` for
@@ -711,7 +711,7 @@ pub struct ProjectionAliasReconciliationGate {
 
     /// Optional CAS store for resolving `WorkSpecV1` documents by
     /// `spec_snapshot_hash`. When set, enables CAS-backed ticket alias
-    /// resolution (TCK-00636, RFC-0032 Phase 1).
+    /// resolution (RFC-0032::REQ-0264, RFC-0032 Phase 1).
     cas: Option<Arc<dyn apm2_core::evidence::ContentAddressedStore>>,
 
     /// Bounded in-memory index for `ticket_alias -> work_id` lookups.
@@ -1296,7 +1296,7 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
         let canonical_projections = self.build_canonical_projections()?;
         let mut result = reconcile_aliases(bindings, &canonical_projections, current_tick);
 
-        // TCK-00420 BLOCKER 2 fix: Enforce observation-window staleness in
+        // RFC-0032::REQ-0164 BLOCKER 2 fix: Enforce observation-window staleness in
         // the production promotion path. Without this, bindings with
         // arbitrarily old `observed_at_tick` values would pass reconciliation
         // unchecked, violating REQ-HEF-0017 temporal freshness enforcement.
@@ -1367,8 +1367,8 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
     }
 
     /// Resolves a ticket alias to a canonical `work_id` using the in-memory
-    /// alias index maintained during projection refresh (TCK-00636, RFC-0032
-    /// Phase 1).
+    /// alias index maintained during projection refresh (RFC-0032::REQ-0264,
+    /// RFC-0032 Phase 1).
     ///
     /// # Fail-closed semantics
     ///
@@ -1669,7 +1669,7 @@ mod tests {
     }
 
     // ====================================================================
-    // TCK-00636: Ticket Alias Resolution Tests (RFC-0032 Phase 1)
+    // RFC-0032::REQ-0264: Ticket Alias Resolution Tests (RFC-0032 Phase 1)
     // ====================================================================
 
     /// Creates a `MemoryCas` with a `WorkSpecV1` stored under `spec_hash`,
@@ -1864,14 +1864,14 @@ mod tests {
 
     #[test]
     fn resolve_ticket_alias_returns_stable_work_id() {
-        let (cas, spec_hash) = setup_cas_with_work_spec("W-636-001", Some("TCK-00636"));
+        let (cas, spec_hash) = setup_cas_with_work_spec("W-636-001", Some("RFC-0032::REQ-0264"));
 
         let emitter = make_emitter_with_work(&[("W-636-001", spec_hash.to_vec())]);
 
         let gate = ProjectionAliasReconciliationGate::new(emitter)
             .with_cas(cas as Arc<dyn apm2_core::evidence::ContentAddressedStore>);
 
-        let result = gate.resolve_ticket_alias("TCK-00636");
+        let result = gate.resolve_ticket_alias("RFC-0032::REQ-0264");
         assert_eq!(
             result.expect("should not error"),
             Some("W-636-001".to_string()),
@@ -1879,7 +1879,7 @@ mod tests {
         );
 
         // Deterministic: calling again returns the same result
-        let result2 = gate.resolve_ticket_alias("TCK-00636");
+        let result2 = gate.resolve_ticket_alias("RFC-0032::REQ-0264");
         assert_eq!(
             result2.expect("should not error"),
             Some("W-636-001".to_string()),
@@ -1926,7 +1926,7 @@ mod tests {
         let gate = ProjectionAliasReconciliationGate::new(emitter)
             .with_cas(cas as Arc<dyn apm2_core::evidence::ContentAddressedStore>);
 
-        let result = gate.resolve_ticket_alias("TCK-00636");
+        let result = gate.resolve_ticket_alias("RFC-0032::REQ-0264");
         assert_eq!(
             result.expect("should not error"),
             None,
@@ -1940,7 +1940,7 @@ mod tests {
 
         let gate = ProjectionAliasReconciliationGate::new(emitter);
         // No CAS configured -- should return None, not error
-        let result = gate.resolve_ticket_alias("TCK-00636");
+        let result = gate.resolve_ticket_alias("RFC-0032::REQ-0264");
         assert_eq!(
             result.expect("should not error"),
             None,

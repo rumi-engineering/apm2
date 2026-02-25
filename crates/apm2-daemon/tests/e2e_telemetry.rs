@@ -1,4 +1,4 @@
-//! E2E telemetry tests for TCK-00176.
+//! E2E telemetry tests for RFC-0033::REQ-0042.
 //!
 //! This module tests the full telemetry collection flow including:
 //! - Frames emitted at configured rate
@@ -15,7 +15,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00176: E2E tool and telemetry tests
+//! - RFC-0033::REQ-0042: E2E tool and telemetry tests
 //! - CTR-DAEMON-005: `TelemetryCollector` and frame streaming
 //! - REQ-TEL-001: Telemetry requirements
 

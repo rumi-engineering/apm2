@@ -1,4 +1,4 @@
-//! Reviewer capability manifest definitions (TCK-00317).
+//! Reviewer capability manifest definitions (RFC-0032::REQ-0111).
 //!
 //! This module provides the canonical reviewer v0 capability manifest,
 //! which defines the tool surface available to reviewer agents during
@@ -50,7 +50,7 @@
 //! - RFC-0019 REQ-0002: Capability manifests must be real
 //! - RFC-0019 DEC-0005: CAS-backed manifest storage
 //! - AD-TOOL-002: Capability manifests as sealed references
-//! - TCK-00254: Allowlist enforcement
+//! - RFC-0032::REQ-0070: Allowlist enforcement
 
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -123,17 +123,18 @@ pub fn reviewer_v0_manifest_hash() -> &'static [u8; 32] {
 ///
 /// # Security Invariants
 ///
-/// - [INV-TCK-00317-001] All granted capabilities are read-only
-/// - [INV-TCK-00317-002] Write, Execute, Network, Inference are NOT in
+/// - [INV-RFC-0032::REQ-0111-001] All granted capabilities are read-only
+/// - [INV-RFC-0032::REQ-0111-002] Write, Execute, Network, Inference are NOT in
 ///   allowlist
-/// - [INV-TCK-00317-003] Manifest validates successfully on construction
+/// - [INV-RFC-0032::REQ-0111-003] Manifest validates successfully on
+///   construction
 ///
 /// # Errors
 ///
 /// Returns an error if manifest validation fails (should not happen for
 /// the canonical manifest).
 pub fn build_reviewer_v0_manifest() -> Result<CapabilityManifest, CapabilityError> {
-    // TCK-00352 BLOCKER 2 fix: V1 minting requires a non-zero expiry.
+    // RFC-0020::REQ-0006 BLOCKER 2 fix: V1 minting requires a non-zero expiry.
     // Use a deterministic far-future timestamp (2099-01-01T00:00:00Z)
     // so that the canonical manifest hash remains stable while still
     // satisfying V1 expiry requirements. Without this, V1 minting
@@ -207,7 +208,7 @@ pub fn build_reviewer_v0_manifest_dynamic(
     manifest_id: &str,
     delegator_id: &str,
 ) -> Result<CapabilityManifest, CapabilityError> {
-    // TCK-00352 BLOCKER 2 fix: dynamic manifests also need non-zero
+    // RFC-0020::REQ-0006 BLOCKER 2 fix: dynamic manifests also need non-zero
     // expiry for V1 compatibility. Default to 24 hours from now.
     const DEFAULT_MANIFEST_TTL_SECS: u64 = 86400; // 24 hours
 
@@ -382,7 +383,7 @@ mod tests {
     #[test]
     fn test_reviewer_v0_manifest_has_v1_compatible_expiry() {
         let manifest = reviewer_v0_manifest();
-        // TCK-00352 BLOCKER 2 fix: V1 manifests require non-zero expiry.
+        // RFC-0020::REQ-0006 BLOCKER 2 fix: V1 manifests require non-zero expiry.
         // The canonical reviewer manifest uses a deterministic far-future
         // expiry (2099-01-01 UTC) to ensure V1 minting succeeds.
         assert!(

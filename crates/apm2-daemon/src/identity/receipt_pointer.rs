@@ -10,8 +10,8 @@
 //!   multiple receipt hashes are members of a single batch root. Each receipt
 //!   currently carries its own independent inclusion proof; the compact
 //!   shared-sibling wire shape (`proof_nodes[]` + `proof_structure`) from
-//!   RFC-0020 §9.5.5 is deferred to TCK-00370. Correctness and acceptance
-//!   equivalence take priority.
+//!   RFC-0020 §9.5.5 is deferred to RFC-0020::REQ-0024. Correctness and
+//!   acceptance equivalence take priority.
 //! - [`ReceiptPointerVerifier`]: a unified verifier that accepts both direct
 //!   and batched semantics with equivalent acceptance behavior.
 //!
@@ -43,7 +43,7 @@
 //! implementation uses K independent inclusion proofs (one per receipt).
 //! The compact multiproof optimization (shared-node deduplication via
 //! `proof_nodes[]` + `proof_structure`) that would reduce network fanout
-//! and verifier hashing work is deferred to TCK-00370.
+//! and verifier hashing work is deferred to RFC-0020::REQ-0024.
 //!
 //! # Security Invariants
 //!
@@ -209,7 +209,7 @@ pub enum ReceiptPointerError {
     },
 
     /// The `FactRoot` proof path is not yet supported.
-    #[error("FactRoot proof path is not yet implemented (deferred to TCK-00370)")]
+    #[error("FactRoot proof path is not yet implemented (deferred to RFC-0020::REQ-0024)")]
     FactRootNotImplemented,
 
     /// A direct pointer was verified against a batch seal.
@@ -355,7 +355,7 @@ pub enum PointerKind {
     /// proof proves the receipt hash is a member of that root.
     Batch    = 0x02,
     /// `FactRoot`: BFT-cell path — receipt membership proven via
-    /// `fact_root_proof` + `qc_pointer`. Deferred to TCK-00370.
+    /// `fact_root_proof` + `qc_pointer`. Deferred to RFC-0020::REQ-0024.
     FactRoot = 0x03,
 }
 
@@ -611,8 +611,9 @@ impl ReceiptPointerV1 {
 /// - `individual_proofs[]`: one `MerkleInclusionProof` per receipt
 ///
 /// Target compact wire shape (`proof_nodes[]` + `proof_structure`) is
-/// deferred to TCK-00370.
-// TODO(TCK-00370): Implement compact shared-sibling multiproof wire shape per RFC-0020 §9.5.5.
+/// deferred to RFC-0020::REQ-0024.
+// TODO(RFC-0020::REQ-0024): Implement compact shared-sibling multiproof wire shape per RFC-0020
+// §9.5.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptMultiProofV1 {
     /// The batch Merkle root hash being proven against.
@@ -1686,7 +1687,7 @@ impl ReceiptPointerVerifier {
                 fallback,
                 overhead_policy,
             ),
-            // TODO(TCK-00370): Route to FactRootVerifier once daemon-side
+            // TODO(RFC-0020::REQ-0024): Route to FactRootVerifier once daemon-side
             // integration lands. For now, return the existing error so callers
             // know this path is not yet wired up.
             PointerKind::FactRoot => Err(ReceiptPointerError::FactRootNotImplemented),

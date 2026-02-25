@@ -331,7 +331,7 @@ impl WorkerOrchestrator {
             },
         };
 
-        // Step 0: Index-first duplicate detection (TCK-00560).
+        // Step 0: Index-first duplicate detection (RFC-0032::REQ-0213).
         //
         // Check the receipt index to see if a receipt already exists for this
         // job_id. This avoids redundant processing of already-completed jobs
@@ -340,7 +340,7 @@ impl WorkerOrchestrator {
         // When a duplicate is detected, the pending file is moved to the correct
         // terminal directory based on the receipt outcome (completed, denied,
         // cancelled, quarantine). This is outcome-aware to prevent denied jobs
-        // from being routed to completed/ (TCK-00564 MAJOR-1 fix round 4).
+        // from being routed to completed/ (RFC-0032::REQ-0215 MAJOR-1 fix round 4).
         let spec = &candidate.spec;
         let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
         if let Some(existing_receipt) =
@@ -393,7 +393,7 @@ impl WorkerOrchestrator {
         // instead of re-computing it in every denial path.
         let sbx_hash = policy.sandbox_hardening.content_hash_hex();
 
-        // TCK-00574 MAJOR-2 fix: Resolve the network policy hash immediately
+        // RFC-0032::REQ-0224 MAJOR-2 fix: Resolve the network policy hash immediately
         // using spec.kind (always available since spec is parsed before
         // the step pipeline runs). This ensures ALL receipt commits — including
         // early post-parse denial paths — use the correct resolved hash for the
@@ -403,7 +403,7 @@ impl WorkerOrchestrator {
             apm2_core::fac::resolve_network_policy(&spec.kind, policy.network_policy.as_ref())
                 .content_hash_hex();
 
-        // TCK-00622 S8: SHA-level gates dedupe.
+        // RFC-0032::REQ-0254 S8: SHA-level gates dedupe.
         //
         // For `gates` jobs, deny duplicate submissions when a completed receipt
         // already exists for the same `(repo_id, head_sha)` AND the same
@@ -524,7 +524,7 @@ impl WorkerOrchestrator {
             let reason_code = match e {
                 JobSpecError::MissingToken { .. } => DenialReasonCode::MissingChannelToken,
                 JobSpecError::InvalidDigest { .. } => DenialReasonCode::MalformedSpec,
-                // TCK-00579: Policy-specific variants map to PolicyViolation
+                // RFC-0032::REQ-0229: Policy-specific variants map to PolicyViolation
                 // for distinct audit signal and automated triage.
                 JobSpecError::DisallowedRepoId { .. }
                 | JobSpecError::DisallowedBytesBackend { .. }
@@ -567,7 +567,7 @@ impl WorkerOrchestrator {
             return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
         }
 
-        // TCK-00587: Control-lane stop_revoke with RFC-0028 token enforcement.
+        // RFC-0032::REQ-0237: Control-lane stop_revoke with RFC-0028 token enforcement.
         //
         // Control-lane stop_revoke jobs enforce a dual-layer authorization:
         // 1. RFC-0028 token validation (signing key proof)
@@ -870,7 +870,7 @@ impl WorkerOrchestrator {
                 return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
             }
 
-            // TCK-00587: Construct stop/revoke admission trace from real
+            // RFC-0032::REQ-0237: Construct stop/revoke admission trace from real
             // runtime state. Each field is derived from actual admission
             // predicates and queue state — no hardcoded constants.
             let sr_policy =
@@ -933,11 +933,11 @@ impl WorkerOrchestrator {
             ));
         }
 
-        // Step 2.5: Enforce admitted policy binding (INV-PADOPT-004, TCK-00561).
-        // Workers MUST fail-closed when the actuation token's policy binding
-        // does not match the admitted digest. This prevents policy drift where
-        // tokens issued under an old policy continue to authorize actuation
-        // after a new policy has been adopted.
+        // Step 2.5: Enforce admitted policy binding (INV-PADOPT-004,
+        // RFC-0032::REQ-0214). Workers MUST fail-closed when the actuation
+        // token's policy binding does not match the admitted digest. This
+        // prevents policy drift where tokens issued under an old policy
+        // continue to authorize actuation after a new policy has been adopted.
         if !apm2_core::fac::is_policy_hash_admitted(fac_root, policy_hash) {
             let reason = format!(
                 "policy hash not admitted (INV-PADOPT-004): worker policy_hash={policy_hash} is not \
@@ -977,7 +977,7 @@ impl WorkerOrchestrator {
         }
 
         // Step 2.6: Enforce admitted economics profile binding (INV-EADOPT-004,
-        // TCK-00584). Workers MUST fail-closed when the policy's economics
+        // RFC-0032::REQ-0234). Workers MUST fail-closed when the policy's economics
         // profile hash does not match the broker-admitted economics profile
         // digest. This prevents economics drift where profiles from an old
         // policy continue to authorize budget decisions after a new economics
@@ -1113,7 +1113,7 @@ impl WorkerOrchestrator {
         // Use monotonic wall-clock seconds for token temporal validation.
         let current_time_secs = current_timestamp_epoch_secs();
 
-        // TCK-00565: Build expected token binding for fail-closed validation.
+        // RFC-0032::REQ-0216: Build expected token binding for fail-closed validation.
         // Parse the canonicalizer tuple digest from the b3-256 hex string to raw bytes.
         // Fail-closed: if the digest cannot be parsed, deny the job immediately —
         // never fall through with None (which would skip token binding validation).
@@ -1154,7 +1154,7 @@ impl WorkerOrchestrator {
             }
             return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
         };
-        // TCK-00567: Derive expected intent from job kind for intent-binding
+        // RFC-0032::REQ-0218: Derive expected intent from job kind for intent-binding
         // verification.  The worker denies if the token intent does not match
         // the job kind (fail-closed).  Unknown job kinds produce None from
         // job_kind_to_intent — treat as hard denial to prevent fail-open bypass.
@@ -1372,8 +1372,8 @@ impl WorkerOrchestrator {
 
         // Validate boundary check defects.
         let defects = validate_channel_boundary(&boundary_check);
-        // TCK-00565: Include decoded token binding in the boundary trace for receipt
-        // audit.
+        // RFC-0032::REQ-0216: Include decoded token binding in the boundary trace for
+        // receipt audit.
         let boundary_trace = build_channel_boundary_trace_with_binding(
             &defects,
             boundary_check.token_binding.as_ref(),
@@ -1423,7 +1423,7 @@ impl WorkerOrchestrator {
             return IdlePhaseOutcome::Done(JobOutcome::Denied { reason });
         }
 
-        // TCK-00566: Token replay protection — validate nonce and record use.
+        // RFC-0032::REQ-0217: Token replay protection — validate nonce and record use.
         //
         // After the token is decoded and boundary defects are checked, extract
         // the nonce from the token binding and validate it against the broker's
@@ -1823,7 +1823,7 @@ impl WorkerOrchestrator {
         // job is committed to denied/ via pipeline.
         if let Err(e) = consume_authority(queue_root, &spec.job_id, &spec.job_spec_digest) {
             let reason = format!("PCAC consume failed: {e}");
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -1903,7 +1903,7 @@ impl WorkerOrchestrator {
         // Avoid acquiring a second worker lane here: `fac gates` already uses its
         // own lane lock/containment strategy for heavy phases.
         if spec.kind == "gates" {
-            // TCK-00574 MAJOR-2: Use the resolved net hash computed at the top
+            // RFC-0032::REQ-0224 MAJOR-2: Use the resolved net hash computed at the top
             // of the execution path (same resolve_network_policy call, now deduplicated).
             let gates_outcome = execute_queued_gates_job(
                 spec,
@@ -2028,7 +2028,7 @@ impl WorkerOrchestrator {
             u64::from(policy.denied_ttl_days).saturating_mul(86400),
         ) {
             let reason = format!("preflight failed: {error:?}");
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2072,7 +2072,7 @@ impl WorkerOrchestrator {
             Ok(profile) => profile,
             Err(e) => {
                 let reason = format!("lane profile load failed for {acquired_lane_id}: {e}");
-                // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
                 if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
@@ -2109,7 +2109,7 @@ impl WorkerOrchestrator {
             },
         };
 
-        // Resolve network policy for this job kind (TCK-00574).
+        // Resolve network policy for this job kind (RFC-0032::REQ-0224).
         // The hash was already computed at the top of the idle phase
         // (resolved_net_hash). We still need the full NetworkPolicy struct here
         // for SystemdUnitProperties.
@@ -2144,9 +2144,10 @@ impl WorkerOrchestrator {
             .compute_hash()
             .unwrap_or_else(|_| "b3-256:unknown".to_string());
 
-        // TCK-00538: Use toolchain fingerprint from worker startup for lane lease.
-        // Worker startup is fail-closed (refuses to start without fingerprint), so
-        // this should always be Some. The unwrap_or is defensive only.
+        // RFC-0032::REQ-0194: Use toolchain fingerprint from worker startup for lane
+        // lease. Worker startup is fail-closed (refuses to start without
+        // fingerprint), so this should always be Some. The unwrap_or is
+        // defensive only.
         let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
         let lane_lease = match build_running_lane_lease(
             &acquired_lane_id,
@@ -2158,7 +2159,7 @@ impl WorkerOrchestrator {
             Ok(lease) => lease,
             Err(e) => {
                 let reason = format!("failed to create lane lease: {e}");
-                // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+                // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
                 if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                     fac_root,
                     queue_root,
@@ -2196,7 +2197,7 @@ impl WorkerOrchestrator {
         };
         if let Err(e) = lane_lease.persist(&lane_dir) {
             let reason = format!("failed to persist lane lease: {e}");
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2346,7 +2347,7 @@ impl WorkerOrchestrator {
         }
 
         let mut patch_digest: Option<String> = None;
-        // TCK-00546: Track which bytes_backend was used for receipt binding.
+        // RFC-0032::REQ-0201: Track which bytes_backend was used for receipt binding.
         let mut resolved_bytes_backend: Option<String> = None;
         // the orchestrator executes one job at a time in a single worker lane, so
         // blocking mirror I/O is intentionally accepted in this default-mode
@@ -2359,7 +2360,7 @@ impl WorkerOrchestrator {
         {
             let reason = format!("mirror ensure failed: {e}");
             let _ = LaneLeaseV1::remove(&lane_dir);
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2419,7 +2420,7 @@ impl WorkerOrchestrator {
                 // Lane is already marked CORRUPT by execute_lane_cleanup on
                 // failure.
             }
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2485,7 +2486,7 @@ impl WorkerOrchestrator {
                 // failure. The denial receipt is still emitted below so
                 // the job has a terminal receipt.
             }
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2533,7 +2534,7 @@ impl WorkerOrchestrator {
                 return deny_with_reason_and_lease_cleanup(patch_missing_error);
             };
 
-            // TCK-00546: Branch on `bytes_backend` to resolve patch bytes.
+            // RFC-0032::REQ-0201: Branch on `bytes_backend` to resolve patch bytes.
             let bytes_backend = patch_obj.get("bytes_backend").and_then(|v| v.as_str());
             // MINOR-1 fix: Capture resolved_bytes_backend immediately at
             // deserialization time so both success and failure receipts carry
@@ -2665,7 +2666,7 @@ impl WorkerOrchestrator {
             ) {
                 Ok((outcome, _receipt)) => outcome,
                 Err(apm2_core::fac::RepoMirrorError::PatchHardeningDenied { reason, receipt }) => {
-                    // TCK-00581: Map PatchHardeningDenied to explicit denial
+                    // RFC-0032::REQ-0231: Map PatchHardeningDenied to explicit denial
                     // with receipt metadata in the reason string for audit.
                     let receipt_hash = receipt.content_hash_hex();
                     let denial_reason =
@@ -2774,7 +2775,7 @@ impl WorkerOrchestrator {
                 // Lane is already marked CORRUPT by execute_lane_cleanup on
                 // failure.
             }
-            // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+            // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
             if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
                 fac_root,
                 queue_root,
@@ -2810,17 +2811,17 @@ impl WorkerOrchestrator {
             return JobOutcome::Denied { reason };
         }
 
-        // Step 8: Containment verification (TCK-00548 BLOCKER-1).
+        // Step 8: Containment verification (RFC-0032::REQ-0203 BLOCKER-1).
         //
         // Verify that the worker's process tree is contained within the
         // expected cgroup hierarchy. This uses the current process PID as
         // the reference because the default-mode worker validates the job
         // spec in-process (no subprocess spawning yet).
         //
-        // TCK-00553: sccache activation is policy-gated.
+        // RFC-0032::REQ-0208: sccache activation is policy-gated.
         let sccache_active = policy.sccache_enabled;
 
-        // TCK-00554: Build sccache env for server lifecycle management.
+        // RFC-0032::REQ-0209: Build sccache env for server lifecycle management.
         // Defined before the containment match so it's accessible for both
         // the server containment protocol and the stop call at unit end.
         //
@@ -2865,14 +2866,14 @@ impl WorkerOrchestrator {
                         verdict.mismatches.len()
                     ));
                 }
-                // TCK-00553: Probe sccache version when policy enables it.
+                // RFC-0032::REQ-0208: Probe sccache version when policy enables it.
                 let sccache_version = if policy.sccache_enabled {
                     apm2_core::fac::containment::probe_sccache_version()
                 } else {
                     None
                 };
 
-                // TCK-00554: Execute sccache server containment protocol.
+                // RFC-0032::REQ-0209: Execute sccache server containment protocol.
                 //
                 // When the policy enables sccache, verify that the sccache
                 // server is inside the unit cgroup. If a pre-existing server
@@ -2931,13 +2932,13 @@ impl WorkerOrchestrator {
             },
         };
 
-        // Step 8b: Handle warm jobs (TCK-00525).
+        // Step 8b: Handle warm jobs (RFC-0032::REQ-0184).
         //
         // Warm jobs execute warm phases (fetch/build/nextest/clippy/doc) using the
         // lane workspace and lane-managed CARGO_HOME/CARGO_TARGET_DIR. The warm
         // receipt is persisted to the FAC receipts directory alongside the job receipt.
         if spec.kind == "warm" {
-            // TCK-00554 BLOCKER-1 fix: Derive effective sccache enablement from
+            // RFC-0032::REQ-0209 BLOCKER-1 fix: Derive effective sccache enablement from
             // server containment protocol result. If the containment protocol
             // auto-disabled sccache, the warm execution environment MUST NOT
             // inject RUSTC_WRAPPER/SCCACHE_* — even though `policy.sccache_enabled`
@@ -2981,7 +2982,7 @@ impl WorkerOrchestrator {
                 effective_sccache_enabled,
             );
 
-            // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
+            // RFC-0032::REQ-0209: Stop sccache server at unit end (INV-CONTAIN-011).
             // MINOR-1 fix: Gate shutdown on ownership — only stop the server if
             // this unit started one or verified a pre-existing in-cgroup server.
             // This prevents one lane from terminating a shared sccache server
@@ -3019,13 +3020,14 @@ impl WorkerOrchestrator {
 
         let observed_cost = observed_cost_from_elapsed(job_wall_start.elapsed());
 
-        // TCK-00564 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
+        // RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
         // This ensures receipt persistence, index update, and job move happen
         // in a crash-safe order via a single ReceiptWritePipeline::commit() call.
         // Persist the gate receipt alongside the completed job (before atomic commit).
         write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
 
-        // TCK-00538: Include toolchain fingerprint in the completed job receipt.
+        // RFC-0032::REQ-0194: Include toolchain fingerprint in the completed job
+        // receipt.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,
@@ -3047,7 +3049,7 @@ impl WorkerOrchestrator {
             Some(&sbx_hash),
             Some(&resolved_net_hash),
             None,                              // stop_revoke_admission
-            resolved_bytes_backend.as_deref(), // TCK-00546: bytes_backend
+            resolved_bytes_backend.as_deref(), // RFC-0032::REQ-0201: bytes_backend
             toolchain_fingerprint,
         ) {
             eprintln!("worker: pipeline commit failed, cannot complete job: {commit_err}");
@@ -3062,7 +3064,7 @@ impl WorkerOrchestrator {
             ) {
                 eprintln!("worker: WARNING: failed to return claimed job to pending: {move_err}");
             }
-            // TCK-00554 MINOR-1 fix: Stop sccache server on early-return path.
+            // RFC-0032::REQ-0209 MINOR-1 fix: Stop sccache server on early-return path.
             // The containment protocol may have started a server; failing to stop
             // it here would leak a daemon beyond the unit lifecycle, violating
             // INV-CONTAIN-011.
@@ -3100,7 +3102,7 @@ impl WorkerOrchestrator {
             // successful execution.
         }
 
-        // TCK-00554: Stop sccache server at unit end (INV-CONTAIN-011).
+        // RFC-0032::REQ-0209: Stop sccache server at unit end (INV-CONTAIN-011).
         // MINOR-1 fix: Gate shutdown on ownership — only stop the server if
         // this unit started one or verified a pre-existing in-cgroup server.
         // This prevents one lane from terminating a shared sccache server

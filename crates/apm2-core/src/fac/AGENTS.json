@@ -1,0 +1,216 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/fac",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-FAC-001",
+      "kind": "safety",
+      "title": "Broker signing key never exposed outside the broker process boundary",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-002",
+      "kind": "invariant",
+      "title": "All issued tokens and envelopes are Ed25519-signed with the broker key",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-003",
+      "kind": "safety",
+      "title": "Fail-closed: missing, stale, or ambiguous authority state results in denial",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-004",
+      "kind": "invariant",
+      "title": "All in-memory collections bounded by hard MAX caps (policies=256, receipts=64)",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-005",
+      "kind": "invariant",
+      "title": "Broker state persistence uses atomic write (temp+rename)",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-006",
+      "kind": "safety",
+      "title": "deserialize_state() enforces 1 MiB I/O limit before JSON parsing to prevent OOM",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-007",
+      "kind": "safety",
+      "title": "Health gate is mandatory precondition for token issuance; defaults to false",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-008",
+      "kind": "safety",
+      "title": "Default BrokerHealthStatus is Failed (fail-closed); missing health state denies",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-009",
+      "kind": "invariant",
+      "title": "Health receipts are Ed25519-signed; workers verify signature before trusting status",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-010",
+      "kind": "invariant",
+      "title": "HealthReceiptV1 verify() recomputes canonical hash and constant-time compares",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-011",
+      "kind": "safety",
+      "title": "Scheduler state: corrupt/oversize/schema-mismatched state treated as reconstruction",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-012",
+      "kind": "invariant",
+      "title": "Scheduler persistence uses atomic durability (temp-file + rename)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-013",
+      "kind": "safety",
+      "title": "Token replay protection: every nonce registered at issuance; second use denied",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-014",
+      "kind": "invariant",
+      "title": "Token ledger bounded by MAX_LEDGER_ENTRIES (16384); expired entries evicted first",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-015",
+      "kind": "safety",
+      "title": "Revoked tokens denied even if not expired; revocation check precedes replay check",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-016",
+      "kind": "safety",
+      "title": "Token ledger persistence is fail-closed: load errors are hard security faults",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-017",
+      "kind": "invariant",
+      "title": "WAL entries appended with fsync; worker MUST persist before job execution begins",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-018",
+      "kind": "safety",
+      "title": "Queue bounds: fail-closed on unreadable pending directory; zero limits deny all",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-019",
+      "kind": "safety",
+      "title": "Directory scan bounded by MAX_SCAN_ENTRIES; truncated scans deny fail-closed",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-020",
+      "kind": "safety",
+      "title": "Projection divergence detection uses constant-time digest comparison",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-021",
+      "kind": "safety",
+      "title": "safe_rmtree: symlink detected at any depth causes immediate abort via O_NOFOLLOW",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-022",
+      "kind": "safety",
+      "title": "safe_rmtree: root must be strictly under allowed_parent by component-wise validation",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-023",
+      "kind": "safety",
+      "title": "safe_rmtree: cross-filesystem deletion refused by st_dev comparison via fstat",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-024",
+      "kind": "safety",
+      "title": "CORRUPT lane is never leased; worker checks marker on each poll iteration",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-025",
+      "kind": "invariant",
+      "title": "Cleanup failure must persist LaneCorruptMarkerV1 before transitioning to Corrupt",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-026",
+      "kind": "safety",
+      "title": "Git hardening: after hardening, no repository-shipped hook can execute",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-027",
+      "kind": "safety",
+      "title": "Control-plane budget: counters advance only after successful admission check",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-028",
+      "kind": "safety",
+      "title": "Control-plane budget: zero limits deny all operations immediately (fail-closed)",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-029",
+      "kind": "safety",
+      "title": "Evidence bundle import refuses when boundary check returns non-tolerated defects",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-030",
+      "kind": "invariant",
+      "title": "Envelope content hash uses canonical_bytes_v2 binding ALL receipt fields",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CORE-FAC-031",
+      "kind": "safety",
+      "title": "Default-deny environment: ambient variables not inherited unless allowlisted",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-032",
+      "kind": "safety",
+      "title": "RUSTC_WRAPPER and SCCACHE_* unconditionally stripped regardless of policy config",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-033",
+      "kind": "safety",
+      "title": "Scan lock files use O_NOFOLLOW to prevent symlink attacks atomically",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-FAC-034",
+      "kind": "invariant",
+      "title": "health_seq monotonically increasing; advances on every health check invocation",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-035",
+      "kind": "safety",
+      "title": "health_seq uses checked_add; overflow persists synthetic FAILED receipt (terminal)",
+      "rfc": ["RFC-0029"]
+    }
+  ]
+}

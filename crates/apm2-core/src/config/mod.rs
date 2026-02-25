@@ -77,7 +77,7 @@ impl EcosystemConfig {
             .adapter_rotation
             .validate()
             .map_err(ConfigError::Validation)?;
-        // TCK-00507: Validate projection sink profiles at startup.
+        // RFC-0033::REQ-0065: Validate projection sink profiles at startup.
         // Invalid trusted signer keys must prevent daemon start, not
         // silently produce DENY at runtime.
         config
@@ -99,8 +99,9 @@ impl EcosystemConfig {
 
     /// Build a default config with environment-based auto-detection.
     ///
-    /// TCK-00595: Enables config-less startup for the CLI layer. When no
-    /// `ecosystem.toml` exists, this method constructs a usable config by:
+    /// RFC-0032::REQ-0244: Enables config-less startup for the CLI layer. When
+    /// no `ecosystem.toml` exists, this method constructs a usable config
+    /// by:
     ///
     /// 1. Using XDG-standard default paths for all daemon paths.
     /// 2. Auto-detecting GitHub owner/repo from `git remote get-url origin`.
@@ -127,8 +128,8 @@ impl EcosystemConfig {
         // Detect GitHub owner/repo from CWD git remote
         let github_coords = crate::github::detect_github_owner_repo_from_cwd();
 
-        // Check for GitHub token via unified resolution chain (TCK-00595 MAJOR FIX):
-        // env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
+        // Check for GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR
+        // FIX): env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
         // $APM2_HOME/private/creds/gh-token
         let github_token_env = if resolve_github_token("GITHUB_TOKEN").is_some() {
             Some("GITHUB_TOKEN".to_string())
@@ -159,14 +160,14 @@ pub struct DaemonConfig {
 
     /// Path to the operator socket (mode 0600, privileged operations).
     ///
-    /// Added in TCK-00249 for dual-socket privilege separation.
+    /// Added in RFC-0032::REQ-0065 for dual-socket privilege separation.
     /// Optional in config files; defaults to an XDG-aware runtime path.
     #[serde(default = "default_operator_socket")]
     pub operator_socket: PathBuf,
 
     /// Path to the session socket (mode 0660, session-scoped operations).
     ///
-    /// Added in TCK-00249 for dual-socket privilege separation.
+    /// Added in RFC-0032::REQ-0065 for dual-socket privilege separation.
     /// Optional in config files; defaults to an XDG-aware runtime path.
     #[serde(default = "default_session_socket")]
     pub session_socket: PathBuf,
@@ -190,13 +191,14 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub audit: AuditConfig,
 
-    /// Projection worker configuration (TCK-00322).
+    /// Projection worker configuration (RFC-0032::REQ-0116).
     ///
     /// Controls the projection worker that posts review results to GitHub.
     #[serde(default)]
     pub projection: ProjectionConfig,
 
-    /// Path to durable content-addressed storage (CAS) directory (TCK-00383).
+    /// Path to durable content-addressed storage (CAS) directory
+    /// (RFC-0032::REQ-0137).
     ///
     /// When provided alongside a ledger database, the daemon uses
     /// `with_persistence_and_cas()` to wire the session dispatcher with
@@ -209,7 +211,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub cas_path: Option<PathBuf>,
 
-    /// Divergence watchdog configuration (TCK-00393).
+    /// Divergence watchdog configuration (RFC-0032::REQ-0147).
     ///
     /// Controls the background watchdog that polls the external trunk HEAD
     /// and compares it against the ledger's `MergeReceipt` HEAD. When
@@ -218,7 +220,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub divergence_watchdog: DivergenceWatchdogSection,
 
-    /// Adapter profile rotation policy (TCK-00400).
+    /// Adapter profile rotation policy (RFC-0032::REQ-0152).
     ///
     /// Defines weighted profile selection and rate-limit backoff behavior for
     /// `SpawnEpisode` when no explicit `adapter_profile_hash` is provided.
@@ -226,7 +228,7 @@ pub struct DaemonConfig {
     pub adapter_rotation: AdapterRotationConfig,
 }
 
-/// Adapter profile rotation configuration (TCK-00400).
+/// Adapter profile rotation configuration (RFC-0032::REQ-0152).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterRotationConfig {
@@ -336,7 +338,7 @@ fn default_adapter_rotation_profiles() -> Vec<AdapterRotationProfileConfig> {
     ]
 }
 
-/// Adapter rotation selection strategy (TCK-00400).
+/// Adapter rotation selection strategy (RFC-0032::REQ-0152).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterRotationStrategyConfig {
@@ -363,7 +365,7 @@ pub struct AdapterRotationProfileConfig {
     pub fallback_priority: u32,
 }
 
-/// Projection worker configuration (TCK-00322).
+/// Projection worker configuration (RFC-0032::REQ-0116).
 ///
 /// Controls the projection worker that posts review results to GitHub.
 /// Disabled by default; enable by setting `enabled = true` and providing
@@ -393,7 +395,8 @@ pub struct ProjectionConfig {
     /// e.g., `$GITHUB_TOKEN` or use a credential profile.
     ///
     /// **Required when `enabled = true`**: Missing token is a fatal error
-    /// to prevent fail-open security issues (TCK-00322 security review).
+    /// to prevent fail-open security issues (RFC-0032::REQ-0116 security
+    /// review).
     #[serde(default)]
     pub github_token_env: Option<String>,
 
@@ -407,9 +410,9 @@ pub struct ProjectionConfig {
 
     /// Path to persistent signer key file for projection receipts.
     ///
-    /// TCK-00322 BLOCKER FIX: The projection worker requires a persistent
-    /// signing key to ensure receipt signatures remain valid across daemon
-    /// restarts. If not specified, defaults to
+    /// RFC-0032::REQ-0116 BLOCKER FIX: The projection worker requires a
+    /// persistent signing key to ensure receipt signatures remain valid
+    /// across daemon restarts. If not specified, defaults to
     /// `{state_file_dir}/projection_signer.key`.
     ///
     /// The key file contains the 32-byte Ed25519 secret key. It is created
@@ -418,7 +421,7 @@ pub struct ProjectionConfig {
     pub signer_key_file: Option<PathBuf>,
 
     /// Per-sink continuity profiles for economics gate input assembly
-    /// (TCK-00507).
+    /// (RFC-0033::REQ-0065).
     ///
     /// Maps sink identifiers to their continuity parameters. Each sink
     /// profile declares outage/replay windows, churn/partition tolerance,
@@ -444,7 +447,7 @@ pub const MAX_TRUSTED_SIGNERS_PER_SINK: usize = 32;
 pub const MAX_SINK_ID_CONFIG_LENGTH: usize =
     crate::economics::projection_continuity::MAX_SINK_ID_LENGTH;
 
-/// Per-sink continuity profile configuration (TCK-00507).
+/// Per-sink continuity profile configuration (RFC-0033::REQ-0065).
 ///
 /// Defines the continuity parameters for a single projection sink.
 /// These values map directly to economics module input types
@@ -505,7 +508,7 @@ pub struct ProjectionSinkProfileConfig {
 }
 
 impl ProjectionConfig {
-    /// Validates all configured sink profiles at startup (TCK-00507).
+    /// Validates all configured sink profiles at startup (RFC-0033::REQ-0065).
     ///
     /// Enforces:
     /// - Sink count within [`MAX_PROJECTION_SINKS`].
@@ -521,7 +524,7 @@ impl ProjectionConfig {
     /// Invalid keys prevent daemon startup (fail-closed).
     pub fn validate_sink_profiles(&self) -> Result<(), String> {
         let sink_count = self.sinks.len();
-        // TCK-00502 MAJOR fix: enforce minimum 2 sinks at startup to match
+        // RFC-0032::REQ-0177 MAJOR fix: enforce minimum 2 sinks at startup to match
         // the economics gate runtime requirement (REQ-0009 multi-sink
         // continuity requires >= 2 distinct sinks). A single-sink config
         // passes startup validation but is deterministically denied at
@@ -650,7 +653,7 @@ impl Default for DaemonConfig {
     }
 }
 
-/// Divergence watchdog configuration (TCK-00393).
+/// Divergence watchdog configuration (RFC-0032::REQ-0147).
 ///
 /// Controls the background task that polls the external trunk HEAD and
 /// compares it against the ledger's `MergeReceipt` HEAD. When divergence
@@ -698,10 +701,10 @@ pub struct DivergenceWatchdogSection {
 impl DivergenceWatchdogSection {
     /// Validate startup prerequisites for the divergence watchdog.
     ///
-    /// TCK-00408: When the watchdog is enabled, a ledger database is mandatory.
-    /// The watchdog is a security control; allowing it to be enabled without
-    /// its required ledger database would silently disable divergence
-    /// detection, violating fail-closed posture.
+    /// RFC-0032::REQ-0156: When the watchdog is enabled, a ledger database is
+    /// mandatory. The watchdog is a security control; allowing it to be
+    /// enabled without its required ledger database would silently disable
+    /// divergence detection, violating fail-closed posture.
     ///
     /// `has_ledger_db` indicates whether a ledger database path was configured.
     ///
@@ -1037,7 +1040,8 @@ pub(crate) enum ResolvedGitHubTokenSource {
     Apm2CredentialFile,
 }
 
-/// Resolve a GitHub token value from available sources (TCK-00595 MAJOR FIX).
+/// Resolve a GitHub token value from available sources (RFC-0032::REQ-0244
+/// MAJOR FIX).
 ///
 /// Resolution order:
 /// 1. Environment variable named by `env_var_name` (e.g., `GITHUB_TOKEN`).
@@ -1314,7 +1318,8 @@ mod tests {
         assert_eq!(config.processes.len(), 1);
     }
 
-    /// TCK-00620: missing socket fields are auto-filled from runtime defaults.
+    /// RFC-0032::REQ-0253: missing socket fields are auto-filled from runtime
+    /// defaults.
     #[test]
     fn config_missing_socket_fields_uses_defaults() {
         let toml = r#"
@@ -1431,9 +1436,10 @@ mod tests {
         assert!(matches!(err, ConfigError::Validation(_)));
     }
 
-    /// TCK-00502 MAJOR fix: validates that `validate_sink_profiles()` rejects
-    /// a single-sink configuration at startup, matching the economics gate
-    /// runtime requirement of >= 2 distinct sinks (REQ-0009).
+    /// RFC-0032::REQ-0177 MAJOR fix: validates that `validate_sink_profiles()`
+    /// rejects a single-sink configuration at startup, matching the
+    /// economics gate runtime requirement of >= 2 distinct sinks
+    /// (REQ-0009).
     #[test]
     fn test_validate_sink_profiles_rejects_single_sink() {
         let mut projection = ProjectionConfig::default();
@@ -1462,7 +1468,7 @@ mod tests {
         );
     }
 
-    /// TCK-00502: validates that `validate_sink_profiles()` accepts a
+    /// RFC-0032::REQ-0177: validates that `validate_sink_profiles()` accepts a
     /// two-sink configuration.
     #[test]
     fn test_validate_sink_profiles_accepts_two_sinks() {
@@ -1488,7 +1494,7 @@ mod tests {
         );
     }
 
-    /// TCK-00502: validates that empty sinks configuration is accepted
+    /// RFC-0032::REQ-0177: validates that empty sinks configuration is accepted
     /// (no projection configured is a valid deployment).
     #[test]
     fn test_validate_sink_profiles_accepts_empty_sinks() {
@@ -1500,7 +1506,8 @@ mod tests {
         );
     }
 
-    /// TCK-00595: `from_env()` produces a valid default config with XDG paths.
+    /// RFC-0032::REQ-0244: `from_env()` produces a valid default config with
+    /// XDG paths.
     #[test]
     fn test_from_env_produces_defaults() {
         // from_env() should never panic regardless of environment state.
@@ -1516,7 +1523,7 @@ mod tests {
         );
     }
 
-    /// TCK-00595 MAJOR FIX: `resolve_github_token` does not panic when
+    /// RFC-0032::REQ-0244 MAJOR FIX: `resolve_github_token` does not panic when
     /// called with any env var name, including ones that do not exist.
     #[test]
     fn test_resolve_github_token_no_panic_on_missing_var() {
@@ -1529,7 +1536,7 @@ mod tests {
         let _ = result;
     }
 
-    /// TCK-00595 MAJOR FIX: `resolve_github_token` returns the env var
+    /// RFC-0032::REQ-0244 MAJOR FIX: `resolve_github_token` returns the env var
     /// value when the env var is set (tested via a known-set variable).
     #[test]
     fn test_resolve_github_token_reads_env_var() {
@@ -1543,7 +1550,7 @@ mod tests {
         );
     }
 
-    /// TCK-00596: source-aware token resolution reports env source.
+    /// RFC-0032::REQ-0245: source-aware token resolution reports env source.
     #[test]
     fn test_resolve_github_token_with_source_reports_env_var() {
         let result = super::resolve_github_token_with_source("PATH");
@@ -1553,7 +1560,7 @@ mod tests {
         ));
     }
 
-    /// TCK-00595 SECURITY BLOCKER FIX: `resolve_github_token` returns
+    /// RFC-0032::REQ-0244 SECURITY BLOCKER FIX: `resolve_github_token` returns
     /// `SecretString` so tokens are not leaked via Debug/Display.
     #[test]
     fn test_resolve_github_token_returns_secret_string() {
@@ -1573,7 +1580,7 @@ mod tests {
         }
     }
 
-    /// TCK-00595 SECURITY BLOCKER FIX: `read_credential_file_bounded`
+    /// RFC-0032::REQ-0244 SECURITY BLOCKER FIX: `read_credential_file_bounded`
     /// rejects files larger than `MAX_CREDENTIAL_FILE_SIZE`.
     #[test]
     fn test_read_credential_file_bounded_rejects_oversize() {
@@ -1590,7 +1597,7 @@ mod tests {
         );
     }
 
-    /// TCK-00595 SECURITY BLOCKER FIX: `read_credential_file_bounded`
+    /// RFC-0032::REQ-0244 SECURITY BLOCKER FIX: `read_credential_file_bounded`
     /// rejects symlinks (on Unix, via `O_NOFOLLOW`).
     #[cfg(unix)]
     #[test]
@@ -1606,8 +1613,8 @@ mod tests {
         );
     }
 
-    /// TCK-00595 SECURITY FIX: `read_credential_file_bounded` reads valid
-    /// credential files that are within the size bound.
+    /// RFC-0032::REQ-0244 SECURITY FIX: `read_credential_file_bounded` reads
+    /// valid credential files that are within the size bound.
     #[test]
     fn test_read_credential_file_bounded_reads_valid_file() {
         use secrecy::ExposeSecret;

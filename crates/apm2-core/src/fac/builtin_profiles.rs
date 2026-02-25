@@ -870,10 +870,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00330: Comprehensive Conformance Tests for AgentAdapterProfileV1
+    // RFC-0032::REQ-0123: Comprehensive Conformance Tests for AgentAdapterProfileV1
     // =========================================================================
 
-    /// Test module for profile conformance testing per TCK-00330.
+    /// Test module for profile conformance testing per RFC-0032::REQ-0123.
     ///
     /// These tests verify that each profile:
     /// 1. Can be instantiated correctly

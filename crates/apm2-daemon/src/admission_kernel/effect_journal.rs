@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! Effect execution journal for crash-safe effect tracking
-//! (RFC-0019 REQ-0029, TCK-00501).
+//! (RFC-0019 REQ-0029, RFC-0032::REQ-0176).
 //!
 //! # Design
 //!
@@ -900,7 +900,7 @@ impl FileBackedEffectJournal {
             let mut pending_error: Option<(usize, u64, String)> = None;
 
             loop {
-                // BLOCKER FIX (TCK-00501): Bounded read to prevent
+                // BLOCKER FIX (RFC-0032::REQ-0176): Bounded read to prevent
                 // memory exhaustion from oversized journal lines.
                 //
                 // BufRead::read_line() allocates the FULL line before any
@@ -1507,7 +1507,7 @@ fn parse_journal_line(line: &str) -> Result<(char, Hash, Option<EffectJournalBin
             let binding: EffectJournalBindingV1 = serde_json::from_str(json_part)
                 .map_err(|e| format!("failed to parse binding JSON: {e}"))?;
 
-            // TCK-00501 MINOR: Validate replayed binding to prevent
+            // RFC-0032::REQ-0176 MINOR: Validate replayed binding to prevent
             // loading invalid/oversized entries into the in-memory index.
             // Without this, a corrupted journal file could inject entries
             // with zero hashes, empty strings, or oversized fields.
@@ -2541,7 +2541,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00501: Bounded journal line read (DoS prevention)
+    // RFC-0032::REQ-0176: Bounded journal line read (DoS prevention)
     // =========================================================================
 
     /// A journal file containing a line exceeding `MAX_JOURNAL_LINE_LEN`
@@ -2606,7 +2606,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00501: Binding validation on replay (MINOR fix)
+    // RFC-0032::REQ-0176: Binding validation on replay (MINOR fix)
     // =========================================================================
 
     /// A journal file containing a Started entry with an invalid binding
@@ -2651,7 +2651,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00501: Witness seed hash zero-check (NIT fix)
+    // RFC-0032::REQ-0176: Witness seed hash zero-check (NIT fix)
     // =========================================================================
 
     /// A binding with a zero `leakage_witness_seed_hash` must fail
@@ -2869,7 +2869,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00501 SEC-BLOCKER: O(1) active count tracking
+    // RFC-0032::REQ-0176 SEC-BLOCKER: O(1) active count tracking
     // =========================================================================
 
     /// Verify that `active_count()` returns the correct O(1) count after
@@ -2950,7 +2950,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00501 SEC-MAJOR-2: Terminal entry compaction
+    // RFC-0032::REQ-0176 SEC-MAJOR-2: Terminal entry compaction
     // =========================================================================
 
     /// Verify that `prune_terminal_entries()` removes all terminal entries

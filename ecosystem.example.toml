@@ -9,13 +9,13 @@ log_dir = "/var/log/apm2"
 state_file = "/var/lib/apm2/state.json"
 ledger_db = "/var/lib/apm2/ledger.db"
 
-# Durable content-addressed storage (CAS) directory (TCK-00383).
+# Durable content-addressed storage (CAS) directory (RFC-0032::REQ-0137).
 # When provided alongside --ledger-db, enables full session dispatcher wiring:
 # tool execution, event emission, and evidence publishing.
 # The directory is created with mode 0700 if it does not exist.
 cas_path = "/var/lib/apm2/cas"
 
-# Divergence watchdog configuration (TCK-00393).
+# Divergence watchdog configuration (RFC-0032::REQ-0147).
 # Monitors external trunk HEAD against ledger MergeReceipt HEAD.
 # On divergence: emits DefectRecorded + InterventionFreeze to halt admissions.
 [daemon.divergence_watchdog]
@@ -27,7 +27,7 @@ github_api_url = "https://api.github.com"
 github_token_env = "$GITHUB_TOKEN"
 poll_interval_secs = 30
 
-# Adapter profile rotation (TCK-00400).
+# Adapter profile rotation (RFC-0032::REQ-0152).
 # Default rollout is operability-first: 100% claude-code-v1.
 # Additional profiles can be enabled once their adapters are production-ready.
 [daemon.adapter_rotation]

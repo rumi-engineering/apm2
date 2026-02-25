@@ -3,7 +3,7 @@
 //! This module provides the client-side implementation for communicating with
 //! the apm2 daemon via Unix domain sockets.
 //!
-//! # TCK-00281: Legacy JSON IPC Removed
+//! # RFC-0032::REQ-0086: Legacy JSON IPC Removed
 //!
 //! Per DD-009 (RFC-0017), legacy JSON IPC has been removed from the daemon.
 //! The CLI must be migrated to use protobuf-based communication in a
@@ -24,13 +24,13 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default connection timeout.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[allow(dead_code)]
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Daemon client for episode operations.
 ///
-/// # TCK-00281: Stub Implementation
+/// # RFC-0032::REQ-0086: Stub Implementation
 ///
 /// This client is currently a stub. Legacy JSON IPC has been removed per
 /// DD-009. The CLI must be migrated to protobuf-based communication.
@@ -58,13 +58,13 @@ pub enum DaemonClientError {
     DaemonError { code: ErrorCode, message: String },
     /// Unexpected response type.
     UnexpectedResponse(String),
-    /// Protocol migration required (TCK-00281).
+    /// Protocol migration required (RFC-0032::REQ-0086).
     ProtocolMigrationRequired,
 }
 
 /// Error codes for daemon responses.
 ///
-/// TCK-00281: This is a minimal subset of error codes retained for CLI
+/// RFC-0032::REQ-0086: This is a minimal subset of error codes retained for CLI
 /// error handling until the CLI is migrated to protobuf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -222,7 +222,7 @@ pub struct ListEpisodesResponse {
     pub total: u32,
 }
 
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[allow(dead_code)]
 impl<'a> DaemonClient<'a> {
     /// Creates a new daemon client.
@@ -253,7 +253,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Creates a new episode from an envelope.
     ///
-    /// # TCK-00281: Stub
+    /// # RFC-0032::REQ-0086: Stub
     ///
     /// Returns an error indicating protobuf migration is required.
     #[allow(clippy::unused_self)]
@@ -267,7 +267,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Starts a created episode.
     ///
-    /// # TCK-00281: Stub
+    /// # RFC-0032::REQ-0086: Stub
     ///
     /// Returns an error indicating protobuf migration is required.
     #[allow(clippy::unused_self)]
@@ -281,7 +281,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Stops a running episode.
     ///
-    /// # TCK-00281: Stub
+    /// # RFC-0032::REQ-0086: Stub
     ///
     /// Returns an error indicating protobuf migration is required.
     #[allow(clippy::unused_self)]
@@ -296,7 +296,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Gets the status of an episode.
     ///
-    /// # TCK-00281: Stub
+    /// # RFC-0032::REQ-0086: Stub
     ///
     /// Returns an error indicating protobuf migration is required.
     #[allow(clippy::unused_self)]
@@ -309,7 +309,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Lists episodes with optional state filter.
     ///
-    /// # TCK-00281: Stub
+    /// # RFC-0032::REQ-0086: Stub
     ///
     /// Returns an error indicating protobuf migration is required.
     #[allow(clippy::unused_self)]

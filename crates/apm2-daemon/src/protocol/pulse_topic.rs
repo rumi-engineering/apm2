@@ -1,5 +1,5 @@
 //! Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
-//! TCK-00301).
+//! RFC-0032::REQ-0097).
 //!
 //! This module implements topic validation and pattern matching for the Holonic
 //! Event Fabric (HEF) pulse subscription system. Topics are ASCII,

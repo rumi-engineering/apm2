@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00515)
+// AGENT-AUTHORED (RFC-0032::REQ-0181)
 //! FAC execution lane management: lane directories, profiles, leases, and
 //! status.
 //!
@@ -70,10 +70,10 @@ pub const LANE_PROFILE_V1_SCHEMA: &str = "apm2.fac.lane_profile.v1";
 /// Schema identifier for lane lease v1.
 pub const LANE_LEASE_V1_SCHEMA: &str = "apm2.fac.lane_lease.v1";
 
-/// Schema identifier for lane init receipt v1 (TCK-00539).
+/// Schema identifier for lane init receipt v1 (RFC-0032::REQ-0195).
 pub const LANE_INIT_RECEIPT_SCHEMA: &str = "apm2.fac.lane_init_receipt.v1";
 
-/// Schema identifier for lane reconcile receipt v1 (TCK-00539).
+/// Schema identifier for lane reconcile receipt v1 (RFC-0032::REQ-0195).
 pub const LANE_RECONCILE_RECEIPT_SCHEMA: &str = "apm2.fac.lane_reconcile_receipt.v1";
 
 /// Schema identifier for corrupt marker files.
@@ -203,7 +203,7 @@ pub enum LaneCleanupError {
         failure_step: Option<String>,
     },
 
-    /// Per-lane environment directory prune failed (TCK-00575).
+    /// Per-lane environment directory prune failed (RFC-0032::REQ-0225).
     #[error("env directory prune failed during {step}: {reason}")]
     EnvDirPruneFailed {
         /// Name of the cleanup step that failed.
@@ -766,6 +766,7 @@ pub fn compute_test_env_for_parallelism(parallelism: u32) -> Vec<(String, String
     vec![
         ("NEXTEST_TEST_THREADS".to_string(), cpu_count.to_string()),
         ("CARGO_BUILD_JOBS".to_string(), cpu_count.to_string()),
+        ("CARGO_INCREMENTAL".to_string(), "1".to_string()),
     ]
 }
 
@@ -1199,10 +1200,10 @@ impl LaneCorruptMarkerV1 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lane Init / Reconcile Receipt Types (TCK-00539)
+// Lane Init / Reconcile Receipt Types (RFC-0032::REQ-0195)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Receipt for `apm2 fac lane init` (TCK-00539).
+/// Receipt for `apm2 fac lane init` (RFC-0032::REQ-0195).
 ///
 /// Records the lanes that were created vs already existed, profile hashes,
 /// and node identity used.
@@ -1238,7 +1239,8 @@ pub struct LaneInitProfileEntry {
     pub created: bool,
 }
 
-/// Receipt for lane reconciliation used by `apm2 fac doctor --fix` (TCK-00539).
+/// Receipt for lane reconciliation used by `apm2 fac doctor --fix`
+/// (RFC-0032::REQ-0195).
 ///
 /// Records all reconciliation actions taken, lanes inspected, and outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1444,7 +1446,7 @@ impl LaneManager {
             create_dir_restricted(&lane_dir.join("workspace"))?;
             create_dir_restricted(&lane_dir.join("target"))?;
             create_dir_restricted(&lane_dir.join("logs"))?;
-            // TCK-00575: Create per-lane env isolation directories.
+            // RFC-0032::REQ-0225: Create per-lane env isolation directories.
             for env_subdir in super::policy::LANE_ENV_DIRS {
                 create_dir_restricted(&lane_dir.join(env_subdir))?;
             }
@@ -1535,7 +1537,8 @@ impl LaneManager {
             boundary_id,
         };
 
-        // TCK-00589: Persist receipt under receipts directory (not legacy evidence/).
+        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy
+        // evidence/).
         let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
@@ -1609,7 +1612,8 @@ impl LaneManager {
 
         let receipt = Self::build_reconcile_receipt(&lane_ids, actions);
 
-        // TCK-00589: Persist receipt under receipts directory (not legacy evidence/).
+        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy
+        // evidence/).
         let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
@@ -2282,7 +2286,7 @@ impl LaneManager {
     /// Mark a lane as CORRUPT with a reason and optional receipt digest.
     ///
     /// This is the canonical operator-facing API for marking a lane as
-    /// corrupt (TCK-00570). The caller MUST hold the lane lock before
+    /// corrupt (RFC-0032::REQ-0220). The caller MUST hold the lane lock before
     /// calling this method to prevent TOCTOU between status check and
     /// marker write.
     ///
@@ -2367,7 +2371,8 @@ impl LaneManager {
         )
     }
 
-    /// Run lane cleanup with explicit log retention policy (TCK-00571).
+    /// Run lane cleanup with explicit log retention policy
+    /// (RFC-0032::REQ-0221).
     ///
     /// Steps:
     /// 1. Reset workspace (`git reset --hard HEAD`)
@@ -2536,7 +2541,7 @@ impl LaneManager {
         }
         steps_completed.push(CLEANUP_STEP_TEMP_PRUNE.to_string());
 
-        // Step 3b (TCK-00575): Prune per-lane environment directories from
+        // Step 3b (RFC-0032::REQ-0225): Prune per-lane environment directories from
         // `LANE_ENV_DIRS`. The `tmp` dir is already handled above in
         // step 3.
         for &env_subdir in super::policy::LANE_ENV_DIRS {
@@ -2575,7 +2580,7 @@ impl LaneManager {
         }
         steps_completed.push(CLEANUP_STEP_ENV_DIR_PRUNE.to_string());
 
-        // Step 4: Enforce log retention policy (TCK-00571).
+        // Step 4: Enforce log retention policy (RFC-0032::REQ-0221).
         //
         // CQ-BLOCKER-1 fix: Uses the caller-provided LogRetentionConfig
         // (derived from FacPolicyV1 fields per_job_log_ttl_days,
@@ -2746,7 +2751,8 @@ impl LaneManager {
         Ok(())
     }
 
-    /// Enforce log retention policy on a lane's `logs/` directory (TCK-00571).
+    /// Enforce log retention policy on a lane's `logs/` directory
+    /// (RFC-0032::REQ-0221).
     ///
     /// This is the post-job cleanup counterpart to the GC planner's
     /// `collect_lane_log_retention_targets`. It applies the same three
@@ -4227,7 +4233,7 @@ mod tests {
     #[test]
     fn compute_test_env_for_parallelism_sets_both_env_vars() {
         let env = compute_test_env_for_parallelism(3);
-        assert_eq!(env.len(), 2);
+        assert_eq!(env.len(), 3);
         let threads = env
             .iter()
             .find(|(k, _)| k == "NEXTEST_TEST_THREADS")
@@ -4238,8 +4244,13 @@ mod tests {
             .find(|(k, _)| k == "CARGO_BUILD_JOBS")
             .and_then(|(_, v)| v.parse::<u32>().ok())
             .unwrap_or(0);
+        let incremental = env
+            .iter()
+            .find(|(k, _)| k == "CARGO_INCREMENTAL")
+            .map(|(_, v)| v.as_str());
         assert_eq!(threads, 3);
         assert_eq!(threads, build_jobs);
+        assert_eq!(incremental, Some("1"));
     }
 
     #[test]
@@ -4250,6 +4261,10 @@ mod tests {
                 .any(|(k, v)| k == "NEXTEST_TEST_THREADS" && v == "1")
         );
         assert!(env.iter().any(|(k, v)| k == "CARGO_BUILD_JOBS" && v == "1"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CARGO_INCREMENTAL" && v == "1")
+        );
     }
 
     #[test]
@@ -5596,7 +5611,7 @@ mod tests {
 
     #[test]
     fn run_lane_cleanup_deeply_nested_logs_succeeds() {
-        // With enforce_log_retention (TCK-00571), cleanup operates at the
+        // With enforce_log_retention (RFC-0032::REQ-0221), cleanup operates at the
         // job-log-directory level (immediate children of logs/). Deep
         // nesting inside a job log directory is not a failure condition
         // because the scanner does not recurse into job dirs — it only
@@ -6649,7 +6664,7 @@ mod tests {
         );
     }
 
-    // ── TCK-00571: Log retention cleanup tests ──────────────────────────
+    // ── RFC-0032::REQ-0221: Log retention cleanup tests ──────────────────────────
 
     #[test]
     fn run_lane_cleanup_with_retention_prunes_stale_job_dirs() {
@@ -6754,7 +6769,7 @@ mod tests {
         assert!(fresh_dir.exists(), "fresh job log dir must be retained");
     }
 
-    // ── Init and Reconcile Tests (TCK-00539) ────────────────────────────
+    // ── Init and Reconcile Tests (RFC-0032::REQ-0195) ────────────────────────────
 
     #[test]
     fn init_lanes_creates_profiles_and_directories() {
@@ -6788,7 +6803,7 @@ mod tests {
             assert!(lane_dir.join("profile.v1.json").is_file());
         }
 
-        // TCK-00589: Verify receipt was persisted under receipts/ (not legacy
+        // RFC-0032::REQ-0239: Verify receipt was persisted under receipts/ (not legacy
         // evidence/).
         let receipts_dir = fac_root.join("receipts");
         assert!(receipts_dir.is_dir());
@@ -6799,7 +6814,7 @@ mod tests {
             .count();
         assert_eq!(entry_count, 1, "exactly one init receipt should exist");
 
-        // TCK-00589: Verify legacy evidence/ directory is NOT created.
+        // RFC-0032::REQ-0239: Verify legacy evidence/ directory is NOT created.
         let legacy_evidence_dir = fac_root.join("evidence");
         assert!(
             !legacy_evidence_dir.exists(),

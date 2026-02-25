@@ -48,7 +48,7 @@
 //!     restart_attempt: 0,
 //!     // HTF time envelope reference (RFC-0016): not yet populated.
 //!     time_envelope_ref: None,
-//!     // Episode ID (RFC-0018, TCK-00306): not yet populated.
+//!     // Episode ID (RFC-0018, RFC-0032::REQ-0102): not yet populated.
 //!     episode_id: String::new(),
 //! };
 //!

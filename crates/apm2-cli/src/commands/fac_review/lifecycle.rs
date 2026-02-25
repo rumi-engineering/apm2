@@ -3718,7 +3718,7 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> 
             projected.merge_sha
         );
 
-        // TCK-00624 S7: projection-first merge flow. Local main is reset only
+        // RFC-0032::REQ-0255 S7: projection-first merge flow. Local main is reset only
         // after an external projection has produced an authoritative merged SHA.
         reset_local_main_after_projection(&merge_dir, &projected.merge_sha)?;
 
@@ -4726,7 +4726,7 @@ const LIFECYCLE_TRANSITION_RULES: &[LifecycleTransitionRule] = &[
         guard: LifecycleTransitionGuard::Always,
         action: LifecycleTransitionAction::None,
         guard_predicate: "github_api_confirmed_merge",
-        requirement_refs: &["TCK-00626-BF002"],
+        requirement_refs: &["RFC-0032::REQ-0257-BF002"],
     },
     LifecycleTransitionRule {
         transition_id: "LC-T-013",
@@ -6793,7 +6793,7 @@ mod tests {
             owner_repo: "guardian-intelligence/apm2".to_string(),
             pr_number: 735,
             merge_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            source_branch: "ticket/RFC-0019/TCK-00617".to_string(),
+            source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251".to_string(),
             merge_receipt_hash: format!("b3-256:{}", "aa".repeat(32)),
             merged_at_iso: "2026-02-18T00:00:00Z".to_string(),
             gate_job_id: "gate-job-1".to_string(),
@@ -6838,7 +6838,7 @@ mod tests {
             vec![
                 "merge_pr:guardian-intelligence/apm2:735:0123456789abcdef0123456789abcdef01234567"
                     .to_string(),
-                "delete_remote_branch:/tmp/apm2-merge-projection:ticket/RFC-0019/TCK-00617"
+                "delete_remote_branch:/tmp/apm2-merge-projection:ticket/RFC-0019/RFC-0032::REQ-0251"
                     .to_string(),
                 "commit_status:guardian-intelligence/apm2:735:0123456789abcdef0123456789abcdef01234567:approve"
                     .to_string(),
@@ -6855,7 +6855,7 @@ mod tests {
             owner_repo: "guardian-intelligence/apm2".to_string(),
             pr_number: 735,
             merge_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            source_branch: "ticket/RFC-0019/TCK-00617".to_string(),
+            source_branch: "ticket/RFC-0019/RFC-0032::REQ-0251".to_string(),
             merge_receipt_hash: format!("b3-256:{}", "aa".repeat(32)),
             merged_at_iso: "2026-02-18T00:00:00Z".to_string(),
             gate_job_id: "gate-job-1".to_string(),
@@ -6892,7 +6892,11 @@ mod tests {
             vec!["merge", "delete", "status", "body"]
         );
         assert!(err.contains("merge_pr: merge failed"));
-        assert!(err.contains("delete_remote_branch `ticket/RFC-0019/TCK-00617`: delete failed"));
+        assert!(
+            err.contains(
+                "delete_remote_branch `ticket/RFC-0019/RFC-0032::REQ-0251`: delete failed"
+            )
+        );
         assert!(err.contains("pr_body: body failed"));
     }
 

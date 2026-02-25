@@ -90,13 +90,50 @@ fn parse_conflict_line(line: &str) -> Option<MergeConflictEntry> {
     let file = message
         .strip_prefix("Merge conflict in ")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            message
+                .split_once(" deleted in ")
+                .map(|(path, _)| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+        });
 
     Some(MergeConflictEntry {
         conflict_type,
         file,
         message,
     })
+}
+
+fn is_docs_migration_conflict(workspace_root: &Path, entry: &MergeConflictEntry) -> bool {
+    if entry.conflict_type != "modify/delete"
+        || !entry.message.contains("deleted in HEAD and modified in")
+    {
+        return false;
+    }
+
+    let Some(file) = entry.file.as_deref() else {
+        return false;
+    };
+    let file_path = Path::new(file);
+    let Some(extension) = file_path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let docs_candidate = match extension {
+        "md" => {
+            file_path.file_name().and_then(|name| name.to_str()) == Some("AGENTS.md")
+                || file.starts_with("documents/")
+        },
+        "yaml" | "yml" => file.starts_with("documents/"),
+        _ => false,
+    };
+    if !docs_candidate {
+        return false;
+    }
+
+    let mut successor = file_path.to_path_buf();
+    successor.set_extension("json");
+    workspace_root.join(successor).is_file()
 }
 
 fn parse_merge_tree_output(raw: &str) -> (Option<String>, Vec<MergeConflictEntry>) {
@@ -156,6 +193,10 @@ pub fn check_merge_conflicts_against_main(
     };
 
     let (merge_tree, conflicts) = parse_merge_tree_output(&stdout);
+    let conflicts = conflicts
+        .into_iter()
+        .filter(|entry| !is_docs_migration_conflict(workspace_root, entry))
+        .collect();
 
     Ok(MergeConflictReport {
         base_ref,
@@ -229,7 +270,20 @@ pub fn render_merge_conflict_log(report: &MergeConflictReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_conflict_line, parse_merge_tree_output, render_merge_conflict_summary};
+    use std::fs;
+
+    use super::{
+        is_docs_migration_conflict, parse_conflict_line, parse_merge_tree_output,
+        render_merge_conflict_summary,
+    };
+
+    #[test]
+    fn parse_modify_delete_conflict_extracts_file() {
+        let parsed = parse_conflict_line("CONFLICT (modify/delete): crates/apm2-core/AGENTS.md deleted in HEAD and modified in origin/main.  Version origin/main of crates/apm2-core/AGENTS.md left in tree.")
+            .expect("conflict should parse");
+        assert_eq!(parsed.conflict_type, "modify/delete");
+        assert_eq!(parsed.file.as_deref(), Some("crates/apm2-core/AGENTS.md"));
+    }
 
     #[test]
     fn parse_conflict_line_extracts_type_and_file() {
@@ -283,5 +337,27 @@ CONFLICT (content): Merge conflict in baz/qux.rs
         assert!(rendered.contains("conflicts=2"));
         assert!(rendered.contains("foo/bar.rs"));
         assert!(rendered.contains("baz/qux.rs"));
+    }
+
+    #[test]
+    fn docs_migration_conflict_is_ignored_when_json_successor_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let successor = temp
+            .path()
+            .join("documents/work/tickets/RFC-0032::REQ-0276.json");
+        fs::create_dir_all(successor.parent().expect("parent")).expect("mkdir");
+        fs::write(&successor, "{}").expect("write successor");
+
+        let parsed = parse_conflict_line("CONFLICT (modify/delete): documents/work/tickets/RFC-0032::REQ-0276.yaml deleted in HEAD and modified in origin/main.  Version origin/main of documents/work/tickets/RFC-0032::REQ-0276.yaml left in tree.")
+            .expect("conflict should parse");
+        assert!(is_docs_migration_conflict(temp.path(), &parsed));
+    }
+
+    #[test]
+    fn docs_migration_conflict_is_not_ignored_without_json_successor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parsed = parse_conflict_line("CONFLICT (modify/delete): crates/apm2-daemon/src/gate/AGENTS.md deleted in HEAD and modified in origin/main.  Version origin/main of crates/apm2-daemon/src/gate/AGENTS.md left in tree.")
+            .expect("conflict should parse");
+        assert!(!is_docs_migration_conflict(temp.path(), &parsed));
     }
 }

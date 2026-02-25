@@ -252,7 +252,7 @@ message ArtifactFetch {
 }
 
 // ============================================================
-// NAVIGATION OPERATIONS (TCK-00315)
+// NAVIGATION OPERATIONS (RFC-0032::REQ-0109)
 // ============================================================
 
 // Request to list files in a directory.

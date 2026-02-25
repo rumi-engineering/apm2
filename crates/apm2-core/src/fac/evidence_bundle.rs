@@ -37,45 +37,48 @@
 //! - [INV-EB-005] All string fields are bounded during deserialization.
 //! - [INV-EB-006] Export refuses when envelope byte size exceeds the leakage
 //!   budget policy ceiling and no valid declassification receipt is present
-//!   (TCK-00555).
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-007] Import refuses when the embedded leakage budget receipt
 //!   declares `leakage_bits > budget_bits` or exceeds the policy ceiling
-//!   carried in the envelope (TCK-00555).
+//!   carried in the envelope (RFC-0032::REQ-0210).
 //! - [INV-EB-008] Import independently verifies that when `exceeded_policy` is
 //!   false, actual values (`actual_export_bytes`, `actual_export_classes`,
-//!   `actual_leakage_bits`) are within the policy ceilings (TCK-00555).
+//!   `actual_leakage_bits`) are within the policy ceilings
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-009] Import cross-checks `actual_export_classes` against the count
-//!   of `blob_refs` in the envelope plus fixed overhead (TCK-00555).
+//!   of `blob_refs` in the envelope plus fixed overhead (RFC-0032::REQ-0210).
 //! - [INV-EB-010] Import cross-checks `actual_leakage_bits` against the
-//!   `leakage_budget_receipt` in the boundary check (TCK-00555).
+//!   `leakage_budget_receipt` in the boundary check (RFC-0032::REQ-0210).
 //! - [INV-EB-011] Export converges `actual_export_bytes` to match the final
-//!   serialized envelope size via iterative re-measurement (TCK-00555).
+//!   serialized envelope size via iterative re-measurement
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-012] Import recomputes the canonical envelope byte size from the
 //!   serialized data and requires `actual_export_bytes` to match, preventing
-//!   forged byte values from bypassing policy enforcement (TCK-00555).
+//!   forged byte values from bypassing policy enforcement (RFC-0032::REQ-0210).
 //! - [INV-EB-013] Export-time declassification validation always checks
 //!   `authorized_leakage_bits >= actual_leakage_bits` when a receipt is
-//!   present, regardless of which dimension triggered exceedance (TCK-00555).
+//!   present, regardless of which dimension triggered exceedance
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-014] Import rejects new-schema envelopes
 //!   (`EVIDENCE_BUNDLE_ENVELOPE_SCHEMA`) that are missing
 //!   `leakage_budget_decision`. Legacy envelopes (`EVIDENCE_BUNDLE_SCHEMA`) are
 //!   exempt for backward compatibility. This prevents downgrade-by-omission
 //!   attacks where an attacker strips the decision field and recomputes a
-//!   self-consistent content hash (TCK-00555).
+//!   self-consistent content hash (RFC-0032::REQ-0210).
 //! - [INV-EB-023] Even legacy-schema envelopes are rejected when missing
 //!   `leakage_budget_decision` if the boundary check carries budget-aware
 //!   fields (`leakage_budget_receipt`, `timing_channel_budget`, or
 //!   `disclosure_policy_binding`). This closes a schema-downgrade bypass where
 //!   an attacker swaps the schema string to legacy after stripping the decision
-//!   (TCK-00555).
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-024] Export-time finalization always validates `authorized_bytes
 //!   >= actual_export_bytes` whenever the policy is exceeded and a
 //!   declassification receipt is present, regardless of which dimension
 //!   triggered exceedance. This aligns export with import semantics
-//!   (TCK-00555).
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-025] Export fails closed when `leakage_budget_policy` is `None`
 //!   for new-schema output. Callers must supply a policy (even if permissive)
-//!   to produce importable envelopes (TCK-00555).
+//!   to produce importable envelopes (RFC-0032::REQ-0210).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -160,7 +163,7 @@ const MAX_BYTE_CONVERGENCE_ROUNDS: usize = 5;
 pub const MAX_DECLASSIFICATION_AUTHORITY_ID_LENGTH: usize = 256;
 
 // =============================================================================
-// Leakage Budget Policy (TCK-00555)
+// Leakage Budget Policy (RFC-0032::REQ-0210)
 // =============================================================================
 
 /// RFC-0028 leakage budget policy defaults for evidence export.
@@ -232,7 +235,8 @@ impl Default for LeakageBudgetPolicy {
     }
 }
 
-/// Declassification receipt for export-time budget overrides (TCK-00555).
+/// Declassification receipt for export-time budget overrides
+/// (RFC-0032::REQ-0210).
 ///
 /// When an evidence export exceeds the configured [`LeakageBudgetPolicy`]
 /// ceilings, the caller must provide this receipt to authorize the export.
@@ -344,7 +348,7 @@ impl DeclassificationExportReceipt {
 /// channel enforcement.
 const MAX_DECLASSIFICATION_RECEIPT_ID_LENGTH: usize = 128;
 
-/// Result of leakage budget enforcement at export time (TCK-00555).
+/// Result of leakage budget enforcement at export time (RFC-0032::REQ-0210).
 ///
 /// Bound into the envelope so import-side validation can verify the
 /// export-time decision. When `exceeded_policy` is true, the full
@@ -580,7 +584,8 @@ pub enum EvidenceBundleError {
         operation: String,
     },
 
-    /// Receipt signature verification failed during import (TCK-00576).
+    /// Receipt signature verification failed during import
+    /// (RFC-0032::REQ-0226).
     ///
     /// Fail-closed: evidence bundle import requires a valid signed receipt
     /// envelope. This prevents forged or unsigned receipts from being
@@ -591,7 +596,7 @@ pub enum EvidenceBundleError {
         detail: String,
     },
 
-    /// Leakage budget enforcement denied the operation (TCK-00555).
+    /// Leakage budget enforcement denied the operation (RFC-0032::REQ-0210).
     ///
     /// Fail-closed: export or import is denied when the leakage budget
     /// policy ceiling is exceeded and no valid declassification receipt
@@ -627,7 +632,8 @@ pub struct EvidenceBundleEnvelopeV1 {
     pub policy_binding: Option<BoundaryFlowPolicyBinding>,
     /// Content-addressed blob references (hex-encoded BLAKE3 hashes).
     pub blob_refs: Vec<String>,
-    /// Leakage budget decision from export-time enforcement (TCK-00555).
+    /// Leakage budget decision from export-time enforcement
+    /// (RFC-0032::REQ-0210).
     ///
     /// Present when the export was subject to leakage budget policy
     /// enforcement. Import-side validation uses this to verify that the
@@ -693,7 +699,7 @@ pub struct BundleEconomicsTraceV1 {
 /// Carries the optional boundary-check substructures that the receipt trace
 /// alone cannot reconstruct: leakage budget receipt, timing channel budget,
 /// and disclosure policy binding. Also carries the leakage budget policy
-/// and optional declassification receipt for TCK-00555 enforcement.
+/// and optional declassification receipt for RFC-0032::REQ-0210 enforcement.
 #[derive(Debug, Clone, Default)]
 pub struct BundleExportConfig {
     /// RFC-0028 boundary-flow policy binding.
@@ -704,7 +710,8 @@ pub struct BundleExportConfig {
     pub timing_channel_budget: Option<TimingChannelBudget>,
     /// Disclosure-control policy interlock binding.
     pub disclosure_policy_binding: Option<DisclosurePolicyBinding>,
-    /// Leakage budget policy ceiling for export-time enforcement (TCK-00555).
+    /// Leakage budget policy ceiling for export-time enforcement
+    /// (RFC-0032::REQ-0210).
     ///
     /// **Required for new-schema output** (INV-EB-025): export fails closed
     /// when this is `None`. Callers must supply a policy, even if permissive
@@ -713,7 +720,7 @@ pub struct BundleExportConfig {
     /// can validate (INV-EB-014).
     pub leakage_budget_policy: Option<LeakageBudgetPolicy>,
     /// Declassification receipt authorizing exports that exceed the leakage
-    /// budget policy ceiling (TCK-00555).
+    /// budget policy ceiling (RFC-0032::REQ-0210).
     ///
     /// Required when the export would exceed the policy ceiling. The receipt
     /// must authorize at least the actual export size and class count.
@@ -816,7 +823,7 @@ pub fn build_evidence_bundle_envelope(
         content_hash: String::new(),
     };
 
-    // INV-EB-006: Leakage budget enforcement (TCK-00555), phase 1.
+    // INV-EB-006: Leakage budget enforcement (RFC-0032::REQ-0210), phase 1.
     // Preliminary pass checks class count and leakage bits. Byte
     // enforcement is deferred until after final serialization (phase 2).
     if let Some(ref policy) = config.leakage_budget_policy {
@@ -829,7 +836,7 @@ pub fn build_evidence_bundle_envelope(
     let hash = compute_envelope_content_hash(&envelope);
     envelope.content_hash = format!("b3-256:{}", hex::encode(hash));
 
-    // INV-EB-006: Leakage budget enforcement (TCK-00555), phase 2.
+    // INV-EB-006: Leakage budget enforcement (RFC-0032::REQ-0210), phase 2.
     // Enforce max_export_bytes against the exact bytes that will be
     // written to disk (serde_json::to_vec_pretty with populated hash).
     //
@@ -942,7 +949,8 @@ pub fn build_evidence_bundle_envelope(
     Ok(envelope)
 }
 
-/// INV-EB-006: Enforce leakage budget policy at export time (TCK-00555).
+/// INV-EB-006: Enforce leakage budget policy at export time
+/// (RFC-0032::REQ-0210).
 ///
 /// Enforcement is deferred: the caller invokes this before the content
 /// hash is populated, records the preliminary decision, then — after
@@ -1113,7 +1121,8 @@ fn enforce_leakage_budget_final(
 /// the leakage-bit dimension itself exceeded its policy ceiling. This
 /// ensures export-time validation is consistent with import-time validation,
 /// which always checks `authorized_leakage_bits >= actual_leakage_bits`
-/// when declassification is authorized (TCK-00555, security finding MINOR).
+/// when declassification is authorized (RFC-0032::REQ-0210, security finding
+/// MINOR).
 fn validate_declassification_receipt(
     declass: &DeclassificationExportReceipt,
     actual_bytes: u64,
@@ -1154,7 +1163,7 @@ fn validate_declassification_receipt(
     // present, regardless of which dimension triggered exceedance. This
     // matches the import-side check that unconditionally requires
     // authorized_leakage_bits >= actual_leakage_bits whenever
-    // declassification is authorized (TCK-00555 MINOR finding fix).
+    // declassification is authorized (RFC-0032::REQ-0210 MINOR finding fix).
     if let Some(lbr) = leakage_budget_receipt {
         if declass.authorized_leakage_bits < lbr.leakage_bits {
             return Err(EvidenceBundleError::LeakageBudgetDenied {
@@ -1283,17 +1292,17 @@ pub fn import_evidence_bundle(
     // INV-EB-002: RFC-0029 economics receipt validation.
     validate_economics_traces(&envelope)?;
 
-    // INV-EB-007: Leakage budget decision consistency (TCK-00555).
+    // INV-EB-007: Leakage budget decision consistency (RFC-0032::REQ-0210).
     // Pass the canonical envelope byte size (data.len()) so the importer
     // independently verifies actual_export_bytes against the real serialized
-    // size, preventing forged byte values (TCK-00555 MAJOR finding fix).
+    // size, preventing forged byte values (RFC-0032::REQ-0210 MAJOR finding fix).
     validate_leakage_budget_decision(&envelope, data.len() as u64)?;
 
     Ok(envelope)
 }
 
 /// Import and validate an evidence bundle envelope with receipt signature
-/// verification (TCK-00576).
+/// verification (RFC-0032::REQ-0226).
 ///
 /// This function performs all validations from [`import_evidence_bundle`] and
 /// additionally verifies the receipt's signed envelope against the provided
@@ -1313,7 +1322,7 @@ pub fn import_evidence_bundle_verified(
     // Perform standard import validation first.
     let envelope = import_evidence_bundle(data)?;
 
-    // TCK-00576: Verify receipt signature.
+    // RFC-0032::REQ-0226: Verify receipt signature.
     // The receipt's content_hash in the envelope is the binding point.
     let receipt_content_hash = &envelope.receipt.content_hash;
 
@@ -1638,10 +1647,10 @@ fn compute_envelope_content_hash(envelope: &EvidenceBundleEnvelopeV1) -> [u8; 32
         hash_len_prefixed(&mut hasher, blob_ref.as_bytes());
     }
 
-    // -- leakage budget decision (TCK-00555) --
+    // -- leakage budget decision (RFC-0032::REQ-0210) --
     // Schema-gated legacy hash path: when `leakage_budget_decision` is absent
     // AND the envelope schema is a legacy schema ID, omit the leakage budget
-    // field entirely to preserve backward compatibility with pre-TCK-00555
+    // field entirely to preserve backward compatibility with pre-RFC-0032::REQ-0210
     // envelopes (INV-EB-026). New-schema envelopes always include the
     // presence/absence tag.
     let is_legacy_schema = envelope.schema == EVIDENCE_BUNDLE_SCHEMA;
@@ -1890,14 +1899,15 @@ fn validate_economics_traces(
     Ok(())
 }
 
-/// Validate the leakage budget decision embedded in the envelope (TCK-00555).
+/// Validate the leakage budget decision embedded in the envelope
+/// (RFC-0032::REQ-0210).
 ///
 /// INV-EB-007: When a leakage budget decision is present, validate:
 /// - `actual_export_bytes` must equal the canonical envelope byte size
 ///   (`canonical_envelope_bytes`) — the importer independently derives this
 ///   from the serialized envelope being imported, preventing an attacker from
 ///   forging a lower value to bypass byte-dimension policy enforcement
-///   (TCK-00555, security finding MAJOR).
+///   (RFC-0032::REQ-0210, security finding MAJOR).
 /// - If `exceeded_policy` is true, `declassification_authorized` must be true.
 /// - If `exceeded_policy` is false, actual values must be within policy
 ///   ceilings (evaluated against the recomputed canonical size).
@@ -1922,13 +1932,13 @@ fn validate_leakage_budget_decision(
         // the bundle without triggering any leakage-budget validation.
         //
         // Legacy envelopes (EVIDENCE_BUNDLE_SCHEMA) are exempt for backward
-        // compatibility — they predate TCK-00555 and never carried a decision.
+        // compatibility — they predate RFC-0032::REQ-0210 and never carried a decision.
         //
         // INV-EB-023: Schema-downgrade detection. Even if the schema string
         // is legacy, if the boundary check carries leakage-budget-aware
         // fields (leakage_budget_receipt, timing_channel_budget, or
         // disclosure_policy_binding), the envelope was produced with
-        // budget-awareness (post-TCK-00555) and cannot be legitimately
+        // budget-awareness (post-RFC-0032::REQ-0210) and cannot be legitimately
         // legacy. An attacker who takes a new-schema envelope, strips the
         // decision, and swaps the schema to legacy must also fabricate a
         // boundary check without these fields — but the content hash binds
@@ -1952,7 +1962,7 @@ fn validate_leakage_budget_decision(
                         .to_string(),
                 });
             }
-            return Ok(()); // Truly pre-TCK-00555 envelope: no decision expected
+            return Ok(()); // Truly pre-RFC-0032::REQ-0210 envelope: no decision expected
         }
         return Err(EvidenceBundleError::LeakageBudgetDenied {
             reason: "import rejected: new-schema envelope requires leakage_budget_decision \
@@ -1967,7 +1977,7 @@ fn validate_leakage_budget_decision(
     // policy accounting via serde_json::to_vec_pretty). An attacker cannot
     // forge a lower actual_export_bytes to bypass the byte ceiling because
     // the importer independently derives the canonical size.
-    // (TCK-00555, security finding MAJOR) ----
+    // (RFC-0032::REQ-0210, security finding MAJOR) ----
     if decision.actual_export_bytes != canonical_envelope_bytes {
         return Err(EvidenceBundleError::LeakageBudgetDenied {
             reason: format!(
@@ -2631,7 +2641,7 @@ pub mod tests {
                 phase_id: "test-phase".to_string(),
                 state_reason: String::new(),
             }),
-            // TCK-00555: Use tier0 policy for tests (generous ceiling).
+            // RFC-0032::REQ-0210: Use tier0 policy for tests (generous ceiling).
             leakage_budget_policy: Some(LeakageBudgetPolicy::tier0_default()),
             declassification_receipt: None,
         }
@@ -3591,7 +3601,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: Manifest struct tests
+    // RFC-0032::REQ-0198: Manifest struct tests
     // =========================================================================
 
     #[test]
@@ -3933,7 +3943,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: Channel boundary check requirement
+    // RFC-0032::REQ-0198: Channel boundary check requirement
     // =========================================================================
 
     #[test]
@@ -3980,7 +3990,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: Manifest mutation detection tests
+    // RFC-0032::REQ-0198: Manifest mutation detection tests
     // =========================================================================
 
     /// Helper: build a valid manifest, mutate a field WITHOUT recomputing
@@ -4059,7 +4069,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: Envelope schema backwards compatibility
+    // RFC-0032::REQ-0198: Envelope schema backwards compatibility
     // =========================================================================
 
     #[test]
@@ -4139,7 +4149,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: deny_unknown_fields enforcement
+    // RFC-0032::REQ-0198: deny_unknown_fields enforcement
     // =========================================================================
 
     #[test]
@@ -4184,7 +4194,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00542: Hash stability / determinism regression tests
+    // RFC-0032::REQ-0198: Hash stability / determinism regression tests
     // =========================================================================
 
     #[test]
@@ -4226,7 +4236,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00576: import_evidence_bundle_verified tests
+    // RFC-0032::REQ-0226: import_evidence_bundle_verified tests
     // =========================================================================
 
     #[test]
@@ -4343,7 +4353,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Leakage Budget Policy tests
+    // RFC-0032::REQ-0210: Leakage Budget Policy tests
     // =========================================================================
 
     #[test]
@@ -4377,7 +4387,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Declassification Export Receipt tests
+    // RFC-0032::REQ-0210: Declassification Export Receipt tests
     // =========================================================================
 
     /// Helper: build a valid declassification receipt.
@@ -4503,7 +4513,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Export-time leakage budget enforcement tests
+    // RFC-0032::REQ-0210: Export-time leakage budget enforcement tests
     // =========================================================================
 
     #[test]
@@ -4710,7 +4720,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Import-time leakage budget validation tests
+    // RFC-0032::REQ-0210: Import-time leakage budget validation tests
     // =========================================================================
 
     #[test]
@@ -4761,12 +4771,12 @@ pub mod tests {
     fn import_accepts_legacy_schema_envelope_without_decision() {
         // INV-EB-014: Legacy envelopes (EVIDENCE_BUNDLE_SCHEMA) are exempt
         // from the mandatory decision requirement for backward compatibility
-        // with pre-TCK-00555 exports.
+        // with pre-RFC-0032::REQ-0210 exports.
         //
         // Construct a truly legacy envelope by building a valid envelope
         // with a decision, then stripping the decision, clearing
         // budget-aware fields, and setting the legacy schema. This
-        // simulates a pre-TCK-00555 export that never had budget awareness.
+        // simulates a pre-RFC-0032::REQ-0210 export that never had budget awareness.
         let receipt = make_valid_receipt();
         let config = make_valid_export_config();
 
@@ -4774,7 +4784,7 @@ pub mod tests {
             build_evidence_bundle_envelope(&receipt, &config, &[]).expect("export should succeed");
 
         // Strip decision and budget-aware boundary check fields to simulate
-        // a truly pre-TCK-00555 legacy envelope.
+        // a truly pre-RFC-0032::REQ-0210 legacy envelope.
         envelope.leakage_budget_decision = None;
         envelope.boundary_check.leakage_budget_receipt = None;
         envelope.boundary_check.timing_channel_budget = None;
@@ -4897,7 +4907,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Round-trip with leakage budget decision
+    // RFC-0032::REQ-0210: Round-trip with leakage budget decision
     // =========================================================================
 
     #[test]
@@ -4946,7 +4956,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555: Leakage budget policy serialization
+    // RFC-0032::REQ-0210: Leakage budget policy serialization
     // =========================================================================
 
     #[test]
@@ -5045,7 +5055,7 @@ pub mod tests {
 
     #[test]
     fn legacy_schema_envelope_without_decision_preserves_hash() {
-        // Fixture-based test: a pre-TCK-00555 envelope uses the legacy
+        // Fixture-based test: a pre-RFC-0032::REQ-0210 envelope uses the legacy
         // schema and has no leakage_budget_decision. The hash must be
         // computed WITHOUT the leakage budget presence/absence byte to
         // preserve backward compatibility (INV-EB-014).
@@ -5553,8 +5563,8 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555 MAJOR: Import rejects forged actual_export_bytes (canonical
-    // envelope byte size mismatch)
+    // RFC-0032::REQ-0210 MAJOR: Import rejects forged actual_export_bytes
+    // (canonical envelope byte size mismatch)
     // =========================================================================
 
     #[test]
@@ -5645,7 +5655,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // TCK-00555 MINOR: Export fails when declassification receipt
+    // RFC-0032::REQ-0210 MINOR: Export fails when declassification receipt
     // under-authorizes leakage bits (byte-triggered declassification)
     // =========================================================================
 

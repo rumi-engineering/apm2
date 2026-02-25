@@ -13,7 +13,7 @@
 //! # Contract References
 //!
 //! - RFC-0018: CLI Usability Plan
-//! - TCK-00288: CLI dual-socket + protocol client alignment
+//! - RFC-0032::REQ-0090: CLI dual-socket + protocol client alignment
 
 use crate::client::protocol::ProtocolClientError;
 

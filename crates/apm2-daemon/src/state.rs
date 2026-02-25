@@ -2,7 +2,7 @@
 //!
 //! Provides thread-safe shared state for the daemon.
 //!
-//! # TCK-00287: Security Fixes
+//! # RFC-0032::REQ-0089: Security Fixes
 //!
 //! Per the security review, dispatchers and registries must be shared across
 //! connections to prevent state loss and authentication secret rotation issues.
@@ -72,10 +72,10 @@ use crate::protocol::session_token::TokenMinter;
 use crate::session::{SessionRegistry, SessionStopConditionsStore, SessionTelemetryStore};
 
 // ============================================================================
-// TCK-00343: Credential Store Service Name
+// RFC-0032::REQ-0133: Credential Store Service Name
 // ============================================================================
 
-/// Service name for the credential store keyring entries (TCK-00343).
+/// Service name for the credential store keyring entries (RFC-0032::REQ-0133).
 ///
 /// This service name is used when creating the `CredentialStore` that backs
 /// the credential management IPC commands (`ListCredentials`, `AddCredential`,
@@ -86,8 +86,9 @@ const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
 
 /// Stores all builtin adapter profiles in CAS and returns `profile_id` -> hash.
 ///
-/// TCK-00400 requires all builtin profiles to be addressable in CAS at daemon
-/// startup so hash-based selection and explicit overrides can resolve them.
+/// RFC-0032::REQ-0152 requires all builtin profiles to be addressable in CAS at
+/// daemon startup so hash-based selection and explicit overrides can resolve
+/// them.
 fn seed_builtin_profiles_in_cas(
     cas: &dyn apm2_core::evidence::ContentAddressedStore,
 ) -> Result<HashMap<String, [u8; 32]>, String> {
@@ -115,7 +116,7 @@ fn is_profile_adapter_available(
         CLAUDE_CODE_PROFILE_ID | GEMINI_CLI_PROFILE_ID | LOCAL_INFERENCE_PROFILE_ID => {
             adapter_registry.contains(AdapterType::Raw)
         },
-        // TCK-00402: codex-cli-v1 uses dedicated Codex adapter.
+        // RFC-0032::REQ-0154: codex-cli-v1 uses dedicated Codex adapter.
         CODEX_CLI_PROFILE_ID => adapter_registry.contains(AdapterType::Codex),
         _ => false,
     }
@@ -240,8 +241,8 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
 /// Returns the bootstrap sovereignty enforcement mode used during daemon
 /// construction.
 ///
-/// TODO(TCK-00427): Load this mode from runtime governance/policy projection
-/// instead of a transitional static default.
+/// TODO(RFC-0020::REQ-0046): Load this mode from runtime governance/policy
+/// projection instead of a transitional static default.
 const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
     apm2_core::pcac::SovereigntyEnforcementMode::Strict
 }
@@ -249,8 +250,8 @@ const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::Sovereignt
 /// Builds the bootstrap sovereignty state snapshot for session dispatcher
 /// wiring.
 ///
-/// TODO(TCK-00427): Hydrate and wire authoritative sovereignty state via
-/// runtime IPC/projection updates.
+/// TODO(RFC-0020::REQ-0046): Hydrate and wire authoritative sovereignty state
+/// via runtime IPC/projection updates.
 ///
 /// NOTE: Tier2+ requests are denied fail-closed by default because no runtime
 /// sovereignty state is hydrated. This is intentional — the operator must
@@ -470,18 +471,19 @@ const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 30_000;
 const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 120;
 
 // ============================================================================
-// TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
+// RFC-0032::REQ-0089: Fail-Closed Manifest Store (kept for potential future
+// use)
 // ============================================================================
 
 /// A manifest store that always returns `None`, enforcing fail-closed behavior.
 ///
-/// Per TCK-00287 security review item 3 (Permissive Default), the
+/// Per RFC-0032::REQ-0089 security review item 3 (Permissive Default), the
 /// `SessionDispatcher` must deny all tools if no manifest is available. When
 /// this store is used with `SessionDispatcher::with_manifest_store()`, any tool
 /// request will be denied because `get_manifest()` returns `None`, triggering
 /// the fail-closed path in `handle_request_tool()`.
 ///
-/// # Security Invariant (INV-TCK-00260-002)
+/// # Security Invariant (INV-RFC-0032::REQ-0076-002)
 ///
 /// Empty or missing `tool_allowlist` denies all tools (fail-closed).
 ///
@@ -505,12 +507,12 @@ impl ManifestStore for FailClosedManifestStore {
 }
 
 // ============================================================================
-// TCK-00287: Shared Dispatcher State
+// RFC-0032::REQ-0089: Shared Dispatcher State
 // ============================================================================
 
 /// Shared dispatcher state across all connections.
 ///
-/// Per TCK-00287 security review:
+/// Per RFC-0032::REQ-0089 security review:
 /// - Item 1 (Cross-Connection State Loss): Dispatchers must persist across
 ///   connections
 /// - Item 2 (Authentication Secret Rotation): `TokenMinter` secret must be
@@ -518,7 +520,7 @@ impl ManifestStore for FailClosedManifestStore {
 /// - Item 3 (Permissive Default): Must use fail-closed manifest store
 ///   initially, but allow manifests to be registered during `SpawnEpisode`
 ///
-/// # TCK-00287 BLOCKER 1, 2, 3 Fixes
+/// # RFC-0032::REQ-0089 BLOCKER 1, 2, 3 Fixes
 ///
 /// This struct now shares:
 /// - `TokenMinter`: Same secret for both minting and validation
@@ -534,7 +536,7 @@ pub struct DispatcherState {
     ///
     /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter`
     /// that persist across connections. Now also contains shared
-    /// `TokenMinter` and `ManifestStore` for TCK-00287 fixes.
+    /// `TokenMinter` and `ManifestStore` for RFC-0032::REQ-0089 fixes.
     privileged_dispatcher: PrivilegedDispatcher,
 
     /// Session endpoint dispatcher with stable token minter.
@@ -545,14 +547,16 @@ pub struct DispatcherState {
     /// registered during spawn are accessible for tool validation.
     session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
 
-    /// Gate execution orchestrator for autonomous gate lifecycle (TCK-00388).
+    /// Gate execution orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// Gate start is publication-driven via
     /// [`GateOrchestrator::start_for_changeset`]. Session termination only
     /// triggers timeout polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
 
-    /// Merge executor for autonomous merge after gate approval (TCK-00390).
+    /// Merge executor for autonomous merge after gate approval
+    /// (RFC-0032::REQ-0144).
     ///
     /// When set, the merge executor is available for triggering the
     /// autonomous merge lifecycle when all gate receipts reach PASS verdict.
@@ -560,7 +564,8 @@ pub struct DispatcherState {
     /// creates a signed `MergeReceipt`, and transitions work to Completed.
     merge_executor: Option<Arc<MergeExecutor>>,
 
-    /// Shared stop authority for runtime mutation (TCK-00351 MAJOR 2 FIX).
+    /// Shared stop authority for runtime mutation (RFC-0020::REQ-0005 MAJOR 2
+    /// FIX).
     ///
     /// Stored as `Arc` so operator/governance control-plane paths can
     /// mutate stop flags at runtime (e.g., set emergency stop) and the
@@ -573,7 +578,7 @@ pub struct DispatcherState {
     /// `governance_uncertain` fail-closed behavior in pre-actuation.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 
-    /// Shared evidence CAS backend (TCK-00418).
+    /// Shared evidence CAS backend (RFC-0032::REQ-0162).
     ///
     /// When present, this is the same `DurableCas` (or `MemoryCas` in tests)
     /// that backs the `PrivilegedDispatcher`'s `validate_lease_time_authority`.
@@ -585,8 +590,8 @@ pub struct DispatcherState {
     /// Runtime anti-entropy economics hook wired to the production PCAC gate.
     anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>>,
 
-    /// TCK-00469: Shared divergence watchdog for IPC-accessible unfreeze and
-    /// durable recovery evidence registration.
+    /// RFC-0020::REQ-0051: Shared divergence watchdog for IPC-accessible
+    /// unfreeze and durable recovery evidence registration.
     ///
     /// When present, operator IPC handlers can call
     /// `register_durable_recovery_evidence`, `create_unfreeze`, and
@@ -611,7 +616,7 @@ impl DispatcherState {
     ///   session handlers
     /// - Registries persist for daemon lifetime
     ///
-    /// # TCK-00287 Fixes
+    /// # RFC-0032::REQ-0089 Fixes
     ///
     /// - BLOCKER 1: Uses shared session registry (passed via
     ///   `with_session_registry`)
@@ -630,31 +635,33 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
-        // TCK-00287 MAJOR 3: Use shared manifest store.
+        // RFC-0032::REQ-0089 MAJOR 3: Use shared manifest store.
         // Manifests registered during SpawnEpisode will be visible to SessionDispatcher
         // for tool request validation. If no manifest is registered for a session,
         // tool requests will be denied (fail-closed behavior in handle_request_tool).
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // TCK-00287: Create session registry (stub for now, use with_session_registry
-        // for real)
+        // RFC-0032::REQ-0089: Create session registry (stub for now, use
+        // with_session_registry for real)
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
-        // TCK-00289: Create shared HolonicClock to prevent mixed clock domain hazard
-        // (RSK-2503)
+        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain
+        // hazard (RSK-2503)
         let clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("failed to create default clock"),
         );
 
-        // TCK-00303: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00343: Create credential store for credential management
+        // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
-        // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
+        // RFC-0032::REQ-0089 BLOCKER 1 & 2: Create privileged dispatcher with shared
+        // state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
@@ -664,7 +671,7 @@ impl DispatcherState {
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
-        // TCK-00568: Wire default baseline economics profile control-plane
+        // RFC-0032::REQ-0219: Wire default baseline economics profile control-plane
         // limits into the dispatcher at startup.
         .with_economics_control_plane_limits(
             apm2_core::economics::EconomicsProfile::default_baseline()
@@ -678,21 +685,22 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00384: Create shared telemetry store for session counters
+        // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // TCK-00287: Create session dispatcher with same token minter and manifest
-        // store This ensures:
+        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and
+        // manifest store This ensures:
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
-        // TCK-00303: Share subscription registry for HEF resource governance
-        // TCK-00344: Wire session registry for SessionStatus queries
-        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
+        // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -715,7 +723,7 @@ impl DispatcherState {
 
     /// Creates new dispatcher state with a specific session registry.
     ///
-    /// # TCK-00287 BLOCKER 1
+    /// # RFC-0032::REQ-0089 BLOCKER 1
     ///
     /// This constructor allows using the global `DaemonStateHandle` session
     /// registry instead of an internal stub, ensuring sessions spawned via
@@ -735,25 +743,26 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let channel_context_signer = Arc::new(apm2_core::crypto::Signer::generate());
 
-        // TCK-00287 MAJOR 3: Use shared manifest store.
+        // RFC-0032::REQ-0089 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // TCK-00289: Create shared HolonicClock to prevent mixed clock domain hazard
-        // (RSK-2503)
+        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain
+        // hazard (RSK-2503)
         let clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("failed to create default clock"),
         );
 
-        // TCK-00303: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00343: Create credential store for credential management
+        // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
-        // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
-        // registry
+        // RFC-0032::REQ-0089 BLOCKER 1: Create privileged dispatcher with global
+        // session registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
@@ -763,7 +772,7 @@ impl DispatcherState {
         )
         .with_credential_store(credential_store)
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
-        // TCK-00568: Wire default baseline economics profile control-plane
+        // RFC-0032::REQ-0219: Wire default baseline economics profile control-plane
         // limits into the dispatcher at startup.
         .with_economics_control_plane_limits(
             apm2_core::economics::EconomicsProfile::default_baseline()
@@ -777,19 +786,20 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00384: Create shared telemetry store for session counters
+        // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // TCK-00287: Create session dispatcher with same token minter and manifest
-        // store
-        // TCK-00303: Share subscription registry for HEF resource governance
-        // TCK-00344: Wire session registry for SessionStatus queries
-        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
+        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and
+        // manifest store
+        // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
+        // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -811,7 +821,7 @@ impl DispatcherState {
     }
 
     /// Creates new dispatcher state with persistent ledger components
-    /// (TCK-00289).
+    /// (RFC-0032::REQ-0091).
     ///
     /// # Arguments
     ///
@@ -844,7 +854,7 @@ impl DispatcherState {
     }
 
     /// Creates new dispatcher state with persistent ledger components and
-    /// adapter rotation config (TCK-00400).
+    /// adapter rotation config (RFC-0032::REQ-0152).
     ///
     /// # Errors
     ///
@@ -871,21 +881,22 @@ impl DispatcherState {
             .as_ref()
             .map(|key| key.verifying_key().to_bytes());
 
-        // TCK-00303: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00344: Clone session_registry before it is moved into the
+        // RFC-0032::REQ-0134: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
-        // TCK-00385 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
-        // stop()/quarantine() can call mark_terminated() in production.
+        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so
+        // that stop()/quarantine() can call mark_terminated() in production.
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
-        // TCK-00343: Create credential store for credential management
+        // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
-        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        // RFC-0020::REQ-0006: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
@@ -910,10 +921,11 @@ impl DispatcherState {
                 signing_key,
             ));
 
-            // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
-            // All file/execute handlers MUST use rooted factories that receive the
-            // workspace root at episode start time. This ensures handlers are isolated
-            // to the episode's workspace, not the daemon's CWD.
+            // RFC-0032::REQ-0113 SECURITY: Configure EpisodeRuntime with workspace-rooted
+            // handlers All file/execute handlers MUST use rooted factories that
+            // receive the workspace root at episode start time. This ensures
+            // handlers are isolated to the episode's workspace, not the
+            // daemon's CWD.
             let mut episode_runtime = EpisodeRuntime::new(EpisodeRuntimeConfig::default());
             episode_runtime = episode_runtime
                 // ReadFileHandler - reads files within workspace
@@ -925,7 +937,7 @@ impl DispatcherState {
                     Box::new(WriteFileHandler::with_root(root))
                 })
                 // ExecuteHandler - executes commands within workspace
-                // TCK-00338: Env scrubbing + stall detection are always active.
+                // RFC-0032::REQ-0129: Env scrubbing + stall detection are always active.
                 // Shell allowlist uses permissive() because the ToolBroker already
                 // enforces shell allowlists via CapabilityManifest before the
                 // handler is invoked. The handler-level allowlist is defense-in-depth
@@ -948,7 +960,7 @@ impl DispatcherState {
                 .with_rooted_handler_factory(|root| {
                     Box::new(SearchHandler::with_root(root))
                 })
-                // TCK-00385 BLOCKER 1: Wire session registry so stop()/quarantine()
+                // RFC-0032::REQ-0139 BLOCKER 1: Wire session registry so stop()/quarantine()
                 // call mark_terminated() in production.
                 .with_session_registry(session_registry_for_runtime);
 
@@ -956,7 +968,7 @@ impl DispatcherState {
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
-            // TCK-00399: Create adapter registry so SpawnEpisode can spawn
+            // RFC-0032::REQ-0151: Create adapter registry so SpawnEpisode can spawn
             // adapter processes (fail-closed: registry is required).
             let mut adapter_registry = crate::episode::AdapterRegistry::new();
             adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
@@ -965,11 +977,11 @@ impl DispatcherState {
             ));
             adapter_registry.register(Box::new(crate::episode::codex_cli::CodexCliAdapter::new()));
 
-            // TCK-00399: CAS for adapter profile resolution during spawn.
+            // RFC-0032::REQ-0151: CAS for adapter profile resolution during spawn.
             let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
                 Arc::new(apm2_core::evidence::MemoryCas::new());
 
-            // TCK-00400: Store all builtin adapter profiles in CAS at startup.
+            // RFC-0032::REQ-0152: Store all builtin adapter profiles in CAS at startup.
             let profile_hashes = seed_builtin_profiles_in_cas(cas.as_ref())
                 .map_err(|e| format!("builtin adapter profile CAS seeding failed: {e}"))?;
             // Fail-closed: invalid adapter rotation config must prevent
@@ -993,20 +1005,20 @@ impl DispatcherState {
                 clock,
                 token_minter.clone(),
                 manifest_store.clone(),
-                // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+                // RFC-0032::REQ-0111: Pre-seed CAS with reviewer v0 manifest
                 Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
                 Arc::clone(&subscription_registry),
             )
-            // TCK-00352: Wire V1 manifest store into production path
+            // RFC-0020::REQ-0006: Wire V1 manifest store into production path
             .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
-            // TCK-00399: Wire adapter registry for agent CLI process spawning.
+            // RFC-0032::REQ-0151: Wire adapter registry for agent CLI process spawning.
             // CAS is intentionally NOT wired here via .with_cas(): fail-closed
             // publish/ingest handlers require explicit CAS configuration via
             // with_persistence_and_cas(). The MemoryCas above is used only to
             // seed builtin adapter profiles at startup; it must NOT be wired
             // as the dispatcher CAS or PublishChangeSet will incorrectly
-            // succeed without durable storage (TCK-00412). Authority binding
-            // validation (TCK-00416) creates a per-request fallback MemoryCas
+            // succeed without durable storage (RFC-0032::REQ-0158). Authority binding
+            // validation (RFC-0032::REQ-0160) creates a per-request fallback MemoryCas
             // when self.cas is None, so it works without wiring here.
             .with_adapter_registry(adapter_registry)
             .with_adapter_selection_policy(
@@ -1040,17 +1052,17 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00384: Create shared telemetry store for session counters
+        // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // RFC-0020::REQ-0005 v4: Create shared stop conditions store for per-session
         // stop limits (max_episodes, escalation_predicate).
         let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
 
-        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // RFC-0020::REQ-0005 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
-        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // RFC-0020::REQ-0005 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
         // The gate evaluates budget availability but records
         // `budget_checked=false` because enforcement is deferred to
         // EpisodeRuntime.
@@ -1065,22 +1077,23 @@ impl DispatcherState {
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
-        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
+        // RFC-0020::REQ-0005 v4: Wire stop conditions store into privileged dispatcher
         privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
             .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
             .with_stop_authority(Arc::clone(&stop_authority))
             .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
-        // TCK-00303: Share subscription registry for HEF resource governance
-        // TCK-00344: Wire session registry for SessionStatus queries
-        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate, stop authority, and stop conditions store
-        // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00426: Authoritative persistence mode requires durable consume
-        // enforcement and lifecycle gate wiring.
+        // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
+        // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries RFC-0020::REQ-0005: Wire pre-actuation gate,
+        // stop authority, and stop conditions store RFC-0020::REQ-0006: Wire V1
+        // manifest store for scope enforcement RFC-0020::REQ-0045:
+        // Authoritative persistence mode requires durable consume enforcement
+        // and lifecycle gate wiring.
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -1136,7 +1149,7 @@ impl DispatcherState {
                     session_dispatcher =
                         session_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
 
-                    // TCK-00494: Wire AdmissionKernel for plan/execute-gated
+                    // RFC-0032::REQ-0172: Wire AdmissionKernel for plan/execute-gated
                     // admission. Uses a SEPARATE consume index file to avoid
                     // file-lock contention with the lifecycle gate's durable
                     // kernel.
@@ -1149,7 +1162,7 @@ impl DispatcherState {
                         // unconditionally append `_admission` to the stem
                         // rather than relying on string replacement.
                         //
-                        // SECURITY MAJOR 1 FIX (TCK-00494): The previous
+                        // SECURITY MAJOR 1 FIX (RFC-0032::REQ-0172): The previous
                         // `name.replace("pcac_consume", "pcac_admission_consume")`
                         // derivation was fragile — if the path did not contain
                         // "pcac_consume", both log paths pointed to the same
@@ -1198,7 +1211,7 @@ impl DispatcherState {
                                 .as_bytes(),
                         };
 
-                        // TCK-00502: Wire DurableAntiRollbackAnchor for fail-closed
+                        // RFC-0032::REQ-0177: Wire DurableAntiRollbackAnchor for fail-closed
                         // external anchor verification. The anchor state file is
                         // co-located alongside the PCAC consume index.
                         let anti_rollback_state_path = {
@@ -1228,7 +1241,7 @@ impl DispatcherState {
                             })?,
                         );
 
-                        // TCK-00501: Wire FileBackedEffectJournal for
+                        // RFC-0032::REQ-0176: Wire FileBackedEffectJournal for
                         // crash-safe effect execution tracking. The journal
                         // file is co-located as a sibling of the admission
                         // consume log for per-instance isolation.
@@ -1282,11 +1295,11 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
-            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // RFC-0020::REQ-0005 MAJOR 2 FIX: Store shared stop authority for
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
             governance_freshness_monitor: Some(governance_freshness_monitor),
-            // TCK-00418: No evidence CAS in non-durable path; gate
+            // RFC-0032::REQ-0162: No evidence CAS in non-durable path; gate
             // orchestrator will need a fallback MemoryCas if wired here.
             evidence_cas: None,
             anti_entropy_pcac_gate,
@@ -1295,9 +1308,9 @@ impl DispatcherState {
     }
 
     /// Creates new dispatcher state with persistent ledger, CAS, and
-    /// `ToolBroker` (TCK-00316).
+    /// `ToolBroker` (RFC-0032::REQ-0110).
     ///
-    /// # TCK-00316: Session Dispatcher Viability
+    /// # RFC-0032::REQ-0110: Session Dispatcher Viability
     ///
     /// This constructor properly wires ALL production dependencies:
     /// - `ledger`: For `EmitEvent` persistence
@@ -1334,7 +1347,7 @@ impl DispatcherState {
     }
 
     /// Creates new dispatcher state with persistent ledger, CAS, and
-    /// adapter rotation config (TCK-00400).
+    /// adapter rotation config (RFC-0032::REQ-0152).
     #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
     pub fn with_persistence_and_cas_and_rotation(
         session_registry: Arc<dyn SessionRegistry>,
@@ -1355,7 +1368,7 @@ impl DispatcherState {
 
     /// Creates new dispatcher state with persistent ledger, CAS,
     /// `ToolBroker`, and an optional pre-existing ledger signing key
-    /// (TCK-00387 Security Review v5 MAJOR 2).
+    /// (RFC-0032::REQ-0141 Security Review v5 MAJOR 2).
     ///
     /// When `ledger_signing_key` is `Some`, that key is reused for the ledger
     /// event emitter instead of generating a new ephemeral one. This ensures
@@ -1378,20 +1391,22 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // TCK-00303: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
-        // TCK-00344: Clone session_registry before it is moved into the
+        // RFC-0032::REQ-0134: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
-        // TCK-00385 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
-        // stop()/quarantine() can call mark_terminated() in production.
+        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so
+        // that stop()/quarantine() can call mark_terminated() in production.
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
-        // TCK-00316: Create durable CAS
+        // RFC-0032::REQ-0110: Create durable CAS
         // Keep the concrete type so we can upcast to both executor and evidence
-        // CAS traits (TCK-00408: dispatcher needs evidence::ContentAddressedStore).
+        // CAS traits (RFC-0032::REQ-0156: dispatcher needs
+        // evidence::ContentAddressedStore).
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
         let durable_cas = Arc::new(DurableCas::new(cas_config)?);
         // Coerce to executor::ContentAddressedStore (infallible, daemon-local)
@@ -1399,11 +1414,11 @@ impl DispatcherState {
             Arc::clone(&durable_cas) as Arc<dyn ContentAddressedStore>;
         // Coerce to apm2_core::evidence::ContentAddressedStore (fallible, core)
         // Used by PrivilegedDispatcher for AgentAdapterProfileV1::load_from_cas
-        // and TCK-00408 fail-closed ingest/publish validation.
+        // and RFC-0032::REQ-0156 fail-closed ingest/publish validation.
         let evidence_cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
             Arc::clone(&durable_cas) as Arc<dyn apm2_core::evidence::ContentAddressedStore>;
 
-        // TCK-00289: Create shared HolonicClock
+        // RFC-0032::REQ-0091: Create shared HolonicClock
         let clock =
             Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
@@ -1428,7 +1443,7 @@ impl DispatcherState {
             signing_key,
         ));
 
-        // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
+        // RFC-0032::REQ-0110: Initialize EpisodeRuntime with CAS and handlers
         // Use safe production defaults:
         // - max_concurrent_episodes = 100 (thread exhaustion protection for sync
         //   dispatch)
@@ -1439,7 +1454,7 @@ impl DispatcherState {
             .with_cas(Arc::clone(&cas))
             .with_default_budget(crate::episode::EpisodeBudget::default());
 
-        // Register workspace-rooted tool handler factories (TCK-00319)
+        // Register workspace-rooted tool handler factories (RFC-0032::REQ-0113)
         // Use rooted factories that accept workspace_root at episode start time.
         // This ensures handlers are isolated to the episode's workspace, not the
         // daemon's CWD.
@@ -1454,7 +1469,7 @@ impl DispatcherState {
                 Box::new(WriteFileHandler::with_root(root))
             })
             // ExecuteHandler - executes commands within workspace
-            // TCK-00338: Env scrubbing + stall detection always active.
+            // RFC-0032::REQ-0129: Env scrubbing + stall detection always active.
             // Shell allowlist permissive (ToolBroker enforces manifest allowlists).
             .with_rooted_handler_factory(|root| {
                 Box::new(ExecuteHandler::with_root_and_sandbox(
@@ -1467,7 +1482,7 @@ impl DispatcherState {
                 Box::new(GitOperationHandler::with_root(root))
             })
             // ArtifactFetchHandler - CAS operations (not workspace-rooted)
-            // TCK-00336: Intentionally uses deprecated with_handler_factory because
+            // RFC-0032::REQ-0128: Intentionally uses deprecated with_handler_factory because
             // ArtifactFetchHandler accesses CAS (content-addressed store), not the
             // filesystem workspace. CAS access is safe without workspace rooting.
             ;
@@ -1483,13 +1498,13 @@ impl DispatcherState {
             .with_rooted_handler_factory(|root| {
                 Box::new(SearchHandler::with_root(root))
             })
-            // TCK-00385 BLOCKER 1: Wire session registry so stop()/quarantine()
+            // RFC-0032::REQ-0139 BLOCKER 1: Wire session registry so stop()/quarantine()
             // call mark_terminated() in production.
             .with_session_registry(session_registry_for_runtime);
 
-        // TCK-00399: Create adapter registry with explicit adapter registrations.
-        // MAJOR fix: Use explicit new() + register() instead of deprecated
-        // with_defaults() to avoid ambient defaults (DoD requires
+        // RFC-0032::REQ-0151: Create adapter registry with explicit adapter
+        // registrations. MAJOR fix: Use explicit new() + register() instead of
+        // deprecated with_defaults() to avoid ambient defaults (DoD requires
         // profile-explicit production path).
         let mut adapter_registry = crate::episode::AdapterRegistry::new();
         adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
@@ -1497,7 +1512,7 @@ impl DispatcherState {
             crate::episode::claude_code::ClaudeCodeAdapter::new(),
         ));
         adapter_registry.register(Box::new(crate::episode::codex_cli::CodexCliAdapter::new()));
-        // TCK-00400: Store all builtin adapter profiles in CAS at startup.
+        // RFC-0032::REQ-0152: Store all builtin adapter profiles in CAS at startup.
         let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref()).map_err(|e| {
             DurableCasError::InitializationFailed {
                 message: format!("builtin adapter profile CAS seeding failed: {e}"),
@@ -1513,7 +1528,7 @@ impl DispatcherState {
 
         let episode_runtime = Arc::new(episode_runtime);
 
-        // TCK-00343: Create credential store for credential management
+        // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
         let broker_github_store: Arc<dyn GitHubCredentialStore> = Arc::new(
             CredentialStoreGitHubAdapter::new(Arc::clone(&credential_store)),
@@ -1524,7 +1539,7 @@ impl DispatcherState {
         let session_broker_registry: SharedSessionBrokerRegistry<StubManifestLoader> =
             Arc::new(SessionBrokerRegistry::new());
 
-        // TCK-00352: Create shared V1 manifest store for scope enforcement
+        // RFC-0020::REQ-0006: Create shared V1 manifest store for scope enforcement
         let v1_manifest_store = Arc::new(V1ManifestStore::new());
 
         let mut privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
@@ -1538,7 +1553,7 @@ impl DispatcherState {
             Arc::clone(&clock),
             token_minter.clone(),
             manifest_store.clone(),
-            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            // RFC-0032::REQ-0111: Pre-seed CAS with reviewer v0 manifest
             Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             Arc::clone(&subscription_registry),
         )
@@ -1548,12 +1563,12 @@ impl DispatcherState {
         .with_broker_cas(Arc::clone(&cas))
         .with_broker_github_store(Arc::clone(&broker_github_store))
         .with_broker_ssh_store(Arc::clone(&broker_ssh_store))
-        // TCK-00408: Wire CAS into privileged dispatcher for fail-closed
+        // RFC-0032::REQ-0156: Wire CAS into privileged dispatcher for fail-closed
         // ingest/publish validation. Uses the core evidence trait impl.
         .with_cas(Arc::clone(&evidence_cas))
-        // TCK-00352: Wire V1 manifest store into production path
+        // RFC-0020::REQ-0006: Wire V1 manifest store into production path
         .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
-        // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
+        // RFC-0032::REQ-0151: Wire adapter registry and CAS for agent CLI process spawning
         .with_adapter_registry(adapter_registry)
         .with_adapter_selection_policy(
             adapter_selection_policy,
@@ -1562,7 +1577,7 @@ impl DispatcherState {
             Arc::clone(&evidence_cas),
         )
         .with_privileged_pcac_policy(PrivilegedPcacPolicy::default())
-        // TCK-00568: Wire default baseline economics profile control-plane
+        // RFC-0032::REQ-0219: Wire default baseline economics profile control-plane
         // limits into the dispatcher at startup. This ensures configured
         // budgets are enforced from daemon initialization (not deferred).
         .with_economics_control_plane_limits(
@@ -1576,17 +1591,17 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00384: Create shared telemetry store for session counters
+        // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // TCK-00351 v4: Create shared stop conditions store for per-session
+        // RFC-0020::REQ-0005 v4: Create shared stop conditions store for per-session
         // stop limits (max_episodes, escalation_predicate).
         let stop_conditions_store = Arc::new(SessionStopConditionsStore::new());
 
-        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // RFC-0020::REQ-0005 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
-        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // RFC-0020::REQ-0005 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
         // The gate evaluates budget availability but records
         // `budget_checked=false` because enforcement is deferred to
         // EpisodeRuntime.
@@ -1601,22 +1616,23 @@ impl DispatcherState {
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
-        // TCK-00384: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
-        // TCK-00351 v4: Wire stop conditions store into privileged dispatcher
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
+        // RFC-0020::REQ-0005 v4: Wire stop conditions store into privileged dispatcher
         privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
             .with_stop_conditions_store(Arc::clone(&stop_conditions_store))
             .with_stop_authority(Arc::clone(&stop_authority))
             .with_governance_freshness_monitor(Arc::clone(&governance_freshness_monitor));
 
-        // TCK-00316: Wire SessionDispatcher with all production dependencies
-        // TCK-00344: Wire session registry for SessionStatus queries
-        // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate, stop authority, stop conditions store
-        // TCK-00352: Wire V1 manifest store for scope enforcement
-        // TCK-00426 BLOCKER 1 FIX: Wire DurableKernel + FileBackedConsumeIndex
-        // in production constructor. The consume log path is co-located inside
+        // RFC-0032::REQ-0110: Wire SessionDispatcher with all production dependencies
+        // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries RFC-0020::REQ-0005: Wire pre-actuation gate,
+        // stop authority, stop conditions store RFC-0020::REQ-0006: Wire V1
+        // manifest store for scope enforcement RFC-0020::REQ-0045 BLOCKER 1
+        // FIX: Wire DurableKernel + FileBackedConsumeIndex in production
+        // constructor. The consume log path is co-located inside
         // the CAS directory to ensure per-instance isolation.
         let consume_log_path = cas_path.as_ref().join("pcac_consume.log");
         let durable_index = crate::pcac::FileBackedConsumeIndex::open(
@@ -1670,7 +1686,7 @@ impl DispatcherState {
                 .with_v1_manifest_store(v1_manifest_store)
                 .with_pcac_lifecycle_gate(pcac_gate);
 
-        // TCK-00494: Wire AdmissionKernel for plan/execute-gated admission.
+        // RFC-0032::REQ-0172: Wire AdmissionKernel for plan/execute-gated admission.
         // This is the CAS-backed production path — authoritative mode with
         // durable CAS requires fail-closed kernel gating.
         // The admission kernel uses a SEPARATE consume index file to avoid
@@ -1703,7 +1719,7 @@ impl DispatcherState {
                 provider_build_digest: *blake3::hash(b"apm2-daemon-build-v1").as_bytes(),
             };
 
-            // TCK-00496: Wire DurableQuarantineGuard for fail-closed quarantine
+            // RFC-0020::REQ-0057: Wire DurableQuarantineGuard for fail-closed quarantine
             // capacity reservation. The quarantine database is co-located inside
             // the CAS directory for per-instance isolation.
             let quarantine_db_path = cas_path.as_ref().join("quarantine_store.db");
@@ -1727,7 +1743,7 @@ impl DispatcherState {
                 })?,
             );
 
-            // TCK-00502: Wire DurableAntiRollbackAnchor for fail-closed
+            // RFC-0032::REQ-0177: Wire DurableAntiRollbackAnchor for fail-closed
             // external anchor verification. The anchor state file is
             // co-located inside the CAS directory for per-instance isolation.
             let anti_rollback_state_path = cas_path.as_ref().join("anti_rollback_anchor.json");
@@ -1745,7 +1761,7 @@ impl DispatcherState {
                 })?,
             );
 
-            // TCK-00501: Wire FileBackedEffectJournal for crash-safe
+            // RFC-0032::REQ-0176: Wire FileBackedEffectJournal for crash-safe
             // effect execution tracking. The journal file is co-located
             // inside the CAS directory for per-instance isolation.
             let effect_journal_path = cas_path.as_ref().join("effect.journal");
@@ -1781,11 +1797,11 @@ impl DispatcherState {
             session_dispatcher,
             gate_orchestrator: None,
             merge_executor: None,
-            // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
+            // RFC-0020::REQ-0005 MAJOR 2 FIX: Store shared stop authority for
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
             governance_freshness_monitor: Some(governance_freshness_monitor),
-            // TCK-00418: Share the durable evidence CAS so the gate
+            // RFC-0032::REQ-0162: Share the durable evidence CAS so the gate
             // orchestrator writes time-envelope artifacts into the same
             // store the dispatcher reads during `validate_lease_time_authority`.
             evidence_cas: Some(evidence_cas),
@@ -1799,7 +1815,7 @@ impl DispatcherState {
         stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
     ) -> Arc<GovernanceFreshnessMonitor> {
         // Phase-1 resolver is transitional-local until authenticated governance
-        // transport is implemented (TCK-00364).
+        // transport is implemented (RFC-0020::REQ-0018).
         let transitional_resolver = true;
         let config = GovernanceFreshnessConfig {
             poll_interval_ms: GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS,
@@ -1881,7 +1897,7 @@ impl DispatcherState {
         }
     }
 
-    /// Sets the daemon state for process management (TCK-00342).
+    /// Sets the daemon state for process management (RFC-0032::REQ-0132).
     ///
     /// When set, process management handlers (`ListProcesses`,
     /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
@@ -1893,8 +1909,8 @@ impl DispatcherState {
         self
     }
 
-    /// TCK-00631: Freeze legacy `ledger_events` writes on both the event
-    /// emitter and lease validator.
+    /// RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the
+    /// event emitter and lease validator.
     ///
     /// Called from daemon startup after RFC-0032 Phase 0 migration completes.
     /// After this call, all new appends route to the canonical `events` table.
@@ -1926,7 +1942,7 @@ impl DispatcherState {
         }
     }
 
-    /// Configures TCK-00565 token binding fields on the dispatcher.
+    /// Configures RFC-0032::REQ-0216 token binding fields on the dispatcher.
     ///
     /// Sets the `boundary_id` and policy digest used when issuing tokens
     /// through the daemon dispatch path. Without this, tokens use the
@@ -1961,7 +1977,8 @@ impl DispatcherState {
         self
     }
 
-    /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    /// Sets the gate orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// Gate start is publication-driven via
     /// [`GateOrchestrator::start_for_changeset`]. Session termination only
@@ -1988,7 +2005,7 @@ impl DispatcherState {
         self.gate_orchestrator.as_ref()
     }
 
-    /// Returns the shared evidence CAS, if configured (TCK-00418).
+    /// Returns the shared evidence CAS, if configured (RFC-0032::REQ-0162).
     ///
     /// The gate orchestrator MUST use this CAS so that
     /// `time_envelope_ref` hashes it stores are resolvable by the
@@ -1999,7 +2016,7 @@ impl DispatcherState {
     }
 
     /// Sets the merge executor for autonomous merge after gate approval
-    /// (TCK-00390).
+    /// (RFC-0032::REQ-0144).
     ///
     /// When set, [`merge_executor`](Self::merge_executor) returns the executor
     /// that the caller can invoke to trigger the autonomous merge lifecycle
@@ -2017,7 +2034,7 @@ impl DispatcherState {
     }
 
     /// Sets the divergence watchdog for IPC-accessible unfreeze and durable
-    /// recovery evidence registration (TCK-00469).
+    /// recovery evidence registration (RFC-0020::REQ-0051).
     ///
     /// When set, operator IPC handlers can invoke
     /// `register_durable_recovery_evidence`, `create_unfreeze`, and
@@ -2028,7 +2045,7 @@ impl DispatcherState {
         mut self,
         watchdog: Arc<DivergenceWatchdog<SystemTimeSource>>,
     ) -> Self {
-        // TCK-00469: Wire watchdog into privileged dispatcher so
+        // RFC-0020::REQ-0051: Wire watchdog into privileged dispatcher so
         // RegisterRecoveryEvidence and RequestUnfreeze handlers can call
         // through to the watchdog methods.
         self.privileged_dispatcher = self
@@ -2076,7 +2093,7 @@ impl DispatcherState {
     /// Returns the shared subscription registry for connection lifecycle
     /// management.
     ///
-    /// # TCK-00303: Connection Cleanup
+    /// # RFC-0032::REQ-0099: Connection Cleanup
     ///
     /// When a connection closes, the connection handler MUST call
     /// `unregister_connection(connection_id)` on this registry to free
@@ -2087,7 +2104,7 @@ impl DispatcherState {
     }
 
     /// Returns the ledger event emitter from the privileged dispatcher
-    /// (TCK-00348).
+    /// (RFC-0020::REQ-0002).
     ///
     /// Used by the connection handler to persist contract binding events
     /// after successful handshake.
@@ -2096,8 +2113,8 @@ impl DispatcherState {
         self.privileged_dispatcher.event_emitter()
     }
 
-    /// Returns the shared stop authority for runtime mutation (TCK-00351
-    /// MAJOR 2 FIX).
+    /// Returns the shared stop authority for runtime mutation
+    /// (RFC-0020::REQ-0005 MAJOR 2 FIX).
     ///
     /// Operator/governance control-plane paths use this to flip stop flags
     /// at runtime.  Changes are immediately visible to the pre-actuation
@@ -2230,16 +2247,16 @@ pub struct DaemonStateHandle {
     /// Time when the daemon started.
     started_at: DateTime<Utc>,
     /// Schema registry (shared across the daemon lifetime).
-    /// Used by future handlers for schema validation (TCK-00181).
+    /// Used by future handlers for schema validation (RFC-0033::REQ-0045).
     #[allow(dead_code)]
     schema_registry: InMemorySchemaRegistry,
-    /// Session registry for RFC-0017 control-plane IPC (TCK-00266).
+    /// Session registry for RFC-0017 control-plane IPC (RFC-0032::REQ-0082).
     /// This is either a persistent or in-memory registry based on
     /// configuration. Will be used when RFC-0017 protobuf IPC is fully
     /// wired up.
     #[allow(dead_code)]
     session_registry: Arc<dyn SessionRegistry>,
-    /// Metrics registry for daemon health observability (TCK-00268).
+    /// Metrics registry for daemon health observability (RFC-0032::REQ-0084).
     /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
     #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
     metrics_registry: Option<SharedMetricsRegistry>,
@@ -2275,7 +2292,7 @@ impl DaemonStateHandle {
 
     /// Create a new daemon state handle with a persistent session registry.
     ///
-    /// # TCK-00266
+    /// # RFC-0032::REQ-0082
     ///
     /// This constructor loads existing session state from the state file
     /// (if it exists) and persists new sessions to disk. Use this for
@@ -2310,7 +2327,8 @@ impl DaemonStateHandle {
     }
 
     /// Get a reference to the schema registry.
-    /// Will be used by future handlers for schema validation (TCK-00181).
+    /// Will be used by future handlers for schema validation
+    /// (RFC-0033::REQ-0045).
     #[must_use]
     #[allow(dead_code)]
     pub const fn schema_registry(&self) -> &InMemorySchemaRegistry {
@@ -2319,7 +2337,7 @@ impl DaemonStateHandle {
 
     /// Get a reference to the session registry.
     ///
-    /// # TCK-00266
+    /// # RFC-0032::REQ-0082
     ///
     /// Returns the session registry for RFC-0017 control-plane IPC.
     /// This may be either a persistent or in-memory registry depending
@@ -2332,7 +2350,7 @@ impl DaemonStateHandle {
 
     /// Get a reference to the metrics registry.
     ///
-    /// # TCK-00268
+    /// # RFC-0032::REQ-0084
     ///
     /// Returns the metrics registry for daemon health observability.
     /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
@@ -2347,7 +2365,8 @@ impl DaemonStateHandle {
         self.inner.read().await
     }
 
-    /// Try to get read access to the inner state without blocking (TCK-00342).
+    /// Try to get read access to the inner state without blocking
+    /// (RFC-0032::REQ-0132).
     ///
     /// Returns `None` if the write lock is currently held. This is used by
     /// synchronous dispatch handlers that cannot `.await`.
@@ -2356,7 +2375,8 @@ impl DaemonStateHandle {
         self.inner.try_read().ok()
     }
 
-    /// Try to get write access to the inner state without blocking (TCK-00342).
+    /// Try to get write access to the inner state without blocking
+    /// (RFC-0032::REQ-0132).
     ///
     /// Returns `None` if any lock (read or write) is currently held. This is
     /// used by synchronous dispatch handlers for process state mutations

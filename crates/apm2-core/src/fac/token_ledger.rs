@@ -1,8 +1,8 @@
 //! Token replay protection: broker-side one-time use ledger + revocation.
 //!
-//! Implements TCK-00566: a bounded, TTL-evicting ledger that tracks issued
-//! and consumed token nonces to detect and deny replay attempts. The broker
-//! registers each nonce at issuance time in an `Issued` state; when the
+//! Implements RFC-0032::REQ-0217: a bounded, TTL-evicting ledger that tracks
+//! issued and consumed token nonces to detect and deny replay attempts. The
+//! broker registers each nonce at issuance time in an `Issued` state; when the
 //! worker validates and consumes the token, the entry transitions to
 //! `Consumed`. A second presentation of the same nonce is denied.
 //!
@@ -554,7 +554,7 @@ impl TokenUseLedger {
     /// [`TokenLedgerError::TokenRevoked`].
     ///
     /// If the nonce is in `Issued` state, transitions it to `Consumed`.
-    /// If the nonce is not found (pre-TCK-00566 token without issuance
+    /// If the nonce is not found (pre-RFC-0032::REQ-0217 token without issuance
     /// registration), creates a new `Consumed` entry.
     ///
     /// Returns a WAL entry for the caller to persist.
@@ -607,7 +607,7 @@ impl TokenUseLedger {
             });
         }
 
-        // Nonce not in ledger (pre-TCK-00566 token or nonce registered
+        // Nonce not in ledger (pre-RFC-0032::REQ-0217 token or nonce registered
         // on a different broker instance). Create a Consumed entry directly.
         while self.entries.len() >= MAX_LEDGER_ENTRIES {
             if let Some((old_nonce, _)) = self.insertion_order.pop_front() {
@@ -845,7 +845,7 @@ impl Default for TokenUseLedger {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence (TCK-00566: durable ledger with WAL)
+// Persistence (RFC-0032::REQ-0217: durable ledger with WAL)
 // ---------------------------------------------------------------------------
 
 /// Maximum size in bytes for the persisted token ledger file.
@@ -1695,7 +1695,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Persistence (TCK-00566: durable ledger)
+    // Persistence (RFC-0032::REQ-0217: durable ledger)
     // -----------------------------------------------------------------------
 
     #[test]

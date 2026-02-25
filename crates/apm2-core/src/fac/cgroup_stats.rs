@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Cgroup v2 usage accounting for FAC job receipts (TCK-00572).
+//! Cgroup v2 usage accounting for FAC job receipts (RFC-0032::REQ-0222).
 //!
 //! This module provides best-effort collection of runtime resource stats
 //! from a job unit's cgroup v2 hierarchy. Collected stats feed economics

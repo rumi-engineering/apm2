@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Tests for PCAC core schemas and deny taxonomy (TCK-00422).
+//! Tests for PCAC core schemas and deny taxonomy (RFC-0020::REQ-0041).
 
 use super::*;
 use crate::crypto::Hash;
@@ -3545,7 +3545,7 @@ fn batched_pointer_all_valid_merkle_steps_passes() {
 }
 
 // =============================================================================
-// Receipt authentication composition tests (TCK-00425)
+// Receipt authentication composition tests (RFC-0020::REQ-0044)
 // =============================================================================
 
 const AUTHV_SEAL: Hash = [0xDD; 32];

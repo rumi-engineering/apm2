@@ -341,7 +341,7 @@ impl ProtocolServer {
         // Accept connection
         let (stream, _addr) = self.listener.accept().await?;
 
-        // Extract peer credentials (TCK-00248)
+        // Extract peer credentials (RFC-0032::REQ-0064)
         // Connections without valid credentials are rejected (fail-closed)
         let creds = PeerCredentials::from_stream(&stream).map_err(|e| {
             ProtocolError::Io(io::Error::new(
@@ -350,7 +350,7 @@ impl ProtocolServer {
             ))
         })?;
 
-        // Validate UID before handshake (TCK-00248, SEC-DCP-001/002)
+        // Validate UID before handshake (RFC-0032::REQ-0064, SEC-DCP-001/002)
         // This rejects unauthorized peers BEFORE they can send any frames.
         // Uses constant-time comparison to prevent timing attacks.
         let current_uid = getuid().as_raw();
@@ -969,8 +969,8 @@ mod tests {
         }
     }
 
-    /// Test that UID validation uses constant-time comparison (TCK-00248,
-    /// SEC-DCP-002).
+    /// Test that UID validation uses constant-time comparison
+    /// (RFC-0032::REQ-0064, SEC-DCP-002).
     ///
     /// This unit test verifies the constant-time comparison logic by testing
     /// that the XOR-based byte comparison works correctly for matching and
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     /// Test that `accept()` extracts and validates peer credentials
-    /// (TCK-00248).
+    /// (RFC-0032::REQ-0064).
     ///
     /// Since we can't easily simulate a UID mismatch in tests (both ends
     /// of the socket are this process), this test verifies:

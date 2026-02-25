@@ -31,7 +31,7 @@
 //!
 //! # Design
 //!
-//! The budget system integrates with the policy layer (TCK-00010) to:
+//! The budget system integrates with the policy layer (RFC-0011::REQ-0030) to:
 //! 1. Check budgets before allowing tool requests
 //! 2. Charge consumption after successful operations
 //! 3. Emit events when budgets are exceeded

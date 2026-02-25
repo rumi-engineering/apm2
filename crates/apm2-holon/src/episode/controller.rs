@@ -451,7 +451,8 @@ impl EpisodeController {
     /// execution context will need to propagate pack miss information back
     /// to the controller.
     ///
-    /// See TCK-00138 for the foundational receipt/defect infrastructure.
+    /// See RFC-0011::REQ-0015 for the foundational receipt/defect
+    /// infrastructure.
     #[allow(dead_code)] // Foundational plumbing - integration pending artifact fetch impl
     pub fn record_pack_miss(
         builder: &mut RunReceiptBuilder,

@@ -1,7 +1,7 @@
 //! Orchestration state machine for FAC revision loops.
 //!
 //! This module implements the orchestration layer for Forge Admission Cycle
-//! (FAC) revision loops as specified in RFC-0019 and TCK-00332. The
+//! (FAC) revision loops as specified in RFC-0019 and RFC-0032::REQ-0125. The
 //! orchestrator drives implementer + reviewer episodes iteratively until a
 //! terminal condition is reached.
 //!

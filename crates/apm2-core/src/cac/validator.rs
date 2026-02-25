@@ -874,7 +874,7 @@ mod tests {
         let valid = json!({
             "ticket_meta": {
                 "ticket": {
-                    "id": "TCK-00128",
+                    "id": "TCK-00001",
                     "title": "Implement CAC JSON Schema validator"
                 }
             }
@@ -899,7 +899,7 @@ mod tests {
         let unknown_field = json!({
             "ticket_meta": {
                 "ticket": {
-                    "id": "TCK-00128",
+                    "id": "TCK-00001",
                     "title": "Test",
                     "assignee": "unknown"
                 }

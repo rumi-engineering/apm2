@@ -1,6 +1,7 @@
 //! Evidence gates (fmt, clippy, doc, test, native checks) for FAC push
 //! pipeline.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -28,8 +29,8 @@ use super::bounded_test_runner::{
 };
 use super::ci_status::{CiStatus, PrBodyStatusUpdater};
 use super::gate_attestation::{
-    GateResourcePolicy, build_nextest_command, compute_gate_attestation,
-    gate_command_for_attestation, short_digest,
+    FAST_GATES_NEXTEST_PROFILE, GateResourcePolicy, build_nextest_command,
+    compute_gate_attestation, gate_command_for_attestation, short_digest,
 };
 use super::gate_cache::{CacheSource, GateCache, ReuseDecision};
 use super::gate_checks;
@@ -43,9 +44,10 @@ use super::timeout_policy::{
 use super::types::now_iso8601;
 
 /// Env var keys unconditionally stripped from ALL gate phases as
-/// defense-in-depth against wrapper injection (TCK-00526, TCK-00548). These are
-/// stripped by `build_job_environment` at the policy level AND by
-/// `env_remove()` on the spawned `Command` for belt-and-suspenders containment.
+/// defense-in-depth against wrapper injection (RFC-0032::REQ-0185,
+/// RFC-0032::REQ-0203). These are stripped by `build_job_environment` at the
+/// policy level AND by `env_remove()` on the spawned `Command` for
+/// belt-and-suspenders containment.
 const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 
 /// Prefix for env vars unconditionally stripped from ALL gate phases.
@@ -112,7 +114,7 @@ pub enum GateProgressEvent {
         passed: bool,
         duration_secs: u64,
         error_hint: Option<String>,
-        /// Structured cache reuse decision (TCK-00626, REQ-0037).
+        /// Structured cache reuse decision (RFC-0032::REQ-0257, REQ-0037).
         /// Present when a cache lookup was performed for this gate.
         /// Used by the gates.rs callback handler in non-test builds.
         #[cfg_attr(test, allow(dead_code))]
@@ -130,7 +132,7 @@ pub struct EvidenceGateOptions {
     pub test_command_environment: Vec<(String, String)>,
     /// Env var keys to remove from the spawned test process environment.
     /// Prevents parent process env inheritance of `sccache`/`RUSTC_WRAPPER`
-    /// keys that could bypass cgroup containment (TCK-00548).
+    /// keys that could bypass cgroup containment (RFC-0032::REQ-0203).
     pub env_remove_keys: Vec<String>,
     /// Optional base unit name used for deterministic bounded gate units.
     /// When set, non-test bounded units are named `<base>-<gate_name>`.
@@ -151,11 +153,11 @@ pub struct EvidenceGateOptions {
     /// progress instead of buffering all events until `run_evidence_gates`
     /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
-    /// TCK-00540 fix round 3: Gate resource policy for attestation digest
-    /// computation during cache-reuse decisions. When `Some`, enables
-    /// cache-reuse in `run_evidence_gates_with_lane_context` so that the
-    /// fail-closed receipt-binding policy is evaluated against attested cache
-    /// entries.
+    /// RFC-0032::REQ-0196 fix round 3: Gate resource policy for attestation
+    /// digest computation during cache-reuse decisions. When `Some`,
+    /// enables cache-reuse in `run_evidence_gates_with_lane_context` so
+    /// that the fail-closed receipt-binding policy is evaluated against
+    /// attested cache entries.
     pub gate_resource_policy: Option<GateResourcePolicy>,
 }
 
@@ -170,7 +172,7 @@ pub struct EvidenceGateResult {
     pub bytes_total: Option<u64>,
     pub was_truncated: Option<bool>,
     pub log_bundle_hash: Option<String>,
-    /// Structured cache reuse decision (TCK-00626, REQ-0037).
+    /// Structured cache reuse decision (RFC-0032::REQ-0257, REQ-0037).
     /// Present when a cache lookup was performed for this gate.
     pub cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision>,
 }
@@ -316,29 +318,32 @@ fn gate_attestation_digest(
 }
 
 // NOTE: `reuse_decision_for_gate` (v2-only reuse path) was removed as part
-// of the TCK-00541 MAJOR security fix. V2 entries lack RFC-0028/0029
+// of the RFC-0032::REQ-0197 MAJOR security fix. V2 entries lack RFC-0028/0029
 // binding proof and cannot satisfy v3 compound-key continuity. All reuse
 // decisions now flow through `reuse_decision_with_v3_fallback` which
 // only allows v3-native entries to satisfy reuse.
 
 // =============================================================================
-// Gate Cache V3 helpers (TCK-00541)
+// Gate Cache V3 helpers (RFC-0032::REQ-0197)
 // =============================================================================
 
 /// Compute a toolchain fingerprint from `rustc --version --verbose` output.
 ///
-/// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc
-/// is not available (fail-closed: different key from any real toolchain).
-pub(super) fn compute_toolchain_fingerprint() -> String {
-    // Use CWD="/" to ensure rustup resolves the default toolchain regardless of
-    // where the caller is invoked from.  Without this, rustup picks up the
-    // nearest rust-toolchain.toml (e.g. nightly from the repo root) while the
-    // worker process runs from $HOME and always gets the stable toolchain,
-    // producing a different fingerprint and a V3 gate-cache lookup miss.
-    let output = std::process::Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .current_dir("/")
-        .output();
+/// The probe is pinned to the workspace-declared toolchain when
+/// `rust-toolchain(.toml)` exists, avoiding stable/nightly drift between
+/// contexts that would otherwise poison cache locality.
+///
+/// Returns a BLAKE3 hex digest. Falls back to a hash of "unknown" if rustc is
+/// not available (fail-closed: different key from any real toolchain).
+pub(super) fn compute_toolchain_fingerprint_for_workspace(workspace_root: &Path) -> String {
+    let mut command = std::process::Command::new("rustc");
+    command.args(["--version", "--verbose"]);
+    if let Some(toolchain) =
+        super::policy_loader::resolve_workspace_rustup_toolchain(workspace_root)
+    {
+        command.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    let output = command.output();
     let version_bytes = match &output {
         Ok(o) if o.status.success() => &o.stdout[..],
         _ => b"unknown-toolchain",
@@ -347,6 +352,13 @@ pub(super) fn compute_toolchain_fingerprint() -> String {
     hasher.update(b"apm2.fac.toolchain_fingerprint:");
     hasher.update(version_bytes);
     format!("b3-256:{}", hasher.finalize().to_hex())
+}
+
+/// Compute toolchain fingerprint using the current process working directory as
+/// workspace hint.
+pub(super) fn compute_toolchain_fingerprint() -> String {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    compute_toolchain_fingerprint_for_workspace(&workspace_root)
 }
 
 /// Compute a v3 compound key from the evidence pipeline context.
@@ -361,13 +373,14 @@ pub(super) fn compute_toolchain_fingerprint() -> String {
 /// `rfc0029_receipt_bound` flags on each `V3GateResult`, validated by
 /// `check_reuse()`.
 pub(super) fn compute_v3_compound_key(
+    workspace_root: &Path,
     sha: &str,
     fac_policy: &FacPolicyV1,
     sandbox_hardening_hash: &str,
     network_policy_hash: &str,
 ) -> Option<V3CompoundKey> {
     let policy_hash = apm2_core::fac::compute_policy_hash(fac_policy).ok()?;
-    let toolchain = compute_toolchain_fingerprint();
+    let toolchain = compute_toolchain_fingerprint_for_workspace(workspace_root);
     V3CompoundKey::new(
         sha,
         &policy_hash,
@@ -385,15 +398,16 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 }
 
 // cache_v2_root removed: v2 fallback loading disabled in evidence pipeline
-// ([INV-GCV3-001] TCK-00541 MAJOR security fix round 4). V2 entries lack
-// RFC-0028/0029 binding proof and cannot satisfy v3 compound-key continuity.
+// ([INV-GCV3-001] RFC-0032::REQ-0197 MAJOR security fix round 4). V2 entries
+// lack RFC-0028/0029 binding proof and cannot satisfy v3 compound-key
+// continuity.
 
 /// Try to reuse from v3 cache; v2 is structurally excluded.
 ///
 /// Returns a unified `ReuseDecision` that can be used by the evidence flow.
 /// When v3 hits, the v3 decision reason is used.
 ///
-/// # Security: V2 structurally excluded (TCK-00541 MAJOR fix round 4)
+/// # Security: V2 structurally excluded (RFC-0032::REQ-0197 MAJOR fix round 4)
 ///
 /// [INV-GCV3-001] V2 entries lack RFC-0028/0029 binding proof and cannot
 /// satisfy v3 compound-key continuity requirements. As of round 4, v2
@@ -420,9 +434,9 @@ fn reuse_decision_with_v3_fallback(
 ) {
     // Try v3 first.
     //
-    // TCK-00626 round 5: check_reuse now returns CacheDecision directly
+    // RFC-0032::REQ-0257 round 5: check_reuse now returns CacheDecision directly
     // (the old check_reuse_decision wrapper was eliminated). The single
-    // check_reuse method performs all checks in the correct TCK-00626 S2
+    // check_reuse method performs all checks in the correct RFC-0032::REQ-0257 S2
     // order (gate_miss -> signature -> receipt_binding -> drift -> TTL)
     // and returns a structured CacheDecision with first_mismatch_dimension.
     if let Some(v3) = v3_cache {
@@ -587,7 +601,7 @@ fn run_gate_command_with_heartbeat(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // TCK-00526: When a policy-filtered environment is provided, clear
+    // RFC-0032::REQ-0185: When a policy-filtered environment is provided, clear
     // the inherited environment first (default-deny) and then apply only
     // the policy-approved variables. Without env_clear(), Command::env()
     // adds to the inherited environment, leaking ambient secrets into
@@ -600,7 +614,7 @@ fn run_gate_command_with_heartbeat(
     }
 
     // Strip env vars that must not be inherited by the bounded test
-    // process (e.g. RUSTC_WRAPPER, SCCACHE_* — TCK-00548).
+    // process (e.g. RUSTC_WRAPPER, SCCACHE_* — RFC-0032::REQ-0203).
     // When env_clear() is active this is defense-in-depth; when extra_env
     // is None (legacy callers) it prevents specific keys from leaking.
     if let Some(keys) = env_remove_keys {
@@ -1202,16 +1216,18 @@ struct PipelineTestCommand {
     test_env: Vec<(String, String)>,
     /// Env var keys to remove from the spawned process environment.
     /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
-    /// that could bypass the bounded test's cgroup containment (TCK-00548).
+    /// that could bypass the bounded test's cgroup containment
+    /// (RFC-0032::REQ-0203).
     env_remove_keys: Vec<String>,
     /// BLAKE3 hex hash of the effective `SandboxHardeningProfile` used for
     /// bounded test execution. Carried through so attestation binds to the
-    /// actual policy-driven profile, not a default (TCK-00573 MAJOR-1 fix).
+    /// actual policy-driven profile, not a default (RFC-0032::REQ-0223 MAJOR-1
+    /// fix).
     sandbox_hardening_hash: String,
     /// BLAKE3 hex hash of the effective `NetworkPolicy` used for gate
     /// execution. Carried through so attestation binds to the actual
     /// policy-driven network posture, preventing cache reuse across
-    /// policy drift (TCK-00574 MAJOR-1 fix).
+    /// policy drift (RFC-0032::REQ-0224 MAJOR-1 fix).
     network_policy_hash: String,
 }
 
@@ -1257,30 +1273,37 @@ fn build_pipeline_test_command(
     let effective_cpu_quota = format!("{}%", execution_profile.cpu_quota_percent);
     let lane_env = compute_test_env_for_parallelism(execution_profile.test_parallelism);
 
-    // TCK-00526: Build policy-filtered environment.
+    // RFC-0032::REQ-0185: Build policy-filtered environment.
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // TCK-00575: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
-    // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
-    // to maintain lock/env coupling (round 2 fix: was previously hardcoded
-    // to lane-00).
-    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
+    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR,
+    // XDG_CACHE_HOME, XDG_CONFIG_HOME). Uses the lane directory from the
+    // actually-locked lane to maintain lock/env coupling (round 2 fix: was
+    // previously hardcoded to lane-00).
+    super::policy_loader::apply_review_lane_environment(
+        &mut policy_env,
+        lane_dir,
+        workspace_root,
+        &ambient,
+    )?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir, workspace_root)?;
 
     for (key, value) in &lane_env {
         policy_env.insert(key.clone(), value.clone());
     }
     let mut test_env: Vec<(String, String)> = policy_env.into_iter().collect();
 
-    // TCK-00573 MAJOR-1 fix: compute the effective sandbox hardening hash
+    // RFC-0032::REQ-0223 MAJOR-1 fix: compute the effective sandbox hardening hash
     // BEFORE the profile is moved into build_systemd_bounded_test_command,
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // TCK-00574: Resolve network policy for evidence gates with operator override.
-    // Compute the hash BEFORE the policy is moved into the bounded test command
-    // builder, so attestation binds to the actual policy-driven network posture
-    // (MAJOR-1 fix: attestation digest must change when network policy changes).
+    // RFC-0032::REQ-0224: Resolve network policy for evidence gates with operator
+    // override. Compute the hash BEFORE the policy is moved into the bounded
+    // test command builder, so attestation binds to the actual policy-driven
+    // network posture (MAJOR-1 fix: attestation digest must change when network
+    // policy changes).
     let evidence_network_policy =
         apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
     let network_policy_hash = evidence_network_policy.content_hash_hex();
@@ -1315,6 +1338,44 @@ fn build_pipeline_test_command(
         sandbox_hardening_hash,
         network_policy_hash,
     })
+}
+
+pub(super) fn apply_lane_compiler_cache_env(
+    policy_env: &mut std::collections::BTreeMap<String, String>,
+    lane_dir: &Path,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let (_, fac_root) = resolve_pipeline_roots_from_lane_dir(lane_dir)?;
+    let toolchain_fingerprint = compute_toolchain_fingerprint_for_workspace(workspace_root);
+    let target_dir_name = apm2_core::fac::fingerprint_short_hex(&toolchain_fingerprint)
+        .map_or_else(|| "target".to_string(), |hex16| format!("target-{hex16}"));
+    let workspace_cache_key = workspace_target_cache_key(workspace_root);
+    let cargo_target_dir = fac_root
+        .join("target_cache")
+        .join(workspace_cache_key)
+        .join(target_dir_name);
+    fs::create_dir_all(&cargo_target_dir).map_err(|err| {
+        format!(
+            "cannot create lane CARGO_TARGET_DIR {}: {err}",
+            cargo_target_dir.display()
+        )
+    })?;
+    policy_env.insert("CARGO_INCREMENTAL".to_string(), "1".to_string());
+    policy_env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        cargo_target_dir.to_string_lossy().into_owned(),
+    );
+    Ok(())
+}
+
+fn workspace_target_cache_key(workspace_root: &Path) -> String {
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"apm2.fac.workspace_target_cache.v1:");
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    format!("ws-{}", hasher.finalize().to_hex())
 }
 
 fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -1363,8 +1424,357 @@ fn resolve_pipeline_roots_from_lane_dir(lane_dir: &Path) -> Result<(PathBuf, Pat
     Ok((apm2_home.to_path_buf(), fac_root.to_path_buf()))
 }
 
-fn resolve_evidence_test_command_override(test_command_override: Option<&[String]>) -> Vec<String> {
-    test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoGateExecutionScope {
+    FullWorkspace,
+    ScopedPackages(Vec<String>),
+    NoCargoImpact,
+}
+
+impl CargoGateExecutionScope {
+    fn summary(&self) -> String {
+        match self {
+            Self::FullWorkspace => "full_workspace".to_string(),
+            Self::ScopedPackages(packages) => {
+                format!("scoped_packages({})", packages.join(","))
+            },
+            Self::NoCargoImpact => "no_cargo_impact".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CargoMetadataPackage {
+    name: String,
+    manifest_path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CargoMetadataDocument {
+    packages: Vec<CargoMetadataPackage>,
+}
+
+#[derive(Debug, Clone)]
+struct Phase2GateSpec {
+    gate_name: &'static str,
+    command: Vec<String>,
+    skip_reason: Option<&'static str>,
+}
+
+fn resolve_cargo_gate_execution_scope(workspace_root: &Path) -> CargoGateExecutionScope {
+    resolve_cargo_gate_execution_scope_with(workspace_root)
+        .unwrap_or(CargoGateExecutionScope::FullWorkspace)
+}
+
+fn resolve_cargo_gate_execution_scope_with(
+    workspace_root: &Path,
+) -> Result<CargoGateExecutionScope, String> {
+    let package_dirs = resolve_workspace_package_dirs(workspace_root)?;
+    let diff_range = resolve_cargo_scope_diff_range(workspace_root)?;
+    let changed_paths = load_changed_paths(workspace_root, &diff_range)?;
+    Ok(classify_cargo_gate_scope(&changed_paths, &package_dirs))
+}
+
+fn resolve_workspace_package_dirs(workspace_root: &Path) -> Result<Vec<(String, String)>, String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute cargo metadata: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "failed to resolve workspace package metadata: {}",
+            if stderr.is_empty() {
+                "cargo metadata returned non-zero status".to_string()
+            } else {
+                stderr
+            }
+        ));
+    }
+    let metadata: CargoMetadataDocument = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse cargo metadata output: {err}"))?;
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut dirs = metadata
+        .packages
+        .into_iter()
+        .filter_map(|package| {
+            let manifest = PathBuf::from(package.manifest_path);
+            let relative_manifest = manifest
+                .strip_prefix(&canonical_workspace_root)
+                .ok()
+                .or_else(|| manifest.strip_prefix(workspace_root).ok())?;
+            let relative_dir = relative_manifest.parent()?;
+            let dir = relative_dir.to_string_lossy().replace('\\', "/");
+            if dir.is_empty() {
+                return None;
+            }
+            Some((dir, package.name))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort_by(|left, right| {
+        right
+            .0
+            .len()
+            .cmp(&left.0.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(dirs)
+}
+
+fn resolve_cargo_scope_diff_range(workspace_root: &Path) -> Result<String, String> {
+    let mut base_ref = None;
+    for candidate in ["origin/main", "main"] {
+        let probe = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{candidate}^{{commit}}"),
+            ])
+            .current_dir(workspace_root)
+            .output()
+            .map_err(|err| format!("failed to execute git rev-parse: {err}"))?;
+        if probe.status.success() {
+            base_ref = Some(candidate.to_string());
+            break;
+        }
+    }
+    let resolved_base_ref = base_ref.unwrap_or_else(|| "HEAD^".to_string());
+    let merge_base = Command::new("git")
+        .args(["merge-base", "HEAD", &resolved_base_ref])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute git merge-base: {err}"))?;
+    if !merge_base.status.success() {
+        return Err(format!(
+            "failed to resolve merge-base against `{resolved_base_ref}`"
+        ));
+    }
+    let base = String::from_utf8_lossy(&merge_base.stdout)
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        return Err("git merge-base returned an empty base commit".to_string());
+    }
+    Ok(format!("{base}..HEAD"))
+}
+
+fn load_changed_paths(workspace_root: &Path, diff_range: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=ACMR", diff_range])
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|err| format!("failed to execute git diff for cargo scope: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "failed to resolve changed files for cargo scope: {}",
+            if stderr.is_empty() {
+                "git diff returned non-zero status".to_string()
+            } else {
+                stderr
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn classify_cargo_gate_scope(
+    changed_paths: &[String],
+    package_dirs: &[(String, String)],
+) -> CargoGateExecutionScope {
+    if changed_paths.is_empty() {
+        return CargoGateExecutionScope::NoCargoImpact;
+    }
+    let mut packages = BTreeSet::new();
+    for path in changed_paths {
+        if path_requires_full_workspace(path) {
+            return CargoGateExecutionScope::FullWorkspace;
+        }
+        if path_is_non_cargo_impact(path) {
+            continue;
+        }
+        if let Some(package_name) = package_for_path(path, package_dirs) {
+            packages.insert(package_name.to_string());
+            continue;
+        }
+        return CargoGateExecutionScope::FullWorkspace;
+    }
+    if packages.is_empty() {
+        CargoGateExecutionScope::NoCargoImpact
+    } else {
+        CargoGateExecutionScope::ScopedPackages(packages.into_iter().collect())
+    }
+}
+
+fn path_requires_full_workspace(path: &str) -> bool {
+    if matches!(
+        path,
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "rust-toolchain.toml"
+            | "rustfmt.toml"
+            | ".config/nextest.toml"
+    ) {
+        return true;
+    }
+    path.starts_with(".cargo/") || path.starts_with("proto/") || path.ends_with("/Cargo.toml")
+}
+
+fn path_is_non_cargo_impact(path: &str) -> bool {
+    if matches!(
+        path,
+        "AGENTS.md"
+            | "AGENTS.json"
+            | "README.md"
+            | "SECURITY.md"
+            | "DAEMON.md"
+            | "LICENSE-APACHE"
+            | "LICENSE-MIT"
+    ) {
+        return true;
+    }
+    if path.ends_with("/AGENTS.md") || path.ends_with("/AGENTS.json") {
+        return true;
+    }
+    path.starts_with("documents/")
+        || path.starts_with("deploy/")
+        || path.starts_with(".github/")
+        || path.starts_with("contrib/")
+        || path.starts_with("evidence/")
+}
+
+fn package_for_path<'a>(path: &str, package_dirs: &'a [(String, String)]) -> Option<&'a str> {
+    let normalized = path.replace('\\', "/");
+    for (dir, package_name) in package_dirs {
+        if normalized == *dir || normalized.starts_with(&format!("{dir}/")) {
+            return Some(package_name);
+        }
+    }
+    None
+}
+
+fn append_scope_package_args(command: &mut Vec<String>, scope: &CargoGateExecutionScope) {
+    match scope {
+        CargoGateExecutionScope::ScopedPackages(packages) if !packages.is_empty() => {
+            for package in packages {
+                command.push("-p".to_string());
+                command.push(package.clone());
+            }
+        },
+        _ => command.push("--workspace".to_string()),
+    }
+}
+
+fn build_rustfmt_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec!["cargo".to_string(), "fmt".to_string()];
+    match scope {
+        CargoGateExecutionScope::ScopedPackages(packages) if !packages.is_empty() => {
+            for package in packages {
+                command.push("-p".to_string());
+                command.push(package.clone());
+            }
+        },
+        _ => command.push("--all".to_string()),
+    }
+    command.extend(["--".to_string(), "--check".to_string()]);
+    command
+}
+
+fn build_doc_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec![
+        "env".to_string(),
+        "RUSTFLAGS=-Dmissing_docs".to_string(),
+        "cargo".to_string(),
+        "check".to_string(),
+        "--offline".to_string(),
+    ];
+    append_scope_package_args(&mut command, scope);
+    command.push("--all-targets".to_string());
+    command.push("--all-features".to_string());
+    command
+}
+
+fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec![
+        "cargo".to_string(),
+        "clippy".to_string(),
+        "--offline".to_string(),
+    ];
+    append_scope_package_args(&mut command, scope);
+    command.extend([
+        "--lib".to_string(),
+        "--bins".to_string(),
+        "--tests".to_string(),
+        "--examples".to_string(),
+        "--all-features".to_string(),
+        "--".to_string(),
+        "-D".to_string(),
+        "warnings".to_string(),
+        "-Aclippy::doc-markdown".to_string(),
+        "-Aclippy::too-long-first-doc-paragraph".to_string(),
+        "-Aclippy::doc-lazy-continuation".to_string(),
+    ]);
+    command
+}
+
+fn should_force_doc_gate() -> bool {
+    std::env::var("APM2_FAC_FORCE_DOC_GATE")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
+}
+
+const fn doc_gate_skip_reason(
+    scope: &CargoGateExecutionScope,
+    force_doc_gate: bool,
+) -> Option<&'static str> {
+    if force_doc_gate {
+        return None;
+    }
+    match scope {
+        CargoGateExecutionScope::FullWorkspace => None,
+        CargoGateExecutionScope::ScopedPackages(_) => Some("scoped_latency_budget"),
+        CargoGateExecutionScope::NoCargoImpact => Some("no_cargo_impact"),
+    }
+}
+
+fn build_scoped_nextest_command(scope: &CargoGateExecutionScope) -> Vec<String> {
+    let mut command = vec![
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "--offline".to_string(),
+    ];
+    append_scope_package_args(&mut command, scope);
+    command.extend([
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        FAST_GATES_NEXTEST_PROFILE.to_string(),
+    ]);
+    command
+}
+
+fn resolve_evidence_test_command_with_scope(
+    test_command_override: Option<&[String]>,
+    scope: &CargoGateExecutionScope,
+) -> Vec<String> {
+    test_command_override.map_or_else(|| build_scoped_nextest_command(scope), <[_]>::to_vec)
 }
 
 fn resolve_evidence_test_command_environment(
@@ -1394,12 +1804,12 @@ fn resolve_evidence_gate_progress_callback(
 /// environment and inheriting only allowlisted variables per
 /// `FacPolicyV1`.
 ///
-/// TCK-00526: Previously only the test gate received a policy-filtered
+/// RFC-0032::REQ-0185: Previously only the test gate received a policy-filtered
 /// environment. This function is used by `run_evidence_gates` and
 /// `run_evidence_gates_with_status` to apply the same policy to
 /// fmt/clippy/doc and script gates.
 ///
-/// TCK-00575: Applies per-lane env isolation (`HOME`, `TMPDIR`,
+/// RFC-0032::REQ-0225: Applies per-lane env isolation (`HOME`, `TMPDIR`,
 /// `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`) so every FAC gate phase runs with
 /// deterministic lane-local values, preventing writes to ambient user
 /// locations.
@@ -1411,7 +1821,10 @@ fn resolve_evidence_gate_progress_callback(
 ///   by the caller's `LaneLockGuard` to maintain lock/env coupling and prevent
 ///   concurrent access races (e.g., with `apm2 fac doctor --fix` lane
 ///   remediation).
-fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, String> {
+fn build_gate_policy_env(
+    lane_dir: &Path,
+    workspace_root: &Path,
+) -> Result<Vec<(String, String)>, String> {
     let apm2_home = apm2_core::github::resolve_apm2_home()
         .ok_or_else(|| "cannot resolve APM2_HOME for gate env policy enforcement".to_string())?;
     let fac_root = apm2_home.join("private/fac");
@@ -1424,22 +1837,28 @@ fn build_gate_policy_env(lane_dir: &Path) -> Result<Vec<(String, String)>, Strin
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // TCK-00575: Apply per-lane env isolation for all evidence gate phases.
-    // Uses the lane directory from the actually-locked lane to maintain
+    // RFC-0032::REQ-0225: Apply per-lane env isolation for all evidence gate
+    // phases. Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
-    super::policy_loader::apply_review_lane_environment(&mut policy_env, lane_dir, &ambient)?;
+    super::policy_loader::apply_review_lane_environment(
+        &mut policy_env,
+        lane_dir,
+        workspace_root,
+        &ambient,
+    )?;
+    apply_lane_compiler_cache_env(&mut policy_env, lane_dir, workspace_root)?;
 
     Ok(policy_env.into_iter().collect())
 }
 
 /// Load or create FAC policy. Delegates to the shared `policy_loader` module
-/// for bounded I/O and deduplication (TCK-00526).
+/// for bounded I/O and deduplication (RFC-0032::REQ-0185).
 fn load_or_create_pipeline_policy(fac_root: &Path) -> Result<FacPolicyV1, String> {
     super::policy_loader::load_or_create_fac_policy(fac_root)
 }
 
 /// Ensure managed `CARGO_HOME` directory exists. Delegates to the shared
-/// `policy_loader` module (TCK-00526).
+/// `policy_loader` module (RFC-0032::REQ-0185).
 fn ensure_pipeline_managed_cargo_home(cargo_home: &Path) -> Result<(), String> {
     super::policy_loader::ensure_managed_cargo_home(cargo_home)
 }
@@ -1559,6 +1978,16 @@ fn write_cached_gate_log_marker(
     }
 }
 
+fn write_skipped_gate_log_marker(log_path: &Path, gate_name: &str, reason: &str) -> StreamStats {
+    let marker = format!("info: gate={gate_name} skipped (reason={reason})\n");
+    let _ = crate::commands::fac_permissions::write_fac_file_with_mode(log_path, marker.as_bytes());
+    StreamStats {
+        bytes_written: marker.len() as u64,
+        bytes_total: marker.len() as u64,
+        was_truncated: false,
+    }
+}
+
 fn attach_log_bundle_hash(
     gate_results: &mut [EvidenceGateResult],
     logs_dir: &Path,
@@ -1601,10 +2030,10 @@ fn finalize_status_gate_run(
     // Force a final update to ensure all gate results are posted.
     updater.force_update(status);
 
-    // TCK-00541: Persist v3 gate cache as the primary (receipt-indexed) store.
-    // V3 is written first and treated as the authoritative cache. V2 follows
-    // as backward-compatible fallback for push.rs / gates.rs callers that
-    // have not yet been migrated to v3.
+    // RFC-0032::REQ-0197: Persist v3 gate cache as the primary (receipt-indexed)
+    // store. V3 is written first and treated as the authoritative cache. V2
+    // follows as backward-compatible fallback for push.rs / gates.rs callers
+    // that have not yet been migrated to v3.
     if let Some(v3) = v3_gate_cache {
         // Populate v3 from the in-memory gate_cache entries (which contain
         // backfilled metadata from the step above). V3 entries are
@@ -1622,7 +2051,7 @@ fn finalize_status_gate_run(
                 log_path: result.log_path.clone(),
                 signature_hex: None, // Will be signed below.
                 signer_id: None,
-                // TCK-00541: Inherit receipt binding flags from v2 cache.
+                // RFC-0032::REQ-0197: Inherit receipt binding flags from v2 cache.
                 // These are fail-closed (false) unless promoted by a durable
                 // receipt lookup. The v3 check_reuse enforces both must be true.
                 rfc0028_receipt_bound: result.rfc0028_receipt_bound,
@@ -1641,7 +2070,7 @@ fn finalize_status_gate_run(
         }
     }
 
-    // TCK-00541: V2 writes removed from default evidence pipeline path.
+    // RFC-0032::REQ-0197: V2 writes removed from default evidence pipeline path.
     // The ticket requires "write only v3 in default mode". V2 read
     // compatibility is preserved (load_from_v2_dir exists for diagnostic/
     // migration tooling), but new gate results are only persisted to v3.
@@ -1657,7 +2086,7 @@ fn finalize_status_gate_run(
     Ok(())
 }
 
-/// Post-receipt v3 gate cache rebinding (TCK-00541 round-3 MAJOR fix).
+/// Post-receipt v3 gate cache rebinding (RFC-0032::REQ-0197 round-3 MAJOR fix).
 ///
 /// After a receipt is committed, loads the persisted v3 cache from disk,
 /// promotes `rfc0028_receipt_bound` and `rfc0029_receipt_bound` flags based
@@ -1820,14 +2249,14 @@ pub(super) fn run_evidence_gates_with_lane_context(
     let on_gate_progress = resolve_evidence_gate_progress_callback(opts);
     let logs_dir = lane_context.logs_dir;
 
-    // TCK-00526: Build policy-filtered environment for ALL gates (not just
+    // RFC-0032::REQ-0185: Build policy-filtered environment for ALL gates (not just
     // the test gate). This enforces default-deny on fmt, clippy, doc, and
     // native gate checks, preventing ambient secret leakage.
-    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // RFC-0032::REQ-0225 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
-    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    // RFC-0032::REQ-0185: Compute wrapper-stripping keys once for ALL gate phases.
     // build_job_environment already strips these at the policy level, but
     // env_remove on the spawned Command provides defense-in-depth against
     // parent process env inheritance. Pass the policy-filtered environment
@@ -1839,7 +2268,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
         Some(&gate_wrapper_strip)
     };
 
-    // TCK-00540 fix round 3: Load the gate cache and signing material for
+    // RFC-0032::REQ-0196 fix round 3: Load the gate cache and signing material for
     // cache-reuse decisions in the `fac gates` path.
     //
     // Cache reuse is only active in full (non-quick) mode because quick mode
@@ -1865,7 +2294,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
     } else {
         (None, None)
     };
-    // TCK-00541: Non-status path now loads native v3 cache for reuse.
+    // RFC-0032::REQ-0197: Non-status path now loads native v3 cache for reuse.
     // This closes the structural throughput gap where v3 persisted entries
     // were never considered and every gate re-executed.
     //
@@ -1880,6 +2309,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let fac_root = apm2_home.join("private/fac");
             let fac_policy = load_or_create_pipeline_policy(&fac_root).ok()?;
             let compound_key = compute_v3_compound_key(
+                workspace_root,
                 sha,
                 &fac_policy,
                 sandbox_hardening_hash,
@@ -1897,24 +2327,36 @@ pub(super) fn run_evidence_gates_with_lane_context(
         (None, None, None)
     };
 
-    // Fastest-first ordering for expensive cargo gates. Keep cheap checks
-    // ahead of heavier analysis to minimize wasted compute on early failure.
-    let gates: &[(&str, &[&str])] = &[
-        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
-        (
-            "clippy",
-            &[
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ),
+    let cargo_scope = resolve_cargo_gate_execution_scope(workspace_root);
+    if emit_human_logs {
+        eprintln!("fac gates: cargo execution scope={}", cargo_scope.summary());
+    }
+    let force_doc_gate = should_force_doc_gate();
+    let doc_skip_reason = doc_gate_skip_reason(&cargo_scope, force_doc_gate);
+    let skip_cargo_heavy_gates = matches!(cargo_scope, CargoGateExecutionScope::NoCargoImpact);
+
+    // Fastest-first ordering for cargo-backed gates.
+    // rustfmt/doc/clippy/test are scoped or skipped based on cargo impact.
+    // doc gate uses `cargo check` + `-Dmissing_docs` to avoid generating
+    // `target/doc` artifacts while still enforcing documentation coverage.
+    // It remains skipped for package-scoped pushes to preserve latency SLO
+    // (override with APM2_FAC_FORCE_DOC_GATE=1).
+    let phase2_gate_specs = vec![
+        Phase2GateSpec {
+            gate_name: "rustfmt",
+            command: build_rustfmt_gate_command(&cargo_scope),
+            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
+        },
+        Phase2GateSpec {
+            gate_name: "doc",
+            command: build_doc_gate_command(&cargo_scope),
+            skip_reason: doc_skip_reason,
+        },
+        Phase2GateSpec {
+            gate_name: "clippy",
+            command: build_clippy_gate_command(&cargo_scope),
+            skip_reason: skip_cargo_heavy_gates.then_some("no_cargo_impact"),
+        },
     ];
 
     let mut evidence_lines = Vec::new();
@@ -2052,9 +2494,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
     }
 
     // Phase 2: cargo fmt/doc/clippy — all receive the policy-filtered env
-    // and wrapper-stripping keys (TCK-00526: defense-in-depth for all gates).
+    // and wrapper-stripping keys (RFC-0032::REQ-0185: defense-in-depth for all
+    // gates).
     //
-    // TCK-00574 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
+    // RFC-0032::REQ-0224 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
     // in systemd-run with network policy isolation directives to enforce
     // default-deny network posture for ALL evidence gate phases (not just test).
     // Quick mode skips network isolation (development shortcut, same as test skip).
@@ -2064,7 +2507,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             None
         } else {
             // Load the policy to resolve network policy and sandbox hardening
-            // for non-test gate phases (TCK-00574 BLOCKER fix).
+            // for non-test gate phases (RFC-0032::REQ-0224 BLOCKER fix).
             let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
                 "cannot resolve APM2_HOME for gate network policy enforcement".to_string()
             })?;
@@ -2073,8 +2516,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
             let gate_network_policy =
                 apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
             let mut specs = Vec::new();
-            for &(gate_name, cmd_args) in gates {
-                let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+            for spec in phase2_gate_specs
+                .iter()
+                .filter(|phase2| phase2.skip_reason.is_none())
+            {
+                let gate_name = spec.gate_name;
+                let gate_cmd = spec.command.clone();
                 let gate_unit_name = opts
                     .and_then(|options| options.bounded_gate_unit_base.as_ref())
                     .map(|base| format!("{base}-{gate_name}"));
@@ -2104,14 +2551,41 @@ pub(super) fn run_evidence_gates_with_lane_context(
             Some(specs)
         };
 
-    for (idx, &(gate_name, cmd_args)) in gates.iter().enumerate() {
+    for spec in &phase2_gate_specs {
+        let gate_name = spec.gate_name;
         let log_path = logs_dir.join(format!("{gate_name}.log"));
 
-        // TCK-00626 round 4: Hoist cache_decision so it is available on both
+        if let Some(skip_reason) = spec.skip_reason {
+            emit_gate_started(opts, gate_name);
+            let stream_stats = write_skipped_gate_log_marker(&log_path, gate_name, skip_reason);
+            let skipped_result = build_evidence_gate_result(
+                gate_name,
+                true,
+                0,
+                Some(&log_path),
+                Some(&stream_stats),
+            );
+            emit_gate_completed(opts, &skipped_result);
+            gate_results.push(skipped_result);
+            let ts = now_iso8601();
+            if emit_human_logs {
+                eprintln!(
+                    "ts={ts} sha={sha} gate={gate_name} status=SKIP reason={skip_reason} log={}",
+                    log_path.display()
+                );
+            }
+            evidence_lines.push(format!(
+                "ts={ts} sha={sha} gate={gate_name} status=SKIP reason={skip_reason} log={}",
+                log_path.display()
+            ));
+            continue;
+        }
+
+        // RFC-0032::REQ-0257 round 4: Hoist cache_decision so it is available on both
         // hit and miss paths — gate_finished must always carry the decision.
         let mut gate_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
 
-        // TCK-00540 fix round 3: Check gate cache for reuse before execution.
+        // RFC-0032::REQ-0196 fix round 3: Check gate cache for reuse before execution.
         if cache_reuse_active {
             // SAFETY: `cache_reuse_policy` is guaranteed `Some` here because
             // `cache_reuse_active` is gated on `cache_reuse_policy.is_some()`.
@@ -2130,7 +2604,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
-            // TCK-00626 round 4: propagate cache decision to outer scope so
+            // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope so
             // both hit and miss paths include it in gate_finished.
             gate_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
@@ -2184,36 +2658,60 @@ pub(super) fn run_evidence_gates_with_lane_context(
         emit_gate_started(opts, gate_name);
         let started = Instant::now();
 
-        // TCK-00574: Use bounded gate command (with network isolation) in
+        // RFC-0032::REQ-0224: Use bounded gate command (with network isolation) in
         // full mode; fall back to bare command in quick mode.
         let (passed, stream_stats) = if let Some(ref specs) = bounded_gate_specs {
-            let (_, ref bounded_cmd, ref bounded_env) = specs[idx];
-            let (bcmd, bargs) = bounded_cmd
-                .split_first()
-                .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
-            // The outer env includes D-Bus runtime variables needed by
-            // systemd-run; the inner unit gets env via --setenv.
-            let mut outer_env = gate_env.clone();
-            outer_env.extend(bounded_env.iter().cloned());
-            run_single_evidence_gate_with_env_and_progress(
-                workspace_root,
-                sha,
-                gate_name,
-                bcmd,
-                &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
-                &log_path,
-                Some(&outer_env),
-                gate_wrapper_strip_ref,
-                emit_human_logs,
-                on_gate_progress,
-            )
+            if let Some((_, bounded_cmd, bounded_env)) =
+                specs.iter().find(|(name, _, _)| *name == gate_name)
+            {
+                let (bcmd, bargs) = bounded_cmd
+                    .split_first()
+                    .ok_or_else(|| format!("bounded gate command is empty for {gate_name}"))?;
+                // The outer env includes D-Bus runtime variables needed by
+                // systemd-run; the inner unit gets env via --setenv.
+                let mut outer_env = gate_env.clone();
+                outer_env.extend(bounded_env.iter().cloned());
+                run_single_evidence_gate_with_env_and_progress(
+                    workspace_root,
+                    sha,
+                    gate_name,
+                    bcmd,
+                    &bargs.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &log_path,
+                    Some(&outer_env),
+                    gate_wrapper_strip_ref,
+                    emit_human_logs,
+                    on_gate_progress,
+                )
+            } else {
+                let (command, args) = spec
+                    .command
+                    .split_first()
+                    .ok_or_else(|| format!("gate command is empty for {gate_name}"))?;
+                run_single_evidence_gate_with_env_and_progress(
+                    workspace_root,
+                    sha,
+                    gate_name,
+                    command,
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &log_path,
+                    Some(&gate_env),
+                    gate_wrapper_strip_ref,
+                    emit_human_logs,
+                    on_gate_progress,
+                )
+            }
         } else {
+            let (command, args) = spec
+                .command
+                .split_first()
+                .ok_or_else(|| format!("gate command is empty for {gate_name}"))?;
             run_single_evidence_gate_with_env_and_progress(
                 workspace_root,
                 sha,
                 gate_name,
-                cmd_args[0],
-                &cmd_args[1..],
+                command,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
                 &log_path,
                 Some(&gate_env),
                 gate_wrapper_strip_ref,
@@ -2254,18 +2752,28 @@ pub(super) fn run_evidence_gates_with_lane_context(
     snapshot_workspace_integrity(workspace_root);
 
     let test_log = logs_dir.join("test.log");
-    if skip_test_gate {
-        let skip_msg = b"quick mode enabled: skipped heavyweight test gate\n";
-        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(&test_log, skip_msg);
+    let skip_test_for_scope =
+        skip_cargo_heavy_gates && opts.and_then(|o| o.test_command.as_ref()).is_none();
+    if skip_test_gate || skip_test_for_scope {
+        let skip_reason = if skip_test_gate {
+            "quick_mode"
+        } else {
+            "no_cargo_impact"
+        };
+        let skip_msg = format!("scope={skip_reason}: skipped heavyweight test gate\n");
+        let _ = crate::commands::fac_permissions::write_fac_file_with_mode(
+            &test_log,
+            skip_msg.as_bytes(),
+        );
         let ts = now_iso8601();
         if emit_human_logs {
             eprintln!(
-                "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+                "ts={ts} sha={sha} gate=test status=SKIP reason={skip_reason} log={}",
                 test_log.display()
             );
         }
         evidence_lines.push(format!(
-            "ts={ts} sha={sha} gate=test status=SKIP reason=quick_mode log={}",
+            "ts={ts} sha={sha} gate=test status=SKIP reason={skip_reason} log={}",
             test_log.display()
         ));
         let test_result = build_evidence_gate_result(
@@ -2282,11 +2790,13 @@ pub(super) fn run_evidence_gates_with_lane_context(
         emit_gate_completed(opts, &test_result);
         gate_results.push(test_result);
     } else {
-        // TCK-00540 fix round 3: Cache reuse for the test gate.
-        let test_command_override =
-            resolve_evidence_test_command_override(opts.and_then(|o| o.test_command.as_deref()));
+        // RFC-0032::REQ-0196 fix round 3: Cache reuse for the test gate.
+        let test_command_override = resolve_evidence_test_command_with_scope(
+            opts.and_then(|o| o.test_command.as_deref()),
+            &cargo_scope,
+        );
         let mut test_cache_hit = false;
-        // TCK-00626 round 4: Hoist cache_decision for miss path.
+        // RFC-0032::REQ-0257 round 4: Hoist cache_decision for miss path.
         let mut test_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
         if cache_reuse_active {
             let reuse_grp = cache_reuse_policy
@@ -2309,7 +2819,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
                 v3_compound_key_ns.as_ref(),
                 Some(sha),
             );
-            // TCK-00626 round 4: propagate cache decision to outer scope.
+            // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope.
             test_cache_decision.clone_from(&cache_decision_local);
             if reuse.reusable {
                 if let Some(cached) = resolve_cached_payload(
@@ -2362,12 +2872,12 @@ pub(super) fn run_evidence_gates_with_lane_context(
         if !test_cache_hit {
             emit_gate_started(opts, "test");
             let test_started = Instant::now();
-            // TCK-00526: Use caller-provided test env if available (gates.rs
+            // RFC-0032::REQ-0185: Use caller-provided test env if available (gates.rs
             // pre-computes policy env + bounded runner env), otherwise fall
             // back to the policy-filtered gate env.
             let caller_test_env = resolve_evidence_test_command_environment(opts);
             let test_env: Option<&[(String, String)]> = caller_test_env.or(Some(&gate_env));
-            // TCK-00526: Use caller-provided env_remove_keys if available
+            // RFC-0032::REQ-0185: Use caller-provided env_remove_keys if available
             // (bounded test runner computes these), otherwise fall back to the
             // gate-level wrapper strip keys for defense-in-depth.
             let env_remove = resolve_evidence_env_remove_keys(opts).or(gate_wrapper_strip_ref);
@@ -2417,7 +2927,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     let wi_log_path = logs_dir.join("workspace_integrity.log");
     let mut wi_cache_hit = false;
-    // TCK-00626 round 4: Hoist cache_decision for miss path.
+    // RFC-0032::REQ-0257 round 4: Hoist cache_decision for miss path.
     let mut wi_cache_decision: Option<apm2_core::fac::gate_cache_v3::CacheDecision> = None;
     if cache_reuse_active {
         let reuse_grp = cache_reuse_policy
@@ -2435,7 +2945,7 @@ pub(super) fn run_evidence_gates_with_lane_context(
             v3_compound_key_ns.as_ref(),
             Some(sha),
         );
-        // TCK-00626 round 4: propagate cache decision to outer scope.
+        // RFC-0032::REQ-0257 round 4: propagate cache decision to outer scope.
         wi_cache_decision.clone_from(&cache_decision_local);
         if reuse.reusable {
             if let Some(cached) = resolve_cached_payload(
@@ -2566,12 +3076,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let logs_dir = lane_context.logs_dir;
     // Pipeline path enforces fail-closed cache reuse decisions.
 
-    // TCK-00526: Build policy-filtered environment for ALL gates.
-    // TCK-00575 round 2: Use the lane_dir from the actually-locked lane
+    // RFC-0032::REQ-0185: Build policy-filtered environment for ALL gates.
+    // RFC-0032::REQ-0225 round 2: Use the lane_dir from the actually-locked lane
     // (not hardcoded lane-00) to maintain lock/env coupling.
-    let gate_env = build_gate_policy_env(&lane_context.lane_dir)?;
+    let gate_env = build_gate_policy_env(&lane_context.lane_dir, workspace_root)?;
 
-    // TCK-00526: Compute wrapper-stripping keys once for ALL gate phases.
+    // RFC-0032::REQ-0185: Compute wrapper-stripping keys once for ALL gate phases.
     // Pass the policy-filtered environment so policy-introduced SCCACHE_*
     // variables are also discovered for defense-in-depth stripping.
     let gate_wrapper_strip = compute_gate_env_remove_keys(Some(&gate_env));
@@ -2584,7 +3094,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut status = CiStatus::new(sha, pr_number);
     let updater = PrBodyStatusUpdater::new(owner_repo, pr_number);
 
-    // TCK-00576: Load the persistent signer for gate cache signature
+    // RFC-0032::REQ-0226: Load the persistent signer for gate cache signature
     // verification (reuse decisions) and signing (new cache entries).
     let fac_signer = {
         let apm2_home = apm2_core::github::resolve_apm2_home()
@@ -2601,8 +3111,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
 
-    // TCK-00541: Build v3 compound key and load v3 cache (with v2 fallback).
+    // RFC-0032::REQ-0197: Build v3 compound key and load v3 cache (with v2
+    // fallback).
     let v3_compound_key = compute_v3_compound_key(
+        workspace_root,
         sha,
         &load_or_create_pipeline_policy(
             &apm2_core::github::resolve_apm2_home()
@@ -2627,12 +3139,12 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut v3_gate_cache = v3_compound_key
         .as_ref()
         .and_then(|ck| GateCacheV3::new(sha, ck.clone()).ok());
-    // TCK-00573 MAJOR-3: Include sandbox hardening hash in gate attestation
-    // to prevent stale gate results from insecure environments being reused.
-    // Uses the effective policy-driven profile carried through
+    // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate
+    // attestation to prevent stale gate results from insecure environments
+    // being reused. Uses the effective policy-driven profile carried through
     // PipelineTestCommand (MAJOR-1 fix: was previously default()).
     let sandbox_hardening_hash = &pipeline_test_command.sandbox_hardening_hash;
-    // TCK-00574 MAJOR-1: Include network policy hash in gate attestation
+    // RFC-0032::REQ-0224 MAJOR-1: Include network policy hash in gate attestation
     // to prevent cache reuse across network policy drift.
     let network_policy_hash = &pipeline_test_command.network_policy_hash;
     let policy = GateResourcePolicy::from_cli(
@@ -2658,21 +3170,18 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
 
     // Fastest-first ordering for expensive cargo gates. Keep cheap checks
     // ahead of heavier analysis to minimize wasted compute on early failure.
-    let gates: &[(&str, &[&str])] = &[
-        ("rustfmt", &["cargo", "fmt", "--all", "--check"]),
-        ("doc", &["cargo", "doc", "--workspace", "--no-deps"]),
+    // Use the same command builders as local `fac gates` so attestation/caching
+    // semantics stay aligned across both execution paths.
+    let gates_scope = CargoGateExecutionScope::FullWorkspace;
+    let gates: Vec<(String, Vec<String>)> = vec![
         (
-            "clippy",
-            &[
-                "cargo",
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
-            ],
+            "rustfmt".to_string(),
+            build_rustfmt_gate_command(&gates_scope),
+        ),
+        ("doc".to_string(), build_doc_gate_command(&gates_scope)),
+        (
+            "clippy".to_string(),
+            build_clippy_gate_command(&gates_scope),
         ),
     ];
 
@@ -2905,10 +3414,10 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
-    // TCK-00574 BLOCKER fix: Build bounded gate commands for non-test gates
-    // to enforce network-deny in the pipeline path (always full mode).
+    // RFC-0032::REQ-0224 BLOCKER fix: Build bounded gate commands for non-test
+    // gates to enforce network-deny in the pipeline path (always full mode).
     #[allow(clippy::type_complexity)]
-    let pipeline_bounded_gate_specs: Vec<(&str, Vec<String>, Vec<(String, String)>)> = {
+    let pipeline_bounded_gate_specs: Vec<(String, Vec<String>, Vec<(String, String)>)> = {
         let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
             "cannot resolve APM2_HOME for pipeline gate network policy enforcement".to_string()
         })?;
@@ -2917,8 +3426,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         let gate_network_policy =
             apm2_core::fac::resolve_network_policy("gates", fac_policy.network_policy.as_ref());
         let mut specs = Vec::new();
-        for &(gate_name, cmd_args) in gates {
-            let gate_cmd: Vec<String> = cmd_args.iter().map(|s| (*s).to_string()).collect();
+        for (gate_name, gate_cmd) in &gates {
             let bounded = build_systemd_bounded_gate_command(
                 workspace_root,
                 BoundedTestLimits {
@@ -2928,7 +3436,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                     pids_max: DEFAULT_TEST_PIDS_MAX,
                     cpu_quota: "200%",
                 },
-                &gate_cmd,
+                gate_cmd,
                 None,
                 &gate_env,
                 fac_policy.sandbox_hardening.clone(),
@@ -2940,13 +3448,14 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
                      (network deny enforcement requires systemd-run): {err}"
                 )
             })?;
-            specs.push((gate_name, bounded.command, bounded.environment));
+            specs.push((gate_name.clone(), bounded.command, bounded.environment));
         }
         specs
     };
 
     // Phase 2: cargo fmt/doc/clippy.
-    for (idx, &(gate_name, _cmd_args)) in gates.iter().enumerate() {
+    for (idx, (gate_name, _cmd_args)) in gates.iter().enumerate() {
+        let gate_name = gate_name.as_str();
         let attestation_digest =
             gate_attestation_digest(workspace_root, sha, gate_name, None, &policy);
         let log_path = logs_dir.join(format!("{gate_name}.log"));
@@ -3070,7 +3579,7 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         status.set_running(gate_name);
         updater.update(&status);
         let started = Instant::now();
-        // TCK-00574: Use bounded gate command with network isolation.
+        // RFC-0032::REQ-0224: Use bounded gate command with network isolation.
         let (_bounded_name, bounded_cmd, bounded_env) = &pipeline_bounded_gate_specs[idx];
         let (bcmd, bargs) = bounded_cmd
             .split_first()
@@ -3564,10 +4073,115 @@ mod tests {
 
     #[test]
     fn default_evidence_test_command_uses_nextest() {
-        let command = resolve_evidence_test_command_override(None);
+        let command =
+            resolve_evidence_test_command_with_scope(None, &CargoGateExecutionScope::FullWorkspace);
         let joined = command.join(" ");
-        assert!(joined.contains("cargo nextest run --workspace"));
+        assert!(joined.contains("cargo nextest run"));
+        assert!(joined.contains("--offline"));
+        assert!(joined.contains("--workspace"));
         assert!(!joined.contains("cargo test --workspace"));
+    }
+
+    #[test]
+    fn cargo_scope_classifies_docs_only_changes_as_no_cargo_impact() {
+        let scope = classify_cargo_gate_scope(
+            &["documents/strategy/ROADMAP.json".to_string()],
+            &[("crates/apm2-cli".to_string(), "apm2-cli".to_string())],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::NoCargoImpact);
+    }
+
+    #[test]
+    fn cargo_scope_classifies_agents_docs_as_no_cargo_impact() {
+        let scope = classify_cargo_gate_scope(
+            &[
+                "crates/apm2-core/AGENTS.json".to_string(),
+                "crates/apm2-daemon/src/gate/AGENTS.md".to_string(),
+            ],
+            &[
+                ("crates/apm2-core".to_string(), "apm2-core".to_string()),
+                ("crates/apm2-daemon".to_string(), "apm2-daemon".to_string()),
+            ],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::NoCargoImpact);
+    }
+
+    #[test]
+    fn cargo_scope_classifies_crate_changes_as_scoped_packages() {
+        let scope = classify_cargo_gate_scope(
+            &[
+                "crates/apm2-cli/src/main.rs".to_string(),
+                "crates/apm2-cli/src/lib.rs".to_string(),
+            ],
+            &[
+                ("crates/apm2-cli".to_string(), "apm2-cli".to_string()),
+                ("crates/apm2-core".to_string(), "apm2-core".to_string()),
+            ],
+        );
+        assert_eq!(
+            scope,
+            CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()])
+        );
+    }
+
+    #[test]
+    fn cargo_scope_escalates_lockfile_changes_to_full_workspace() {
+        let scope = classify_cargo_gate_scope(
+            &["Cargo.lock".to_string()],
+            &[("crates/apm2-cli".to_string(), "apm2-cli".to_string())],
+        );
+        assert_eq!(scope, CargoGateExecutionScope::FullWorkspace);
+    }
+
+    #[test]
+    fn scoped_commands_emit_package_flags_without_workspace_flag() {
+        let scope = CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()]);
+        let rustfmt = build_rustfmt_gate_command(&scope).join(" ");
+        let nextest = build_scoped_nextest_command(&scope).join(" ");
+        let doc = build_doc_gate_command(&scope).join(" ");
+        let clippy = build_clippy_gate_command(&scope).join(" ");
+
+        assert!(rustfmt.contains("cargo fmt -p apm2-cli -- --check"));
+        assert!(!rustfmt.contains("--all"));
+        assert!(nextest.contains("cargo nextest run"));
+        assert!(nextest.contains("--offline"));
+        assert!(nextest.contains("-p apm2-cli"));
+        assert!(!nextest.contains("--workspace"));
+        assert!(doc.contains("env RUSTFLAGS=-Dmissing_docs cargo check"));
+        assert!(doc.contains("-p apm2-cli"));
+        assert!(doc.contains("--all-targets"));
+        assert!(doc.contains("--all-features"));
+        assert!(doc.contains("--offline"));
+        assert!(!doc.contains("--workspace"));
+        assert!(clippy.contains("cargo clippy"));
+        assert!(clippy.contains("-p apm2-cli"));
+        assert!(clippy.contains("--offline"));
+        assert!(clippy.contains("-Aclippy::doc-markdown"));
+        assert!(clippy.contains("-Aclippy::too-long-first-doc-paragraph"));
+        assert!(clippy.contains("-Aclippy::doc-lazy-continuation"));
+        assert!(!clippy.contains("--workspace"));
+    }
+
+    #[test]
+    fn doc_gate_skip_reason_defaults_to_skip_for_scoped_packages() {
+        let scope = CargoGateExecutionScope::ScopedPackages(vec!["apm2-cli".to_string()]);
+        assert_eq!(
+            doc_gate_skip_reason(&scope, false),
+            Some("scoped_latency_budget")
+        );
+        assert_eq!(doc_gate_skip_reason(&scope, true), None);
+    }
+
+    #[test]
+    fn doc_gate_skip_reason_respects_scope_transitions() {
+        assert_eq!(
+            doc_gate_skip_reason(&CargoGateExecutionScope::FullWorkspace, false),
+            None
+        );
+        assert_eq!(
+            doc_gate_skip_reason(&CargoGateExecutionScope::NoCargoImpact, false),
+            Some("no_cargo_impact")
+        );
     }
 
     #[test]
@@ -3581,7 +4195,9 @@ mod tests {
             Ok(command) => {
                 let joined = command.command.join(" ");
                 assert!(joined.contains("systemd-run"));
-                assert!(joined.contains("cargo nextest run --workspace"));
+                assert!(joined.contains("cargo nextest run"));
+                assert!(joined.contains("--offline"));
+                assert!(joined.contains("--workspace"));
                 assert!(!joined.contains(".sh"));
                 assert_eq!(
                     command.gate_profile,
@@ -3622,6 +4238,37 @@ mod tests {
                 );
             },
         }
+    }
+
+    #[test]
+    fn lane_compiler_cache_env_sets_incremental_and_lane_target_dir() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let lane_dir = temp_dir.path().join("apm2/private/fac/lanes/lane-00");
+        let workspace_root = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&lane_dir).expect("create lane dir");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace dir");
+        let mut env = std::collections::BTreeMap::new();
+
+        apply_lane_compiler_cache_env(&mut env, &lane_dir, &workspace_root)
+            .expect("compiler cache env");
+
+        assert_eq!(env.get("CARGO_INCREMENTAL").map(String::as_str), Some("1"));
+        let target_dir = env
+            .get("CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR must be set");
+        let target_path = std::path::Path::new(target_dir);
+        assert!(
+            target_path.starts_with(temp_dir.path().join("apm2/private/fac/target_cache")),
+            "target dir must be fac-level shared cache: {target_dir}"
+        );
+        assert!(target_path.is_dir());
+        assert!(
+            target_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("target")),
+            "target dir must be namespaced under lane dir: {target_dir}"
+        );
     }
 
     #[test]
@@ -3826,7 +4473,8 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00541 BLOCKER regression: v3-only cache hits must succeed without v2
+    // RFC-0032::REQ-0197 BLOCKER regression: v3-only cache hits must succeed
+    // without v2
     // =========================================================================
 
     /// Prove that when v3 has a valid signed entry but v2 is absent,
@@ -4012,9 +4660,9 @@ mod tests {
     /// [INV-GCV3-001] Prove that when v3 misses and v2 has a signed entry,
     /// v2 fallback is denied for reuse (security: no binding continuity proof).
     ///
-    /// TCK-00541 MAJOR fix: v2 entries lack RFC-0028/0029 binding proof and
-    /// cannot satisfy v3 compound-key continuity requirements. The gate
-    /// must be re-executed under v3 with full bindings.
+    /// RFC-0032::REQ-0197 MAJOR fix: v2 entries lack RFC-0028/0029 binding
+    /// proof and cannot satisfy v3 compound-key continuity requirements.
+    /// The gate must be re-executed under v3 with full bindings.
     #[test]
     fn v2_fallback_denied_when_v3_misses() {
         use apm2_core::crypto::Signer;
@@ -4166,6 +4814,7 @@ mod tests {
         );
 
         let compound_key = compute_v3_compound_key(
+            &workspace_root,
             sha,
             &fac_policy,
             sandbox_hardening_hash,

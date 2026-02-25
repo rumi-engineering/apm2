@@ -6,7 +6,7 @@ Wants=apm2-daemon.service
 Requires=apm2-daemon.service
 
 [Service]
-# TCK-00600: Type=notify — worker sends READY=1 after broker connection.
+# RFC-0032::REQ-0248: Type=notify — worker sends READY=1 after broker connection.
 Type=notify
 # Adjust this path to match your deployment layout if different.
 ExecStart=/usr/local/bin/apm2 fac worker

@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00577)
+// AGENT-AUTHORED (RFC-0032::REQ-0227)
 //! FAC service user ownership gate for receipt and queue directories.
 //!
 //! This module implements the receipt store permissions model: a dedicated
@@ -202,7 +202,7 @@ fn check_queue_write_permission_with_backend(
     if write_mode == QueueWriteMode::UnsafeLocalWrite {
         tracing::warn!(
             mode = %write_mode,
-            "TCK-00577: --unsafe-local-write active — bypassing service user gate. \
+            "RFC-0032::REQ-0227: --unsafe-local-write active — bypassing service user gate. \
              This is NOT recommended for production deployments."
         );
         return Ok(());
@@ -212,7 +212,7 @@ fn check_queue_write_permission_with_backend(
         tracing::info!(
             mode = %write_mode,
             backend = %backend,
-            "TCK-00657: execution backend is user-mode — bypassing service user gate"
+            "RFC-0032::REQ-0274: execution backend is user-mode — bypassing service user gate"
         );
         return Ok(());
     }
@@ -232,7 +232,7 @@ fn check_queue_write_permission_with_backend(
                 service_user = %service_user,
                 current_uid = current_uid,
                 reason = %reason,
-                "TCK-00577: service user not resolvable — denying write (fail-closed)"
+                "RFC-0032::REQ-0227: service user not resolvable — denying write (fail-closed)"
             );
             return Err(ServiceUserGateError::ServiceUserNotResolved {
                 service_user,
@@ -727,15 +727,15 @@ mod tests {
         assert!(result.is_err(), "should fail for nonexistent path");
     }
 
-    // ── Service user identity resolution (TCK-00577 round 16) ────────
+    // ── Service user identity resolution (RFC-0032::REQ-0227 round 16) ────────
 
-    /// TCK-00577 round 16: Verify `resolve_service_user_identity` behavior
-    /// with the default service user (which typically does not exist in test
-    /// environments). We cannot set env vars without unsafe, so we test the
-    /// default behavior: the default `_apm2-job` user is unlikely to exist,
-    /// so we expect Err. If it does exist (CI environment with the user
-    /// provisioned), both uid and gid must be non-zero or the test is still
-    /// valid.
+    /// RFC-0032::REQ-0227 round 16: Verify `resolve_service_user_identity`
+    /// behavior with the default service user (which typically does not
+    /// exist in test environments). We cannot set env vars without unsafe,
+    /// so we test the default behavior: the default `_apm2-job` user is
+    /// unlikely to exist, so we expect Err. If it does exist (CI
+    /// environment with the user provisioned), both uid and gid must be
+    /// non-zero or the test is still valid.
     #[test]
     #[cfg(unix)]
     fn resolve_service_user_identity_default_user_behavior() {
@@ -758,8 +758,8 @@ mod tests {
         }
     }
 
-    /// TCK-00577 round 16: Verify `ServiceUserIdentity` struct construction
-    /// and field access.
+    /// RFC-0032::REQ-0227 round 16: Verify `ServiceUserIdentity` struct
+    /// construction and field access.
     #[test]
     fn service_user_identity_struct_has_expected_fields() {
         let identity = ServiceUserIdentity {

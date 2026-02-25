@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00535)
+// AGENT-AUTHORED (RFC-0032::REQ-0191)
 //! Shared utilities for FAC commands.
 
 use std::fs::{self, File, OpenOptions};

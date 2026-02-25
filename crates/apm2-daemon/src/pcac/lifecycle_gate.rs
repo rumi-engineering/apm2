@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! In-process `AuthorityJoinKernel` implementation and lifecycle gate
-//! (RFC-0027 §3.3, TCK-00423).
+//! (RFC-0027 §3.3, RFC-0020::REQ-0042).
 //!
 //! # Design
 //!
@@ -68,9 +68,9 @@ fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
 /// Phase 1 in-process `AuthorityJoinKernel` implementation.
 ///
 /// Validates authority locally. The consumed set is held in memory;
-/// TCK-00426 (Durable Consume) will add persistent backing.
+/// RFC-0020::REQ-0045 (Durable Consume) will add persistent backing.
 ///
-/// # Clock Integration (TCK-00427 quality BLOCKER fix)
+/// # Clock Integration (RFC-0020::REQ-0046 quality BLOCKER fix)
 ///
 /// When constructed with [`InProcessKernel::with_clock`], the kernel
 /// derives its current tick dynamically from the shared [`HolonicClock`].
@@ -285,7 +285,7 @@ impl InProcessKernel {
 
     /// Validates that a hash field is non-zero (fail-closed).
     ///
-    /// TCK-00427 quality MAJOR fix: Deny records now carry contextual
+    /// RFC-0020::REQ-0046 quality MAJOR fix: Deny records now carry contextual
     /// `time_envelope_ref`, `ledger_anchor`, and `denied_at_tick` so they
     /// pass `AuthorityDenyV1::validate` replay-binding invariants.
     fn require_nonzero(
@@ -945,7 +945,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
-        // TCK-00427 quality MAJOR fix: Validate time_envelope_ref and
+        // RFC-0020::REQ-0046 quality MAJOR fix: Validate time_envelope_ref and
         // as_of_ledger_anchor first so they can be threaded as context into
         // subsequent require_nonzero calls, producing deny records that pass
         // AuthorityDenyV1::validate replay-binding invariants.
@@ -1084,7 +1084,7 @@ impl AuthorityJoinKernel for InProcessKernel {
         // Compute revocation head from directory_head_hash.
         let revocation_head_hash = input.directory_head_hash;
 
-        // TCK-00429 MAJOR fix: join economics timing must not reinterpret
+        // RFC-0020::REQ-0048 MAJOR fix: join economics timing must not reinterpret
         // `scope_witness_hashes` as a depth-constrained Merkle proof. Measure
         // the actual join operation latency directly and keep proof checks
         // independent of scope witness cardinality.
@@ -1236,7 +1236,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
-        // TCK-00429: run timed verifier checks on the current revalidate
+        // RFC-0020::REQ-0048: run timed verifier checks on the current revalidate
         // operation data and enforce bounds.
         let bindings = Self::build_revalidate_bindings(cert, current_time_envelope_ref);
         let timed_bindings = timed_validate_authoritative_bindings(
@@ -1259,7 +1259,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             tick,
         )?;
 
-        // TCK-00429: enforce declared receipt-auth timing bound separately.
+        // RFC-0020::REQ-0048: enforce declared receipt-auth timing bound separately.
         let timed_receipt_auth = timed_verify_receipt_authentication(
             &bindings.authentication,
             &cert.ajc_id,
@@ -1470,7 +1470,7 @@ impl AuthorityJoinKernel for InProcessKernel {
             }));
         }
 
-        // TCK-00429: validate replay lifecycle ordering for this consume
+        // RFC-0020::REQ-0048: validate replay lifecycle ordering for this consume
         // operation and enforce verifier-economics bounds before mutating
         // durable state.
         let replay_entries = Self::build_consume_replay_entries(cert, tick);
@@ -1604,19 +1604,20 @@ impl std::error::Error for TemporalArbitrationError {}
 /// Executes the full `join -> revalidate -> consume` sequence. If any stage
 /// fails, the deny is returned and no side effect may execute.
 ///
-/// TCK-00427: When a `SovereigntyChecker` is configured, Tier2+ operations
-/// are additionally validated against sovereignty state during revalidate
-/// and consume stages.
+/// RFC-0020::REQ-0046: When a `SovereigntyChecker` is configured, Tier2+
+/// operations are additionally validated against sovereignty state during
+/// revalidate and consume stages.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
     /// Optional reference to the in-process kernel for production tick
     /// advancement. When set, `advance_tick` calls are forwarded so
     /// freshness checks observe monotonic runtime time.
     tick_kernel: Option<Arc<InProcessKernel>>,
-    /// Optional sovereignty checker for Tier2+ enforcement (TCK-00427).
+    /// Optional sovereignty checker for Tier2+ enforcement
+    /// (RFC-0020::REQ-0046).
     sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
-    /// Optional stop authority for sovereignty freeze actuation (TCK-00427
-    /// security review BLOCKER 1).
+    /// Optional stop authority for sovereignty freeze actuation
+    /// (RFC-0020::REQ-0046 security review BLOCKER 1).
     ///
     /// When a sovereignty denial carries a `containment_action`, the gate
     /// actuates the freeze via this authority before returning the denial.
@@ -1693,7 +1694,8 @@ impl LifecycleGate {
         }
     }
 
-    /// Creates a new lifecycle gate with sovereignty enforcement (TCK-00427).
+    /// Creates a new lifecycle gate with sovereignty enforcement
+    /// (RFC-0020::REQ-0046).
     ///
     /// When a sovereignty checker is provided, Tier2+ operations are
     /// validated against sovereignty state during revalidate and consume.
@@ -1712,7 +1714,7 @@ impl LifecycleGate {
     }
 
     /// Creates a new lifecycle gate with sovereignty enforcement and freeze
-    /// actuation (TCK-00427 security review BLOCKER 1).
+    /// actuation (RFC-0020::REQ-0046 security review BLOCKER 1).
     ///
     /// When a sovereignty denial carries a `containment_action`, the gate
     /// actuates the freeze via the provided `StopAuthority` before returning
@@ -2103,7 +2105,7 @@ impl LifecycleGate {
     /// Actuates a sovereignty freeze via `StopAuthority` and logs the
     /// containment action.
     ///
-    /// TCK-00427 security review BLOCKER 1: Sovereignty denials with
+    /// RFC-0020::REQ-0046 security review BLOCKER 1: Sovereignty denials with
     /// `containment_action` are now mapped to authoritative runtime controls:
     /// - `HardFreeze` -> `set_emergency_stop(true)` (persistent, all sessions)
     /// - `SoftFreeze` -> `set_governance_stop(true)` (session-scoped

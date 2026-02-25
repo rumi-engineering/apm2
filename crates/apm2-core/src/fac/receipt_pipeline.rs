@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00564)
+// AGENT-AUTHORED (RFC-0032::REQ-0215)
 //! Receipt write pipeline: atomic commit protocol for job completion.
 //!
 //! This module implements [`ReceiptWritePipeline`], a crash-safe commit
@@ -522,7 +522,8 @@ impl ReceiptWritePipeline {
         )
     }
 
-    /// Execute the atomic commit protocol with receipt signing (TCK-00576).
+    /// Execute the atomic commit protocol with receipt signing
+    /// (RFC-0032::REQ-0226).
     ///
     /// Identical to [`commit`](Self::commit) but additionally persists a
     /// `SignedReceiptEnvelopeV1` alongside the receipt. The signed envelope
@@ -693,7 +694,7 @@ impl ReceiptWritePipeline {
             .map_err(ReceiptPipelineError::ReceiptPersistFailed)?;
 
         if let Some((signer, signer_id)) = signer {
-            // Step 1b (TCK-00576): Persist signed envelope alongside receipt.
+            // Step 1b (RFC-0032::REQ-0226): Persist signed envelope alongside receipt.
             // Non-fatal: if signing fails, the receipt is still valid but
             // downstream verification treats missing envelope as fail-closed.
             let envelope = sign_receipt(&content_hash, signer, signer_id);
@@ -872,8 +873,8 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
 /// Iterates chars, accumulating `len_utf8()` bytes until the budget is
 /// reached. This ensures the result is always valid UTF-8 and never exceeds
 /// `max_bytes` bytes. Used for filesystem filename construction where limits
-/// are byte-based (255 bytes) rather than char-based (MINOR-1 fix, TCK-00564
-/// round 8).
+/// are byte-based (255 bytes) rather than char-based (MINOR-1 fix,
+/// RFC-0032::REQ-0215 round 8).
 fn truncate_to_byte_budget(s: &str, max_bytes: usize) -> String {
     let mut byte_count: usize = 0;
     let mut result = String::new();
@@ -2571,7 +2572,7 @@ mod tests {
 
     #[test]
     fn test_recover_torn_state_multibyte_job_id_stays_within_byte_limit() {
-        // Regression test for MINOR-1 (TCK-00564 round 8): A job_id composed
+        // Regression test for MINOR-1 (RFC-0032::REQ-0215 round 8): A job_id composed
         // of multibyte UTF-8 chars must produce a recovery receipt filename
         // that fits within the 255-byte filesystem limit. With char-based
         // truncation, 64 4-byte emoji chars would use 256 bytes for the
@@ -2703,7 +2704,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00576: commit_signed tests
+    // RFC-0032::REQ-0226: commit_signed tests
     // =========================================================================
 
     #[test]

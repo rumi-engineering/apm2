@@ -21,7 +21,7 @@ use apm2_core::evidence::MemoryCas;
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
 
-/// Exit codes for CAC commands per TCK-00133.
+/// Exit codes for CAC commands per RFC-0011::REQ-0002.
 pub mod exit_codes {
     /// Success exit code.
     pub const SUCCESS: u8 = 0;
@@ -448,7 +448,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -468,7 +468,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -479,7 +479,7 @@ mod tests {
         assert!(result.is_ok(), "Expected success, got: {result:?}");
 
         let receipt = result.unwrap();
-        assert_eq!(receipt.dcp_id, "dcp://test/ticket/TCK-00133");
+        assert_eq!(receipt.dcp_id, "dcp://test/ticket/RFC-0011::REQ-0002");
         assert!(receipt.patch_hash.is_some());
         assert!(receipt.base_hash.is_some());
     }
@@ -492,7 +492,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -512,7 +512,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::MergePatch,
             dry_run: false,
@@ -537,7 +537,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
         // Create patch
@@ -559,7 +559,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -581,7 +581,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -601,7 +601,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -623,7 +623,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -643,7 +643,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: true, // Dry run mode
@@ -666,7 +666,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -686,7 +686,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -728,7 +728,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -765,7 +765,7 @@ mod tests {
             patch: Some(patch_path),
             base: base_path, // Doesn't exist
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,
@@ -792,7 +792,7 @@ mod tests {
         let schema_path = temp_dir.path().join("schema.json");
 
         // Create base document
-        let base = serde_json::json!({"id": "TCK-00133", "version": 1});
+        let base = serde_json::json!({"id": "RFC-0011::REQ-0002", "version": 1});
         let base_hash = compute_base_hash(&base);
         std::fs::write(&base_path, serde_json::to_string(&base).unwrap()).unwrap();
 
@@ -804,14 +804,14 @@ mod tests {
             // Write opening bracket for JSON array
             file.write_all(b"[").unwrap();
             // Write enough data to exceed 10MB
-            let chunk = r#"{"op":"test","path":"/id","value":"TCK-00133"},"#;
+            let chunk = r#"{"op":"test","path":"/id","value":"RFC-0011::REQ-0002"},"#;
             #[allow(clippy::cast_possible_truncation)]
             let chunk_count = (super::MAX_INPUT_FILE_SIZE as usize / chunk.len()) + 100;
             for _ in 0..chunk_count {
                 file.write_all(chunk.as_bytes()).unwrap();
             }
             // Write closing operation and bracket
-            file.write_all(b"{\"op\":\"test\",\"path\":\"/id\",\"value\":\"TCK-00133\"}]")
+            file.write_all(b"{\"op\":\"test\",\"path\":\"/id\",\"value\":\"RFC-0011::REQ-0002\"}]")
                 .unwrap();
         }
 
@@ -834,7 +834,7 @@ mod tests {
             patch: Some(oversized_path),
             base: base_path,
             schema: schema_path,
-            dcp_id: "dcp://test/ticket/TCK-00133".to_string(),
+            dcp_id: "dcp://test/ticket/RFC-0011::REQ-0002".to_string(),
             artifact_kind: "ticket".to_string(),
             patch_type: PatchTypeArg::JsonPatch,
             dry_run: false,

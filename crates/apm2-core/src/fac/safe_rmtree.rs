@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00516)
+// AGENT-AUTHORED (RFC-0032::REQ-0182)
 //! Symlink-safe recursive tree deletion primitive.
 //!
 //! Implements `safe_rmtree_v1` for secure deletion of lane directories

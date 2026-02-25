@@ -32,6 +32,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 // Allow large stack arrays in tests for schema registry handshake limit testing.
 // The actual code uses heap allocation (Vec), but const evaluation may trigger
 // this lint during test compilation with MAX_HANDSHAKE_DIGESTS (10000).
@@ -73,7 +76,6 @@ pub mod pcac;
 pub mod policy;
 pub mod process;
 pub mod reducer;
-pub mod refactor_radar;
 pub mod restart;
 pub mod rfc_framer;
 pub mod run_manifest;
@@ -83,7 +85,6 @@ pub mod shutdown;
 pub mod state;
 pub mod supervisor;
 pub mod syscall;
-pub mod ticket_emitter;
 pub mod tool;
 pub mod webhook;
 pub mod work;

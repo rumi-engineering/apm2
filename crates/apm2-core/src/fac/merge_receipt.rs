@@ -359,7 +359,8 @@ impl From<MergeReceipt> for MergeReceiptProto {
             gate_actor_id: receipt.gate_actor_id,
             gate_signature: receipt.gate_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
         }
     }

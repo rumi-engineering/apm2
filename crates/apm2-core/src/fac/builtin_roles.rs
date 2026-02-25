@@ -139,7 +139,7 @@ pub fn orchestrator_role() -> RoleSpecV1 {
              2. Allocate tasks to implementer and reviewer agents\n\
              3. Monitor progress and enforce budgets\n\
              4. Drive iteration loops until completion or failure\n\n\
-             Stage-2 (TCK-00419): Default lifecycle path uses projection-request/receipt \
+             Stage-2 (RFC-0032::REQ-0163): Default lifecycle path uses projection-request/receipt \
              mode. Direct write side-effects require explicit override.\n\n\
              Work ID: {work_id}\n\
              Context: {context}",
@@ -235,7 +235,7 @@ pub fn implementer_role() -> RoleSpecV1 {
              3. Make targeted changes to address the requirements\n\
              4. Run tests to verify your changes\n\
              5. Produce a clean changeset for review\n\n\
-             Stage-2 (TCK-00419): Default lifecycle path uses projection-request/receipt \
+             Stage-2 (RFC-0032::REQ-0163): Default lifecycle path uses projection-request/receipt \
              mode. Direct write side-effects require explicit override.\n\n\
              Work ID: {work_id}\n\
              Context: {context}",

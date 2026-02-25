@@ -1,7 +1,0 @@
-network_access:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_NETWORK_ACCESS_V1"
-  values:
-    - "DISALLOWED"
-    - "ALLOW_LISTED_ONLY"
-    - "ALLOWED"

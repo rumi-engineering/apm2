@@ -131,7 +131,7 @@ clap-introspection = ["dep:clap"]
 # When disabled, YubiHsmProvider operates in mock mode for testing
 yubihsm = []
 # UNSAFE: Allow NoOpVerifier in non-test builds. For dev/testing only.
-# Default builds ban NoOpVerifier at compile time (TCK-00550).
+# Default builds ban NoOpVerifier at compile time (RFC-0032::REQ-0205).
 unsafe_no_verify = []
 
 [lints]

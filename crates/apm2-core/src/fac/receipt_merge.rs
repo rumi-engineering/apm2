@@ -155,13 +155,14 @@ pub struct MergedReceiptHeader {
     pub job_id: String,
     /// Epoch timestamp (seconds).
     pub timestamp_secs: u64,
-    /// HTF time envelope stamp in nanoseconds (RFC-0016, TCK-00543).
+    /// HTF time envelope stamp in nanoseconds (RFC-0016, RFC-0032::REQ-0199).
     ///
     /// When present, this is the primary sort key for deterministic
     /// receipt ordering per RFC-0019 section 8.4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub htf_time_envelope_ns: Option<u64>,
-    /// Node fingerprint for deterministic ordering fallback (TCK-00543).
+    /// Node fingerprint for deterministic ordering fallback
+    /// (RFC-0032::REQ-0199).
     ///
     /// Second component of the fallback ordering tuple per RFC-0019
     /// section 8.4.
@@ -1049,7 +1050,7 @@ mod tests {
     }
 
     /// Create a test receipt with HTF and/or `node_fingerprint` for
-    /// deterministic ordering tests (TCK-00543).
+    /// deterministic ordering tests (RFC-0032::REQ-0199).
     fn make_test_receipt_with_provenance(
         job_id: &str,
         timestamp_secs: u64,
@@ -1077,8 +1078,8 @@ mod tests {
         receipt
     }
 
-    /// TCK-00543: Two receipts with the same timestamp but different HTF
-    /// envelopes must sort by HTF (descending).
+    /// RFC-0032::REQ-0199: Two receipts with the same timestamp but different
+    /// HTF envelopes must sort by HTF (descending).
     #[test]
     fn test_htf_ordering_same_timestamp_different_htf() {
         let source = tempfile::tempdir().expect("tempdir");
@@ -1108,8 +1109,8 @@ mod tests {
         );
     }
 
-    /// TCK-00543: Receipts with HTF stamps sort before receipts without,
-    /// regardless of timestamp.
+    /// RFC-0032::REQ-0199: Receipts with HTF stamps sort before receipts
+    /// without, regardless of timestamp.
     #[test]
     fn test_htf_receipts_sort_before_non_htf() {
         let source = tempfile::tempdir().expect("tempdir");
@@ -1139,7 +1140,7 @@ mod tests {
         );
     }
 
-    /// TCK-00543: Two receipts with same timestamp and no HTF sort by
+    /// RFC-0032::REQ-0199: Two receipts with same timestamp and no HTF sort by
     /// `node_fingerprint` ascending.
     #[test]
     fn test_no_htf_same_timestamp_sort_by_node_fingerprint() {
@@ -1169,8 +1170,8 @@ mod tests {
         );
     }
 
-    /// TCK-00543: Receipts with `node_fingerprint` sort before those without
-    /// when timestamps are equal and no HTF is present.
+    /// RFC-0032::REQ-0199: Receipts with `node_fingerprint` sort before those
+    /// without when timestamps are equal and no HTF is present.
     #[test]
     fn test_no_htf_same_timestamp_fingerprint_before_no_fingerprint() {
         let source = tempfile::tempdir().expect("tempdir");
@@ -1197,8 +1198,8 @@ mod tests {
         );
     }
 
-    /// TCK-00543: Full fallback chain is deterministic — same inputs always
-    /// produce the same ordering regardless of insertion order.
+    /// RFC-0032::REQ-0199: Full fallback chain is deterministic — same inputs
+    /// always produce the same ordering regardless of insertion order.
     #[test]
     fn test_full_ordering_determinism() {
         let source = tempfile::tempdir().expect("tempdir");

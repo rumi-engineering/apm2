@@ -1,4 +1,4 @@
-//! Topic derivation for HEF Pulse Plane (RFC-0018, TCK-00305).
+//! Topic derivation for HEF Pulse Plane (RFC-0018, RFC-0032::REQ-0101).
 //!
 //! This module implements deterministic topic derivation for kernel events,
 //! mapping Work and Gate events to their respective pulse topics.
@@ -6,13 +6,13 @@
 //! # Topic Taxonomy (DD-HEF-0001)
 //!
 //! - `work.<work_id>.events` - Work lifecycle events
-//! - `work_graph.<work_id>.edge` - Work graph edge events (TCK-00642)
+//! - `work_graph.<work_id>.edge` - Work graph edge events (RFC-0032::REQ-0269)
 //! - `gate.<work_id>.<changeset_digest>.<gate_id>` - Gate receipt events
 //! - `ledger.head` - System/ledger events
 //! - `episode.<episode_id>.<category>` - Episode lifecycle and tool events
 //! - `defect.new` - Defect notifications
 //!
-//! # Multi-Topic Derivation (TCK-00642)
+//! # Multi-Topic Derivation (RFC-0032::REQ-0269)
 //!
 //! Work graph edge events (`work_graph.edge.added/removed/waived`) reference
 //! two work IDs (`from_work_id` and `to_work_id`). These events emit **two**
@@ -26,9 +26,9 @@
 //! - [INV-TOPIC-003] Changeset lookup uses bounded-size index
 //! - [INV-TOPIC-004] All derived topics pass HEF Topic Grammar validation
 //! - [INV-TOPIC-005] Work graph event types MUST NOT start with `work.` prefix
-//!   to avoid WorkReducer decoding (TCK-00642)
+//!   to avoid WorkReducer decoding (RFC-0032::REQ-0269)
 //!
-//! # Changeset->Work Mapping (TCK-00305, TCK-00672)
+//! # Changeset->Work Mapping (RFC-0032::REQ-0101, RFC-0032::REQ-0276)
 //!
 //! Gate receipts reference a `changeset_digest` but need to route to topics
 //! containing `work_id`. The `ChangesetWorkIndex` maintains this mapping by
@@ -366,7 +366,7 @@ impl TopicDeriver {
     ///
     /// Most event types produce a single topic (returned as a one-element vec).
     /// Work graph edge events (`work_graph.edge.*`) produce two topics: one for
-    /// `from_work_id` and one for `to_work_id` (TCK-00642).
+    /// `from_work_id` and one for `to_work_id` (RFC-0032::REQ-0269).
     ///
     /// # Arguments
     ///
@@ -438,18 +438,19 @@ impl TopicDeriver {
             // System events -> ledger.head
             "ledger.head" => "ledger.head".to_string(),
 
-            // Work events -> work.<work_id>.events (TCK-00305)
+            // Work events -> work.<work_id>.events (RFC-0032::REQ-0101)
             "work.opened" | "work.transitioned" | "work.completed" | "work.aborted"
             | "work.pr_associated" => derive_work_topic(event, &sanitized_namespace),
 
             // Evidence events that impact work-scoped observability.
             "evidence.published" => derive_evidence_topic(event, &sanitized_namespace),
 
-            // Gate receipts -> gate.<work_id>.<changeset_digest>.<gate_id> (TCK-00305)
+            // Gate receipts -> gate.<work_id>.<changeset_digest>.<gate_id> (RFC-0032::REQ-0101)
             "gate.receipt" => self.derive_gate_topic(event, &sanitized_namespace),
 
-            // Session events -> episode.<episode_id>.lifecycle if episode_id present (TCK-00306)
-            // Falls back to namespace.lifecycle for non-episode sessions
+            // Session events -> episode.<episode_id>.lifecycle if episode_id present
+            // (RFC-0032::REQ-0102) Falls back to namespace.lifecycle for non-episode
+            // sessions
             "session.started"
             | "session.progress"
             | "session.terminated"
@@ -460,16 +461,16 @@ impl TopicDeriver {
                 format!("episode.{sanitized_namespace}.lifecycle")
             },
 
-            // Tool events -> episode.<episode_id>.tool if episode_id present (TCK-00306)
+            // Tool events -> episode.<episode_id>.tool if episode_id present (RFC-0032::REQ-0102)
             // Falls back to namespace.tool for non-episode sessions
             "tool.requested" | "tool.decided" | "tool.executed" => {
                 derive_tool_topic(event, &sanitized_namespace)
             },
 
-            // IO artifact events -> episode.<episode_id>.io (TCK-00306)
+            // IO artifact events -> episode.<episode_id>.io (RFC-0032::REQ-0102)
             "io.artifact.published" => derive_io_artifact_topic(event, &sanitized_namespace),
 
-            // Defect events (TCK-00307)
+            // Defect events (RFC-0032::REQ-0103)
             // DefectRecorded ledger events derive to defect.new topic
             "defect.recorded" => "defect.new".to_string(),
 
@@ -482,7 +483,7 @@ impl TopicDeriver {
                 }
             },
 
-            // Work graph edge events -> work_graph.<from_work_id>.edge (TCK-00642)
+            // Work graph edge events -> work_graph.<from_work_id>.edge (RFC-0032::REQ-0269)
             // INV-TOPIC-005: Uses `work_graph.` prefix, NOT `work.`, to avoid
             // WorkReducer decoding.
             // Note: derive_topic() rejects these event types with
@@ -599,7 +600,7 @@ impl TopicDeriver {
 }
 
 // ============================================================================
-// Work Topic Derivation (TCK-00305)
+// Work Topic Derivation (RFC-0032::REQ-0101)
 // ============================================================================
 
 /// Derives a work topic from a work event.
@@ -644,7 +645,7 @@ fn derive_evidence_topic(event: &KernelEvent, fallback_namespace: &str) -> Strin
 }
 
 // ============================================================================
-// Session Topic Derivation (TCK-00306)
+// Session Topic Derivation (RFC-0032::REQ-0102)
 // ============================================================================
 
 /// Derives a session topic from a session event.
@@ -683,7 +684,7 @@ fn derive_session_topic(event: &KernelEvent, fallback_namespace: &str) -> String
 }
 
 // ============================================================================
-// Tool Topic Derivation (TCK-00306)
+// Tool Topic Derivation (RFC-0032::REQ-0102)
 // ============================================================================
 
 /// Derives a tool topic from a tool event.
@@ -715,7 +716,7 @@ fn derive_tool_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
 }
 
 // ============================================================================
-// IO Artifact Topic Derivation (TCK-00306)
+// IO Artifact Topic Derivation (RFC-0032::REQ-0102)
 // ============================================================================
 
 /// Derives an IO artifact topic from an `IoArtifactPublished` event.
@@ -737,7 +738,7 @@ fn derive_io_artifact_topic(event: &KernelEvent, fallback_namespace: &str) -> St
 }
 
 // ============================================================================
-// Work Graph Topic Derivation (TCK-00642)
+// Work Graph Topic Derivation (RFC-0032::REQ-0269)
 // ============================================================================
 
 /// Returns `true` if the event type is a multi-topic work graph edge event.
@@ -1246,7 +1247,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Work Topic Derivation Tests (TCK-00305)
+    // Work Topic Derivation Tests (RFC-0032::REQ-0101)
     // ========================================================================
 
     mod work_topics {
@@ -1356,7 +1357,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Gate Topic Derivation Tests (TCK-00305)
+    // Gate Topic Derivation Tests (RFC-0032::REQ-0101)
     // ========================================================================
 
     mod gate_topics {
@@ -1565,7 +1566,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Typed/Dotted Parity Tests (TCK-00653)
+    // Typed/Dotted Parity Tests (RFC-0032::REQ-0272)
     // ========================================================================
 
     mod typed_dotted_parity {
@@ -1720,7 +1721,7 @@ mod tests {
             let deriver = TopicDeriver::new();
             let event = KernelEvent::default();
 
-            // TCK-00307: DefectRecorded events derive to defect.new topic
+            // RFC-0032::REQ-0103: DefectRecorded events derive to defect.new topic
             let notification = CommitNotification::new(1, [0; 32], "DefectRecorded", "kernel");
             let result = deriver.derive_topic(&notification, &event);
             assert_eq!(result.topic(), Some("defect.new"));
@@ -1835,7 +1836,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Episode Topic Derivation Tests (TCK-00306)
+    // Episode Topic Derivation Tests (RFC-0032::REQ-0102)
     // ========================================================================
 
     mod episode_topics {
@@ -2198,7 +2199,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Event Serialization Tests (TCK-00306)
+    // Event Serialization Tests (RFC-0032::REQ-0102)
     // ========================================================================
 
     mod event_serialization {
@@ -2373,7 +2374,7 @@ mod tests {
     }
 
     // ========================================================================
-    // DefectRecorded Event Tests (TCK-00307)
+    // DefectRecorded Event Tests (RFC-0032::REQ-0103)
     // ========================================================================
 
     mod defect_recorded_tests {
@@ -2569,7 +2570,8 @@ mod tests {
     }
 
     // ========================================================================
-    // WorkGraphEvent Topic Derivation Tests (TCK-00642, drift barrier D1.2)
+    // WorkGraphEvent Topic Derivation Tests (RFC-0032::REQ-0269, drift barrier
+    // D1.2)
     // ========================================================================
 
     mod work_graph_topics {

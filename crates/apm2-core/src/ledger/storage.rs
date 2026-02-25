@@ -200,7 +200,7 @@ pub fn init_canonical_schema(conn: &Connection) -> Result<(), LedgerError> {
 /// Returns `true` if the ledger schema is in canonical `events` mode (not
 /// legacy `ledger_events` mode).
 ///
-/// This is the post-migration invariant check for TCK-00631: after
+/// This is the post-migration invariant check for RFC-0032::REQ-0260: after
 /// `migrate_legacy_ledger_events` completes, this function MUST return
 /// `true`. If it returns `false`, the daemon should refuse to start.
 ///
@@ -926,7 +926,7 @@ impl SqliteLedgerBackend {
         // Run migrations for existing databases (RFC-0014 consensus columns)
         Self::migrate_consensus_columns(conn)?;
 
-        // TCK-00398 phase 1: create idempotent read-compat scaffolding for
+        // RFC-0032::REQ-0150 phase 1: create idempotent read-compat scaffolding for
         // daemon-owned `ledger_events` databases.
         Self::migrate_legacy_read_compat(conn)?;
 
@@ -1763,7 +1763,7 @@ impl SqliteLedgerBackend {
     ///     rationale_code: "APPROVED".to_string(),
     ///     budget_consumed: 100,
     ///     time_envelope_ref: None,
-    ///     // Episode ID (RFC-0018, TCK-00306): not yet populated.
+    ///     // Episode ID (RFC-0018, RFC-0032::REQ-0102): not yet populated.
     ///     episode_id: String::new(),
     /// };
     /// let payload = tool_decided.encode_to_vec();
@@ -1931,12 +1931,12 @@ impl SqliteLedgerBackend {
             "artifact_manifest" => Ok(crate::events::ARTIFACT_MANIFEST_DOMAIN_PREFIX),
             // FAC events
             "changeset_published" => Ok(crate::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX),
-            // TCK-00395: Work lifecycle transition events
+            // RFC-0032::REQ-0149: Work lifecycle transition events
             "work_transitioned" => Ok(crate::events::WORK_TRANSITIONED_DOMAIN_PREFIX),
-            // RFC-0018 HEF review events (TCK-00313)
+            // RFC-0018 HEF review events (RFC-0032::REQ-0107)
             "review_receipt_recorded" => Ok(crate::events::REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX),
             "review_blocked_recorded" => Ok(crate::events::REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX),
-            // TCK-00323: Projection receipt event
+            // RFC-0032::REQ-0117: Projection receipt event
             "projection_receipt_recorded" => {
                 Ok(crate::events::PROJECTION_RECEIPT_RECORDED_DOMAIN_PREFIX)
             },
@@ -2094,9 +2094,9 @@ impl SqliteLedgerBackend {
 // INTENTIONAL DESIGN: Namespace parameter is ignored in this implementation.
 //
 // This SqliteLedgerBackend is a direct extraction of the existing Ledger struct
-// (TCK-00180 scope: "No behavioral changes to existing code"). The namespace
-// parameter was added to the LedgerBackend trait API to enable future namespace
-// isolation per RFC-0014's architectural design.
+// (RFC-0033::REQ-0044 scope: "No behavioral changes to existing code"). The
+// namespace parameter was added to the LedgerBackend trait API to enable future
+// namespace isolation per RFC-0014's architectural design.
 //
 // The actual namespace isolation (table partitioning or separate databases per
 // namespace) is intentionally deferred to a future ticket. This approach:

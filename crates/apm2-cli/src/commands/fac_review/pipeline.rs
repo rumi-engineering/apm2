@@ -4,7 +4,7 @@
 //! PR. Runs evidence gates with CI status comment updates, then dispatches
 //! reviews if all gates pass.
 //!
-//! # TCK-00544: mirror-based lane execution
+//! # RFC-0032::REQ-0200: mirror-based lane execution
 //!
 //! Evidence gates execute inside a lane workspace that is cloned from the
 //! node-local bare mirror at the exact target SHA. This eliminates the SHA
@@ -37,7 +37,8 @@ use crate::exit_codes::codes as exit_codes;
 /// Returns an exit code: 0 on success, 1 if evidence gates fail or an error
 /// occurs.
 pub fn run_pipeline(repo: &str, pr_number: u32, sha: &str, json_output: bool) -> u8 {
-    // TCK-00596: Fail-fast credential gate for GitHub-facing pipeline command.
+    // RFC-0032::REQ-0245: Fail-fast credential gate for GitHub-facing pipeline
+    // command.
     if let Err(err) = apm2_core::fac::require_github_credentials() {
         let message = err.to_string();
         eprintln!("ERROR: {message}");
@@ -120,8 +121,8 @@ fn run_pipeline_inner(
         });
     }
 
-    // TCK-00544: resolve workspace via mirror checkout to an isolated lane,
-    // eliminating SHA drift and dirty-attests-clean hazards.
+    // RFC-0032::REQ-0200: resolve workspace via mirror checkout to an isolated
+    // lane, eliminating SHA drift and dirty-attests-clean hazards.
     let (workspace_root, lane_context) = setup_mirror_lane_workspace(repo, sha, json_output)?;
 
     if json_output {
@@ -330,7 +331,8 @@ fn run_pipeline_inner(
     Ok(true)
 }
 
-// ── TCK-00544: mirror-based lane workspace setup ────────────────────────────
+// ── RFC-0032::REQ-0200: mirror-based lane workspace setup
+// ────────────────────────────
 
 /// Derive the HTTPS remote URL from the `owner/name` repo slug.
 ///

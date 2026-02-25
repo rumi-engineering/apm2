@@ -1,0 +1,48 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/adapter/seccomp",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SECCOMP-001",
+      "kind": "invariant",
+      "title": "Seccomp levels are strictly cumulative",
+      "description": "Restricted includes all Baseline blocks; Strict includes all Restricted blocks.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-SECCOMP-002",
+      "kind": "invariant",
+      "title": "None level applies zero filtering",
+      "description": "SeccompProfileLevel::None applies zero filtering and should only be used for debugging or non-Linux platforms.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-SECCOMP-003",
+      "kind": "invariant",
+      "title": "Log violations controls SECCOMP_RET action",
+      "description": "When log_violations is true, blocked syscalls use SECCOMP_RET_TRAP (SIGSYS). When false, uses SECCOMP_RET_KILL_PROCESS (immediate termination).",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-SECCOMP-004",
+      "kind": "invariant",
+      "title": "Applied is true only when BPF filter loaded into kernel",
+      "description": "SeccompResult.applied is true only when a BPF filter was successfully loaded into the kernel. On non-Linux platforms or None level, applied is always false.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-SECCOMP-005",
+      "kind": "safety",
+      "title": "Apply performs no heap allocations for pre_exec safety",
+      "description": "CompiledSeccompFilter::apply() performs no heap allocations, making it safe for use inside pre_exec hooks (async-signal-safe context).",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CORE-SECCOMP-006",
+      "kind": "capability",
+      "title": "Blocklist-based syscall filtering with tiered restriction",
+      "description": "Three tiered restriction levels (Baseline, Restricted, Strict) provide progressive syscall sandboxing via seccomp-BPF blocklists.",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

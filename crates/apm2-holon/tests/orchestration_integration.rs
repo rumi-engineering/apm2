@@ -1,4 +1,4 @@
-//! Integration tests for the orchestration module (TCK-00332).
+//! Integration tests for the orchestration module (RFC-0032::REQ-0125).
 //!
 //! These tests verify:
 //! - A `work_id` can run >= 20 revision iterations without human interaction

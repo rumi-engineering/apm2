@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! `BatchEpochRootV1` hierarchical batch forests (TCK-00371).
+//! `BatchEpochRootV1` hierarchical batch forests (RFC-0020::REQ-0025).
 //!
 //! This module provides:
 //! - [`BatchEpochRootV1`]: root-of-roots commitment that binds multiple batch
@@ -28,7 +28,7 @@
 //!
 //! - RFC-0020: Batch epoch hierarchical forests
 //! - REQ-0025: Root-of-roots commitment requirement
-//! - TCK-00370: `FactRootV1` composition (prerequisite)
+//! - RFC-0020::REQ-0024: `FactRootV1` composition (prerequisite)
 
 use thiserror::Error;
 

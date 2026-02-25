@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00535)
+// AGENT-AUTHORED (RFC-0032::REQ-0191)
 //! FAC queue introspection: `apm2 fac queue status`.
 //!
 //! Provides forensics-first queue status reporting for operators by scanning

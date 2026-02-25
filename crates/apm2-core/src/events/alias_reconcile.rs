@@ -44,7 +44,7 @@ use std::hash::BuildHasher;
 /// The canonical identity is always the `work_id` hash on the ledger/CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketAliasBinding {
-    /// Human-readable ticket alias (e.g., "TCK-00420").
+    /// Human-readable ticket alias (e.g., "RFC-0032::REQ-0164").
     pub ticket_alias: String,
 
     /// Canonical work ID hash this alias is bound to.

@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Tests for PCAC lifecycle gate (TCK-00423).
+//! Tests for PCAC lifecycle gate (RFC-0020::REQ-0042).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1627,7 +1627,7 @@ fn lifecycle_receipts_have_monotonic_ticks() {
 fn pre_actuation_receipt_binding() {
     // When pre_actuation_receipt_hashes are present in the input,
     // the kernel still succeeds (Phase 1 does not enforce mandatory
-    // pre-actuation — that's TCK-00424). This test verifies the
+    // pre-actuation — that's RFC-0020::REQ-0043). This test verifies the
     // field is accepted without error.
     let kernel = Arc::new(InProcessKernel::new(100));
     let gate = LifecycleGate::new(kernel);
@@ -1645,7 +1645,7 @@ fn pre_actuation_receipt_binding() {
 }
 
 // =============================================================================
-// TCK-00427: Sovereignty integration in LifecycleGate
+// RFC-0020::REQ-0046: Sovereignty integration in LifecycleGate
 // =============================================================================
 
 #[test]
@@ -2109,7 +2109,7 @@ fn lifecycle_gate_sovereignty_uncertainty_carries_freeze_signal() {
 }
 
 // =============================================================================
-// TCK-00427 MAJOR 2: compute_join_hash covers all normative fields
+// RFC-0020::REQ-0046 MAJOR 2: compute_join_hash covers all normative fields
 // =============================================================================
 
 #[test]
@@ -2237,7 +2237,7 @@ fn compute_join_hash_changes_on_freshness_tick() {
 }
 
 // =============================================================================
-// TCK-00427 MAJOR 2: compute_join_hash covers determinism_class and
+// RFC-0020::REQ-0046 MAJOR 2: compute_join_hash covers determinism_class and
 // identity_evidence_level
 // =============================================================================
 
@@ -2295,7 +2295,8 @@ fn compute_join_hash_changes_on_pointer_only_waiver_hash() {
 }
 
 // =============================================================================
-// TCK-00427 MAJOR 3: LedgerAnchorDrift and CertificateExpired in consume
+// RFC-0020::REQ-0046 MAJOR 3: LedgerAnchorDrift and CertificateExpired in
+// consume
 // =============================================================================
 
 #[test]
@@ -2351,7 +2352,7 @@ fn consume_denies_expired_certificate() {
 }
 
 // =============================================================================
-// TCK-00427 BLOCKER 2: No premature consume-set mutation
+// RFC-0020::REQ-0046 BLOCKER 2: No premature consume-set mutation
 // =============================================================================
 
 /// Proves that sovereignty consume check failure does NOT mark the AJC as
@@ -2441,7 +2442,7 @@ fn sovereignty_consume_failure_does_not_mark_consumed() {
 }
 
 // =============================================================================
-// TCK-00427 MAJOR 1: Epoch signature cryptographic verification
+// RFC-0020::REQ-0046 MAJOR 1: Epoch signature cryptographic verification
 // =============================================================================
 
 #[test]
@@ -2559,7 +2560,7 @@ fn epoch_with_untrusted_signer_denied() {
 }
 
 // =============================================================================
-// TCK-00427 Security Review BLOCKER 1: Freeze actuation tests
+// RFC-0020::REQ-0046 Security Review BLOCKER 1: Freeze actuation tests
 // =============================================================================
 
 /// Proves that a sovereignty denial with `HardFreeze` containment action
@@ -2795,7 +2796,8 @@ fn post_hard_freeze_blocks_subsequent_valid_requests() {
 }
 
 // =============================================================================
-// TCK-00427 Security Review MAJOR 1: Future-dated epoch in lifecycle gate
+// RFC-0020::REQ-0046 Security Review MAJOR 1: Future-dated epoch in lifecycle
+// gate
 // =============================================================================
 
 #[test]
@@ -2864,7 +2866,7 @@ fn lifecycle_gate_denies_future_dated_epoch() {
 }
 
 // =============================================================================
-// TCK-00427 quality BLOCKER: Production-constructor signer gate test
+// RFC-0020::REQ-0046 quality BLOCKER: Production-constructor signer gate test
 // =============================================================================
 
 /// Proves that a sovereignty checker constructed with the daemon's actual
@@ -2947,7 +2949,7 @@ fn production_signer_key_accepts_valid_epoch() {
 }
 
 // =============================================================================
-// TCK-00427 quality MAJOR: Kernel-emitted deny records pass validation
+// RFC-0020::REQ-0046 quality MAJOR: Kernel-emitted deny records pass validation
 // =============================================================================
 
 /// Proves that `AuthorityDenyV1` records emitted by `InProcessKernel::join`
@@ -3051,7 +3053,7 @@ fn kernel_zero_anchor_denies_have_positive_tick() {
 }
 
 // =============================================================================
-// TCK-00427 quality BLOCKER: Clock-backed kernel tick derivation
+// RFC-0020::REQ-0046 quality BLOCKER: Clock-backed kernel tick derivation
 // =============================================================================
 
 /// Proves that `InProcessKernel::with_clock` derives its tick from the
@@ -3159,8 +3161,8 @@ fn clock_backed_kernel_advance_tick_sets_floor() {
 /// errors. This is the structural guarantee that prevents fail-open on
 /// clock regression: the error MUST be handled at each call site.
 ///
-/// TCK-00427 security BLOCKER fix: Previously, `current_tick()` returned
-/// `u64` and fell back to `0` on clock regression. Tick `0` caused
+/// RFC-0020::REQ-0046 security BLOCKER fix: Previously, `current_tick()`
+/// returned `u64` and fell back to `0` on clock regression. Tick `0` caused
 /// certificate expiry checks (`0 > expires_at_tick`) to evaluate `false`,
 /// accepting expired certificates (fail-open). By returning `Result`,
 /// clock errors now propagate as authority denials (fail-closed).
@@ -3182,7 +3184,7 @@ fn current_tick_returns_result_not_raw_u64() {
 /// `SovereigntyUncertainty` deny class (fail-closed), NOT a fallback
 /// that would allow expired certificates to pass.
 ///
-/// TCK-00427 security BLOCKER fix: This test verifies the integration
+/// RFC-0020::REQ-0046 security BLOCKER fix: This test verifies the integration
 /// between `current_tick()` error propagation and the `join` call site.
 /// Since we cannot easily simulate a real clock regression with
 /// `HolonicClock` (which wraps `Instant`), we verify the deny class
@@ -3270,7 +3272,7 @@ fn clock_error_deny_uses_unknown_tick_sentinel_when_tick_unavailable() {
 }
 
 // =============================================================================
-// TCK-00426: Durable consume + split-stage lifecycle tests from main
+// RFC-0020::REQ-0045: Durable consume + split-stage lifecycle tests from main
 // =============================================================================
 
 #[test]

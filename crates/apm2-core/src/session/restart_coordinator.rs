@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Tick-based Quarantine Tests (TCK-00243)
+    // Tick-based Quarantine Tests (RFC-0016::REQ-0003)
     // ========================================================================
 
     #[test]
@@ -1387,7 +1387,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Tick-based RestartCoordinator Methods (TCK-00243 Security Fixes)
+    // Tick-based RestartCoordinator Methods (RFC-0016::REQ-0003 Security Fixes)
     // ========================================================================
 
     #[test]

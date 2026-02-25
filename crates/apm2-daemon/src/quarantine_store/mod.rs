@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00496)
+// AGENT-AUTHORED (RFC-0020::REQ-0057)
 //! Durable quarantine store with priority-aware eviction, per-session quota
 //! isolation, saturation-safe insertion, and restart-safe persistence.
 //!

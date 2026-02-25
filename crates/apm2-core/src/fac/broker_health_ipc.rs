@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00600)
+// AGENT-AUTHORED (RFC-0032::REQ-0248)
 //! Broker health IPC endpoint: file-based health + version + readiness status.
 //!
 //! The daemon writes a JSON health status file after each main-loop tick.

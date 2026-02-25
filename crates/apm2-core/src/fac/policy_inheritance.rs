@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00340)
+// AGENT-AUTHORED (RFC-0032::REQ-0131)
 //! Multi-holon policy inheritance enforcement and attestation ratcheting.
 //!
 //! This module enforces two critical security properties:
@@ -25,7 +25,8 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00340: Security hardening: multi-holon policy inheritance enforcement
+//! - RFC-0032::REQ-0131: Security hardening: multi-holon policy inheritance
+//!   enforcement
 //!   + attestation tightening
 //! - REQ-0016: Attestation requirements ratcheted for higher risk tiers
 //! - RFC-0019 Section 03: Trust Boundaries

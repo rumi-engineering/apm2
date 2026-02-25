@@ -1,5 +1,6 @@
 // AGENT-AUTHORED
-//! Durable consume index for authoritative single-use enforcement (TCK-00426).
+//! Durable consume index for authoritative single-use enforcement
+//! (RFC-0020::REQ-0045).
 //!
 //! # Design
 //!

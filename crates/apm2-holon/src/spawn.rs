@@ -1343,7 +1343,7 @@ mod integration_tests {
     //! Integration tests for `spawn_holon` with `MockHolon`.
     //!
     //! These tests verify the complete orchestration flow as specified
-    //! in TCK-00045 definition of done.
+    //! in RFC-0032::REQ-0042 definition of done.
 
     use super::*;
     use crate::episode::EpisodeControllerConfig;
@@ -1515,7 +1515,7 @@ mod integration_tests {
     #[test]
     fn test_integration_full_orchestration() {
         // This test exercises the full spawn_holon flow as a comprehensive
-        // integration test covering all TCK-00045 acceptance criteria.
+        // integration test covering all RFC-0032::REQ-0042 acceptance criteria.
 
         let mut holon = MockHolon::new("full-test-holon").with_episodes_until_complete(3);
 

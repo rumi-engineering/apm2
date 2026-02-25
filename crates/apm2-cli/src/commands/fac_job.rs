@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00533, TCK-00535)
+// AGENT-AUTHORED (RFC-0032::REQ-0189, RFC-0032::REQ-0191)
 //! FAC Job lifecycle management: cancel and show commands.
 //!
 //! Implements `apm2 fac job cancel <job_id>` with the following semantics:
@@ -29,7 +29,7 @@
 //!   worker validates this token on the control-lane admission path AND
 //!   verifies local-origin authority (queue directory ownership).  This
 //!   dual-layer enforcement ensures that cancellation requires both signing key
-//!   access and filesystem privilege (TCK-00587).
+//!   access and filesystem privilege (RFC-0032::REQ-0237).
 //! - Receipt emission failures are fatal: the cancel command fails with an
 //!   error exit code rather than silently continuing without evidence.
 //!
@@ -589,7 +589,7 @@ fn find_job_in_dir(dir: &Path, job_id: &str) -> Option<PathBuf> {
 /// The spec has priority 0 (highest) to ensure it is processed before any
 /// other pending jobs (INV-CANCEL-005).
 ///
-/// TCK-00587: RFC-0028 token enforcement. The cancel command issues a
+/// RFC-0032::REQ-0237: RFC-0028 token enforcement. The cancel command issues a
 /// self-signed channel context token using the persistent FAC signing key.
 /// The worker validates this token on the control-lane admission path,
 /// ensuring that only entities with access to the signing key (same trust
@@ -651,7 +651,7 @@ fn build_stop_revoke_spec(
     spec.job_spec_digest.clone_from(&digest);
     spec.actuation.request_id.clone_from(&digest);
 
-    // TCK-00587: Issue RFC-0028 channel context token for the stop_revoke
+    // RFC-0032::REQ-0237: Issue RFC-0028 channel context token for the stop_revoke
     // spec. This ensures the worker can validate token authenticity before
     // executing the cancellation (no unauth cancel).
     let token = issue_stop_revoke_token(fac_root, &lease_id, &digest, now)?;
@@ -748,7 +748,8 @@ fn emit_cancellation_receipt(
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
 
-    // TCK-00576: Best-effort signed envelope alongside cancellation receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation
+    // receipt.
     if let Ok(signer) =
         crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
     {
@@ -791,8 +792,8 @@ fn emit_cancellation_requested_receipt(
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
 
-    // TCK-00576: Best-effort signed envelope alongside cancellation-requested
-    // receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside
+    // cancellation-requested receipt.
     if let Ok(signer) =
         crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
     {
@@ -925,7 +926,7 @@ fn output_error(json_output: bool, message: &str) {
 // =============================================================================
 
 // =============================================================================
-// Job Show Command (TCK-00535)
+// Job Show Command (RFC-0032::REQ-0191)
 // =============================================================================
 
 /// JSON output for `apm2 fac job show`.
@@ -1083,7 +1084,7 @@ fn discover_log_pointers(job_id: &str) -> (Vec<String>, bool) {
     // Helper: check if we've hit the global cap.
     let at_cap = |p: &Vec<String>| p.len() >= MAX_LOG_POINTERS;
 
-    // TCK-00589: Check legacy evidence and migrated legacy directories for
+    // RFC-0032::REQ-0239: Check legacy evidence and migrated legacy directories for
     // job-related logs (compatibility reads for old tooling).
     if let Some(apm2_home) = apm2_core::github::resolve_apm2_home() {
         // Scan both legacy paths: evidence/ (pre-migration) and legacy/
@@ -1319,7 +1320,7 @@ mod tests {
         assert!(spec.job_id.starts_with("stop-revoke-target-job-123-"));
         assert!(!spec.job_spec_digest.is_empty());
         assert_eq!(spec.actuation.request_id, spec.job_spec_digest);
-        // TCK-00587: RFC-0028 token MUST be present.
+        // RFC-0032::REQ-0237: RFC-0028 token MUST be present.
         assert!(
             spec.actuation.channel_context_token.is_some(),
             "stop_revoke spec must carry RFC-0028 token"
@@ -1687,7 +1688,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Job Show tests (TCK-00535)
+    // Job Show tests (RFC-0032::REQ-0191)
     // =========================================================================
 
     #[test]

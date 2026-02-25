@@ -1,4 +1,4 @@
-//! E2E tool mediation tests for TCK-00176.
+//! E2E tool mediation tests for RFC-0033::REQ-0042.
 //!
 //! This module tests the full tool mediation flow including:
 //! - Allow decision flow
@@ -14,7 +14,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00176: E2E tool and telemetry tests
+//! - RFC-0033::REQ-0042: E2E tool and telemetry tests
 //! - CTR-DAEMON-004: `ToolBroker` structure
 //! - REQ-TOOL-001: Tool mediation requirements
 
@@ -49,8 +49,8 @@ fn test_args_hash() -> [u8; 32] {
 
 /// Creates a capability manifest with the specified capabilities.
 ///
-/// Per TCK-00254, the `tool_allowlist` is automatically populated from the
-/// capabilities' tool classes, and `write_allowlist` is populated for
+/// Per RFC-0032::REQ-0070, the `tool_allowlist` is automatically populated from
+/// the capabilities' tool classes, and `write_allowlist` is populated for
 /// Write capabilities.
 fn create_manifest_with_capabilities(caps: Vec<Capability>) -> CapabilityManifest {
     use std::path::PathBuf;
@@ -153,7 +153,8 @@ async fn test_allow_decision_with_matching_capability() {
 
     // Create broker and initialize with manifest
     // NOTE: Use without_policy_check() because this test focuses on capability
-    // validation, not policy engine integration (TCK-00292 default-deny behavior)
+    // validation, not policy engine integration (RFC-0032::REQ-0094 default-deny
+    // behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
@@ -207,9 +208,10 @@ async fn test_allow_multiple_tool_classes() {
         execute_capability(),
     ]);
     // NOTE: Use without_policy_check() because this test focuses on capability
-    // validation, not policy engine integration (TCK-00292 default-deny behavior).
-    // Configure a ShellBridgePolicy that allows "ls" so the Execute request passes
-    // the shell bridge allowlist check (the default is deny_all per TCK-00377).
+    // validation, not policy engine integration (RFC-0032::REQ-0094 default-deny
+    // behavior). Configure a ShellBridgePolicy that allows "ls" so the Execute
+    // request passes the shell bridge allowlist check (the default is deny_all
+    // per RFC-0020::REQ-0031).
     let shell_policy =
         ShellBridgePolicy::new(vec!["ls".to_string()], false).expect("valid shell policy");
     let broker: TestToolBroker = ToolBroker::new(
@@ -385,7 +387,8 @@ async fn test_dedupe_cache_hit() {
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
     // NOTE: Use without_policy_check() because this test focuses on dedupe cache
-    // behavior, not policy engine integration (TCK-00292 default-deny behavior)
+    // behavior, not policy engine integration (RFC-0032::REQ-0094 default-deny
+    // behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
@@ -468,7 +471,8 @@ async fn test_dedupe_cache_miss_different_key() {
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
     // NOTE: Use without_policy_check() because this test focuses on dedupe cache
-    // behavior, not policy engine integration (TCK-00292 default-deny behavior)
+    // behavior, not policy engine integration (RFC-0032::REQ-0094 default-deny
+    // behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
@@ -541,8 +545,8 @@ async fn test_dedupe_cache_episode_isolation() {
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
     // NOTE: Use without_policy_check() because this test focuses on dedupe cache
-    // episode isolation, not policy engine integration (TCK-00292 default-deny
-    // behavior)
+    // episode isolation, not policy engine integration (RFC-0032::REQ-0094
+    // default-deny behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
@@ -756,7 +760,8 @@ async fn test_broker_with_mock_harness() {
         write_capability("/workspace"),
     ]);
     // NOTE: Use without_policy_check() because this test focuses on broker/harness
-    // integration, not policy engine integration (TCK-00292 default-deny behavior)
+    // integration, not policy engine integration (RFC-0032::REQ-0094 default-deny
+    // behavior)
     let broker: TestToolBroker =
         ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker

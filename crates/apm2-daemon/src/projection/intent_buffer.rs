@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00504)
+// AGENT-AUTHORED (RFC-0033::REQ-0062)
 //! Projection intent schema and durable buffer for economics-gated admission.
 //!
 //! This module implements the [`IntentBuffer`] — a SQLite-backed durable buffer

@@ -1,4 +1,4 @@
-//! TCK-00417 integration tests:
+//! RFC-0032::REQ-0161 integration tests:
 //! event-family parity convergence and replay-equivalence gates.
 
 use std::collections::{BTreeSet, HashSet};
@@ -307,8 +307,8 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
     let work_id = "W-REPLAY-001";
     let actor_id = "actor:replay";
 
-    // TCK-00672: ChangeSetPublished must be observed BEFORE review-start and
-    // completion gates (CSID-004 fail-closed latest-changeset admission).
+    // RFC-0032::REQ-0276: ChangeSetPublished must be observed BEFORE review-start
+    // and completion gates (CSID-004 fail-closed latest-changeset admission).
     let events = vec![
         dotted_opened_event(work_id, actor_id, 2_000, 1),
         dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 2_100, 2),
@@ -413,7 +413,7 @@ fn restart_recovery_replay_converges() {
     let work_id = "W-RESTART-001";
     let actor_id = "actor:restart";
 
-    // TCK-00672: ChangeSetPublished must be observed BEFORE review-start
+    // RFC-0032::REQ-0276: ChangeSetPublished must be observed BEFORE review-start
     // (CSID-004 fail-closed latest-changeset admission).
     let events = vec![
         dotted_opened_event(work_id, actor_id, 4_000, 1),

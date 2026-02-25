@@ -847,7 +847,7 @@ level1:
     }
 
     // =========================================================================
-    // Security fix tests (TCK-00110)
+    // Security fix tests (RFC-0011::REQ-0029)
     // =========================================================================
 
     /// CRITICAL: Test that integer and string keys with same representation
@@ -1056,7 +1056,7 @@ level1:
     }
 
     // =========================================================================
-    // Security review fix tests (TCK-00110 - review findings)
+    // Security review fix tests (RFC-0011::REQ-0029 - review findings)
     // =========================================================================
 
     /// BLOCKER/HIGH: Test that `u64::MAX` as number and its string

@@ -15,7 +15,7 @@ pub(super) const DENIED_DIR: &str = "denied";
 pub(super) const QUARANTINE_DIR: &str = "quarantine";
 pub(super) const CANCELLED_DIR: &str = "cancelled";
 /// Broker requests directory where non-service-user callers submit jobs
-/// for promotion by the worker (TCK-00577).
+/// for promotion by the worker (RFC-0032::REQ-0227).
 pub(super) const BROKER_REQUESTS_DIR: &str = "broker_requests";
 pub(super) const CONSUME_RECEIPTS_DIR: &str = "authority_consumed";
 

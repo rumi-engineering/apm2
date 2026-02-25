@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/impact_map",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-IMPACT-001",
+      "kind": "invariant",
+      "title": "Impact map output is deterministic: same inputs produce identical YAML",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-002",
+      "kind": "invariant",
+      "title": "All requirements are mapped, classified as net-new, or marked unresolved",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-003",
+      "kind": "invariant",
+      "title": "Duplication risks flagged when multiple extension points match",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-004",
+      "kind": "invariant",
+      "title": "Output files use canonical YAML with sorted keys",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-005",
+      "kind": "invariant",
+      "title": "Requirement IDs are unique within a PRD",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-006",
+      "kind": "invariant",
+      "title": "Candidates sorted by fit score descending",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-007",
+      "kind": "safety",
+      "title": "Path traversal prevention via PRD ID validation and canonicalization",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-008",
+      "kind": "safety",
+      "title": "File reads bounded to 1MB per file, 1000 files max (DoS protection)",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-CORE-IMPACT-009",
+      "kind": "requirement",
+      "title": "Atomic writes ensure no partial files on crash",
+      "rfc": ["RFC-0021"]
+    }
+  ]
+}

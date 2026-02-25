@@ -76,7 +76,7 @@ pub const SESSION_TERMINATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_termina
 /// 1.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
-/// Domain prefix for `WorkTransitioned` events (TCK-00395).
+/// Domain prefix for `WorkTransitioned` events (RFC-0032::REQ-0149).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
 /// This prefix is used for work lifecycle state transition events emitted
@@ -424,7 +424,7 @@ impl DomainSeparatedCanonical for ArtifactManifest {
 }
 
 // =============================================================================
-// RFC-0017 KERNEL EVENT CANONICALIZE IMPLEMENTATIONS (TCK-00264)
+// RFC-0017 KERNEL EVENT CANONICALIZE IMPLEMENTATIONS (RFC-0032::REQ-0080)
 // =============================================================================
 //
 // The following implementations are for RFC-0017 kernel events that require
@@ -578,17 +578,17 @@ impl Canonicalize for KernelEvent {
                 | kernel_event::Payload::AatResultReused(_)
                 | kernel_event::Payload::QuarantineCleared(_)
                 | kernel_event::Payload::ChangesetPublished(_)
-                // IoArtifactPublished has no repeated fields (TCK-00306)
+                // IoArtifactPublished has no repeated fields (RFC-0032::REQ-0102)
                 | kernel_event::Payload::IoArtifactPublished(_)
-                // DefectRecorded has no repeated fields (TCK-00307)
+                // DefectRecorded has no repeated fields (RFC-0032::REQ-0103)
                 | kernel_event::Payload::DefectRecorded(_)
-                // ReviewBlockedRecorded has no repeated fields (TCK-00311)
+                // ReviewBlockedRecorded has no repeated fields (RFC-0032::REQ-0105)
                 | kernel_event::Payload::ReviewBlockedRecorded(_)
-                // ReviewReceiptRecorded has no repeated fields (TCK-00312)
+                // ReviewReceiptRecorded has no repeated fields (RFC-0032::REQ-0106)
                 | kernel_event::Payload::ReviewReceiptRecorded(_)
-                // ProjectionReceiptRecorded has no repeated fields (TCK-00323)
+                // ProjectionReceiptRecorded has no repeated fields (RFC-0032::REQ-0117)
                 | kernel_event::Payload::ProjectionReceiptRecorded(_)
-                // WorkGraphEvent has no repeated fields (TCK-00642)
+                // WorkGraphEvent has no repeated fields (RFC-0032::REQ-0269)
                 | kernel_event::Payload::WorkGraph(_),
             )
             | None => {},
@@ -659,7 +659,8 @@ mod tests {
             artifact_size: 100,
             metadata: vec!["key=value".to_string()],
             // HTF time envelope reference (RFC-0016): not yet populated.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
         };
 
@@ -864,7 +865,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00264: Golden Vector Tests for RFC-0017 Kernel Events
+    // RFC-0032::REQ-0080: Golden Vector Tests for RFC-0017 Kernel Events
     // =========================================================================
     //
     // These tests verify:
@@ -876,7 +877,8 @@ mod tests {
         TOOL_DECIDED_DOMAIN_PREFIX, TOOL_EXECUTED_DOMAIN_PREFIX, WORK_CLAIMED_DOMAIN_PREFIX,
     };
 
-    /// TCK-00264: Verify `ToolDecided` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `ToolDecided` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -914,7 +916,8 @@ mod tests {
         assert_eq!(&bytes1[..prefix_len], b"apm2.event.tool_decided:");
     }
 
-    /// TCK-00264: Verify `ToolExecuted` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `ToolExecuted` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -950,7 +953,8 @@ mod tests {
         assert_eq!(&bytes1[..prefix_len], b"apm2.event.tool_executed:");
     }
 
-    /// TCK-00264: Verify `SessionTerminated` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `SessionTerminated` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -986,7 +990,7 @@ mod tests {
         assert_eq!(&bytes1[..prefix_len], b"apm2.event.session_terminated:");
     }
 
-    /// TCK-00264: Verify domain prefixes prevent cross-context replay.
+    /// RFC-0032::REQ-0080: Verify domain prefixes prevent cross-context replay.
     ///
     /// A signature computed for one event type must not be valid for another.
     /// This test verifies that domain prefixes are unique across event types.
@@ -1024,7 +1028,7 @@ mod tests {
         }
     }
 
-    /// TCK-00264: Verify canonical bytes differ across event types.
+    /// RFC-0032::REQ-0080: Verify canonical bytes differ across event types.
     ///
     /// Even with similar field values, canonical bytes must differ due to
     /// domain prefixes and protobuf field tags.
@@ -1085,7 +1089,8 @@ mod tests {
         );
     }
 
-    /// TCK-00264: Verify `KernelEvent` canonicalize handles `ToolEvent`.
+    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles
+    /// `ToolEvent`.
     #[test]
     fn tck_00264_kernel_event_canonicalize_tool_event() {
         use super::super::{ToolEvent, tool_event};
@@ -1114,7 +1119,8 @@ mod tests {
         assert!(event.payload.is_some());
     }
 
-    /// TCK-00264: Verify `KernelEvent` canonicalize handles `SessionEvent`.
+    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles
+    /// `SessionEvent`.
     #[test]
     fn tck_00264_kernel_event_canonicalize_session_event() {
         use super::super::{SessionEvent, session_event};
@@ -1141,7 +1147,8 @@ mod tests {
         assert!(event.payload.is_some());
     }
 
-    /// TCK-00264: Verify domain prefix constants match RFC-0017 specification.
+    /// RFC-0032::REQ-0080: Verify domain prefix constants match RFC-0017
+    /// specification.
     #[test]
     fn tck_00264_domain_prefix_constants_match_rfc() {
         // These values are specified in RFC-0017 DD-006
@@ -1158,7 +1165,7 @@ mod tests {
         );
     }
 
-    /// TCK-00264: Golden vector for `ToolDecided` with known bytes.
+    /// RFC-0032::REQ-0080: Golden vector for `ToolDecided` with known bytes.
     ///
     /// This test uses a fixed input and verifies the output matches a
     /// precomputed golden vector. If the protobuf encoding changes,
@@ -1197,7 +1204,7 @@ mod tests {
         );
     }
 
-    /// TCK-00264: Golden vector for `ToolExecuted` with known bytes.
+    /// RFC-0032::REQ-0080: Golden vector for `ToolExecuted` with known bytes.
     #[test]
     fn tck_00264_tool_executed_golden_vector() {
         use super::ToolExecuted;
@@ -1223,7 +1230,8 @@ mod tests {
         assert_eq!(bytes, bytes2, "Golden vector must be stable across runs");
     }
 
-    /// TCK-00264: Golden vector for `SessionTerminated` with known bytes.
+    /// RFC-0032::REQ-0080: Golden vector for `SessionTerminated` with known
+    /// bytes.
     #[test]
     fn tck_00264_session_terminated_golden_vector() {
         use super::SessionTerminated;
@@ -1588,7 +1596,7 @@ mod tests {
         );
     }
 
-    /// TCK-00264: Verify paired sorting preserves `profile_id` <->
+    /// RFC-0032::REQ-0080: Verify paired sorting preserves `profile_id` <->
     /// `manifest_hash` association.
     ///
     /// This is a critical security test. If profile IDs and manifest hashes are

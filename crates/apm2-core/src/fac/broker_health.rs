@@ -2,9 +2,9 @@
 //! Broker health monitoring: validates RFC-0029 TP001/TP002/TP003 invariants
 //! and emits health receipts.
 //!
-//! Implements TCK-00585: the broker periodically self-checks its horizon and
-//! envelope invariants and produces a [`HealthReceiptV1`] that workers can
-//! inspect before admitting work.
+//! Implements RFC-0032::REQ-0235: the broker periodically self-checks its
+//! horizon and envelope invariants and produces a [`HealthReceiptV1`] that
+//! workers can inspect before admitting work.
 //!
 //! # Security Invariants
 //!

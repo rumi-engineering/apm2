@@ -623,7 +623,7 @@ fn test_actor_id_preserved() {
 }
 
 // =============================================================================
-// TCK-00398: Legacy ledger_events Compatibility Bridge
+// RFC-0032::REQ-0150: Legacy ledger_events Compatibility Bridge
 // =============================================================================
 
 #[test]
@@ -778,7 +778,7 @@ fn tck_00398_rejects_legacy_schema_type_mismatch() {
 }
 
 // =============================================================================
-// TCK-00182: RFC-0014 Consensus Column Tests
+// RFC-0033::REQ-0046: RFC-0014 Consensus Column Tests
 // =============================================================================
 
 /// Test that new consensus fields default to None when creating events.
@@ -984,7 +984,7 @@ fn tck_00182_reader_includes_consensus_fields() {
 }
 
 // =============================================================================
-// TCK-00265: Signature Verification on Ledger Ingestion
+// RFC-0032::REQ-0081: Signature Verification on Ledger Ingestion
 // =============================================================================
 
 /// Helper to create a properly signed event for testing.
@@ -1489,7 +1489,7 @@ fn tck_00265_chain_integrity_violation_detected() {
 }
 
 // =============================================================================
-// TCK-00398: Legacy-mode write rejection (fail-closed)
+// RFC-0032::REQ-0150: Legacy-mode write rejection (fail-closed)
 //
 // Security review BLOCKERs:
 // 1. Fail-closed invariant bypassable after initialization — write paths always
@@ -1653,7 +1653,7 @@ fn tck_00398_legacy_mode_reads_still_work() {
 }
 
 // =============================================================================
-// TCK-00630: RFC-0032 Phase 0 — Legacy Migration with Hash Chain
+// RFC-0032::REQ-0259: RFC-0032 Phase 0 — Legacy Migration with Hash Chain
 // =============================================================================
 
 /// Helper: check if a `SQLite` table exists (test-local, avoids private
@@ -3203,12 +3203,12 @@ fn tck_00630_frozen_exists_events_empty_frozen_empty_noop() {
     }
 }
 
-/// Regression (TCK-00630 R5): frozen snapshot has rows, canonical `events` is
-/// empty, but `ledger_events` has live rows (simulating truncation + rogue
-/// write).  The old code checked `live_legacy_rows` BEFORE `events_rows`
-/// inside the `frozen_exists` branch, allowing re-migration to bypass the
-/// fail-closed `MigrationPartialState` guard.  After the fix, `events_rows`
-/// is checked FIRST — this scenario must always fail closed.
+/// Regression (RFC-0032::REQ-0259 R5): frozen snapshot has rows, canonical
+/// `events` is empty, but `ledger_events` has live rows (simulating truncation
+/// + rogue write).  The old code checked `live_legacy_rows` BEFORE
+/// `events_rows` inside the `frozen_exists` branch, allowing re-migration to
+/// bypass the fail-closed `MigrationPartialState` guard.  After the fix,
+/// `events_rows` is checked FIRST — this scenario must always fail closed.
 #[test]
 fn tck_00630_frozen_nonempty_events_empty_live_legacy_nonzero_fails_closed() {
     let dir = TempDir::new().unwrap();
@@ -3345,8 +3345,8 @@ fn assert_genesis_migration_result(conn: &Connection, expected_events: i64) {
     assert_eq!(null_hashes, 0, "no NULL event_hash values after migration");
 }
 
-/// Regression (TCK-00630 R6): empty frozen migration followed by new legacy
-/// rows must trigger a full migration from genesis, NOT return
+/// Regression (RFC-0032::REQ-0259 R6): empty frozen migration followed by new
+/// legacy rows must trigger a full migration from genesis, NOT return
 /// `already_migrated`.
 ///
 /// Scenario: migration runs on an empty `ledger_events` (creates empty frozen,
@@ -3423,7 +3423,7 @@ fn tck_00630_empty_frozen_with_new_live_rows_migrates_from_genesis() {
     }
 }
 
-/// TCK-00631: `is_canonical_events_mode` returns correct results
+/// RFC-0032::REQ-0260: `is_canonical_events_mode` returns correct results
 /// for all three DB states:
 /// (a) legacy-only -> false
 /// (b) canonical-only -> true
@@ -3463,7 +3463,7 @@ fn tck_00631_is_canonical_events_mode_three_states() {
 }
 
 // =============================================================================
-// TCK-00632: RFC-0032 AT-0 — Ledger Unification Acceptance Test
+// RFC-0032::REQ-0261: RFC-0032 AT-0 — Ledger Unification Acceptance Test
 //
 // System-level acceptance test that seeds a DB containing only legacy
 // `ledger_events` rows and verifies that the daemon startup migration

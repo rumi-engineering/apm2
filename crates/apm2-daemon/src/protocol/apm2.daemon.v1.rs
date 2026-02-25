@@ -326,12 +326,12 @@ pub struct SpawnEpisodeRequest {
     /// Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
     #[prost(string, optional, tag = "3")]
     pub lease_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// TCK-00319: Workspace root directory for this episode.
+    /// RFC-0032::REQ-0113: Workspace root directory for this episode.
     /// All file operations will be confined to this directory.
     /// REQUIRED: Episodes cannot be spawned without a workspace root.
     #[prost(string, tag = "4")]
     pub workspace_root: ::prost::alloc::string::String,
-    /// TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
+    /// RFC-0020::REQ-0005 BLOCKER 1: Authoritative stop conditions from the episode
     /// envelope.  When present, these override StopConditions::default() so
     /// that max_episodes and escalation_predicate are actually enforced.
     /// When absent, the handler falls back to fail-closed defaults
@@ -342,12 +342,12 @@ pub struct SpawnEpisodeRequest {
     /// Non-empty string triggers EscalationTriggered stop denial.
     #[prost(string, optional, tag = "6")]
     pub escalation_predicate: ::core::option::Option<::prost::alloc::string::String>,
-    /// TCK-00397: Optional adapter profile hash for explicit adapter binding.
+    /// RFC-0032::REQ-0289: Optional adapter profile hash for explicit adapter binding.
     /// Must be a 32-byte BLAKE3 digest and must resolve in CAS (fail-closed).
     /// Tag 8 chosen to avoid renumbering existing fields (wire stability).
     #[prost(bytes = "vec", optional, tag = "8")]
     pub adapter_profile_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    /// TCK-00373: Optional permeability receipt hash for delegated spawns.
+    /// RFC-0020::REQ-0027: Optional permeability receipt hash for delegated spawns.
     /// When present, the spawn path routes through validate_delegated_spawn_gate
     /// for full consumption-binding verification. Must be a 32-byte BLAKE3 digest.
     /// Tag 9 chosen to preserve wire stability.
@@ -369,7 +369,7 @@ pub struct SpawnEpisodeResponse {
     #[prost(string, tag = "4")]
     pub ephemeral_handle: ::prost::alloc::string::String,
     /// HMAC-signed session token for authenticating session-scoped IPC requests.
-    /// TCK-00287: Required for clients to access session endpoints.
+    /// RFC-0032::REQ-0089: Required for clients to access session endpoints.
     #[prost(string, tag = "5")]
     pub session_token: ::prost::alloc::string::String,
 }
@@ -445,7 +445,7 @@ pub struct UpdateStopFlagsResponse {
     #[prost(bool, tag = "2")]
     pub governance_stop_active: bool,
 }
-/// IPC-PRIV-005: WorkStatus (TCK-00344)
+/// IPC-PRIV-005: WorkStatus (RFC-0032::REQ-0134)
 /// Query the status of a work item from the work queue.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkStatusRequest {
@@ -555,7 +555,7 @@ pub struct WorkStatusResponse {
     #[prost(uint32, tag = "17")]
     pub identity_chain_defect_count: u32,
 }
-/// IPC-PRIV-019: WorkList (TCK-00415)
+/// IPC-PRIV-019: WorkList (RFC-0032::REQ-0159)
 /// List all work items known to projection authority.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkListRequest {
@@ -577,7 +577,7 @@ pub struct WorkListResponse {
     #[prost(message, repeated, tag = "1")]
     pub work_items: ::prost::alloc::vec::Vec<WorkStatusResponse>,
 }
-/// IPC-PRIV-073: VerifyLedgerChain (TCK-00487)
+/// IPC-PRIV-073: VerifyLedgerChain (RFC-0020::REQ-0053)
 /// Explicit full-chain verification endpoint for operator maintenance/audit.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct VerifyLedgerChainRequest {}
@@ -596,7 +596,7 @@ pub struct VerifyLedgerChainResponse {
     #[prost(string, tag = "4")]
     pub message: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)
+/// IPC-PRIV-020: AuditorLaunchProjection (RFC-0020::REQ-0040)
 /// Return launch-lineage and boundary-conformance projection for auditors.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct AuditorLaunchProjectionRequest {}
@@ -630,7 +630,7 @@ pub struct AuditorLaunchProjectionResponse {
     #[prost(bool, tag = "9")]
     pub admissible: bool,
 }
-/// IPC-PRIV-027: OrchestratorLaunchProjection (TCK-00452)
+/// IPC-PRIV-027: OrchestratorLaunchProjection (RFC-0020::REQ-0040)
 /// Return launch liveness/restart projection for orchestrator consumers.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct OrchestratorLaunchProjectionRequest {}
@@ -696,7 +696,7 @@ pub struct EndSessionRequest {
     /// Human-readable reason for termination.
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
-    /// Typed termination outcome (TCK-00395 Quality v3 MAJOR).
+    /// Typed termination outcome (RFC-0032::REQ-0149 Quality v3 MAJOR).
     /// When set, this takes precedence over string-based reason matching.
     #[prost(enumeration = "TerminationOutcome", tag = "3")]
     pub outcome: i32,
@@ -884,7 +884,7 @@ pub struct RequestToolRequest {
     /// Deduplication key for idempotent requests.
     #[prost(string, tag = "4")]
     pub dedupe_key: ::prost::alloc::string::String,
-    /// Optional epoch seal payload for Tier2+ admission (TCK-00365).
+    /// Optional epoch seal payload for Tier2+ admission (RFC-0020::REQ-0019).
     /// When present, the broker verifies monotonicity, anti-equivocation,
     /// and signature authenticity. Missing at Tier2+ causes fail-closed deny.
     /// Serialized EpochSealV1 bytes (bincode or canonical encoding).
@@ -906,34 +906,34 @@ pub struct RequestToolResponse {
     #[prost(bytes = "vec", tag = "4")]
     pub policy_hash: ::prost::alloc::vec::Vec<u8>,
     /// Result hash from tool execution (CAS reference, populated on ALLOW after execution).
-    /// TCK-00316: Required for kernel-side execution model.
+    /// RFC-0032::REQ-0110: Required for kernel-side execution model.
     #[prost(bytes = "vec", optional, tag = "5")]
     pub result_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     /// Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
-    /// TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
+    /// RFC-0032::REQ-0110: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
     #[prost(bytes = "vec", optional, tag = "6")]
     pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     /// Daemon-issued signed channel context token for FAC role-launch authorization.
     /// Present when authoritative channel-boundary checks pass for launch-relevant tools.
     #[prost(string, optional, tag = "11")]
     pub channel_context_token: ::core::option::Option<::prost::alloc::string::String>,
-    /// TCK-00351: Pre-actuation stop check proof.
+    /// RFC-0020::REQ-0005: Pre-actuation stop check proof.
     /// True indicates stop conditions were evaluated and cleared before actuation.
     /// False or absent indicates stop check was not performed (fail-closed: deny).
     #[prost(bool, tag = "7")]
     pub stop_checked: bool,
-    /// TCK-00351: Pre-actuation budget check proof.
+    /// RFC-0020::REQ-0005: Pre-actuation budget check proof.
     /// True indicates budget was enforced at pre-actuation.
     /// False is only valid when `budget_enforcement_deferred=true`.
     /// Replayers MUST reject traces where both `budget_checked=false` and
     /// `budget_enforcement_deferred=false`.
     #[prost(bool, tag = "8")]
     pub budget_checked: bool,
-    /// TCK-00351: Explicitly marks budget enforcement deferred beyond
+    /// RFC-0020::REQ-0005: Explicitly marks budget enforcement deferred beyond
     /// pre-actuation (e.g., to EpisodeRuntime).
     #[prost(bool, tag = "9")]
     pub budget_enforcement_deferred: bool,
-    /// TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
+    /// RFC-0020::REQ-0005: HTF timestamp (nanoseconds) when pre-actuation checks completed.
     /// Provides replay-verifiable ordering proof that checks preceded actuation.
     #[prost(uint64, tag = "10")]
     pub preactuation_timestamp_ns: u64,
@@ -1016,7 +1016,7 @@ pub struct StreamTelemetryResponse {
     #[prost(bool, tag = "2")]
     pub promoted: bool,
 }
-/// IPC-SESS-005: SessionStatus (TCK-00344)
+/// IPC-SESS-005: SessionStatus (RFC-0032::REQ-0134)
 /// Query session-scoped status via session.sock.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionStatusRequest {
@@ -1271,7 +1271,7 @@ pub struct PatternRejection {
 /// - Each pattern: max 128 chars, ASCII only
 /// - session_token required on session.sock (INV-SESS-001)
 ///
-/// ## ACL Enforcement (handled by TCK-00302)
+/// ## ACL Enforcement (handled by RFC-0032::REQ-0098)
 ///
 /// - Session subscriptions: deny-by-default, capability-manifest allowlist
 /// - Operator subscriptions: full topic taxonomy access
@@ -1783,7 +1783,7 @@ pub struct IngestReviewReceiptResponse {
     #[prost(string, tag = "3")]
     pub event_id: ::prost::alloc::string::String,
 }
-/// Request to delegate a sublease from a parent gate lease (TCK-00340).
+/// Request to delegate a sublease from a parent gate lease (RFC-0032::REQ-0131).
 ///
 /// The daemon validates the parent lease, checks strict-subset constraints,
 /// and issues a signed sublease for the delegatee actor.
@@ -1827,7 +1827,7 @@ pub struct DelegateSubleaseResponse {
     #[prost(string, tag = "6")]
     pub event_id: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-074: RegisterRecoveryEvidence (TCK-00469)
+/// IPC-PRIV-074: RegisterRecoveryEvidence (RFC-0020::REQ-0051)
 /// Operator registers durable replay evidence to transition projection recovery
 /// state from non-durable to durable provenance, enabling subsequent unfreeze.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1863,7 +1863,7 @@ pub struct RegisterRecoveryEvidenceResponse {
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-075: RequestUnfreeze (TCK-00469)
+/// IPC-PRIV-075: RequestUnfreeze (RFC-0020::REQ-0051)
 /// Operator requests lifting a projection freeze after durable recovery evidence
 /// has been registered and verified.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1893,7 +1893,7 @@ pub struct RequestUnfreezeResponse {
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+/// IPC-PRIV-076: OpenWork (RFC-0032, RFC-0032::REQ-0263)
 /// Opens a new work item by persisting a validated WorkSpec to CAS
 /// and emitting a canonical work.opened event. Actor ID is derived
 /// from peer credentials (never from client input).
@@ -1920,7 +1920,7 @@ pub struct OpenWorkResponse {
     #[prost(bool, tag = "3")]
     pub already_existed: bool,
 }
-/// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+/// IPC-PRIV-077: PublishWorkContextEntry (RFC-0032::REQ-0266, RFC-0032 Phase 2)
 /// Publishes a work context entry to CAS and anchors it in the ledger via
 /// evidence.published with category WORK_CONTEXT_ENTRY.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1961,7 +1961,7 @@ pub struct PublishWorkContextEntryResponse {
     #[prost(string, tag = "4")]
     pub work_id: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+/// IPC-PRIV-079: PublishWorkLoopProfile (RFC-0032::REQ-0270, RFC-0032 Phase 4)
 /// Publishes a work loop profile to CAS and anchors it in the ledger via
 /// evidence.published with category WORK_LOOP_PROFILE.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1997,7 +1997,7 @@ pub struct PublishWorkLoopProfileResponse {
     #[prost(string, tag = "4")]
     pub dedupe_key: ::prost::alloc::string::String,
 }
-/// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+/// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, RFC-0032::REQ-0265)
 /// Claims an EXISTING work item (opened via OpenWork). Does not create a new
 /// work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
 /// ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
@@ -2034,7 +2034,7 @@ pub struct ClaimWorkV2Response {
     #[prost(bool, tag = "5")]
     pub already_claimed: bool,
 }
-/// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+/// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, RFC-0032::REQ-0267)
 /// Records a PR association for an existing work item. Emits a canonical
 /// work.pr_associated event and optionally publishes a LINKOUT context entry
 /// with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
@@ -2078,14 +2078,14 @@ pub struct RecordWorkPrAssociationResponse {
     #[prost(bool, tag = "4")]
     pub already_existed: bool,
 }
-/// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+/// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, RFC-0032::REQ-0264)
 /// Resolves a ticket alias to a canonical work_id via projection state.
 /// Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
 /// WorkSpec lookup. Returns exactly one work_id on success, or an error
 /// on ambiguity/infrastructure failure (fail-closed).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveTicketAliasRequest {
-    /// Ticket alias to resolve (e.g. "TCK-00636").
+    /// Ticket alias to resolve (e.g. "RFC-0032::REQ-0264").
     /// Must not be empty; bounded to MAX_ID_LENGTH bytes.
     #[prost(string, tag = "1")]
     pub ticket_alias: ::prost::alloc::string::String,
@@ -2505,7 +2505,7 @@ impl ProjectionUncertaintyFlag {
         }
     }
 }
-/// Typed termination outcome for EndSession (TCK-00395 Quality v3 MAJOR).
+/// Typed termination outcome for EndSession (RFC-0032::REQ-0149 Quality v3 MAJOR).
 /// Replaces free-form string matching for success/failure inference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2664,7 +2664,7 @@ pub enum PrivilegedErrorCode {
     CredentialInvalidConfig = 18,
     /// Invalid argument in request (generic validation failure).
     InvalidArgument = 19,
-    /// Work item already exists with a different spec hash (TCK-00635).
+    /// Work item already exists with a different spec hash (RFC-0032::REQ-0263).
     WorkAlreadyExists = 20,
     /// Precondition failed (e.g., work is in wrong state for the requested operation).
     FailedPrecondition = 21,

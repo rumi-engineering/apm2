@@ -24,7 +24,7 @@
 //! - Yin et al. "`HotStuff`: BFT Consensus with Linearity and Responsiveness."
 //!   PODC 2019.
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00186: BFT Library Evaluation Spike
+//! - RFC-0033::REQ-0047: BFT Library Evaluation Spike
 //!
 //! # Example
 //!
@@ -1932,7 +1932,7 @@ mod tests {
         assert_eq!(qc, qc2);
     }
 
-    /// Test for TCK-00186 ticket verification.
+    /// Test for RFC-0033::REQ-0047 ticket verification.
     #[test]
     #[allow(clippy::no_effect_underscore_binding)]
     fn tck_00186_bft_types_defined() {

@@ -32,7 +32,7 @@
       "RFC-0016",
       "RFC-0020"
     ],
-    "ticket_id": "TCK-00193",
+    "ticket_id": "RFC-0033::REQ-0053",
     "architecture": {
       "planes": [
         {
@@ -707,7 +707,7 @@
     },
     "anti_entropy_budget_controls": {
       "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml#requirement",
-      "delivery_ticket": "TCK-00381",
+      "delivery_ticket": "RFC-0033::REQ-0068",
       "pull_only_enforcement": true,
       "budget_scopes": [
         {
@@ -735,7 +735,7 @@
     },
     "continuity_objectives": {
       "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml#requirement",
-      "delivery_ticket": "TCK-00382",
+      "delivery_ticket": "RFC-0020::REQ-0036",
       "recovery_targets": [
         {
           "asset": "ledger",

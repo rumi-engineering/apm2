@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00496)
+// AGENT-AUTHORED (RFC-0020::REQ-0057)
 //! Tests for quarantine store: priority-aware eviction, saturation-safe
 //! insertion, per-session quota isolation, restart-safe persistence,
 //! durable capacity guard, and adversarial flood tests.

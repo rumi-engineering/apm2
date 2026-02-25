@@ -1,8 +1,0 @@
-versioning_schemes:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_VERSIONING_SCHEME_V1"
-  values:
-    - "SEMVER"
-    - "CALVER"
-    - "DATE_TAGGED"
-    - "CUSTOM"

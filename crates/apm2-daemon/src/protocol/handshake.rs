@@ -23,7 +23,7 @@
 //! - Same major version
 //! - Client minor version <= server minor version (backward compatible)
 //!
-//! # Session Authentication (TCK-00250)
+//! # Session Authentication (RFC-0032::REQ-0066)
 //!
 //! After handshake, session-scoped connections require a [`SessionToken`]
 //! for authentication. Tokens are minted when an episode is spawned via
@@ -54,7 +54,7 @@ use crate::hsi_contract::handshake_binding::CanonicalizerInfo;
 /// The server validates the version and responds with [`HelloAck`]
 /// or [`HelloNack`].
 ///
-/// # TCK-00348: Contract Binding Fields
+/// # RFC-0020::REQ-0002: Contract Binding Fields
 ///
 /// Per RFC-0020 section 3.1.2, the client MUST include its
 /// `cli_contract_hash` and canonicalizer metadata so the daemon can
@@ -73,7 +73,7 @@ pub struct Hello {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 
-    /// Client's HSI contract manifest content hash (TCK-00348).
+    /// Client's HSI contract manifest content hash (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.2, this MUST be included in the session
     /// handshake. Format: `blake3:<64-hex>` (or equivalent hash scheme).
@@ -81,7 +81,7 @@ pub struct Hello {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cli_contract_hash: String,
 
-    /// Canonicalizer metadata declared by the client (TCK-00348).
+    /// Canonicalizer metadata declared by the client (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.2, the client declares which
     /// canonicalizers it uses so the daemon can detect incompatible
@@ -122,14 +122,14 @@ impl Hello {
         self
     }
 
-    /// Set the client's HSI contract manifest hash (TCK-00348).
+    /// Set the client's HSI contract manifest hash (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_contract_hash(mut self, hash: impl Into<String>) -> Self {
         self.cli_contract_hash = hash.into();
         self
     }
 
-    /// Set the client's canonicalizer metadata (TCK-00348).
+    /// Set the client's canonicalizer metadata (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
         self.canonicalizers = canonicalizers;
@@ -141,7 +141,7 @@ impl Hello {
 ///
 /// Sent when the server accepts the client's Hello message.
 ///
-/// # TCK-00348: Contract Binding Fields
+/// # RFC-0020::REQ-0002: Contract Binding Fields
 ///
 /// Per RFC-0020 section 3.1.2, the server echoes its active contract
 /// hash and supported canonicalizers so the client can verify
@@ -171,14 +171,14 @@ pub struct HelloAck {
     pub capabilities: Vec<String>,
 
     /// The daemon's active HSI contract manifest content hash
-    /// (TCK-00348).
+    /// (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.2, echoed to the client so it can
     /// detect contract drift on its side.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub server_contract_hash: String,
 
-    /// Canonicalizers supported by the daemon (TCK-00348).
+    /// Canonicalizers supported by the daemon (RFC-0020::REQ-0002).
     ///
     /// Allows the client to verify canonicalizer compatibility.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -189,7 +189,8 @@ pub struct HelloAck {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub daemon_signing_public_key: String,
 
-    /// Whether a contract mismatch was detected and waived (TCK-00348).
+    /// Whether a contract mismatch was detected and waived
+    /// (RFC-0020::REQ-0002).
     ///
     /// `true` if the client's `cli_contract_hash` differs from the
     /// daemon's active contract but the session was allowed to proceed
@@ -228,14 +229,14 @@ impl HelloAck {
         self
     }
 
-    /// Set the server's active contract hash (TCK-00348).
+    /// Set the server's active contract hash (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_server_contract_hash(mut self, hash: impl Into<String>) -> Self {
         self.server_contract_hash = hash.into();
         self
     }
 
-    /// Set the server's supported canonicalizers (TCK-00348).
+    /// Set the server's supported canonicalizers (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
         self.server_canonicalizers = canonicalizers;
@@ -249,7 +250,7 @@ impl HelloAck {
         self
     }
 
-    /// Set the contract mismatch waived flag (TCK-00348).
+    /// Set the contract mismatch waived flag (RFC-0020::REQ-0002).
     #[must_use]
     pub const fn with_contract_mismatch_waived(mut self, waived: bool) -> Self {
         self.contract_mismatch_waived = waived;
@@ -298,7 +299,7 @@ impl HelloNack {
         }
     }
 
-    /// Create a contract mismatch rejection (TCK-00348).
+    /// Create a contract mismatch rejection (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.3, Tier2+ sessions MUST be denied when
     /// the client's contract or canonicalizer metadata does not match.
@@ -328,7 +329,7 @@ pub enum HandshakeErrorCode {
     /// Too many connections.
     TooManyConnections,
 
-    /// Contract hash or canonicalizer mismatch at Tier2+ (TCK-00348).
+    /// Contract hash or canonicalizer mismatch at Tier2+ (RFC-0020::REQ-0002).
     ///
     /// Per RFC-0020 section 3.1.3, Tier2+ sessions MUST be denied when
     /// the client's `cli_contract_hash` or canonicalizer metadata does
@@ -466,7 +467,7 @@ pub enum HandshakeState {
 ///
 /// Validates client Hello messages and generates appropriate responses.
 ///
-/// # TCK-00348: Contract Binding and Mismatch Gates
+/// # RFC-0020::REQ-0002: Contract Binding and Mismatch Gates
 ///
 /// When configured with a server contract hash and risk tier, the
 /// handshake evaluates the tiered mismatch policy per RFC-0020
@@ -474,7 +475,7 @@ pub enum HandshakeState {
 /// - Tier0/Tier1: mismatch is warned and waived (session proceeds)
 /// - Tier2+: mismatch is denied (`HelloNack` with `ContractMismatch`)
 ///
-/// # Security Note (TCK-00248)
+/// # Security Note (RFC-0032::REQ-0064)
 ///
 /// UID-based authorization is performed at the connection accept level
 /// in [`crate::protocol::ProtocolServer::accept`], NOT during handshake.
@@ -494,20 +495,21 @@ pub struct ServerHandshake {
     /// Negotiated protocol version (after successful handshake).
     negotiated_version: Option<u32>,
 
-    /// Server's active HSI contract manifest hash (TCK-00348).
+    /// Server's active HSI contract manifest hash (RFC-0020::REQ-0002).
     server_contract_hash: String,
 
-    /// Server's supported canonicalizers (TCK-00348).
+    /// Server's supported canonicalizers (RFC-0020::REQ-0002).
     server_canonicalizers: Vec<CanonicalizerInfo>,
 
     /// Daemon Ed25519 verifying key (hex-encoded) used for signed authority
     /// tokens.
     daemon_signing_public_key: String,
 
-    /// Risk tier for mismatch policy evaluation (TCK-00348).
+    /// Risk tier for mismatch policy evaluation (RFC-0020::REQ-0002).
     risk_tier: crate::hsi_contract::RiskTier,
 
-    /// Mismatch outcome from the last `process_hello` call (TCK-00348).
+    /// Mismatch outcome from the last `process_hello` call
+    /// (RFC-0020::REQ-0002).
     mismatch_outcome: Option<crate::hsi_contract::MismatchOutcome>,
 }
 
@@ -535,14 +537,14 @@ impl ServerHandshake {
         self
     }
 
-    /// Set the server's active contract hash (TCK-00348).
+    /// Set the server's active contract hash (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_server_contract_hash(mut self, hash: impl Into<String>) -> Self {
         self.server_contract_hash = hash.into();
         self
     }
 
-    /// Set the server's supported canonicalizers (TCK-00348).
+    /// Set the server's supported canonicalizers (RFC-0020::REQ-0002).
     #[must_use]
     pub fn with_server_canonicalizers(mut self, canonicalizers: Vec<CanonicalizerInfo>) -> Self {
         self.server_canonicalizers = canonicalizers;
@@ -556,7 +558,7 @@ impl ServerHandshake {
         self
     }
 
-    /// Set the risk tier for mismatch policy evaluation (TCK-00348).
+    /// Set the risk tier for mismatch policy evaluation (RFC-0020::REQ-0002).
     #[must_use]
     pub const fn with_risk_tier(mut self, tier: crate::hsi_contract::RiskTier) -> Self {
         self.risk_tier = tier;
@@ -567,7 +569,7 @@ impl ServerHandshake {
     ///
     /// Returns the response to send to the client.
     ///
-    /// # TCK-00348: Contract Mismatch Gates
+    /// # RFC-0020::REQ-0002: Contract Mismatch Gates
     ///
     /// After version validation, this method evaluates the tiered
     /// mismatch policy. If the outcome is `Denied`, the handshake
@@ -596,7 +598,7 @@ impl ServerHandshake {
             return Ok(HelloNack::version_mismatch(hello.protocol_version).into());
         }
 
-        // TCK-00348 BLOCKER-2: Validate untrusted contract binding fields
+        // RFC-0020::REQ-0002 BLOCKER-2: Validate untrusted contract binding fields
         // BEFORE mismatch evaluation. Reject over-limit payloads fail-closed.
         let binding = crate::hsi_contract::ContractBinding {
             cli_contract_hash: hello.cli_contract_hash.clone(),
@@ -609,7 +611,7 @@ impl ServerHandshake {
             );
         }
 
-        // TCK-00348: Evaluate contract mismatch policy.
+        // RFC-0020::REQ-0002: Evaluate contract mismatch policy.
         // Check admission BEFORE mutating state to Completed (transactional
         // state mutation pattern).
         let outcome = crate::hsi_contract::evaluate_mismatch_policy(
@@ -644,7 +646,7 @@ impl ServerHandshake {
         if let Some(ref hash) = self.policy_hash {
             ack = ack.with_policy_hash(hash);
         }
-        // TCK-00348: Include contract binding in HelloAck
+        // RFC-0020::REQ-0002: Include contract binding in HelloAck
         if !self.server_contract_hash.is_empty() {
             ack = ack.with_server_contract_hash(&self.server_contract_hash);
         }
@@ -690,7 +692,7 @@ impl ServerHandshake {
     }
 
     /// Returns the mismatch outcome from the last `process_hello` call
-    /// (TCK-00348).
+    /// (RFC-0020::REQ-0002).
     ///
     /// This is used by the caller to emit mismatch counters with
     /// risk-tier labels after the handshake completes.
@@ -945,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_hello_accepts_unknown_fields_for_forward_compat() {
-        // TCK-00348: Hello no longer uses deny_unknown_fields to allow
+        // RFC-0020::REQ-0002: Hello no longer uses deny_unknown_fields to allow
         // forward-compatible field additions (e.g., cli_contract_hash,
         // canonicalizers). Unknown fields are silently ignored per standard
         // serde behavior.
@@ -1088,7 +1090,7 @@ mod tests {
     // be spoofed.
 
     // =========================================================================
-    // TCK-00348: Contract binding and mismatch gate tests
+    // RFC-0020::REQ-0002: Contract binding and mismatch gate tests
     // =========================================================================
 
     #[test]
@@ -1408,7 +1410,7 @@ mod tests {
         }
     }
 
-    /// TCK-00348 BLOCKER-2: Validate contract binding bounds in
+    /// RFC-0020::REQ-0002 BLOCKER-2: Validate contract binding bounds in
     /// `process_hello`. Over-limit contract hash must be rejected before
     /// mismatch evaluation.
     #[test]
@@ -1426,7 +1428,8 @@ mod tests {
         assert_eq!(server.state(), HandshakeState::Failed);
     }
 
-    /// TCK-00348 BLOCKER-2: Too many canonicalizer entries must be rejected.
+    /// RFC-0020::REQ-0002 BLOCKER-2: Too many canonicalizer entries must be
+    /// rejected.
     #[test]
     fn test_process_hello_rejects_too_many_canonicalizers() {
         let mut server =

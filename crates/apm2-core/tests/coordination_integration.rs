@@ -1,4 +1,5 @@
-//! End-to-end integration tests for the coordination system (TCK-00155).
+//! End-to-end integration tests for the coordination system
+//! (RFC-0032::REQ-0055).
 //!
 //! This module provides integration tests that verify:
 //!
@@ -27,7 +28,7 @@
 //!
 //! # References
 //!
-//! - TCK-00155: Implement coordination end-to-end integration tests
+//! - RFC-0032::REQ-0055: Implement coordination end-to-end integration tests
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - AD-COORD-006: Normative atomic work binding (CAS-at-commit)
 //! - AD-COORD-014: `SessionSpawner` trait for execution decoupling
@@ -375,7 +376,7 @@ fn run_coordination(
 // Integration Tests
 // ============================================================================
 
-/// TCK-00155: Happy path produces valid completion event.
+/// RFC-0032::REQ-0055: Happy path produces valid completion event.
 ///
 /// This test verifies that a complete coordination run:
 /// 1. Processes all work items successfully
@@ -412,7 +413,8 @@ fn tck_00155_happy_path_produces_valid_completion() {
     );
 }
 
-/// TCK-00155: Verify CAS-at-commit ordering (`SessionBound` BEFORE spawn).
+/// RFC-0032::REQ-0055: Verify CAS-at-commit ordering (`SessionBound` BEFORE
+/// spawn).
 ///
 /// This test verifies the NORMATIVE ordering per AD-COORD-006:
 /// 1. Controller emits `session_bound` event
@@ -482,7 +484,7 @@ fn tck_00155_cas_at_commit_ordering_session_bound_before_spawn() {
     assert_eq!(records[0].work_id, work_id);
 }
 
-/// TCK-00155: Proper event ordering throughout coordination lifecycle.
+/// RFC-0032::REQ-0055: Proper event ordering throughout coordination lifecycle.
 ///
 /// Verifies the event sequence:
 /// 1. `coordination.started`
@@ -554,7 +556,7 @@ fn tck_00155_proper_event_ordering() {
     }
 }
 
-/// TCK-00155: `MockSessionSpawner` correctly records spawns.
+/// RFC-0032::REQ-0055: `MockSessionSpawner` correctly records spawns.
 #[test]
 fn tck_00155_mock_spawner_records_spawns() {
     let spawner = MockSessionSpawner::new();
@@ -580,7 +582,7 @@ fn tck_00155_mock_spawner_records_spawns() {
     assert_eq!(records[2].sequence, 2);
 }
 
-/// TCK-00155: `MockSessionSpawner` returns configured outcomes.
+/// RFC-0032::REQ-0055: `MockSessionSpawner` returns configured outcomes.
 #[test]
 fn tck_00155_mock_spawner_configured_outcomes() {
     let spawner = MockSessionSpawner::new();
@@ -610,7 +612,7 @@ fn tck_00155_mock_spawner_configured_outcomes() {
     assert_eq!(term3.tokens_consumed, 1000);
 }
 
-/// TCK-00155: `MockSessionSpawner` can be configured to fail spawns.
+/// RFC-0032::REQ-0055: `MockSessionSpawner` can be configured to fail spawns.
 #[test]
 fn tck_00155_mock_spawner_fail_spawn() {
     let spawner = MockSessionSpawner::new();
@@ -632,7 +634,7 @@ fn tck_00155_mock_spawner_fail_spawn() {
     assert!(result.is_ok());
 }
 
-/// TCK-00155: Receipt can be stored in CAS and retrieved.
+/// RFC-0032::REQ-0055: Receipt can be stored in CAS and retrieved.
 #[test]
 fn tck_00155_receipt_cas_storage() {
     let cas = MemoryCas::new();
@@ -673,7 +675,7 @@ fn tck_00155_receipt_cas_storage() {
     assert!(receipt.verify(&canonical_hash).is_ok());
 }
 
-/// TCK-00155: Coordination with failed work items.
+/// RFC-0032::REQ-0055: Coordination with failed work items.
 #[test]
 fn tck_00155_coordination_with_failures() {
     let config = create_test_config(vec!["work-1", "work-2"]);
@@ -711,7 +713,7 @@ fn tck_00155_coordination_with_failures() {
     assert_eq!(spawner.spawn_count(), 4);
 }
 
-/// TCK-00155: `SessionSpawner` trait is Send + Sync.
+/// RFC-0032::REQ-0055: `SessionSpawner` trait is Send + Sync.
 #[test]
 fn tck_00155_session_spawner_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -723,7 +725,7 @@ fn tck_00155_session_spawner_is_send_sync() {
     assert_trait_object_send_sync::<dyn SessionSpawner>();
 }
 
-/// TCK-00155: `SpawnError` is properly formatted.
+/// RFC-0032::REQ-0055: `SpawnError` is properly formatted.
 #[test]
 fn tck_00155_spawn_error_display() {
     let errors = vec![
@@ -758,7 +760,7 @@ fn tck_00155_spawn_error_display() {
     }
 }
 
-/// TCK-00155: `SessionTerminationInfo` helpers work correctly.
+/// RFC-0032::REQ-0055: `SessionTerminationInfo` helpers work correctly.
 #[test]
 fn tck_00155_session_termination_info_helpers() {
     let success = SessionTerminationInfo::success("sess-1", 1000);
@@ -772,7 +774,7 @@ fn tck_00155_session_termination_info_helpers() {
     assert_eq!(failure.tokens_consumed, 500);
 }
 
-/// TCK-00155: Receipt hash changes with content changes.
+/// RFC-0032::REQ-0055: Receipt hash changes with content changes.
 #[test]
 fn tck_00155_receipt_hash_changes_with_content() {
     let budget = create_test_budget();
@@ -799,8 +801,8 @@ fn tck_00155_receipt_hash_changes_with_content() {
     );
 }
 
-/// TCK-00155: Verify `expected_transition_count` is included in `SessionBound`
-/// event.
+/// RFC-0032::REQ-0055: Verify `expected_transition_count` is included in
+/// `SessionBound` event.
 ///
 /// Per AD-COORD-006: The `expected_transition_count` field enables optimistic
 /// concurrency control by detecting stale bindings where the work item's state
@@ -844,7 +846,7 @@ fn tck_00155_session_bound_includes_expected_transition_count() {
     assert_eq!(default_event.expected_transition_count, 0);
 }
 
-/// TCK-00155: Golden test vector for receipt canonical encoding.
+/// RFC-0032::REQ-0055: Golden test vector for receipt canonical encoding.
 ///
 /// This test verifies that the length-prefixed binary encoding produces
 /// deterministic, stable output. If this test fails after code changes,
@@ -905,7 +907,8 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
     );
 }
 
-/// TCK-00155: Golden test vector for `SessionBound` event serialization.
+/// RFC-0032::REQ-0055: Golden test vector for `SessionBound` event
+/// serialization.
 ///
 /// Verifies that the JSON serialization format is stable and includes
 /// the `expected_transition_count` field.

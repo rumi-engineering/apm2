@@ -1,4 +1,4 @@
-//! Integration tests for agent handoff flow (TCK-00089).
+//! Integration tests for agent handoff flow (RFC-0032::REQ-0046).
 //!
 //! This test file provides comprehensive integration tests for the agent
 //! handoff flow as specified in RFC-0008. It verifies:

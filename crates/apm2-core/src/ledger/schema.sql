@@ -82,7 +82,7 @@ ON events (event_type, seq_id);
 CREATE INDEX IF NOT EXISTS idx_events_actor
 ON events (actor_id, seq_id);
 
--- TCK-00635: At-most-one work.opened per work_id (session_id) in canonical events.
+-- RFC-0032::REQ-0263: At-most-one work.opened per work_id (session_id) in canonical events.
 -- Defense-in-depth constraint for OpenWork idempotency: the application-level
 -- check provides the idempotent fast-path, while this database constraint
 -- provides the authoritative uniqueness guarantee that cannot be bypassed by
@@ -91,7 +91,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_work_opened_unique
 ON events (session_id)
 WHERE event_type = 'work.opened';
 
--- TCK-00638: At-most-one evidence.published per evidence_id in canonical events.
+-- RFC-0032::REQ-0266: At-most-one evidence.published per evidence_id in canonical events.
 -- Defense-in-depth constraint for PublishWorkContextEntry idempotency: the
 -- application-level check provides the idempotent fast-path, while this
 -- database constraint provides the authoritative uniqueness guarantee that

@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Bisimulation gate for recursive holon composition (TCK-00367).
+//! Bisimulation gate for recursive holon composition (RFC-0020::REQ-0021).
 //!
 //! This module implements a bisimulation checker that verifies observational
 //! equivalence between nested holon compositions and their flattened

@@ -1,0 +1,229 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-001",
+      "kind": "invariant",
+      "title": "Shutdown flag is monotonic: once true, never reverts to false",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-002",
+      "kind": "invariant",
+      "title": "started_at is immutable after construction",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-003",
+      "kind": "invariant",
+      "title": "All access to inner state requires acquiring the RwLock",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-004",
+      "kind": "invariant",
+      "title": "Runners map only contains entries for processes defined in supervisor",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-005",
+      "kind": "invariant",
+      "title": "Each RunnerKey (ProcessId, instance index) is unique",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-006",
+      "kind": "invariant",
+      "title": "Instance index is always less than spec.instances for the process",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-007",
+      "kind": "invariant",
+      "title": "Maximum frame size enforced before allocation",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-008",
+      "kind": "invariant",
+      "title": "Connection closes on any framing or parse error",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-009",
+      "kind": "safety",
+      "title": "Legacy JSON IPC listeners/adapters prohibited in default builds",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-010",
+      "kind": "invariant",
+      "title": "Operator socket always has mode 0600",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-011",
+      "kind": "invariant",
+      "title": "Session socket always has mode 0660",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-012",
+      "kind": "invariant",
+      "title": "is_privileged determined solely by which socket accepted connection",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-013",
+      "kind": "invariant",
+      "title": "Both sockets share the same parent directory with mode 0700",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-014",
+      "kind": "invariant",
+      "title": "Session endpoints require valid session_token",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-015",
+      "kind": "invariant",
+      "title": "Token validation uses constant-time HMAC comparison",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-016",
+      "kind": "safety",
+      "title": "Active quarantines with severity >= incoming are never evicted",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-017",
+      "kind": "invariant",
+      "title": "Per-session quota prevents single session exhausting quarantine budget",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-018",
+      "kind": "safety",
+      "title": "Quarantine insertion failure denies request (fail-closed)",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-019",
+      "kind": "invariant",
+      "title": "Severity is monotonically non-decreasing per channel key",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-DAEMON-020",
+      "kind": "requirement",
+      "title": "PID file written after successful daemonization",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-021",
+      "kind": "requirement",
+      "title": "Signal handler sets shutdown flag via request_shutdown()",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-022",
+      "kind": "requirement",
+      "title": "Graceful shutdown stops all running processes with 10-second timeout",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-023",
+      "kind": "requirement",
+      "title": "Systemd READY=1 sent exactly once after socket bind",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-024",
+      "kind": "requirement",
+      "title": "Watchdog pings driven by background poller, not dedicated task",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-DAEMON-025",
+      "kind": "invariant",
+      "title": "PCAC recovery handlers require PCAC lifecycle before any mutation",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-026",
+      "kind": "safety",
+      "title": "Caller identity bound to authenticated peer credentials before processing",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-027",
+      "kind": "invariant",
+      "title": "Receipts JSON bounded before deserialization to prevent exhaustion",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-028",
+      "kind": "safety",
+      "title": "Digest comparisons use constant-time ct_eq to prevent timing attacks",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-029",
+      "kind": "safety",
+      "title": "GitHub API tokens stored as SecretString, exposed only at HTTP boundary",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-030",
+      "kind": "invariant",
+      "title": "Atomic writes never produce partial files at the target path",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-031",
+      "kind": "safety",
+      "title": "safe_open refuses symlinks on Linux via O_NOFOLLOW and on other platforms",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-032",
+      "kind": "invariant",
+      "title": "Bounded reads check file size on handle not path to prevent TOCTOU",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-033",
+      "kind": "invariant",
+      "title": "Parent directories created with mode 0700; files with mode 0600",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-034",
+      "kind": "requirement",
+      "title": "Legacy ledger writes frozen at daemon startup via freeze_legacy_writes()",
+      "description": "After RFC-0032 Phase 0 migration, both SqliteLedgerEventEmitter and SqliteLeaseValidator are frozen. Once frozen, all write methods route to canonical events table with BLAKE3 hash chain continuity.",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-DAEMON-035",
+      "kind": "requirement",
+      "title": "Freeze-aware reads merge canonical and legacy tables when frozen",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-DAEMON-036",
+      "kind": "safety",
+      "title": "Evidence scan queries enforce LIMIT MAX_EVIDENCE_SCAN_ROWS (1000)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-DAEMON-037",
+      "kind": "requirement",
+      "title": "ClaimWorkV2 stores claims keyed by (work_id, role) for multi-role support",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

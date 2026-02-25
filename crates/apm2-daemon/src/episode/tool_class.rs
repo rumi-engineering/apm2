@@ -19,7 +19,7 @@
 // Re-export the canonical ToolClass and ToolClassExt from apm2-core to
 // eliminate type duplication. Per Code Quality Review [MINOR]: ToolClass
 // canonicalization logic was previously fragmented between crates. The
-// canonical definition now lives in apm2-core (TCK-00254).
+// canonical definition now lives in apm2-core (RFC-0032::REQ-0070).
 //
 // Also re-export allowlist constants and helpers from apm2-core to eliminate
 // duplication (Code Quality Review [MAJOR]). All MAX_*_ALLOWLIST constants

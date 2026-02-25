@@ -122,7 +122,7 @@ pub enum ProtocolError {
         reason: String,
     },
 
-    /// Control-plane budget exceeded (TCK-00568).
+    /// Control-plane budget exceeded (RFC-0032::REQ-0219).
     ///
     /// The requested operation would exceed a configured control-plane rate
     /// limit or quota. Carries a structured [`ControlPlaneDenialReceipt`]

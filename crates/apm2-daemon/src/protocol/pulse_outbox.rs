@@ -1,4 +1,4 @@
-//! HEF Pulse Outbox and Publisher (RFC-0018, TCK-00304).
+//! HEF Pulse Outbox and Publisher (RFC-0018, RFC-0032::REQ-0100).
 //!
 //! This module implements the daemon-owned outbox that receives post-commit
 //! notifications from the ledger and publishes `PulseEvent` messages to
@@ -91,7 +91,8 @@ pub const PULSE_EVENT_TAG: u8 = 68;
 /// A typical work session produces ~10-100 changesets, so 10,000 entries
 /// provides ample headroom while bounding memory to ~1MB worst case.
 ///
-/// Security: Prevents `DoS` via unbounded memory growth (TCK-00304 review).
+/// Security: Prevents `DoS` via unbounded memory growth (RFC-0032::REQ-0100
+/// review).
 pub const MAX_CHANGESET_MAP_ENTRIES: usize = 10_000;
 
 /// Maximum payload bytes processed by bridge fallback routing.
@@ -153,7 +154,7 @@ pub struct PulsePublisher {
     /// Commit notification receiver from ledger.
     receiver: CommitNotificationReceiver,
 
-    /// Ledger backend for reading event payloads (TCK-00305).
+    /// Ledger backend for reading event payloads (RFC-0032::REQ-0101).
     ///
     /// Required to extract `work_id` and `changeset_digest` for topic
     /// derivation.
@@ -168,14 +169,15 @@ pub struct PulsePublisher {
     /// implementation, this would be wired to the actual connection write
     /// halves.
     ///
-    /// NOTE: For TCK-00304, we define the interface. Full wiring to connection
-    /// handlers will be completed when the connection lifecycle is integrated.
+    /// NOTE: For RFC-0032::REQ-0100, we define the interface. Full wiring to
+    /// connection handlers will be completed when the connection lifecycle
+    /// is integrated.
     connection_senders: Arc<std::sync::RwLock<std::collections::HashMap<String, PulseFrameSender>>>,
 
     /// Current ledger head (updated as notifications are processed).
     ledger_head: std::sync::atomic::AtomicU64,
 
-    /// Topic deriver for Work and Gate events (TCK-00305).
+    /// Topic deriver for Work and Gate events (RFC-0032::REQ-0101).
     ///
     /// Handles the mapping from kernel events to pulse topics, including
     /// the `changeset_digest` -> `work_id` index for gate receipts.
@@ -184,9 +186,9 @@ pub struct PulsePublisher {
 
 /// Result of a non-blocking pulse send attempt.
 ///
-/// Per TCK-00304 security review: `send_pulse` must be non-blocking to prevent
-/// head-of-line blocking denial of service. A slow consumer on one connection
-/// must not stall pulse delivery to other connections.
+/// Per RFC-0032::REQ-0100 security review: `send_pulse` must be non-blocking to
+/// prevent head-of-line blocking denial of service. A slow consumer on one
+/// connection must not stall pulse delivery to other connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendResult {
     /// Pulse was successfully queued for delivery.
@@ -203,7 +205,7 @@ pub enum TrySendResult {
 /// This trait abstracts the actual frame sending mechanism to allow testing
 /// and different transport implementations.
 ///
-/// # Non-Blocking Guarantee (TCK-00304 Security Review)
+/// # Non-Blocking Guarantee (RFC-0032::REQ-0100 Security Review)
 ///
 /// Implementations MUST be non-blocking. The `try_send_pulse` method should
 /// return immediately, using `try_send` semantics on an internal per-connection
@@ -362,7 +364,7 @@ impl PulsePublisher {
         );
 
         // Read event record from ledger to get payload
-        // This is necessary for TCK-00305 topic derivation (Work/Gate events)
+        // This is necessary for RFC-0032::REQ-0101 topic derivation (Work/Gate events)
         let event_record = match self
             .ledger
             .read_from(&notification.namespace, notification.seq_id, 1)
@@ -387,10 +389,10 @@ impl PulsePublisher {
         // stored format is not a KernelEvent envelope.
         let topic_results = match KernelEvent::decode(event_record.payload.as_slice()) {
             Ok(kernel_event) => {
-                // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
+                // Update index for RFC-0032::REQ-0101 (PolicyResolvedForChangeSet lookup)
                 self.topic_deriver.update_index(&kernel_event);
 
-                // Derive topics using multi-topic derivation (TCK-00642).
+                // Derive topics using multi-topic derivation (RFC-0032::REQ-0269).
                 // Most events produce a single topic; work graph edge events
                 // produce topics for both from_work_id and to_work_id.
                 self.topic_deriver
@@ -1105,7 +1107,7 @@ mod tests {
             .derive_topic(&notification, &event);
         assert_eq!(result.topic(), Some("gate.W-456.receipts"));
 
-        // Test defect topic (TCK-00307)
+        // Test defect topic (RFC-0032::REQ-0103)
         let notification = CommitNotification::new(4, [0; 32], "DefectRecorded", "kernel");
         let result = publisher
             .topic_deriver()

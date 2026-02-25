@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
-//! Permeability authority lattice meet algorithm enforcement (TCK-00373,
-//! REQ-0027).
+//! Permeability authority lattice meet algorithm enforcement
+//! (RFC-0020::REQ-0027, REQ-0027).
 //!
 //! This module implements the permeability delegation meet algorithm that
 //! enforces the strict-subset rule: delegated authority D MUST equal
@@ -83,7 +83,8 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00373: Permeability authority lattice meet algorithm enforcement
+//! - RFC-0020::REQ-0027: Permeability authority lattice meet algorithm
+//!   enforcement
 //! - REQ-0027: Permeability authority lattice meet enforcement
 //! - `HOLONIC_SUBSTRATE_INTERFACE.md` Section 8.3.1 - 8.3.3
 

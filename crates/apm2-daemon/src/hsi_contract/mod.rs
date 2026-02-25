@@ -1,4 +1,4 @@
-//! HSI Contract Manifest V1 for RFC-0020 (TCK-00347).
+//! HSI Contract Manifest V1 for RFC-0020 (RFC-0020::REQ-0001).
 //!
 //! This module implements the `HSIContractManifestV1` artifact as specified in
 //! RFC-0020 section 3.1. The manifest is a canonical inventory of daemon and

@@ -1,0 +1,54 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/run_manifest",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-RUNMAN-001",
+      "kind": "invariant",
+      "title": "Manifests are deterministically serialized: BTreeMap ordering ensures canonical JSON",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-002",
+      "kind": "invariant",
+      "title": "UUID v7 manifest IDs enable temporal ordering of manifests",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-003",
+      "kind": "invariant",
+      "title": "Signatures cover the canonical representation (canonical_bytes() output)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-004",
+      "kind": "invariant",
+      "title": "All BLAKE3 hashes are hex-encoded strings",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-005",
+      "kind": "invariant",
+      "title": "Serialization round-trip is lossless: from_json(to_json(manifest)) == manifest",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-006",
+      "kind": "invariant",
+      "title": "manifest_bytes and signature are base64-encoded in JSON serialization",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-007",
+      "kind": "invariant",
+      "title": "public_key is hex-encoded and exactly 64 hex characters (32 bytes)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RUNMAN-008",
+      "kind": "invariant",
+      "title": "Ed25519 signatures are deterministic: same manifest + same key = identical signatures",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

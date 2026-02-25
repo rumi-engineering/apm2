@@ -104,24 +104,24 @@ pub enum GcActionKind {
     LaneTarget,
     LaneLog,
     GateCache,
-    /// Gate cache v3 (receipt-indexed, TCK-00541).
+    /// Gate cache v3 (receipt-indexed, RFC-0032::REQ-0197).
     GateCacheV3,
     BlobPrune,
     /// CAS blob prune: removes CAS objects referenced only by FAC patch
-    /// injection receipts (TCK-00546).  Only CAS entries whose digest
+    /// injection receipts (RFC-0032::REQ-0201).  Only CAS entries whose digest
     /// appears in a receipt with `bytes_backend=apm2_cas` are candidates;
     /// all other CAS data is left untouched.
     CasBlobPrune,
     QuarantinePrune,
     DeniedPrune,
     CargoCache,
-    /// Managed sccache cache directory (TCK-00553).
+    /// Managed sccache cache directory (RFC-0032::REQ-0208).
     SccacheCache,
     /// Receipt index compaction: prune old index entries and rebuild
-    /// deterministically (TCK-00583).
+    /// deterministically (RFC-0032::REQ-0233).
     IndexCompaction,
     /// Per-lane log retention pruning: removes job log directories that
-    /// exceed TTL, count, or per-lane byte quota (TCK-00571).
+    /// exceed TTL, count, or per-lane byte quota (RFC-0032::REQ-0221).
     LaneLogRetention,
 }
 

@@ -1,4 +1,4 @@
-# TCK-00595: System-mode service unit (multi-user.target).
+# RFC-0032::REQ-0244: System-mode service unit (multi-user.target).
 # For user-mode, see contrib/systemd/user/apm2-daemon.service.
 [Unit]
 Description=APM2 Daemon — Forge Admission Cycle
@@ -8,7 +8,7 @@ Wants=network-online.target
 Requires=apm2-daemon.socket
 
 [Service]
-# TCK-00600: Type=notify — daemon sends READY=1 after socket bind, WATCHDOG=1
+# RFC-0032::REQ-0248: Type=notify — daemon sends READY=1 after socket bind, WATCHDOG=1
 # periodically. systemd restarts if watchdog is not pinged within WatchdogSec.
 Type=notify
 ExecStart=/usr/local/bin/apm2 daemon --no-daemon

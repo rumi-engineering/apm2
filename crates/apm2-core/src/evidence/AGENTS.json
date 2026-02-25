@@ -1,0 +1,96 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/evidence",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-EVID-001",
+      "kind": "invariant",
+      "title": "Content verified against hash on both store and retrieve",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-002",
+      "kind": "invariant",
+      "title": "Duplicate content is deduplicated by hash",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-003",
+      "kind": "invariant",
+      "title": "Stored content is immutable; overwrites rejected",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-004",
+      "kind": "safety",
+      "title": "Reject empty content on store",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-005",
+      "kind": "safety",
+      "title": "Reject content exceeding MAX_ARTIFACT_SIZE (100 MB)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-006",
+      "kind": "invariant",
+      "title": "MemoryCas clone shares storage via Arc, not deep copy",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-007",
+      "kind": "invariant",
+      "title": "Total stored size cannot exceed max_total_size (default 1 GB)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-008",
+      "kind": "invariant",
+      "title": "Classifications ordered: Public < Internal < Confidential < Restricted",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-009",
+      "kind": "requirement",
+      "title": "Confidential and Restricted require progressive disclosure",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-010",
+      "kind": "invariant",
+      "title": "EvidenceReducer is deterministic: same events produce same state",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-011",
+      "kind": "safety",
+      "title": "Reject duplicate evidence_id",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-012",
+      "kind": "safety",
+      "title": "Reject invalid hash size (must be 32 bytes)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-013",
+      "kind": "safety",
+      "title": "Verification command IDs limited to 100 entries (DoS protection)",
+      "rfc": ["RFC-0015"]
+    },
+    {
+      "id": "BEH-CORE-EVID-014",
+      "kind": "invariant",
+      "title": "Bundle hash is deterministic from sorted evidence IDs",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-CORE-EVID-015",
+      "kind": "requirement",
+      "title": "Publisher does not emit events directly; returns PublishResult",
+      "rfc": ["RFC-0015"]
+    }
+  ]
+}

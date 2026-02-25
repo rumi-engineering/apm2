@@ -337,7 +337,7 @@ const fn default_legacy_tick_rate() -> u64 {
 /// Per AD-COORD-004: `max_episodes` and `max_duration_ticks` are required.
 /// `max_tokens` is optional but recommended.
 ///
-/// # HTF Compliance (TCK-00242)
+/// # HTF Compliance (RFC-0016::REQ-0003)
 ///
 /// Duration budgets use tick-based tracking for replay stability. The tick
 /// rate is carried alongside the budget to enable conversion when needed.
@@ -395,7 +395,7 @@ impl CoordinationBudget {
     /// - `max_duration_ticks` is zero
     /// - `tick_rate_hz` is zero
     ///
-    /// Per RFC-0012/TB-COORD-004 and TCK-00242: Budget constraints use
+    /// Per RFC-0012/TB-COORD-004 and RFC-0016::REQ-0003: Budget constraints use
     /// tick-based durations for replay stability.
     pub const fn new(
         max_episodes: u32,
@@ -456,7 +456,7 @@ impl CoordinationBudget {
 ///
 /// All counters are monotonically non-decreasing within a coordination.
 ///
-/// # HTF Compliance (TCK-00242)
+/// # HTF Compliance (RFC-0016::REQ-0003)
 ///
 /// Elapsed time is tracked in ticks rather than wall-clock milliseconds
 /// for replay stability. The tick rate is stored alongside for conversion.
@@ -468,7 +468,7 @@ pub struct BudgetUsage {
     /// Elapsed time in ticks since coordination started.
     ///
     /// Ticks are node-local monotonic units. This replaces `elapsed_ms`
-    /// for replay stability per TCK-00242.
+    /// for replay stability per RFC-0016::REQ-0003.
     ///
     /// # Backward Compatibility
     ///
@@ -526,7 +526,7 @@ impl BudgetUsage {
     }
 
     // =========================================================================
-    // Budget Tracking Helper Methods (TCK-00151, TCK-00242)
+    // Budget Tracking Helper Methods (RFC-0032::REQ-0051, RFC-0016::REQ-0003)
     // =========================================================================
 
     /// Checks if the episode budget is exhausted.
@@ -548,8 +548,8 @@ impl BudgetUsage {
 
     /// Checks if the duration budget is exhausted.
     ///
-    /// Per AD-COORD-004 and TCK-00242: Returns `true` when `elapsed_ticks >=
-    /// max_duration_ticks`.
+    /// Per AD-COORD-004 and RFC-0016::REQ-0003: Returns `true` when
+    /// `elapsed_ticks >= max_duration_ticks`.
     ///
     /// # Arguments
     ///
@@ -635,7 +635,7 @@ impl BudgetUsage {
 
     /// Updates the elapsed time from tick values.
     ///
-    /// Per TCK-00242: Uses tick-based tracking for replay stability.
+    /// Per RFC-0016::REQ-0003: Uses tick-based tracking for replay stability.
     /// This replaces the wall-clock based `update_elapsed_from`.
     ///
     /// # Arguments
@@ -661,7 +661,7 @@ impl BudgetUsage {
         current_tick: u64,
         tick_rate_hz: u64,
     ) -> Result<(), CoordinationError> {
-        // Enforce rate immutability once initialized (TCK-00242)
+        // Enforce rate immutability once initialized (RFC-0016::REQ-0003)
         // A rate of 0 indicates uninitialized state (from Default or new())
         if self.tick_rate_hz != 0 && self.tick_rate_hz != tick_rate_hz {
             return Err(CoordinationError::TickRateMismatch {
@@ -670,7 +670,7 @@ impl BudgetUsage {
             });
         }
 
-        // Detect clock regression (fail-closed per TCK-00242)
+        // Detect clock regression (fail-closed per RFC-0016::REQ-0003)
         // Instead of saturating to 0 which allows indefinite coordination,
         // we fail explicitly to prevent security bypass.
         if current_tick < start_tick {
@@ -701,7 +701,8 @@ impl BudgetUsage {
 
     /// Returns the remaining duration in ticks before budget exhaustion.
     ///
-    /// Per TCK-00242: Duration tracking uses ticks for replay stability.
+    /// Per RFC-0016::REQ-0003: Duration tracking uses ticks for replay
+    /// stability.
     ///
     /// # Arguments
     ///
@@ -1237,7 +1238,7 @@ mod tests {
     const TEST_TICK_RATE_HZ: u64 = 1_000_000;
 
     // ========================================================================
-    // CoordinationBudget Tests (TCK-00242: tick-based)
+    // CoordinationBudget Tests (RFC-0016::REQ-0003: tick-based)
     // ========================================================================
 
     #[test]
@@ -1269,9 +1270,10 @@ mod tests {
         assert_eq!(budget, restored);
     }
 
-    /// TCK-00148, TCK-00242: Test that zero budget values are rejected.
+    /// RFC-0032::REQ-0048, RFC-0016::REQ-0003: Test that zero budget values are
+    /// rejected.
     ///
-    /// Per RFC-0012/TB-COORD-004 and TCK-00242: `max_episodes`,
+    /// Per RFC-0012/TB-COORD-004 and RFC-0016::REQ-0003: `max_episodes`,
     /// `max_duration_ticks`, and `tick_rate_hz` are required positive integers.
     #[test]
     fn test_coordination_budget_requires_positive() {
@@ -1311,7 +1313,7 @@ mod tests {
     }
 
     // ========================================================================
-    // BudgetUsage Tests (TCK-00242: tick-based)
+    // BudgetUsage Tests (RFC-0016::REQ-0003: tick-based)
     // ========================================================================
 
     #[test]
@@ -1648,10 +1650,11 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00148 Specific Tests (Serde Round-Trip)
+    // RFC-0032::REQ-0048 Specific Tests (Serde Round-Trip)
     // ========================================================================
 
-    /// TCK-00148: Verify all types serialize and deserialize correctly.
+    /// RFC-0032::REQ-0048: Verify all types serialize and deserialize
+    /// correctly.
     #[test]
     fn tck_00148_serde_roundtrip_all_types() {
         // CoordinationBudget
@@ -1719,10 +1722,10 @@ mod tests {
     }
 
     // ========================================================================
-    // Security Tests (TCK-00148)
+    // Security Tests (RFC-0032::REQ-0048)
     // ========================================================================
 
-    /// TCK-00148: Test that work queue size limit is enforced.
+    /// RFC-0032::REQ-0048: Test that work queue size limit is enforced.
     #[test]
     fn test_coordination_session_queue_limit() {
         let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
@@ -1767,7 +1770,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// TCK-00148: Test that `work_queue` size limit is enforced during
+    /// RFC-0032::REQ-0048: Test that `work_queue` size limit is enforced during
     /// deserialization, preventing denial-of-service via oversized JSON
     /// payloads.
     #[test]
@@ -1827,7 +1830,7 @@ mod tests {
         );
     }
 
-    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// RFC-0032::REQ-0048: Test that `HashMap` size limits are enforced during
     /// deserialization for `work_tracking`.
     #[test]
     fn test_work_tracking_hashmap_limit_serde() {
@@ -1881,7 +1884,7 @@ mod tests {
         );
     }
 
-    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// RFC-0032::REQ-0048: Test that `HashMap` size limits are enforced during
     /// deserialization for `coordinations` in `CoordinationState`.
     #[test]
     fn test_coordinations_hashmap_limit_serde() {
@@ -1936,7 +1939,7 @@ mod tests {
         );
     }
 
-    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// RFC-0032::REQ-0048: Test that `HashMap` size limits are enforced during
     /// deserialization for `bindings` in `CoordinationState`.
     #[test]
     fn test_bindings_hashmap_limit_serde() {
@@ -1971,8 +1974,8 @@ mod tests {
         );
     }
 
-    /// TCK-00148: Verify streaming deserializer rejects oversized arrays
-    /// without attempting full allocation.
+    /// RFC-0032::REQ-0048: Verify streaming deserializer rejects oversized
+    /// arrays without attempting full allocation.
     ///
     /// This test documents that the streaming visitor pattern prevents OOM
     /// by checking bounds during iteration rather than after full allocation.
@@ -2016,9 +2019,9 @@ mod tests {
         );
     }
 
-    /// TCK-00148: Test that `session_ids` size limit is enforced during
-    /// deserialization, preventing denial-of-service via oversized JSON
-    /// payloads in `WorkItemTracking`.
+    /// RFC-0032::REQ-0048: Test that `session_ids` size limit is enforced
+    /// during deserialization, preventing denial-of-service via oversized
+    /// JSON payloads in `WorkItemTracking`.
     #[test]
     fn test_work_tracking_session_ids_limit_serde() {
         // Build a session_ids array that exceeds the limit
@@ -2063,10 +2066,10 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00151: Budget Enforcement Helper Tests
+    // RFC-0032::REQ-0051: Budget Enforcement Helper Tests
     // ========================================================================
 
-    /// TCK-00151: Test episode budget exhaustion detection.
+    /// RFC-0032::REQ-0051: Test episode budget exhaustion detection.
     ///
     /// Verification: Coordination stops at `max_episodes`.
     #[test]
@@ -2094,7 +2097,7 @@ mod tests {
         assert_eq!(usage.remaining_episodes(&budget), 0);
     }
 
-    /// TCK-00151: Test duration budget exhaustion detection.
+    /// RFC-0032::REQ-0051: Test duration budget exhaustion detection.
     ///
     /// Verification: Coordination stops at `max_duration_ticks`.
     #[test]
@@ -2122,7 +2125,7 @@ mod tests {
         assert_eq!(usage.remaining_duration_ticks(&budget), 0);
     }
 
-    /// TCK-00151: Test token budget exhaustion detection.
+    /// RFC-0032::REQ-0051: Test token budget exhaustion detection.
     ///
     /// Verification: Coordination stops at `max_tokens` (when set).
     #[test]
@@ -2158,7 +2161,7 @@ mod tests {
         assert_eq!(usage.remaining_tokens(&budget_no_tokens), None);
     }
 
-    /// TCK-00151: Test budget exhaustion priority ordering.
+    /// RFC-0032::REQ-0051: Test budget exhaustion priority ordering.
     ///
     /// Per AD-COORD-013: Duration > Tokens > Episodes priority.
     #[test]
@@ -2201,7 +2204,7 @@ mod tests {
         );
     }
 
-    /// TCK-00151: Test token aggregation from session outcomes.
+    /// RFC-0032::REQ-0051: Test token aggregation from session outcomes.
     ///
     /// Verification: `consumed_tokens` reflects session `final_entropy`.
     #[test]
@@ -2229,7 +2232,7 @@ mod tests {
         assert_eq!(usage.consumed_tokens, u64::MAX);
     }
 
-    /// TCK-00151: Test episode increment helper.
+    /// RFC-0032::REQ-0051: Test episode increment helper.
     #[test]
     fn tck_00151_episode_increment() {
         let mut usage = BudgetUsage::new();
@@ -2248,7 +2251,8 @@ mod tests {
         assert_eq!(usage.consumed_episodes, u32::MAX);
     }
 
-    /// TCK-00151: Test remaining budget calculations at boundary conditions.
+    /// RFC-0032::REQ-0051: Test remaining budget calculations at boundary
+    /// conditions.
     #[test]
     fn tck_00151_remaining_budget_boundaries() {
         let budget =
@@ -2277,7 +2281,8 @@ mod tests {
         assert_eq!(usage_over_limit.remaining_tokens(&budget), Some(0));
     }
 
-    /// TCK-00151: Test budget usage with large values (near `u64::MAX`).
+    /// RFC-0032::REQ-0051: Test budget usage with large values (near
+    /// `u64::MAX`).
     #[test]
     fn tck_00151_budget_large_values() {
         // Create budget with large values
@@ -2311,7 +2316,8 @@ mod tests {
         assert!(usage.is_token_budget_exhausted(&budget));
     }
 
-    /// TCK-00151: Test budget usage serde roundtrip preserves helper behavior.
+    /// RFC-0032::REQ-0051: Test budget usage serde roundtrip preserves helper
+    /// behavior.
     #[test]
     fn tck_00151_budget_usage_serde_roundtrip() {
         let budget =
@@ -2359,10 +2365,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00242: BudgetUsage Tick Rate Validation Tests
+    // RFC-0016::REQ-0003: BudgetUsage Tick Rate Validation Tests
     // =========================================================================
 
-    /// TCK-00242: `BudgetUsage` allows first tick rate assignment.
+    /// RFC-0016::REQ-0003: `BudgetUsage` allows first tick rate assignment.
     ///
     /// When `tick_rate_hz` is 0 (default/uninitialized), any rate can be set.
     #[test]
@@ -2377,7 +2383,8 @@ mod tests {
         assert_eq!(usage.tick_rate_hz, 1_000_000);
     }
 
-    /// TCK-00242: `BudgetUsage` allows same tick rate on subsequent updates.
+    /// RFC-0016::REQ-0003: `BudgetUsage` allows same tick rate on subsequent
+    /// updates.
     ///
     /// When the same rate is used, updates should succeed.
     #[test]
@@ -2393,7 +2400,7 @@ mod tests {
         assert_eq!(usage.elapsed_ticks, 2000);
     }
 
-    /// TCK-00242: `BudgetUsage` returns error on tick rate mismatch.
+    /// RFC-0016::REQ-0003: `BudgetUsage` returns error on tick rate mismatch.
     ///
     /// Once initialized with a non-zero rate, attempting to use a different
     /// rate should return an error to prevent temporal confusion.
@@ -2415,7 +2422,8 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: `BudgetUsage` from Default still allows rate assignment.
+    /// RFC-0016::REQ-0003: `BudgetUsage` from Default still allows rate
+    /// assignment.
     ///
     /// Default-constructed `BudgetUsage` has `tick_rate_hz` = 0, allowing
     /// first-time assignment.
@@ -2431,7 +2439,7 @@ mod tests {
         assert_eq!(usage.tick_rate_hz, 1_000_000);
     }
 
-    /// TCK-00242: `BudgetUsage` detects clock regression.
+    /// RFC-0016::REQ-0003: `BudgetUsage` detects clock regression.
     ///
     /// When `current_tick` < `start_tick`, the method should return an error
     /// rather than silently saturating to 0.
@@ -2451,11 +2459,11 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00242: Legacy JSON Deserialization Tests
+    // RFC-0016::REQ-0003: Legacy JSON Deserialization Tests
     // =========================================================================
 
-    /// TCK-00242: Verify legacy JSON deserialization works by defaulting
-    /// `tick_rate_hz` to 1000.
+    /// RFC-0016::REQ-0003: Verify legacy JSON deserialization works by
+    /// defaulting `tick_rate_hz` to 1000.
     #[test]
     fn tck_00242_legacy_json_deserialization() {
         // Legacy Budget JSON (missing tick_rate_hz)

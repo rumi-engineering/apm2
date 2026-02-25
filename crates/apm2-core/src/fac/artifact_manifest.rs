@@ -1356,7 +1356,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // Evidence Hygiene for Admission Tests (TCK-00229)
+    // Evidence Hygiene for Admission Tests (RFC-0032::REQ-0062)
     // =========================================================================
 
     /// Helper to create a confidential artifact with specified retention

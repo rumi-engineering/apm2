@@ -18,17 +18,17 @@
 //!
 //! # References
 //!
-//! - TCK-00153: Implement apm2 coordinate CLI command
-//! - TCK-00247: HTF CLI rendering of ticks/ledger windows with bounded wall
-//!   overlay
-//! - TCK-00346: Wire coordinate command to daemon integration
+//! - RFC-0032::REQ-0053: Implement apm2 coordinate CLI command
+//! - RFC-0016::REQ-0006: HTF CLI rendering of ticks/ledger windows with bounded
+//!   wall overlay
+//! - RFC-0032::REQ-0136: Wire coordinate command to daemon integration
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - RFC-0016: Hierarchical Time Framework
 //! - CTR-COORD-007: CLI Command (apm2 coordinate)
 //!
 //! # HTF Compliance (RFC-0016)
 //!
-//! This command is HTF-compliant per TCK-00247:
+//! This command is HTF-compliant per RFC-0016::REQ-0006:
 //!
 //! - **Tick-based budget enforcement**: Duration budgets use `HtfTick`
 //!   (monotonic, node-local) for authority decisions. The
@@ -42,7 +42,7 @@
 //! - **No wall-time authority**: Budget exhaustion, stop conditions, and all
 //!   coordination decisions are based on tick deltas, not wall clock readings.
 //!
-//! # Daemon Integration (TCK-00346)
+//! # Daemon Integration (RFC-0032::REQ-0136)
 //!
 //! The coordinate command uses the daemon's operator socket for:
 //! - `ClaimWork`: Claiming work items from the queue
@@ -266,7 +266,7 @@ pub struct CoordinateArgs {
     pub quiet: bool,
 
     // =========================================================================
-    // Daemon Integration Arguments (TCK-00346)
+    // Daemon Integration Arguments (RFC-0032::REQ-0136)
     // =========================================================================
     /// Actor ID for work claiming (display hint).
     ///
@@ -399,7 +399,7 @@ enum CoordinateCliError {
     InvalidArgs(String),
     /// Coordination error.
     CoordinationError(String),
-    /// Daemon connection error (TCK-00346).
+    /// Daemon connection error (RFC-0032::REQ-0136).
     DaemonError(String),
 }
 
@@ -480,7 +480,7 @@ fn output_receipt(receipt: &CoordinationReceipt, json_output: bool) {
 
 /// Inner implementation that returns Result for easier error handling.
 ///
-/// # TCK-00346: Daemon Integration
+/// # RFC-0032::REQ-0136: Daemon Integration
 ///
 /// This function now connects to the daemon via `operator_socket` and uses
 /// `OperatorClient::claim_work` and `OperatorClient::spawn_episode` to
@@ -602,7 +602,7 @@ fn run_coordinate_inner(
             CoordinateCliError::DaemonError(format!("Failed to build tokio runtime: {e}"))
         })?;
 
-    // Run the coordination loop with daemon integration (TCK-00346)
+    // Run the coordination loop with daemon integration (RFC-0032::REQ-0136)
     let result = rt.block_on(run_coordination_loop(
         &mut controller,
         &config,
@@ -696,8 +696,8 @@ const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Conservative token estimation rate: tokens per second of wall-clock time.
 ///
 /// **Fallback only**: When the daemon reports `actual_tokens_consumed` via
-/// `SessionStatus` (TCK-00384/TCK-00386), that value is used instead. This
-/// rate is only applied when `actual_tokens_consumed` is `None`.
+/// `SessionStatus` (RFC-0032::REQ-0138/RFC-0032::REQ-0140), that value is used
+/// instead. This rate is only applied when `actual_tokens_consumed` is `None`.
 ///
 /// The rate (100 tokens/sec) is deliberately over-estimated to ensure budget
 /// enforcement errs on the side of caution — modern LLM agents routinely
@@ -723,7 +723,7 @@ const BLOCKED_WORKSPACE_ROOTS: &[&str] = &[
 
 /// Runs the coordination loop with daemon integration.
 ///
-/// # TCK-00346: This is the core daemon integration logic.
+/// # RFC-0032::REQ-0136: This is the core daemon integration logic.
 ///
 /// The loop:
 /// 1. Checks stop conditions
@@ -772,7 +772,7 @@ async fn run_coordination_loop(
             eprintln!("Processing work item: {work_id}");
         }
 
-        // Claim work from daemon using actor_id (TCK-00346 fix: wire actor_id)
+        // Claim work from daemon using actor_id (RFC-0032::REQ-0136 fix: wire actor_id)
         // Use empty credential/nonce for now; the daemon enforces manifests.
         let claim_result = client
             .claim_work(actor_id, WorkRole::Implementer, &[], &[])
@@ -829,7 +829,7 @@ async fn run_coordination_loop(
             );
         }
 
-        // Spawn episode via daemon (TCK-00346 fix: use Implementer role, not
+        // Spawn episode via daemon (RFC-0032::REQ-0136 fix: use Implementer role, not
         // Coordinator)
         let spawn_response = client
             .spawn_episode(&work_id, WorkRole::Implementer, None, workspace_root, None)
@@ -892,7 +892,7 @@ async fn run_coordination_loop(
 /// Observes session termination by polling `SessionStatus` via the session
 /// socket.
 ///
-/// # TCK-00386: Session Termination Signal
+/// # RFC-0032::REQ-0140: Session Termination Signal
 ///
 /// Polls `SessionClient::session_status_with_termination()` to detect when a
 /// session transitions from `ACTIVE` to `TERMINATED`. The daemon populates
@@ -935,7 +935,7 @@ async fn observe_session_termination(
     match session_client {
         Ok(mut client) => {
             // Poll session status until TERMINATED or timeout.
-            // TCK-00386: Uses session_status_with_termination() which returns
+            // RFC-0032::REQ-0140: Uses session_status_with_termination() which returns
             // termination details (reason, exit_code, tokens) for ended sessions.
             while observation_start.elapsed() < SESSION_OBSERVATION_TIMEOUT {
                 tokio::time::sleep(SESSION_POLL_INTERVAL).await;
@@ -951,7 +951,7 @@ async fn observe_session_termination(
                                 response.exit_code,
                             );
 
-                            // TCK-00386: Use actual token consumption when available,
+                            // RFC-0032::REQ-0140: Use actual token consumption when available,
                             // fall back to wall-clock estimate otherwise.
                             let tokens = resolve_token_consumption(
                                 response.actual_tokens_consumed,
@@ -1031,7 +1031,7 @@ async fn observe_session_termination(
 
 /// Maps daemon-reported termination details to a [`SessionOutcome`].
 ///
-/// # TCK-00386: Termination Reason Mapping
+/// # RFC-0032::REQ-0140: Termination Reason Mapping
 ///
 /// Only `termination_reason == "normal"` **and** `exit_code == Some(0)` produce
 /// [`SessionOutcome::Success`]. All other combinations produce
@@ -1058,7 +1058,7 @@ fn map_termination_to_outcome(
 /// Resolves token consumption: prefers actual daemon-reported value, falls back
 /// to wall-clock estimate.
 ///
-/// # TCK-00386: Token Accounting
+/// # RFC-0032::REQ-0140: Token Accounting
 ///
 /// When `actual_tokens` is `Some(n)`, returns `max(n, MIN_TOKENS_PER_SESSION)`
 /// to prevent zero-cost sessions. When `None`, delegates to
@@ -1404,7 +1404,7 @@ mod tests {
         PathBuf::from("/tmp/apm2-test-nonexistent.sock")
     }
 
-    /// Helper to create default test args with new TCK-00346 fields.
+    /// Helper to create default test args with new RFC-0032::REQ-0136 fields.
     fn test_args_with_defaults(
         work_ids: Option<Vec<String>>,
         max_episodes: u32,
@@ -1430,7 +1430,7 @@ mod tests {
     // Argument Parsing Tests
     // =========================================================================
 
-    /// TCK-00153: Test that command parses all options correctly.
+    /// RFC-0032::REQ-0053: Test that command parses all options correctly.
     #[test]
     fn test_coordinate_args_defaults() {
         // Verify default values
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(MAX_WORK_QUEUE_SIZE, 1000);
     }
 
-    /// TCK-00153: Test `work_ids` validation.
+    /// RFC-0032::REQ-0053: Test `work_ids` validation.
     #[test]
     fn test_coordinate_empty_work_ids() {
         let args = test_args_with_defaults(None, 10, 60_000);
@@ -1447,7 +1447,7 @@ mod tests {
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
     }
 
-    /// TCK-00153: Test work queue size validation.
+    /// RFC-0032::REQ-0053: Test work queue size validation.
     #[test]
     fn test_coordinate_queue_size_exceeded() {
         // Create work_ids that exceed the max_work_queue
@@ -1466,7 +1466,7 @@ mod tests {
         }
     }
 
-    /// TCK-00153: Test zero budget validation.
+    /// RFC-0032::REQ-0053: Test zero budget validation.
     #[test]
     fn test_coordinate_zero_budget() {
         let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 0, 60_000);
@@ -1480,7 +1480,7 @@ mod tests {
         assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
     }
 
-    /// TCK-00153: Test mutually exclusive arguments.
+    /// RFC-0032::REQ-0053: Test mutually exclusive arguments.
     #[test]
     fn test_coordinate_mutually_exclusive_args() {
         let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 60_000);
@@ -1500,7 +1500,7 @@ mod tests {
     // Receipt Tests
     // =========================================================================
 
-    /// TCK-00153: Test that JSON output is valid.
+    /// RFC-0032::REQ-0053: Test that JSON output is valid.
     #[test]
     fn test_coordination_receipt_serde() {
         let receipt = CoordinationReceipt {
@@ -1544,7 +1544,7 @@ mod tests {
     // Work ID Parsing Tests
     // =========================================================================
 
-    /// TCK-00153: Test `work_ids` comma parsing.
+    /// RFC-0032::REQ-0053: Test `work_ids` comma parsing.
     #[test]
     fn test_parse_work_ids_comma_separated() {
         let args = test_args_with_defaults(
@@ -1564,7 +1564,7 @@ mod tests {
         assert_eq!(work_ids[2], "work-3");
     }
 
-    /// TCK-00153: Test `work_ids` with whitespace trimming.
+    /// RFC-0032::REQ-0053: Test `work_ids` with whitespace trimming.
     #[test]
     fn test_parse_work_ids_with_whitespace() {
         let args = test_args_with_defaults(
@@ -1583,8 +1583,8 @@ mod tests {
         assert_eq!(work_ids[1], "work-2");
     }
 
-    /// TCK-00153: Test malformed JSON in work-query is rejected (security
-    /// fix).
+    /// RFC-0032::REQ-0053: Test malformed JSON in work-query is rejected
+    /// (security fix).
     ///
     /// Per security review: If input looks like JSON (starts with `[`) but
     /// fails to parse, we must return an error instead of falling back to
@@ -1610,7 +1610,7 @@ mod tests {
         }
     }
 
-    /// TCK-00153: Test valid JSON array in work-query is parsed.
+    /// RFC-0032::REQ-0053: Test valid JSON array in work-query is parsed.
     #[test]
     fn test_parse_work_query_valid_json() {
         use std::io::Write;
@@ -1629,7 +1629,7 @@ mod tests {
         assert_eq!(ids[2], "work-3");
     }
 
-    /// TCK-00153: Test line-separated work-query is parsed.
+    /// RFC-0032::REQ-0053: Test line-separated work-query is parsed.
     #[test]
     fn test_parse_work_query_line_separated() {
         use std::io::Write;
@@ -1652,7 +1652,7 @@ mod tests {
     // Exit Code Tests
     // =========================================================================
 
-    /// TCK-00153: Test exit codes.
+    /// RFC-0032::REQ-0053: Test exit codes.
     #[test]
     fn test_exit_codes() {
         assert_eq!(exit_codes::SUCCESS, 0);
@@ -1660,7 +1660,7 @@ mod tests {
         assert_eq!(exit_codes::INVALID_ARGS, 2);
     }
 
-    /// TCK-00153: Test successful coordination returns exit code 0.
+    /// RFC-0032::REQ-0053: Test successful coordination returns exit code 0.
     #[test]
     fn test_coordinate_success_exit_code() {
         // Create a receipt with WORK_COMPLETED
@@ -1695,9 +1695,9 @@ mod tests {
         }
     }
 
-    /// TCK-00153: Test aborted coordination returns exit code 1.
+    /// RFC-0032::REQ-0053: Test aborted coordination returns exit code 1.
     ///
-    /// TCK-00346: Updated to test daemon unavailable scenario.
+    /// RFC-0032::REQ-0136: Updated to test daemon unavailable scenario.
     #[test]
     fn test_coordinate_aborted_exit_code() {
         let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 60_000);
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(exit_code, exit_codes::ABORTED);
     }
 
-    /// TCK-00153: Test invalid arguments returns exit code 2.
+    /// RFC-0032::REQ-0053: Test invalid arguments returns exit code 2.
     #[test]
     fn test_coordinate_invalid_args_exit_code() {
         let args = test_args_with_defaults(None, 10, 60_000);
@@ -1717,26 +1717,27 @@ mod tests {
     }
 
     // =========================================================================
-    // HTF Compliance Tests (TCK-00247)
+    // HTF Compliance Tests (RFC-0016::REQ-0006)
     // =========================================================================
 
-    /// TCK-00247: Verify tick-based duration takes precedence over wall-clock
-    /// ms.
+    /// RFC-0016::REQ-0006: Verify tick-based duration takes precedence over
+    /// wall-clock ms.
     ///
     /// Per RFC-0016: Ticks are authoritative for duration/budget enforcement.
     /// When `max_duration_ticks` is provided, it takes precedence over
     /// `max_duration_ms`.
     ///
     /// Note: This test verifies the receipt contains correct tick values.
-    /// With TCK-00346 daemon integration, the function always returns a receipt
-    /// (even when daemon is unavailable - it just aborts).
+    /// With RFC-0032::REQ-0136 daemon integration, the function always returns
+    /// a receipt (even when daemon is unavailable - it just aborts).
     #[test]
     fn tck_00247_tick_duration_takes_precedence() {
         let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
         args.max_duration_ticks = Some(5_000_000); // 5M ticks = 5s at 1MHz
 
-        // With TCK-00346, the function returns Ok(receipt) even when daemon unavailable
-        // The receipt will have ABORTED status but correct budget ceiling values
+        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon
+        // unavailable The receipt will have ABORTED status but correct budget
+        // ceiling values
         let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(
             result.is_ok(),
@@ -1750,7 +1751,8 @@ mod tests {
         assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
-    /// TCK-00247: Verify zero ticks is rejected (tick authority validation).
+    /// RFC-0016::REQ-0006: Verify zero ticks is rejected (tick authority
+    /// validation).
     ///
     /// Per RFC-0016: Zero duration is invalid for any authority clock domain.
     #[test]
@@ -1768,18 +1770,21 @@ mod tests {
         }
     }
 
-    /// TCK-00247: Verify wall-clock ms fallback when ticks not provided.
+    /// RFC-0016::REQ-0006: Verify wall-clock ms fallback when ticks not
+    /// provided.
     ///
     /// Per RFC-0016: ms input is converted to ticks for internal use.
     /// This maintains backward compatibility while enforcing tick authority.
     ///
-    /// Note: With TCK-00346 daemon integration, the function always returns a
-    /// receipt (even when daemon is unavailable - it just aborts).
+    /// Note: With RFC-0032::REQ-0136 daemon integration, the function always
+    /// returns a receipt (even when daemon is unavailable - it just
+    /// aborts).
     #[test]
     fn tck_00247_ms_converted_to_ticks() {
         let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
 
-        // With TCK-00346, the function returns Ok(receipt) even when daemon unavailable
+        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon
+        // unavailable
         let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(
             result.is_ok(),
@@ -1793,8 +1798,8 @@ mod tests {
         assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
-    /// TCK-00247: Verify receipt includes both ticks (authority) and ms
-    /// (overlay).
+    /// RFC-0016::REQ-0006: Verify receipt includes both ticks (authority) and
+    /// ms (overlay).
     ///
     /// Per RFC-0016: Wall time is permitted as observational overlay for
     /// display. Receipts should include both tick-based values
@@ -1838,7 +1843,7 @@ mod tests {
         assert!(json.contains("60000000")); // max_duration_ticks
     }
 
-    /// TCK-00247: Verify wall-clock timestamps are observational only.
+    /// RFC-0016::REQ-0006: Verify wall-clock timestamps are observational only.
     ///
     /// Per RFC-0016: Wall time fields (`started_at`, `completed_at`) are for
     /// display/audit purposes only. They MUST NOT affect coordination
@@ -1907,7 +1912,7 @@ mod tests {
         assert_eq!(receipt1.stop_condition, receipt2.stop_condition);
     }
 
-    /// TCK-00247: Verify tick rate constant is correctly defined.
+    /// RFC-0016::REQ-0006: Verify tick rate constant is correctly defined.
     ///
     /// Per RFC-0016: Tick rates must be explicit and consistent.
     #[test]
@@ -2215,10 +2220,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00346 Security Hardening Tests
+    // RFC-0032::REQ-0136 Security Hardening Tests
     // =========================================================================
 
-    /// TCK-00346: Token estimation never returns zero.
+    /// RFC-0032::REQ-0136: Token estimation never returns zero.
     ///
     /// BLOCKER 2 fix: Verify that `estimate_token_consumption` always returns
     /// at least `MIN_TOKENS_PER_SESSION`, even for zero elapsed time.
@@ -2241,7 +2246,7 @@ mod tests {
         assert!(huge > 0);
     }
 
-    /// TCK-00346: Token estimation uses conservative rate.
+    /// RFC-0032::REQ-0136: Token estimation uses conservative rate.
     ///
     /// BLOCKER 2 fix: Verify the estimation constants are reasonable.
     #[test]
@@ -2254,7 +2259,7 @@ mod tests {
         const { assert!(MIN_TOKENS_PER_SESSION >= CONSERVATIVE_TOKENS_PER_SECOND) };
     }
 
-    /// TCK-00346: Workspace root validation rejects sensitive paths.
+    /// RFC-0032::REQ-0136: Workspace root validation rejects sensitive paths.
     ///
     /// MAJOR fix: Verify that system-critical directories are blocked.
     #[test]
@@ -2269,7 +2274,7 @@ mod tests {
         }
     }
 
-    /// TCK-00346: Workspace root validation rejects /etc.
+    /// RFC-0032::REQ-0136: Workspace root validation rejects /etc.
     #[test]
     fn tck_00346_workspace_root_rejects_etc() {
         let result = validate_workspace_root(Some("/etc"));
@@ -2282,7 +2287,8 @@ mod tests {
         }
     }
 
-    /// TCK-00346: Workspace root validation rejects non-existent paths.
+    /// RFC-0032::REQ-0136: Workspace root validation rejects non-existent
+    /// paths.
     #[test]
     fn tck_00346_workspace_root_rejects_nonexistent() {
         let result = validate_workspace_root(Some("/nonexistent/path/that/does/not/exist"));
@@ -2295,7 +2301,7 @@ mod tests {
         }
     }
 
-    /// TCK-00346: Workspace root validation accepts valid directories.
+    /// RFC-0032::REQ-0136: Workspace root validation accepts valid directories.
     #[test]
     fn tck_00346_workspace_root_accepts_valid() {
         // /tmp should be a valid workspace root
@@ -2306,7 +2312,7 @@ mod tests {
         assert!(path.starts_with('/'));
     }
 
-    /// TCK-00346: Workspace root defaults to cwd when None.
+    /// RFC-0032::REQ-0136: Workspace root defaults to cwd when None.
     #[test]
     fn tck_00346_workspace_root_defaults_to_cwd() {
         let result = validate_workspace_root(None);
@@ -2316,7 +2322,7 @@ mod tests {
         assert!(path.starts_with('/'));
     }
 
-    /// TCK-00346: Workspace root rejects files (not directories).
+    /// RFC-0032::REQ-0136: Workspace root rejects files (not directories).
     #[test]
     fn tck_00346_workspace_root_rejects_files() {
         use std::io::Write;
@@ -2334,7 +2340,7 @@ mod tests {
         }
     }
 
-    /// TCK-00346: Blocked workspace root list includes critical paths.
+    /// RFC-0032::REQ-0136: Blocked workspace root list includes critical paths.
     #[test]
     fn tck_00346_blocked_workspace_roots_comprehensive() {
         // Verify all expected paths are in the blocklist
@@ -2350,8 +2356,8 @@ mod tests {
         assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/var"));
     }
 
-    /// TCK-00346: Workspace root validation blocks subdirectories of sensitive
-    /// paths.
+    /// RFC-0032::REQ-0136: Workspace root validation blocks subdirectories of
+    /// sensitive paths.
     ///
     /// Security fix: `starts_with` (path-component-aware) blocks `/var/log`,
     /// `/etc/ssh`, etc. — not just the exact blocked roots.
@@ -2376,7 +2382,7 @@ mod tests {
         }
     }
 
-    /// TCK-00346: Token estimation rate is a strict upper bound.
+    /// RFC-0032::REQ-0136: Token estimation rate is a strict upper bound.
     ///
     /// Security fix: The conservative rate must be >= 100 tokens/sec to act
     /// as a Safe-Fail upper bound for modern LLM agents (50-100+ tok/sec).
@@ -2386,17 +2392,17 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00386: Session Termination Signal Tests
+    // RFC-0032::REQ-0140: Session Termination Signal Tests
     // =========================================================================
 
-    /// TCK-00386: Normal exit with code 0 maps to Success.
+    /// RFC-0032::REQ-0140: Normal exit with code 0 maps to Success.
     #[test]
     fn tck_00386_normal_exit_zero_maps_to_success() {
         let outcome = map_termination_to_outcome(Some("normal"), Some(0));
         assert_eq!(outcome, SessionOutcome::Success);
     }
 
-    /// TCK-00386: Normal exit with non-zero code maps to Failure.
+    /// RFC-0032::REQ-0140: Normal exit with non-zero code maps to Failure.
     #[test]
     fn tck_00386_normal_exit_nonzero_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("normal"), Some(1));
@@ -2409,7 +2415,7 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Normal exit with missing `exit_code` maps to Failure
+    /// RFC-0032::REQ-0140: Normal exit with missing `exit_code` maps to Failure
     /// (fail-closed).
     #[test]
     fn tck_00386_normal_exit_no_code_maps_to_failure() {
@@ -2417,7 +2423,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Crash termination maps to Failure regardless of exit code.
+    /// RFC-0032::REQ-0140: Crash termination maps to Failure regardless of exit
+    /// code.
     #[test]
     fn tck_00386_crash_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("crash"), Some(0));
@@ -2430,7 +2437,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Timeout termination maps to Failure regardless of exit code.
+    /// RFC-0032::REQ-0140: Timeout termination maps to Failure regardless of
+    /// exit code.
     #[test]
     fn tck_00386_timeout_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("timeout"), Some(0));
@@ -2440,21 +2448,22 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Quarantined termination maps to Failure.
+    /// RFC-0032::REQ-0140: Quarantined termination maps to Failure.
     #[test]
     fn tck_00386_quarantined_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("quarantined"), Some(0));
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Budget-exhausted termination maps to Failure.
+    /// RFC-0032::REQ-0140: Budget-exhausted termination maps to Failure.
     #[test]
     fn tck_00386_budget_exhausted_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("budget_exhausted"), Some(0));
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Missing termination reason maps to Failure (fail-closed).
+    /// RFC-0032::REQ-0140: Missing termination reason maps to Failure
+    /// (fail-closed).
     #[test]
     fn tck_00386_no_reason_maps_to_failure() {
         let outcome = map_termination_to_outcome(None, Some(0));
@@ -2464,14 +2473,15 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Unknown termination reason maps to Failure (fail-closed).
+    /// RFC-0032::REQ-0140: Unknown termination reason maps to Failure
+    /// (fail-closed).
     #[test]
     fn tck_00386_unknown_reason_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("alien_abduction"), Some(0));
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// TCK-00386: Actual token consumption is used when available.
+    /// RFC-0032::REQ-0140: Actual token consumption is used when available.
     #[test]
     fn tck_00386_resolve_tokens_uses_actual_when_available() {
         // Actual tokens reported by daemon: should be used directly
@@ -2483,7 +2493,7 @@ mod tests {
         assert_eq!(tokens, 1_000_000);
     }
 
-    /// TCK-00386: Actual token consumption is floored at
+    /// RFC-0032::REQ-0140: Actual token consumption is floored at
     /// `MIN_TOKENS_PER_SESSION`.
     #[test]
     fn tck_00386_resolve_tokens_floors_actual_at_minimum() {
@@ -2500,7 +2510,8 @@ mod tests {
         assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
     }
 
-    /// TCK-00386: Falls back to wall-clock estimate when actual is unavailable.
+    /// RFC-0032::REQ-0140: Falls back to wall-clock estimate when actual is
+    /// unavailable.
     #[test]
     fn tck_00386_resolve_tokens_falls_back_to_estimate() {
         // No actual tokens: should use wall-clock estimate
@@ -2513,7 +2524,7 @@ mod tests {
         assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
     }
 
-    /// TCK-00386: Token resolution never returns zero.
+    /// RFC-0032::REQ-0140: Token resolution never returns zero.
     #[test]
     fn tck_00386_resolve_tokens_never_zero() {
         // Every combination must produce > 0
@@ -2523,7 +2534,7 @@ mod tests {
         assert!(resolve_token_consumption(None, 60) > 0);
     }
 
-    /// TCK-00386: Only one specific combination produces Success.
+    /// RFC-0032::REQ-0140: Only one specific combination produces Success.
     ///
     /// Exhaustively verify that the only path to Success is
     /// (`reason="normal"`, `exit_code=0`). This is a binding test —

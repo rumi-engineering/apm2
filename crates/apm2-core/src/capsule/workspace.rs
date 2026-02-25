@@ -13,14 +13,14 @@
 //! - Relative paths in workspace context are rejected if absolute
 //! - Workspace root itself is validated (no sensitive system directories)
 //!
-//! # Symlink Detection (Deferred to TCK-00375)
+//! # Symlink Detection (Deferred to RFC-0020::REQ-0029)
 //!
 //! This module defines the [`WorkspaceConfinementError::SymlinkDetected`]
 //! error variant for use by future runtime callers that perform filesystem
 //! I/O. Symlink-safe runtime path resolution (using `symlink_metadata()`
 //! calls per CTR-1503 and filesystem-level TOCTOU checks) is **deferred to
-//! TCK-00375**. This module currently provides only lexical path validation;
-//! it does NOT perform runtime symlink detection.
+//! RFC-0020::REQ-0029**. This module currently provides only lexical path
+//! validation; it does NOT perform runtime symlink detection.
 //!
 //! # Example
 //!

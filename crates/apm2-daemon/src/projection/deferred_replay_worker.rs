@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00508)
+// AGENT-AUTHORED (RFC-0033::REQ-0066)
 //! Deferred replay worker for projection intent buffer drain after outage
 //! recovery.
 //!

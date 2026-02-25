@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00525)
+// AGENT-AUTHORED (RFC-0032::REQ-0184)
 //! `apm2 fac warm` — lane-scoped prewarm with receipts + economics +
 //! authorization.
 //!
@@ -24,9 +24,10 @@
 //! - [INV-WARM-CLI-004] Broker health gate is opened before token issuance
 //!   (fail-closed on missing/stale authority).
 //! - [INV-WARM-CLI-005] Warm specs are validated against the FAC policy-derived
-//!   `JobSpecValidationPolicy` before enqueue (TCK-00579). This enforces
-//!   `repo_id` allowlist, `bytes_backend` allowlist, and filesystem-path
-//!   rejection at enqueue time, matching the gates enqueue path.
+//!   `JobSpecValidationPolicy` before enqueue (RFC-0032::REQ-0229). This
+//!   enforces `repo_id` allowlist, `bytes_backend` allowlist, and
+//!   filesystem-path rejection at enqueue time, matching the gates enqueue
+//!   path.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -165,7 +166,7 @@ pub fn run_fac_warm(
         },
     };
 
-    // TCK-00579: Derive job spec validation policy from FAC policy for
+    // RFC-0032::REQ-0229: Derive job spec validation policy from FAC policy for
     // enqueue-time enforcement of repo_id allowlist, bytes_backend
     // allowlist, and filesystem-path rejection.
     let job_spec_policy = match fac_policy.job_spec_validation_policy() {
@@ -449,7 +450,7 @@ fn build_warm_job_spec(
     // Option<&FacIntent>, Option<&[FacIntent]>) where Hash = [u8; 32].
     // Bind token policy fields to the admitted FAC policy digest while
     // keeping request_id bound to this concrete job spec digest.
-    // TCK-00567: Derive intent from job kind and pass to broker for
+    // RFC-0032::REQ-0218: Derive intent from job kind and pass to broker for
     // intent-bound token issuance.  Thread FacPolicyV1.allowed_intents
     // so the broker enforces the allowlist at issuance (fail-closed).
     let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind);
@@ -469,9 +470,9 @@ fn build_warm_job_spec(
         .map_err(|e| format!("token ledger WAL persist on issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
 
-    // TCK-00579: Validate the warm spec against the policy-derived validation
-    // policy before enqueue, failing closed on validation error.  This mirrors
-    // the gates enqueue path (INV-JS-005).
+    // RFC-0032::REQ-0229: Validate the warm spec against the policy-derived
+    // validation policy before enqueue, failing closed on validation error.
+    // This mirrors the gates enqueue path (INV-JS-005).
     validate_job_spec_with_policy(&spec, job_spec_policy)
         .map_err(|e| format!("validate warm job spec: {e}"))?;
 

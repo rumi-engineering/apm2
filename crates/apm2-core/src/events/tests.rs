@@ -19,7 +19,7 @@ fn test_session_started_roundtrip() {
         restart_attempt: 0,
         // HTF time envelope reference (RFC-0016): not yet populated.
         time_envelope_ref: None,
-        // Episode ID (RFC-0018, TCK-00306): empty for non-episode sessions.
+        // Episode ID (RFC-0018, RFC-0032::REQ-0102): empty for non-episode sessions.
         episode_id: String::new(),
     };
 
@@ -109,7 +109,7 @@ fn test_tool_requested_roundtrip() {
         tool_name: "file_read".to_string(),
         tool_args_hash: vec![0xab; 32],
         dedupe_key: "key-123".to_string(),
-        // Episode ID (RFC-0018, TCK-00306): empty for non-episode sessions.
+        // Episode ID (RFC-0018, RFC-0032::REQ-0102): empty for non-episode sessions.
         episode_id: String::new(),
     };
 
@@ -312,7 +312,7 @@ fn test_canonical_encoding_deterministic() {
                 progress_sequence: 42,
                 progress_type: "HEARTBEAT".to_string(),
                 entropy_consumed: 500,
-                // Episode ID (RFC-0018, TCK-00306): empty for non-episode sessions.
+                // Episode ID (RFC-0018, RFC-0032::REQ-0102): empty for non-episode sessions.
                 episode_id: String::new(),
             })),
         })),

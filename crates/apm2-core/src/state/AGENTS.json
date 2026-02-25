@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/state",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-STATE-001",
+      "kind": "invariant",
+      "title": "version is monotonically increasing; newer versions can read older formats",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-002",
+      "kind": "invariant",
+      "title": "saved_at is updated on every save() call",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-003",
+      "kind": "invariant",
+      "title": "specs and instances maintain referential integrity: every instance spec_id exists in specs",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-004",
+      "kind": "invariant",
+      "title": "(spec_id, instance_index) forms a unique key within PersistedState.instances",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-005",
+      "kind": "invariant",
+      "title": "dirty flag is set on any mutation via state_mut()",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-006",
+      "kind": "invariant",
+      "title": "dirty flag is cleared only after successful save() or save_if_dirty()",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-007",
+      "kind": "safety",
+      "title": "load() rejects state files with version > CURRENT_VERSION (forward-incompatibility)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-008",
+      "kind": "requirement",
+      "title": "save() performs atomic write (write to .tmp, then rename) to prevent partial writes",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-STATE-009",
+      "kind": "requirement",
+      "title": "remove_spec() cascades to remove all associated instances (referential integrity)",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

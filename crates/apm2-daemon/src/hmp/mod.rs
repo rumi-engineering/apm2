@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! Holonic Message Protocol (HMP) — digest-first channels and admission
-//! receipt semantics (TCK-00380, REQ-0034).
+//! receipt semantics (RFC-0020::REQ-0034, REQ-0034).
 //!
 //! This module implements:
 //! - [`ChannelClass`]: the five HMP channel classes (DISCOVERY, HANDSHAKE,

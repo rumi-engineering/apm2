@@ -1,0 +1,42 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/supervisor",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-SUPER-001",
+      "kind": "invariant",
+      "title": "Process names are unique across all registered specifications",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SUPER-002",
+      "kind": "invariant",
+      "title": "For each spec with n instances, exactly n handles exist at keys (spec_id, 0..n-1)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SUPER-003",
+      "kind": "invariant",
+      "title": "Each handle has a corresponding RestartManager and ShutdownManager at the same key",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SUPER-004",
+      "kind": "safety",
+      "title": "Running processes cannot be unregistered (must stop first)",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SUPER-005",
+      "kind": "safety",
+      "title": "register() rejects duplicate process names with DuplicateName error",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-SUPER-006",
+      "kind": "safety",
+      "title": "unregister() rejects removal of running processes with StillRunning error",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

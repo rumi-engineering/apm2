@@ -4,19 +4,19 @@
 //! decisions to the Governance Holon (or local policy configuration in Phase
 //! 1).
 //!
-//! # TCK-00289
+//! # RFC-0032::REQ-0091
 //!
 //! Implements real policy resolution wiring. Currently uses local deterministic
 //! resolution until the Governance Holon is fully integrated.
 //!
-//! # TCK-00352
+//! # RFC-0020::REQ-0006
 //!
 //! The policy resolver is the ONLY authorized source for minting
 //! `CapabilityManifestV1` instances. It holds the [`PolicyMintToken`]
 //! that proves minting authority. Requester surfaces cannot obtain this
 //! token.
 //!
-//! # Phase 1 Transitional Tier Mapping (TCK-00340, v7 Finding 3)
+//! # Phase 1 Transitional Tier Mapping (RFC-0032::REQ-0131, v7 Finding 3)
 //!
 //! SECURITY NOTE: Risk tiers are assigned based on work role as a
 //! transitional measure until full Governance Holon integration (RFC-0019).
@@ -47,10 +47,10 @@
 //! implemented, which will derive risk tiers from changeset metadata (file
 //! paths, module criticality, dependency fanout).
 //!
-//! **Waiver**: TCK-00340 v9 MAJOR — Role-based tier mapping is a tracked
-//! transitional measure. The waiver scope is bounded to Phase 1 single-node
-//! operation and MUST NOT be carried forward into multi-tenant or cross-node
-//! federation without full RFC-0019 governance resolution.
+//! **Waiver**: RFC-0032::REQ-0131 v9 MAJOR — Role-based tier mapping is a
+//! tracked transitional measure. The waiver scope is bounded to Phase 1
+//! single-node operation and MUST NOT be carried forward into multi-tenant or
+//! cross-node federation without full RFC-0019 governance resolution.
 
 use apm2_core::fac::fac_workobject_implementor_v2_role_contract;
 use tracing::warn;
@@ -64,7 +64,7 @@ use crate::protocol::messages::WorkRole;
 
 /// Resolves policy via governance integration.
 ///
-/// # TCK-00352: Policy-Only Minting Authority
+/// # RFC-0020::REQ-0006: Policy-Only Minting Authority
 ///
 /// This resolver is the sole holder of [`PolicyMintToken`], which is required
 /// to construct
@@ -94,7 +94,7 @@ impl GovernancePolicyResolver {
 
     /// Returns a [`PolicyMintToken`] for minting `CapabilityManifestV1`.
     ///
-    /// # TCK-00352: Minting Authority
+    /// # RFC-0020::REQ-0006: Minting Authority
     ///
     /// Only the policy resolver can create mint tokens. This method is the
     /// single point of authority for V1 manifest minting. The token proves
@@ -119,7 +119,7 @@ impl PolicyResolver for GovernancePolicyResolver {
         role: WorkRole,
         actor_id: &str,
     ) -> Result<PolicyResolution, PolicyResolutionError> {
-        // TCK-00289: In Phase 1, we use deterministic local resolution.
+        // RFC-0032::REQ-0091: In Phase 1, we use deterministic local resolution.
         // In Phase 2, this will make an IPC call to the Governance Holon.
 
         // Generate deterministic hashes for policy and capability manifest
@@ -211,7 +211,7 @@ impl PolicyResolver for GovernancePolicyResolver {
             resolved_risk_tier,
             resolved_scope_baseline,
             expected_adapter_profile_hash: None,
-            // TCK-00428: Populate PCAC policy knobs for Phase 1 transitional enforcement.
+            // RFC-0020::REQ-0047: Populate PCAC policy knobs for Phase 1 transitional enforcement.
             // - Lifecycle: enforced (opt-in via gate presence).
             // - Identity: Tier2+ requires Verified evidence.
             // - Freshness: 100 ticks max age.
@@ -224,7 +224,7 @@ impl PolicyResolver for GovernancePolicyResolver {
                 tier2_sovereignty_mode: apm2_core::pcac::SovereigntyEnforcementMode::Strict,
                 pointer_only_waiver: None,
             }),
-            // TCK-00428: PointerOnly waiver logic (stub for now).
+            // RFC-0020::REQ-0047: PointerOnly waiver logic (stub for now).
             // For Phase 1, we assume no global waiver unless configured.
             pointer_only_waiver: None,
         })
@@ -310,7 +310,7 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
 }
 
 // =============================================================================
-// Governance Freshness Monitor (TCK-00351 MAJOR 1)
+// Governance Freshness Monitor (RFC-0020::REQ-0005 MAJOR 1)
 // =============================================================================
 
 /// Configuration for the governance freshness monitor.
@@ -323,7 +323,7 @@ fn transitional_risk_tier(role: WorkRole) -> u8 {
 ///
 /// [`StopAuthority`]: crate::episode::preactuation::StopAuthority
 ///
-/// # TCK-00351 MAJOR 1
+/// # RFC-0020::REQ-0005 MAJOR 1
 ///
 /// This struct wires the `set_governance_uncertain(...)` control surface
 /// into the production path.  Prior to this fix, the flag was only ever
@@ -349,7 +349,7 @@ impl Default for GovernanceFreshnessConfig {
 /// Governance freshness monitor that probes governance service health and
 /// updates the [`StopAuthority`] uncertainty flag.
 ///
-/// # Production Wiring (TCK-00351 MAJOR 1)
+/// # Production Wiring (RFC-0020::REQ-0005 MAJOR 1)
 ///
 /// Instantiate a monitor, invoke [`record_success`](Self::record_success) /
 /// [`record_failure`](Self::record_failure) from governance probe paths,

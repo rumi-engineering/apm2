@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00323)
+// AGENT-AUTHORED (RFC-0032::REQ-0117)
 //! Projection receipt types for FAC v0 successful projection completion.
 //!
 //! This module implements the `ProjectionReceiptRecorded` event which is

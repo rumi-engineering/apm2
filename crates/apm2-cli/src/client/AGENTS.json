@@ -1,0 +1,82 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli/src/client",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-CLIENT-001",
+      "kind": "invariant",
+      "title": "Legacy DaemonClient returns ProtocolMigrationRequired per DD-009",
+      "description": "All DaemonClient methods return `Err(ProtocolMigrationRequired)` per DD-009 migration mandate.",
+      "rfc": ["RFC-0013"],
+      "req": ["RFC-0013#DD-009"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-002",
+      "kind": "invariant",
+      "title": "Default connection timeout is 30 seconds",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-003",
+      "kind": "requirement",
+      "title": "Connection errors map NotFound and ConnectionRefused to DaemonNotRunning",
+      "description": "`io::ErrorKind::NotFound` and `ConnectionRefused` map to `DaemonNotRunning` for both legacy and protocol clients.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-004",
+      "kind": "invariant",
+      "title": "OperatorClient performs mandatory Hello/HelloAck handshake",
+      "description": "Mandatory Hello/HelloAck handshake must complete before any requests are sent.",
+      "rfc": ["RFC-0020"],
+      "req": ["RFC-0020#CTR-PROTO-001"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-005",
+      "kind": "safety",
+      "title": "All requests use tag-based protobuf framing; JSON prohibited",
+      "rfc": ["RFC-0013"],
+      "req": ["RFC-0013#DD-009"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-006",
+      "kind": "invariant",
+      "title": "Handshake includes client contract hash per RFC-0020",
+      "description": "Handshake includes client HSI contract hash per RFC-0020 section 3.1.2.",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-007",
+      "kind": "invariant",
+      "title": "Session operations require a valid session_token",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-008",
+      "kind": "invariant",
+      "title": "SessionClient uses same handshake protocol as OperatorClient",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-009",
+      "kind": "safety",
+      "title": "Maximum IPC frame size is 16 MiB",
+      "description": "MAX_FRAME_SIZE enforces a 16 MiB upper bound on IPC frames per AD-DAEMON-002.",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-010",
+      "kind": "capability",
+      "title": "OperatorClient authorized for privileged operations on operator.sock",
+      "description": "OperatorClient sends privileged operations (Shutdown, ClaimWork, SpawnEpisode, IssueCapability, process/credential management, review receipt ingestion, changeset publishing) over operator.sock.",
+      "rfc": ["RFC-0013", "RFC-0020"]
+    },
+    {
+      "id": "BEH-CLI-CLIENT-011",
+      "kind": "capability",
+      "title": "SessionClient authorized for session-scoped operations on session.sock",
+      "description": "SessionClient sends session-scoped operations (RequestTool, EmitEvent, PublishEvidence, StreamLogs, SessionStatus) over session.sock.",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

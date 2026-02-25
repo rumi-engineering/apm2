@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00549)
+// AGENT-AUTHORED (RFC-0032::REQ-0204)
 //! Rust-native bounded test executor with policy-driven environment.
 //!
 //! Replaces shell-wrapper command assembly with deterministic Rust logic.
@@ -7,7 +7,7 @@
 //! command construction are delegated to the core
 //! [`apm2_core::fac::execution_backend`] module.
 //!
-//! # Environment Policy (TCK-00549)
+//! # Environment Policy (RFC-0032::REQ-0204)
 //!
 //! Environment variables passed to the transient systemd unit are derived
 //! entirely from `FacPolicyV1` via `build_job_environment()`. No ad-hoc
@@ -42,7 +42,7 @@ const MAX_SETENV_PAIRS: usize = 256;
 
 /// Env var keys that are unconditionally stripped from the spawned bounded
 /// test process environment, regardless of policy configuration. This is
-/// a defense-in-depth measure (INV-ENV-008, TCK-00548) that ensures
+/// a defense-in-depth measure (INV-ENV-008, RFC-0032::REQ-0203) that ensures
 /// sccache cannot bypass cgroup containment even if the policy is
 /// misconfigured.
 const SCCACHE_ENV_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
@@ -85,7 +85,7 @@ fn parse_cpu_quota_percent(cpu_quota: &str) -> Result<u32, String> {
 /// Parses string-format limits (e.g., "48G", "200%") into numeric types
 /// used by the core command builder. Uses the provided sandbox hardening
 /// profile and network policy (from policy) instead of hard-coding
-/// defaults (TCK-00573, TCK-00574).
+/// defaults (RFC-0032::REQ-0223, RFC-0032::REQ-0224).
 fn limits_to_properties(
     limits: BoundedTestLimits<'_>,
     sandbox_hardening: SandboxHardeningProfile,
@@ -148,8 +148,8 @@ pub fn build_bounded_test_command(
 
     // Convert CLI limits to core properties for unified command
     // construction. Uses the policy-driven sandbox hardening profile
-    // and network policy (TCK-00573, TCK-00574) instead of hard-coding
-    // defaults.
+    // and network policy (RFC-0032::REQ-0223, RFC-0032::REQ-0224) instead of
+    // hard-coding defaults.
     let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
 
     // Select execution backend: user-mode (requires D-Bus session) or
@@ -158,7 +158,7 @@ pub fn build_bounded_test_command(
         select_backend().map_err(|e| format!("execution backend selection failed: {e}"))?;
 
     // Build setenv pairs from the policy-computed environment.
-    // TCK-00549: The environment is now entirely derived from FacPolicyV1
+    // RFC-0032::REQ-0204: The environment is now entirely derived from FacPolicyV1
     // via build_job_environment(). No ad-hoc allowlists are applied here.
     // Defense-in-depth: strip RUSTC_WRAPPER and SCCACHE_* (INV-ENV-008).
     let setenv_pairs = build_policy_setenv_pairs(policy_env)?;
@@ -219,7 +219,7 @@ pub fn build_bounded_test_command(
     // Collect sccache-related env var keys to strip from the spawned
     // process environment. This prevents the bounded test unit from
     // inheriting sccache configuration from the parent process, which
-    // could bypass cgroup containment (TCK-00548 MAJOR-3).
+    // could bypass cgroup containment (RFC-0032::REQ-0203 MAJOR-3).
     let mut env_remove_keys: Vec<String> = SCCACHE_ENV_STRIP_KEYS
         .iter()
         .map(|k| (*k).to_string())
@@ -241,7 +241,8 @@ pub fn build_bounded_test_command(
 }
 
 /// Build a bounded gate command for non-test evidence gates (rustfmt, clippy,
-/// doc) that applies network policy isolation via `systemd-run` (TCK-00574).
+/// doc) that applies network policy isolation via `systemd-run`
+/// (RFC-0032::REQ-0224).
 ///
 /// This ensures ALL evidence gate phases — not only the bounded test phase —
 /// run under network-deny when the default policy is active. Uses the same
@@ -358,8 +359,8 @@ fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String
 
 /// Build `--setenv` pairs from a policy-computed environment.
 ///
-/// TCK-00549: This replaces the previous ad-hoc allowlist approach. The
-/// caller provides a pre-computed environment from `FacPolicyV1` (via
+/// RFC-0032::REQ-0204: This replaces the previous ad-hoc allowlist approach.
+/// The caller provides a pre-computed environment from `FacPolicyV1` (via
 /// `build_job_environment`), and this function forwards all entries as
 /// `--setenv` arguments after applying defense-in-depth stripping of
 /// `RUSTC_WRAPPER` and `SCCACHE_*` (INV-ENV-008).
@@ -429,7 +430,7 @@ fn command_available(command: &str) -> bool {
 }
 
 // NOTE: `check_sccache_containment_for_build()` was removed as part of
-// TCK-00548 review findings (MAJOR-1, MAJOR-3). It checked containment
+// RFC-0032::REQ-0203 review findings (MAJOR-1, MAJOR-3). It checked containment
 // against the CLI process PID (wrong PID -- the bounded test unit does
 // not exist yet). The fix unconditionally strips sccache env vars from
 // bounded test commands via the allowlist and env_remove_keys instead.
@@ -494,7 +495,7 @@ mod tests {
 
     #[test]
     fn policy_setenv_pairs_strip_sccache_defense_in_depth() {
-        // TCK-00549: Even if policy env contains RUSTC_WRAPPER or
+        // RFC-0032::REQ-0204: Even if policy env contains RUSTC_WRAPPER or
         // SCCACHE_*, they must be stripped (defense-in-depth).
         let policy_env = vec![
             ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
@@ -621,7 +622,7 @@ mod tests {
         );
     }
 
-    // --- TCK-00574 BLOCKER: bounded gate command for non-test gates ---
+    // --- RFC-0032::REQ-0224 BLOCKER: bounded gate command for non-test gates ---
 
     #[test]
     fn bounded_gate_command_rejects_empty_gate_command() {

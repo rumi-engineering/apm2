@@ -1,4 +1,4 @@
-//! FAC root permissions validation (TCK-00536).
+//! FAC root permissions validation (RFC-0032::REQ-0192).
 //!
 //! Enforces 0700 ownership checks on `$APM2_HOME` and `$APM2_HOME/private/fac`
 //! before any FAC command executes. Refuses to run when permissions are unsafe,
@@ -35,7 +35,7 @@ const fn fac_file_open_flags() -> i32 {
 /// permissions invariant (mode 0700, owner-only).
 ///
 /// Queue directories are intentionally excluded from this list because the
-/// queue hardening (TCK-00577) sets `queue/` to 0711 and
+/// queue hardening (RFC-0032::REQ-0227) sets `queue/` to 0711 and
 /// `queue/broker_requests/` to 01733. These intentional modes would fail
 /// the strict 0700 check, breaking non-enqueue commands like `fac lane status`.
 ///
@@ -59,7 +59,7 @@ const FAC_SUBDIRS_STRICT: &[&str] = &[
 ];
 
 /// Queue subdirectories under `$APM2_HOME` that use intentionally relaxed
-/// permission modes (TCK-00577 round 10 fix).
+/// permission modes (RFC-0032::REQ-0227 round 10 fix).
 ///
 /// These are checked by the **relaxed** validator only (which permits
 /// execute-only traversal bits). The strict validator skips them because
@@ -555,7 +555,7 @@ pub fn validate_fac_root_permissions_for(apm2_home: &Path) -> Result<(), FacPerm
     validate_fac_root_permissions_at(apm2_home)
 }
 
-/// Relaxed validation for enqueue-class commands (TCK-00577 round 3).
+/// Relaxed validation for enqueue-class commands (RFC-0032::REQ-0227 round 3).
 ///
 /// In a service-user-owned deployment, non-service-user callers cannot
 /// satisfy the strict ownership check on FAC roots (directories are owned
@@ -609,8 +609,8 @@ pub fn validate_fac_root_permissions_relaxed_for_enqueue_at(
 /// without checking ownership. Used for enqueue-class commands where the
 /// caller may not own the FAC directories.
 ///
-/// TCK-00577 round 6: Permits group/other execute (`o+x`, `g+x`) bits for
-/// directory traversal. Non-service-user callers need execute permission on
+/// RFC-0032::REQ-0227 round 6: Permits group/other execute (`o+x`, `g+x`) bits
+/// for directory traversal. Non-service-user callers need execute permission on
 /// `queue/` (mode 0711) to reach `broker_requests/` (mode 01733). Read and
 /// write bits for group/other are still rejected.
 #[cfg(unix)]
@@ -646,7 +646,7 @@ fn validate_fac_root_permissions_at(apm2_home: &Path) -> Result<(), FacPermissio
     // Validate the APM2 home directory itself.
     validate_directory(apm2_home, expected_uid)?;
 
-    // TCK-00577 round 10: Only validate strict subdirectories here.
+    // RFC-0032::REQ-0227 round 10: Only validate strict subdirectories here.
     // Queue directories are intentionally set to 0711 (not 0700) after
     // queue hardening, so they would fail this strict check. Queue
     // directories are validated by the relaxed validator (for enqueue-class
@@ -668,8 +668,8 @@ mod tests {
 
     use super::*;
 
-    /// TCK-00536: Verify that `ensure_dir_with_mode` creates directories with
-    /// mode 0700.
+    /// RFC-0032::REQ-0192: Verify that `ensure_dir_with_mode` creates
+    /// directories with mode 0700.
     #[test]
     #[cfg(unix)]
     fn ensure_dir_creates_with_0700() {
@@ -688,8 +688,8 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `ensure_dir_with_mode` creates nested directories
-    /// with mode 0700.
+    /// RFC-0032::REQ-0192: Verify that `ensure_dir_with_mode` creates nested
+    /// directories with mode 0700.
     #[test]
     #[cfg(unix)]
     fn ensure_dir_creates_nested_with_0700() {
@@ -733,7 +733,7 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `ensure_dir_with_mode` rejects existing
+    /// RFC-0032::REQ-0192: Verify that `ensure_dir_with_mode` rejects existing
     /// world-readable directories.
     #[test]
     #[cfg(unix)]
@@ -755,8 +755,8 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify `write_fac_file_with_mode` rejects world-readable
-    /// pre-existing FAC files.
+    /// RFC-0032::REQ-0192: Verify `write_fac_file_with_mode` rejects
+    /// world-readable pre-existing FAC files.
     #[test]
     #[cfg(unix)]
     fn write_fac_file_with_mode_rejects_world_readable_file() {
@@ -779,8 +779,8 @@ mod tests {
         assert_eq!(data, b"prior");
     }
 
-    /// TCK-00536: Verify `append_fac_file_with_mode` rejects world-readable
-    /// pre-existing FAC files.
+    /// RFC-0032::REQ-0192: Verify `append_fac_file_with_mode` rejects
+    /// world-readable pre-existing FAC files.
     #[test]
     #[cfg(unix)]
     fn append_fac_file_with_mode_rejects_world_readable_file() {
@@ -803,7 +803,7 @@ mod tests {
         assert_eq!(data, b"prior");
     }
 
-    /// TCK-00536: Verify `write_fac_file_with_mode` succeeds on safe
+    /// RFC-0032::REQ-0192: Verify `write_fac_file_with_mode` succeeds on safe
     /// pre-existing FAC files with mode 0600.
     #[test]
     #[cfg(unix)]
@@ -823,7 +823,7 @@ mod tests {
         assert_eq!(data, b"next");
     }
 
-    /// TCK-00536: Verify `append_fac_file_with_mode` succeeds on safe
+    /// RFC-0032::REQ-0192: Verify `append_fac_file_with_mode` succeeds on safe
     /// pre-existing FAC files with mode 0600.
     #[test]
     #[cfg(unix)]
@@ -846,8 +846,8 @@ mod tests {
         assert_eq!(data, b"prior next");
     }
 
-    /// TCK-00536: Verify that `validate_directory` rejects group/world-writable
-    /// directories.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` rejects
+    /// group/world-writable directories.
     #[test]
     #[cfg(unix)]
     fn validate_directory_rejects_group_writable() {
@@ -877,8 +877,8 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `validate_directory` rejects world-readable
-    /// directories.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` rejects
+    /// world-readable directories.
     #[test]
     #[cfg(unix)]
     fn validate_directory_rejects_world_readable() {
@@ -897,7 +897,8 @@ mod tests {
         assert!(result.is_err(), "should reject world-readable directory");
     }
 
-    /// TCK-00536: Verify that `validate_directory` accepts strict mode 0700.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` accepts strict mode
+    /// 0700.
     #[test]
     #[cfg(unix)]
     fn validate_directory_accepts_0700() {
@@ -915,7 +916,8 @@ mod tests {
         assert!(result.is_ok(), "should accept mode 0700 directory");
     }
 
-    /// TCK-00536: Verify that `validate_directory` accepts stricter mode 0500.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` accepts stricter
+    /// mode 0500.
     #[test]
     #[cfg(unix)]
     fn validate_directory_accepts_stricter_than_0700() {
@@ -937,7 +939,7 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `validate_directory` rejects symlinks.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` rejects symlinks.
     #[test]
     #[cfg(unix)]
     fn validate_directory_rejects_symlink() {
@@ -959,8 +961,8 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `validate_directory` creates missing directories
-    /// with mode 0700.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` creates missing
+    /// directories with mode 0700.
     #[test]
     #[cfg(unix)]
     fn validate_directory_creates_missing_dir_with_0700() {
@@ -984,8 +986,8 @@ mod tests {
         );
     }
 
-    /// TCK-00536: Verify that `validate_directory` rejects ownership mismatch.
-    /// Uses a fake UID that does not match the current user.
+    /// RFC-0032::REQ-0192: Verify that `validate_directory` rejects ownership
+    /// mismatch. Uses a fake UID that does not match the current user.
     #[test]
     #[cfg(unix)]
     fn validate_directory_rejects_ownership_mismatch() {
@@ -1007,10 +1009,10 @@ mod tests {
         );
     }
 
-    /// TCK-00536: End-to-end test of `validate_fac_root_permissions` with a
-    /// temporary `$APM2_HOME`.
+    /// RFC-0032::REQ-0192: End-to-end test of `validate_fac_root_permissions`
+    /// with a temporary `$APM2_HOME`.
     ///
-    /// TCK-00577 round 10: The strict validator only creates/validates
+    /// RFC-0032::REQ-0227 round 10: The strict validator only creates/validates
     /// `FAC_SUBDIRS_STRICT` (not queue dirs). Queue dirs are intentionally
     /// excluded because they use 0711 mode after hardening.
     #[test]
@@ -1055,10 +1057,11 @@ mod tests {
         }
     }
 
-    /// TCK-00577 round 10 MAJOR fix: The strict validator must succeed when
-    /// queue directories exist with mode 0711 (the intentional hardened mode).
-    /// Previously, queue dirs were in `FAC_SUBDIRS` and the strict validator
-    /// rejected 0711, breaking non-enqueue commands like `fac lane status`.
+    /// RFC-0032::REQ-0227 round 10 MAJOR fix: The strict validator must succeed
+    /// when queue directories exist with mode 0711 (the intentional
+    /// hardened mode). Previously, queue dirs were in `FAC_SUBDIRS` and the
+    /// strict validator rejected 0711, breaking non-enqueue commands like
+    /// `fac lane status`.
     #[test]
     #[cfg(unix)]
     fn strict_validation_succeeds_when_queue_dirs_have_mode_0711() {
@@ -1115,10 +1118,11 @@ mod tests {
         );
     }
 
-    // ── TCK-00577 round 3: relaxed validation for enqueue-class commands ──
+    // ── RFC-0032::REQ-0227 round 3: relaxed validation for enqueue-class commands
+    // ──
 
-    /// TCK-00577: Relaxed validation allows directories owned by a different
-    /// user (service user) as long as mode is safe.
+    /// RFC-0032::REQ-0227: Relaxed validation allows directories owned by a
+    /// different user (service user) as long as mode is safe.
     #[test]
     #[cfg(unix)]
     fn relaxed_validation_allows_different_owner_with_safe_mode() {
@@ -1138,11 +1142,12 @@ mod tests {
         );
     }
 
-    /// TCK-00577 round 6: Relaxed validation accepts 0711 on `queue/` (needed
-    /// for non-service-user traversal to `broker_requests/`).
+    /// RFC-0032::REQ-0227 round 6: Relaxed validation accepts 0711 on `queue/`
+    /// (needed for non-service-user traversal to `broker_requests/`).
     ///
-    /// TCK-00577 round 10: The strict validator no longer creates queue dirs,
-    /// so this test creates them manually before setting mode 0711.
+    /// RFC-0032::REQ-0227 round 10: The strict validator no longer creates
+    /// queue dirs, so this test creates them manually before setting mode
+    /// 0711.
     #[test]
     #[cfg(unix)]
     fn relaxed_validation_accepts_0711_queue_dir() {
@@ -1171,8 +1176,8 @@ mod tests {
         );
     }
 
-    /// TCK-00577: Relaxed validation rejects directories with unsafe mode
-    /// bits even when ownership is not checked.
+    /// RFC-0032::REQ-0227: Relaxed validation rejects directories with unsafe
+    /// mode bits even when ownership is not checked.
     #[test]
     #[cfg(unix)]
     fn relaxed_validation_rejects_unsafe_mode() {
@@ -1196,7 +1201,7 @@ mod tests {
         );
     }
 
-    /// TCK-00577: Relaxed validation rejects symlinks.
+    /// RFC-0032::REQ-0227: Relaxed validation rejects symlinks.
     #[test]
     #[cfg(unix)]
     fn relaxed_validation_rejects_symlink() {
@@ -1212,7 +1217,8 @@ mod tests {
         assert!(msg.contains("symlink"), "should mention symlink: {msg}");
     }
 
-    /// TCK-00577: `validate_directory_mode_only` accepts 0700 and rejects 0755.
+    /// RFC-0032::REQ-0227: `validate_directory_mode_only` accepts 0700 and
+    /// rejects 0755.
     #[test]
     #[cfg(unix)]
     fn validate_directory_mode_only_rejects_group_readable() {
@@ -1239,7 +1245,7 @@ mod tests {
         );
     }
 
-    /// TCK-00577 round 6: `validate_directory_mode_only` accepts 0711
+    /// RFC-0032::REQ-0227 round 6: `validate_directory_mode_only` accepts 0711
     /// (traverse-only for group/other) and rejects 0755 (group/other read).
     #[test]
     #[cfg(unix)]

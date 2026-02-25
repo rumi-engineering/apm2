@@ -1,4 +1,4 @@
-//! E2E compaction and TTL tests for TCK-00177.
+//! E2E compaction and TTL tests for RFC-0033::REQ-0043.
 //!
 //! This module tests the full compaction and TTL lifecycle including:
 //! - TTL-based artifact expiration
@@ -16,7 +16,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00177: E2E evidence and receipt verification tests
+//! - RFC-0033::REQ-0043: E2E evidence and receipt verification tests
 //! - AD-EVID-002: Evidence retention and TTL
 //! - REQ-EVID-003: Evidence compaction requirements
 //!

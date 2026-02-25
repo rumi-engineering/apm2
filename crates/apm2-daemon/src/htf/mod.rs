@@ -35,7 +35,7 @@
 //! # References
 //!
 //! - RFC-0016: Holonic Time Fabric
-//! - TCK-00240: `HolonicClock` service implementation
+//! - RFC-0016::REQ-0002: `HolonicClock` service implementation
 
 mod clock;
 

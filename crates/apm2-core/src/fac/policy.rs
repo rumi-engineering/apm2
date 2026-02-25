@@ -237,7 +237,8 @@ pub struct FacPolicyV1 {
     #[serde(default = "default_economics_profile_hash")]
     pub economics_profile_hash: [u8; 32],
 
-    /// Sandbox hardening profile for systemd transient units (TCK-00573).
+    /// Sandbox hardening profile for systemd transient units
+    /// (RFC-0032::REQ-0223).
     ///
     /// Defines which systemd security directives are applied to FAC job units.
     /// The default profile enables all hardening directives with safe defaults
@@ -245,7 +246,7 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub sandbox_hardening: SandboxHardeningProfile,
 
-    /// Network access policy override for FAC job units (TCK-00574).
+    /// Network access policy override for FAC job units (RFC-0032::REQ-0224).
     ///
     /// When `Some`, this policy takes precedence over the built-in
     /// per-job-kind mapping in `resolve_network_policy()`. When `None`
@@ -256,12 +257,13 @@ pub struct FacPolicyV1 {
     /// globally (e.g., deny network even for warm, or allow for gates).
     ///
     /// The default is `None` (use built-in mapping). Existing policies
-    /// that predate TCK-00574 will correctly default to `None` via
+    /// that predate RFC-0032::REQ-0224 will correctly default to `None` via
     /// `serde(default)`, preserving the built-in warm→allow mapping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<NetworkPolicy>,
 
-    /// Optional `repo_id` allowlist for job spec validation (TCK-00579).
+    /// Optional `repo_id` allowlist for job spec validation
+    /// (RFC-0032::REQ-0229).
     ///
     /// When `Some`, only the listed `repo_id` values are accepted by
     /// policy-aware job spec validators.  When `None` (the default), any
@@ -269,14 +271,14 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because `None` is the MOST
     /// permissive option for this field, and the default is correct for
-    /// existing persisted policies that predate TCK-00579.  The remaining
-    /// policy checks (`bytes_backend` allowlist, filesystem-path rejection)
-    /// are unconditional and do not depend on this field.
+    /// existing persisted policies that predate RFC-0032::REQ-0229.  The
+    /// remaining policy checks (`bytes_backend` allowlist, filesystem-path
+    /// rejection) are unconditional and do not depend on this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<String>>,
 
     /// Optional RFC-0028 intent allowlist for broker token issuance
-    /// (TCK-00567).
+    /// (RFC-0032::REQ-0218).
     ///
     /// When `Some`, only the listed intents are permitted by the broker
     /// when issuing tokens.  When `None` (the default), any structurally
@@ -284,27 +286,28 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because `None` is the MOST
     /// permissive option for this field, and the default is correct for
-    /// existing persisted policies that predate TCK-00567.  The fail-closed
-    /// enforcement is at the broker and worker layers when the field is
-    /// `Some`.
+    /// existing persisted policies that predate RFC-0032::REQ-0218.  The
+    /// fail-closed enforcement is at the broker and worker layers when the
+    /// field is `Some`.
     ///
     /// The list is bounded by [`super::job_spec::MAX_ALLOWED_INTENTS_SIZE`]
     /// at validation time (CTR-1303).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_intents: Option<Vec<super::job_spec::FacIntent>>,
 
-    /// Queue bounds policy controlling maximum pending queue size (TCK-00578).
+    /// Queue bounds policy controlling maximum pending queue size
+    /// (RFC-0032::REQ-0228).
     ///
     /// Configures `max_pending_jobs`, `max_pending_bytes`, and optional
     /// `per_lane_max_pending_jobs` for enqueue-time enforcement. When not
-    /// present in persisted policy (pre-TCK-00578 policies), defaults to
-    /// `QueueBoundsPolicy::default()` via `serde(default)`.
+    /// present in persisted policy (pre-RFC-0032::REQ-0228 policies), defaults
+    /// to `QueueBoundsPolicy::default()` via `serde(default)`.
     #[serde(default)]
     pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
 
     /// Enables temporary dual-write of FAC queue filesystem mutations to the
     /// queue lifecycle ledger vocabulary (`fac.job.*`) for migration
-    /// (TCK-00669).
+    /// (RFC-0032::REQ-0275).
     ///
     /// Default is `false` (fail-closed migration posture). When disabled, the
     /// queue continues filesystem-only behavior. When enabled, queue mutation
@@ -312,7 +315,7 @@ pub struct FacPolicyV1 {
     #[serde(default)]
     pub queue_lifecycle_dual_write_enabled: bool,
 
-    /// Whether sccache is explicitly enabled for FAC jobs (TCK-00553).
+    /// Whether sccache is explicitly enabled for FAC jobs (RFC-0032::REQ-0208).
     ///
     /// Default is `false` (fail-closed). When `true`, `RUSTC_WRAPPER=sccache`
     /// and `SCCACHE_DIR` are injected into the job environment, but ONLY if
@@ -321,11 +324,11 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because `false` is the MOST
     /// restrictive option (sccache disabled). Existing persisted policies
-    /// that predate TCK-00553 will correctly default to `false`.
+    /// that predate RFC-0032::REQ-0208 will correctly default to `false`.
     #[serde(default)]
     pub sccache_enabled: bool,
 
-    /// Optional override for the sccache cache directory (TCK-00553).
+    /// Optional override for the sccache cache directory (RFC-0032::REQ-0208).
     ///
     /// When `None` (the default), `$APM2_HOME/private/fac/sccache` is used
     /// as the managed sccache directory. When `Some`, the provided path is
@@ -336,7 +339,7 @@ pub struct FacPolicyV1 {
     pub sccache_dir: Option<String>,
 
     /// Maximum total log bytes per lane before oldest job logs are pruned
-    /// (TCK-00571). Default: 100 MiB.
+    /// (RFC-0032::REQ-0221). Default: 100 MiB.
     ///
     /// When the total size of a lane's `logs/` directory exceeds this value,
     /// the GC planner emits pruning targets for the oldest job log
@@ -344,13 +347,13 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because the default is a
     /// conservative retention limit (100 MiB), not an unbounded value.
-    /// Existing policies that predate TCK-00571 will default to a reasonable
-    /// cap.
+    /// Existing policies that predate RFC-0032::REQ-0221 will default to a
+    /// reasonable cap.
     #[serde(default = "default_per_lane_log_max_bytes")]
     pub per_lane_log_max_bytes: u64,
 
-    /// Days to retain per-job log directories before pruning (TCK-00571).
-    /// Default: 7.
+    /// Days to retain per-job log directories before pruning
+    /// (RFC-0032::REQ-0221). Default: 7.
     ///
     /// Job log directories whose mtime is older than this TTL are eligible
     /// for pruning during GC. A value of 0 means "use default" (7 days).
@@ -361,7 +364,7 @@ pub struct FacPolicyV1 {
     pub per_job_log_ttl_days: u32,
 
     /// Number of most-recent job log directories to keep per lane regardless
-    /// of TTL or size quota (TCK-00571). Default: 5.
+    /// of TTL or size quota (RFC-0032::REQ-0221). Default: 5.
     ///
     /// During retention pruning, at least this many job log directories
     /// (sorted by mtime descending) are always retained, even if they exceed
@@ -399,7 +402,7 @@ impl FacPolicyV1 {
                 "CARGO_".to_string(),
                 // SAFETY: The previous broad "RUST" prefix admitted RUSTC_WRAPPER,
                 // enabling wrapper-controlled compiler execution that bypasses
-                // containment (TCK-00548). Specific prefixes are enumerated to
+                // containment (RFC-0032::REQ-0203). Specific prefixes are enumerated to
                 // cover RUSTFLAGS, RUSTDOCFLAGS, RUSTUP_*, and RUST_BACKTRACE
                 // without admitting RUSTC_WRAPPER or RUSTC (which could be
                 // spoofed). See env_denylist_prefixes for defense-in-depth.
@@ -427,7 +430,7 @@ impl FacPolicyV1 {
                 "DOCKER_".to_string(),
                 // Defense-in-depth: explicitly deny wrapper/cache injection
                 // variables even if a custom policy re-introduces a broad
-                // "RUST" allowlist prefix (TCK-00526, TCK-00548).
+                // "RUST" allowlist prefix (RFC-0032::REQ-0185, RFC-0032::REQ-0203).
                 "RUSTC_WRAPPER".to_string(),
                 "SCCACHE_".to_string(),
             ],
@@ -459,7 +462,7 @@ impl FacPolicyV1 {
     }
 
     /// Derives a [`super::job_spec::JobSpecValidationPolicy`] from this
-    /// policy's `allowed_repo_ids` field (TCK-00579).
+    /// policy's `allowed_repo_ids` field (RFC-0032::REQ-0229).
     ///
     /// This is the canonical way to obtain a validation policy for use with
     /// [`super::job_spec::validate_job_spec_with_policy`] and
@@ -526,7 +529,7 @@ impl FacPolicyV1 {
             validate_string_field_len("env_set.value", entry.value.len(), MAX_ENV_VALUE_LENGTH)?;
         }
 
-        // Validate sandbox hardening profile (TCK-00573).
+        // Validate sandbox hardening profile (RFC-0032::REQ-0223).
         self.sandbox_hardening
             .validate()
             .map_err(|e| FacPolicyError::InvalidFieldValue {
@@ -535,7 +538,7 @@ impl FacPolicyV1 {
             })?;
 
         // Validate allowed_repo_ids length for early detection during policy
-        // loading (TCK-00579).  The same bound is enforced during policy
+        // loading (RFC-0032::REQ-0229).  The same bound is enforced during policy
         // derivation in `job_spec_validation_policy()`, but checking here
         // ensures oversized allowlists are caught at deserialization time.
         if let Some(ref repos) = self.allowed_repo_ids {
@@ -548,7 +551,7 @@ impl FacPolicyV1 {
             }
         }
 
-        // Validate allowed_intents length (TCK-00567, CTR-1303).
+        // Validate allowed_intents length (RFC-0032::REQ-0218, CTR-1303).
         if let Some(ref intents) = self.allowed_intents {
             if intents.len() > super::job_spec::MAX_ALLOWED_INTENTS_SIZE {
                 return Err(FacPolicyError::VectorTooLarge {
@@ -559,7 +562,7 @@ impl FacPolicyV1 {
             }
         }
 
-        // Validate queue bounds policy (TCK-00578).
+        // Validate queue bounds policy (RFC-0032::REQ-0228).
         self.queue_bounds_policy
             .validate()
             .map_err(|e| FacPolicyError::InvalidFieldValue {
@@ -567,14 +570,14 @@ impl FacPolicyV1 {
                 value: format!("{e}"),
             })?;
 
-        // Validate sccache_dir if present (TCK-00553).
+        // Validate sccache_dir if present (RFC-0032::REQ-0208).
         validate_string_field_opt("sccache_dir", self.sccache_dir.as_deref())?;
 
         Ok(())
     }
 
     /// Resolves the effective `SCCACHE_DIR` path for FAC job execution
-    /// (TCK-00553).
+    /// (RFC-0032::REQ-0208).
     ///
     /// Priority:
     /// 1. `policy.sccache_dir` (explicit override)
@@ -619,16 +622,16 @@ impl FacPolicyV1 {
 /// 4. Remove all variables listed in `env_clear` (unconditional strip).
 /// 5. Apply `env_set` overrides (force-set specific key=value pairs).
 /// 6. Hardcoded safety: unconditionally strip `RUSTC_WRAPPER` and `SCCACHE_*`
-///    regardless of policy configuration (containment invariant, TCK-00548).
-///    This step runs AFTER `env_set` to ensure policy overrides cannot
-///    re-introduce these variables.
+///    regardless of policy configuration (containment invariant,
+///    RFC-0032::REQ-0203). This step runs AFTER `env_set` to ensure policy
+///    overrides cannot re-introduce these variables.
 /// 7. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
 ///    the ambient environment, replace it with the managed path.
 /// 8. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
 /// 9. If `sccache_enabled` is true in policy, inject `RUSTC_WRAPPER=sccache`
-///    and `SCCACHE_DIR` from the policy-resolved path (TCK-00553). The caller
-///    is responsible for gating on containment verification before actually
-///    using the environment with sccache enabled.
+///    and `SCCACHE_DIR` from the policy-resolved path (RFC-0032::REQ-0208). The
+///    caller is responsible for gating on containment verification before
+///    actually using the environment with sccache enabled.
 ///
 /// The result is a deterministic `BTreeMap<String, String>` of environment
 /// variables suitable for passing to `Command::envs()` after clearing the
@@ -680,7 +683,7 @@ pub fn build_job_environment(
     // Step 6: Hardcoded containment safety — unconditionally strip
     // RUSTC_WRAPPER and SCCACHE_* regardless of policy configuration.
     // These variables enable wrapper-controlled compiler execution that
-    // bypasses cgroup containment (TCK-00548). This is a non-configurable
+    // bypasses cgroup containment (RFC-0032::REQ-0203). This is a non-configurable
     // safety invariant: even a misconfigured policy cannot re-admit them
     // via env_set overrides. This step MUST run AFTER env_set (Step 5) to
     // ensure policy env_set cannot re-introduce these variables.
@@ -700,7 +703,7 @@ pub fn build_job_environment(
         env.insert("CARGO_TARGET_DIR".to_string(), target_dir.clone());
     }
 
-    // Step 9 (TCK-00553): If sccache is explicitly enabled in policy,
+    // Step 9 (RFC-0032::REQ-0208): If sccache is explicitly enabled in policy,
     // inject the wrapper and cache directory variables. This runs AFTER
     // the hardcoded stripping in Step 6 to re-introduce the variables
     // only when the policy explicitly opts in. The caller MUST gate on
@@ -756,7 +759,7 @@ pub const LANE_ENV_DIRS: &[&str] = &[
 /// `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` to
 /// deterministic per-lane directories under `lane_dir`. This prevents FAC
 /// jobs from writing into ambient user locations (`~/.cache`, `~/.cargo`,
-/// etc.) and provides per-lane isolation (TCK-00575).
+/// etc.) and provides per-lane isolation (RFC-0032::REQ-0225).
 ///
 /// This function must be called AFTER [`build_job_environment`] so that
 /// the per-lane overrides take final precedence over any ambient values
@@ -898,7 +901,7 @@ pub fn ensure_lane_env_dirs(lane_dir: &Path) -> Result<(), String> {
 ///
 /// This is the shared implementation backing both
 /// `verify_lane_env_dir_permissions` and `verify_cargo_home_permissions`
-/// (TCK-00575 round 2 NIT: deduplicated permission verification).
+/// (RFC-0032::REQ-0225 round 2 NIT: deduplicated permission verification).
 ///
 /// # Errors
 ///
@@ -1272,7 +1275,7 @@ mod tests {
         ));
     }
 
-    // ── Sandbox hardening policy tests (TCK-00573) ──
+    // ── Sandbox hardening policy tests (RFC-0032::REQ-0223) ──
 
     #[test]
     fn test_default_policy_includes_sandbox_hardening() {
@@ -1371,7 +1374,7 @@ mod tests {
         assert_eq!(policy, restored);
     }
 
-    // ── build_job_environment tests (TCK-00526) ──
+    // ── build_job_environment tests (RFC-0032::REQ-0185) ──
 
     #[test]
     fn test_build_job_environment_clears_by_default() {
@@ -1581,7 +1584,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // ── RUSTC_WRAPPER / SCCACHE_* denial regression tests (TCK-00526) ──
+    // ── RUSTC_WRAPPER / SCCACHE_* denial regression tests (RFC-0032::REQ-0185) ──
 
     #[test]
     fn test_default_policy_denies_rustc_wrapper_prefix() {
@@ -1777,7 +1780,7 @@ mod tests {
         );
     }
 
-    // ── Per-lane env isolation tests (TCK-00575) ──
+    // ── Per-lane env isolation tests (RFC-0032::REQ-0225) ──
 
     #[test]
     fn test_apply_lane_env_overrides_sets_all_vars() {
@@ -2173,7 +2176,7 @@ mod tests {
         );
     }
 
-    // ── TCK-00579: job_spec_validation_policy tests ──
+    // ── RFC-0032::REQ-0229: job_spec_validation_policy tests ──
 
     #[test]
     fn test_job_spec_validation_policy_open_by_default() {

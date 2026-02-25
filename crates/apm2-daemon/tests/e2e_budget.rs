@@ -12,8 +12,8 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00175: E2E lifecycle and budget tests
-//! - TCK-00165: Tool execution and budget charging
+//! - RFC-0033::REQ-0041: E2E lifecycle and budget tests
+//! - RFC-0033::REQ-0032: Tool execution and budget charging
 //! - CTR-2504: Defensive time handling
 //!
 //! # Test Coverage

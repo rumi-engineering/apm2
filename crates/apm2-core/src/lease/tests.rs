@@ -1215,10 +1215,11 @@ fn test_renewal_uses_event_timestamp() {
 }
 
 // =============================================================================
-// TCK-00241: Tick-Based Expiry Tests for Reducer State
+// RFC-0016::REQ-0003: Tick-Based Expiry Tests for Reducer State
 // =============================================================================
 
-/// TCK-00241: Tests for tick-based expiry detection in `LeaseReducerState`.
+/// RFC-0016::REQ-0003: Tests for tick-based expiry detection in
+/// `LeaseReducerState`.
 mod tck_00241 {
     use super::*;
     use crate::htf::HtfTick;
@@ -1229,8 +1230,8 @@ mod tck_00241 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// TCK-00241: SEC-CTRL-FAC-0015 Legacy leases not included in tick-only
-    /// method.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases not included in
+    /// tick-only method.
     ///
     /// Legacy leases (without tick data) are NOT returned by
     /// `get_expired_but_active_at_tick`. Callers should use
@@ -1264,7 +1265,8 @@ mod tck_00241 {
         );
     }
 
-    /// TCK-00241: SEC-CTRL-FAC-0015 Legacy leases use wall-clock fallback.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases use wall-clock
+    /// fallback.
     ///
     /// When using `get_expired_but_active_at_tick_or_wall`, legacy leases
     /// fall back to wall-clock comparison for expiry detection.
@@ -1309,7 +1311,7 @@ mod tck_00241 {
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
-    /// TCK-00241: Leases with tick data use tick-based expiry.
+    /// RFC-0016::REQ-0003: Leases with tick data use tick-based expiry.
     ///
     /// This test manually sets tick data to verify correct behavior.
     #[test]
@@ -1347,7 +1349,8 @@ mod tck_00241 {
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
-    /// TCK-00241: Wall time does not affect tick-based expiry detection.
+    /// RFC-0016::REQ-0003: Wall time does not affect tick-based expiry
+    /// detection.
     ///
     /// This verifies the core acceptance criterion: wall time changes
     /// do not affect lease validity when using tick-based expiry.
@@ -1393,7 +1396,7 @@ mod tck_00241 {
         );
     }
 
-    /// TCK-00241: SEC-HTF-003 Tick rate mismatch fails closed.
+    /// RFC-0016::REQ-0003: SEC-HTF-003 Tick rate mismatch fails closed.
     ///
     /// When the current tick has a different rate than the lease's expiry tick,
     /// the comparison is invalid. The method fails closed (treats as expired).
@@ -1435,7 +1438,8 @@ mod tck_00241 {
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
-    /// TCK-00241: Tick timing validation in reducer rejects invalid events.
+    /// RFC-0016::REQ-0003: Tick timing validation in reducer rejects invalid
+    /// events.
     ///
     /// Events where `expires_at_tick <= issued_at_tick` should be rejected.
     #[test]
@@ -1472,7 +1476,7 @@ mod tck_00241 {
         assert!(matches!(result2, Err(LeaseError::InvalidTickTiming { .. })));
     }
 
-    /// TCK-00241: Valid tick timing is accepted.
+    /// RFC-0016::REQ-0003: Valid tick timing is accepted.
     #[test]
     fn valid_tick_timing_accepted() {
         let mut reducer = LeaseReducer::new();

@@ -1,4 +1,4 @@
-//! Receipt-derived metrics for FAC observability (TCK-00551).
+//! Receipt-derived metrics for FAC observability (RFC-0032::REQ-0206).
 //!
 //! This module extracts operator-facing metrics from [`FacJobReceiptV1`] and
 //! [`GcReceiptV1`] data. All computation is pure (no I/O, no side effects):
@@ -89,7 +89,7 @@ pub struct MetricsSummary {
     /// Count of denials due to insufficient disk space.
     pub disk_preflight_failures: u64,
 
-    // -- Observed resource usage (TCK-00572) --
+    // -- Observed resource usage (RFC-0032::REQ-0222) --
     /// Number of completed jobs with non-empty `observed_usage` data.
     /// Used as the sample size for resource usage aggregates.
     #[serde(default)]
@@ -239,7 +239,7 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
     let mut receipt_cancelled: u64 = 0;
     let mut receipt_total: u64 = 0;
 
-    // -- Observed resource usage accumulators (TCK-00572) --
+    // -- Observed resource usage accumulators (RFC-0032::REQ-0222) --
     let mut cpu_time_sum: u64 = 0;
     let mut cpu_time_count: u64 = 0;
     let mut peak_mem_sum: u64 = 0;
@@ -255,7 +255,7 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
                 if let Some(ref cost) = receipt.observed_cost {
                     durations.push(cost.duration_ms);
                 }
-                // Aggregate observed resource usage (TCK-00572).
+                // Aggregate observed resource usage (RFC-0032::REQ-0222).
                 // Gate on !is_empty() so that receipts with
                 // observed_usage present but all fields None do not
                 // inflate the sample count without contributing data.
@@ -333,7 +333,7 @@ pub fn compute_metrics(input: &MetricsInput<'_>) -> MetricsSummary {
         summary.p95_duration_ms = Some(percentile(&durations, 95));
     }
 
-    // -- Observed resource usage means (TCK-00572) --
+    // -- Observed resource usage means (RFC-0032::REQ-0222) --
     if cpu_time_count > 0 {
         summary.mean_cpu_time_us = Some(cpu_time_sum / cpu_time_count);
     }
@@ -1411,7 +1411,7 @@ mod tests {
             deserialized.unverified_headers_skipped, 0,
             "unverified_headers_skipped must default to 0 for old JSON"
         );
-        // TCK-00572: resource usage fields must default for old JSON.
+        // RFC-0032::REQ-0222: resource usage fields must default for old JSON.
         assert_eq!(
             deserialized.resource_usage_samples, 0,
             "resource_usage_samples must default to 0 for old JSON"
@@ -1698,7 +1698,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00572: observed_usage consumed by metrics pipeline
+    // RFC-0032::REQ-0222: observed_usage consumed by metrics pipeline
     // =========================================================================
 
     fn make_job_receipt_with_usage(

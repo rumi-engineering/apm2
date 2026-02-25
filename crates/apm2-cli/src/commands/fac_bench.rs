@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00552)
+// AGENT-AUTHORED (RFC-0032::REQ-0207)
 //! `apm2 fac bench` -- standardized benchmark harness for cold/warm gate times,
 //! disk footprint collapse, and concurrency stability.
 //!
@@ -496,7 +496,7 @@ pub fn run_fac_bench(
 
 /// Run gates and capture timing, returning a `GateRunMeasurement`.
 ///
-/// TCK-00577 round 6: `write_mode` is threaded through so the spawned
+/// RFC-0032::REQ-0227 round 6: `write_mode` is threaded through so the spawned
 /// `fac gates` child process receives `--unsafe-local-write` when the
 /// caller specified it.
 fn run_gate_measurement(
@@ -528,7 +528,7 @@ fn run_gate_measurement(
     // We parse the JSON output to extract per-phase timings.
     let mut cmd = Command::new(exe);
     cmd.arg("fac");
-    // TCK-00577 round 6: Forward --unsafe-local-write when active so the
+    // RFC-0032::REQ-0227 round 6: Forward --unsafe-local-write when active so the
     // spawned gate process uses relaxed permission validation and can reach
     // the broker-mediated enqueue path.
     if write_mode == QueueWriteMode::UnsafeLocalWrite {
@@ -860,7 +860,7 @@ fn find_repo_root_from_cwd() -> Option<PathBuf> {
 fn run_warm_phase(timeout_seconds: u64, json_output: bool, write_mode: QueueWriteMode) -> bool {
     // Thread caller-provided write mode through to warm phase.
     // ServiceUserOnly is the default; UnsafeLocalWrite requires explicit
-    // --unsafe-local-write flag (TCK-00577).
+    // --unsafe-local-write flag (RFC-0032::REQ-0227).
     let status = run_fac_warm(&None, &None, true, timeout_seconds, json_output, write_mode);
     status == exit_codes::SUCCESS
 }
@@ -873,7 +873,7 @@ fn run_warm_phase(timeout_seconds: u64, json_output: bool, write_mode: QueueWrit
 ///
 /// Bounded by `MAX_CONCURRENCY` (INV-BENCH-003).
 ///
-/// TCK-00577 round 6: `write_mode` is forwarded to each spawned gate
+/// RFC-0032::REQ-0227 round 6: `write_mode` is forwarded to each spawned gate
 /// measurement so `--unsafe-local-write` propagates to child processes.
 fn run_concurrent_gates(
     concurrency: u8,

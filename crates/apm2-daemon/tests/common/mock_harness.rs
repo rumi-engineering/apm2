@@ -26,7 +26,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00176: E2E tool and telemetry tests
+//! - RFC-0033::REQ-0042: E2E tool and telemetry tests
 //! - REQ-TOOL-001: Tool mediation requirements
 //! - REQ-TEL-001: Telemetry requirements
 

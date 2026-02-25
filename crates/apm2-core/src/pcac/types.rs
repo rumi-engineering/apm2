@@ -767,7 +767,7 @@ pub struct AuthorityConsumedV1 {
 }
 
 // =============================================================================
-// Sovereignty types (RFC-0027 §6.6, TCK-00427)
+// Sovereignty types (RFC-0027 §6.6, RFC-0020::REQ-0046)
 // =============================================================================
 
 /// Sovereignty epoch evidence for Tier2+ authority paths.
@@ -902,7 +902,7 @@ pub struct AutonomyCeiling {
 }
 
 // =============================================================================
-// Policy Types (RFC-0027 §5, TCK-00428)
+// Policy Types (RFC-0027 §5, RFC-0020::REQ-0047)
 // =============================================================================
 
 /// Enforcement mode for sovereignty checks.

@@ -165,7 +165,7 @@ pub const PROJECTION_REPLAY_RECEIPT_PREFIX: &[u8] = b"PROJECTION_REPLAY_RECEIPT:
 /// be accepted as proof of temporal binding.
 pub const PROJECTION_ADMISSION_RECEIPT_PREFIX: &[u8] = b"PROJECTION_ADMISSION_RECEIPT:";
 
-/// Domain prefix for signed receipt envelope signatures (TCK-00576).
+/// Domain prefix for signed receipt envelope signatures (RFC-0032::REQ-0226).
 ///
 /// Used when signing/verifying receipt payload digests in the
 /// `SignedReceiptEnvelopeV1` container. Distinct from `GATE_RECEIPT:`
@@ -173,7 +173,7 @@ pub const PROJECTION_ADMISSION_RECEIPT_PREFIX: &[u8] = b"PROJECTION_ADMISSION_RE
 /// MUST NOT be accepted as proof of receipt envelope binding.
 pub const SIGNED_RECEIPT_ENVELOPE_PREFIX: &[u8] = b"SIGNED_RECEIPT_ENVELOPE:";
 
-/// Domain prefix for gate cache receipt entries (TCK-00576).
+/// Domain prefix for gate cache receipt entries (RFC-0032::REQ-0226).
 ///
 /// Used when signing/verifying per-SHA gate cache receipts.  These are
 /// the on-disk YAML files under `gate_cache_v2/{sha}/{gate}.yaml` that

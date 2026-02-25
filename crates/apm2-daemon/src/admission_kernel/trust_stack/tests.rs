@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Tests for the ledger trust stack (TCK-00500).
+//! Tests for the ledger trust stack (RFC-0032::REQ-0175).
 //!
 //! Coverage:
 //! - (a) `RootTrustBundle` validation: empty, oversized, duplicate keys

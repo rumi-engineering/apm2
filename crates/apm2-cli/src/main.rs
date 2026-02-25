@@ -138,23 +138,23 @@ enum Commands {
     /// Consensus commands for cluster status and diagnostics
     Consensus(commands::consensus::ConsensusCommand),
 
-    // === Work queue operations (TCK-00288) ===
+    // === Work queue operations (RFC-0032::REQ-0090) ===
     /// Work queue commands (claim work from queue)
     Work(commands::work::WorkCommand),
 
-    // === Tool operations (TCK-00288) ===
+    // === Tool operations (RFC-0032::REQ-0090) ===
     /// Tool commands (request tool execution via session socket)
     Tool(commands::tool::ToolCommand),
 
-    // === Event operations (TCK-00288) ===
+    // === Event operations (RFC-0032::REQ-0090) ===
     /// Event commands (emit events to ledger via session socket)
     Event(commands::event::EventCommand),
 
-    // === Capability operations (TCK-00288) ===
+    // === Capability operations (RFC-0032::REQ-0090) ===
     /// Capability commands (issue capabilities to sessions via operator socket)
     Capability(commands::capability::CapabilityCommand),
 
-    // === Evidence operations (TCK-00288) ===
+    // === Evidence operations (RFC-0032::REQ-0090) ===
     /// Evidence commands (publish evidence artifacts via session socket)
     Evidence(commands::evidence::EvidenceCommand),
 
@@ -258,14 +258,8 @@ enum FactoryCommands {
     /// RFC commands (RFC framing from Impact Map and CCP)
     Rfc(commands::factory::rfc::RfcCommand),
 
-    /// Ticket commands (emit tickets from RFC decomposition)
-    Tickets(commands::factory::tickets::TicketsCommand),
-
     /// Compile pipeline (end-to-end PRD to tickets)
     Compile(commands::factory::compile::CompileArgs),
-
-    /// Refactor radar (maintenance recommendations)
-    Refactor(commands::factory::refactor::RefactorCommand),
 }
 
 fn main() -> Result<()> {
@@ -273,11 +267,11 @@ fn main() -> Result<()> {
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
-    // Validate kernel schema registration capability on startup (TCK-00181).
-    // The CLI is short-lived, so we verify that kernel schemas CAN be registered
-    // correctly. The actual long-lived registry is maintained by the daemon.
-    // This ensures the CLI can validate schema-related operations before
-    // forwarding to the daemon.
+    // Validate kernel schema registration capability on startup
+    // (RFC-0033::REQ-0045). The CLI is short-lived, so we verify that kernel
+    // schemas CAN be registered correctly. The actual long-lived registry is
+    // maintained by the daemon. This ensures the CLI can validate
+    // schema-related operations before forwarding to the daemon.
     let registry = InMemorySchemaRegistry::new();
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -297,7 +291,7 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
-    // TCK-00288: Deprecation warning for --socket flag
+    // RFC-0032::REQ-0090: Deprecation warning for --socket flag
     // The --socket flag is deprecated and maps to operator_socket only.
     // Users should migrate to using config-based socket paths.
     if cli.socket.is_some() {
@@ -312,7 +306,7 @@ fn main() -> Result<()> {
     // worktrees target the same daemon by default.
     let daemon_config_path = resolve_daemon_config_path(&cli.config);
 
-    // Determine socket paths (TCK-00288: dual-socket privilege separation)
+    // Determine socket paths (RFC-0032::REQ-0090: dual-socket privilege separation)
     // - operator_socket: For privileged operations (ClaimWork, SpawnEpisode,
     //   Shutdown)
     // - session_socket: For session-scoped operations (RequestTool, EmitEvent)
@@ -366,7 +360,7 @@ fn main() -> Result<()> {
             } => commands::creds::login(&socket_path, &provider, profile_id.as_deref()),
         },
         Commands::Cac(cac_cmd) => {
-            // CAC commands use specific exit codes per TCK-00133:
+            // CAC commands use specific exit codes per RFC-0011::REQ-0002:
             // 0=success, 1=validation_error, 2=replay_violation
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
@@ -374,7 +368,7 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Pack(pack_cmd) => {
-            // Pack commands use specific exit codes per TCK-00139:
+            // Pack commands use specific exit codes per RFC-0011::REQ-0003:
             // 0=success, 1=budget_exceeded, 2=validation_error
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
@@ -382,7 +376,7 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Export(export_args) => {
-            // Export commands use specific exit codes per TCK-00143:
+            // Export commands use specific exit codes per RFC-0011::REQ-0005:
             // 0=success, 1=error, 2=conformance_failure
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
@@ -390,12 +384,12 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Coordinate(coordinate_args) => {
-            // Coordinate commands use specific exit codes per TCK-00153:
+            // Coordinate commands use specific exit codes per RFC-0032::REQ-0053:
             // 0=success (WORK_COMPLETED), 1=aborted, 2=invalid_args
-            // TCK-00346: Uses operator_socket for privileged ClaimWork/SpawnEpisode
-            // operations, and session_socket for session observation/polling.
-            // We use std::process::exit to bypass anyhow Result handling and
-            // ensure precise exit codes are returned.
+            // RFC-0032::REQ-0136: Uses operator_socket for privileged
+            // ClaimWork/SpawnEpisode operations, and session_socket for session
+            // observation/polling. We use std::process::exit to bypass anyhow
+            // Result handling and ensure precise exit codes are returned.
             let exit_code = commands::coordinate::run_coordinate(
                 &coordinate_args,
                 &operator_socket,
@@ -412,7 +406,7 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Consensus(consensus_cmd) => {
-            // Consensus commands use specific exit codes per TCK-00193:
+            // Consensus commands use specific exit codes per RFC-0033::REQ-0053:
             // 0=success, 1=error, 2=cluster_unhealthy
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
@@ -453,7 +447,7 @@ fn main() -> Result<()> {
             // FAC commands are primarily ledger/CAS-driven; work lifecycle
             // status/list subcommands route through operator IPC.
             // Exit codes per RFC-0018.
-            // TCK-00595 MAJOR-2 FIX: Thread config path so ensure_daemon_running
+            // RFC-0032::REQ-0244 MAJOR-2 FIX: Thread config path so ensure_daemon_running
             // can forward --config when spawning the daemon.
             let exit_code = commands::fac::run_fac(
                 &fac_cmd,
@@ -476,14 +470,8 @@ fn main() -> Result<()> {
                 commands::factory::impact_map::run_impact_map(&impact_map_cmd)
             },
             FactoryCommands::Rfc(rfc_cmd) => commands::factory::rfc::run_rfc(&rfc_cmd),
-            FactoryCommands::Tickets(tickets_cmd) => {
-                commands::factory::tickets::run_tickets(&tickets_cmd)
-            },
             FactoryCommands::Compile(compile_args) => {
                 commands::factory::compile::run_compile(&compile_args)
-            },
-            FactoryCommands::Refactor(refactor_cmd) => {
-                commands::factory::refactor::run_refactor(&refactor_cmd)
             },
         },
     }
@@ -544,7 +532,8 @@ fn resolve_cli_socket_paths_with_runtime(
                     (default_operator, default_session)
                 }
             } else {
-                // TCK-00595: Environment-based auto-config when no ecosystem.toml exists.
+                // RFC-0032::REQ-0244: Environment-based auto-config when no ecosystem.toml
+                // exists.
                 let env_config = apm2_core::config::EcosystemConfig::from_env();
                 (
                     normalize_operator_socket_path_with_runtime(

@@ -138,15 +138,11 @@
             "note": "Anchor proposals in APM2 invariant surfaces."
           },
           {
-            "file": "documents/rfcs/RFC-0016/README.yaml",
+            "file": "documents/rfcs/RFC-0016.cac.rfc_doc.v1.json",
             "note": "Holonic time constraints."
           },
           {
-            "file": "documents/rfcs/RFC-0018/README.yaml",
-            "note": "Event fabric constraints and evidence flow."
-          },
-          {
-            "file": "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+            "file": "documents/rfcs/RFC-0020.cac.rfc_doc.v1.json",
             "note": "Boundary, identity, and delegation constraints."
           },
           {
@@ -174,10 +170,6 @@
             "note": "Security review and assurance expectations."
           },
           {
-            "file": "documents/security/SECURITY_POLICY.cac.json",
-            "note": "Normative security policy constraints."
-          },
-          {
             "file": "documents/security/SIGNING_AND_VERIFICATION.cac.json",
             "note": "Authenticity, signing, and verification requirements."
           },
@@ -188,18 +180,6 @@
           {
             "file": "documents/security/consensus-runbook.cac.json",
             "note": "Consensus security operations and failure handling."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0101.yaml",
-            "note": "Current security exception context."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0102.yaml",
-            "note": "Current security exception context."
-          },
-          {
-            "file": "documents/work/waivers/WVR-0103.yaml",
-            "note": "Current security exception context."
           }
         ],
         "tools": [
@@ -315,22 +295,15 @@
       "Please read all theory and security artifacts before synthesis — the security corpus provides essential context for grounded proposals.",
       [
         "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
-        "documents/theory/unified-theory-v2.json",
         "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/INCIDENT_RESPONSE.cac.json",
         "documents/security/NETWORK_DEFENSE.cac.json",
         "documents/security/RELEASE_PROCEDURE.cac.json",
         "documents/security/SECRETS_MANAGEMENT.cac.json",
         "documents/security/SECURITY_CHECKLIST.cac.json",
-        "documents/security/SECURITY_POLICY.cac.json",
         "documents/security/SIGNING_AND_VERIFICATION.cac.json",
         "documents/security/THREAT_MODEL.cac.json",
-        "documents/security/consensus-runbook.cac.json",
-        "documents/work/waivers/WVR-0101.yaml",
-        "documents/work/waivers/WVR-0102.yaml",
-        "documents/work/waivers/WVR-0103.yaml"
+        "documents/security/consensus-runbook.cac.json"
       ]
     ],
     "reading_expansion_policy": {

@@ -1,0 +1,20 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "documents/theory",
+  "behaviors": [
+    {
+      "id": "BEH-DOC-THEORY-001",
+      "kind": "requirement",
+      "title": "Theory directory is single source of truth for kernel theory and laws",
+      "description": "Contains unified theory, holonic laws, compressed principles, defects, architecture extracts, and compact terminology in a CAC-indexed manifest.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-DOC-THEORY-002",
+      "kind": "requirement",
+      "title": "CAC manifest indexes theory documents with v1 schema",
+      "description": "The AGENTS.md (now AGENTS.json) describes a CAC index at v1 with a manifest listing files and their descriptions and primary utility.",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

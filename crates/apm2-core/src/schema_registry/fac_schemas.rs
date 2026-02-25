@@ -1,7 +1,7 @@
 //! FAC schema registry: stable schema IDs and bounded deserialization for
 //! all Forge Admission Cycle schemas.
 //!
-//! This module enforces TCK-00593 requirements:
+//! This module enforces RFC-0032::REQ-0242 requirements:
 //! - Every FAC schema has a stable, unique schema ID string
 //! - Deserialization is bounded by [`MAX_FAC_SCHEMA_PAYLOAD_SIZE`]
 //! - All schema IDs are centrally registered and tested for drift
@@ -109,7 +109,7 @@ pub const CREDENTIAL_MOUNT_SCHEMA_ID: &str = "apm2.fac.credential_mount.v1";
 /// Schema ID for toolchain fingerprint v1.
 pub const TOOLCHAIN_FINGERPRINT_SCHEMA_ID: &str = "apm2.fac.toolchain_fingerprint.v1";
 
-// -- Work CAS schemas (RFC-0032 Phase 1, TCK-00633) --
+// -- Work CAS schemas (RFC-0032 Phase 1, RFC-0032::REQ-0262) --
 /// Schema ID for work spec v1 (immutable "what is this work?" CAS document).
 pub const WORK_SPEC_V1_SCHEMA_ID: &str = "apm2.work_spec.v1";
 
@@ -152,7 +152,7 @@ pub const ALL_FAC_SCHEMA_IDS: &[&str] = &[
     EFFICIENCY_PRIMITIVES_SCHEMA_ID,
     CREDENTIAL_MOUNT_SCHEMA_ID,
     TOOLCHAIN_FINGERPRINT_SCHEMA_ID,
-    // Work CAS schemas (RFC-0032 Phase 1, TCK-00633)
+    // Work CAS schemas (RFC-0032 Phase 1, RFC-0032::REQ-0262)
     WORK_SPEC_V1_SCHEMA_ID,
     WORK_CONTEXT_ENTRY_V1_SCHEMA_ID,
     WORK_LOOP_PROFILE_V1_SCHEMA_ID,
@@ -474,7 +474,7 @@ mod tests {
         );
     }
 
-    // -- Work CAS schema cross-references (TCK-00633, RFC-0032 Phase 1) --
+    // -- Work CAS schema cross-references (RFC-0032::REQ-0262, RFC-0032 Phase 1) --
 
     #[test]
     fn tck_00633_work_spec_v1_schema_id_matches_module() {

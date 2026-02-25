@@ -1,4 +1,5 @@
-//! Non-interactive, lane-scoped GitHub CLI (`gh`) command builder (TCK-00597).
+//! Non-interactive, lane-scoped GitHub CLI (`gh`) command builder
+//! (RFC-0032::REQ-0246).
 //!
 //! This module provides a [`gh_command`] constructor that returns a
 //! [`GhCommand`] wrapper pre-configured for token-based, non-interactive
@@ -10,17 +11,17 @@
 //! The `gh` CLI natively supports `GH_TOKEN` for authentication. When
 //! `GH_TOKEN` is set, `gh` skips its usual auth-state lookup entirely.
 //! This module resolves the token through the credential chain established
-//! by TCK-00596 ([`crate::config::resolve_github_token`]) and injects it
-//! into the spawned command's environment.
+//! by RFC-0032::REQ-0245 ([`crate::config::resolve_github_token`]) and injects
+//! it into the spawned command's environment.
 //!
 //! # Lane Scoping
 //!
 //! The `gh` CLI reads and writes config/state under `$GH_CONFIG_DIR`
 //! (defaults to `~/.config/gh`). In lane-scoped FAC execution environments,
-//! `HOME` points to a per-lane directory (TCK-00575) and `XDG_CONFIG_HOME`
-//! is similarly scoped. This module explicitly sets `GH_CONFIG_DIR` to
-//! `<XDG_CONFIG_HOME>/gh` when `XDG_CONFIG_HOME` is set, ensuring `gh`
-//! state is lane-local rather than user-global.
+//! `HOME` points to a per-lane directory (RFC-0032::REQ-0225) and
+//! `XDG_CONFIG_HOME` is similarly scoped. This module explicitly sets
+//! `GH_CONFIG_DIR` to `<XDG_CONFIG_HOME>/gh` when `XDG_CONFIG_HOME` is set,
+//! ensuring `gh` state is lane-local rather than user-global.
 //!
 //! # Security Invariants
 //!
@@ -187,8 +188,10 @@ pub fn gh_command() -> GhCommand {
     // Lane-scope the gh config directory (INV-GHCLI-002, INV-GHCLI-005).
     //
     // Resolution order (XDG convention, user-isolated):
-    //   1. $XDG_CONFIG_HOME/gh  — lane-scoped (TCK-00575 sets this per-lane)
-    //   2. $HOME/.config/gh     — XDG fallback (HOME is always set per TCK-00575)
+    //   1. $XDG_CONFIG_HOME/gh  — lane-scoped (RFC-0032::REQ-0225 sets this
+    //      per-lane)
+    //   2. $HOME/.config/gh     — XDG fallback (HOME is always set per
+    //      RFC-0032::REQ-0225)
     //   3. Fail-closed          — if neither is set, gh will fail with I/O error
     //
     // Security invariants:
@@ -254,7 +257,7 @@ pub fn gh_command() -> GhCommand {
         // Fail-closed (RS-41): neither XDG_CONFIG_HOME nor HOME is set.
         // Set GH_CONFIG_DIR to a non-existent path so gh fails with a clear
         // I/O error rather than falling back to a shared/predictable path.
-        // This should never happen in lane context (TCK-00575 ensures HOME).
+        // This should never happen in lane context (RFC-0032::REQ-0225 ensures HOME).
         eprintln!(
             "apm2: WARNING: neither XDG_CONFIG_HOME nor HOME is set; \
              gh CLI will fail (fail-closed per INV-GHCLI-005)"

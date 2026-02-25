@@ -380,7 +380,8 @@ pub mod helpers {
             artifact_size,
             metadata,
             // HTF time envelope reference (RFC-0016): not yet populated.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
         };
         let event = EvidenceEvent {

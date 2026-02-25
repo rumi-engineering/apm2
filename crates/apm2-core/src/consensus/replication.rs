@@ -44,7 +44,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00195: Leader-Based Replication (Basic)
+//! - RFC-0033::REQ-0055: Leader-Based Replication (Basic)
 //! - DD-0001: Hybrid Consensus Model
 
 use std::collections::{HashMap, VecDeque};
@@ -1082,7 +1082,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         // prevent a race condition where the queue fills between capacity check
         // and push. This ensures atomic capacity check + ledger append + queue
         // push, preventing state divergence where an event is persisted to the
-        // ledger but never queued for broadcast (TCK-00195).
+        // ledger but never queued for broadcast (RFC-0033::REQ-0055).
         // NOTE: We intentionally hold this lock across await points for correctness.
         // While this is generally discouraged for performance, correctness
         // requires serializing proposals to prevent ledger-queue divergence.

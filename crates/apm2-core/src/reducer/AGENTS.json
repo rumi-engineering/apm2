@@ -1,0 +1,42 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/reducer",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-REDUCER-001",
+      "kind": "invariant",
+      "title": "Determinism: same event sequence and initial state produce identical final states",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-REDUCER-002",
+      "kind": "invariant",
+      "title": "Purity: apply must not perform I/O, access global state, or depend on wall-clock time",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-REDUCER-003",
+      "kind": "invariant",
+      "title": "Totality: apply must handle all event types, returning Ok for irrelevant events",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-REDUCER-004",
+      "kind": "invariant",
+      "title": "Checkpoint round-trip is lossless: deserialize(serialize(state)) restores identical state",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-REDUCER-005",
+      "kind": "requirement",
+      "title": "name() returns a unique stable string used as the checkpoint storage key",
+      "rfc": ["RFC-0001"]
+    },
+    {
+      "id": "BEH-CORE-REDUCER-006",
+      "kind": "requirement",
+      "title": "reset() restores the reducer to an empty initial state equivalent to Default",
+      "rfc": ["RFC-0001"]
+    }
+  ]
+}

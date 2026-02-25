@@ -1,4 +1,4 @@
-//! Pre-actuation stop and budget proof obligations (TCK-00351).
+//! Pre-actuation stop and budget proof obligations (RFC-0020::REQ-0005).
 //!
 //! This module enforces mandatory stop-condition and budget checks before
 //! any tool actuation can proceed.  Every tool request must pass through the
@@ -28,7 +28,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00351: Pre-actuation stop and budget proof obligations
+//! - RFC-0020::REQ-0005: Pre-actuation stop and budget proof obligations
 //! - AD-EPISODE-001: Immutable episode envelope with budget/stop fields
 //! - SEC-CTRL-FAC-0015: Fail-closed security posture
 
@@ -96,7 +96,7 @@ pub(crate) fn transitional_waiver_active() -> bool {
 /// [`PreActuationGate`] reads these flags on every tool request to determine
 /// whether actuation should be blocked.
 ///
-/// # TCK-00351 BLOCKER 1 FIX
+/// # RFC-0020::REQ-0005 BLOCKER 1 FIX
 ///
 /// Prior to this fix, the session dispatcher passed hardcoded `false` for
 /// both `emergency_stop_active` and `governance_stop_active`, meaning real
@@ -117,7 +117,7 @@ pub struct StopAuthority {
     /// Whether the governance stop state is uncertain (service unreachable
     /// or response stale beyond freshness threshold).
     ///
-    /// TCK-00351 MAJOR 1 v2 FIX: When this flag is set, the
+    /// RFC-0020::REQ-0005 MAJOR 1 v2 FIX: When this flag is set, the
     /// [`StopConditionEvaluator::evaluate_with_uncertainty`] returns
     /// [`StopStatus::Uncertain`], which triggers deadline-based fail-closed
     /// denial.
@@ -491,7 +491,7 @@ impl StopConditionEvaluator {
         }
 
         // Check escalation predicate (non-empty means triggered).
-        // TCK-00351 BLOCKER 1 FIX: Actually trigger EscalationTriggered
+        // RFC-0020::REQ-0005 BLOCKER 1 FIX: Actually trigger EscalationTriggered
         // deny when the predicate is non-empty.  The previous implementation
         // checked the predicate but fell through to Clear, allowing actuation
         // to proceed even when escalation was triggered.
@@ -583,7 +583,7 @@ impl Default for StopConditionEvaluator {
 /// If any check fails, the gate returns `Err(PreActuationDenial)`.
 /// The caller MUST NOT proceed with actuation on error.
 ///
-/// # TCK-00351 BLOCKER 1 & 2 FIX
+/// # RFC-0020::REQ-0005 BLOCKER 1 & 2 FIX
 ///
 /// The gate now holds:
 /// - [`StopAuthority`] for authoritative emergency/governance stop state
@@ -599,13 +599,13 @@ pub struct PreActuationGate {
     budget_tracker: Option<Arc<BudgetTracker>>,
     /// Authoritative stop state from the daemon runtime.
     ///
-    /// TCK-00351 BLOCKER 1: When set, the gate reads emergency and
+    /// RFC-0020::REQ-0005 BLOCKER 1: When set, the gate reads emergency and
     /// governance stop flags from this authority instead of accepting
     /// hardcoded `false` from the caller.
     stop_authority: Option<Arc<StopAuthority>>,
     /// Whether to require a budget tracker for authority-bearing actuation.
     ///
-    /// TCK-00351 BLOCKER 2: When `true` and no budget tracker is
+    /// RFC-0020::REQ-0005 BLOCKER 2: When `true` and no budget tracker is
     /// configured, the gate denies with `BudgetExhausted` (fail-closed).
     /// When `false`, a missing tracker is treated as unlimited budget
     /// (useful for tests or non-budget-constrained sessions).
@@ -681,7 +681,7 @@ impl PreActuationGate {
 
     /// Sets the stop authority for authoritative stop state reads.
     ///
-    /// TCK-00351 BLOCKER 1 FIX: Connects the gate to the runtime's
+    /// RFC-0020::REQ-0005 BLOCKER 1 FIX: Connects the gate to the runtime's
     /// stop state so emergency/governance stops actually block actuation.
     #[must_use]
     pub fn with_stop_authority(mut self, authority: Arc<StopAuthority>) -> Self {
@@ -762,7 +762,7 @@ impl PreActuationGate {
         elapsed_ms: u64,
         timestamp: ReplayTimestamp,
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
-        // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
+        // RFC-0020::REQ-0005 BLOCKER 1 FIX: Read from authoritative stop state
         // when available, instead of trusting caller-supplied values.
         let (emer_stop, gov_stop, gov_uncertain, gov_transitional_resolver) =
             self.stop_authority.as_ref().map_or(
@@ -778,7 +778,7 @@ impl PreActuationGate {
             );
 
         // --- Step 1: Evaluate stop conditions ---
-        // TCK-00351 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
+        // RFC-0020::REQ-0005 MAJOR 1 v2 FIX: Use evaluate_with_uncertainty so
         // the Uncertain path is reachable when governance is uncertain.
         let stop_status = self.evaluator.evaluate_with_uncertainty(
             conditions,
@@ -854,13 +854,13 @@ impl PreActuationGate {
 
     /// Evaluates the budget dimension.
     ///
-    /// TCK-00351 BLOCKER 2 FIX: When `require_budget` is `true` and no
+    /// RFC-0020::REQ-0005 BLOCKER 2 FIX: When `require_budget` is `true` and no
     /// budget tracker is configured, returns `Exhausted` (fail-closed).
     /// When `require_budget` is `false` (legacy/test mode), returns
     /// `Available` for missing trackers (unlimited budget).
     fn evaluate_budget(&self) -> BudgetStatus {
         let Some(ref tracker) = self.budget_tracker else {
-            // TCK-00351 BLOCKER 2: Fail-closed when budget is required
+            // RFC-0020::REQ-0005 BLOCKER 2: Fail-closed when budget is required
             // but no tracker is available.
             if self.require_budget {
                 return BudgetStatus::Exhausted {
@@ -1093,7 +1093,7 @@ impl std::error::Error for ReplayViolation {}
 /// which yields `budget_checked=false` and
 /// `budget_enforcement_deferred=true`. This verifier accepts that tuple
 /// explicitly until real pre-actuation budget tracking is wired under
-/// TCK-00346.
+/// RFC-0032::REQ-0136.
 ///
 /// # `DoS` Protection
 ///
@@ -1105,9 +1105,9 @@ impl std::error::Error for ReplayViolation {}
 /// `SessionDispatcher::handle_broker_decision` before accepting an `Allow`
 /// actuation response.
 ///
-/// TODO(TCK-00356, RFC-0020 §3.1.1): Extend this from per-request production
-/// verification to the full replay/evidence ingestion pipeline so multi-entry
-/// historical traces are verified before evidence acceptance.
+/// TODO(RFC-0020::REQ-0010, RFC-0020 §3.1.1): Extend this from per-request
+/// production verification to the full replay/evidence ingestion pipeline so
+/// multi-entry historical traces are verified before evidence acceptance.
 pub struct ReplayVerifier;
 
 impl ReplayVerifier {
@@ -1138,7 +1138,7 @@ impl ReplayVerifier {
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
                     }
-                    // WVR-0102 (bound to TCK-00346): deferred budget
+                    // WVR-0102 (bound to RFC-0032::REQ-0136): deferred budget
                     // enforcement is accepted only when explicitly bound via
                     // `budget_enforcement_deferred=true`.
                     if !budget_checked && !budget_enforcement_deferred {
@@ -1288,7 +1288,7 @@ mod tests {
         let conditions = StopConditions::default();
         let receipt = gate.check(&conditions, 0, false, false, 0, 1000).unwrap();
         assert!(receipt.stop_checked);
-        // TCK-00351 v3: budget_checked is false when no tracker is wired
+        // RFC-0020::REQ-0005 v3: budget_checked is false when no tracker is wired
         // (honest receipt -- no tracker means no real budget check occurred).
         assert!(!receipt.budget_checked);
         assert!(receipt.budget_enforcement_deferred);
@@ -1388,7 +1388,7 @@ mod tests {
         let receipt = gate
             .check(&conditions, 0, false, false, 1000, 2000)
             .unwrap();
-        // TCK-00351 v3: stop_checked is true, budget_checked is false
+        // RFC-0020::REQ-0005 v3: stop_checked is true, budget_checked is false
         // (no tracker wired).
         assert!(receipt.stop_checked);
         assert!(!receipt.budget_checked);
@@ -1823,7 +1823,7 @@ mod tests {
     }
 
     // =========================================================================
-    // StopAuthority tests (TCK-00351 BLOCKER 1 FIX)
+    // StopAuthority tests (RFC-0020::REQ-0005 BLOCKER 1 FIX)
     // =========================================================================
 
     #[test]
@@ -1869,7 +1869,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Gate with StopAuthority tests (TCK-00351 BLOCKER 1 FIX)
+    // Gate with StopAuthority tests (RFC-0020::REQ-0005 BLOCKER 1 FIX)
     // =========================================================================
 
     #[test]
@@ -1938,12 +1938,12 @@ mod tests {
     }
 
     // =========================================================================
-    // Production gate / require_budget tests (TCK-00351 BLOCKER 2 FIX)
+    // Production gate / require_budget tests (RFC-0020::REQ-0005 BLOCKER 2 FIX)
     // =========================================================================
 
     #[test]
     fn test_production_gate_no_tracker_allows() {
-        // TCK-00351 BLOCKER 1 v2 FIX: Production gate with no budget
+        // RFC-0020::REQ-0005 BLOCKER 1 v2 FIX: Production gate with no budget
         // tracker should ALLOW (budget deferred to EpisodeRuntime) to
         // avoid self-DoS where ALL tool requests are denied.
         let authority = Arc::new(StopAuthority::new());
@@ -1956,7 +1956,7 @@ mod tests {
             "production gate without tracker should allow"
         );
         let receipt = result.unwrap();
-        // TCK-00351 v3: stop_checked is true, budget_checked is false
+        // RFC-0020::REQ-0005 v3: stop_checked is true, budget_checked is false
         // (no tracker wired -- honest receipt).
         assert!(receipt.stop_checked);
         assert!(!receipt.budget_checked);
@@ -2019,7 +2019,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Receipt field provenance tests (TCK-00351 MAJOR 1 FIX)
+    // Receipt field provenance tests (RFC-0020::REQ-0005 MAJOR 1 FIX)
     // =========================================================================
 
     #[test]
@@ -2034,14 +2034,14 @@ mod tests {
         // (no tracker wired), timestamp must be 42_000 (the value we passed
         // in, not a later clock sample).
         assert!(receipt.stop_checked);
-        // TCK-00351 v3: budget_checked is false without a real tracker.
+        // RFC-0020::REQ-0005 v3: budget_checked is false without a real tracker.
         assert!(!receipt.budget_checked);
         assert!(receipt.budget_enforcement_deferred);
         assert_eq!(receipt.timestamp_ns, 42_000);
     }
 
     // =========================================================================
-    // Escalation predicate denial tests (TCK-00351 BLOCKER 1 FIX)
+    // Escalation predicate denial tests (RFC-0020::REQ-0005 BLOCKER 1 FIX)
     // =========================================================================
 
     #[test]
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00351 MAJOR 1 v2 FIX: Governance-uncertainty & deadline tests
+    // RFC-0020::REQ-0005 MAJOR 1 v2 FIX: Governance-uncertainty & deadline tests
     // =========================================================================
 
     #[test]
@@ -2109,7 +2109,7 @@ mod tests {
 
     #[test]
     fn test_gate_uncertain_deadline_crossing_denies() {
-        // TCK-00351 MAJOR 1 v2 FIX: When governance is uncertain and
+        // RFC-0020::REQ-0005 MAJOR 1 v2 FIX: When governance is uncertain and
         // elapsed_ms exceeds the deadline, the gate MUST deny with
         // StopUncertain.
         let authority = Arc::new(StopAuthority::new());
@@ -2195,7 +2195,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00351 MAJOR 2 v2 FIX: StopAuthority runtime mutation test
+    // RFC-0020::REQ-0005 MAJOR 2 v2 FIX: StopAuthority runtime mutation test
     // =========================================================================
 
     #[test]
@@ -2241,7 +2241,8 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00351 MAJOR 3 v2 FIX: ReplayVerifier integration test (EVID-0305)
+    // RFC-0020::REQ-0005 MAJOR 3 v2 FIX: ReplayVerifier integration test
+    // (EVID-0305)
     // =========================================================================
 
     /// Integration-style test exercising `ReplayVerifier::verify` on a
@@ -2256,7 +2257,7 @@ mod tests {
         use crate::episode::budget_tracker::BudgetTracker;
 
         // Simulate a production flow: gate check -> tool actuation.
-        // TCK-00351 v3: Use a real budget tracker so budget_checked=true
+        // RFC-0020::REQ-0005 v3: Use a real budget tracker so budget_checked=true
         // in the receipt, matching production deployment where a tracker
         // is always wired.
         let authority = Arc::new(StopAuthority::new());
@@ -2340,10 +2341,10 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00351 v3: Integration tests for real stop conditions enforcement
+    // RFC-0020::REQ-0005 v3: Integration tests for real stop conditions enforcement
     // =========================================================================
 
-    /// TCK-00351 BLOCKER 1 v3: When `max_episodes=2` and
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3: When `max_episodes=2` and
     /// `current_episode_count=2`, the gate MUST deny with
     /// `StopActive { class: MaxEpisodesReached }`.
     ///
@@ -2393,8 +2394,9 @@ mod tests {
         );
     }
 
-    /// TCK-00351 BLOCKER 1 v3: When the escalation predicate is non-empty,
-    /// the gate MUST deny with `StopActive { class: EscalationTriggered }`.
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3: When the escalation predicate is
+    /// non-empty, the gate MUST deny with `StopActive { class:
+    /// EscalationTriggered }`.
     #[test]
     fn test_gate_denies_when_escalation_predicate_set() {
         let authority = Arc::new(StopAuthority::new());
@@ -2421,7 +2423,7 @@ mod tests {
         );
     }
 
-    /// TCK-00351 BLOCKER 2 v3: When no budget tracker is wired and
+    /// RFC-0020::REQ-0005 BLOCKER 2 v3: When no budget tracker is wired and
     /// `require_budget=false`, the receipt MUST set `budget_checked=false`
     /// (honest receipt claim).
     ///
@@ -2474,7 +2476,7 @@ mod tests {
         );
     }
 
-    /// TCK-00351 BLOCKER 2 v3: When a real budget tracker IS wired and
+    /// RFC-0020::REQ-0005 BLOCKER 2 v3: When a real budget tracker IS wired and
     /// has sufficient budget, the receipt MUST set `budget_checked=true`.
     #[test]
     fn test_budget_checked_true_with_real_tracker() {

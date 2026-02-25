@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00529)
+// AGENT-AUTHORED (RFC-0032::REQ-0187)
 //! Execution backend selection for FAC jobs.
 //!
 //! This module implements the system-mode execution path for FAC jobs,
@@ -548,7 +548,7 @@ fn parse_dbus_unix_path(address: &str) -> Option<&str> {
 /// system-mode `User=` property is added separately by the caller.
 ///
 /// Includes sandbox hardening directives from `SandboxHardeningProfile`
-/// (TCK-00573) after the resource and kill-signal properties.
+/// (RFC-0032::REQ-0223) after the resource and kill-signal properties.
 fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend) -> Vec<String> {
     let mut list = vec![
         "MemoryAccounting=yes".to_string(),
@@ -569,7 +569,7 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
         "SendSIGKILL=yes".to_string(),
     ];
 
-    // Sandbox hardening directives (TCK-00573).
+    // Sandbox hardening directives (RFC-0032::REQ-0223).
     // User-mode systemd cannot apply mount-namespace directives (PrivateTmp,
     // ProtectControlGroups, ProtectKernelTunables, ProtectKernelLogs) or
     // capability-manipulation directives (RestrictSUIDSGID, LockPersonality,
@@ -579,7 +579,7 @@ fn build_property_list(props: &SystemdUnitProperties, backend: ExecutionBackend)
     match backend {
         ExecutionBackend::SystemMode => {
             list.extend(props.sandbox_hardening.to_property_strings());
-            // Network policy directives (TCK-00574).
+            // Network policy directives (RFC-0032::REQ-0224).
             // PrivateNetwork requires CAP_SYS_ADMIN (network namespace).
             // IPAddressDeny/IPAddressAllow require BPF cgroup support.
             // Both are only available in system mode.
@@ -1200,7 +1200,8 @@ mod tests {
         let props = test_properties();
         let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
-        // All default sandbox hardening directives must be present (TCK-00573).
+        // All default sandbox hardening directives must be present
+        // (RFC-0032::REQ-0223).
         assert!(
             list.contains(&"NoNewPrivileges=yes".to_string()),
             "missing NoNewPrivileges in property list"
@@ -1316,7 +1317,7 @@ mod tests {
             !list.iter().any(|p| p.starts_with("RestrictRealtime")),
             "RestrictRealtime requires root"
         );
-        // TCK-00574: RestrictAddressFamilies=AF_UNIX is now emitted in
+        // RFC-0032::REQ-0224: RestrictAddressFamilies=AF_UNIX is now emitted in
         // user-mode by the network-policy deny path (partial mitigation for
         // PrivateNetwork which requires root). The sandbox_hardening form
         // (which lists AF_INET, AF_INET6, AF_UNIX) is still root-only.
@@ -1632,7 +1633,7 @@ mod tests {
         assert!(!ExecutionBackendError::EnvValueNotUtf8 { var: "X" }.is_platform_unavailable());
     }
 
-    // ── Network denial enforcement (TCK-00574) ─────────────────────────
+    // ── Network denial enforcement (RFC-0032::REQ-0224) ─────────────────────────
 
     #[test]
     fn property_list_system_mode_network_deny_emits_isolation_directives() {

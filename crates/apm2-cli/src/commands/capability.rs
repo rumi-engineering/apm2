@@ -1,7 +1,7 @@
 //! Capability management CLI commands.
 //!
 //! This module implements `apm2 capability` subcommands for capability
-//! operations using the protocol-based operator socket (TCK-00288).
+//! operations using the protocol-based operator socket (RFC-0032::REQ-0090).
 //!
 //! # Commands
 //!

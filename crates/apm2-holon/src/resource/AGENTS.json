@@ -1,0 +1,112 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-holon/src/resource",
+  "behaviors": [
+    {
+      "id": "BEH-HOLON-RES-001",
+      "kind": "invariant",
+      "title": "All remaining budget values are monotonically decreasing",
+      "description": "INV-RS01: Once consumed, resources cannot be restored.",
+      "rfc": ["RFC-0021", "RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-RES-002",
+      "kind": "invariant",
+      "title": "remaining <= initial always holds (conservation law)",
+      "description": "INV-RS02: consumed + remaining == initial for each dimension.",
+      "rfc": ["RFC-0021", "RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-RES-003",
+      "kind": "invariant",
+      "title": "is_exhausted() true iff at least one dimension has remaining == 0",
+      "description": "INV-RS03: Budget exhaustion is triggered by any single dimension reaching zero.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-RES-004",
+      "kind": "safety",
+      "title": "Failed deductions leave the budget completely unchanged",
+      "description": "INV-RS04: No partial application on failure.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-RES-005",
+      "kind": "requirement",
+      "title": "Multi-dimension deduction is atomic (all-or-nothing)",
+      "description": "CTR-RS02: All four dimensions are checked before any are applied. If any single dimension is insufficient, no changes are made.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-HOLON-RES-006",
+      "kind": "invariant",
+      "title": "Derived leases cannot exceed parent scope or budget",
+      "description": "INV-RS06/INV-RS07: Child lease expires_at_ns <= parent, child scope is a subset of parent scope.",
+      "rfc": ["RFC-0021", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-007",
+      "kind": "requirement",
+      "title": "Lease derivation deducts budget from parent preventing resource inflation",
+      "description": "CTR-RS12: On success, derive() deducts the child budget from the parent. On failure, parent is unchanged.",
+      "rfc": ["RFC-0021", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-008",
+      "kind": "invariant",
+      "title": "Empty scope set means no access, not unlimited",
+      "description": "INV-RS09: Only unlimited == true bypasses permission checks.",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-009",
+      "kind": "safety",
+      "title": "Path traversal sequences (..) are always rejected in namespace checks",
+      "description": "INV-RS11: Both / and \\ separators are checked. Rejected even for unlimited scopes (defense in depth).",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-010",
+      "kind": "invariant",
+      "title": "Namespace matching uses path-aware prefix semantics",
+      "description": "INV-RS10: 'project/src' allows 'project/src/main.rs' but not 'project/srcfile' or 'project/src_backup'.",
+      "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-011",
+      "kind": "requirement",
+      "title": "Lease validate() checks expiration and budget exhaustion",
+      "description": "CTR-RS08: Returns LeaseExpired if current_time_ns >= expires_at_ns, BudgetExhausted if any budget dimension is zero.",
+      "rfc": ["RFC-0021", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-012",
+      "kind": "invariant",
+      "title": "signing_bytes() is deterministic and excludes signature field",
+      "description": "INV-RS08/CTR-RS13: Produces deterministic JSON enabling sign-then-verify workflows.",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-HOLON-RES-013",
+      "kind": "invariant",
+      "title": "All resource errors are non-recoverable",
+      "description": "CTR-RS25: is_recoverable() always returns false -- all resource errors require external intervention.",
+      "rfc": ["RFC-0021", "RFC-0027"]
+    },
+    {
+      "id": "BEH-HOLON-RES-014",
+      "kind": "requirement",
+      "title": "LeaseBuilder returns MissingField error if required fields not set",
+      "description": "CTR-RS14: lease_id, issuer_id, holder_id, scope, budget, expires_at_ns are all required.",
+      "rfc": ["RFC-0021"]
+    },
+    {
+      "id": "BEH-HOLON-RES-015",
+      "kind": "requirement",
+      "title": "Budget tracks four resource dimensions per REQ-3004",
+      "description": "Episodes, tool calls, tokens, and wall-clock duration are tracked as four orthogonal resource dimensions.",
+      "rfc": ["RFC-0021", "RFC-0029"],
+      "req": ["RFC-0029#REQ-3004"]
+    }
+  ]
+}

@@ -81,7 +81,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00198: `StrictlyOrderedEvidence` and Gate Predicates
+//! - RFC-0033::REQ-0058: `StrictlyOrderedEvidence` and Gate Predicates
 
 use serde::{Deserialize, Serialize};
 

@@ -1,8 +1,8 @@
 //! Durable content-addressed storage (CAS) for evidence artifacts.
 //!
 //! This module provides a filesystem-based CAS that persists artifacts across
-//! daemon restarts. Per TCK-00293 and RFC-0018, evidence artifacts must be
-//! durable and content-addressed for FAC v0.
+//! daemon restarts. Per RFC-0032::REQ-0095 and RFC-0018, evidence artifacts
+//! must be durable and content-addressed for FAC v0.
 //!
 //! # Architecture
 //!
@@ -41,7 +41,7 @@
 //!
 //! # Contract References
 //!
-//! - TCK-00293: Durable CAS backend + wiring
+//! - RFC-0032::REQ-0095: Durable CAS backend + wiring
 //! - RFC-0018: HEF requirements for evidence durability
 //! - REQ-HEF-0009: `ChangeSetBundle` in CAS referenced by ledger
 
@@ -58,7 +58,7 @@ use thiserror::Error;
 // Constants
 // =============================================================================
 
-/// Maximum artifact size (100 MB) per TCK-00293.
+/// Maximum artifact size (100 MB) per RFC-0032::REQ-0095.
 pub const MAX_ARTIFACT_SIZE: usize = 100 * 1024 * 1024;
 
 /// Default maximum total CAS size (10 GB).
@@ -675,9 +675,9 @@ impl DurableCas {
 
     /// Recovers total size from persistent storage or recalculates it.
     ///
-    /// TCK-00537: Uses [`crate::fs_safe::bounded_read`] for symlink refusal
-    /// (`O_NOFOLLOW`), bounded reads, and regular-file verification on the
-    /// total-size metadata file.
+    /// RFC-0032::REQ-0193: Uses [`crate::fs_safe::bounded_read`] for symlink
+    /// refusal (`O_NOFOLLOW`), bounded reads, and regular-file verification
+    /// on the total-size metadata file.
     fn recover_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);
 
@@ -749,7 +749,7 @@ impl DurableCas {
 
     /// Persists the current total size to the metadata file.
     ///
-    /// TCK-00537: Uses [`crate::fs_safe::atomic_write`] for crash-safe
+    /// RFC-0032::REQ-0193: Uses [`crate::fs_safe::atomic_write`] for crash-safe
     /// persistence with fsync + atomic rename + directory fsync.
     fn persist_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);

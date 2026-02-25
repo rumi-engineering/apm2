@@ -21,12 +21,16 @@
 //! - path inputs are validated before shell interaction
 //! - workspaces are fully cleaned with `safe_rmtree_v1` before checkout
 //! - post-checkout git hardening disables hooks and refuses unsafe configs
-//!   (TCK-00580)
-//! - mirror updates are serialized via per-mirror file lock (TCK-00582)
-//! - remote URLs are validated against a policy-driven allowlist (TCK-00582)
-//! - git fetch/clone operations are bounded by wall-clock timeout (TCK-00582)
-//! - mirror paths are validated to contain no symlink components (TCK-00582)
-//! - mirror updates emit receipts with before/after refs (TCK-00582)
+//!   (RFC-0032::REQ-0230)
+//! - mirror updates are serialized via per-mirror file lock
+//!   (RFC-0032::REQ-0232)
+//! - remote URLs are validated against a policy-driven allowlist
+//!   (RFC-0032::REQ-0232)
+//! - git fetch/clone operations are bounded by wall-clock timeout
+//!   (RFC-0032::REQ-0232)
+//! - mirror paths are validated to contain no symlink components
+//!   (RFC-0032::REQ-0232)
+//! - mirror updates emit receipts with before/after refs (RFC-0032::REQ-0232)
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -53,7 +57,7 @@ use super::safe_rmtree::{SafeRmtreeError, safe_rmtree_v1};
 
 /// Schema identifier for repository mirror metadata.
 pub const REPO_MIRROR_SCHEMA: &str = "apm2.fac.repo_mirror.v1";
-/// Schema identifier for mirror update receipts (TCK-00582).
+/// Schema identifier for mirror update receipts (RFC-0032::REQ-0232).
 pub const MIRROR_UPDATE_RECEIPT_SCHEMA: &str = "apm2.fac.mirror_update_receipt.v1";
 /// Maximum allowed repository identifier length.
 pub const MAX_REPO_ID_LENGTH: usize = 256;
@@ -101,14 +105,14 @@ pub const MIRROR_LOCK_TIMEOUT_SECS: u64 = 120;
 const MIRROR_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mirror Policy (TCK-00582)
+// Mirror Policy (RFC-0032::REQ-0232)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Policy-driven remote URL allowlist for mirror updates.
 ///
 /// When `allowed_url_patterns` is non-empty, only remote URLs matching at
 /// least one pattern are permitted. An empty list means "use built-in
-/// protocol validation only" (the pre-TCK-00582 behavior).
+/// protocol validation only" (the pre-RFC-0032::REQ-0232 behavior).
 ///
 /// Patterns are matched as prefixes: a URL must start with one of the
 /// allowed patterns. This supports both exact-match and domain-scoped
@@ -173,7 +177,7 @@ impl MirrorPolicy {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mirror Update Receipt (TCK-00582)
+// Mirror Update Receipt (RFC-0032::REQ-0232)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Receipt emitted after a mirror update operation, capturing before/after
@@ -284,7 +288,7 @@ pub enum RepoMirrorError {
         actual: String,
     },
 
-    /// Patch content was denied by hardening validation (TCK-00581).
+    /// Patch content was denied by hardening validation (RFC-0032::REQ-0231).
     #[error("patch hardening denied: {reason}")]
     PatchHardeningDenied {
         /// Why the patch was denied.
@@ -320,25 +324,25 @@ pub enum RepoMirrorError {
         reason: String,
     },
 
-    /// Git hardening failed after checkout (TCK-00580).
+    /// Git hardening failed after checkout (RFC-0032::REQ-0230).
     #[error("git hardening failed: {0}")]
     GitHardeningFailed(#[from] GitHardeningError),
 
-    /// Remote URL rejected by mirror policy allowlist (TCK-00582).
+    /// Remote URL rejected by mirror policy allowlist (RFC-0032::REQ-0232).
     #[error("remote URL denied by policy: {reason}")]
     PolicyDenied {
         /// Why the URL was denied.
         reason: String,
     },
 
-    /// Mirror update lock could not be acquired (TCK-00582).
+    /// Mirror update lock could not be acquired (RFC-0032::REQ-0232).
     #[error("mirror lock acquisition failed: {reason}")]
     LockFailed {
         /// Why the lock could not be acquired.
         reason: String,
     },
 
-    /// Git operation timed out (TCK-00582).
+    /// Git operation timed out (RFC-0032::REQ-0232).
     #[error("git operation timed out after {timeout_secs}s: {reason}")]
     Timeout {
         /// Timeout that was exceeded.
@@ -347,7 +351,7 @@ pub enum RepoMirrorError {
         reason: String,
     },
 
-    /// Mirror path contains a symlink component (TCK-00582).
+    /// Mirror path contains a symlink component (RFC-0032::REQ-0232).
     #[error("symlink component in mirror path: {reason}")]
     SymlinkInPath {
         /// Which component was a symlink.
@@ -451,7 +455,7 @@ impl RepoMirrorManager {
     /// If `remote_url` is present, it is configured as `origin` and then used
     /// to fetch updates.
     ///
-    /// **TCK-00582 hardening:**
+    /// **RFC-0032::REQ-0232 hardening:**
     /// - Acquires an exclusive file lock for the duration of the update.
     /// - Validates remote URL against the policy allowlist.
     /// - Bounds fetch/clone with a wall-clock timeout.
@@ -542,7 +546,7 @@ impl RepoMirrorManager {
         mirror_path: &Path,
     ) -> Result<String, RepoMirrorError> {
         if mirror_path.exists() {
-            // Refuse symlink components in the mirror path (TCK-00582).
+            // Refuse symlink components in the mirror path (RFC-0032::REQ-0232).
             validate_no_symlinks_in_path(mirror_path)?;
 
             if !mirror_path.is_dir() {
@@ -708,7 +712,7 @@ impl RepoMirrorManager {
             });
         }
 
-        // TCK-00580: Harden the lane workspace git config immediately after
+        // RFC-0032::REQ-0230: Harden the lane workspace git config immediately after
         // checkout and before any further git operations. The hooks directory
         // is placed under `allowed_parent` (the lanes root), outside the
         // workspace tree. Policy default: refuse unsafe configs.
@@ -728,7 +732,7 @@ impl RepoMirrorManager {
 
     /// Apply patch bytes with hardened validation and provenance receipt.
     ///
-    /// This is the **safe apply mode** entry point (TCK-00581).  It:
+    /// This is the **safe apply mode** entry point (RFC-0032::REQ-0231).  It:
     /// 1. Validates patch content against `git_diff_v1` rules (path traversal,
     ///    absolute paths, format checks).
     /// 2. Applies the patch via `git apply`.
@@ -958,7 +962,7 @@ fn open_lock_file(path: &Path) -> Result<File, RepoMirrorError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Symlink path validation (TCK-00582)
+// Symlink path validation (RFC-0032::REQ-0232)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Validate that no component of `path` is a symlink.
@@ -997,7 +1001,7 @@ fn validate_no_symlinks_in_path(path: &Path) -> Result<(), RepoMirrorError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ref snapshot helper (TCK-00582)
+// Ref snapshot helper (RFC-0032::REQ-0232)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Snapshot all refs in a bare mirror via `git show-ref`.
@@ -1333,7 +1337,7 @@ fn set_or_replace_remote(mirror_path: &Path, remote_url: &str) -> Result<(), Rep
     Ok(())
 }
 
-/// Fetch with wall-clock timeout (TCK-00582).
+/// Fetch with wall-clock timeout (RFC-0032::REQ-0232).
 fn git_fetch_bounded(mirror_path: &Path, timeout: Duration) -> Result<(), RepoMirrorError> {
     git_command_with_timeout(
         &[
@@ -1352,7 +1356,7 @@ fn git_fetch_bounded(mirror_path: &Path, timeout: Duration) -> Result<(), RepoMi
     .map(|_| ())
 }
 
-/// Clone --bare with wall-clock timeout (TCK-00582).
+/// Clone --bare with wall-clock timeout (RFC-0032::REQ-0232).
 fn git_clone_bare_bounded(
     remote_url: &str,
     mirror_path: &Path,
@@ -1987,7 +1991,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // apply_patch_hardened tests (TCK-00581)
+    // apply_patch_hardened tests (RFC-0032::REQ-0231)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2189,7 +2193,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TCK-00582: New hardening tests
+    // RFC-0032::REQ-0232: New hardening tests
     // -----------------------------------------------------------------------
 
     #[test]

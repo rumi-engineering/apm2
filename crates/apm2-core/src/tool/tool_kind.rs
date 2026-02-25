@@ -1,5 +1,5 @@
 // AGENT-AUTHORED
-//! Typed `ToolKind` safety, idempotency, and validation (TCK-00377).
+//! Typed `ToolKind` safety, idempotency, and validation (RFC-0020::REQ-0031).
 //!
 //! This module enforces RFC-0020 Section 6 requirements:
 //!
@@ -920,7 +920,7 @@ pub fn evaluate_preconditions(
         ToolKind::GitOp {
             cwd, preconditions, ..
         } => {
-            // TCK-00377 MAJOR FIX: GitOp now carries preconditions for
+            // RFC-0020::REQ-0031 MAJOR FIX: GitOp now carries preconditions for
             // side-effectful operations. Evaluate each one in order.
             let cwd_str = cwd.as_ref().map(ValidatedPath::as_str);
             for precondition in preconditions {
@@ -966,13 +966,13 @@ pub struct ShellBridgePolicy {
     /// Whether Tier2+ routes are allowed to use shell execution at all.
     /// Defaults to `false` (deny).
     ///
-    /// **NOTE (TCK-00377):** This field is currently unused in enforcement
-    /// because `check()` unconditionally denies Tier2+ shell execution per
-    /// CQ review requirements.  It is retained for forward-compatibility:
-    /// a future policy revision may gate Tier2+ shell access behind an
-    /// explicit opt-in flag, at which point this field will be consulted.
-    /// Removing it would be a breaking change to the serialized config
-    /// schema (`Serialize`/`Deserialize`).
+    /// **NOTE (RFC-0020::REQ-0031):** This field is currently unused in
+    /// enforcement because `check()` unconditionally denies Tier2+ shell
+    /// execution per CQ review requirements.  It is retained for
+    /// forward-compatibility: a future policy revision may gate Tier2+
+    /// shell access behind an explicit opt-in flag, at which point this
+    /// field will be consulted. Removing it would be a breaking change to
+    /// the serialized config schema (`Serialize`/`Deserialize`).
     tier2_plus_allowed: bool,
 }
 
@@ -1159,7 +1159,7 @@ pub fn tool_kind_from_proto(tool: &tool_request::Tool) -> Result<ToolKind, ToolK
         tool_request::Tool::GitOp(req) => from_git_op(req),
         tool_request::Tool::ShellExec(req) => from_shell_exec(req),
         // Other tool types (Inference, Artifact, ListFiles, Search) are not
-        // in scope for TCK-00377 typed ToolKind hardening. They pass through
+        // in scope for RFC-0020::REQ-0031 typed ToolKind hardening. They pass through
         // to existing validation in validation.rs.
         _ => Err(ToolKindError::MissingToolVariant),
     }
@@ -1316,7 +1316,7 @@ fn from_git_op(req: &GitOperation) -> Result<ToolKind, ToolKindError> {
         Some(ValidatedPath::new(&req.cwd)?)
     };
 
-    // TCK-00377 MAJOR FIX: Populate preconditions for side-effectful Git
+    // RFC-0020::REQ-0031 MAJOR FIX: Populate preconditions for side-effectful Git
     // operations. Push, merge, rebase, and checkout require a clean working
     // tree to prevent data loss from uncommitted changes.
     let preconditions = if operation.is_side_effectful() {
@@ -2557,7 +2557,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00377 MAJOR 1: Git URL/refspec validation tests
+    // RFC-0020::REQ-0031 MAJOR 1: Git URL/refspec validation tests
     // =========================================================================
 
     #[test]
@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00377 BLOCKER: Flag-like args rejected in ref positions
+    // RFC-0020::REQ-0031 BLOCKER: Flag-like args rejected in ref positions
     // =========================================================================
 
     #[test]
@@ -2729,7 +2729,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00377 MAJOR: URL/refspec strict validation
+    // RFC-0020::REQ-0031 MAJOR: URL/refspec strict validation
     // =========================================================================
 
     #[test]
@@ -2984,7 +2984,7 @@ mod tests {
     }
 
     // =========================================================================
-    // PreconditionEvaluator + evaluate_preconditions tests (TCK-00377)
+    // PreconditionEvaluator + evaluate_preconditions tests (RFC-0020::REQ-0031)
     // =========================================================================
 
     /// Stub evaluator that always succeeds.
@@ -3105,7 +3105,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00377 MAJOR: Git precondition tests
+    // RFC-0020::REQ-0031 MAJOR: Git precondition tests
     // =========================================================================
 
     #[test]

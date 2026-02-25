@@ -63,7 +63,7 @@
 //! # References
 //!
 //! - RFC-0014: Distributed Consensus and Replication Layer
-//! - TCK-00193: Operational Monitoring and Alerting
+//! - RFC-0033::REQ-0053: Operational Monitoring and Alerting
 //! - `05_rollout_and_ops.yaml`: Observability section
 
 use std::fmt::Write;
@@ -443,7 +443,7 @@ pub struct ConsensusMetrics {
     byzantine_quorum_forgery: AtomicU64,
     byzantine_replay: AtomicU64,
 
-    // === HEF Outbox Metrics (TCK-00304) ===
+    // === HEF Outbox Metrics (RFC-0032::REQ-0100) ===
     /// Counter for HEF commit notifications dropped due to channel full.
     ///
     /// Per DOD: "Notification drops logged at WARN and increment
@@ -644,7 +644,7 @@ impl ConsensusMetrics {
     }
 
     // ========================================================================
-    // HEF Outbox Metrics (TCK-00304)
+    // HEF Outbox Metrics (RFC-0032::REQ-0100)
     // ========================================================================
 
     /// Increments the HEF notification drops counter.
@@ -882,7 +882,7 @@ impl ConsensusMetrics {
             self.byzantine_replay.load(Ordering::Relaxed)
         );
 
-        // === HEF Outbox Metrics (TCK-00304) ===
+        // === HEF Outbox Metrics (RFC-0032::REQ-0100) ===
         let _ = writeln!(
             output,
             "# HELP hef_notification_drops_total HEF commit notifications dropped due to channel full"
@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(ClusterHealth::Unknown.as_str(), "unknown");
     }
 
-    /// TCK-00193: Verify all required metrics are exported.
+    /// RFC-0033::REQ-0053: Verify all required metrics are exported.
     #[test]
     fn tck_00193_required_metrics_present() {
         let metrics = ConsensusMetrics::new("test-node");
@@ -1184,7 +1184,7 @@ mod tests {
         );
     }
 
-    /// TCK-00304: Verify HEF notification drops metric is exported.
+    /// RFC-0032::REQ-0100: Verify HEF notification drops metric is exported.
     #[test]
     fn tck_00304_hef_notification_drops_metric() {
         let metrics = ConsensusMetrics::new("test-node");

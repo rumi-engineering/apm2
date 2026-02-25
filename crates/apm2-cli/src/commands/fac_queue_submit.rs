@@ -32,7 +32,8 @@ use crate::commands::{fac_key_material, fac_secure_io};
 pub(super) const QUEUE_DIR: &str = "queue";
 /// Queue pending subdirectory.
 pub(super) const PENDING_DIR: &str = "pending";
-/// Broker requests subdirectory for non-service-user submissions (TCK-00577).
+/// Broker requests subdirectory for non-service-user submissions
+/// (RFC-0032::REQ-0227).
 ///
 /// Non-service-user processes write job specs here instead of directly to
 /// `pending/`. The FAC worker (running as the service user) picks up
@@ -204,20 +205,20 @@ pub(super) fn load_or_init_policy(
 ///
 /// # Flow
 ///
-/// 1. **Service user gate (TCK-00577)**: Check whether the current process is
-///    the FAC service user. If yes (or if `--unsafe-local-write` is active),
-///    write directly to `queue/pending/`.
+/// 1. **Service user gate (RFC-0032::REQ-0227)**: Check whether the current
+///    process is the FAC service user. If yes (or if `--unsafe-local-write` is
+///    active), write directly to `queue/pending/`.
 ///
 /// 2. **Broker-mediated fallback**: If the service user gate denies (because
 ///    the caller is not the service user), write to `queue/broker_requests/`
 ///    instead. The FAC worker (running as the service user) picks up requests
 ///    from this directory and moves them into `pending/` after validation. This
-///    fulfills the TCK-00577 `DoD`: "CLI still works via broker-mediated
-///    enqueue."
+///    fulfills the RFC-0032::REQ-0227 `DoD`: "CLI still works via
+///    broker-mediated enqueue."
 ///
-/// 3. **Queue bounds (TCK-00578)**: For direct writes to `pending/`, the
-///    pending queue must not exceed `max_pending_jobs` or `max_pending_bytes`
-///    as configured by the provided [`QueueBoundsPolicy`].
+/// 3. **Queue bounds (RFC-0032::REQ-0228)**: For direct writes to `pending/`,
+///    the pending queue must not exceed `max_pending_jobs` or
+///    `max_pending_bytes` as configured by the provided [`QueueBoundsPolicy`].
 ///
 /// A process-level lockfile (`queue/.enqueue.lock`) is held for the
 /// full check-write critical section to prevent concurrent `apm2 fac`
@@ -232,7 +233,7 @@ pub(super) fn load_or_init_policy(
 /// * `queue_bounds_policy` - The queue bounds policy loaded from FAC
 ///   configuration. Must be pre-validated via `QueueBoundsPolicy::validate()`.
 /// * `write_mode` - Controls whether the service user ownership gate is
-///   enforced or bypassed (TCK-00577).
+///   enforced or bypassed (RFC-0032::REQ-0227).
 pub(super) fn enqueue_job(
     queue_root: &Path,
     fac_root: &Path,
@@ -241,7 +242,7 @@ pub(super) fn enqueue_job(
     write_mode: QueueWriteMode,
     dual_write_enabled: bool,
 ) -> Result<PathBuf, String> {
-    // TCK-00577: Gate 1 — service user write permission check.
+    // RFC-0032::REQ-0227: Gate 1 — service user write permission check.
     // If the gate passes, we do a direct write to pending/. If it denies,
     // we fall back to the broker-mediated requests directory.
     let gate_result = check_queue_write_permission(write_mode);
@@ -262,9 +263,10 @@ pub(super) fn enqueue_job(
             ref service_user,
             ref reason,
         }) if write_mode == QueueWriteMode::ServiceUserOnly => {
-            // TCK-00577 round 10 MAJOR fix (security review): ServiceUserNotResolved
-            // in ServiceUserOnly mode is a HARD error, not a broker fallback.
-            // The service user identity cannot be confirmed, so we must fail-closed.
+            // RFC-0032::REQ-0227 round 10 MAJOR fix (security review):
+            // ServiceUserNotResolved in ServiceUserOnly mode is a HARD error,
+            // not a broker fallback. The service user identity cannot be
+            // confirmed, so we must fail-closed.
             //
             // Rationale: ServiceUserNotResolved means "I cannot determine who
             // the service user is" — this is an unresolvable trust question.
@@ -289,10 +291,10 @@ pub(super) fn enqueue_job(
         {
             // NotServiceUser means "I know who you are, you're just not
             // the service user" — broker-mediated enqueue is the correct
-            // fallback (TCK-00577 DoD: "CLI still works via broker").
+            // fallback (RFC-0032::REQ-0227 DoD: "CLI still works via broker").
             tracing::info!(
                 job_id = %spec.job_id,
-                "TCK-00577: non-service-user caller, submitting via broker-mediated enqueue"
+                "RFC-0032::REQ-0227: non-service-user caller, submitting via broker-mediated enqueue"
             );
             enqueue_via_broker_requests(queue_root, spec)
         },
@@ -318,9 +320,9 @@ fn enqueue_direct(
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
 
-    // TCK-00577 round 8: Harden queue root and pending directory permissions
-    // immediately after creation. Mode 0711 allows traversal but prevents
-    // world-listing of queue artifacts.
+    // RFC-0032::REQ-0227 round 8: Harden queue root and pending directory
+    // permissions immediately after creation. Mode 0711 allows traversal but
+    // prevents world-listing of queue artifacts.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -330,11 +332,11 @@ fn enqueue_direct(
             .map_err(|err| format!("harden pending dir mode to 0711: {err}"))?;
     }
 
-    // CODE-QUALITY fix (TCK-00577 round 17): Ensure all queue subdirectories
-    // exist with deterministic, hardened permissions. Propagate create/chmod
-    // failures (fail-closed) instead of silently ignoring them. Each subdir
-    // gets mode 0711 (traversal-only for group/other), and broker_requests
-    // gets mode 01733 (sticky + write-only for group/other).
+    // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Ensure all queue
+    // subdirectories exist with deterministic, hardened permissions. Propagate
+    // create/chmod failures (fail-closed) instead of silently ignoring them.
+    // Each subdir gets mode 0711 (traversal-only for group/other), and
+    // broker_requests gets mode 01733 (sticky + write-only for group/other).
     for subdir in &[
         "claimed",
         "completed",
@@ -379,8 +381,9 @@ fn enqueue_direct(
         ));
     }
 
-    // TCK-00578: Validate and enforce queue bounds before writing the job spec.
-    // Policy is loaded from the persisted FAC configuration by the caller.
+    // RFC-0032::REQ-0228: Validate and enforce queue bounds before writing the job
+    // spec. Policy is loaded from the persisted FAC configuration by the
+    // caller.
     queue_bounds_policy
         .validate()
         .map_err(|err| format!("queue bounds policy validation failed: {err}"))?;
@@ -394,7 +397,7 @@ fn enqueue_direct(
 
     let proposed_bytes = json.len() as u64;
     if let Err(err) = check_queue_bounds(&pending_dir, proposed_bytes, queue_bounds_policy) {
-        // Persist denial receipt for downstream tooling (TCK-00578).
+        // Persist denial receipt for downstream tooling (RFC-0032::REQ-0228).
         if let QueueBoundsError::QueueBoundsExceeded {
             ref receipt,
             ref reason,
@@ -446,7 +449,7 @@ fn enqueue_direct(
 }
 
 /// Broker-mediated enqueue: write job spec to `queue/broker_requests/`
-/// for pickup by the service-user worker (TCK-00577).
+/// for pickup by the service-user worker (RFC-0032::REQ-0227).
 ///
 /// This path is used when the caller is NOT the service user but needs to
 /// submit a job. The worker process (running as service user) monitors this
@@ -478,10 +481,10 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         )
     })?;
 
-    // TCK-00577 round 9 MAJOR fix: Only chmod directories that this process
-    // just created. For pre-existing directories (owned by the service user),
-    // validate the existing mode is acceptable instead of attempting chmod
-    // (which returns EPERM for non-owner callers). This makes the broker
+    // RFC-0032::REQ-0227 round 9 MAJOR fix: Only chmod directories that this
+    // process just created. For pre-existing directories (owned by the service
+    // user), validate the existing mode is acceptable instead of attempting
+    // chmod (which returns EPERM for non-owner callers). This makes the broker
     // fallback work for non-service-user processes.
     #[cfg(unix)]
     {
@@ -573,8 +576,8 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
     let filename = format!("{}.json", spec.job_id);
     let target = broker_dir.join(&filename);
 
-    // SECURITY fix (TCK-00577 round 17): Resolve service user GID so we can
-    // set the file's group to the service user, enabling the worker to read
+    // SECURITY fix (RFC-0032::REQ-0227 round 17): Resolve service user GID so we
+    // can set the file's group to the service user, enabling the worker to read
     // broker files in cross-user deployments. Fail-closed: if the service
     // user is not resolvable, return an error instead of falling back to
     // world-readable mode 0644. The 0644 fallback was fail-open because job
@@ -588,7 +591,7 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         .map(|identity| identity.gid)
         .map_err(|e| {
             format!(
-                "TCK-00577: service user not resolvable for group-based broker \
+                "RFC-0032::REQ-0227: service user not resolvable for group-based broker \
                  file handoff (fail-closed, no 0644 fallback): {e}. \
                  Configure a valid FAC service user, or use --unsafe-local-write \
                  for development environments."
@@ -606,7 +609,7 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         let mut file = temp.as_file();
         #[cfg(unix)]
         {
-            // SECURITY fix (TCK-00577 round 17): Cross-user deployment with
+            // SECURITY fix (RFC-0032::REQ-0227 round 17): Cross-user deployment with
             // fail-closed handoff. Set group to service user's primary GID
             // and mode 0640 (owner read+write, group read). The service-user
             // worker is in this group and can read the file.
@@ -627,7 +630,7 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
             )
             .map_err(|e| {
                 format!(
-                    "TCK-00577: fchown to service user GID {service_user_gid} \
+                    "RFC-0032::REQ-0227: fchown to service user GID {service_user_gid} \
                      failed (fail-closed, no 0644 fallback): {e}. \
                      Ensure the submitting user is in the service user's \
                      group, or grant CAP_CHOWN."
@@ -638,7 +641,7 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
             tracing::debug!(
                 gid = service_user_gid,
                 mode = "0640",
-                "TCK-00577: broker request file group set to service user GID"
+                "RFC-0032::REQ-0227: broker request file group set to service user GID"
             );
         }
         file.write_all(json.as_bytes())
@@ -651,7 +654,7 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
     tracing::info!(
         job_id = %spec.job_id,
         path = %target.display(),
-        "TCK-00577: job spec submitted via broker-mediated enqueue \
+        "RFC-0032::REQ-0227: job spec submitted via broker-mediated enqueue \
          (worker will promote to pending/)"
     );
 
@@ -1004,7 +1007,7 @@ mod tests {
         }
     }
 
-    // ── Broker-mediated enqueue (TCK-00577) ──────────────────────────
+    // ── Broker-mediated enqueue (RFC-0032::REQ-0227) ──────────────────────────
 
     #[test]
     fn enqueue_via_broker_requests_writes_to_broker_dir() {
@@ -1016,7 +1019,7 @@ mod tests {
 
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: broker enqueue now fails closed when the
+        // RFC-0032::REQ-0227 round 17: broker enqueue now fails closed when the
         // service user is not resolvable. In test environments without
         // `_apm2-job`, this returns an error.
         let path = match result {
@@ -1041,10 +1044,11 @@ mod tests {
         assert_eq!(parsed.job_id, "test-broker-001");
     }
 
-    /// SECURITY fix (TCK-00577 round 17): Broker enqueue now fails closed
-    /// when the service user is not resolvable. In test environments where
-    /// `_apm2-job` does not exist, `enqueue_via_broker_requests` returns an
-    /// error instead of falling back to world-readable mode 0644.
+    /// SECURITY fix (RFC-0032::REQ-0227 round 17): Broker enqueue now fails
+    /// closed when the service user is not resolvable. In test environments
+    /// where `_apm2-job` does not exist, `enqueue_via_broker_requests`
+    /// returns an error instead of falling back to world-readable mode
+    /// 0644.
     ///
     /// The previous 0644 fallback was fail-open: job filenames are not
     /// opaque random UUIDs and can be guessed, so world-readable files in
@@ -1114,13 +1118,13 @@ mod tests {
         );
     }
 
-    // ── enqueue_job fallback (TCK-00577) ─────────────────────────────
+    // ── enqueue_job fallback (RFC-0032::REQ-0227) ─────────────────────────────
 
     #[cfg(unix)]
     #[allow(unsafe_code)] // Env var mutation serialized via env_var_test_lock.
     #[test]
     fn enqueue_job_hard_denies_when_service_user_not_resolved_in_service_user_only_mode() {
-        // TCK-00657: In system-mode, ServiceUserNotResolved in
+        // RFC-0032::REQ-0274: In system-mode, ServiceUserNotResolved in
         // ServiceUserOnly mode remains a HARD error (fail-closed). Force
         // backend=system to make this deterministic.
         let _lock = crate::commands::env_var_test_lock().lock().unwrap();
@@ -1183,7 +1187,7 @@ mod tests {
     #[allow(unsafe_code)] // Env var mutation serialized via env_var_test_lock.
     #[test]
     fn enqueue_job_service_user_only_bypasses_gate_in_user_mode() {
-        // TCK-00657: In user-mode, service-user-only enqueue auto-bypasses
+        // RFC-0032::REQ-0274: In user-mode, service-user-only enqueue auto-bypasses
         // to direct local write semantics.
         let _lock = crate::commands::env_var_test_lock().lock().unwrap();
         let previous_backend = std::env::var_os("APM2_FAC_EXECUTION_BACKEND");
@@ -1253,7 +1257,7 @@ mod tests {
         );
     }
 
-    // ── Permission hardening (TCK-00577 round 8) ─────────────────────
+    // ── Permission hardening (RFC-0032::REQ-0227 round 8) ─────────────────────
 
     #[cfg(unix)]
     #[test]
@@ -1349,7 +1353,7 @@ mod tests {
 
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: In test environments without a service user,
+        // RFC-0032::REQ-0227 round 17: In test environments without a service user,
         // broker enqueue now fails closed. The directory hardening still
         // runs (it happens before service user resolution), so we can
         // verify modes even on error.
@@ -1393,13 +1397,14 @@ mod tests {
         );
     }
 
-    // ── Broker fallback with pre-existing directories (TCK-00577 round 9) ──
+    // ── Broker fallback with pre-existing directories (RFC-0032::REQ-0227 round 9)
+    // ──
 
-    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must succeed when
-    /// queue directories already exist with correct modes. Previously, the
-    /// function unconditionally called chmod, which returns EPERM for non-owner
-    /// callers. Now it only chmods newly-created dirs and validates existing
-    /// ones.
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// succeed when queue directories already exist with correct modes.
+    /// Previously, the function unconditionally called chmod, which returns
+    /// EPERM for non-owner callers. Now it only chmods newly-created dirs
+    /// and validates existing ones.
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_succeeds_with_preexisting_correct_mode_dirs() {
@@ -1419,7 +1424,7 @@ mod tests {
         let spec = test_job_spec("test-preexist-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: In test environments without a service user,
+        // RFC-0032::REQ-0227 round 17: In test environments without a service user,
         // broker enqueue fails closed after directory validation passes.
         // This test validates directory mode acceptance, not file creation.
         let path = match result {
@@ -1436,8 +1441,9 @@ mod tests {
         assert!(path.exists(), "broker request file should exist");
     }
 
-    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must reject
-    /// pre-existing directories with unsafe modes (group/other read).
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// reject pre-existing directories with unsafe modes (group/other
+    /// read).
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_rejects_preexisting_unsafe_queue_root() {
@@ -1467,8 +1473,8 @@ mod tests {
         );
     }
 
-    /// TCK-00577 round 9 MAJOR fix: Broker-mediated enqueue must reject
-    /// pre-existing `broker_requests/` with group/other read bits.
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// reject pre-existing `broker_requests/` with group/other read bits.
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_rejects_preexisting_readable_broker_dir() {
@@ -1552,7 +1558,7 @@ mod tests {
         let spec = test_job_spec("test-sticky-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: In test environments without a service user,
+        // RFC-0032::REQ-0227 round 17: In test environments without a service user,
         // broker enqueue fails closed after directory validation passes.
         // The key assertion: error is NOT about directory mode (the mode
         // 01333 was accepted).
@@ -1585,7 +1591,7 @@ mod tests {
         let spec = test_job_spec("test-owner-only-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: In test environments without a service user,
+        // RFC-0032::REQ-0227 round 17: In test environments without a service user,
         // broker enqueue fails closed after directory validation passes.
         // The key assertion: error is NOT about directory mode.
         if let Err(err) = result {
@@ -1649,7 +1655,7 @@ mod tests {
         let spec = test_job_spec("test-grp-sticky-001");
         let result = enqueue_via_broker_requests(&queue_root, &spec);
 
-        // TCK-00577 round 17: In test environments without a service user,
+        // RFC-0032::REQ-0227 round 17: In test environments without a service user,
         // broker enqueue fails closed after directory validation passes.
         // The key assertion: error is NOT about directory mode.
         if let Err(err) = result {

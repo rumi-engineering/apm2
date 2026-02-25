@@ -299,11 +299,11 @@ message SpawnEpisodeRequest {
   WorkRole role = 2;
   // Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
   optional string lease_id = 3;
-  // TCK-00319: Workspace root directory for this episode.
+  // RFC-0032::REQ-0113: Workspace root directory for this episode.
   // All file operations will be confined to this directory.
   // REQUIRED: Episodes cannot be spawned without a workspace root.
   string workspace_root = 4;
-  // TCK-00351 BLOCKER 1: Authoritative stop conditions from the episode
+  // RFC-0020::REQ-0005 BLOCKER 1: Authoritative stop conditions from the episode
   // envelope.  When present, these override StopConditions::default() so
   // that max_episodes and escalation_predicate are actually enforced.
   // When absent, the handler falls back to fail-closed defaults
@@ -312,11 +312,11 @@ message SpawnEpisodeRequest {
   // Escalation predicate from the episode envelope (free-form v1).
   // Non-empty string triggers EscalationTriggered stop denial.
   optional string escalation_predicate = 6;
-  // TCK-00397: Optional adapter profile hash for explicit adapter binding.
+  // RFC-0032::REQ-0289: Optional adapter profile hash for explicit adapter binding.
   // Must be a 32-byte BLAKE3 digest and must resolve in CAS (fail-closed).
   // Tag 8 chosen to avoid renumbering existing fields (wire stability).
   optional bytes adapter_profile_hash = 8;
-  // TCK-00373: Optional permeability receipt hash for delegated spawns.
+  // RFC-0020::REQ-0027: Optional permeability receipt hash for delegated spawns.
   // When present, the spawn path routes through validate_delegated_spawn_gate
   // for full consumption-binding verification. Must be a 32-byte BLAKE3 digest.
   // Tag 9 chosen to preserve wire stability.
@@ -333,7 +333,7 @@ message SpawnEpisodeResponse {
   // Ephemeral handle for session identification (not a credential).
   string ephemeral_handle = 4;
   // HMAC-signed session token for authenticating session-scoped IPC requests.
-  // TCK-00287: Required for clients to access session endpoints.
+  // RFC-0032::REQ-0089: Required for clients to access session endpoints.
   string session_token = 5;
 }
 
@@ -394,7 +394,7 @@ message UpdateStopFlagsResponse {
   bool governance_stop_active = 2;
 }
 
-// IPC-PRIV-005: WorkStatus (TCK-00344)
+// IPC-PRIV-005: WorkStatus (RFC-0032::REQ-0134)
 // Query the status of a work item from the work queue.
 message WorkStatusRequest {
   // Work identifier to query.
@@ -480,7 +480,7 @@ message WorkStatusResponse {
   uint32 identity_chain_defect_count = 17;
 }
 
-// IPC-PRIV-019: WorkList (TCK-00415)
+// IPC-PRIV-019: WorkList (RFC-0032::REQ-0159)
 // List all work items known to projection authority.
 message WorkListRequest {
   // If true, return only claimable work items.
@@ -498,7 +498,7 @@ message WorkListResponse {
   repeated WorkStatusResponse work_items = 1;
 }
 
-// IPC-PRIV-073: VerifyLedgerChain (TCK-00487)
+// IPC-PRIV-073: VerifyLedgerChain (RFC-0020::REQ-0053)
 // Explicit full-chain verification endpoint for operator maintenance/audit.
 message VerifyLedgerChainRequest {}
 
@@ -528,7 +528,7 @@ enum ProjectionUncertaintyFlag {
   PROJECTION_UNCERTAINTY_FLAG_TRUNCATED_HISTORY = 5;
 }
 
-// IPC-PRIV-020: AuditorLaunchProjection (TCK-00452)
+// IPC-PRIV-020: AuditorLaunchProjection (RFC-0020::REQ-0040)
 // Return launch-lineage and boundary-conformance projection for auditors.
 message AuditorLaunchProjectionRequest {}
 
@@ -553,7 +553,7 @@ message AuditorLaunchProjectionResponse {
   bool admissible = 9;
 }
 
-// IPC-PRIV-027: OrchestratorLaunchProjection (TCK-00452)
+// IPC-PRIV-027: OrchestratorLaunchProjection (RFC-0020::REQ-0040)
 // Return launch liveness/restart projection for orchestrator consumers.
 message OrchestratorLaunchProjectionRequest {}
 
@@ -575,7 +575,7 @@ message OrchestratorLaunchProjectionResponse {
 }
 
 // =============================================================================
-// IPC-PRIV-017: PublishChangeSet (TCK-00394, RFC-0018)
+// IPC-PRIV-017: PublishChangeSet (RFC-0032::REQ-0148, RFC-0018)
 // =============================================================================
 // Accepts a ChangeSetBundleV1 payload, validates it, stores it in DurableCas,
 // emits a ChangeSetPublished ledger event, and returns the changeset_digest and
@@ -604,12 +604,12 @@ message PublishChangeSetResponse {
 }
 
 // =============================================================================
-// IPC-PRIV-016: EndSession (TCK-00395)
+// IPC-PRIV-016: EndSession (RFC-0032::REQ-0149)
 // =============================================================================
 // Terminates an active session and emits SessionTerminated + WorkTransitioned
 // ledger events. Wires the SessionTerminated code-path into production use.
 
-// Typed termination outcome for EndSession (TCK-00395 Quality v3 MAJOR).
+// Typed termination outcome for EndSession (RFC-0032::REQ-0149 Quality v3 MAJOR).
 // Replaces free-form string matching for success/failure inference.
 enum TerminationOutcome {
   // Unspecified outcome (treated as failure for safety).
@@ -630,7 +630,7 @@ message EndSessionRequest {
   string session_id = 1;
   // Human-readable reason for termination.
   string reason = 2;
-  // Typed termination outcome (TCK-00395 Quality v3 MAJOR).
+  // Typed termination outcome (RFC-0032::REQ-0149 Quality v3 MAJOR).
   // When set, this takes precedence over string-based reason matching.
   TerminationOutcome outcome = 3;
 }
@@ -644,7 +644,7 @@ message EndSessionResponse {
 }
 
 // =============================================================================
-// CTR-PROTO-012: Credential Management Endpoints (RFC-0018, TCK-00343)
+// CTR-PROTO-012: Credential Management Endpoints (RFC-0018, RFC-0032::REQ-0133)
 // =============================================================================
 // These endpoints manage credential profiles for agent authentication.
 // All credential operations are privileged and require operator.sock (mode 0600).
@@ -828,7 +828,7 @@ enum PrivilegedErrorCode {
   CREDENTIAL_INVALID_CONFIG = 18;
   // Invalid argument in request (generic validation failure).
   INVALID_ARGUMENT = 19;
-  // Work item already exists with a different spec hash (TCK-00635).
+  // Work item already exists with a different spec hash (RFC-0032::REQ-0263).
   WORK_ALREADY_EXISTS = 20;
   // Precondition failed (e.g., work is in wrong state for the requested operation).
   FAILED_PRECONDITION = 21;
@@ -841,7 +841,7 @@ message PrivilegedError {
 }
 
 // =============================================================================
-// CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+// CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, RFC-0032::REQ-0068)
 // =============================================================================
 // These endpoints require a valid session_token (connection on session.sock).
 // Invalid or expired tokens receive SESSION_INVALID error.
@@ -858,7 +858,7 @@ message RequestToolRequest {
   bytes arguments = 3;
   // Deduplication key for idempotent requests.
   string dedupe_key = 4;
-  // Optional epoch seal payload for Tier2+ admission (TCK-00365).
+  // Optional epoch seal payload for Tier2+ admission (RFC-0020::REQ-0019).
   // When present, the broker verifies monotonicity, anti-equivocation,
   // and signature authenticity. Missing at Tier2+ causes fail-closed deny.
   // Serialized EpochSealV1 bytes (bincode or canonical encoding).
@@ -875,28 +875,28 @@ message RequestToolResponse {
   // Policy hash at decision time.
   bytes policy_hash = 4;
   // Result hash from tool execution (CAS reference, populated on ALLOW after execution).
-  // TCK-00316: Required for kernel-side execution model.
+  // RFC-0032::REQ-0110: Required for kernel-side execution model.
   optional bytes result_hash = 5;
   // Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
-  // TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
+  // RFC-0032::REQ-0110: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
   optional bytes inline_result = 6;
   // Daemon-issued signed channel context token for FAC role-launch authorization.
   // Present when authoritative channel-boundary checks pass for launch-relevant tools.
   optional string channel_context_token = 11;
-  // TCK-00351: Pre-actuation stop check proof.
+  // RFC-0020::REQ-0005: Pre-actuation stop check proof.
   // True indicates stop conditions were evaluated and cleared before actuation.
   // False or absent indicates stop check was not performed (fail-closed: deny).
   bool stop_checked = 7;
-  // TCK-00351: Pre-actuation budget check proof.
+  // RFC-0020::REQ-0005: Pre-actuation budget check proof.
   // True indicates budget was enforced at pre-actuation.
   // False is only valid when `budget_enforcement_deferred=true`.
   // Replayers MUST reject traces where both `budget_checked=false` and
   // `budget_enforcement_deferred=false`.
   bool budget_checked = 8;
-  // TCK-00351: Explicitly marks budget enforcement deferred beyond
+  // RFC-0020::REQ-0005: Explicitly marks budget enforcement deferred beyond
   // pre-actuation (e.g., to EpisodeRuntime).
   bool budget_enforcement_deferred = 9;
-  // TCK-00351: HTF timestamp (nanoseconds) when pre-actuation checks completed.
+  // RFC-0020::REQ-0005: HTF timestamp (nanoseconds) when pre-actuation checks completed.
   // Provides replay-verifiable ordering proof that checks preceded actuation.
   uint64 preactuation_timestamp_ns = 10;
 }
@@ -961,7 +961,7 @@ message StreamTelemetryResponse {
   bool promoted = 2;
 }
 
-// IPC-SESS-005: SessionStatus (TCK-00344)
+// IPC-SESS-005: SessionStatus (RFC-0032::REQ-0134)
 // Query session-scoped status via session.sock.
 message SessionStatusRequest {
   // Session token for authentication.
@@ -988,7 +988,7 @@ message SessionStatusResponse {
   // Session duration in milliseconds.
   uint64 duration_ms = 9;
 
-  // TCK-00385: Session termination fields.
+  // RFC-0032::REQ-0139: Session termination fields.
   // Present only when state == "TERMINATED".
 
   // Termination reason (normal, crash, timeout, quarantined, budget_exhausted).
@@ -1031,7 +1031,7 @@ message SessionError {
 }
 
 // =============================================================================
-// CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
+// CTR-PROTO-009: Crash Recovery Signals (RFC-0032::REQ-0083)
 // =============================================================================
 // These messages support daemon crash recovery and lease revocation.
 
@@ -1084,7 +1084,7 @@ message RecoverSessionsResponse {
 }
 
 // =============================================================================
-// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, RFC-0032::REQ-0096)
 // =============================================================================
 // Holonic Event Fabric (HEF) pulse messages for lossy event notifications.
 // Pulses are derived from committed ledger+CAS artifacts and provide hints
@@ -1271,7 +1271,7 @@ message PatternRejection {
 // - Each pattern: max 128 chars, ASCII only
 // - session_token required on session.sock (INV-SESS-001)
 //
-// ## ACL Enforcement (handled by TCK-00302)
+// ## ACL Enforcement (handled by RFC-0032::REQ-0098)
 //
 // - Session subscriptions: deny-by-default, capability-manifest allowlist
 // - Operator subscriptions: full topic taxonomy access
@@ -1384,7 +1384,7 @@ message HefError {
 }
 
 // =============================================================================
-// CTR-PROTO-011: Process Management Endpoints (TCK-00342)
+// CTR-PROTO-011: Process Management Endpoints (RFC-0032::REQ-0132)
 // =============================================================================
 // These endpoints provide process lifecycle management via operator.sock.
 // All process management operations (except StreamLogs) require operator
@@ -1619,7 +1619,7 @@ enum ProcessErrorCode {
 }
 
 // =============================================================================
-// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
+// CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, RFC-0032::REQ-0135)
 // =============================================================================
 // Privileged endpoints for querying consensus subsystem state.
 // These endpoints are only accessible via operator.sock.
@@ -1786,7 +1786,7 @@ message ConsensusError {
 }
 
 // =============================================================================
-// IPC-PRIV-017: IngestReviewReceipt (TCK-00389)
+// IPC-PRIV-017: IngestReviewReceipt (RFC-0032::REQ-0143)
 // =============================================================================
 // Ingests a review receipt from an external reviewer into the FAC ledger.
 // Validates reviewer identity against gate lease, verifies artifact bundle
@@ -1835,7 +1835,7 @@ message IngestReviewReceiptResponse {
   string event_id = 3;
 }
 
-// Request to delegate a sublease from a parent gate lease (TCK-00340).
+// Request to delegate a sublease from a parent gate lease (RFC-0032::REQ-0131).
 //
 // The daemon validates the parent lease, checks strict-subset constraints,
 // and issues a signed sublease for the delegatee actor.
@@ -1868,7 +1868,7 @@ message DelegateSubleaseResponse {
   string event_id = 6;
 }
 
-// IPC-PRIV-074: RegisterRecoveryEvidence (TCK-00469)
+// IPC-PRIV-074: RegisterRecoveryEvidence (RFC-0020::REQ-0051)
 // Operator registers durable replay evidence to transition projection recovery
 // state from non-durable to durable provenance, enabling subsequent unfreeze.
 message RegisterRecoveryEvidenceRequest {
@@ -1895,7 +1895,7 @@ message RegisterRecoveryEvidenceResponse {
   string message = 3;
 }
 
-// IPC-PRIV-075: RequestUnfreeze (TCK-00469)
+// IPC-PRIV-075: RequestUnfreeze (RFC-0020::REQ-0051)
 // Operator requests lifting a projection freeze after durable recovery evidence
 // has been registered and verified.
 message RequestUnfreezeRequest {
@@ -1918,7 +1918,7 @@ message RequestUnfreezeResponse {
   string message = 3;
 }
 
-// IPC-PRIV-076: OpenWork (RFC-0032, TCK-00635)
+// IPC-PRIV-076: OpenWork (RFC-0032, RFC-0032::REQ-0263)
 // Opens a new work item by persisting a validated WorkSpec to CAS
 // and emitting a canonical work.opened event. Actor ID is derived
 // from peer credentials (never from client input).
@@ -1940,7 +1940,7 @@ message OpenWorkResponse {
   bool already_existed = 3;
 }
 
-// IPC-PRIV-077: PublishWorkContextEntry (TCK-00638, RFC-0032 Phase 2)
+// IPC-PRIV-077: PublishWorkContextEntry (RFC-0032::REQ-0266, RFC-0032 Phase 2)
 // Publishes a work context entry to CAS and anchors it in the ledger via
 // evidence.published with category WORK_CONTEXT_ENTRY.
 message PublishWorkContextEntryRequest {
@@ -1972,7 +1972,7 @@ message PublishWorkContextEntryResponse {
   string work_id = 4;
 }
 
-// IPC-PRIV-079: PublishWorkLoopProfile (TCK-00645, RFC-0032 Phase 4)
+// IPC-PRIV-079: PublishWorkLoopProfile (RFC-0032::REQ-0270, RFC-0032 Phase 4)
 // Publishes a work loop profile to CAS and anchors it in the ledger via
 // evidence.published with category WORK_LOOP_PROFILE.
 message PublishWorkLoopProfileRequest {
@@ -2000,7 +2000,7 @@ message PublishWorkLoopProfileResponse {
   string dedupe_key = 4;
 }
 
-// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, TCK-00637)
+// IPC-PRIV-078: ClaimWorkV2 (RFC-0032, RFC-0032::REQ-0265)
 // Claims an EXISTING work item (opened via OpenWork). Does not create a new
 // work_id. Transitions Open -> Claimed (IMPLEMENTER/COORDINATOR) or
 // ReadyForReview -> Review (REVIEWER). Issues a lease and publishes
@@ -2029,7 +2029,7 @@ message ClaimWorkV2Response {
   bool already_claimed = 5;
 }
 
-// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, TCK-00639)
+// IPC-PRIV-079: RecordWorkPrAssociation (RFC-0032, RFC-0032::REQ-0267)
 // Records a PR association for an existing work item. Emits a canonical
 // work.pr_associated event and optionally publishes a LINKOUT context entry
 // with the PR URL. Idempotent on (work_id, pr_number, commit_sha).
@@ -2063,13 +2063,13 @@ message RecordWorkPrAssociationResponse {
   bool already_existed = 4;
 }
 
-// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, TCK-00636)
+// IPC-PRIV-080: ResolveTicketAlias (RFC-0032, RFC-0032::REQ-0264)
 // Resolves a ticket alias to a canonical work_id via projection state.
 // Uses AliasReconciliationGate::resolve_ticket_alias for CAS-backed
 // WorkSpec lookup. Returns exactly one work_id on success, or an error
 // on ambiguity/infrastructure failure (fail-closed).
 message ResolveTicketAliasRequest {
-  // Ticket alias to resolve (e.g. "TCK-00636").
+  // Ticket alias to resolve (e.g. "RFC-0032::REQ-0264").
   // Must not be empty; bounded to MAX_ID_LENGTH bytes.
   string ticket_alias = 1;
 }

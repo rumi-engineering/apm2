@@ -25,7 +25,7 @@ use super::capabilities::{EffectCapability, LedgerWriteCapability, QuarantineCap
 use super::prerequisites::LedgerAnchorV1;
 
 // =============================================================================
-// Bounded deserialization helpers (SECURITY BLOCKER 2, TCK-00492)
+// Bounded deserialization helpers (SECURITY BLOCKER 2, RFC-0032::REQ-0170)
 // =============================================================================
 
 /// Bounded deserialization module (SECURITY: visitor-based bounds enforcement).
@@ -392,7 +392,7 @@ impl KernelRequestV1 {
                 reason: "freshness_policy_hash is zero".into(),
             });
         }
-        // QUALITY MAJOR 1 (TCK-00492): Non-zero checks for ALL mandatory
+        // QUALITY MAJOR 1 (RFC-0032::REQ-0170): Non-zero checks for ALL mandatory
         // digest fields. These were previously missing, allowing requests
         // with unbound digests to pass validation.
         if self.hsi_contract_manifest_digest == ZERO {
@@ -589,7 +589,7 @@ impl WitnessSeedV1 {
 // WitnessEvidenceV1
 // =============================================================================
 
-/// Post-effect witness evidence object (RFC-0028 REQ-0004, TCK-00497).
+/// Post-effect witness evidence object (RFC-0028 REQ-0004, RFC-0020::REQ-0058).
 ///
 /// Materialized AFTER the effect executes. Binds daemon-measured values
 /// (leakage metrics, timing measurements) to the witness seed that was
@@ -716,7 +716,7 @@ impl WitnessEvidenceV1 {
 // MonitorWaiverV1
 // =============================================================================
 
-/// Explicit waiver for monitor-tier witness bypass (TCK-00497).
+/// Explicit waiver for monitor-tier witness bypass (RFC-0020::REQ-0058).
 ///
 /// Monitor tiers may skip witness enforcement ONLY when an explicit
 /// waiver is provided. Silent permissive defaults are forbidden.
@@ -792,7 +792,7 @@ impl MonitorWaiverV1 {
                 reason: "waiver is only valid for Monitor tier, not FailClosed".into(),
             });
         }
-        // SECURITY MAJOR 2 (TCK-00497): Enforce waiver expiry.
+        // SECURITY MAJOR 2 (RFC-0020::REQ-0058): Enforce waiver expiry.
         // A non-zero expires_at_tick that is less than the current tick
         // means the waiver has expired. Expired waivers MUST NOT bypass
         // witness enforcement — otherwise a stale waiver could be reused
@@ -934,7 +934,7 @@ pub struct QuarantineActionV1 {
 }
 
 // =============================================================================
-// AdmissionBundleV1 (RFC-0019 REQ-0024, TCK-00493)
+// AdmissionBundleV1 (RFC-0019 REQ-0024, RFC-0032::REQ-0171)
 // =============================================================================
 
 /// Deterministic, bounded, `deny_unknown_fields` CAS admission bundle.
@@ -1200,7 +1200,7 @@ impl AdmissionBundleV1 {
 }
 
 // =============================================================================
-// AdmissionOutcomeIndexV1 (RFC-0019 REQ-0024, TCK-00493)
+// AdmissionOutcomeIndexV1 (RFC-0019 REQ-0024, RFC-0032::REQ-0171)
 // =============================================================================
 
 /// Forward index emitted AFTER authoritative receipts/events are created.
@@ -1372,7 +1372,8 @@ pub struct BoundarySpanV1 {
 /// post-effect path can invoke `finalize_post_effect_witness` with the
 /// actual seeds (not just their hashes). This closes the gap where the
 /// runtime path previously did ad-hoc hash-only validation instead of
-/// calling the kernel's canonical validator (QUALITY MAJOR 1, TCK-00497).
+/// calling the kernel's canonical validator (QUALITY MAJOR 1,
+/// RFC-0020::REQ-0058).
 pub struct AdmissionResultV1 {
     /// Digest of the sealed `AdmissionBundleV1` CAS object
     /// (v1.1 `AdmissionBindingHash`).
@@ -1397,7 +1398,8 @@ pub struct AdmissionResultV1 {
     pub consume_record: AuthorityConsumeRecordV1,
     /// Boundary span for output mediation.
     pub boundary_span: BoundarySpanV1,
-    /// Leakage witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    /// Leakage witness seed from plan time (RFC-0020::REQ-0058 QUALITY MAJOR
+    /// 1).
     ///
     /// Carried through from the consumed plan so the runtime post-effect
     /// path can pass the actual seed (not just its hash) to
@@ -1405,19 +1407,19 @@ pub struct AdmissionResultV1 {
     /// full seed/provider binding validation instead of ad-hoc hash-only
     /// checks.
     pub leakage_witness_seed: WitnessSeedV1,
-    /// Timing witness seed from plan time (TCK-00497 QUALITY MAJOR 1).
+    /// Timing witness seed from plan time (RFC-0020::REQ-0058 QUALITY MAJOR 1).
     ///
     /// See `leakage_witness_seed` for rationale.
     pub timing_witness_seed: WitnessSeedV1,
     /// Idempotency key for propagation into tool/broker adapter calls
-    /// (TCK-00501, REQ-0029).
+    /// (RFC-0032::REQ-0176, REQ-0029).
     ///
     /// Deterministically derived from `RequestId` + AJC ID. External
     /// systems that support idempotency keys should use this to
     /// deduplicate effect execution.
     pub idempotency_key: super::effect_journal::IdempotencyKeyV1,
     /// Reference to the effect execution journal for post-effect
-    /// completion recording (TCK-00501).
+    /// completion recording (RFC-0032::REQ-0176).
     ///
     /// The caller MUST call `record_completed(request_id)` after
     /// successful effect execution to transition the journal state
@@ -1428,7 +1430,7 @@ pub struct AdmissionResultV1 {
     pub effect_journal: Option<std::sync::Arc<dyn super::effect_journal::EffectJournal>>,
     /// Pre-built journal binding data for the caller to call
     /// `record_started` at the true pre-dispatch boundary
-    /// (TCK-00501 SEC-MAJOR-1 fix).
+    /// (RFC-0032::REQ-0176 SEC-MAJOR-1 fix).
     ///
     /// The caller MUST call `journal.record_started(&binding)` just
     /// before the actual effect dispatch (`broker.execute()` for tool
@@ -1552,7 +1554,7 @@ pub enum AdmitError {
         /// Bounded reason string.
         reason: String,
     },
-    /// Post-effect witness evidence is missing or invalid (TCK-00497).
+    /// Post-effect witness evidence is missing or invalid (RFC-0020::REQ-0058).
     ///
     /// For fail-closed tiers, output release is denied when witness
     /// evidence is missing, incomplete, or fails validation.
@@ -1560,7 +1562,7 @@ pub enum AdmitError {
         /// Bounded reason string.
         reason: String,
     },
-    /// Boundary output release denied (TCK-00497).
+    /// Boundary output release denied (RFC-0020::REQ-0058).
     ///
     /// Fail-closed tiers deny output release when post-effect witness
     /// evidence is missing or invalid. The output remains held.
@@ -1568,7 +1570,7 @@ pub enum AdmitError {
         /// Bounded reason string.
         reason: String,
     },
-    /// Monitor-tier witness waiver is invalid (TCK-00497).
+    /// Monitor-tier witness waiver is invalid (RFC-0020::REQ-0058).
     ///
     /// Monitor tiers require an explicit waiver to bypass witness
     /// enforcement. This error is raised when the waiver is missing,

@@ -356,12 +356,12 @@ pub struct PolicyResolvedForChangeSet {
     pub resolver_version: String,
 
     /// BLAKE3 hash of the authoritative `RoleSpecV2` contract (32 bytes,
-    /// TCK-00448).
+    /// RFC-0032::REQ-0169).
     #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub role_spec_hash: Vec<u8>,
 
     /// BLAKE3 hash of the compiled context recipe lineage artifact (32 bytes,
-    /// TCK-00448).
+    /// RFC-0032::REQ-0169).
     #[serde(with = "serde_bytes", default, skip_serializing_if = "Vec::is_empty")]
     pub context_pack_recipe_hash: Vec<u8>,
 
@@ -602,11 +602,11 @@ impl PolicyResolvedForChangeSet {
         bytes.extend_from_slice(&(self.resolver_version.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.resolver_version.as_bytes());
 
-        // 11. role_spec_hash (TCK-00448, length-prefixed)
+        // 11. role_spec_hash (RFC-0032::REQ-0169, length-prefixed)
         bytes.extend_from_slice(&(self.role_spec_hash.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&self.role_spec_hash);
 
-        // 12. context_pack_recipe_hash (TCK-00448, length-prefixed)
+        // 12. context_pack_recipe_hash (RFC-0032::REQ-0169, length-prefixed)
         bytes.extend_from_slice(&(self.context_pack_recipe_hash.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&self.context_pack_recipe_hash);
 
@@ -898,14 +898,14 @@ impl PolicyResolvedForChangeSetBuilder {
         self
     }
 
-    /// Sets the authoritative `RoleSpecV2` hash (TCK-00448).
+    /// Sets the authoritative `RoleSpecV2` hash (RFC-0032::REQ-0169).
     #[must_use]
     pub fn role_spec_hash(mut self, hash: [u8; 32]) -> Self {
         self.role_spec_hash = hash.to_vec();
         self
     }
 
-    /// Sets the authoritative context recipe lineage hash (TCK-00448).
+    /// Sets the authoritative context recipe lineage hash (RFC-0032::REQ-0169).
     #[must_use]
     pub fn context_pack_recipe_hash(mut self, hash: [u8; 32]) -> Self {
         self.context_pack_recipe_hash = hash.to_vec();

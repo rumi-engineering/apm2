@@ -87,24 +87,24 @@ pub const MAX_ERROR_MESSAGE_LEN: usize = 4096;
 /// We use 255 to allow for some flexibility while still preventing abuse.
 pub const MAX_HOST_LEN: usize = 255;
 
-/// Maximum length for git operation names (TCK-00292).
+/// Maximum length for git operation names (RFC-0032::REQ-0094).
 ///
 /// Git operations are short strings like "status", "push", "commit", etc.
 /// The longest standard git command is "cherry-pick" at 11 characters.
 /// We use 32 to allow for reasonable extension while preventing abuse.
 pub const MAX_GIT_OPERATION_LEN: usize = 32;
 
-/// Maximum length for `ListFiles` pattern (TCK-00315).
+/// Maximum length for `ListFiles` pattern (RFC-0032::REQ-0109).
 pub const MAX_LIST_FILES_PATTERN_LEN: usize = 256;
 
-/// Maximum length for Search query (TCK-00315).
+/// Maximum length for Search query (RFC-0032::REQ-0109).
 pub const MAX_SEARCH_QUERY_LEN: usize = 1024;
 
 /// Maximum size for inline tool results (bytes).
 ///
-/// TCK-00316: Security - enforces `DoS` protection per SEC-CTRL-FAC-0015.
-/// Inline results larger than this limit MUST be stored in CAS and
-/// referenced via `result_hash`. This prevents memory exhaustion from
+/// RFC-0032::REQ-0110: Security - enforces `DoS` protection per
+/// SEC-CTRL-FAC-0015. Inline results larger than this limit MUST be stored in
+/// CAS and referenced via `result_hash`. This prevents memory exhaustion from
 /// large tool outputs being held inline in IPC messages.
 pub const MAX_INLINE_RESULT_SIZE: usize = 64 * 1024; // 64 KB
 
@@ -161,12 +161,12 @@ pub struct BrokerToolRequest {
 
     /// Optional shell command for Execute operations.
     ///
-    /// Per TCK-00254, when the tool class is Execute and the manifest has
-    /// a `shell_allowlist` configured, this field MUST be present for
+    /// Per RFC-0032::REQ-0070, when the tool class is Execute and the manifest
+    /// has a `shell_allowlist` configured, this field MUST be present for
     /// validation.
     pub shell_command: Option<String>,
 
-    /// Optional git operation for Git tool class (TCK-00292).
+    /// Optional git operation for Git tool class (RFC-0032::REQ-0094).
     ///
     /// When the tool class is Git, this field MUST be present to specify the
     /// exact git operation (e.g., "status", "push", "commit"). This prevents
@@ -177,10 +177,10 @@ pub struct BrokerToolRequest {
     /// branch, checkout, merge, rebase, pull, reset, stash, tag, remote.
     pub git_operation: Option<String>,
 
-    /// Optional pattern for `ListFiles` (TCK-00315).
+    /// Optional pattern for `ListFiles` (RFC-0032::REQ-0109).
     pub pattern: Option<String>,
 
-    /// Optional query for Search (TCK-00315).
+    /// Optional query for Search (RFC-0032::REQ-0109).
     pub query: Option<String>,
 
     /// Optional artifact hash for Artifact tool class.
@@ -189,7 +189,7 @@ pub struct BrokerToolRequest {
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 
-    /// Optional epoch seal for admission validation (TCK-00365).
+    /// Optional epoch seal for admission validation (RFC-0020::REQ-0019).
     ///
     /// When present, this seal is consumed by the `verify_epoch_seal` admission
     /// step. Tier2+ requests require a valid epoch seal; Tier0/Tier1 pass
@@ -197,7 +197,8 @@ pub struct BrokerToolRequest {
     /// to track monotonicity and detect equivocation.
     pub epoch_seal: Option<EpochSealV1>,
 
-    /// Optional typed tool operation for precondition enforcement (TCK-00377).
+    /// Optional typed tool operation for precondition enforcement
+    /// (RFC-0020::REQ-0031).
     ///
     /// When present, the broker evaluates idempotency preconditions declared
     /// on this `ToolKind` **before** proceeding with capability/policy checks.
@@ -209,7 +210,7 @@ pub struct BrokerToolRequest {
     /// [`with_tool_kind`](Self::with_tool_kind).
     pub tool_kind: Option<apm2_core::tool::ToolKind>,
 
-    /// Idempotency key for external deduplication (TCK-00501).
+    /// Idempotency key for external deduplication (RFC-0032::REQ-0176).
     ///
     /// Derived from `RequestId` + AJC ID in the admission kernel. External
     /// systems that support idempotency keys should use this to deduplicate
@@ -274,7 +275,7 @@ pub enum RequestValidationError {
         max: usize,
     },
 
-    /// Git operation exceeds maximum length (TCK-00292).
+    /// Git operation exceeds maximum length (RFC-0032::REQ-0094).
     GitOperationTooLong {
         /// Actual length.
         len: usize,
@@ -282,7 +283,7 @@ pub enum RequestValidationError {
         max: usize,
     },
 
-    /// `ListFiles` pattern exceeds maximum length (TCK-00315).
+    /// `ListFiles` pattern exceeds maximum length (RFC-0032::REQ-0109).
     PatternTooLong {
         /// Actual length.
         len: usize,
@@ -290,7 +291,7 @@ pub enum RequestValidationError {
         max: usize,
     },
 
-    /// Search query exceeds maximum length (TCK-00315).
+    /// Search query exceeds maximum length (RFC-0032::REQ-0109).
     QueryTooLong {
         /// Actual length.
         len: usize,
@@ -408,16 +409,16 @@ impl BrokerToolRequest {
 
     /// Sets the shell command for Execute operations.
     ///
-    /// Per TCK-00254, when the tool class is Execute and `shell_allowlist` is
-    /// configured, this field is required for validation (fail-closed
-    /// semantics).
+    /// Per RFC-0032::REQ-0070, when the tool class is Execute and
+    /// `shell_allowlist` is configured, this field is required for
+    /// validation (fail-closed semantics).
     #[must_use]
     pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
         self.shell_command = Some(command.into());
         self
     }
 
-    /// Sets the git operation for Git tool class (TCK-00292).
+    /// Sets the git operation for Git tool class (RFC-0032::REQ-0094).
     ///
     /// This field MUST be set when the tool class is Git to ensure proper
     /// policy evaluation. Without this, the request will be denied to prevent
@@ -433,14 +434,14 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the pattern for `ListFiles` (TCK-00315).
+    /// Sets the pattern for `ListFiles` (RFC-0032::REQ-0109).
     #[must_use]
     pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.pattern = Some(pattern.into());
         self
     }
 
-    /// Sets the query for Search (TCK-00315).
+    /// Sets the query for Search (RFC-0032::REQ-0109).
     #[must_use]
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
@@ -454,7 +455,7 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the epoch seal for admission verification (TCK-00365).
+    /// Sets the epoch seal for admission verification (RFC-0020::REQ-0019).
     ///
     /// When set, the broker admission path will consume this seal during
     /// `verify_epoch_seal`. Tier2+ requests require a valid seal; Tier0/Tier1
@@ -465,7 +466,8 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the typed tool operation for precondition enforcement (TCK-00377).
+    /// Sets the typed tool operation for precondition enforcement
+    /// (RFC-0020::REQ-0031).
     ///
     /// When set, the broker evaluates idempotency preconditions declared on
     /// this `ToolKind` before executing the tool. If the precondition fails,
@@ -476,7 +478,8 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the idempotency key for external deduplication (TCK-00501).
+    /// Sets the idempotency key for external deduplication
+    /// (RFC-0032::REQ-0176).
     ///
     /// When set, external systems that support idempotency keys can use
     /// this to deduplicate effect execution during crash-recovery
@@ -535,7 +538,7 @@ impl BrokerToolRequest {
                 });
             }
         }
-        // Validate shell command length (TCK-00254: boundedness check)
+        // Validate shell command length (RFC-0032::REQ-0070: boundedness check)
         if let Some(ref command) = self.shell_command {
             if command.len() > MAX_SHELL_PATTERN_LEN {
                 return Err(RequestValidationError::ShellCommandTooLong {
@@ -544,7 +547,7 @@ impl BrokerToolRequest {
                 });
             }
         }
-        // Validate git operation length (TCK-00292: boundedness check)
+        // Validate git operation length (RFC-0032::REQ-0094: boundedness check)
         if let Some(ref operation) = self.git_operation {
             if operation.len() > MAX_GIT_OPERATION_LEN {
                 return Err(RequestValidationError::GitOperationTooLong {
@@ -553,7 +556,7 @@ impl BrokerToolRequest {
                 });
             }
         }
-        // Validate ListFiles pattern length (TCK-00315: boundedness check)
+        // Validate ListFiles pattern length (RFC-0032::REQ-0109: boundedness check)
         if let Some(ref pattern) = self.pattern {
             if pattern.len() > MAX_LIST_FILES_PATTERN_LEN {
                 return Err(RequestValidationError::PatternTooLong {
@@ -562,7 +565,7 @@ impl BrokerToolRequest {
                 });
             }
         }
-        // Validate Search query length (TCK-00315: boundedness check)
+        // Validate Search query length (RFC-0032::REQ-0109: boundedness check)
         if let Some(ref query) = self.query {
             if query.len() > MAX_SEARCH_QUERY_LEN {
                 return Err(RequestValidationError::QueryTooLong {
@@ -587,7 +590,7 @@ impl BrokerToolRequest {
         if let Some((ref host, port)) = self.network {
             req = req.with_network(host.clone(), port);
         }
-        // TCK-00254: Include shell_command for Execute operations
+        // RFC-0032::REQ-0070: Include shell_command for Execute operations
         if let Some(ref command) = self.shell_command {
             req = req.with_shell_command(command.clone());
         }
@@ -595,7 +598,7 @@ impl BrokerToolRequest {
     }
 
     /// Converts to a core `ToolRequest` for policy engine evaluation
-    /// (TCK-00292).
+    /// (RFC-0032::REQ-0094).
     ///
     /// This enables the real `PolicyEngine` from `apm2-core` to evaluate broker
     /// requests.
@@ -689,7 +692,7 @@ impl BrokerToolRequest {
                     max_lines: 0,
                 })
             }),
-            // TCK-00292: Fail-closed for unknown tool classes.
+            // RFC-0032::REQ-0094: Fail-closed for unknown tool classes.
             // Unknown ToolClass variants return None, which triggers MISSING_TOOL
             // denial in the core policy engine. This prevents fail-open
             // vulnerabilities where unknown tool classes could be incorrectly
@@ -904,7 +907,7 @@ impl AsRef<str> for DedupeKey {
 ///
 /// Moved from `consume.rs` to support `ToolDecision::Terminate`.
 ///
-/// # TCK-00385: Extended Termination Details
+/// # RFC-0032::REQ-0139: Extended Termination Details
 ///
 /// Extended with `exit_code`, `terminated_at_ns`, and `actual_tokens_consumed`
 /// fields to support the session termination signal protocol. These fields
@@ -925,19 +928,19 @@ pub struct SessionTerminationInfo {
     /// Exit classification (SUCCESS, FAILURE, etc.).
     pub exit_classification: String,
 
-    /// Process exit code (TCK-00385).
+    /// Process exit code (RFC-0032::REQ-0139).
     ///
     /// `Some(0)` indicates clean exit; non-zero indicates abnormal termination.
     /// `None` when exit code is not available (e.g., killed by signal).
     pub exit_code: Option<i32>,
 
     /// Timestamp when the session terminated, in nanoseconds since epoch
-    /// (TCK-00385).
+    /// (RFC-0032::REQ-0139).
     ///
     /// Set automatically by [`Self::new`] using the system clock.
     pub terminated_at_ns: u64,
 
-    /// Actual tokens consumed by the agent adapter (TCK-00385).
+    /// Actual tokens consumed by the agent adapter (RFC-0032::REQ-0139).
     ///
     /// `None` when token tracking is not available from the adapter.
     pub actual_tokens_consumed: Option<u64>,
@@ -983,7 +986,7 @@ impl SessionTerminationInfo {
 }
 
 // =============================================================================
-// Credential (TCK-00262)
+// Credential (RFC-0032::REQ-0078)
 // =============================================================================
 
 /// Opaque credential wrapper for secure handling in broker decisions.
@@ -1045,9 +1048,10 @@ impl fmt::Debug for Credential {
 
 impl PartialEq for Credential {
     fn eq(&self, other: &Self) -> bool {
-        // TCK-00262: Use constant-time comparison to prevent timing side-channel
-        // attacks. Although credentials are primarily compared in test contexts,
-        // we use constant-time comparison as a defense-in-depth measure.
+        // RFC-0032::REQ-0078: Use constant-time comparison to prevent timing
+        // side-channel attacks. Although credentials are primarily compared in
+        // test contexts, we use constant-time comparison as a defense-in-depth
+        // measure.
         let a = self.0.expose_secret().as_bytes();
         let b = other.0.expose_secret().as_bytes();
 
@@ -1064,14 +1068,14 @@ impl PartialEq for Credential {
 impl Eq for Credential {}
 
 // =============================================================================
-// SessionContext (TCK-00263)
+// SessionContext (RFC-0032::REQ-0079)
 // =============================================================================
 
 /// Session context for broker-mediated credential access.
 ///
-/// Per TCK-00263 code review, session-specific state MUST NOT be stored in the
-/// `ToolBroker` struct to prevent cross-session credential leaks. Instead, the
-/// daemon passes session context to each `request()` call.
+/// Per RFC-0032::REQ-0079 code review, session-specific state MUST NOT be
+/// stored in the `ToolBroker` struct to prevent cross-session credential leaks.
+/// Instead, the daemon passes session context to each `request()` call.
 ///
 /// # Security
 ///
@@ -1098,13 +1102,13 @@ impl Eq for Credential {}
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext {
-    /// GitHub App installation ID for this session (TCK-00262).
+    /// GitHub App installation ID for this session (RFC-0032::REQ-0078).
     ///
     /// When set, Git/Network tool requests will use this installation ID
     /// to fetch credentials from the GitHub credential store.
     pub github_installation_id: Option<String>,
 
-    /// Session ID for SSH credential lookups (TCK-00263).
+    /// Session ID for SSH credential lookups (RFC-0032::REQ-0079).
     ///
     /// When set, Git tool requests will first try to look up a per-session
     /// `SSH_AUTH_SOCK` path from the keychain before falling back to the
@@ -1153,7 +1157,8 @@ impl SessionContext {
 // VerifiedToolContent
 // =============================================================================
 
-/// TOCTOU-verified file content for a single broker request (TCK-00375).
+/// TOCTOU-verified file content for a single broker request
+/// (RFC-0020::REQ-0029).
 ///
 /// Keys are normalized manifest-style paths. Values are the exact bytes that
 /// were hash-verified against the context manifest and are therefore safe to
@@ -1186,7 +1191,7 @@ impl VerifiedToolContent {
 // BrokerResponse
 // =============================================================================
 
-/// Atomic broker response for a single request (TCK-00375).
+/// Atomic broker response for a single request (RFC-0020::REQ-0029).
 ///
 /// This keeps the decision, request-scoped defects, and verified content
 /// together to prevent cross-request attribution drift.
@@ -1283,7 +1288,8 @@ pub enum ToolDecision {
         /// Resource budget to charge for this operation.
         budget_delta: BudgetDelta,
 
-        /// Optional credential for authenticated operations (TCK-00262).
+        /// Optional credential for authenticated operations
+        /// (RFC-0032::REQ-0078).
         ///
         /// Per RFC-0017 TB-003, credentials are held by the daemon and
         /// mediated through the broker. When present, this credential
@@ -1466,10 +1472,10 @@ impl BudgetDelta {
 /// This captures the output, timing, and resource usage of a completed tool
 /// invocation. Results are stored in the dedupe cache for idempotent replay.
 ///
-/// Per RFC-0016 (HTF) and TCK-00240, tool results include an optional
+/// Per RFC-0016 (HTF) and RFC-0016::REQ-0002, tool results include an optional
 /// `time_envelope_ref` for temporal ordering and causality tracking.
 ///
-/// # CAS Result Hash (TCK-00320)
+/// # CAS Result Hash (RFC-0032::REQ-0114)
 ///
 /// Per SEC-CTRL-FAC-0015, the `result_hash` field provides a CAS reference to
 /// the full `ToolResultData`. This is distinct from `output_hash` (truncation
@@ -1511,7 +1517,7 @@ pub struct ToolResult {
     /// `ToolResultData`.
     pub output_hash: Option<Hash>,
 
-    /// CAS hash of the full `ToolResultData` (TCK-00320).
+    /// CAS hash of the full `ToolResultData` (RFC-0032::REQ-0114).
     ///
     /// This is the BLAKE3 hash of the serialized `ToolResultData` stored in
     /// the content-addressed store. Clients can use this hash to retrieve
@@ -1542,8 +1548,8 @@ pub struct ToolResult {
 
     /// Reference to the `TimeEnvelope` for this result (RFC-0016 HTF).
     ///
-    /// Per TCK-00240, tool results include a time envelope reference for
-    /// temporal ordering and causality tracking.
+    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference
+    /// for temporal ordering and causality tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_envelope_ref: Option<TimeEnvelopeRef>,
 
@@ -1578,7 +1584,7 @@ impl ToolResult {
             success: true,
             output,
             output_hash,
-            result_hash: None, // TCK-00320: Set via with_result_hash() after CAS store
+            result_hash: None, // RFC-0032::REQ-0114: Set via with_result_hash() after CAS store
             error_message: None,
             exit_code: Some(0),
             budget_consumed,
@@ -1609,7 +1615,7 @@ impl ToolResult {
             success: false,
             output: Vec::new(),
             output_hash: None,
-            result_hash: None, // TCK-00320: Set via with_result_hash() after CAS store
+            result_hash: None, // RFC-0032::REQ-0114: Set via with_result_hash() after CAS store
             error_message: Some(error),
             exit_code,
             budget_consumed,
@@ -1622,8 +1628,8 @@ impl ToolResult {
 
     /// Sets the time envelope for this result (RFC-0016 HTF).
     ///
-    /// Per TCK-00240, tool results include a time envelope reference for
-    /// temporal ordering and causality tracking. Both the preimage and
+    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference
+    /// for temporal ordering and causality tracking. Both the preimage and
     /// reference are stored for verifiability.
     #[must_use]
     pub fn with_time_envelope(
@@ -1654,7 +1660,7 @@ impl ToolResult {
         self.time_envelope.as_ref()
     }
 
-    /// Sets the CAS result hash for this result (TCK-00320).
+    /// Sets the CAS result hash for this result (RFC-0032::REQ-0114).
     ///
     /// This is the hash of the full `ToolResultData` stored in the content-
     /// addressed store, which includes output, `error_output`, and budget.
@@ -1672,7 +1678,7 @@ impl ToolResult {
         self
     }
 
-    /// Returns the CAS result hash for this result (TCK-00320).
+    /// Returns the CAS result hash for this result (RFC-0032::REQ-0114).
     ///
     /// The result hash is the BLAKE3 hash of the serialized `ToolResultData`
     /// stored in CAS. Use this to retrieve the full execution data or to
@@ -1715,7 +1721,7 @@ struct ToolResultProto {
     // Tag 9: time_envelope_ref - INCLUDED for temporal ordering (RFC-0016 HTF)
     #[prost(bytes = "vec", optional, tag = "9")]
     time_envelope_ref: Option<Vec<u8>>,
-    // Tag 10: result_hash - CAS hash of ToolResultData (TCK-00320)
+    // Tag 10: result_hash - CAS hash of ToolResultData (RFC-0032::REQ-0114)
     #[prost(bytes = "vec", optional, tag = "10")]
     result_hash: Option<Vec<u8>>,
 }
@@ -1757,7 +1763,7 @@ impl ToolResult {
                 .time_envelope_ref
                 .as_ref()
                 .map(|r| r.as_bytes().to_vec()),
-            // Include result_hash for CAS reference (TCK-00320)
+            // Include result_hash for CAS reference (RFC-0032::REQ-0114)
             result_hash: self.result_hash.map(|h| h.to_vec()),
         };
         proto.encode_to_vec()
@@ -2315,7 +2321,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Credential Tests (TCK-00262)
+    // Credential Tests (RFC-0032::REQ-0078)
     // =========================================================================
 
     #[test]
@@ -2373,7 +2379,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00292: Git Operation Fail-Closed Tests
+    // RFC-0032::REQ-0094: Git Operation Fail-Closed Tests
     // =========================================================================
 
     #[test]
@@ -2475,7 +2481,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00292: Unknown Tool Class Fail-Closed Tests
+    // RFC-0032::REQ-0094: Unknown Tool Class Fail-Closed Tests
     // =========================================================================
 
     // Note: We cannot easily test the catch-all `_ =>` branch since all ToolClass
@@ -2632,7 +2638,7 @@ mod tests {
     }
 
     // =========================================================================
-    // TCK-00320: Tool Result Hash Propagation Tests
+    // RFC-0032::REQ-0114: Tool Result Hash Propagation Tests
     // =========================================================================
 
     #[test]

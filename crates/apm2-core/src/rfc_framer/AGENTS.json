@@ -1,0 +1,54 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/rfc_framer",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-RFCF-001",
+      "kind": "safety",
+      "title": "PathTraversalError returned for any PRD or RFC ID containing /, \\, or ..",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-002",
+      "kind": "safety",
+      "title": "FileTooLarge enforces 10 MB maximum on all input files",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-003",
+      "kind": "invariant",
+      "title": "Section filename() returns a stable deterministic filename for each section type",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-004",
+      "kind": "invariant",
+      "title": "all() returns all 10 section types in canonical order (00 through 09)",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-005",
+      "kind": "invariant",
+      "title": "RfcFrame sections always contains exactly 10 elements sorted by filename",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-006",
+      "kind": "invariant",
+      "title": "ccp_index_hash is the first 7 hex chars of the BLAKE3 hash of CCP index content",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-007",
+      "kind": "invariant",
+      "title": "component_references sorted by id for deterministic output",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CORE-RFCF-008",
+      "kind": "requirement",
+      "title": "Atomic writes: all section files use write-then-rename for crash safety",
+      "rfc": ["RFC-0019"]
+    }
+  ]
+}

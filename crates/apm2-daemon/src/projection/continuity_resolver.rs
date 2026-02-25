@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00507)
+// AGENT-AUTHORED (RFC-0033::REQ-0065)
 //! Continuity profile and sink snapshot resolution for economics gate
 //! input assembly.
 //!
@@ -121,7 +121,7 @@ pub struct ResolvedContinuityWindow {
 // ConfigBackedResolver
 // ============================================================================
 
-/// Config-backed continuity profile resolver (TCK-00507).
+/// Config-backed continuity profile resolver (RFC-0033::REQ-0065).
 ///
 /// Loads projection sink profiles from daemon TOML configuration at
 /// construction time. All trusted signer keys are pre-decoded and
@@ -608,7 +608,7 @@ mod tests {
     // ===================================================================
 
     /// Creates a valid baseline sink config for use as the second sink in
-    /// tests, satisfying the >= 2 sinks requirement (TCK-00502).
+    /// tests, satisfying the >= 2 sinks requirement (RFC-0032::REQ-0177).
     fn make_valid_baseline_sink() -> (String, ProjectionSinkProfileConfig) {
         (
             "baseline-secondary".to_string(),
@@ -783,7 +783,7 @@ mod tests {
     // ===================================================================
 
     /// UT-00507-17: Sink profile parsed from TOML and resolved correctly.
-    /// TCK-00502: requires >= 2 sinks for multi-sink continuity.
+    /// RFC-0032::REQ-0177: requires >= 2 sinks for multi-sink continuity.
     #[test]
     fn toml_sink_profile_round_trip() {
         let key_hex = valid_test_key_hex();
@@ -842,7 +842,8 @@ mod tests {
     }
 
     /// UT-00507-18: Malformed hex key in TOML causes startup failure.
-    /// TCK-00502: requires >= 2 sinks, so a valid secondary is included.
+    /// RFC-0032::REQ-0177: requires >= 2 sinks, so a valid secondary is
+    /// included.
     #[test]
     fn toml_malformed_key_fails_at_parse_time() {
         let key_hex_2 = valid_test_key_hex_2();

@@ -1,0 +1,83 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/cac",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-CAC-001",
+      "kind": "invariant",
+      "title": "Schema validated at CacValidator construction time",
+      "description": "JSON Schema is validated at construction time; invalid schemas cause new() to return Err(InvalidSchema).",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-002",
+      "kind": "safety",
+      "title": "Size limits checked before schema validation (DoS prevention)",
+      "description": "Size limits are checked before expensive schema validation to prevent denial-of-service attacks via maliciously large inputs.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-003",
+      "kind": "safety",
+      "title": "Unknown fields rejected via unevaluatedProperties",
+      "description": "Unknown fields are rejected when schema uses unevaluatedProperties: false, providing defense-in-depth against schema evolution attacks.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-004",
+      "kind": "invariant",
+      "title": "DCP stable IDs must be unique with collision detection",
+      "description": "Stable IDs must be unique within the DcpIndex. Collision detection prevents duplicate registrations.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-005",
+      "kind": "invariant",
+      "title": "Reserved prefixes require authorization",
+      "description": "Reserved prefixes (cac:, bootstrap:, internal:) require authorization and are enforced at admission time.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-006",
+      "kind": "invariant",
+      "title": "Content hash must be valid 64-char hex BLAKE3 hash",
+      "description": "DcpEntry content_hash must be a valid 64-character hex BLAKE3 hash.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-007",
+      "kind": "requirement",
+      "title": "ContextPackCompiler cycle detection via Tarjan SCC",
+      "description": "Cycle detection uses Tarjan's SCC algorithm for O(V+E) complexity. compile() returns CycleDetected error with full cycle path.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-008",
+      "kind": "invariant",
+      "title": "Compiled manifest entries sorted for determinism",
+      "description": "Manifest entries are sorted by stable_id for determinism. Same input spec always produces identical manifest bytes.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-009",
+      "kind": "requirement",
+      "title": "TypedQuantity arithmetic rejects unit mismatches",
+      "description": "Operations between quantities with different units return UnitMismatch error. Checked operations return errors on overflow, never panic.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-010",
+      "kind": "invariant",
+      "title": "Conformance overall_passed reflects all test results",
+      "description": "ExportReceipt overall_passed is true if and only if all conformance tests passed.",
+      "rfc": ["RFC-0011"]
+    },
+    {
+      "id": "BEH-CORE-CAC-011",
+      "kind": "safety",
+      "title": "DCP ID must not contain control characters",
+      "description": "DCP IDs must not contain control characters to prevent metadata injection. ID length and character safety are validated before any expensive operations.",
+      "rfc": ["RFC-0011"]
+    }
+  ]
+}

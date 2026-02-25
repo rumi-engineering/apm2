@@ -1,0 +1,48 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/log",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-LOG-001",
+      "kind": "invariant",
+      "title": "merge_stderr true redirects stderr to stdout destination",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-002",
+      "kind": "invariant",
+      "title": "Default rotation max_size is 10 MiB",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-003",
+      "kind": "invariant",
+      "title": "Log timestamps always in UTC",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-004",
+      "kind": "invariant",
+      "title": "Consecutive success/failure counters are mutually exclusive",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-005",
+      "kind": "invariant",
+      "title": "Built-in secret patterns detect common API keys, tokens, credentials",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-006",
+      "kind": "invariant",
+      "title": "Redaction returns Cow::Borrowed when no redaction needed (zero-copy)",
+      "rfc": ["RFC-0013"]
+    },
+    {
+      "id": "BEH-CORE-LOG-007",
+      "kind": "requirement",
+      "title": "Redact is infallible: always returns a valid string",
+      "rfc": ["RFC-0013"]
+    }
+  ]
+}

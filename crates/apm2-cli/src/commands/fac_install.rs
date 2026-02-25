@@ -1,4 +1,4 @@
-// AGENT-AUTHORED (TCK-00625)
+// AGENT-AUTHORED (RFC-0032::REQ-0256)
 //! FAC Install: enforce one canonical runtime binary path.
 //!
 //! Implements `apm2 fac install` which:
@@ -809,7 +809,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-1 regression: `ensure_symlink` failure on a
+    /// RFC-0032::REQ-0256 MAJOR-1 regression: `ensure_symlink` failure on a
     /// read-only directory causes an error, not silent success.
     #[cfg(unix)]
     #[test]
@@ -844,7 +844,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-1 atomicity regression: when the temp symlink
+    /// RFC-0032::REQ-0256 MAJOR-1 atomicity regression: when the temp symlink
     /// succeeds but rename fails (simulated via a read-only parent that
     /// already has the original symlink), the original symlink at dest
     /// MUST be preserved intact.
@@ -912,7 +912,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625: `ensure_symlink` successfully replaces an existing
+    /// RFC-0032::REQ-0256: `ensure_symlink` successfully replaces an existing
     /// symlink atomically (happy path).
     #[cfg(unix)]
     #[test]
@@ -948,7 +948,7 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-1 regression: When symlink creation fails,
+    /// RFC-0032::REQ-0256 MAJOR-1 regression: When symlink creation fails,
     /// `InstallResult.success` must be `false` and the error field must
     /// describe the symlink failure.
     #[test]
@@ -1009,9 +1009,9 @@ mod tests {
         );
     }
 
-    /// TCK-00625 MAJOR-1: Symlink failure must produce non-zero exit code
-    /// unless --allow-partial is set. This is a unit-level assertion that
-    /// the exit code logic is correct given the boolean states.
+    /// RFC-0032::REQ-0256 MAJOR-1: Symlink failure must produce non-zero exit
+    /// code unless --allow-partial is set. This is a unit-level assertion
+    /// that the exit code logic is correct given the boolean states.
     #[test]
     fn symlink_failure_exit_code_logic() {
         // When symlink fails and allow_partial is false: non-zero exit.

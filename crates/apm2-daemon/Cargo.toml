@@ -108,7 +108,7 @@ http-body-util.workspace = true
 # Database (persistent idempotency cache)
 rusqlite.workspace = true
 
-# Metrics / Observability (TCK-00268)
+# Metrics / Observability (RFC-0032::REQ-0084)
 prometheus.workspace = true
 
 # HTTP Server (metrics endpoint)
@@ -117,20 +117,20 @@ axum.workspace = true
 # Futures traits (for framed streams)
 futures = "0.3"
 
-# File locking for durable consume index (TCK-00426)
+# File locking for durable consume index (RFC-0020::REQ-0045)
 fs2 = "0.4"
 
-# O_NOFOLLOW for symlink-safe file opens (TCK-00537)
+# O_NOFOLLOW for symlink-safe file opens (RFC-0032::REQ-0193)
 libc.workspace = true
 
-# Atomic file writes with restrictive permissions (TCK-00502: anti-rollback anchor persistence)
+# Atomic file writes with restrictive permissions (RFC-0032::REQ-0177: anti-rollback anchor persistence)
 tempfile.workspace = true
 
 [dev-dependencies]
 # Testing utilities
 # Note: tempfile is also used in production (anti-rollback anchor atomic writes)
 # and is listed above in [dependencies].
-# Benchmarking (TCK-00269)
+# Benchmarking (RFC-0032::REQ-0282)
 criterion.workspace = true
 rand.workspace = true
 
@@ -151,7 +151,7 @@ workspace = true
 constructible_struct_adds_field = "allow"
 enum_variant_added = "allow"
 
-# Latency benchmarks for RFC-0017 (TCK-00269)
+# Latency benchmarks for RFC-0017 (RFC-0032::REQ-0282)
 # - BENCH-001: spawn_ack_latency <100ms p99
 # - BENCH-002: session_ready_latency <2s p99
 # - BENCH-003: tool_mediation_overhead <5ms p50
@@ -159,7 +159,7 @@ enum_variant_added = "allow"
 name = "latency_benchmarks"
 harness = false
 
-# Verifier cache amortization benchmark (TCK-00359)
+# Verifier cache amortization benchmark (RFC-0020::REQ-0013)
 [[bench]]
 name = "verifier_cache_bench"
 harness = false

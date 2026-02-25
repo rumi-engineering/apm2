@@ -63,7 +63,7 @@
       }
     ]
   },
-  "description": "APM2 Distributed Consensus Layer monitoring dashboard per RFC-0014 TCK-00193",
+  "description": "APM2 Distributed Consensus Layer monitoring dashboard per RFC-0014 RFC-0033::REQ-0053",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,

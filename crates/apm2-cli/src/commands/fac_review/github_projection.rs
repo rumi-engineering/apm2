@@ -2,7 +2,7 @@
 //!
 //! This module is the write boundary for GitHub projection operations.
 //! All `gh` CLI calls use [`apm2_core::fac::gh_command`] for non-interactive,
-//! lane-scoped auth (TCK-00597).
+//! lane-scoped auth (RFC-0032::REQ-0246).
 
 use std::io::Write;
 

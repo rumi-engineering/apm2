@@ -1,0 +1,96 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/tool",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-TOOL-001",
+      "kind": "invariant",
+      "title": "request_id must be non-empty and <= 256 characters",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-002",
+      "kind": "invariant",
+      "title": "session_token must be non-empty and <= 256 characters",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-003",
+      "kind": "invariant",
+      "title": "Exactly one tool variant must be specified per request",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-004",
+      "kind": "invariant",
+      "title": "Encoding is deterministic: same request produces identical bytes",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-005",
+      "kind": "invariant",
+      "title": "Decode-encode roundtrip preserves all fields exactly",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-006",
+      "kind": "safety",
+      "title": "Path must not contain null bytes or path traversal sequences (..)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-007",
+      "kind": "invariant",
+      "title": "FileRead limit must be <= 1 GB; FileWrite content <= 100 MB; FileEdit <= 10 MB",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-008",
+      "kind": "invariant",
+      "title": "FileWrite create_only and append cannot both be true (mutually exclusive)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-009",
+      "kind": "invariant",
+      "title": "ShellExec timeout_ms must be <= 3,600,000 (1 hour)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-010",
+      "kind": "invariant",
+      "title": "GitOperation operation must be one of the 18 allowed operations",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-011",
+      "kind": "invariant",
+      "title": "InferenceCall prompt_hash must be exactly 32 bytes (BLAKE3 hash)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-012",
+      "kind": "invariant",
+      "title": "ArtifactPublish content_hash must be exactly 32 bytes (BLAKE3 hash)",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-013",
+      "kind": "safety",
+      "title": "Repeated fields bounded to MAX_REPEATED_ITEMS (1000) for DoS protection",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-014",
+      "kind": "requirement",
+      "title": "Every ToolRequest receives exactly one ToolResponse with matching request_id",
+      "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-CORE-TOOL-015",
+      "kind": "requirement",
+      "title": "Validator returns all validation errors in a single call (not fail-fast)",
+      "rfc": ["RFC-0017"]
+    }
+  ]
+}

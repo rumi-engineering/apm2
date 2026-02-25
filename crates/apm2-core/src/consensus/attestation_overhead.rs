@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! Attestation overhead accounting contract and scale projection helpers
-//! (RFC-0020 §9.5.7, TCK-00372).
+//! (RFC-0020 §9.5.7, RFC-0020::REQ-0026).
 //!
 //! This module defines deterministic types for:
 //! - recording measured CPU/network p99 envelopes at a concrete effect scale,

@@ -1,5 +1,5 @@
-//! Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252, TCK-00260,
-//! TCK-00290).
+//! Session-scoped endpoint dispatcher for RFC-0017 IPC (RFC-0032::REQ-0068,
+//! RFC-0032::REQ-0076, RFC-0032::REQ-0092).
 //!
 //! This module implements the session-scoped endpoint dispatcher per DD-001 and
 //! RFC-0017. Session endpoints (RequestTool, EmitEvent, PublishEvidence,
@@ -7,7 +7,7 @@
 //! socket connections receive `SESSION_ERROR_PERMISSION_DENIED` for all session
 //! requests.
 //!
-//! # TCK-00260: Tool Broker with Capability Manifest Validation
+//! # RFC-0032::REQ-0076: Tool Broker with Capability Manifest Validation
 //!
 //! The `RequestTool` handler validates tool requests against capability
 //! manifests:
@@ -16,9 +16,9 @@
 //! - If not in allowlist: `SESSION_ERROR_TOOL_NOT_ALLOWED` (TOOL_NOT_ALLOWED)
 //! - Validation overhead target: <5ms p50
 //!
-//! # TCK-00290: Session Dispatcher Viability
+//! # RFC-0032::REQ-0092: Session Dispatcher Viability
 //!
-//! Per TCK-00290, this module implements:
+//! Per RFC-0032::REQ-0092, this module implements:
 //! - **RequestTool**: Wire to ToolBroker execution (no stub Allow path)
 //! - **EmitEvent**: Real ledger event persistence (no stub response)
 //! - **PublishEvidence**: Real CAS storage with content addressing
@@ -35,12 +35,15 @@
 //! - [INV-SESS-003] Operator connections blocked from session handlers
 //! - [INV-SESS-004] Token validation uses constant-time HMAC comparison
 //!   (CTR-WH001)
-//! - [INV-TCK-00260-001] Tool requests validated against capability manifest
-//! - [INV-TCK-00260-002] Empty tool_allowlist denies all tools (fail-closed)
-//! - [INV-TCK-00290-001] RequestTool requires manifest store (fail-closed)
-//! - [INV-TCK-00290-002] EmitEvent requires ledger (fail-closed)
-//! - [INV-TCK-00290-003] PublishEvidence requires CAS (fail-closed)
-//! - [INV-TCK-00290-004] StreamTelemetry disabled until implemented
+//! - [INV-RFC-0032::REQ-0076-001] Tool requests validated against capability
+//!   manifest
+//! - [INV-RFC-0032::REQ-0076-002] Empty tool_allowlist denies all tools
+//!   (fail-closed)
+//! - [INV-RFC-0032::REQ-0092-001] RequestTool requires manifest store
+//!   (fail-closed)
+//! - [INV-RFC-0032::REQ-0092-002] EmitEvent requires ledger (fail-closed)
+//! - [INV-RFC-0032::REQ-0092-003] PublishEvidence requires CAS (fail-closed)
+//! - [INV-RFC-0032::REQ-0092-004] StreamTelemetry disabled until implemented
 //!   (fail-closed)
 //!
 //! # Message Flow
@@ -189,9 +192,9 @@ pub enum SessionMessageType {
     PublishEvidence  = 3,
     /// `StreamTelemetry` request (IPC-SESS-004)
     StreamTelemetry  = 4,
-    /// `StreamLogs` request (IPC-SESS-005, TCK-00342)
+    /// `StreamLogs` request (IPC-SESS-005, RFC-0032::REQ-0132)
     StreamLogs       = 5,
-    /// `SessionStatus` request (IPC-SESS-006, TCK-00344)
+    /// `SessionStatus` request (IPC-SESS-006, RFC-0032::REQ-0134)
     SessionStatus    = 6,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
@@ -360,13 +363,13 @@ pub enum SessionResponse {
     PublishEvidence(PublishEvidenceResponse),
     /// Successful `StreamTelemetry` response.
     StreamTelemetry(StreamTelemetryResponse),
-    /// Successful `StreamLogs` response (TCK-00342).
+    /// Successful `StreamLogs` response (RFC-0032::REQ-0132).
     StreamLogs(StreamLogsResponse),
-    /// Successful `SessionStatus` response (TCK-00344).
+    /// Successful `SessionStatus` response (RFC-0032::REQ-0134).
     SessionStatus(SessionStatusResponse),
-    /// Successful `SubscribePulse` response (TCK-00302).
+    /// Successful `SubscribePulse` response (RFC-0032::REQ-0098).
     SubscribePulse(SubscribePulseResponse),
-    /// Successful `UnsubscribePulse` response (TCK-00302).
+    /// Successful `UnsubscribePulse` response (RFC-0032::REQ-0098).
     UnsubscribePulse(UnsubscribePulseResponse),
     /// Error response.
     Error(SessionError),
@@ -454,7 +457,7 @@ impl SessionResponse {
 }
 
 // ============================================================================
-// Manifest Store (TCK-00260)
+// Manifest Store (RFC-0032::REQ-0076)
 // ============================================================================
 
 /// Maximum length for `tool_id` in requests.
@@ -610,8 +613,8 @@ fn sanitize_error_message(msg: &str) -> String {
 
 /// Trait for looking up capability manifests by session ID.
 ///
-/// Per TCK-00260, the dispatcher needs to validate tool requests against
-/// the session's capability manifest. This trait abstracts the manifest
+/// Per RFC-0032::REQ-0076, the dispatcher needs to validate tool requests
+/// against the session's capability manifest. This trait abstracts the manifest
 /// storage to allow different implementations (in-memory, persistent, etc.).
 pub trait ManifestStore: Send + Sync {
     /// Retrieves the capability manifest for a session.
@@ -695,13 +698,13 @@ impl ManifestStore for InMemoryManifestStore {
 }
 
 // ============================================================================
-// TCK-00352: V1 Manifest Store (Security Review MAJOR 2)
+// RFC-0020::REQ-0006: V1 Manifest Store (Security Review MAJOR 2)
 // ============================================================================
 
 /// Thread-safe store for V1 capability manifests keyed by session ID.
 ///
-/// Per TCK-00352 Security Review MAJOR 2, V1 manifests must be wired into
-/// the production actuation path. This store is shared between the
+/// Per RFC-0020::REQ-0006 Security Review MAJOR 2, V1 manifests must be wired
+/// into the production actuation path. This store is shared between the
 /// `PrivilegedDispatcher` (which mints and registers V1 manifests during
 /// `SpawnEpisode`) and the `SessionDispatcher` (which enforces V1 scope
 /// checks during `RequestTool`).
@@ -793,14 +796,15 @@ const fn is_zero_hash(value: &Hash) -> bool {
     true
 }
 
-/// TCK-00489: Per-session quarantine quota.
+/// RFC-0020::REQ-0055: Per-session quarantine quota.
 ///
 /// Each session may use at most this fraction of the global quarantine
 /// capacity. This prevents a single adversarial session from exhausting the
 /// quarantine budget and starving other sessions.
 const PER_SESSION_QUARANTINE_QUOTA: usize = MAX_QUARANTINED_BOUNDARY_CHANNELS / 8;
 
-/// TCK-00489: Violation severity for priority-aware quarantine eviction.
+/// RFC-0020::REQ-0055: Violation severity for priority-aware quarantine
+/// eviction.
 ///
 /// Active unexpired quarantines with severity >= incoming entry's severity are
 /// never evicted. Only expired entries and lower-severity entries are
@@ -861,7 +865,7 @@ struct QuarantinedBoundaryChannel {
     reason: String,
     local_time_ref: Hash,
     local_window_ref: Hash,
-    /// TCK-00489: Violation severity for priority-aware eviction.
+    /// RFC-0020::REQ-0055: Violation severity for priority-aware eviction.
     severity: ViolationSeverity,
 }
 
@@ -875,8 +879,8 @@ impl QuarantinedBoundaryChannel {
     }
 }
 
-/// TCK-00489: Error returned when quarantine insertion is not possible due to
-/// saturation with no evictable entries.
+/// RFC-0020::REQ-0055: Error returned when quarantine insertion is not possible
+/// due to saturation with no evictable entries.
 ///
 /// Callers MUST deny the request when this error is returned (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -960,7 +964,8 @@ impl BoundaryChannelQuarantineState {
         removed_keys.len()
     }
 
-    /// TCK-00489: Count of quarantine entries belonging to a specific session.
+    /// RFC-0020::REQ-0055: Count of quarantine entries belonging to a specific
+    /// session.
     fn session_entry_count(&self, session_id: &str) -> usize {
         self.channels
             .values()
@@ -968,8 +973,9 @@ impl BoundaryChannelQuarantineState {
             .count()
     }
 
-    /// TCK-00489: Priority-aware quarantine insertion with saturation-safe
-    /// fail-closed semantics and per-session quota isolation.
+    /// RFC-0020::REQ-0055: Priority-aware quarantine insertion with
+    /// saturation-safe fail-closed semantics and per-session quota
+    /// isolation.
     ///
     /// # Eviction Strategy
     ///
@@ -1017,7 +1023,7 @@ impl BoundaryChannelQuarantineState {
             return Ok(true);
         }
 
-        // TCK-00489: Per-session quota isolation check.
+        // RFC-0020::REQ-0055: Per-session quota isolation check.
         let session_count = self.session_entry_count(&session_id);
         if session_count >= PER_SESSION_QUARANTINE_QUOTA {
             return Err(QuarantineInsertionError::PerSessionQuotaExceeded {
@@ -1027,7 +1033,7 @@ impl BoundaryChannelQuarantineState {
             });
         }
 
-        // TCK-00489: Priority-aware eviction when at capacity.
+        // RFC-0020::REQ-0055: Priority-aware eviction when at capacity.
         if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
             // Phase 1: Evict expired entries (oldest first via insertion order).
             let mut evicted_any_expired = false;
@@ -1074,7 +1080,7 @@ impl BoundaryChannelQuarantineState {
             // severity strictly less than the incoming severity. An entry
             // of equal severity is NOT evictable -- active unexpired
             // quarantines at the same or higher priority level are
-            // protected. This is the containment invariant from TCK-00489:
+            // protected. This is the containment invariant from RFC-0020::REQ-0055:
             // "Active quarantines (unexpired, triggered by MAJOR+
             // violations) are never evicted by lower-priority entries."
             if self.channels.len() >= MAX_QUARANTINED_BOUNDARY_CHANNELS {
@@ -1127,15 +1133,15 @@ impl BoundaryChannelQuarantineState {
 /// Routes incoming messages to the appropriate handler based on message type.
 /// Enforces session token validation before dispatching to any handler.
 ///
-/// # TCK-00260: Capability Manifest Validation
+/// # RFC-0032::REQ-0076: Capability Manifest Validation
 ///
 /// The dispatcher validates `RequestTool` requests against the session's
 /// capability manifest. If the tool is not in the manifest's `tool_allowlist`,
 /// `SESSION_ERROR_TOOL_NOT_ALLOWED` is returned.
 ///
-/// # TCK-00290: Real Handler Implementations
+/// # RFC-0032::REQ-0092: Real Handler Implementations
 ///
-/// Per TCK-00290, the dispatcher uses real backing stores:
+/// Per RFC-0032::REQ-0092, the dispatcher uses real backing stores:
 /// - **`RequestTool`**: Requires `manifest_store` (fail-closed without it)
 /// - **`EmitEvent`**: Requires `ledger` for persistent events (fail-closed)
 /// - **`PublishEvidence`**: Requires `cas` for artifact storage (fail-closed)
@@ -1144,15 +1150,15 @@ impl BoundaryChannelQuarantineState {
 ///
 /// # Security Contract
 ///
-/// Per INV-SESS-001 through INV-SESS-004 and INV-TCK-00260-001/002:
+/// Per INV-SESS-001 through INV-SESS-004 and INV-RFC-0032::REQ-0076-001/002:
 /// - All session endpoints require valid `session_token`
 /// - Token validation uses constant-time HMAC comparison (CTR-WH001)
 /// - Operator connections receive `SESSION_ERROR_PERMISSION_DENIED`
 /// - Invalid/expired tokens receive `SESSION_ERROR_INVALID`
-/// - Tool requests validated against capability manifest (TCK-00260)
+/// - Tool requests validated against capability manifest (RFC-0032::REQ-0076)
 /// - Empty `tool_allowlist` denies all tools (fail-closed)
 ///
-/// Per INV-TCK-00290-001 through INV-TCK-00290-004:
+/// Per INV-RFC-0032::REQ-0092-001 through INV-RFC-0032::REQ-0092-004:
 /// - `RequestTool` requires `ToolBroker` (fail-closed)
 /// - `EmitEvent` requires ledger (fail-closed)
 /// - `PublishEvidence` requires CAS (fail-closed)
@@ -1164,26 +1170,27 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     channel_context_signer: Arc<apm2_core::crypto::Signer>,
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
-    /// Manifest store for capability validation (TCK-00260).
+    /// Manifest store for capability validation (RFC-0032::REQ-0076).
     /// NOTE: This is retained for backwards compatibility with existing tests
     /// even though the broker now handles manifest validation.
     #[allow(dead_code)]
     manifest_store: Option<Arc<M>>,
-    /// Ledger event emitter for `EmitEvent` persistence (TCK-00290).
+    /// Ledger event emitter for `EmitEvent` persistence (RFC-0032::REQ-0092).
     ledger: Option<Arc<dyn LedgerEventEmitter>>,
-    /// Content-addressed store for `PublishEvidence` (TCK-00290).
+    /// Content-addressed store for `PublishEvidence` (RFC-0032::REQ-0092).
     cas: Option<Arc<dyn ContentAddressedStore>>,
-    /// Tool broker for `RequestTool` execution (TCK-00290).
+    /// Tool broker for `RequestTool` execution (RFC-0032::REQ-0092).
     ///
     /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
     /// `ToolResult` or Deny"
     broker: Option<SharedToolBroker<StubManifestLoader>>,
-    /// Per-session broker registry for capability/policy isolation (TCK-00401).
+    /// Per-session broker registry for capability/policy isolation
+    /// (RFC-0032::REQ-0153).
     ///
     /// When configured, `RequestTool` resolves the broker by `session_id`.
     /// Missing session brokers are denied fail-closed.
     session_brokers: Option<SharedSessionBrokerRegistry<StubManifestLoader>>,
-    /// Holonic clock for monotonic timestamps (TCK-00290).
+    /// Holonic clock for monotonic timestamps (RFC-0032::REQ-0092).
     ///
     /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
     /// violates time monotonicity guarantees.
@@ -1194,62 +1201,62 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Event sequence counter (per-session, monotonic).
     event_seq: AtomicU64,
     /// Subscription registry for HEF Pulse Plane resource governance
-    /// (TCK-00303).
+    /// (RFC-0032::REQ-0099).
     ///
     /// Tracks per-connection subscription state and enforces limits per
     /// RFC-0018. Shared with `PrivilegedDispatcher` to manage subscriptions
     /// across both operator and session sockets.
     subscription_registry: Option<super::resource_governance::SharedSubscriptionRegistry>,
-    /// Episode runtime for tool execution (TCK-00316).
+    /// Episode runtime for tool execution (RFC-0032::REQ-0110).
     ///
-    /// Per TCK-00316, this is required to execute tools kernel-side and return
-    /// durable result references.
+    /// Per RFC-0032::REQ-0110, this is required to execute tools kernel-side
+    /// and return durable result references.
     episode_runtime: Option<Arc<EpisodeRuntime>>,
-    /// Session registry for session status queries (TCK-00344).
+    /// Session registry for session status queries (RFC-0032::REQ-0134).
     ///
-    /// Per TCK-00344, the session registry is used to look up session state
-    /// for `SessionStatus` queries.
+    /// Per RFC-0032::REQ-0134, the session registry is used to look up session
+    /// state for `SessionStatus` queries.
     session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
     /// Session telemetry store for tracking tool calls, events emitted,
-    /// and session start time (TCK-00384).
+    /// and session start time (RFC-0032::REQ-0138).
     ///
-    /// Per TCK-00384, this store tracks per-session counters using atomic
-    /// operations. It is separate from the session registry because
+    /// Per RFC-0032::REQ-0138, this store tracks per-session counters using
+    /// atomic operations. It is separate from the session registry because
     /// `SessionState` must remain `Clone + Serialize + Deserialize`.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
-    /// Gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    /// Gate orchestrator for autonomous gate lifecycle (RFC-0032::REQ-0142).
     ///
     /// Gate start is publication-driven via
     /// [`GateOrchestrator::start_for_changeset`] (CSID-003). Session
     /// termination only triggers timeout polling.
     #[allow(dead_code)]
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
-    /// Pre-actuation gate for stop/budget checks (TCK-00351).
+    /// Pre-actuation gate for stop/budget checks (RFC-0020::REQ-0005).
     ///
     /// When set, every `RequestTool` invocation must pass through this gate
     /// before reaching the broker. The gate checks stop conditions and
     /// budget availability, returning a receipt that is embedded in the
     /// tool response.
     preactuation_gate: Option<Arc<crate::episode::preactuation::PreActuationGate>>,
-    /// Authoritative stop state for the daemon runtime (TCK-00351).
+    /// Authoritative stop state for the daemon runtime (RFC-0020::REQ-0005).
     ///
-    /// TCK-00351 BLOCKER 1 FIX: This provides the runtime stop flags
+    /// RFC-0020::REQ-0005 BLOCKER 1 FIX: This provides the runtime stop flags
     /// (emergency stop, governance stop) that the pre-actuation gate reads.
     /// When set, the gate ignores hardcoded false values and reads from
     /// this authority.
     stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
-    /// Per-session stop conditions store (TCK-00351 v3).
+    /// Per-session stop conditions store (RFC-0020::REQ-0005 v3).
     ///
-    /// TCK-00351 BLOCKER 1 v3 FIX: The pre-actuation gate was called with
-    /// `StopConditions::default()` and `current_episode_count=0`, meaning
-    /// `max_episodes` and `escalation_predicate` were never actually
-    /// checked.  This store holds real stop conditions per session, loaded
-    /// from the episode envelope at session spawn time.  The gate reads
-    /// from this store and passes real `current_episode_count` from the
-    /// session telemetry.
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3 FIX: The pre-actuation gate was called
+    /// with `StopConditions::default()` and `current_episode_count=0`,
+    /// meaning `max_episodes` and `escalation_predicate` were never
+    /// actually checked.  This store holds real stop conditions per
+    /// session, loaded from the episode envelope at session spawn time.
+    /// The gate reads from this store and passes real
+    /// `current_episode_count` from the session telemetry.
     stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
     /// Shared V1 manifest store for broker scope enforcement
-    /// (TCK-00352 Security Review MAJOR 2).
+    /// (RFC-0020::REQ-0006 Security Review MAJOR 2).
     ///
     /// When a session has a V1 manifest registered, the `handle_request_tool`
     /// path enforces V1 scope checks (risk tier ceiling, host restrictions,
@@ -1260,7 +1267,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
     /// so that `SpawnEpisode` can mint and register V1 manifests.
     v1_manifest_store: Option<SharedV1ManifestStore>,
-    /// PCAC lifecycle gate for authority lifecycle enforcement (TCK-00423).
+    /// PCAC lifecycle gate for authority lifecycle enforcement
+    /// (RFC-0020::REQ-0042).
     ///
     /// When set, every `RequestTool` invocation must pass through the
     /// lifecycle:
@@ -1270,7 +1278,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// In authoritative mode (`ledger` or `cas` configured), this gate is
     /// mandatory and missing wiring causes deny (fail-closed).
     pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
-    /// Sovereignty state for Tier2+ authority composition checks (TCK-00427).
+    /// Sovereignty state for Tier2+ authority composition checks
+    /// (RFC-0020::REQ-0046).
     ///
     /// When present and the lifecycle gate is configured with sovereignty
     /// checking, Tier2+ revalidation/consume stages enforce sovereignty epoch,
@@ -1278,8 +1287,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     sovereignty_state: Option<Arc<crate::pcac::SovereigntyState>>,
     /// Runtime taint policy for ingress checks on tool request arguments.
     ///
-    /// TCK-00406: Production ingress paths must evaluate taint flow and deny
-    /// forbidden flows before actuation.
+    /// RFC-0020::REQ-0030: Production ingress paths must evaluate taint flow
+    /// and deny forbidden flows before actuation.
     taint_policy: Arc<TaintPolicy>,
     /// Policy switch for strict boundary witness enforcement.
     ///
@@ -1291,7 +1300,7 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Violating channels are denied fail-closed until mitigation/clearance.
     boundary_channel_quarantine: Arc<Mutex<BoundaryChannelQuarantineState>>,
     /// `AdmissionKernel` for plan/execute-gated admission in authoritative mode
-    /// (TCK-00494, RFC-0019 REQ-0025).
+    /// (RFC-0032::REQ-0172, RFC-0019 REQ-0025).
     ///
     /// When set, `handle_request_tool` delegates all authority-bearing
     /// admission to `kernel.plan()` -> `kernel.execute()`. Effect execution
@@ -1456,8 +1465,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
     ///
     /// **Note**: This creates a dispatcher without backing stores. Per
-    /// TCK-00290, handlers will return fail-closed errors when their stores
-    /// are unavailable:
+    /// RFC-0032::REQ-0092, handlers will return fail-closed errors when their
+    /// stores are unavailable:
     /// - `RequestTool`: Returns `TOOL_NOT_ALLOWED` (no broker)
     /// - `EmitEvent`: Returns `SESSION_ERROR_INTERNAL` (no ledger)
     /// - `PublishEvidence`: Returns `SESSION_ERROR_INTERNAL` (no CAS)
@@ -1539,8 +1548,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
 impl<M: ManifestStore> SessionDispatcher<M> {
     /// Creates a dispatcher with a manifest store for capability validation.
     ///
-    /// Per TCK-00260, the manifest store is used to look up session capability
-    /// manifests for tool request validation.
+    /// Per RFC-0032::REQ-0076, the manifest store is used to look up session
+    /// capability manifests for tool request validation.
     #[must_use]
     pub fn with_manifest_store(token_minter: TokenMinter, manifest_store: Arc<M>) -> Self {
         Self {
@@ -1620,7 +1629,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Creates a fully-configured dispatcher with all backing stores
-    /// (TCK-00290).
+    /// (RFC-0032::REQ-0092).
     ///
     /// This is the production-ready constructor that configures all
     /// dependencies for real handler implementations:
@@ -1705,7 +1714,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the tool broker for `RequestTool` execution (TCK-00290).
+    /// Sets the tool broker for `RequestTool` execution (RFC-0032::REQ-0092).
     ///
     /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
     /// `ToolResult` or Deny"
@@ -1725,7 +1734,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the holonic clock for monotonic timestamps (TCK-00290).
+    /// Sets the holonic clock for monotonic timestamps (RFC-0032::REQ-0092).
     ///
     /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
     /// violates time monotonicity guarantees.
@@ -1746,7 +1755,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Sets the subscription registry for HEF Pulse Plane resource governance
-    /// (TCK-00303).
+    /// (RFC-0032::REQ-0099).
     ///
     /// The subscription registry tracks per-connection subscription state and
     /// enforces limits per RFC-0018. It should be shared with
@@ -1761,14 +1770,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the episode runtime for tool execution (TCK-00316).
+    /// Sets the episode runtime for tool execution (RFC-0032::REQ-0110).
     #[must_use]
     pub fn with_episode_runtime(mut self, runtime: Arc<EpisodeRuntime>) -> Self {
         self.episode_runtime = Some(runtime);
         self
     }
 
-    /// Sets the session registry for session status queries (TCK-00344).
+    /// Sets the session registry for session status queries
+    /// (RFC-0032::REQ-0134).
     #[must_use]
     pub fn with_session_registry(
         mut self,
@@ -1779,7 +1789,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Sets the session telemetry store for tracking tool calls, events
-    /// emitted, and session start time (TCK-00384).
+    /// emitted, and session start time (RFC-0032::REQ-0138).
     #[must_use]
     pub fn with_telemetry_store(
         mut self,
@@ -1789,7 +1799,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    /// Sets the gate orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// When set, session termination via `ToolDecision::Terminate` triggers
     /// gate orchestration. Events from the orchestrator are persisted to
@@ -1809,7 +1820,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self.gate_orchestrator = Some(orchestrator);
     }
 
-    /// Sets the pre-actuation gate for stop/budget checks (TCK-00351).
+    /// Sets the pre-actuation gate for stop/budget checks (RFC-0020::REQ-0005).
     ///
     /// When set, every `RequestTool` invocation must pass through this gate
     /// before reaching the broker.  The gate enforces fail-closed semantics:
@@ -1841,9 +1852,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Sets the stop authority for authoritative stop-state reads
-    /// (TCK-00351).
+    /// (RFC-0020::REQ-0005).
     ///
-    /// TCK-00351 BLOCKER 1 FIX: When set, the pre-actuation gate reads
+    /// RFC-0020::REQ-0005 BLOCKER 1 FIX: When set, the pre-actuation gate reads
     /// emergency and governance stop flags from this authority instead
     /// of using hardcoded `false`.
     #[must_use]
@@ -1855,9 +1866,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the per-session stop conditions store (TCK-00351 v3).
+    /// Sets the per-session stop conditions store (RFC-0020::REQ-0005 v3).
     ///
-    /// TCK-00351 BLOCKER 1 v3 FIX: When set, the pre-actuation gate
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3 FIX: When set, the pre-actuation gate
     /// reads real stop conditions from this store instead of using
     /// `StopConditions::default()`.  Conditions are registered at
     /// session spawn time from the episode envelope.
@@ -1870,10 +1881,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the shared V1 manifest store for TCK-00352 scope enforcement.
+    /// Sets the shared V1 manifest store for RFC-0020::REQ-0006 scope
+    /// enforcement.
     ///
-    /// Per TCK-00352 Security Review MAJOR 2, this store is shared with
-    /// `PrivilegedDispatcher` so that V1 manifests minted during
+    /// Per RFC-0020::REQ-0006 Security Review MAJOR 2, this store is shared
+    /// with `PrivilegedDispatcher` so that V1 manifests minted during
     /// `SpawnEpisode` are visible for scope enforcement in
     /// `handle_request_tool`.
     #[must_use]
@@ -1882,7 +1894,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the PCAC lifecycle gate for authority enforcement (TCK-00423).
+    /// Sets the PCAC lifecycle gate for authority enforcement
+    /// (RFC-0020::REQ-0042).
     ///
     /// When set, every `RequestTool` invocation must pass through the
     /// split lifecycle:
@@ -1918,7 +1931,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Wire the `AdmissionKernel` for plan/execute-gated admission
-    /// (TCK-00494, RFC-0019 REQ-0025).
+    /// (RFC-0032::REQ-0172, RFC-0019 REQ-0025).
     ///
     /// When set, `handle_request_tool` delegates admission to the kernel.
     /// In authoritative mode, missing kernel wiring causes a hard deny
@@ -1992,7 +2005,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
              health before effect (non-mutating)"
         );
 
-        // TCK-00502 MINOR fix: use non-mutating health probe instead of
+        // RFC-0032::REQ-0177 MINOR fix: use non-mutating health probe instead of
         // finalize_anti_rollback(). The pre-effect circuit probe must NOT
         // advance the anchor watermark; it only verifies that the anchor
         // subsystem is healthy (can verify committed state). Anchor
@@ -2020,7 +2033,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
 
-            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // RFC-0032::REQ-0103 MAJOR 3 FIX: Use proper timestamps instead of zeros.
             // Since this is called when the clock regression is detected, we use
             // the `current` timestamp from the regression error as our best available
             // timestamp. We cannot call the clock again since it just failed.
@@ -2032,9 +2045,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
-            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
-            // JSON artifact, not a raw string or placeholder.
+            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in
+            // CAS. Per the DefectRecorded protocol, cas_hash must point to a
+            // full DefectRecord JSON artifact, not a raw string or placeholder.
             let defect_record = match DefectRecord::clock_regression(
                 &defect_id,
                 "system",
@@ -2088,7 +2101,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-MISS-{}", uuid::Uuid::new_v4());
 
-            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // RFC-0032::REQ-0103 MAJOR 3 FIX: Use proper timestamps instead of zeros.
             // Try to get timestamp from clock; if not configured, use SystemTime
             // as a fallback for defect logging (this is observational, not authoritative).
             #[allow(clippy::map_unwrap_or)] // Clearer with explicit closure for the fallback
@@ -2118,9 +2131,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
-            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
-            // JSON artifact, not a raw description string.
+            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in
+            // CAS. Per the DefectRecorded protocol, cas_hash must point to a
+            // full DefectRecord JSON artifact, not a raw description string.
             //
             // Note: DefectRecord::pack_miss requires a pack_hash, but for context misses
             // detected during session dispatch, we may not have the pack hash available.
@@ -2603,7 +2616,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         frame: &Bytes,
         ctx: &ConnectionContext,
     ) -> ProtocolResult<SessionResponse> {
-        // TCK-00349: Check session phase BEFORE any message processing.
+        // RFC-0020::REQ-0003: Check session phase BEFORE any message processing.
         // No session-scoped IPC is permitted before SessionOpen.
         if !ctx.phase().allows_dispatch() {
             warn!(
@@ -2649,11 +2662,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::EmitEvent => self.handle_emit_event(payload, ctx),
             SessionMessageType::PublishEvidence => self.handle_publish_evidence(payload, ctx),
             SessionMessageType::StreamTelemetry => self.handle_stream_telemetry(payload, ctx),
-            // TCK-00342: Process log streaming
+            // RFC-0032::REQ-0132: Process log streaming
             SessionMessageType::StreamLogs => self.handle_stream_logs(payload, ctx),
-            // TCK-00344: Session status query
+            // RFC-0032::REQ-0134: Session status query
             SessionMessageType::SessionStatus => self.handle_session_status(payload, ctx),
-            // HEF Pulse Plane (TCK-00302): Subscription handlers
+            // HEF Pulse Plane (RFC-0032::REQ-0098): Subscription handlers
             SessionMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             SessionMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
             // PulseEvent is server-to-client only, reject if received from client
@@ -3006,7 +3019,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .unwrap_or(0)
     }
 
-    /// TCK-00489: Insert a boundary-channel quarantine entry with
+    /// RFC-0020::REQ-0055: Insert a boundary-channel quarantine entry with
     /// priority-aware eviction and per-session quota isolation.
     ///
     /// # Returns
@@ -6458,7 +6471,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles `RequestTool` requests (IPC-SESS-001).
     ///
-    /// # TCK-00260: Capability Manifest Validation
+    /// # RFC-0032::REQ-0076: Capability Manifest Validation
     ///
     /// This handler validates tool requests against the session's capability
     /// manifest:
@@ -6472,11 +6485,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # Performance
     ///
-    /// Per TCK-00260 acceptance criteria, validation overhead must be <5ms p50.
-    /// The validation is O(n) where n = `tool_allowlist` length (bounded by
-    /// `MAX_TOOL_ALLOWLIST` = 100).
+    /// Per RFC-0032::REQ-0076 acceptance criteria, validation overhead must be
+    /// <5ms p50. The validation is O(n) where n = `tool_allowlist` length
+    /// (bounded by `MAX_TOOL_ALLOWLIST` = 100).
     ///
-    /// # TCK-00290: `ToolBroker` Integration
+    /// # RFC-0032::REQ-0092: `ToolBroker` Integration
     ///
     /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
     /// `ToolResult` or Deny" The broker validates capabilities, policy, and
@@ -6500,7 +6513,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(resp) => return Ok(resp),
         };
 
-        // TCK-00395 Security BLOCKER 2: Enforce active-session check.
+        // RFC-0032::REQ-0149 Security BLOCKER 2: Enforce active-session check.
         // HMAC token validation alone is not sufficient because EndSession
         // revokes only session-registry state. A retained token could
         // continue tool actions after EndSession if we don't verify
@@ -6592,7 +6605,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00260: Parse tool_id to ToolClass
+        // RFC-0032::REQ-0076: Parse tool_id to ToolClass
         let Some(tool_class) = ToolClass::parse(&request.tool_id) else {
             warn!(
                 session_id = %token.session_id,
@@ -6684,7 +6697,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00406: Runtime taint ingress enforcement on production request
+        // RFC-0020::REQ-0030: Runtime taint ingress enforcement on production request
         // path. Deny and emit durable defect evidence for forbidden flows.
         let taint_assessment =
             evaluate_tool_argument_ingress(&request.arguments, self.taint_policy.as_ref());
@@ -6735,25 +6748,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             self.broker.clone()
         };
 
-        // TCK-00351: Pre-actuation stop/budget gate.
+        // RFC-0020::REQ-0005: Pre-actuation stop/budget gate.
         // This check MUST precede broker dispatch.  If the gate denies,
         // we return immediately without reaching the broker (fail-closed).
         //
-        // TCK-00351 BLOCKER 2 v2 FIX: When broker/runtime are configured
+        // RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: When broker/runtime are configured
         // the pre-actuation gate is MANDATORY.  If absent, hard-deny the
         // request instead of silently setting proof fields to false and
         // allowing execution to proceed.
         //
-        // TCK-00351 BLOCKER 1 FIX: Read real stop state from stop_authority
+        // RFC-0020::REQ-0005 BLOCKER 1 FIX: Read real stop state from stop_authority
         // instead of hardcoded false.
-        // TCK-00351 MAJOR 1 FIX: Store the receipt and propagate its fields
+        // RFC-0020::REQ-0005 MAJOR 1 FIX: Store the receipt and propagate its fields
         // into the response (stop_checked, budget_checked, timestamp_ns).
         let preactuation_receipt = if broker.is_some() {
             if let Some(ref gate) = self.preactuation_gate {
                 // Get monotonic timestamp for the receipt.
                 let precheck_ts = self.get_htf_timestamp()?;
 
-                // TCK-00351 BLOCKER 1 FIX: Use real stop conditions.
+                // RFC-0020::REQ-0005 BLOCKER 1 FIX: Use real stop conditions.
                 // Read stop flags from the authoritative StopAuthority (set by
                 // operator/governance) instead of hardcoded false.
                 // No stop authority configured; defaults to no stops.
@@ -6769,7 +6782,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             )
                         });
 
-                // TCK-00351 BLOCKER 1 v3 FIX: Load real stop conditions from the
+                // RFC-0020::REQ-0005 BLOCKER 1 v3 FIX: Load real stop conditions from the
                 // per-session store.  If no store is wired or the session has no
                 // conditions registered, fall back to fail-closed defaults
                 // (max_episodes=1) rather than StopConditions::default() which
@@ -6782,7 +6795,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     .and_then(|store| store.get(&token.session_id))
                     .unwrap_or_else(|| crate::episode::envelope::StopConditions::max_episodes(1));
 
-                // TCK-00351 MAJOR v3 FIX: Hard-deny when telemetry is missing for
+                // RFC-0020::REQ-0005 MAJOR v3 FIX: Hard-deny when telemetry is missing for
                 // an active session.  An active session MUST have telemetry
                 // registered; missing telemetry indicates a configuration bug and
                 // continuing with elapsed_ms=0 would mask the stop-uncertainty
@@ -6842,7 +6855,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     },
                 }
             } else {
-                // TCK-00351 BLOCKER 2 v2 FIX: Broker is configured but gate
+                // RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Broker is configured but gate
                 // is missing.  This is a configuration error; hard-deny rather
                 // than allowing execution without pre-actuation proof.
                 error!(
@@ -6858,7 +6871,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         } else {
             None
         };
-        // TCK-00352 Security Review BLOCKER 1 fix: V1 scope enforcement gate.
+        // RFC-0020::REQ-0006 Security Review BLOCKER 1 fix: V1 scope enforcement gate.
         // If the session has a V1 manifest registered, enforce V1 checks
         // (risk tier ceiling, host restrictions, expiry) BEFORE dispatching
         // to the broker. Deny if V1 validation fails.
@@ -6886,7 +6899,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 let mut v1_request = crate::episode::ToolRequest::new(tool_class, risk_tier);
 
-                // TCK-00352 BLOCKER 1 fix: Parse request.arguments JSON to
+                // RFC-0020::REQ-0006 BLOCKER 1 fix: Parse request.arguments JSON to
                 // extract typed fields (path, network, shell_command, size).
                 // Without this, validate_request_scoped only checks risk tier
                 // and expiry but skips host/path/shell checks because those
@@ -7021,7 +7034,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 }
 
-                // TCK-00352: Verify envelope-manifest hash binding.
+                // RFC-0020::REQ-0006: Verify envelope-manifest hash binding.
                 // Look up the session's envelope manifest hash and verify it
                 // matches the V1 manifest digest.
                 if let Some(ref registry) = self.session_registry {
@@ -7055,7 +7068,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         );
 
         // ================================================================
-        // TCK-00494: AdmissionKernel guard for authoritative mode
+        // RFC-0032::REQ-0172: AdmissionKernel guard for authoritative mode
         // (RFC-0019 REQ-0025).
         //
         // In authoritative mode with fail-closed tiers, the handler MUST
@@ -7096,7 +7109,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     tool_class = %tool_class,
                     risk_tier = ?tool_risk_tier,
                     "RequestTool denied: no authority lifecycle gate wired in authoritative \
-                     mode for fail-closed tier (TCK-00494, no-bypass invariant)"
+                     mode for fail-closed tier (RFC-0032::REQ-0172, no-bypass invariant)"
                 );
                 return Ok(SessionResponse::error(
                     SessionErrorCode::SessionErrorToolNotAllowed,
@@ -7106,7 +7119,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00423/TCK-00426: Stage 1 and Stage 2 of PCAC lifecycle.
+        // RFC-0020::REQ-0042/RFC-0020::REQ-0045: Stage 1 and Stage 2 of PCAC lifecycle.
         // join -> revalidate-before-decision
         //
         // Stage 3 and Stage 4 (revalidate-before-execution + consume) run in
@@ -7676,7 +7689,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }),
             })
         } else if self.is_authoritative_mode() {
-            // TCK-00494 FIX: In authoritative mode without PCAC gate, the
+            // RFC-0032::REQ-0172 FIX: In authoritative mode without PCAC gate, the
             // AdmissionKernel is a valid alternative authority gate for
             // fail-closed tiers. Only deny when BOTH gates are unavailable.
             // This is consistent with the early guard at the top of
@@ -7721,7 +7734,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // ================================================================
-        // TCK-00494 BLOCKER FIX + TCK-00501 SEC-MAJOR-2 FIX:
+        // RFC-0032::REQ-0172 BLOCKER FIX + RFC-0032::REQ-0176 SEC-MAJOR-2 FIX:
         // AdmissionKernel plan/execute invocation.
         //
         // The kernel MUST run WHENEVER it is wired, regardless of whether
@@ -7873,7 +7886,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     hsi_envelope_binding_digest,
                     stop_budget_digest,
                     pcac_policy,
-                    // TODO(TCK-00501): Source declared_idempotent from
+                    // TODO(RFC-0032::REQ-0176): Source declared_idempotent from
                     // manifest/capability metadata. Currently hardcoded to
                     // false because `Capability` does not yet carry a
                     // `declared_idempotent` field. Until the manifest schema
@@ -7985,7 +7998,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // ================================================================
-        // TCK-00494 SECURITY MAJOR 1 FIX: Persist AdmissionBundleV1
+        // RFC-0032::REQ-0172 SECURITY MAJOR 1 FIX: Persist AdmissionBundleV1
         // evidence to the ledger BEFORE broker dispatch.
         //
         // The admission result from the kernel contains a sealed
@@ -8092,7 +8105,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             // in depth, not gating).
         }
 
-        // TCK-00290: Use ToolBroker for request validation and execution
+        // RFC-0032::REQ-0092: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
         let Some(broker) = broker else {
             warn!(
@@ -8105,14 +8118,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
-        // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
+        // RFC-0032::REQ-0092 BLOCKER 3: Get monotonic timestamp from HolonicClock
         let actuation_timestamp = self.get_htf_timestamp()?;
         let timestamp_ns = actuation_timestamp.wall_ns;
 
         // Build BrokerToolRequest
 
-        // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
-        // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
+        // BLOCKER 1 FIX (RFC-0032::REQ-0092): Fail-closed if session ID is not valid
+        // for EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
         // fallback that could cause cross-session ID collision. Return
         // SESSION_ERROR_INVALID instead.
         let episode_id = match EpisodeId::new(&token.session_id) {
@@ -8227,7 +8240,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 broker_request = broker_request.with_pattern(pattern);
             }
 
-            // TCK-00377: Populate tool_kind from parsed arguments so broker
+            // RFC-0020::REQ-0031: Populate tool_kind from parsed arguments so broker
             // precondition checks can execute. Build the proto-level
             // tool_request::Tool variant, then convert to typed ToolKind.
             let proto_tool: Option<tool_req::Tool> = match tool_class {
@@ -8357,7 +8370,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }))
                 },
                 // Other tool classes (ListFiles, Search, Network, Inference,
-                // Artifact) are not in scope for TCK-00377 typed ToolKind
+                // Artifact) are not in scope for RFC-0020::REQ-0031 typed ToolKind
                 // hardening. tool_kind_from_proto returns MissingToolVariant
                 // for them, so we skip construction entirely.
                 _ => None,
@@ -8368,7 +8381,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         broker_request = broker_request.with_tool_kind(tk);
                     },
                     Err(e) => {
-                        // TCK-00377 BLOCKER FIX: Fail-closed on tool_kind
+                        // RFC-0020::REQ-0031 BLOCKER FIX: Fail-closed on tool_kind
                         // conversion failure. If typed validation rejects the
                         // request (shell metachar, bad git ref, path traversal),
                         // the request MUST be denied — not forwarded without a
@@ -8376,7 +8389,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         warn!(
                             request_id = %request_id,
                             error = %e,
-                            "TCK-00377: tool_kind_from_proto conversion failed (fail-closed)"
+                            "RFC-0020::REQ-0031: tool_kind_from_proto conversion failed (fail-closed)"
                         );
                         return Ok(SessionResponse::error(
                             SessionErrorCode::SessionErrorToolNotAllowed,
@@ -8387,7 +8400,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00365: Extract epoch seal from protocol message and attach to
+        // RFC-0020::REQ-0019: Extract epoch seal from protocol message and attach to
         // broker request for Tier2+ admission verification.
         if let Some(seal_bytes) = &request.epoch_seal {
             match apm2_core::htf::EpochSealV1::from_canonical_bytes(seal_bytes) {
@@ -8408,7 +8421,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00501: Propagate idempotency key from admission result into
+        // RFC-0032::REQ-0176: Propagate idempotency key from admission result into
         // broker transport for external deduplication.
         if let Some(ref result) = admission_result {
             broker_request =
@@ -8591,7 +8604,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         .iter()
                         .any(|defect| defect.violation_class.requires_quarantine())
                     {
-                        // TCK-00489: Derive severity from the violation classes
+                        // RFC-0020::REQ-0055: Derive severity from the violation classes
                         // present in the defect list.
                         let severity = ViolationSeverity::from_violation_classes(
                             defects.iter().map(|d| d.violation_class),
@@ -8611,7 +8624,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                 // already quarantined.
                             },
                             Err(QuarantineInsertionError::Saturated) => {
-                                // TCK-00489: Fail-closed -- quarantine is
+                                // RFC-0020::REQ-0055: Fail-closed -- quarantine is
                                 // mandatory but no evictable entry exists.
                                 // The request MUST be denied.
                                 error!(
@@ -8633,7 +8646,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                 current_count,
                                 quota,
                             }) => {
-                                // TCK-00489: Per-session quota isolation --
+                                // RFC-0020::REQ-0055: Per-session quota isolation --
                                 // this session is consuming too many
                                 // quarantine slots. Deny the request to
                                 // prevent cross-session exhaustion.
@@ -8679,7 +8692,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             matches!(&decision, Ok(ToolDecision::Allow { .. }));
 
         // ================================================================
-        // TCK-00501 SEC-BLOCKER FIX: record_started is now called INSIDE
+        // RFC-0032::REQ-0176 SEC-BLOCKER FIX: record_started is now called INSIDE
         // handle_broker_decision, immediately before actual tool execution
         // (execute_tool_with_verified_content). This ensures Started entries
         // are only created when ALL pre-dispatch checks have passed.
@@ -8694,7 +8707,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .as_ref()
             .and_then(|r| r.journal_binding.as_ref());
 
-        // TCK-00501: Extract idempotency key hex for propagation into
+        // RFC-0032::REQ-0176: Extract idempotency key hex for propagation into
         // tool execution context.
         let idempotency_key_hex = admission_result
             .as_ref()
@@ -8721,7 +8734,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         );
 
         // ================================================================
-        // TCK-00497 QUALITY BLOCKER 1: Post-effect witness finalization
+        // RFC-0020::REQ-0058 QUALITY BLOCKER 1: Post-effect witness finalization
         // and boundary output release.
         //
         // After the broker executes the effect (handle_broker_decision),
@@ -8741,7 +8754,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             if let Ok(SessionResponse::RequestTool(ref resp)) = response {
                 if resp.decision == i32::from(DecisionType::Allow) {
                     // ====================================================
-                    // TCK-00502 BLOCKER-2 FIX: Finalize anti-rollback
+                    // RFC-0032::REQ-0177 BLOCKER-2 FIX: Finalize anti-rollback
                     // anchor AFTER confirmed effect success. The anchor
                     // commit was moved out of execute() to prevent the
                     // pre-commit hazard where a failed effect would leave
@@ -8837,7 +8850,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let plan_enforcement_tier = admission_res.boundary_span.enforcement_tier;
 
                     // ====================================================
-                    // TCK-00497 QUALITY MAJOR 1+2 FIX:
+                    // RFC-0020::REQ-0058 QUALITY MAJOR 1+2 FIX:
                     // Route ALL post-effect witness validation through
                     // kernel.finalize_post_effect_witness() — the single
                     // source of truth for seed/provider/temporal binding.
@@ -9148,7 +9161,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // ================================================================
-        // TCK-00501: Record effect completion in the journal after
+        // RFC-0032::REQ-0176: Record effect completion in the journal after
         // successful witness closure and outcome index persistence.
         //
         // This transitions the journal state from Started -> Completed,
@@ -9274,7 +9287,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00384: Increment tool_calls counter on successful dispatch.
+        // RFC-0032::REQ-0138: Increment tool_calls counter on successful dispatch.
         // We count Allow and DedupeCacheHit as successful tool calls.
         if let Ok(SessionResponse::RequestTool(ref resp)) = response {
             if resp.decision == i32::from(DecisionType::Allow) {
@@ -9291,7 +9304,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles the broker decision and converts it to a `SessionResponse`.
     ///
-    /// # TCK-00351 MAJOR 1 FIX
+    /// # RFC-0020::REQ-0005 MAJOR 1 FIX
     ///
     /// The `preactuation_receipt` parameter carries the gate receipt from
     /// the pre-actuation check. Its fields (`stop_checked`, `budget_checked`,
@@ -9364,7 +9377,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 if let Some(pending_pcac) = pending_pcac {
-                    // TCK-00426 BLOCKER 3 + QUALITY BLOCKER 2:
+                    // RFC-0020::REQ-0045 BLOCKER 3 + QUALITY BLOCKER 2:
                     // revalidate and consume from fresh authoritative sources
                     // immediately before effect execution.
                     let (current_time_envelope_ref, current_ledger_anchor, current_revocation_head) =
@@ -9386,7 +9399,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                             },
                         };
 
-                    // SECURITY/QUALITY (TCK-00427): Stage-3 must fail closed if
+                    // SECURITY/QUALITY (RFC-0020::REQ-0046): Stage-3 must fail closed if
                     // the authoritative clock read fails. Revalidate/consume
                     // must not proceed with a stale join-phase tick.
                     let fresh_tick = match self.derive_stage3_pcac_tick() {
@@ -9591,7 +9604,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         ));
                     }
 
-                    // TCK-00423: Consume-time pre-actuation selector binding
+                    // RFC-0020::REQ-0042: Consume-time pre-actuation selector binding
                     // prerequisite (REQ-0009). Any policy-required pre-actuation
                     // path missing selector bindings must deny before effect.
                     if pending_pcac.pre_actuation_required
@@ -9611,7 +9624,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         ));
                     }
 
-                    // TCK-00423: Enforce intent digest equality at consume
+                    // RFC-0020::REQ-0042: Enforce intent digest equality at consume
                     // time against the request-scoped payload
                     // (`tool_class + channel_key + argument_digest`).
                     let argument_content_digest = *blake3::hash(request_arguments).as_bytes();
@@ -9838,7 +9851,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
-                // TCK-00316: Execute tool via EpisodeRuntime
+                // RFC-0032::REQ-0110: Execute tool via EpisodeRuntime
                 let (result_hash, inline_result) = if let Some(ref runtime) = self.episode_runtime {
                     // Deserialize arguments
                     let tool_args: crate::episode::tool_handler::ToolArgs =
@@ -9853,7 +9866,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         };
 
                     // ============================================================
-                    // TCK-00501 SEC-BLOCKER FIX: Record effect journal Started
+                    // RFC-0032::REQ-0176 SEC-BLOCKER FIX: Record effect journal Started
                     // at the TRUE pre-dispatch boundary — immediately before
                     // tool execution, AFTER all pre-dispatch deny gates have
                     // passed (replay ordering, PCAC revalidate, PCAC consume,
@@ -9898,7 +9911,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let verified_for_execution = verified_content.take();
                     let toctou_required_for_execution = toctou_verification_required;
                     let request_id_for_execution = request_id.clone();
-                    // TCK-00501: Propagate idempotency key into
+                    // RFC-0032::REQ-0176: Propagate idempotency key into
                     // ExecutionContext so tool handlers can use it for
                     // external deduplication.
                     let idempotency_key_for_execution = idempotency_key_hex;
@@ -9966,7 +9979,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 };
 
-                // TCK-00351 MAJOR 1 FIX: Populate proof fields from the
+                // RFC-0020::REQ-0005 MAJOR 1 FIX: Populate proof fields from the
                 // gate receipt, not from hardcoded values or a later
                 // clock sample.  The receipt's timestamp proves the
                 // ordering invariant (check preceded actuation).
@@ -10007,7 +10020,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason = %reason,
                     "Tool request denied by broker"
                 );
-                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                // RFC-0020::REQ-0005 MAJOR 1 FIX: Derive proof fields from receipt.
                 let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
                     preactuation_receipt.map_or((false, false, false, 0), |r| {
                         (
@@ -10043,7 +10056,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     tool_class = %tool_class,
                     "Tool request hit dedupe cache"
                 );
-                // TCK-00316 SECURITY MAJOR 1 FIX: Properly separate policy_hash from
+                // RFC-0032::REQ-0110 SECURITY MAJOR 1 FIX: Properly separate policy_hash from
                 // result_hash. The previous code conflated output_hash with
                 // policy_hash, which is a security metadata conflation bug.
                 // Policy hash is the hash of the policy that authorized
@@ -10053,7 +10066,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // carried by the dedupe record, not an empty/synthetic value.
                 // The result_hash comes from the cached ToolResult's output_hash.
                 //
-                // TCK-00316 SECURITY MAJOR 2 FIX: Enforce MAX_INLINE_RESULT_SIZE for
+                // RFC-0032::REQ-0110 SECURITY MAJOR 2 FIX: Enforce MAX_INLINE_RESULT_SIZE for
                 // inline_result. If the cached output exceeds the limit, return
                 // only result_hash without inline data.
 
@@ -10065,7 +10078,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     None
                 };
 
-                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                // RFC-0020::REQ-0005 MAJOR 1 FIX: Derive proof fields from receipt.
                 let (stop_checked, budget_checked, budget_enforcement_deferred, preactuation_ts) =
                     preactuation_receipt.map_or((false, false, false, 0), |r| {
                         (
@@ -10103,7 +10116,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
                 // MAJOR 2: Wire session end-of-life to mark_terminated()
                 // so production sessions transition to TERMINATED state.
-                // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
+                // RFC-0032::REQ-0139 MAJOR 1: Propagate mark_terminated errors (fail-closed).
                 // Per session/mod.rs:159, persistence failures are fatal.
                 if let Some(session_registry) = &self.session_registry {
                     // MINOR fix: Normalize info.session_id to the authoritative
@@ -10128,7 +10141,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
-                // TCK-00351 BLOCKER-2: `episode_count` tracks completed
+                // RFC-0020::REQ-0005 BLOCKER-2: `episode_count` tracks completed
                 // episodes. Increment on termination (not spawn) so a
                 // newly spawned session starts at 0.
                 if let Some(ref store) = self.telemetry_store {
@@ -10137,25 +10150,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
-                // TCK-00384: Clean up telemetry on session termination to
+                // RFC-0032::REQ-0138: Clean up telemetry on session termination to
                 // free capacity in the bounded store.
                 if let Some(ref store) = self.telemetry_store {
                     store.remove(session_id);
                 }
 
-                // TCK-00351 BLOCKER 3 FIX: Clean up stop conditions on
+                // RFC-0020::REQ-0005 BLOCKER 3 FIX: Clean up stop conditions on
                 // session termination to free capacity in the bounded
                 // store.  Same lifecycle as telemetry cleanup above.
                 if let Some(ref store) = self.stop_conditions_store {
                     store.remove(session_id);
                 }
 
-                // FAC vNext (TCK-00672): Session termination is lifecycle-only.
+                // FAC vNext (RFC-0032::REQ-0276): Session termination is lifecycle-only.
                 // Gate start orchestration is triggered authoritatively from
                 // `changeset_published` via the gate-start orchestrator-kernel
                 // pipeline.
 
-                // TCK-00307: Emit DefectRecorded for ContextMiss
+                // RFC-0032::REQ-0103: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
                     if let Some(event_bytes) = refinement_event {
                         if let Ok(req) =
@@ -10175,7 +10188,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 ))
             },
             Err(crate::episode::BrokerError::PreconditionFailed { ref reason }) => {
-                // TCK-00377 MAJOR FIX: Precondition failures are policy denials,
+                // RFC-0020::REQ-0031 MAJOR FIX: Precondition failures are policy denials,
                 // not internal faults. Map to SessionErrorToolNotAllowed so
                 // callers receive deny semantics consistent with broker Deny
                 // decisions.
@@ -10240,7 +10253,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Gets an HTF-compliant monotonic timestamp.
     ///
-    /// # TCK-00290 MAJOR 2 FIX: Time Monotonicity
+    /// # RFC-0032::REQ-0092 MAJOR 2 FIX: Time Monotonicity
     ///
     /// Per RFC-0016 and SEC-CTRL-FAC-0015, timestamps must come from
     /// `HolonicClock` for monotonicity. Using `SystemTime::now()` as a
@@ -10270,7 +10283,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }),
             None => {
-                // MAJOR 2 FIX (TCK-00290): Fail-closed when clock is not configured.
+                // MAJOR 2 FIX (RFC-0032::REQ-0092): Fail-closed when clock is not configured.
                 // Per SEC-CTRL-FAC-0015, we must not fall back to SystemTime::now()
                 // as this violates time monotonicity guarantees.
                 error!("HolonicClock not configured (fail-closed per SEC-CTRL-FAC-0015)");
@@ -10282,7 +10295,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     // ================================================================
-    // TCK-00498: Shared helper for authority lifecycle enforcement on
+    // RFC-0032::REQ-0173: Shared helper for authority lifecycle enforcement on
     // session-scoped endpoints (EmitEvent, PublishEvidence).
     //
     // These endpoints are effect-capable (ledger writes, CAS writes) and
@@ -10313,7 +10326,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return Ok(None);
         }
 
-        // TCK-00498: In authoritative mode, session-scoped effect-capable
+        // RFC-0032::REQ-0173: In authoritative mode, session-scoped effect-capable
         // endpoints (EmitEvent, PublishEvidence) are treated as inherently
         // fail-closed because they perform authoritative state mutations
         // (ledger writes, CAS writes). The kernel guard MUST be enforced.
@@ -10325,7 +10338,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 session_id = %token.session_id,
                 endpoint = %endpoint_class,
                 "session endpoint denied: no authority lifecycle gate wired in \
-                 authoritative mode (TCK-00498, fail-closed)"
+                 authoritative mode (RFC-0032::REQ-0173, fail-closed)"
             );
             return Err(SessionResponse::error(
                 SessionErrorCode::SessionErrorToolNotAllowed,
@@ -11031,7 +11044,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             // evidence persisted. If the kernel is NOT wired, the caller
             // may proceed. If the kernel IS wired, fall through to also
             // run kernel plan/execute for effect journal tracking
-            // (TCK-00501 SEC-MAJOR-2 fix).
+            // (RFC-0032::REQ-0176 SEC-MAJOR-2 fix).
             if self.admission_kernel.is_none() {
                 return Ok(None);
             }
@@ -11192,7 +11205,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // they perform authoritative state mutations (ledger/CAS writes).
         let pcac_risk_tier = apm2_core::pcac::RiskTier::Tier2Plus;
 
-        // TCK-00498: Enforce authoritative policy-root prerequisite for
+        // RFC-0032::REQ-0173: Enforce authoritative policy-root prerequisite for
         // fail-closed tiers. EmitEvent/PublishEvidence are effect-capable
         // endpoints that require governance policy root when the kernel is
         // enforcing fail-closed semantics.
@@ -11238,7 +11251,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             hsi_envelope_binding_digest,
             stop_budget_digest,
             pcac_policy,
-            // TODO(TCK-00501): Source declared_idempotent from
+            // TODO(RFC-0032::REQ-0176): Source declared_idempotent from
             // manifest/capability metadata (see KernelRequestV1 in
             // handle_tool_request for rationale).
             declared_idempotent: false,
@@ -11315,8 +11328,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Persist `AdmissionBundleV1` evidence to the ledger BEFORE the
-    /// session-endpoint effect (TCK-00498, same pattern as TCK-00494
-    /// `ToolActuation`).
+    /// session-endpoint effect (RFC-0032::REQ-0173, same pattern as
+    /// RFC-0032::REQ-0172 `ToolActuation`).
     ///
     /// Fail-closed: serialization or persistence failure denies the request.
     #[allow(clippy::result_large_err)]
@@ -11429,7 +11442,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Construct and persist `AdmissionOutcomeIndexV1` after a successful
-    /// session-endpoint effect (TCK-00498).
+    /// session-endpoint effect (RFC-0032::REQ-0173).
     fn persist_session_endpoint_outcome_index(
         &self,
         endpoint_class: &str,
@@ -11501,20 +11514,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles `EmitEvent` requests (IPC-SESS-002).
     ///
-    /// # TCK-00290: Real Ledger Persistence
+    /// # RFC-0032::REQ-0092: Real Ledger Persistence
     ///
-    /// Per TCK-00290, this handler persists events to the ledger. Events are
-    /// signed and stored with HTF-compliant timestamps. The handler requires
-    /// a ledger to be configured; without it, returns `SESSION_ERROR_INTERNAL`
-    /// (fail-closed).
+    /// Per RFC-0032::REQ-0092, this handler persists events to the ledger.
+    /// Events are signed and stored with HTF-compliant timestamps. The
+    /// handler requires a ledger to be configured; without it, returns
+    /// `SESSION_ERROR_INTERNAL` (fail-closed).
     ///
-    /// # TCK-00498: `AdmissionKernel` Cutover
+    /// # RFC-0032::REQ-0173: `AdmissionKernel` Cutover
     ///
     /// In authoritative mode, `EmitEvent` routes through `AdmissionKernel`
     /// plan/execute API, enforcing PCAC lifecycle, bundle binding, and
     /// policy-root trust prerequisites for fail-closed tiers (REQ-0026).
     ///
-    /// # Security (INV-TCK-00290-002)
+    /// # Security (INV-RFC-0032::REQ-0092-002)
     ///
     /// Per SEC-CTRL-FAC-0015, the ledger must be configured for this handler
     /// to function. Returning stub responses without persistence would violate
@@ -11537,7 +11550,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(resp) => return Ok(resp),
         };
 
-        // TCK-00395 Security BLOCKER 1: Enforce active-session check.
+        // RFC-0032::REQ-0149 Security BLOCKER 1: Enforce active-session check.
         // HMAC token validation alone is not sufficient because EndSession
         // revokes only session-registry state. A retained token could
         // continue writing events to the ledger after EndSession if we
@@ -11570,7 +11583,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // TCK-00415 BLOCKER 2: Reject reserved work-domain event type names.
+        // RFC-0032::REQ-0159 BLOCKER 2: Reject reserved work-domain event type names.
         //
         // Session EmitEvent must not allow event types that collide with
         // the work-domain namespace. Without this guard, a session could
@@ -11598,7 +11611,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // INV-TCK-00290-002: Require ledger for event persistence (fail-closed)
+        // INV-RFC-0032::REQ-0092-002: Require ledger for event persistence
+        // (fail-closed)
         let Some(ref ledger) = self.ledger else {
             error!(
                 session_id = %token.session_id,
@@ -11611,7 +11625,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // ================================================================
-        // TCK-00498: AdmissionKernel lifecycle enforcement for EmitEvent.
+        // RFC-0032::REQ-0173: AdmissionKernel lifecycle enforcement for EmitEvent.
         //
         // EmitEvent is an effect-capable endpoint (ledger write). In
         // authoritative mode, it MUST route through AdmissionKernel
@@ -11644,13 +11658,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
+        // RFC-0032::REQ-0092 BLOCKER 3: Get monotonic timestamp from HolonicClock
         let now_ns = self.get_htf_timestamp()?.wall_ns;
 
         // Increment sequence counter atomically
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // RFC-0032::REQ-0176 SEC-MAJOR-1 FIX: Record effect journal Started at the
         // true pre-dispatch boundary for EmitEvent — immediately before
         // the ledger write.
         if let Some(ref result) = admission_result {
@@ -11671,7 +11685,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00290 BLOCKER 2: Use emit_session_event with proper parameters
+        // RFC-0032::REQ-0092 BLOCKER 2: Use emit_session_event with proper parameters
         // - event_type: The actual event type from the request (not coerced)
         // - payload: The actual payload bytes from the request (not discarded)
         // - actor_id: The session ID (proper actor identification)
@@ -11683,7 +11697,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             now_ns,
         ) {
             Ok(signed_event) => {
-                // TCK-00384: Increment events_emitted counter on successful
+                // RFC-0032::REQ-0138: Increment events_emitted counter on successful
                 // ledger persistence.
                 if let Some(ref store) = self.telemetry_store {
                     if let Some(telemetry) = store.get(&token.session_id) {
@@ -11692,7 +11706,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 // ====================================================
-                // TCK-00502 MAJOR fix: Finalize anti-rollback anchor
+                // RFC-0032::REQ-0177 MAJOR fix: Finalize anti-rollback anchor
                 // AFTER confirmed effect success (ledger write) using
                 // the POST-EFFECT anchor from the ledger trust verifier,
                 // not the pre-effect bundle anchor. EmitEvent advances
@@ -11783,7 +11797,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
                 }
 
-                // TCK-00498: Persist AdmissionOutcomeIndexV1 after successful
+                // RFC-0032::REQ-0173: Persist AdmissionOutcomeIndexV1 after successful
                 // effect (ledger write). This durably records the admission
                 // closure for the session endpoint.
                 if let Some(ref result) = admission_result {
@@ -11791,7 +11805,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }
 
                 // ============================================================
-                // TCK-00501: Record effect completion in the journal after
+                // RFC-0032::REQ-0176: Record effect completion in the journal after
                 // successful ledger persistence (EmitEvent).
                 //
                 // This transitions Started -> Completed so that a restart
@@ -11854,21 +11868,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles `PublishEvidence` requests (IPC-SESS-003).
     ///
-    /// # TCK-00290: Real CAS Storage
+    /// # RFC-0032::REQ-0092: Real CAS Storage
     ///
-    /// Per TCK-00290, this handler stores evidence artifacts in the durable
-    /// content-addressed store. Artifacts are stored with BLAKE3 content
-    /// addressing and verified on retrieval. The handler requires a CAS to be
-    /// configured; without it, returns `SESSION_ERROR_INTERNAL` (fail-closed).
+    /// Per RFC-0032::REQ-0092, this handler stores evidence artifacts in the
+    /// durable content-addressed store. Artifacts are stored with BLAKE3
+    /// content addressing and verified on retrieval. The handler requires a
+    /// CAS to be configured; without it, returns `SESSION_ERROR_INTERNAL`
+    /// (fail-closed).
     ///
-    /// # TCK-00498: `AdmissionKernel` Cutover
+    /// # RFC-0032::REQ-0173: `AdmissionKernel` Cutover
     ///
     /// In authoritative mode, `PublishEvidence` routes through
     /// `AdmissionKernel` plan/execute API, enforcing PCAC lifecycle, bundle
     /// binding, and policy-root trust prerequisites for fail-closed tiers
     /// (REQ-0026).
     ///
-    /// # Security (INV-TCK-00290-003)
+    /// # Security (INV-RFC-0032::REQ-0092-003)
     ///
     /// Per SEC-CTRL-FAC-0015 and RFC-0018 HEF requirements, the CAS must be
     /// configured for this handler to function. Returning stub responses
@@ -11895,7 +11910,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Err(resp) => return Ok(resp),
         };
 
-        // TCK-00395 Security BLOCKER 1: Enforce active-session check.
+        // RFC-0032::REQ-0149 Security BLOCKER 1: Enforce active-session check.
         // HMAC token validation alone is not sufficient because EndSession
         // revokes only session-registry state. A retained token could
         // continue writing artifacts to CAS after EndSession if we
@@ -11928,7 +11943,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // INV-TCK-00290-003: Require CAS for artifact storage (fail-closed)
+        // INV-RFC-0032::REQ-0092-003: Require CAS for artifact storage (fail-closed)
         let Some(ref cas) = self.cas else {
             error!(
                 session_id = %token.session_id,
@@ -11941,7 +11956,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         // ================================================================
-        // TCK-00498: AdmissionKernel lifecycle enforcement for
+        // RFC-0032::REQ-0173: AdmissionKernel lifecycle enforcement for
         // PublishEvidence.
         //
         // PublishEvidence is an effect-capable endpoint (CAS write). In
@@ -11977,7 +11992,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00501 SEC-MAJOR-1 FIX: Record effect journal Started at the
+        // RFC-0032::REQ-0176 SEC-MAJOR-1 FIX: Record effect journal Started at the
         // true pre-dispatch boundary for PublishEvidence — immediately
         // before the CAS write.
         if let Some(ref result) = admission_result {
@@ -12057,7 +12072,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // ====================================================
-        // TCK-00502: Finalize anti-rollback anchor AFTER
+        // RFC-0032::REQ-0177: Finalize anti-rollback anchor AFTER
         // confirmed effect success (CAS write). Mirrors
         // handle_request_tool post-effect path. The anchor
         // commit was deferred from execute() to prevent the
@@ -12141,14 +12156,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // TCK-00498: Persist AdmissionOutcomeIndexV1 after successful
+        // RFC-0032::REQ-0173: Persist AdmissionOutcomeIndexV1 after successful
         // effect (CAS write).
         if let Some(ref result) = admission_result {
             self.persist_session_endpoint_outcome_index("publish_evidence", &token, result);
         }
 
         // ================================================================
-        // TCK-00501: Record effect completion in the journal after
+        // RFC-0032::REQ-0176: Record effect completion in the journal after
         // successful CAS persistence (PublishEvidence).
         //
         // This transitions Started -> Completed so that a restart
@@ -12209,13 +12224,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles `StreamTelemetry` requests (IPC-SESS-004).
     ///
-    /// # TCK-00290: Fail-Closed (Not Implemented)
+    /// # RFC-0032::REQ-0092: Fail-Closed (Not Implemented)
     ///
-    /// Per TCK-00290 and SEC-CTRL-FAC-0015, `StreamTelemetry` is explicitly
-    /// disabled until a proper implementation is available. This handler
-    /// returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
+    /// Per RFC-0032::REQ-0092 and SEC-CTRL-FAC-0015, `StreamTelemetry` is
+    /// explicitly disabled until a proper implementation is available. This
+    /// handler returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
     ///
-    /// # Security (INV-TCK-00290-004)
+    /// # Security (INV-RFC-0032::REQ-0092-004)
     ///
     /// Per the fail-closed security posture, returning stub responses for
     /// unimplemented functionality would violate security invariants. Instead,
@@ -12251,22 +12266,23 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "StreamTelemetry request rejected: not implemented (fail-closed)"
         );
 
-        // INV-TCK-00290-004: StreamTelemetry disabled until implemented (fail-closed)
-        // Per SEC-CTRL-FAC-0015, we do not return stub responses for unimplemented
-        // functionality. Instead, we return a clear NOT_IMPLEMENTED error.
+        // INV-RFC-0032::REQ-0092-004: StreamTelemetry disabled until implemented
+        // (fail-closed) Per SEC-CTRL-FAC-0015, we do not return stub responses
+        // for unimplemented functionality. Instead, we return a clear
+        // NOT_IMPLEMENTED error.
         Ok(SessionResponse::error(
             SessionErrorCode::SessionErrorNotImplemented,
             "StreamTelemetry not implemented (fail-closed)",
         ))
     }
 
-    /// Handles `SessionStatus` requests (IPC-SESS-005, TCK-00344,
-    /// TCK-00385).
+    /// Handles `SessionStatus` requests (IPC-SESS-005, RFC-0032::REQ-0134,
+    /// RFC-0032::REQ-0139).
     ///
     /// Queries session-scoped status including state, telemetry summary,
     /// and termination details (when applicable).
     ///
-    /// # TCK-00385: Termination Signal
+    /// # RFC-0032::REQ-0139: Termination Signal
     ///
     /// When a session has been terminated, this handler returns
     /// `state = "TERMINATED"` with `termination_reason`, `exit_code`,
@@ -12302,7 +12318,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "SessionStatus request received"
         );
 
-        // TCK-00384: Look up telemetry counters for this session
+        // RFC-0032::REQ-0138: Look up telemetry counters for this session
         let telemetry = self
             .telemetry_store
             .as_ref()
@@ -12312,7 +12328,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         if let Some(session_registry) = &self.session_registry {
             // First check for active session
             if let Some(session) = session_registry.get_session(&token.session_id) {
-                // TCK-00384: Read duration_ms from the snapshot's monotonic
+                // RFC-0032::REQ-0138: Read duration_ms from the snapshot's monotonic
                 // Instant-based field. Wall-clock SystemTime is no longer
                 // used for elapsed time computation (security review fix:
                 // immune to clock jumps/skew).
@@ -12335,7 +12351,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     events_emitted,
                     started_at_ns,
                     duration_ms,
-                    // TCK-00385: No termination info for active sessions
+                    // RFC-0032::REQ-0139: No termination info for active sessions
                     termination_reason: None,
                     exit_code: None,
                     terminated_at_ns: None,
@@ -12345,7 +12361,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 return Ok(SessionResponse::SessionStatus(response));
             }
 
-            // TCK-00385: Check for terminated session
+            // RFC-0032::REQ-0139: Check for terminated session
             if let Some((session, term_info)) =
                 session_registry.get_terminated_session(&token.session_id)
             {
@@ -12359,7 +12375,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     events_emitted: 0,
                     started_at_ns: 0,
                     duration_ms: 0,
-                    // TCK-00385 / MAJOR 1: Normalize termination reason
+                    // RFC-0032::REQ-0139 / MAJOR 1: Normalize termination reason
                     // through TerminationReason enum to prevent free-form
                     // strings on the wire.
                     termination_reason: Some(
@@ -12398,10 +12414,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     // ========================================================================
-    // Process Log Streaming (TCK-00342)
+    // Process Log Streaming (RFC-0032::REQ-0132)
     // ========================================================================
 
-    /// Handles `StreamLogs` requests (IPC-SESS-005, TCK-00342).
+    /// Handles `StreamLogs` requests (IPC-SESS-005, RFC-0032::REQ-0132).
     ///
     /// # Overview
     ///
@@ -12467,7 +12483,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "StreamLogs request received"
         );
 
-        // TODO(TCK-00342): Wire to supervisor log buffer
+        // TODO(RFC-0032::REQ-0132): Wire to supervisor log buffer
         // For Phase 1, return a stub response indicating the feature is not yet
         // fully implemented. The handler validates inputs and token, but actual
         // log retrieval requires supervisor integration.
@@ -12486,12 +12502,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     // ========================================================================
-    // HEF Pulse Plane Handlers (TCK-00302)
+    // HEF Pulse Plane Handlers (RFC-0032::REQ-0098)
     // ========================================================================
 
     /// Handles `SubscribePulse` requests (IPC-HEF-001).
     ///
-    /// # TCK-00302: Session ACL Enforcement
+    /// # RFC-0032::REQ-0098: Session ACL Enforcement
     ///
     /// This handler enforces the default-deny ACL for session subscriptions:
     ///
@@ -12512,8 +12528,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// # Note: Subscription Registry
     ///
     /// This handler validates ACLs and returns accepted patterns, but actual
-    /// subscription registration and pulse delivery are handled by TCK-00303
-    /// (resource governance) and TCK-00304 (outbox + publisher).
+    /// subscription registration and pulse delivery are handled by
+    /// RFC-0032::REQ-0099 (resource governance) and RFC-0032::REQ-0100
+    /// (outbox + publisher).
     fn handle_subscribe_pulse(
         &self,
         payload: &[u8],
@@ -12579,10 +12596,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         //
         // NOTE: In a full implementation, the topic allowlist would be extracted
         // from the session's capability manifest. For now, we create an empty
-        // allowlist which enforces deny-by-default until TCK-00314 adds the
+        // allowlist which enforces deny-by-default until RFC-0032::REQ-0108 adds the
         // topic_allowlist field to CapabilityManifest.
         //
-        // TODO(TCK-00314): Extract topic_allowlist from capability manifest
+        // TODO(RFC-0032::REQ-0108): Extract topic_allowlist from capability manifest
         let topic_allowlist = self.get_session_topic_allowlist(&token.session_id);
         let evaluator = PulseAclEvaluator::for_session(topic_allowlist);
 
@@ -12611,15 +12628,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // Generate subscription ID; use connection ID from context (TCK-00303)
+        // Generate subscription ID; use connection ID from context (RFC-0032::REQ-0099)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
-        // TCK-00303: Use connection_id from context for consistent tracking
+        // RFC-0032::REQ-0099: Use connection_id from context for consistent tracking
         // across the connection lifecycle. The connection handler will call
         // unregister_connection with this ID when the connection closes.
         let connection_id = ctx.connection_id();
 
-        // TCK-00303: Wire resource governance - register connection if not exists
-        // and add subscription with limit checks (only if registry is configured)
+        // RFC-0032::REQ-0099: Wire resource governance - register connection if not
+        // exists and add subscription with limit checks (only if registry is
+        // configured)
         if let Some(ref registry) = self.subscription_registry {
             if !accepted_patterns.is_empty() {
                 // Parse accepted patterns into TopicPattern
@@ -12725,7 +12743,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }))
     }
 
-    /// Gets the topic allowlist for a session (TCK-00314).
+    /// Gets the topic allowlist for a session (RFC-0032::REQ-0108).
     ///
     /// Per RFC-0018, session subscriptions are gated via capability manifest
     /// allowlist. This method extracts the `topic_allowlist` from the session's
@@ -12735,7 +12753,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// Empty allowlist = deny all (fail-closed).
     fn get_session_topic_allowlist(&self, session_id: &str) -> TopicAllowlist {
-        // TCK-00314: Extract topic_allowlist from capability manifest
+        // RFC-0032::REQ-0108: Extract topic_allowlist from capability manifest
         if let Some(ref store) = self.manifest_store {
             if let Some(manifest) = store.get_manifest(session_id) {
                 // Convert manifest's topic_allowlist to TopicAllowlist
@@ -12764,13 +12782,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Handles `UnsubscribePulse` requests (IPC-HEF-002).
     ///
-    /// # TCK-00302: Unsubscribe Handling
+    /// # RFC-0032::REQ-0098: Unsubscribe Handling
     ///
     /// This handler validates the unsubscribe request and returns success.
     ///
     /// # Note: Subscription Registry
     ///
-    /// Actual subscription removal is handled by TCK-00303 (resource
+    /// Actual subscription removal is handled by RFC-0032::REQ-0099 (resource
     /// governance). This handler validates the request and returns a
     /// response.
     fn handle_unsubscribe_pulse(
@@ -12809,8 +12827,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // TCK-00303: Wire resource governance - remove subscription from registry
-        // Use connection_id from context for consistent tracking
+        // RFC-0032::REQ-0099: Wire resource governance - remove subscription from
+        // registry Use connection_id from context for consistent tracking
         let connection_id = ctx.connection_id();
 
         let removed = if let Some(ref registry) = self.subscription_registry {
@@ -12890,7 +12908,7 @@ pub fn encode_stream_telemetry_request(request: &StreamTelemetryRequest) -> Byte
     Bytes::from(buf)
 }
 
-/// Encodes a `StreamLogs` request to bytes for sending (TCK-00342).
+/// Encodes a `StreamLogs` request to bytes for sending (RFC-0032::REQ-0132).
 #[must_use]
 pub fn encode_stream_logs_request(request: &StreamLogsRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::StreamLogs.tag()];
@@ -12898,7 +12916,8 @@ pub fn encode_stream_logs_request(request: &StreamLogsRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes a `SubscribePulse` request to bytes for sending (TCK-00302).
+/// Encodes a `SubscribePulse` request to bytes for sending
+/// (RFC-0032::REQ-0098).
 #[must_use]
 pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::SubscribePulse.tag()];
@@ -12906,7 +12925,8 @@ pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes 
     Bytes::from(buf)
 }
 
-/// Encodes an `UnsubscribePulse` request to bytes for sending (TCK-00302).
+/// Encodes an `UnsubscribePulse` request to bytes for sending
+/// (RFC-0032::REQ-0098).
 #[must_use]
 pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::UnsubscribePulse.tag()];
@@ -12914,7 +12934,7 @@ pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> By
     Bytes::from(buf)
 }
 
-/// Encodes a `SessionStatus` request to bytes for sending (TCK-00344).
+/// Encodes a `SessionStatus` request to bytes for sending (RFC-0032::REQ-0134).
 #[must_use]
 pub fn encode_session_status_request(request: &SessionStatusRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::SessionStatus.tag()];
@@ -14203,18 +14223,18 @@ mod tests {
     }
 
     // ========================================================================
-    // INT-002: Session endpoint routing (TCK-00252)
+    // INT-002: Session endpoint routing (RFC-0032::REQ-0068)
     // Test name matches verification command: cargo test -p apm2-daemon
     // session_routing
     // ========================================================================
     mod session_routing {
         use super::*;
 
-        /// TCK-00290: `RequestTool` without manifest store returns fail-closed
-        /// error.
+        /// RFC-0032::REQ-0092: `RequestTool` without manifest store returns
+        /// fail-closed error.
         ///
-        /// Per INV-TCK-00290-001, `RequestTool` requires a manifest store.
-        /// Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
+        /// Per INV-RFC-0032::REQ-0092-001, `RequestTool` requires a manifest
+        /// store. Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
         #[test]
         fn test_request_tool_routing_fail_closed() {
             let minter = test_minter();
@@ -14249,9 +14269,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: `EmitEvent` without ledger returns fail-closed error.
+        /// RFC-0032::REQ-0092: `EmitEvent` without ledger returns fail-closed
+        /// error.
         ///
-        /// Per INV-TCK-00290-002, `EmitEvent` requires a ledger.
+        /// Per INV-RFC-0032::REQ-0092-002, `EmitEvent` requires a ledger.
         /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
         fn test_emit_event_routing_fail_closed() {
@@ -14286,9 +14307,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: `PublishEvidence` without CAS returns fail-closed error.
+        /// RFC-0032::REQ-0092: `PublishEvidence` without CAS returns
+        /// fail-closed error.
         ///
-        /// Per INV-TCK-00290-003, `PublishEvidence` requires a CAS.
+        /// Per INV-RFC-0032::REQ-0092-003, `PublishEvidence` requires a CAS.
         /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
         fn test_publish_evidence_routing_fail_closed() {
@@ -14323,10 +14345,10 @@ mod tests {
             }
         }
 
-        /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED`
+        /// RFC-0032::REQ-0092: `StreamTelemetry` returns `NOT_IMPLEMENTED`
         /// (fail-closed).
         ///
-        /// Per INV-TCK-00290-004, `StreamTelemetry` is disabled until
+        /// Per INV-RFC-0032::REQ-0092-004, `StreamTelemetry` is disabled until
         /// implemented.
         #[test]
         fn test_stream_telemetry_routing_not_implemented() {
@@ -14635,8 +14657,8 @@ mod tests {
         }
     }
 
-    /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED` even with missing
-    /// frame.
+    /// RFC-0032::REQ-0092: `StreamTelemetry` returns `NOT_IMPLEMENTED` even
+    /// with missing frame.
     ///
     /// Since `StreamTelemetry` is disabled (fail-closed), it doesn't validate
     /// the frame before rejecting with `NOT_IMPLEMENTED`.
@@ -14656,8 +14678,8 @@ mod tests {
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
         match response {
             SessionResponse::Error(err) => {
-                // Per TCK-00290, StreamTelemetry is disabled, so returns NOT_IMPLEMENTED
-                // regardless of frame validation
+                // Per RFC-0032::REQ-0092, StreamTelemetry is disabled, so returns
+                // NOT_IMPLEMENTED regardless of frame validation
                 assert_eq!(
                     err.code,
                     SessionErrorCode::SessionErrorNotImplemented as i32,
@@ -15691,7 +15713,7 @@ mod tests {
         );
     }
 
-    /// TCK-00495: Verifies that consumption ledger events carry all
+    /// RFC-0020::REQ-0056: Verifies that consumption ledger events carry all
     /// replay-critical binding fields including `receipt_hash` and
     /// `admission_bundle_digest` for O(1) correlation.
     #[test]
@@ -15824,7 +15846,7 @@ mod tests {
         );
     }
 
-    /// TCK-00495: Verifies that cross-request replay with distinct
+    /// RFC-0020::REQ-0056: Verifies that cross-request replay with distinct
     /// request IDs is denied even when all other fields match.
     #[test]
     fn test_cross_request_replay_denied_by_durable_consume() {
@@ -15940,7 +15962,7 @@ mod tests {
         );
     }
 
-    /// TCK-00495: Verifies that consumption record survives simulated
+    /// RFC-0020::REQ-0056: Verifies that consumption record survives simulated
     /// daemon restart and still denies replay.
     #[test]
     fn test_consumption_survives_restart_with_binding_fields() {
@@ -17988,8 +18010,9 @@ mod tests {
         );
     }
 
-    /// TCK-00489: When all entries are unexpired and have the same severity as
-    /// the incoming entry, insertion must return `Err(Saturated)`.
+    /// RFC-0020::REQ-0055: When all entries are unexpired and have the same
+    /// severity as the incoming entry, insertion must return
+    /// `Err(Saturated)`.
     #[test]
     fn test_boundary_channel_quarantine_rejects_zero_timestamp() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
@@ -18054,7 +18077,7 @@ mod tests {
             overflow_session_id,
             ToolClass::Inference,
         );
-        // TCK-00489: Same severity as existing entries -- cannot evict.
+        // RFC-0020::REQ-0055: Same severity as existing entries -- cannot evict.
         let result = dispatcher.quarantine_boundary_channel(
             overflow_session_id,
             overflow_channel_key.clone(),
@@ -18639,7 +18662,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00260: Tool Broker with Capability Manifest Validation Tests
+    // RFC-0032::REQ-0076: Tool Broker with Capability Manifest Validation Tests
     // ========================================================================
     mod tck_00260_manifest_validation {
         use super::*;
@@ -18995,12 +19018,12 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00302: HEF Pulse Subscription ACL Tests
+    // RFC-0032::REQ-0098: HEF Pulse Subscription ACL Tests
     // ========================================================================
     mod tck_00302_hef_acl {
         use super::*;
 
-        /// TCK-00302: Session subscriptions are deny-by-default.
+        /// RFC-0032::REQ-0098: Session subscriptions are deny-by-default.
         ///
         /// Per DD-HEF-0004 and INV-ACL-001, session connections cannot
         /// subscribe to any topics without an explicit allowlist.
@@ -19036,7 +19059,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Session wildcards are rejected in Phase 1.
+        /// RFC-0032::REQ-0098: Session wildcards are rejected in Phase 1.
         ///
         /// Per DD-HEF-0004 and INV-ACL-002, session connections cannot use
         /// wildcard patterns in Phase 1.
@@ -19081,7 +19104,8 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Invalid patterns are rejected with `INVALID_PATTERN`.
+        /// RFC-0032::REQ-0098: Invalid patterns are rejected with
+        /// `INVALID_PATTERN`.
         #[test]
         fn test_invalid_pattern_rejected() {
             let minter = test_minter();
@@ -19118,7 +19142,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Too many patterns in request returns error.
+        /// RFC-0032::REQ-0098: Too many patterns in request returns error.
         #[test]
         fn test_too_many_patterns_rejected() {
             let minter = test_minter();
@@ -19156,7 +19180,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Client subscription ID too long returns error.
+        /// RFC-0032::REQ-0098: Client subscription ID too long returns error.
         #[test]
         fn test_client_sub_id_too_long() {
             let minter = test_minter();
@@ -19186,7 +19210,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Unsubscribe validates subscription ID length.
+        /// RFC-0032::REQ-0098: Unsubscribe validates subscription ID length.
         #[test]
         fn test_unsubscribe_validates_subscription_id() {
             let minter = test_minter();
@@ -19213,7 +19237,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Valid unsubscribe request succeeds.
+        /// RFC-0032::REQ-0098: Valid unsubscribe request succeeds.
         #[test]
         fn test_valid_unsubscribe() {
             let minter = test_minter();
@@ -19237,7 +19261,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: `PulseEvent` received from client is rejected.
+        /// RFC-0032::REQ-0098: `PulseEvent` received from client is rejected.
         #[test]
         fn test_pulse_event_from_client_rejected() {
             let minter = test_minter();
@@ -19261,7 +19285,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Subscribe with invalid token returns
+        /// RFC-0032::REQ-0098: Subscribe with invalid token returns
         /// `SESSION_ERROR_INVALID`.
         #[test]
         fn test_subscribe_invalid_token() {
@@ -19291,7 +19315,7 @@ mod tests {
             }
         }
 
-        /// TCK-00302: Response encoding includes correct tags.
+        /// RFC-0032::REQ-0098: Response encoding includes correct tags.
         #[test]
         fn test_subscribe_response_encoding() {
             let response = SessionResponse::SubscribePulse(SubscribePulseResponse {
@@ -19307,7 +19331,8 @@ mod tests {
             assert!(encoded.len() > 1);
         }
 
-        /// TCK-00302: Unsubscribe response encoding includes correct tag.
+        /// RFC-0032::REQ-0098: Unsubscribe response encoding includes correct
+        /// tag.
         #[test]
         fn test_unsubscribe_response_encoding() {
             let response =
@@ -19321,7 +19346,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00316: Tool Execution Integration Tests
+    // RFC-0032::REQ-0110: Tool Execution Integration Tests
     // ========================================================================
     mod tool_execution {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19339,15 +19364,16 @@ mod tests {
         use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
         use crate::session::{SessionRegistry, SessionState};
 
-        /// TCK-00316: Verify fail-closed behavior when broker is configured but
-        /// holonic clock is missing.
+        /// RFC-0032::REQ-0110: Verify fail-closed behavior when broker is
+        /// configured but holonic clock is missing.
         ///
         /// Per SEC-CTRL-FAC-0015, the dispatcher must fail-closed when required
         /// infrastructure (clock, runtime) is missing. This test verifies the
         /// clock check happens before broker request.
         ///
-        /// TCK-00351 BLOCKER 2 v2 FIX: Broker now requires a gate; this test
-        /// wires a default gate so the clock check is the first failure point.
+        /// RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Broker now requires a gate;
+        /// this test wires a default gate so the clock check is the
+        /// first failure point.
         #[test]
         fn test_request_tool_fails_closed_without_clock() {
             use crate::episode::preactuation::{PreActuationGate, StopAuthority};
@@ -20860,7 +20886,8 @@ mod tests {
             );
         }
 
-        /// TCK-00336: Verify fail-closed behavior when no broker is configured.
+        /// RFC-0032::REQ-0128: Verify fail-closed behavior when no broker is
+        /// configured.
         ///
         /// When no broker is configured, the dispatcher returns a fail-closed
         /// error rather than falling back to legacy manifest validation.
@@ -20908,7 +20935,7 @@ mod tests {
             }
         }
 
-        /// TCK-00351 BLOCKER 2 v2 FIX: Broker configured without
+        /// RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Broker configured without
         /// pre-actuation gate must be denied (fail-closed).
         ///
         /// This regression test verifies that when a broker is configured
@@ -21012,11 +21039,11 @@ mod tests {
             registry
                 .register_session(crate::session::SessionState {
                     session_id: session_id.to_string(),
-                    work_id: "W-TCK-00375".to_string(),
+                    work_id: "W-RFC-0020::REQ-0029".to_string(),
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
-                    lease_id: "L-TCK-00375".to_string(),
+                    lease_id: "L-RFC-0020::REQ-0029".to_string(),
                     ephemeral_handle: "handle-tck-00375".to_string(),
-                    // TCK-00426: PCAC gate requires non-empty manifest hash
+                    // RFC-0020::REQ-0045: PCAC gate requires non-empty manifest hash
                     // and policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
                     pcac_policy: None,
@@ -21236,7 +21263,8 @@ mod tests {
                 let ledger = Arc::new(StubLedgerEventEmitter::new());
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
 
-                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let (sovereignty_checker, sovereignty_state) =
@@ -21469,7 +21497,8 @@ mod tests {
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> =
                     Arc::new(StubLedgerEventEmitter::new());
 
-                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let (sovereignty_checker, sovereignty_state) =
@@ -21698,11 +21727,11 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00336: Broker Mediation Regression Tests
+    // RFC-0032::REQ-0128: Broker Mediation Regression Tests
     // ========================================================================
 
-    /// TCK-00336: Regression tests ensuring no tool executes without broker
-    /// mediation.
+    /// RFC-0032::REQ-0128: Regression tests ensuring no tool executes without
+    /// broker mediation.
     ///
     /// These tests verify that:
     /// 1. All tool requests go through the broker (fail-closed without it)
@@ -21711,7 +21740,8 @@ mod tests {
     mod tck_00336_broker_mediation_regression {
         use super::*;
 
-        /// TCK-00336: Verify that ALL tool classes fail closed without broker.
+        /// RFC-0032::REQ-0128: Verify that ALL tool classes fail closed without
+        /// broker.
         ///
         /// This test ensures that no tool class has a special bypass path.
         #[test]
@@ -21779,7 +21809,8 @@ mod tests {
             }
         }
 
-        /// TCK-00336: Verify fail-closed behavior with no manifest store.
+        /// RFC-0032::REQ-0128: Verify fail-closed behavior with no manifest
+        /// store.
         ///
         /// When neither broker nor manifest store is configured, tool requests
         /// must still fail closed.
@@ -21816,8 +21847,8 @@ mod tests {
             }
         }
 
-        /// TCK-00336: Verify that manifest-only validation doesn't allow
-        /// execution.
+        /// RFC-0032::REQ-0128: Verify that manifest-only validation doesn't
+        /// allow execution.
         ///
         /// Even if a tool is in the manifest's allowlist, without a broker
         /// the request MUST be denied (no legacy manifest-based allow path).
@@ -21873,7 +21904,7 @@ mod tests {
             }
         }
 
-        /// TCK-00336: Verify `EpisodeRuntime` requires broker for tool
+        /// RFC-0032::REQ-0128: Verify `EpisodeRuntime` requires broker for tool
         /// execution.
         ///
         /// The `handle_broker_decision` path checks that `EpisodeRuntime` is
@@ -21938,7 +21969,7 @@ mod tests {
             }
         }
 
-        /// TCK-00336: Verify that unknown tool classes fail closed.
+        /// RFC-0032::REQ-0128: Verify that unknown tool classes fail closed.
         ///
         /// Unknown tool classes should be denied before even checking the
         /// broker.
@@ -21985,7 +22016,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00344: SessionStatus Integration Tests
+    // RFC-0032::REQ-0134: SessionStatus Integration Tests
     // ========================================================================
 
     /// IT-00344-SS: `SessionStatus` handler tests.
@@ -22028,7 +22059,7 @@ mod tests {
                 .register_session(session)
                 .expect("session registration should succeed");
 
-            // TCK-00384: Wire telemetry store with a real start time
+            // RFC-0032::REQ-0138: Wire telemetry store with a real start time
             let telemetry_store = Arc::new(SessionTelemetryStore::new());
             let started_at_ns = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -22172,7 +22203,7 @@ mod tests {
         }
 
         // ====================================================================
-        // TCK-00384: Session Telemetry Integration Tests
+        // RFC-0032::REQ-0138: Session Telemetry Integration Tests
         // ====================================================================
 
         /// IT-00384-01: `SessionStatus` returns real telemetry counters
@@ -22463,7 +22494,7 @@ mod tests {
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "L-E2E-001".to_string(),
                     ephemeral_handle: "handle-e2e".to_string(),
-                    // TCK-00426: PCAC gate requires non-empty manifest hash and
+                    // RFC-0020::REQ-0045: PCAC gate requires non-empty manifest hash and
                     // policy_resolved_ref in authoritative mode.
                     policy_resolved_ref: "test-policy-ref".to_string(),
                     pcac_policy: None,
@@ -22492,7 +22523,7 @@ mod tests {
                     .expect("telemetry registration should succeed");
 
                 // --- Build dispatcher with all production dependencies ---
-                // TCK-00351 BLOCKER 2 v2 FIX: Gate is mandatory when broker
+                // RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Gate is mandatory when broker
                 // is configured.
                 let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
                 let preactuation_gate = Arc::new(
@@ -22501,7 +22532,8 @@ mod tests {
                         None,
                     ),
                 );
-                // TCK-00426: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
@@ -22568,7 +22600,7 @@ mod tests {
                 }
 
                 // --- (c) Dispatch EmitEvent through real ledger path ---
-                // TCK-00498: With PCAC lifecycle enforcement, EmitEvent is
+                // RFC-0032::REQ-0173: With PCAC lifecycle enforcement, EmitEvent is
                 // a Tier2Plus Actuate endpoint requiring full PCAC lifecycle
                 // (join -> revalidate -> consume). This test setup does not
                 // emit a governance policy event, so the PCAC path correctly
@@ -22744,7 +22776,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00385: Session Termination Signal Tests
+    // RFC-0032::REQ-0139: Session Termination Signal Tests
     // ========================================================================
 
     /// IT-00385: `SessionStatus` returns TERMINATED state with termination
@@ -22757,7 +22789,7 @@ mod tests {
         use crate::session::{SessionRegistry, SessionState};
 
         /// IT-00385-01: `SessionStatus` returns ACTIVE for active session
-        /// (no regression from TCK-00344).
+        /// (no regression from RFC-0032::REQ-0134).
         #[test]
         fn test_active_session_returns_active_state() {
             let minter = test_minter();
@@ -22796,7 +22828,7 @@ mod tests {
                     assert_eq!(resp.session_id, "session-001");
                     assert_eq!(resp.state, "ACTIVE");
                     assert_eq!(resp.work_id, "W-385-001");
-                    // TCK-00385: Termination fields should be None for active
+                    // RFC-0032::REQ-0139: Termination fields should be None for active
                     // sessions
                     assert!(
                         resp.termination_reason.is_none(),
@@ -22875,7 +22907,7 @@ mod tests {
                     assert_eq!(resp.work_id, "W-385-002");
                     assert_eq!(resp.role, i32::from(WorkRole::Implementer));
                     assert_eq!(resp.episode_id, Some("E-385-002".to_string()));
-                    // TCK-00385: Termination details should be populated
+                    // RFC-0032::REQ-0139: Termination details should be populated
                     assert_eq!(resp.termination_reason, Some("normal".to_string()),);
                     assert_eq!(resp.exit_code, Some(0));
                     assert!(
@@ -23264,7 +23296,8 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00395 Security BLOCKER 1: Post-termination revocation enforcement
+    // RFC-0032::REQ-0149 Security BLOCKER 1: Post-termination revocation
+    // enforcement
     // ========================================================================
 
     /// Regression tests proving `EmitEvent` and `PublishEvidence` are denied
@@ -23316,7 +23349,7 @@ mod tests {
                 .with_cas(cas)
         }
 
-        /// TCK-00395 Security BLOCKER 1: `EmitEvent` is denied after
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `EmitEvent` is denied after
         /// `EndSession`.
         ///
         /// A retained HMAC token must not be able to write events to the
@@ -23354,8 +23387,8 @@ mod tests {
             }
         }
 
-        /// TCK-00395 Security BLOCKER 1: `PublishEvidence` is denied after
-        /// `EndSession`.
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `PublishEvidence` is denied
+        /// after `EndSession`.
         ///
         /// A retained HMAC token must not be able to write artifacts to
         /// CAS after the session has been terminated.
@@ -23394,8 +23427,9 @@ mod tests {
             }
         }
 
-        /// TCK-00395 Security BLOCKER 1: `SessionStatus` is still allowed after
-        /// `EndSession` (the only post-termination endpoint).
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `SessionStatus` is still
+        /// allowed after `EndSession` (the only post-termination
+        /// endpoint).
         ///
         /// This confirms the positive case: `SessionStatus` should still work
         /// for terminated sessions to allow agents to query final state.
@@ -23424,8 +23458,8 @@ mod tests {
             );
         }
 
-        /// TCK-00395 Security BLOCKER 1: `EmitEvent` succeeds while session is
-        /// still active (positive test / no regression).
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `EmitEvent` succeeds while
+        /// session is still active (positive test / no regression).
         #[test]
         fn emit_event_succeeds_while_session_active() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -23456,7 +23490,7 @@ mod tests {
                     .expect("default ClockConfig should succeed"),
             );
 
-            // TCK-00498: Wire a PCAC lifecycle gate to satisfy the authority
+            // RFC-0032::REQ-0173: Wire a PCAC lifecycle gate to satisfy the authority
             // lifecycle guard in authoritative mode (ledger wired).
             // The PCAC lifecycle is now fully enforced for session endpoints,
             // so the test verifies that the PCAC lifecycle enforcement runs
@@ -23517,7 +23551,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00352 MAJOR 4: V1 dispatch/session integration tests
+    // RFC-0020::REQ-0006 MAJOR 4: V1 dispatch/session integration tests
     //
     // These tests prove that V1 scope enforcement is exercised through the
     // real `SessionDispatcher::handle_request_tool` path, including deny
@@ -23639,7 +23673,7 @@ mod tests {
             encode_request_tool_request(&request)
         }
 
-        /// TCK-00352 BLOCKER 1 integration test: V1 scope enforcement
+        /// RFC-0020::REQ-0006 BLOCKER 1 integration test: V1 scope enforcement
         /// denies a network request to an unauthorized host when the
         /// actual host is extracted from request.arguments.
         #[test]
@@ -23695,7 +23729,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 1 integration test: V1 scope enforcement
+        /// RFC-0020::REQ-0006 BLOCKER 1 integration test: V1 scope enforcement
         /// denies a Read request with a path outside the allowed scope.
         #[test]
         fn v1_denies_read_request_with_out_of_scope_path_via_dispatch() {
@@ -23745,7 +23779,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 MAJOR 4 integration test: V1 scope enforcement
+        /// RFC-0020::REQ-0006 MAJOR 4 integration test: V1 scope enforcement
         /// denies a tool not in the manifest allowlist.
         #[test]
         fn v1_denies_disallowed_tool_class_via_dispatch() {
@@ -23797,8 +23831,8 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 1 v3: Authority confusion attack via userinfo
-        /// in URL. A URL like `https://trusted.com:443@evil.com/steal` must
+        /// RFC-0020::REQ-0006 BLOCKER 1 v3: Authority confusion attack via
+        /// userinfo in URL. A URL like `https://trusted.com:443@evil.com/steal` must
         /// be rejected because the actual network destination is `evil.com`,
         /// not `trusted.com`. The `url` crate correctly parses the authority
         /// and we deny any URL containing userinfo.
@@ -23855,9 +23889,9 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 1 v3: URL with username-only userinfo must
-        /// also be rejected. Even without a password, the presence of
-        /// userinfo indicates potential authority confusion.
+        /// RFC-0020::REQ-0006 BLOCKER 1 v3: URL with username-only userinfo
+        /// must also be rejected. Even without a password, the presence
+        /// of userinfo indicates potential authority confusion.
         #[test]
         fn v1_denies_url_with_username_only_userinfo() {
             let (dispatcher, minter) = setup_v1_dispatcher(
@@ -23910,7 +23944,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 BLOCKER 1 v3: Unparseable URL must be denied for
+        /// RFC-0020::REQ-0006 BLOCKER 1 v3: Unparseable URL must be denied for
         /// Network tool class (fail-closed). If we cannot reliably determine
         /// the host, we must not allow the request through.
         #[test]
@@ -23968,7 +24002,7 @@ mod tests {
             }
         }
 
-        /// TCK-00352 MAJOR 2: V1 store cleanup on remove.
+        /// RFC-0020::REQ-0006 MAJOR 2: V1 store cleanup on remove.
         /// Verifies that removing a V1 manifest from the store means
         /// subsequent requests bypass V1 checks (as if the session
         /// was terminated).
@@ -24005,7 +24039,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00377: tool_kind population from session dispatch
+    // RFC-0020::REQ-0031: tool_kind population from session dispatch
     // ========================================================================
     mod tool_kind_population {
         use apm2_core::tool::{self, tool_request as tool_req};
@@ -24217,12 +24251,13 @@ mod tests {
     }
 
     // =====================================================================
-    // TCK-00489: Priority-aware quarantine lifecycle tests
+    // RFC-0020::REQ-0055: Priority-aware quarantine lifecycle tests
     // =====================================================================
 
-    /// TCK-00489 (a): Adversarial flood of low-severity entries cannot evict
-    /// unexpired high-severity quarantine. A higher-severity entry CAN evict a
-    /// lower-severity entry, but a same-severity entry cannot (fail-closed).
+    /// RFC-0020::REQ-0055 (a): Adversarial flood of low-severity entries cannot
+    /// evict unexpired high-severity quarantine. A higher-severity entry
+    /// CAN evict a lower-severity entry, but a same-severity entry cannot
+    /// (fail-closed).
     #[test]
     fn tck_00489_adversarial_flood_cannot_evict_unexpired_high_severity_quarantine() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24322,8 +24357,8 @@ mod tests {
         );
     }
 
-    /// TCK-00489 (b): Higher-severity entry can evict lower-severity entry
-    /// when capacity is full and no expired entries exist.
+    /// RFC-0020::REQ-0055 (b): Higher-severity entry can evict lower-severity
+    /// entry when capacity is full and no expired entries exist.
     #[test]
     fn tck_00489_higher_severity_evicts_lower_severity_when_saturated() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24370,8 +24405,8 @@ mod tests {
         );
     }
 
-    /// TCK-00489 (c): Expired entries are evicted before active entries of any
-    /// severity.
+    /// RFC-0020::REQ-0055 (c): Expired entries are evicted before active
+    /// entries of any severity.
     #[test]
     fn tck_00489_expired_entries_evicted_before_active_entries() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24433,8 +24468,8 @@ mod tests {
         );
     }
 
-    /// TCK-00489 (d): Per-session quota isolation prevents cross-session
-    /// quarantine exhaustion.
+    /// RFC-0020::REQ-0055 (d): Per-session quota isolation prevents
+    /// cross-session quarantine exhaustion.
     #[test]
     fn tck_00489_per_session_quota_prevents_cross_session_exhaustion() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24497,8 +24532,8 @@ mod tests {
         );
     }
 
-    /// TCK-00489 (e): Normal-path quarantine lifecycle works: insert, query,
-    /// TTL expiry, clearance.
+    /// RFC-0020::REQ-0055 (e): Normal-path quarantine lifecycle works: insert,
+    /// query, TTL expiry, clearance.
     #[test]
     fn tck_00489_normal_path_quarantine_lifecycle() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24545,7 +24580,7 @@ mod tests {
         );
     }
 
-    /// TCK-00489 (f): Severity escalation on update-in-place.
+    /// RFC-0020::REQ-0055 (f): Severity escalation on update-in-place.
     #[test]
     fn tck_00489_severity_escalation_on_update() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24603,7 +24638,7 @@ mod tests {
         );
     }
 
-    /// TCK-00489: `ViolationSeverity::from_violation_classes` derives
+    /// RFC-0020::REQ-0055: `ViolationSeverity::from_violation_classes` derives
     /// correct severity from boundary defect classes.
     #[test]
     fn tck_00489_violation_severity_from_classes() {
@@ -24661,7 +24696,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00494: AdmissionKernel no-bypass and no-early-output tests
+    // RFC-0032::REQ-0172: AdmissionKernel no-bypass and no-early-output tests
     // ========================================================================
 
     mod tck_00494_admission_kernel_guard {
@@ -24714,9 +24749,9 @@ mod tests {
             registry
                 .register_session(SessionState {
                     session_id: session_id.to_string(),
-                    work_id: "W-TCK-00494".to_string(),
+                    work_id: "W-RFC-0032::REQ-0172".to_string(),
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
-                    lease_id: "L-TCK-00494".to_string(),
+                    lease_id: "L-RFC-0032::REQ-0172".to_string(),
                     ephemeral_handle: "handle-tck-00494".to_string(),
                     policy_resolved_ref: "test-policy-ref".to_string(),
                     pcac_policy: None,
@@ -25297,9 +25332,9 @@ mod tests {
         /// `LifecycleGate` (PCAC gate) is NOT, fail-closed tier (Tier2/3/4)
         /// tool requests MUST NOT be denied by the authority gate guard.
         /// The `AdmissionKernel` satisfies the "at least one authority gate"
-        /// requirement specified by the TCK-00494 contract.
+        /// requirement specified by the RFC-0032::REQ-0172 contract.
         ///
-        /// TCK-00494 BLOCKER FIX: The kernel is now ACTUALLY INVOKED
+        /// RFC-0032::REQ-0172 BLOCKER FIX: The kernel is now ACTUALLY INVOKED
         /// (`plan()`/`execute()`). With minimal wiring (no clock, etc.), the
         /// kernel invocation path will fail at a kernel-specific denial
         /// (e.g., "admission kernel denied: clock unavailable") rather
@@ -25982,7 +26017,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00498: AdmissionKernel cutover for EmitEvent + PublishEvidence
+    // RFC-0032::REQ-0173: AdmissionKernel cutover for EmitEvent + PublishEvidence
     // ========================================================================
 
     mod tck_00498_session_endpoint_kernel_cutover {
@@ -26027,9 +26062,9 @@ mod tests {
             registry
                 .register_session(SessionState {
                     session_id: session_id.to_string(),
-                    work_id: "W-TCK-00498".to_string(),
+                    work_id: "W-RFC-0032::REQ-0173".to_string(),
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
-                    lease_id: "L-TCK-00498".to_string(),
+                    lease_id: "L-RFC-0032::REQ-0173".to_string(),
                     ephemeral_handle: "handle-tck-00498".to_string(),
                     policy_resolved_ref: "test-policy-ref".to_string(),
                     pcac_policy: None,
@@ -26047,7 +26082,7 @@ mod tests {
         // EmitEvent: deny on missing kernel for fail-closed authoritative
         // ----------------------------------------------------------------
 
-        /// **TCK-00498, REQ-0026**: `EmitEvent` MUST be denied in
+        /// **RFC-0032::REQ-0173, REQ-0026**: `EmitEvent` MUST be denied in
         /// authoritative mode when no authority lifecycle gate (kernel or
         /// PCAC) is wired.
         #[test]
@@ -26108,8 +26143,9 @@ mod tests {
         // PublishEvidence: deny on missing kernel for fail-closed
         // ----------------------------------------------------------------
 
-        /// **TCK-00498, REQ-0026**: `PublishEvidence` MUST be denied in
-        /// authoritative mode when no authority lifecycle gate is wired.
+        /// **RFC-0032::REQ-0173, REQ-0026**: `PublishEvidence` MUST be denied
+        /// in authoritative mode when no authority lifecycle gate is
+        /// wired.
         #[test]
         fn publish_evidence_denied_when_kernel_missing_in_authoritative_mode() {
             let minter = test_minter();
@@ -26167,8 +26203,9 @@ mod tests {
             }
         }
 
-        /// **TCK-00502 MAJOR-1**: `EmitEvent` must fail-safe when post-effect
-        /// anti-rollback finalization fails for fail-closed tiers.
+        /// **RFC-0032::REQ-0177 MAJOR-1**: `EmitEvent` must fail-safe when
+        /// post-effect anti-rollback finalization fails for fail-closed
+        /// tiers.
         #[test]
         fn emit_event_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -26229,7 +26266,7 @@ mod tests {
                 "outcome index must not persist when finalize fails in fail-closed mode"
             );
 
-            // TCK-00502 MINOR fix: the circuit probe is now non-mutating
+            // RFC-0032::REQ-0177 MINOR fix: the circuit probe is now non-mutating
             // (uses verify_committed instead of finalize_anti_rollback).
             // Since verify_committed passes in this test setup, the circuit
             // closes on probe, allowing the second request through. The
@@ -26260,8 +26297,9 @@ mod tests {
             }
         }
 
-        /// **TCK-00502 MAJOR-1**: `PublishEvidence` must fail-safe when
-        /// post-effect anti-rollback finalization fails for fail-closed tiers.
+        /// **RFC-0032::REQ-0177 MAJOR-1**: `PublishEvidence` must fail-safe
+        /// when post-effect anti-rollback finalization fails for
+        /// fail-closed tiers.
         #[test]
         fn publish_evidence_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -26326,7 +26364,7 @@ mod tests {
                 "outcome index must not persist when finalize fails in fail-closed mode"
             );
 
-            // TCK-00502 MINOR fix: non-mutating circuit probe. See emit_event
+            // RFC-0032::REQ-0177 MINOR fix: non-mutating circuit probe. See emit_event
             // test above for the rationale. The circuit probe passes via
             // verify_committed, allowing the second request through, which
             // then also fails at finalize.
@@ -26359,10 +26397,10 @@ mod tests {
         // EmitEvent: non-authoritative mode does NOT require kernel
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: `EmitEvent` in non-authoritative mode (no ledger/CAS
-        /// configured) should not be blocked by the kernel guard. The handler
-        /// will fail for other reasons (no ledger) but NOT from the kernel
-        /// guard.
+        /// **RFC-0032::REQ-0173**: `EmitEvent` in non-authoritative mode (no
+        /// ledger/CAS configured) should not be blocked by the kernel
+        /// guard. The handler will fail for other reasons (no ledger)
+        /// but NOT from the kernel guard.
         #[test]
         fn emit_event_non_authoritative_not_blocked_by_kernel_guard() {
             let minter = test_minter();
@@ -26400,8 +26438,8 @@ mod tests {
         // PublishEvidence: non-authoritative mode does NOT require kernel
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: `PublishEvidence` in non-authoritative mode should
-        /// not be blocked by the kernel guard.
+        /// **RFC-0032::REQ-0173**: `PublishEvidence` in non-authoritative mode
+        /// should not be blocked by the kernel guard.
         #[test]
         fn publish_evidence_non_authoritative_not_blocked_by_kernel_guard() {
             let minter = test_minter();
@@ -26438,12 +26476,13 @@ mod tests {
         // EmitEvent: PCAC lifecycle gate enforces full lifecycle
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: When a PCAC lifecycle gate IS wired (but not the
-        /// kernel), the handler MUST NOT trigger the kernel-missing denial
-        /// AND MUST enforce the full PCAC lifecycle (join -> revalidate ->
-        /// consume) before the effect. With all dependencies wired, the
-        /// PCAC lifecycle runs and the governance policy root check fires
-        /// as expected for `Tier2Plus` session endpoints.
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired (but not
+        /// the kernel), the handler MUST NOT trigger the kernel-missing
+        /// denial AND MUST enforce the full PCAC lifecycle (join ->
+        /// revalidate -> consume) before the effect. With all
+        /// dependencies wired, the PCAC lifecycle runs and the
+        /// governance policy root check fires as expected for
+        /// `Tier2Plus` session endpoints.
         #[test]
         fn emit_event_pcac_gate_enforces_lifecycle() {
             use crate::episode::preactuation::StopAuthority;
@@ -26529,8 +26568,9 @@ mod tests {
         // PublishEvidence: PCAC lifecycle gate enforces full lifecycle
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: When a PCAC lifecycle gate IS wired, the handler
-        /// MUST enforce the full PCAC lifecycle for `PublishEvidence`.
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired, the
+        /// handler MUST enforce the full PCAC lifecycle for
+        /// `PublishEvidence`.
         #[test]
         fn publish_evidence_pcac_gate_enforces_lifecycle() {
             use crate::episode::preactuation::StopAuthority;
@@ -26610,7 +26650,7 @@ mod tests {
         // EmitEvent: PCAC gate wired but clock missing -> fail-closed
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: When a PCAC lifecycle gate IS wired but the
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired but the
         /// clock dependency is missing, the handler MUST deny fail-closed
         /// (not silently bypass with Ok(None)).
         #[test]
@@ -26683,7 +26723,7 @@ mod tests {
         // fail-closed
         // ----------------------------------------------------------------
 
-        /// **TCK-00498**: When a PCAC lifecycle gate IS wired but the
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired but the
         /// `stop_authority` dependency is missing, the handler MUST deny
         /// fail-closed.
         #[test]
@@ -26763,7 +26803,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCK-00501: Effect journal record_completed for session endpoints
+    // RFC-0032::REQ-0176: Effect journal record_completed for session endpoints
     // ========================================================================
 
     mod tck_00501_session_endpoint_record_completed {
@@ -26820,7 +26860,7 @@ mod tests {
             registry
                 .register_session(SessionState {
                     session_id: session_id.to_string(),
-                    work_id: "W-TCK-00501".to_string(),
+                    work_id: "W-RFC-0032::REQ-0176".to_string(),
                     role: crate::protocol::messages::WorkRole::Implementer.into(),
                     lease_id: "lease-001".to_string(),
                     ephemeral_handle: "handle-tck-00501".to_string(),
@@ -27140,7 +27180,7 @@ mod tests {
             let policy_hash = test_hash(0x30); // Matches PassingPolicyResolver
             let governance_payload =
                 serde_json::to_vec(&crate::gate::GateOrchestratorEvent::PolicyResolved {
-                    work_id: "W-TCK-00501-GOVERNANCE".to_string(),
+                    work_id: "W-RFC-0032::REQ-0176-GOVERNANCE".to_string(),
                     changeset_digest: [0u8; 32],
                     policy_hash,
                     timestamp_ms: 1,
@@ -27287,10 +27327,10 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
-        // TCK-00501 BLOCKER: EmitEvent must call record_completed
+        // RFC-0032::REQ-0176 BLOCKER: EmitEvent must call record_completed
         // ----------------------------------------------------------------
 
-        /// **TCK-00501**: After a successful `EmitEvent` through the
+        /// **RFC-0032::REQ-0176**: After a successful `EmitEvent` through the
         /// `AdmissionKernel` path, the journal state for the request MUST
         /// be `Completed`, not `Started`.
         ///
@@ -27370,12 +27410,12 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
-        // TCK-00501 BLOCKER: PublishEvidence must call record_completed
+        // RFC-0032::REQ-0176 BLOCKER: PublishEvidence must call record_completed
         // ----------------------------------------------------------------
 
-        /// **TCK-00501**: After a successful `PublishEvidence` through the
-        /// `AdmissionKernel` path, the journal state for the request MUST
-        /// be `Completed`, not `Started`.
+        /// **RFC-0032::REQ-0176**: After a successful `PublishEvidence` through
+        /// the `AdmissionKernel` path, the journal state for the
+        /// request MUST be `Completed`, not `Started`.
         #[test]
         fn publish_evidence_records_completed_in_effect_journal() {
             let minter = test_minter();

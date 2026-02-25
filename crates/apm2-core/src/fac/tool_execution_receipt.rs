@@ -1,8 +1,8 @@
 // AGENT-AUTHORED
 //! Tool execution receipt types for proof-carrying tool actuation.
 //!
-//! This module implements [`ToolExecutionReceipt`] per TCK-00327 and RFC-0019.
-//! Each tool actuation produces a signed receipt that binds:
+//! This module implements [`ToolExecutionReceipt`] per RFC-0032::REQ-0120 and
+//! RFC-0019. Each tool actuation produces a signed receipt that binds:
 //! - Episode/policy/request/capability context
 //! - Arguments hash and result hash
 //! - Time envelope and duration

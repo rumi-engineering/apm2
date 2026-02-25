@@ -1,0 +1,69 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-core/src/coordination",
+  "behaviors": [
+    {
+      "id": "BEH-CORE-COORD-001",
+      "kind": "invariant",
+      "title": "Serial execution: one session at a time",
+      "description": "Coordination enforces serial execution with at most one session running at a time.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-002",
+      "kind": "invariant",
+      "title": "Session ID generated before binding event",
+      "description": "Session ID is generated BEFORE the binding event. Binding events bracket session lifecycle: session_bound before spawn, session_unbound after termination.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-003",
+      "kind": "safety",
+      "title": "Circuit breaker aborts after consecutive failures",
+      "description": "Circuit breaker aborts after CIRCUIT_BREAKER_THRESHOLD (3) consecutive work item failures.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-004",
+      "kind": "requirement",
+      "title": "Session bound event committed before spawn",
+      "description": "Controller MUST commit session_bound event BEFORE calling spawn (CAS-at-Commit ordering).",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-005",
+      "kind": "invariant",
+      "title": "Budget counters are monotonically non-decreasing",
+      "description": "All budget usage counters are monotonically non-decreasing within a coordination. Tick rate must be consistent across all updates.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-006",
+      "kind": "invariant",
+      "title": "Reducer is deterministic and idempotent",
+      "description": "CoordinationReducer is deterministic: same event sequence always produces same state. Replayed coordination.started does not reset accumulated state.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-007",
+      "kind": "requirement",
+      "title": "Receipt hash in completion event must match CAS content",
+      "description": "CoordinationReceipt is tamper-evident. Receipt hash in completion event must match CAS content. Hash uses length-prefixed binary encoding.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-008",
+      "kind": "invariant",
+      "title": "EFE weights clamped to valid range, NaN rejected",
+      "description": "EFE weights clamped to [0.0, 1.0]; NaN/infinite rejected. Component scores in [0.0, 1.0]; 0.0 is best.",
+      "rfc": ["RFC-0012"]
+    },
+    {
+      "id": "BEH-CORE-COORD-009",
+      "kind": "requirement",
+      "title": "Empty work queues and oversized queues rejected",
+      "description": "CoordinationConfig::new() rejects empty work queues and queues exceeding MAX_WORK_QUEUE_SIZE (1000).",
+      "rfc": ["RFC-0012"]
+    }
+  ]
+}

@@ -97,73 +97,73 @@
 //! - AD-LAYER-001: `EpisodeRuntime` extends `EpisodeController`
 //! - REQ-EPISODE-001: Episode envelope requirements
 
-// TCK-00159: Envelope and budget types
+// RFC-0033::REQ-0026: Envelope and budget types
 pub mod budget;
 pub mod envelope;
 pub mod golden_vectors;
 pub mod snapshot;
 
-// TCK-00160: Runtime and state machine
+// RFC-0033::REQ-0027: Runtime and state machine
 mod error;
 mod handle;
 mod runtime;
 mod state;
 
-// TCK-00161: PTY spawning and output capture
+// RFC-0033::REQ-0028: PTY spawning and output capture
 pub mod output;
 pub mod pty;
 pub mod ring_buffer;
 
-// TCK-00162: Harness adapter and registry
+// RFC-0033::REQ-0029: Harness adapter and registry
 pub mod adapter;
 pub mod raw_adapter;
 pub mod registry;
 
-// TCK-00173: Claude Code harness adapter
+// RFC-0033::REQ-0039: Claude Code harness adapter
 pub mod claude_code;
 pub mod claude_parser;
 
-// TCK-00402: Codex CLI adapter with TI1 tool bridge
+// RFC-0032::REQ-0154: Codex CLI adapter with TI1 tool bridge
 pub mod codex_cli;
 pub mod ti1_scanner;
 
-// TCK-00163: Capability manifest and validation
+// RFC-0033::REQ-0030: Capability manifest and validation
 pub mod capability;
 pub mod reviewer_manifest;
 pub mod scope;
 pub mod tool_class;
 
-// TCK-00164: Tool broker with dedupe cache
+// RFC-0033::REQ-0031: Tool broker with dedupe cache
 pub mod broker;
 pub mod decision;
 pub mod dedupe;
 
-// TCK-00165: Tool execution and budget charging
+// RFC-0033::REQ-0032: Tool execution and budget charging
 pub mod budget_tracker;
 pub mod executor;
 pub mod handlers;
 pub mod tool_handler;
 pub(crate) mod verified_content;
 
-// TCK-00311: Workspace snapshot and apply
+// RFC-0032::REQ-0105: Workspace snapshot and apply
 pub mod workspace;
 
-// TCK-00351: Pre-actuation stop and budget proof obligations
+// RFC-0020::REQ-0005: Pre-actuation stop and budget proof obligations
 pub mod preactuation;
 
-// TCK-00376: No-bypass path ratchet enforcement
+// RFC-0020::REQ-0030: No-bypass path ratchet enforcement
 pub mod path_ratchet;
 
-// TCK-00387: Crash recovery wiring
+// RFC-0032::REQ-0141: Crash recovery wiring
 pub mod crash_recovery;
 
-// Re-export envelope types (TCK-00159)
-// Re-export adapter types (TCK-00162)
+// Re-export envelope types (RFC-0033::REQ-0026)
+// Re-export adapter types (RFC-0033::REQ-0029)
 pub use adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
     HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
 };
-// Re-export broker types (TCK-00164, TCK-00292, TCK-00293)
+// Re-export broker types (RFC-0033::REQ-0031, RFC-0032::REQ-0094, RFC-0032::REQ-0095)
 pub use broker::{
     BrokerError, BrokerPolicyEngine, NO_POLICY_RATIONALE, NO_POLICY_RULE_ID, PolicyDecision,
     RuntimePreconditionEvaluator, SessionBrokerRegistry, SharedSessionBrokerRegistry,
@@ -171,13 +171,13 @@ pub use broker::{
     new_shared_broker_with_cas,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
-// Re-export tool execution types (TCK-00165)
+// Re-export tool execution types (RFC-0033::REQ-0032)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163, TCK-00254, TCK-00258, TCK-00317, TCK-00352)
-// NOTE: PolicyMintToken is intentionally NOT re-exported. It is pub(crate) and
-// only accessible to daemon-internal code (specifically GovernancePolicyResolver
-// and state.rs). This prevents external crates and requester surfaces from
-// minting capabilities. See Security Review BLOCKER 1.
+// Re-export capability types (RFC-0033::REQ-0030, RFC-0032::REQ-0070, RFC-0032::REQ-0074,
+// RFC-0032::REQ-0111, RFC-0020::REQ-0006) NOTE: PolicyMintToken is intentionally NOT
+// re-exported. It is pub(crate) and only accessible to daemon-internal code (specifically
+// GovernancePolicyResolver and state.rs). This prevents external crates and requester surfaces
+// from minting capabilities. See Security Review BLOCKER 1.
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityManifestV1, CapabilityValidator, CustodyDomainError,
@@ -189,7 +189,7 @@ pub use capability::{
 };
 // NOTE: PolicyMintToken is accessed via crate::episode::capability::PolicyMintToken
 // by governance.rs. No re-export needed here since direct path access is used.
-// Re-export Claude Code adapter types (TCK-00173)
+// Re-export Claude Code adapter types (RFC-0033::REQ-0039)
 pub use claude_code::{
     ClaudeCodeAdapter, ClaudeCodeHolon, ClaudeCodeOutput, ClaudeCodeState, SharedClaudeCodeState,
 };
@@ -217,29 +217,30 @@ pub use envelope::{
     EpisodeEnvelope, EpisodeEnvelopeBuilder, EpisodeEnvelopeV1, EpisodeEnvelopeV1Builder, RiskTier,
     StopConditions, validate_delegated_spawn_gate, validate_spawn_gate,
 };
-// Re-export runtime types (TCK-00160)
+// Re-export runtime types (RFC-0033::REQ-0027)
 pub use error::{EpisodeError, EpisodeId, MAX_EPISODE_ID_LEN};
 pub use executor::{
     ContentAddressedStore, ExecutionContext, ExecutorError, SharedToolExecutor, ToolExecutor,
     new_shared_executor,
 };
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
-// TCK-00319: register_stub_handlers is test-only (insecure CWD rooting)
+// RFC-0032::REQ-0113: register_stub_handlers is test-only (insecure CWD rooting)
 #[cfg(test)]
 #[allow(deprecated)]
 pub use handlers::register_stub_handlers;
-// Re-export handler types (TCK-00291, TCK-00315, TCK-00319, TCK-00338)
+// Re-export handler types (RFC-0032::REQ-0093, RFC-0032::REQ-0109, RFC-0032::REQ-0113,
+// RFC-0032::REQ-0129)
 pub use handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
     SandboxConfig, SearchHandler, WriteFileHandler, register_handlers_with_root,
 };
-// Re-export PTY types (TCK-00161)
+// Re-export PTY types (RFC-0033::REQ-0028)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
-// Re-export path ratchet types (TCK-00376)
+// Re-export path ratchet types (RFC-0020::REQ-0030)
 pub use path_ratchet::{
     EnforcementStatus, PathRatchet, PathRatchetError, PathRatchetInput, PathRatchetOutcome,
 };
-// Re-export pre-actuation types (TCK-00351)
+// Re-export pre-actuation types (RFC-0020::REQ-0005)
 pub use preactuation::{
     BudgetStatus, DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, MAX_REPLAY_ENTRIES, PreActuationDenial,
     PreActuationGate, PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayVerifier,
@@ -249,12 +250,13 @@ pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
     RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
 };
-// Re-export registry types (TCK-00162, TCK-00328: profile-based selection, TCK-00385: TTL)
+// Re-export registry types (RFC-0033::REQ-0029, RFC-0032::REQ-0121: profile-based selection,
+// RFC-0032::REQ-0139: TTL)
 pub use registry::{
     AdapterRegistry, AdapterRegistryError, InMemorySessionRegistry, PersistentRegistryError,
     PersistentSessionRegistry, TERMINATED_SESSION_TTL_SECS,
 };
-// Re-export reviewer manifest types (TCK-00317)
+// Re-export reviewer manifest types (RFC-0032::REQ-0111)
 pub use reviewer_manifest::{
     DAEMON_DELEGATOR_ID, REVIEWER_V0_MANIFEST_ID, build_reviewer_v0_manifest,
     build_reviewer_v0_manifest_dynamic, is_reviewer_v0_manifest_hash, reviewer_v0_manifest,
@@ -286,7 +288,7 @@ pub use tool_handler::{
     MAX_RESULT_MESSAGE_LEN, MAX_TOOL_ARGS_SIZE, NetworkArgs, RawArgs, ReadArgs, ResultMetadata,
     ToolArgs, ToolHandler, ToolHandlerError, ToolResultData, WriteArgs,
 };
-// Re-export workspace types (TCK-00311, TCK-00312, TCK-00318)
+// Re-export workspace types (RFC-0032::REQ-0105, RFC-0032::REQ-0106, RFC-0032::REQ-0112)
 pub use workspace::{
     ApplyResult, MAX_FILE_SIZE, MAX_GIT_LINE_LEN, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS,
     MAX_WORKSPACE_FILES, RetryContext, ReviewCompletionResult, ReviewCompletionResultBuilder,

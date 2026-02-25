@@ -625,7 +625,7 @@ mod unit_tests {
     }
 }
 
-/// TCK-00241: Tick-based lease expiry tests (RFC-0016 HTF).
+/// RFC-0016::REQ-0003: Tick-based lease expiry tests (RFC-0016 HTF).
 ///
 /// These tests verify that lease validity is determined by monotonic ticks,
 /// not wall time, and that wall time changes do not affect lease validity.
@@ -640,7 +640,7 @@ mod tck_00241 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// TCK-00241: Tick-based expiry is independent of wall time.
+    /// RFC-0016::REQ-0003: Tick-based expiry is independent of wall time.
     ///
     /// Verifies that changing wall time values does not affect lease validity
     /// when tick-based timing is used.
@@ -673,7 +673,7 @@ mod tck_00241 {
         // values
     }
 
-    /// TCK-00241: Tick-based expiry at exact boundary.
+    /// RFC-0016::REQ-0003: Tick-based expiry at exact boundary.
     #[test]
     fn tick_expiry_at_exact_boundary() {
         let lease = Lease::new_with_ticks(
@@ -700,7 +700,7 @@ mod tck_00241 {
         assert_eq!(lease.ticks_remaining(&tick(2001)), 0);
     }
 
-    /// TCK-00241: SEC-CTRL-FAC-0015 legacy lease handling.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 legacy lease handling.
     ///
     /// Legacy leases without tick data should NOT be treated as expired by
     /// tick-only methods. Instead, callers should use the wall-clock fallback
@@ -728,7 +728,8 @@ mod tck_00241 {
         assert_eq!(lease.ticks_remaining(&tick(1500)), 0);
     }
 
-    /// TCK-00241: SEC-CTRL-FAC-0015 wall-clock fallback for legacy leases.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 wall-clock fallback for legacy
+    /// leases.
     ///
     /// Legacy leases should use wall-clock comparison when tick data is
     /// not available. This provides a migration path for existing leases.
@@ -754,7 +755,7 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick_or_wall(&tick(1000), 3_000_000_000));
     }
 
-    /// TCK-00241: Terminal leases are not considered expired.
+    /// RFC-0016::REQ-0003: Terminal leases are not considered expired.
     ///
     /// A lease in terminal state (Released/Expired) should return false
     /// from `is_expired_at_tick`, as it's already been processed.
@@ -778,7 +779,7 @@ mod tck_00241 {
         assert!(!lease.is_expired_at_tick(&tick(3000)));
     }
 
-    /// TCK-00241: Injected ticks work correctly for testing.
+    /// RFC-0016::REQ-0003: Injected ticks work correctly for testing.
     ///
     /// Demonstrates that tests can use arbitrary tick values without
     /// needing real time sources.
@@ -819,7 +820,7 @@ mod tck_00241 {
         }
     }
 
-    /// TCK-00241: SEC-HTF-003 Tick rate mismatch fails closed.
+    /// RFC-0016::REQ-0003: SEC-HTF-003 Tick rate mismatch fails closed.
     ///
     /// When tick rates differ between current tick and lease expiry tick,
     /// the comparison is invalid. The method fails closed (returns true
@@ -853,7 +854,7 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick(&expired_tick));
     }
 
-    /// TCK-00241: Same tick rates allow proper comparison.
+    /// RFC-0016::REQ-0003: Same tick rates allow proper comparison.
     ///
     /// When tick rates match, raw tick values are compared directly.
     #[test]
@@ -882,7 +883,7 @@ mod tck_00241 {
         assert_eq!(lease.ticks_remaining(&HtfTick::new(2001, 1_000_000)), 0);
     }
 
-    /// TCK-00241: `Lease::new_with_ticks` sets all fields correctly.
+    /// RFC-0016::REQ-0003: `Lease::new_with_ticks` sets all fields correctly.
     #[test]
     fn new_with_ticks_sets_all_fields() {
         let issued = tick(1000);
@@ -918,7 +919,8 @@ mod tck_00241 {
         assert!(!lease.is_legacy_lease());
     }
 
-    /// TCK-00241: Tick-based lease uses tick comparison, ignores wall time.
+    /// RFC-0016::REQ-0003: Tick-based lease uses tick comparison, ignores wall
+    /// time.
     ///
     /// When tick data is present, `is_expired_at_tick_or_wall` uses tick
     /// comparison and ignores the wall time parameter.
@@ -942,7 +944,7 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick_or_wall(&tick(2500), 1_500_000_000));
     }
 
-    /// TCK-00241: SEC-HTF-003 tick rate mismatch in combined method.
+    /// RFC-0016::REQ-0003: SEC-HTF-003 tick rate mismatch in combined method.
     ///
     /// When tick rates mismatch, the combined method also fails closed.
     #[test]
@@ -963,7 +965,8 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
     }
 
-    /// TCK-00241: Terminal lease returns false from all expiry methods.
+    /// RFC-0016::REQ-0003: Terminal lease returns false from all expiry
+    /// methods.
     #[test]
     fn terminal_lease_not_expired_in_combined_method() {
         let mut lease = Lease::new_with_ticks(

@@ -4,7 +4,7 @@
 //! identifiers to content hashes for artifact resolution. It enables:
 //!
 //! - **Stable references**: Artifacts can be referenced by human-readable names
-//!   (e.g., `org:ticket:TCK-00134@v1`) instead of raw content hashes
+//!   (e.g., `org:ticket:RFC-0011::REQ-0001@v1`) instead of raw content hashes
 //! - **Schema tracking**: Each artifact entry tracks its schema for validation
 //! - **Dependency graphs**: Edges between artifacts for impact analysis
 //! - **Collision detection**: Duplicate `stable_id` registrations are rejected
@@ -28,8 +28,8 @@
 //! Stable IDs follow the format: `namespace:kind:identifier[@version]`
 //!
 //! Examples:
-//! - `org:ticket:TCK-00134` (latest version)
-//! - `org:ticket:TCK-00134@v1` (specific version)
+//! - `org:ticket:RFC-0011::REQ-0001` (latest version)
+//! - `org:ticket:RFC-0011::REQ-0001@v1` (specific version)
 //! - `org:schema:ticket-v1` (reserved namespace)
 //!
 //! # Reserved Prefixes
@@ -56,14 +56,14 @@
 //!
 //! // Register an artifact (content_hash must be 64 hex chars - BLAKE3)
 //! let entry = DcpEntry::new(
-//!     "org:ticket:TCK-00134",
+//!     "org:ticket:RFC-0011::REQ-0001",
 //!     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 //!     "org:schema:ticket-v1", // schema reference
 //! );
 //! index.register(entry).unwrap();
 //!
 //! // Resolve the artifact
-//! let content_hash = index.resolve("org:ticket:TCK-00134");
+//! let content_hash = index.resolve("org:ticket:RFC-0011::REQ-0001");
 //! assert!(content_hash.is_some());
 //! ```
 
@@ -190,7 +190,7 @@ impl From<LedgerError> for DcpIndexError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DcpEntry {
-    /// The stable identifier (e.g., "org:ticket:TCK-00134@v1").
+    /// The stable identifier (e.g., "org:ticket:RFC-0011::REQ-0001@v1").
     pub stable_id: String,
 
     /// The BLAKE3 content hash (hex-encoded).

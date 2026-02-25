@@ -107,7 +107,7 @@ pub use receipt::{
 };
 pub use reducer::{EvidenceReducer, EvidenceReducerState};
 pub use state::{Evidence, EvidenceBundle, EvidenceSummary};
-// StrictlyOrderedEvidence and Gate Predicates (TCK-00198)
+// StrictlyOrderedEvidence and Gate Predicates (RFC-0033::REQ-0058)
 pub use strictly_ordered::{
     EvidencePredicate, GatePredicateReceipt, MAX_EVIDENCE_HASHES, MAX_EVIDENCE_ID_LEN,
     MAX_EVIDENCE_PREDICATES, MAX_PREDICATE_NAME_LEN, MAX_PREDICATE_VALUE_LEN,

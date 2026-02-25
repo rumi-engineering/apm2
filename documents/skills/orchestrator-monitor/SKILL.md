@@ -9,7 +9,7 @@ orientation: "You are managing the Forge Admission Cycle for one or more merge r
 title: Parallel PR Orchestrator Monitor
 protocol:
   id: ORCH-MONITOR
-  version: 2.2.0
+  version: 2.3.0
   type: executable_specification
   inputs[1]:
     - PR_SCOPE_OPTIONAL
@@ -139,9 +139,7 @@ decision_tree:
             For `recommended_action.action=dispatch_implementor`, run `recommended_action.command`
             to retrieve current findings, then dispatch one fresh implementor with
             `/implementor-default <WORK_IDENTIFIER>` where WORK_IDENTIFIER is:
-              - the canonical work_id (`W-...`) if no YAML file exists for this work, or
-              - the TCK alias (`TCK-xxxxx`) if a YAML file exists at
-                `documents/work/tickets/<alias>.yaml`, or
+              - the canonical work_id (`W-...`), or
               - the PR context if resolving from an open PR.
             Include `@documents/skills/implementor-default/SKILL.md`, work identifier,
             and worktree path in the warm handoff payload.
@@ -205,7 +203,7 @@ decision_tree:
       purpose: "Ensure implementor agent briefs are consistent and conservatively gated."
       steps[7]:
         - id: REQUIRE_DEFAULT_IMPLEMENTOR_SKILL
-          action: "Prompt must start with `/implementor-default <TICKET_ID or PR_CONTEXT>`."
+          action: "Prompt must start with `/implementor-default <WORK_IDENTIFIER>` where WORK_IDENTIFIER is the canonical work_id (`W-...`), TCK alias (`TCK-xxxxx`), or PR context."
         - id: REQUIRE_FINDINGS_SOURCE
           action: |
             Build findings handoff from `recommended_action.reason` plus
@@ -308,24 +306,24 @@ operational_playbook:
       observed_via: "A PR number appears for the first time in `apm2 fac doctor` output during this session"
       action: "Enqueue `apm2 fac warm` to pre-warm lane targets before gate execution. Do not block orchestration on warm completion."
 
-    - trigger: "Operator reports new work (bug or feature) with no existing YAML file"
-      observed_via: "Operator describes work to be done; no TCK YAML file exists at documents/work/tickets/ and no existing work object is found via `apm2 fac work current`"
+    - trigger: "Operator reports new work (bug or feature) with no existing work object"
+      observed_via: "Operator describes work to be done; no existing work object is found via `apm2 fac work current`"
       action: |
-        Work creation currently requires a canonical work object materialized via
-        `apm2 fac work open --from-ticket <yaml_path> --lease-id <lease_id>`.
-        Inline creation without a YAML file is NOT yet implemented in the CLI.
+        Work creation requires a canonical work object materialized via
+        `apm2 fac work open --from-ticket <work-scope.json> --lease-id <lease_id>`.
+        Inline creation without a work scope file is NOT yet implemented in the CLI.
         Resolution options in priority order:
         (1) Check whether a work object already exists in the daemon for this scope:
             run `apm2 fac work current` or ask operator for the work_id. If found,
-            proceed directly with the W-... work_id — no YAML needed.
-        (2) If no work object exists: operator must create a minimal YAML file at
-            documents/work/tickets/<NEW_ID>.yaml with at minimum:
-              ticket_meta.ticket.id, ticket_meta.ticket.title, work_type
-            then run `apm2 fac work open --from-ticket ...` to materialize it.
+            proceed directly with the W-... work_id.
+        (2) If no work object exists: operator must create a minimal work scope JSON
+            file (any path) with at minimum: id, title, work_type, and requirement_ids
+            (RFC::REQ identifiers), then run
+            `apm2 fac work open --from-ticket <path> --lease-id <lease_id>` to materialize it.
         (3) Do NOT dispatch an implementor until a canonical work object is confirmed
             in the daemon. Dispatching without work identity is a BLOCKED escalation.
 
-invariants[14]:
+invariants[16]:
   - "GitHub PR status, CI check status, and GitHub review state are projections, not truth. Always use `apm2 fac doctor --pr <N>` as the authoritative orchestration surface."
   - "Bounded search: orchestrate only 1-20 PRs per run; >20 requires explicit user partitioning into waves."
   - "When doctor provides `recommended_action.command`, execute it verbatim. Do not re-derive commands from raw JSON fields."

@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! Receipt authentication verifier for PCAC acceptance-fact composition
-//! (RFC-0027 §6.5, TCK-00425).
+//! (RFC-0027 §6.5, RFC-0020::REQ-0044).
 //!
 //! This module implements verification logic for authoritative acceptance
 //! facts:

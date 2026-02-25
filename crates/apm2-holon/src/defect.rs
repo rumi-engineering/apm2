@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Error Handling Tests - HIGH: DoS Vector Prevention (TCK-00138)
+    // Error Handling Tests - HIGH: DoS Vector Prevention (RFC-0011::REQ-0015)
     // =========================================================================
 
     /// Test that `build()` returns error when `work_id` is missing.
@@ -1247,7 +1247,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Input Validation Tests - MEDIUM: Unbounded Memory Prevention (TCK-00138)
+    // Input Validation Tests - MEDIUM: Unbounded Memory Prevention
+    // (RFC-0011::REQ-0015)
     // =========================================================================
 
     /// Test that `defect_id` exceeding `MAX_DEFECT_ID_LENGTH` is rejected.

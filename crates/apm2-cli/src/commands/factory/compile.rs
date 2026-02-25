@@ -1,13 +1,11 @@
-//! Compile command for end-to-end idea-to-tickets pipeline orchestration.
+//! Compile command for end-to-end idea-to-RFC pipeline orchestration.
 //!
 //! This module provides the `apm2 factory compile` command that orchestrates
-//! the complete pipeline from PRD to emitted tickets. It chains all stages in
-//! order:
+//! the complete pipeline from PRD to RFC. It chains all stages in order:
 //!
 //! 1. **CCP Build**: Build the Code Context Protocol index
 //! 2. **Impact Map**: Map PRD requirements to CCP components
 //! 3. **RFC Frame**: Generate RFC skeleton with CCP grounding
-//! 4. **Ticket Emit**: Decompose RFC into atomic implementation tickets
 //!
 //! # Features
 //!
@@ -45,7 +43,6 @@ use apm2_core::impact_map::{ImpactMapBuildOptions, ImpactMapBuildResult, build_i
 use apm2_core::model_router::{RoutingProfile, load_profile_by_id};
 use apm2_core::rfc_framer::{RfcFrameOptions, RfcFrameResult, frame_rfc};
 use apm2_core::run_manifest::{ManifestBuilder, RunManifest, SignedManifest, sign_manifest};
-use apm2_core::ticket_emitter::{TicketEmitOptions, TicketEmitResult, emit_tickets};
 use chrono::{DateTime, Utc};
 use clap::Args;
 use regex::Regex;
@@ -114,8 +111,6 @@ pub enum Stage {
     ImpactMap,
     /// RFC framing stage.
     RfcFrame,
-    /// Ticket emission stage.
-    TicketEmit,
 }
 
 impl Stage {
@@ -126,7 +121,6 @@ impl Stage {
             Self::CcpBuild => "ccp_build",
             Self::ImpactMap => "impact_map",
             Self::RfcFrame => "rfc_frame",
-            Self::TicketEmit => "ticket_emit",
         }
     }
 }
@@ -199,8 +193,6 @@ pub enum PipelineEvent {
         impact_map: serde_json::Value,
         /// RFC summary.
         rfc: serde_json::Value,
-        /// Tickets summary.
-        tickets: serde_json::Value,
     },
 }
 
@@ -538,61 +530,6 @@ impl CompilePipeline {
         result.context("RFC frame stage failed")
     }
 
-    /// Runs the ticket emit stage.
-    fn run_ticket_emit(&mut self) -> Result<TicketEmitResult> {
-        let stage = Stage::TicketEmit;
-        self.emit_stage_start(stage);
-        let start = Instant::now();
-
-        let options = TicketEmitOptions {
-            force: self.force,
-            dry_run: self.dry_run,
-            skip_validation: false,
-            prd_id: Some(self.prd_id.clone()),
-        };
-
-        let result = emit_tickets(&self.repo_root, &self.rfc_id, &options);
-        let duration = start.elapsed();
-
-        match &result {
-            Ok(r) => {
-                // Determine provider from routing profile
-                let provider = self
-                    .profile
-                    .as_ref()
-                    .and_then(|p| p.get_stage_config(stage.name()))
-                    .map_or("local", |c| c.provider.as_str());
-
-                self.manifest_builder = std::mem::take(&mut self.manifest_builder)
-                    .record_routing_decision(stage.name(), provider)
-                    .record_stage_timing(stage.name(), duration.as_millis() as u64);
-
-                // Track dry-run writes
-                if self.dry_run {
-                    for ticket in &r.tickets {
-                        self.dry_run_ctx.record_write(
-                            stage,
-                            r.output_dir.join(format!("{}.yaml", ticket.id)),
-                            format!("Ticket: {}", ticket.title),
-                        );
-                    }
-                }
-
-                let summary = serde_json::json!({
-                    "rfc_id": r.rfc_id,
-                    "ticket_count": r.tickets.len(),
-                    "tickets": r.tickets.iter().map(|t| &t.id).collect::<Vec<_>>(),
-                });
-                self.emit_stage_complete(stage, duration, summary);
-            },
-            Err(e) => {
-                self.emit_stage_error(stage, duration, e);
-            },
-        }
-
-        result.context("Ticket emit stage failed")
-    }
-
     /// Generates and optionally signs the run manifest.
     fn generate_manifest(&mut self) -> Result<(RunManifest, Option<SignedManifest>)> {
         // Take ownership of the builder and replace with a fresh one
@@ -687,10 +624,6 @@ impl CompilePipeline {
         let rfc_result = self.run_rfc_frame()?;
         stages_completed += 1;
 
-        // Stage 4: Ticket Emit
-        let ticket_result = self.run_ticket_emit()?;
-        stages_completed += 1;
-
         // Generate manifest
         let (manifest, signed) = self.generate_manifest()?;
 
@@ -721,7 +654,6 @@ impl CompilePipeline {
             ccp_result,
             impact_result,
             rfc_result,
-            ticket_result,
             manifest,
             signed_manifest: signed,
             manifest_dir,
@@ -743,8 +675,6 @@ pub struct CompileResult {
     pub impact_result: ImpactMapBuildResult,
     /// RFC frame result.
     pub rfc_result: RfcFrameResult,
-    /// Ticket emit result.
-    pub ticket_result: TicketEmitResult,
     /// Run manifest.
     pub manifest: RunManifest,
     /// Signed manifest (if signing was requested).
@@ -889,10 +819,6 @@ pub fn run_compile(args: &CompileArgs) -> Result<()> {
                 "title": result.rfc_result.frame.title,
                 "sections": result.rfc_result.frame.sections.len(),
             }),
-            tickets: serde_json::json!({
-                "count": result.ticket_result.tickets.len(),
-                "ids": result.ticket_result.tickets.iter().map(|t| &t.id).collect::<Vec<_>>(),
-            }),
         }
         .emit();
     }
@@ -961,13 +887,6 @@ fn print_summary(result: &CompileResult) -> Result<()> {
         "  Sections: {}",
         result.rfc_result.frame.sections.len()
     )?;
-    writeln!(stderr)?;
-
-    writeln!(stderr, "Tickets:")?;
-    writeln!(stderr, "  Count: {}", result.ticket_result.tickets.len())?;
-    for ticket in &result.ticket_result.tickets {
-        writeln!(stderr, "    {}: {}", ticket.id, ticket.title)?;
-    }
     writeln!(stderr)?;
 
     writeln!(stderr, "Run Manifest:")?;
@@ -1139,7 +1058,6 @@ mod tests {
         assert_eq!(Stage::CcpBuild.name(), "ccp_build");
         assert_eq!(Stage::ImpactMap.name(), "impact_map");
         assert_eq!(Stage::RfcFrame.name(), "rfc_frame");
-        assert_eq!(Stage::TicketEmit.name(), "ticket_emit");
     }
 
     #[test]

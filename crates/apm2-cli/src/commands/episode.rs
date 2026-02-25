@@ -1,7 +1,7 @@
 //! Episode management CLI commands.
 //!
 //! This module implements the `apm2 episode` subcommands for managing
-//! bounded execution episodes per RFC-0013 and TCK-00174.
+//! bounded execution episodes per RFC-0013 and RFC-0033::REQ-0040.
 //!
 //! # Commands
 //!
@@ -11,9 +11,9 @@
 //! - `apm2 episode status <episode_id>` - Show episode status
 //! - `apm2 episode list [--state]` - List episodes
 //! - `apm2 episode spawn --work-id <id> --role <role>` - Spawn episode via
-//!   protocol (TCK-00288)
+//!   protocol (RFC-0032::REQ-0090)
 //! - `apm2 episode session-status --session-token <token>` - Session-scoped
-//!   status (TCK-00288)
+//!   status (RFC-0032::REQ-0090)
 //!
 //! # JSON Output
 //!
@@ -34,7 +34,7 @@
 //! - AD-DAEMON-002: UDS transport with length-prefixed framing
 //! - AD-EPISODE-001: Immutable episode envelope
 //! - AD-EPISODE-002: Episode state machine
-//! - DD-009: Protocol-based IPC (TCK-00288)
+//! - DD-009: Protocol-based IPC (RFC-0032::REQ-0090)
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -62,7 +62,7 @@ pub mod exit_codes {
     pub const ERROR: u8 = 1;
     /// Episode not found exit code.
     ///
-    /// Reserved for future protocol support (TCK-00288).
+    /// Reserved for future protocol support (RFC-0032::REQ-0090).
     #[allow(dead_code)]
     pub const NOT_FOUND: u8 = 2;
 }
@@ -115,13 +115,13 @@ pub enum EpisodeSubcommand {
     /// quarantined).
     List(ListArgs),
 
-    /// Spawn an episode for work execution (TCK-00288).
+    /// Spawn an episode for work execution (RFC-0032::REQ-0090).
     ///
     /// Uses protocol-based IPC via `OperatorClient::spawn_episode`.
     /// Returns session ID and token for subsequent session-scoped operations.
     Spawn(SpawnArgs),
 
-    /// Query session-scoped episode status (TCK-00288).
+    /// Query session-scoped episode status (RFC-0032::REQ-0090).
     ///
     /// Uses session socket with session token for authentication.
     /// Returns current session state and telemetry summary.
@@ -233,7 +233,7 @@ pub struct ListArgs {
     pub limit: u32,
 }
 
-/// Role for spawning episodes (TCK-00288).
+/// Role for spawning episodes (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum SpawnRoleArg {
     /// Implementer role (default).
@@ -269,7 +269,7 @@ impl std::fmt::Display for SpawnRoleArg {
     }
 }
 
-/// Arguments for `apm2 episode spawn` (TCK-00288).
+/// Arguments for `apm2 episode spawn` (RFC-0032::REQ-0090).
 #[derive(Debug, Args)]
 pub struct SpawnArgs {
     /// Work identifier from a prior `ClaimWork`.
@@ -284,7 +284,7 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub lease_id: Option<String>,
 
-    /// Workspace root directory for this episode (TCK-00319).
+    /// Workspace root directory for this episode (RFC-0032::REQ-0113).
     ///
     /// All file operations will be confined to this directory.
     /// Must be an absolute path to an existing directory.
@@ -296,7 +296,7 @@ pub struct SpawnArgs {
     pub adapter_profile_hash: Option<String>,
 }
 
-/// Arguments for `apm2 episode session-status` (TCK-00288).
+/// Arguments for `apm2 episode session-status` (RFC-0032::REQ-0090).
 #[derive(Debug, Args)]
 pub struct SessionStatusArgs {
     /// Session token for authentication.
@@ -320,7 +320,7 @@ pub struct SessionStatusArgs {
 
 /// Response for episode create command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -335,7 +335,7 @@ pub struct CreateResponse {
 
 /// Response for episode start command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -352,7 +352,7 @@ pub struct StartResponse {
 
 /// Response for episode stop command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -367,7 +367,7 @@ pub struct StopResponse {
 
 /// Response for episode status command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -402,7 +402,7 @@ pub struct StatusResponse {
 
 /// Budget summary for status response.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -417,7 +417,7 @@ pub struct BudgetSummary {
 
 /// Episode summary for list command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -435,7 +435,7 @@ pub struct EpisodeSummary {
 
 /// Response for episode list command.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -456,7 +456,7 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-/// Response for episode spawn command (TCK-00288).
+/// Response for episode spawn command (RFC-0032::REQ-0090).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnResponse {
@@ -472,7 +472,8 @@ pub struct SpawnResponse {
     pub session_token: String,
 }
 
-/// Response for session-scoped episode status (TCK-00288, TCK-00344).
+/// Response for session-scoped episode status (RFC-0032::REQ-0090,
+/// RFC-0032::REQ-0134).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStatusResponse {
@@ -544,7 +545,7 @@ pub fn run_episode(
 
 /// Execute the create command.
 ///
-/// # Deprecation Notice (TCK-00288)
+/// # Deprecation Notice (RFC-0032::REQ-0090)
 ///
 /// This command is deprecated. Use `apm2 episode spawn` instead, which combines
 /// create+start in a single protocol operation.
@@ -568,7 +569,7 @@ fn run_create(args: &CreateArgs, _socket_path: &std::path::Path, json_output: bo
         );
     }
 
-    // TCK-00288: This command requires protocol support not yet available.
+    // RFC-0032::REQ-0090: This command requires protocol support not yet available.
     // The DD-009 protocol uses SpawnEpisode which combines create+start.
     // Guide users to the new workflow.
     output_error(
@@ -582,7 +583,7 @@ fn run_create(args: &CreateArgs, _socket_path: &std::path::Path, json_output: bo
 
 /// Execute the start command.
 ///
-/// # Deprecation Notice (TCK-00288)
+/// # Deprecation Notice (RFC-0032::REQ-0090)
 ///
 /// This command is deprecated. Use `apm2 episode spawn` instead, which combines
 /// create+start in a single protocol operation.
@@ -606,7 +607,7 @@ fn run_start(args: &StartArgs, _socket_path: &std::path::Path, json_output: bool
         );
     }
 
-    // TCK-00288: This command requires protocol support not yet available.
+    // RFC-0032::REQ-0090: This command requires protocol support not yet available.
     // The DD-009 protocol uses SpawnEpisode which combines create+start.
     // Guide users to the new workflow.
     output_error(
@@ -620,7 +621,7 @@ fn run_start(args: &StartArgs, _socket_path: &std::path::Path, json_output: bool
 
 /// Execute the stop command.
 ///
-/// # Deprecation Notice (TCK-00288)
+/// # Deprecation Notice (RFC-0032::REQ-0090)
 ///
 /// This command is deprecated. Episode termination is handled automatically
 /// when a session closes or the daemon shuts down.
@@ -635,7 +636,7 @@ fn run_stop(args: &StopArgs, _socket_path: &std::path::Path, json_output: bool) 
         );
     }
 
-    // TCK-00288: This command requires protocol support not yet available.
+    // RFC-0032::REQ-0090: This command requires protocol support not yet available.
     // Episode termination is handled via session close or daemon shutdown.
     output_error(
         json_output,
@@ -648,7 +649,7 @@ fn run_stop(args: &StopArgs, _socket_path: &std::path::Path, json_output: bool) 
 
 /// Execute the status command.
 ///
-/// # Deprecation Notice (TCK-00288)
+/// # Deprecation Notice (RFC-0032::REQ-0090)
 ///
 /// This command is deprecated. Use `apm2 episode session-status` for
 /// session-scoped status queries via the protocol-based IPC.
@@ -663,7 +664,7 @@ fn run_status(args: &StatusArgs, _socket_path: &std::path::Path, json_output: bo
         );
     }
 
-    // TCK-00288: This command requires protocol support not yet available.
+    // RFC-0032::REQ-0090: This command requires protocol support not yet available.
     // Use session-status for session-scoped status queries.
     output_error(
         json_output,
@@ -676,12 +677,12 @@ fn run_status(args: &StatusArgs, _socket_path: &std::path::Path, json_output: bo
 
 /// Execute the list command.
 ///
-/// # Deprecation Notice (TCK-00288)
+/// # Deprecation Notice (RFC-0032::REQ-0090)
 ///
 /// This command is deprecated. Episode listing is not available in the
 /// protocol-based IPC. Use telemetry or ledger queries for episode tracking.
 fn run_list(args: &ListArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
-    // TCK-00288: This command requires protocol support not yet available.
+    // RFC-0032::REQ-0090: This command requires protocol support not yet available.
     // Episode listing is not part of the DD-009 minimal agent command set.
     let _ = args; // Acknowledge args to avoid unused warning
     output_error(
@@ -693,7 +694,7 @@ fn run_list(args: &ListArgs, _socket_path: &std::path::Path, json_output: bool) 
     )
 }
 
-/// Execute the spawn command (TCK-00288).
+/// Execute the spawn command (RFC-0032::REQ-0090).
 ///
 /// Uses `OperatorClient::spawn_episode` for protocol-based IPC.
 fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
@@ -816,7 +817,7 @@ fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool)
     }
 }
 
-/// Execute the session-status command (TCK-00288, TCK-00344).
+/// Execute the session-status command (RFC-0032::REQ-0090, RFC-0032::REQ-0134).
 ///
 /// Uses `SessionClient` for session-scoped operations via session.sock.
 fn run_session_status(
@@ -949,7 +950,7 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
 
 /// Truncate a string to a maximum length.
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[allow(dead_code)]
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -968,7 +969,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// - `EpisodeNotFound` -> `NOT_FOUND` (2)
 /// - Other errors -> ERROR (1)
 ///
-/// Reserved for future protocol support (TCK-00288).
+/// Reserved for future protocol support (RFC-0032::REQ-0090).
 #[allow(dead_code)]
 fn handle_daemon_error(json_output: bool, error: &crate::client::daemon::DaemonClientError) -> u8 {
     use crate::client::daemon::DaemonClientError;
@@ -1266,7 +1267,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Session Status Response Tests (TCK-00344)
+    // Session Status Response Tests (RFC-0032::REQ-0134)
     // =========================================================================
 
     #[test]

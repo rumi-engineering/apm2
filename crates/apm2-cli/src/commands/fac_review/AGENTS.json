@@ -1,0 +1,180 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-cli/src/commands/fac_review",
+  "behaviors": [
+    {
+      "id": "BEH-CLI-FAC-REV-001",
+      "kind": "invariant",
+      "title": "Terminal review states are Done, Failed, and Crashed",
+      "description": "`is_terminal()` returns `true` only for `Done`, `Failed`, and `Crashed` states.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-002",
+      "kind": "invariant",
+      "title": "Dispatch idempotency key normalizes review_type",
+      "description": "`review_type` is normalized: `code-quality` becomes `quality`.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-003",
+      "kind": "invariant",
+      "title": "Dispatch idempotency key lowercases and trims owner_repo",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-004",
+      "kind": "safety",
+      "title": "Dispatch idempotency validate enforces 40-hex SHA format",
+      "description": "`validate()` enforces 40-hex SHA and `security|quality` type constraint.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-005",
+      "kind": "capability",
+      "title": "Detached dispatch of security and quality reviewers",
+      "description": "Security and quality reviewers are dispatched idempotently via systemd and tracked via lifecycle and dispatch markers.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-006",
+      "kind": "capability",
+      "title": "Liveness monitoring via pulse files for stall detection",
+      "description": "Pulse files track reviewer health; stale/idle lanes surface through doctor diagnostics and repair recommendations.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-007",
+      "kind": "invariant",
+      "title": "Reviews invalidated if PR head moves during execution",
+      "description": "SHA freshness enforced: reviews are invalidated if PR head moves during execution.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-008",
+      "kind": "safety",
+      "title": "Bounded test execution via systemd-run containment",
+      "description": "FAC constructs `systemd-run` bounded test execution with fixed timeout and memory containment (600s, 48G defaults) and profile-driven CPU/parallelism.",
+      "rfc": ["RFC-0019", "RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-009",
+      "kind": "safety",
+      "title": "RUSTC_WRAPPER and SCCACHE stripped from job environment",
+      "description": "`RUSTC_WRAPPER` and `SCCACHE_*` are unconditionally stripped both in `build_policy_setenv_pairs()` and via `env_remove_keys` on spawned processes.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-010",
+      "kind": "safety",
+      "title": "Lock file opens enforce O_NOFOLLOW and O_CLOEXEC",
+      "description": "Lock file opens enforce `O_NOFOLLOW | O_CLOEXEC` on Unix for both acquisition and reaper paths, preventing symlink-target truncation and TOCTOU substitution attacks.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-011",
+      "kind": "safety",
+      "title": "Lock inode verification after acquisition",
+      "description": "After acquiring a lock, `single_flight_lock_file_matches_path()` verifies the locked fd still matches the lock path inode/dev and nlink > 0.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-012",
+      "kind": "safety",
+      "title": "Gate attestation schema v2 prevents dirty-state cache poisoning",
+      "description": "Attestation schema version-bumped from v1 to v2, invalidating pre-existing cache entries. `input_digest()` uses actual file content hash instead of git blob references.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-013",
+      "kind": "safety",
+      "title": "Gate cache reuse requires RFC-0028/0029 receipt binding",
+      "description": "`check_reuse()` unconditionally denies entries missing `rfc0028_receipt_bound` or `rfc0029_receipt_bound` flags. Receipt binding is the only promotion path.",
+      "rfc": ["RFC-0028", "RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-014",
+      "kind": "safety",
+      "title": "V2 cache fallback disabled for v3 gate cache",
+      "description": "V2 entries lack RFC-0028/0029 binding proof and cannot satisfy v3 compound-key continuity. V2 fallback structurally removed from evidence pipeline.",
+      "rfc": ["RFC-0028", "RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-015",
+      "kind": "safety",
+      "title": "Network policy default-deny for gates, allow only for fetch/warm",
+      "description": "Default deny network for gates. Network policy hash included in attestation binding to prevent cache reuse across policy drift.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-016",
+      "kind": "safety",
+      "title": "Sandbox hardening hash bound into attestation digest",
+      "description": "Mutating sandbox hardening changes the resource digest and attestation digest, denying cache reuse across profile drift.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-017",
+      "kind": "invariant",
+      "title": "Pipeline uses mirror-based lane checkout to eliminate SHA drift",
+      "description": "Pipeline checks out exact target SHA from bare mirror to lane workspace. Lane workspace is clean by construction, eliminating SHA drift and dirty-attests-clean hazard.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-018",
+      "kind": "safety",
+      "title": "Event scanning for doctor is explicitly bounded",
+      "description": "Doctor event scanning bounded by `DOCTOR_EVENT_SCAN_MAX_LINES` and `DOCTOR_EVENT_SCAN_MAX_LINE_BYTES`. Log counting bounded to avoid unbounded memory/CPU growth.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-019",
+      "kind": "invariant",
+      "title": "At most one nudge per review run",
+      "description": "Orchestrator allows at most one nudge per run (`MAX_MISSING_VERDICT_NUDGES = 1`), disableable via `APM2_FAC_DISABLE_NUDGE`.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-020",
+      "kind": "safety",
+      "title": "V3 cache save serialized by exclusive flock",
+      "description": "`save_to_dir()` acquires exclusive `flock(LOCK_EX)` on `root/.{index_key}.lock` for the duration of the write, serializing concurrent FAC runs.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-021",
+      "kind": "safety",
+      "title": "Non-interactive GitHub CLI with token-based auth",
+      "description": "All `gh` CLI calls use `apm2_core::fac::gh_command()` for token-based auth and lane-scoped `GH_CONFIG_DIR`, removing dependency on `gh auth login`.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-022",
+      "kind": "invariant",
+      "title": "Per-lane env isolation for HOME/TMPDIR/XDG paths",
+      "description": "Every FAC gate phase runs with deterministic lane-local HOME/TMPDIR/XDG_CACHE_HOME/XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_STATE_HOME/XDG_RUNTIME_DIR scoped to the locked lane.",
+      "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-023",
+      "kind": "safety",
+      "title": "Lane env dir creation uses atomic mkdir, not exists-check",
+      "description": "Lane env directory creation uses atomic mkdir + handle AlreadyExists instead of TOCTOU-prone exists() check. UID comparison uses constant-time equality.",
+      "rfc": ["RFC-0028"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-024",
+      "kind": "safety",
+      "title": "Gate execution always local; no broker/worker queue mode",
+      "description": "`apm2 fac gates` runs all evidence gates locally with bounded test execution via `systemd-run`. Broker/worker queue mode removed.",
+      "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-CLI-FAC-REV-025",
+      "kind": "invariant",
+      "title": "V3 cache check order: signature then receipt then drift then TTL",
+      "description": "TTL check is last in evaluation order. Stale entries with integrity failures surface signature_invalid or receipt_binding_missing before ttl_expired.",
+      "rfc": ["RFC-0028"]
+    }
+  ]
+}

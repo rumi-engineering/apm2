@@ -1,6 +1,6 @@
 // AGENT-AUTHORED
 //! `EpochSealV1`: Monotonic sealing and validation for epoch-bound artifacts
-//! (TCK-00365).
+//! (RFC-0020::REQ-0019).
 //!
 //! This module implements epoch seals that bind directory heads and
 //! receipt-batch epochs to a cryptographic commitment. The verifier
@@ -4239,9 +4239,9 @@ mod tests {
     // BLOCKER 3: Integration evidence (end-to-end seal verification flow)
     // =========================================================================
 
-    // NOTE(TCK-00365): EpochSealVerifier::verify_with_policy() is now wired
-    // into the daemon ToolBroker admission path (broker.rs). The verifier API
-    // enforces monotonicity, anti-equivocation, and signature verification.
+    // NOTE(RFC-0020::REQ-0019): EpochSealVerifier::verify_with_policy() is now
+    // wired into the daemon ToolBroker admission path (broker.rs). The verifier
+    // API enforces monotonicity, anti-equivocation, and signature verification.
     // Request-carried seals are consumed via BrokerToolRequest.epoch_seal.
 
     #[test]
@@ -4312,7 +4312,7 @@ mod tests {
     }
 
     // =========================================================================
-    // VDF profile + policy tests (TCK-00366)
+    // VDF profile + policy tests (RFC-0020::REQ-0020)
     // =========================================================================
 
     #[test]
@@ -5450,7 +5450,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Canonical Bytes Serialization Tests (TCK-00365)
+    // Canonical Bytes Serialization Tests (RFC-0020::REQ-0019)
     // =========================================================================
 
     #[test]
@@ -5477,7 +5477,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Length-Prefix Collision Resistance Tests (TCK-00365 MAJOR-2)
+    // Length-Prefix Collision Resistance Tests (RFC-0020::REQ-0019 MAJOR-2)
     // =========================================================================
 
     /// Regression: without length-prefix framing, issuer="A" + reason="AA"

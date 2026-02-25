@@ -25,7 +25,7 @@
 //!
 //! For AAT gates, the lease includes an optional `aat_extension` field that
 //! binds the lease to specific RCP manifest and view commitment. This is
-//! required by RFC-0015 and TCK-00203.
+//! required by RFC-0015 and RFC-0032::REQ-0056.
 //!
 //! # Example
 //!
@@ -517,14 +517,14 @@ impl GateLease {
             });
         }
 
-        // Validate rcp_profile_id matches (TCK-00225)
+        // Validate rcp_profile_id matches (RFC-0032::REQ-0061)
         if ext.rcp_profile_id != receipt.rcp_profile_id {
             return Err(LeaseError::AatBindingMismatch {
                 field: "rcp_profile_id",
             });
         }
 
-        // Validate selection_policy_id matches (TCK-00225)
+        // Validate selection_policy_id matches (RFC-0032::REQ-0061)
         if ext.selection_policy_id != receipt.selection_policy_id {
             return Err(LeaseError::AatBindingMismatch {
                 field: "selection_policy_id",
@@ -1466,7 +1466,7 @@ pub mod tests {
     }
 
     // =========================================================================
-    // AAT Binding Validation Tests (TCK-00225)
+    // AAT Binding Validation Tests (RFC-0032::REQ-0061)
     // =========================================================================
 
     mod aat {
@@ -1601,7 +1601,7 @@ pub mod tests {
         }
 
         // =====================================================================
-        // Profile and Policy ID Binding Validation Tests (TCK-00225 BLOCKER)
+        // Profile and Policy ID Binding Validation Tests (RFC-0032::REQ-0061 BLOCKER)
         // =====================================================================
 
         #[test]
@@ -1835,7 +1835,7 @@ pub mod tests {
         }
 
         // =====================================================================
-        // Custody Domain Validation Tests (TCK-00225)
+        // Custody Domain Validation Tests (RFC-0032::REQ-0061)
         // =====================================================================
 
         #[test]
@@ -2035,7 +2035,7 @@ pub mod tests {
         }
 
         // =====================================================================
-        // Actor-Based Custody Validation Tests (TCK-00225 MAJOR)
+        // Actor-Based Custody Validation Tests (RFC-0032::REQ-0061 MAJOR)
         // =====================================================================
 
         #[test]

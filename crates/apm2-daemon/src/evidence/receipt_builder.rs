@@ -241,8 +241,8 @@ impl ReceiptBuilder {
     ///
     /// * `envelope_ref` - Reference to the `TimeEnvelope` for temporal ordering
     ///
-    /// Per TCK-00240, tool receipts should include a time envelope reference
-    /// for temporal ordering and causality tracking.
+    /// Per RFC-0016::REQ-0002, tool receipts should include a time envelope
+    /// reference for temporal ordering and causality tracking.
     #[must_use]
     pub const fn with_time_envelope_ref(mut self, envelope_ref: TimeEnvelopeRef) -> Self {
         self.time_envelope_ref = Some(envelope_ref);
