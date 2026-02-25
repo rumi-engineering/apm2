@@ -1,3 +1,6 @@
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 //! apm2-daemon - AI CLI Process Manager Daemon
 //!
 //! This is the main daemon binary that manages AI CLI processes.

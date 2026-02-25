@@ -15599,31 +15599,25 @@ impl PrivilegedDispatcher {
         );
 
         // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
-        let spec_hash = match self
+        let Some(spec_hash) = self
             .alias_reconciliation_gate
             .get_spec_hash(&request.work_id)
-        {
-            Some(hash) => hash,
-            None => {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!(
-                        "WorkShow: no spec_snapshot_hash found for work_id '{}'",
-                        request.work_id,
-                    ),
-                ));
-            },
+        else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "WorkShow: no spec_snapshot_hash found for work_id '{}'",
+                    request.work_id,
+                ),
+            ));
         };
 
         // 2. Retrieve the canonical WorkSpec JSON from CAS.
-        let cas = match &self.cas {
-            Some(cas) => cas,
-            None => {
-                return Ok(PrivilegedResponse::error(
-                    PrivilegedErrorCode::CapabilityRequestRejected,
-                    "WorkShow: CAS not configured",
-                ));
-            },
+        let Some(cas) = &self.cas else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "WorkShow: CAS not configured",
+            ));
         };
 
         let spec_bytes = match cas.retrieve(&spec_hash) {

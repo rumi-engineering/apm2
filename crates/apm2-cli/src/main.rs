@@ -1,3 +1,6 @@
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 //! apm2 - AI CLI Process Manager
 //!
 //! CLI client for managing AI CLI processes like Claude Code, Gemini CLI, etc.
