@@ -10,6 +10,10 @@ Checklist:
 - `CursorStore` durability is keyed by stable `orchestrator_id`.
 - `IntentStore` is idempotent (`INSERT OR IGNORE` semantics).
 - `EffectJournal` enforces fail-closed ambiguity handling (`resolve_in_doubt`).
+- `OrchestratorDomain::apply_events` and `plan` remain deterministic and
+  side-effect free (no durable store I/O).
+- Domain cache persistence is flushed in `OrchestratorDomain::checkpoint`
+  before cursor save.
 - Cursor is persisted only after receipt durability.
 
 Preferred daemon adapters:
@@ -56,6 +60,14 @@ Do not run `rusqlite` directly on tokio async execution paths.
 
 Use `spawn_blocking` wrappers provided by runtime adapters/pollers.
 
+## Anti-Pattern: Durable Writes Inside `apply_events` / `plan`
+
+Do not perform durable store reads/writes inside `OrchestratorDomain` fold/planning
+phases.
+
+Use `checkpoint` for domain-cache persistence so replay semantics and cursor
+advance ordering stay explicit and auditable.
+
 ## Anti-Pattern: Persisted Monotonic as Durable Truth
 
 `Instant`/monotonic timestamps are process-local and reset on restart.
@@ -73,6 +85,9 @@ Reference grep anchors:
 ## Reviewer Quick Anchors
 
 - `run_tick`
+- `checkpoint(`
+- `apply_events(`
+- `plan(`
 - `orchestrator_runtime`
 - `ledger_poll`
 - `canonical_event_id`

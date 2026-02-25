@@ -36,6 +36,20 @@ pub trait OrchestratorDomain<Event, Intent, IntentKey, Receipt>: Send {
     /// before any execute call in the same tick.
     async fn plan(&mut self) -> Result<Vec<Intent>, Self::Error>;
 
+    /// Flushes domain-internal durable checkpoints after execute outcomes
+    /// are applied but before cursor advance.
+    ///
+    /// Contract:
+    /// - Use this phase for idempotent domain cache persistence that must be
+    ///   durable before cursor advancement.
+    /// - `apply_events` and `plan` should remain deterministic and free of
+    ///   durable side effects.
+    /// - Implementations that do not require checkpointing may use the default
+    ///   no-op.
+    async fn checkpoint(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Executes a single intent.
     ///
     /// Contract:
@@ -75,6 +89,9 @@ pub enum ControllerLoopError {
     /// Planning failed.
     #[error("plan failed: {0}")]
     Plan(String),
+    /// Domain checkpoint failed.
+    #[error("checkpoint failed: {0}")]
+    Checkpoint(String),
     /// Intent enqueue failed.
     #[error("intent enqueue failed: {0}")]
     Enqueue(String),
@@ -125,6 +142,7 @@ pub enum ControllerLoopError {
 /// - For completed intents, receipts are persisted before completion is
 ///   acknowledged in the effect journal and intent store.
 /// - Cursor is not advanced if any durable phase fails.
+/// - Domain checkpoint is flushed before cursor save.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::too_many_lines,
@@ -300,6 +318,11 @@ where
             },
         }
     }
+
+    domain
+        .checkpoint()
+        .await
+        .map_err(|e| ControllerLoopError::Checkpoint(e.to_string()))?;
 
     if let Some(last) = observed.last() {
         let next_cursor = advance_cursor_with_event(&cursor, last);
@@ -901,6 +924,100 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingCheckpointDomain;
+
+    impl OrchestratorDomain<TestEvent, String, String, String> for FailingCheckpointDomain {
+        type Error = String;
+
+        fn intent_key(&self, intent: &String) -> String {
+            intent.clone()
+        }
+
+        async fn apply_events(&mut self, _events: &[TestEvent]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn plan(&mut self) -> Result<Vec<String>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn checkpoint(&mut self) -> Result<(), Self::Error> {
+            Err("forced checkpoint failure".to_string())
+        }
+
+        async fn execute(
+            &mut self,
+            intent: &String,
+        ) -> Result<ExecutionOutcome<String>, Self::Error> {
+            Ok(ExecutionOutcome::Completed {
+                receipts: vec![format!("receipt-{intent}")],
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CheckpointOrderingDomain {
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl OrchestratorDomain<TestEvent, String, String, String> for CheckpointOrderingDomain {
+        type Error = String;
+
+        fn intent_key(&self, intent: &String) -> String {
+            intent.clone()
+        }
+
+        async fn apply_events(&mut self, _events: &[TestEvent]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn plan(&mut self) -> Result<Vec<String>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn checkpoint(&mut self) -> Result<(), Self::Error> {
+            self.order
+                .lock()
+                .map_err(|e| e.to_string())?
+                .push("checkpoint".to_string());
+            Ok(())
+        }
+
+        async fn execute(
+            &mut self,
+            intent: &String,
+        ) -> Result<ExecutionOutcome<String>, Self::Error> {
+            Ok(ExecutionOutcome::Completed {
+                receipts: vec![format!("receipt-{intent}")],
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingCursorStore {
+        cursor: Mutex<CompositeCursor>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CursorStore<CompositeCursor> for RecordingCursorStore {
+        type Error = String;
+
+        async fn load(&self) -> Result<CompositeCursor, Self::Error> {
+            Ok(self.cursor.lock().map_err(|e| e.to_string())?.clone())
+        }
+
+        async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error> {
+            self.order
+                .lock()
+                .map_err(|e| e.to_string())?
+                .push("cursor-save".to_string());
+            let mut guard = self.cursor.lock().map_err(|e| e.to_string())?;
+            *guard = cursor.clone();
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn run_tick_enforces_execute_limit() {
         let mut domain = TestDomain;
@@ -1250,5 +1367,122 @@ mod tests {
             .lock()
             .expect("states lock should not be poisoned");
         assert_eq!(states.get("intent-a").map(String::as_str), Some("blocked"));
+    }
+
+    #[tokio::test]
+    async fn run_tick_checkpoint_failure_prevents_cursor_advance() {
+        let mut domain = FailingCheckpointDomain;
+        let ledger = TestLedgerReader {
+            events: vec![TestEvent {
+                ts: 10,
+                id: "evt-a".to_string(),
+            }],
+        };
+        let cursor_store = TestCursorStore::default();
+        let intent_store = TestIntentStore::default();
+        let journal = TestJournal::default();
+        let receipts = TestReceiptWriter::default();
+
+        let err = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 8,
+                execute_limit: 8,
+            },
+        )
+        .await
+        .expect_err("checkpoint failure must fail tick");
+
+        assert!(matches!(err, ControllerLoopError::Checkpoint(_)));
+        let cursor = cursor_store
+            .load()
+            .await
+            .expect("cursor load should succeed");
+        assert_eq!(
+            cursor,
+            CompositeCursor::default(),
+            "cursor must remain unchanged on checkpoint failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tick_runs_checkpoint_before_cursor_save() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut domain = CheckpointOrderingDomain {
+            order: Arc::clone(&order),
+        };
+        let ledger = TestLedgerReader {
+            events: vec![TestEvent {
+                ts: 11,
+                id: "evt-order".to_string(),
+            }],
+        };
+        let cursor_store = RecordingCursorStore {
+            cursor: Mutex::new(CompositeCursor::default()),
+            order: Arc::clone(&order),
+        };
+        let intent_store = TestIntentStore::default();
+        let journal = TestJournal::default();
+        let receipts = TestReceiptWriter::default();
+
+        let report = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 8,
+                execute_limit: 8,
+            },
+        )
+        .await
+        .expect("tick should succeed");
+        assert!(report.cursor_advanced);
+
+        let observed = order.lock().expect("order lock should not be poisoned");
+        assert_eq!(
+            observed.as_slice(),
+            &["checkpoint".to_string(), "cursor-save".to_string()],
+            "checkpoint must run before cursor save"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tick_default_checkpoint_noop_keeps_existing_domain_behavior() {
+        let mut domain = NoPlanDomain;
+        let ledger = TestLedgerReader {
+            events: vec![TestEvent {
+                ts: 12,
+                id: "evt-default-checkpoint".to_string(),
+            }],
+        };
+        let cursor_store = TestCursorStore::default();
+        let intent_store = TestIntentStore::default();
+        let journal = TestJournal::default();
+        let receipts = TestReceiptWriter::default();
+
+        let report = run_tick(
+            &mut domain,
+            &ledger,
+            &cursor_store,
+            &intent_store,
+            &journal,
+            &receipts,
+            TickConfig {
+                observe_limit: 8,
+                execute_limit: 8,
+            },
+        )
+        .await
+        .expect("default checkpoint no-op should not change behavior");
+
+        assert!(report.cursor_advanced);
     }
 }

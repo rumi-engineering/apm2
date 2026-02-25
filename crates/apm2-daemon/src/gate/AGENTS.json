@@ -136,6 +136,13 @@
       "title": "GateStart legacy storage migration is one-time, idempotent, and fail-closed",
       "description": "Legacy gate-start artifacts (`gate_start_kernel_cursor`, `gate_start_intents`, `gate_start_effect_journal.sqlite`) are migrated into shared orchestrator_runtime tables only when the target namespace is empty. Legacy effect states `started/unknown` map to `unknown` to preserve fail-closed semantics.",
       "rfc": ["RFC-0020", "RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-023",
+      "kind": "invariant",
+      "title": "GateTimeoutDomain apply_events/plan are pure and persist observed-lease cache only in checkpoint before cursor advance",
+      "description": "GateTimeoutKernel uses `OrchestratorDomain::checkpoint` to flush observed-lease upserts/removals. `apply_events` and `plan` mutate in-memory state only, preserving deterministic replay semantics and explicit durability ordering.",
+      "rfc": ["RFC-0020", "RFC-0032"]
     }
   ]
 }

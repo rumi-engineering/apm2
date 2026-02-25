@@ -4,7 +4,7 @@
 //! shared `apm2_core::orchestrator_kernel` harness:
 //! Observe -> Plan -> Execute -> Receipt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -31,6 +31,34 @@ use crate::protocol::dispatch::LedgerEventEmitter;
 
 const TIMEOUT_PERSISTOR_SESSION_ID: &str = "gate-timeout-poller";
 const TIMEOUT_PERSISTOR_ACTOR_ID: &str = "orchestrator:timeout-poller";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeoutTickNow {
+    wall_ms: u64,
+    monotonic_ns: u64,
+}
+
+impl TimeoutTickNow {
+    fn capture() -> Result<Self, String> {
+        Ok(Self {
+            wall_ms: epoch_now_ms_u64(),
+            monotonic_ns: monotonic_now_ns()?,
+        })
+    }
+}
+
+trait TimeoutTickClock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Result<TimeoutTickNow, String>;
+}
+
+#[derive(Debug, Default)]
+struct SystemTimeoutTickClock;
+
+impl TimeoutTickClock for SystemTimeoutTickClock {
+    fn now(&self) -> Result<TimeoutTickNow, String> {
+        TimeoutTickNow::capture()
+    }
+}
 
 /// Kernel configuration for gate-timeout orchestration ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +102,7 @@ pub struct GateTimeoutKernel {
     effect_journal: TimeoutEffectJournalEnum,
     receipt_writer: GateTimeoutReceiptWriter,
     tick_config: TickConfig,
+    tick_clock: Arc<dyn TimeoutTickClock>,
 }
 
 /// Dispatch enum for cursor store: `SQLite` (shared) or Memory.
@@ -343,11 +372,17 @@ impl GateTimeoutKernel {
                 observe_limit: config.observe_limit,
                 execute_limit: config.execute_limit,
             },
+            tick_clock: Arc::new(SystemTimeoutTickClock),
         })
     }
 
     /// Runs one timeout-kernel tick.
     pub async fn tick(&mut self) -> Result<TickReport, GateTimeoutKernelError> {
+        let tick_now = self
+            .tick_clock
+            .now()
+            .map_err(|e| GateTimeoutKernelError::Tick(format!("tick clock failure: {e}")))?;
+        self.domain.set_tick_now(tick_now);
         run_tick(
             &mut self.domain,
             &self.ledger_reader,
@@ -1164,6 +1199,9 @@ struct GateTimeoutDomain {
     observed_leases: HashMap<String, ObservedLeaseState>,
     observed_lease_store: TimeoutObservedLeaseStore,
     terminal_checker: TimeoutTerminalChecker,
+    dirty_upserts: HashMap<String, ObservedLeaseState>,
+    dirty_removals: HashSet<String>,
+    tick_now: Option<TimeoutTickNow>,
 }
 
 impl GateTimeoutDomain {
@@ -1178,14 +1216,38 @@ impl GateTimeoutDomain {
             observed_leases,
             observed_lease_store,
             terminal_checker,
+            dirty_upserts: HashMap::new(),
+            dirty_removals: HashSet::new(),
+            tick_now: Some(TimeoutTickNow::capture()?),
         })
+    }
+
+    const fn set_tick_now(&mut self, tick_now: TimeoutTickNow) {
+        self.tick_now = Some(tick_now);
+    }
+
+    fn require_tick_now(&self) -> Result<TimeoutTickNow, String> {
+        self.tick_now.ok_or_else(|| {
+            "timeout tick context missing; set tick snapshot before apply/plan".to_string()
+        })
+    }
+
+    fn mark_dirty_upsert(&mut self, state: &ObservedLeaseState) {
+        let lease_id = state.lease.lease_id.clone();
+        self.dirty_removals.remove(&lease_id);
+        self.dirty_upserts.insert(lease_id, state.clone());
+    }
+
+    fn mark_dirty_remove(&mut self, lease_id: &str) {
+        self.dirty_upserts.remove(lease_id);
+        self.dirty_removals.insert(lease_id.to_string());
     }
 
     /// Synchronous variant kept for potential non-async callers.
     /// Production async callers should prefer
     /// [`Self::remove_work_leases_async`].
     #[allow(dead_code)]
-    fn remove_work_leases(&mut self, work_id: &str) -> Result<(), String> {
+    fn remove_work_leases(&mut self, work_id: &str) {
         let lease_ids: Vec<String> = self
             .observed_leases
             .iter()
@@ -1193,26 +1255,9 @@ impl GateTimeoutDomain {
             .map(|(lease_id, _)| lease_id.clone())
             .collect();
         for lease_id in lease_ids {
-            self.observed_lease_store.remove(&lease_id)?;
             self.observed_leases.remove(&lease_id);
+            self.mark_dirty_remove(&lease_id);
         }
-        Ok(())
-    }
-
-    /// Async variant of [`Self::remove_work_leases`] that uses
-    /// `remove_async` to offload `SQLite` I/O per `INV-CQ-OK-003`.
-    async fn remove_work_leases_async(&mut self, work_id: &str) -> Result<(), String> {
-        let lease_ids: Vec<String> = self
-            .observed_leases
-            .iter()
-            .filter(|(_, state)| state.lease.work_id == work_id)
-            .map(|(lease_id, _)| lease_id.clone())
-            .collect();
-        for lease_id in lease_ids {
-            self.observed_lease_store.remove_async(&lease_id).await?;
-            self.observed_leases.remove(&lease_id);
-        }
-        Ok(())
     }
 }
 
@@ -1226,27 +1271,27 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
     }
 
     async fn apply_events(&mut self, events: &[TimeoutObservedEvent]) -> Result<(), Self::Error> {
+        let tick_now = self.require_tick_now()?;
         for event in events {
             match &event.kind {
                 TimeoutObservedKind::LeaseIssued { lease, gate_type } => {
-                    let observed_wall_ms = self.orchestrator.now_ms();
-                    let observed_monotonic_ns = monotonic_now_ns()?;
                     let state = ObservedLeaseState::from_observation(
                         lease.as_ref(),
                         *gate_type,
-                        observed_wall_ms,
-                        observed_monotonic_ns,
+                        tick_now.wall_ms,
+                        tick_now.monotonic_ns,
                     );
-                    self.observed_lease_store.upsert_async(&state).await?;
-                    self.observed_leases.insert(lease.lease_id.clone(), state);
+                    self.observed_leases
+                        .insert(lease.lease_id.clone(), state.clone());
+                    self.mark_dirty_upsert(&state);
                 },
                 TimeoutObservedKind::GateReceiptFinalized { lease_id }
                 | TimeoutObservedKind::TimedOut { lease_id } => {
-                    self.observed_lease_store.remove_async(lease_id).await?;
                     self.observed_leases.remove(lease_id);
+                    self.mark_dirty_remove(lease_id);
                 },
                 TimeoutObservedKind::AllCompleted { work_id } => {
-                    self.remove_work_leases_async(work_id).await?;
+                    self.remove_work_leases(work_id);
                 },
                 TimeoutObservedKind::Skipped { .. } => {
                     // Intentionally ignored -- the event exists only to
@@ -1258,8 +1303,9 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
     }
 
     async fn plan(&mut self) -> Result<Vec<GateTimeoutIntent>, Self::Error> {
-        let monotonic_now_ns = monotonic_now_ns()?;
-        let now_wall_ms = epoch_now_ms_u64();
+        let tick_now = self.require_tick_now()?;
+        let monotonic_now_ns = tick_now.monotonic_ns;
+        let now_wall_ms = tick_now.wall_ms;
 
         // Guard: scan for stale/corrupt monotonic entries and rebase them
         // before generating timeout intents. This prevents a long-running
@@ -1271,10 +1317,10 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
             .map(|(key, _)| key.clone())
             .collect();
         for key in &stale_keys {
-            if let Some(state) = self.observed_leases.get(key) {
+            if let Some(state) = self.observed_leases.get(key).cloned() {
                 let rebased = state.rebase(now_wall_ms, monotonic_now_ns);
-                self.observed_lease_store.upsert_async(&rebased).await?;
-                self.observed_leases.insert(key.clone(), rebased);
+                self.observed_leases.insert(key.clone(), rebased.clone());
+                self.mark_dirty_upsert(&rebased);
             }
         }
 
@@ -1289,6 +1335,24 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
             .collect();
         timed_out.sort_by(|a, b| a.lease.lease_id.cmp(&b.lease.lease_id));
         Ok(timed_out)
+    }
+
+    async fn checkpoint(&mut self) -> Result<(), Self::Error> {
+        let mut upserts: Vec<ObservedLeaseState> = self.dirty_upserts.values().cloned().collect();
+        upserts.sort_by(|a, b| a.lease.lease_id.cmp(&b.lease.lease_id));
+        for state in &upserts {
+            self.observed_lease_store.upsert_async(state).await?;
+        }
+
+        let mut removals: Vec<String> = self.dirty_removals.iter().cloned().collect();
+        removals.sort();
+        for lease_id in &removals {
+            self.observed_lease_store.remove_async(lease_id).await?;
+        }
+
+        self.dirty_upserts.clear();
+        self.dirty_removals.clear();
+        Ok(())
     }
 
     async fn execute(
@@ -2743,6 +2807,142 @@ mod tests {
         assert!(
             planned.is_empty(),
             "completed gate lease must not produce timeout intents"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_events_uses_injected_tick_snapshot_for_observation_baseline() {
+        let orchestrator = Arc::new(GateOrchestrator::new(
+            crate::gate::GateOrchestratorConfig::default(),
+            Arc::new(Signer::generate()),
+        ));
+        let mut domain = GateTimeoutDomain::new(
+            Arc::clone(&orchestrator),
+            TimeoutObservedLeaseStore::Memory(MemoryTimeoutObservedLeaseStore::default()),
+            TimeoutTerminalChecker::Memory(MemoryTimeoutTerminalChecker),
+        )
+        .expect("domain initialization should succeed");
+
+        let tick_now = TimeoutTickNow {
+            wall_ms: 50_000,
+            monotonic_ns: 9_000,
+        };
+        domain.set_tick_now(tick_now);
+
+        let lease = sample_gate_lease("lease-tick-snapshot-1", 50_123);
+        domain
+            .apply_events(&[TimeoutObservedEvent {
+                timestamp_ns: 1,
+                event_id: "evt-lease".to_string(),
+                kind: TimeoutObservedKind::LeaseIssued {
+                    lease: Box::new(lease.clone()),
+                    gate_type: GateType::Quality,
+                },
+            }])
+            .await
+            .expect("apply_events should succeed");
+
+        let state = domain
+            .observed_leases
+            .get(&lease.lease_id)
+            .expect("lease state should be tracked");
+        assert_eq!(state.observed_wall_ms, tick_now.wall_ms);
+        assert_eq!(state.observed_monotonic_ns, tick_now.monotonic_ns);
+        assert_eq!(
+            state.deadline_monotonic_ns,
+            tick_now
+                .monotonic_ns
+                .saturating_add(123_u64.saturating_mul(1_000_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_lease_persistence_is_deferred_until_checkpoint() {
+        let orchestrator = Arc::new(GateOrchestrator::new(
+            crate::gate::GateOrchestratorConfig::default(),
+            Arc::new(Signer::generate()),
+        ));
+        let memory_store = MemoryTimeoutObservedLeaseStore::default();
+        let mut domain = GateTimeoutDomain::new(
+            Arc::clone(&orchestrator),
+            TimeoutObservedLeaseStore::Memory(memory_store.clone()),
+            TimeoutTerminalChecker::Memory(MemoryTimeoutTerminalChecker),
+        )
+        .expect("domain initialization should succeed");
+        domain.set_tick_now(TimeoutTickNow {
+            wall_ms: 60_000,
+            monotonic_ns: 12_000,
+        });
+
+        let lease = sample_gate_lease("lease-checkpoint-1", 61_000);
+        domain
+            .apply_events(&[TimeoutObservedEvent {
+                timestamp_ns: 1,
+                event_id: "evt-issued".to_string(),
+                kind: TimeoutObservedKind::LeaseIssued {
+                    lease: Box::new(lease.clone()),
+                    gate_type: GateType::Quality,
+                },
+            }])
+            .await
+            .expect("apply_events should succeed");
+
+        let before_checkpoint = memory_store
+            .load_all()
+            .expect("memory store load should succeed before checkpoint");
+        assert!(
+            before_checkpoint.is_empty(),
+            "apply_events must not persist observed leases before checkpoint"
+        );
+
+        let _planned = domain.plan().await.expect("plan should succeed");
+        let still_before = memory_store
+            .load_all()
+            .expect("memory store load should succeed before checkpoint");
+        assert!(
+            still_before.is_empty(),
+            "plan must not persist observed leases before checkpoint"
+        );
+
+        domain
+            .checkpoint()
+            .await
+            .expect("checkpoint should persist dirty observed leases");
+        let after_checkpoint = memory_store
+            .load_all()
+            .expect("memory store load should succeed after checkpoint");
+        assert_eq!(after_checkpoint.len(), 1);
+        assert!(after_checkpoint.contains_key(&lease.lease_id));
+
+        domain
+            .apply_events(&[TimeoutObservedEvent {
+                timestamp_ns: 2,
+                event_id: "evt-complete".to_string(),
+                kind: TimeoutObservedKind::GateReceiptFinalized {
+                    lease_id: lease.lease_id.clone(),
+                },
+            }])
+            .await
+            .expect("apply_events remove should succeed");
+
+        let before_remove_checkpoint = memory_store
+            .load_all()
+            .expect("memory store load should succeed before remove checkpoint");
+        assert!(
+            before_remove_checkpoint.contains_key(&lease.lease_id),
+            "removal must not persist before checkpoint"
+        );
+
+        domain
+            .checkpoint()
+            .await
+            .expect("checkpoint should flush removals");
+        let after_remove_checkpoint = memory_store
+            .load_all()
+            .expect("memory store load should succeed after remove checkpoint");
+        assert!(
+            !after_remove_checkpoint.contains_key(&lease.lease_id),
+            "lease should be removed after checkpoint flush"
         );
     }
 

@@ -97,6 +97,11 @@
           "id": "INV-CQ-OK-005",
           "description": "Any code that merges canonical `events` and legacy `ledger_events` tables MUST use the shared poller module (crates/apm2-daemon/src/ledger_poll.rs). Hand-rolled SQL that unions or interleaves both tables is a MAJOR finding. Grep anchors: ledger_events, canonical.*events, poll_events.",
           "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-006",
+          "description": "In `OrchestratorDomain` implementations, `apply_events` and `plan` MUST remain deterministic and free of durable store I/O side effects. Durable domain-cache persistence MUST occur in an explicit `checkpoint` phase before cursor save. Any sqlite writes/reads (upsert/remove/query/execute) in `apply_events`/`plan` are a MAJOR finding. Grep anchors: `impl OrchestratorDomain`, `apply_events(`, `plan(`, `checkpoint(`, `upsert_async`, `remove_async`, `query_row`, `execute`.",
+          "criticality": "CORRECTNESS"
         }
       ]
     },
@@ -107,6 +112,7 @@
         "Reject new per-orchestrator sqlite tables/files for cursor/intent/effect journal concerns. Grep: `CREATE TABLE IF NOT EXISTS .*_cursor`, `CREATE TABLE IF NOT EXISTS .*_intent`, `effect_journal`, `Connection::open(`.",
         "For daemon async paths, verify every rusqlite call is offloaded via `spawn_blocking` or adapter wrappers.",
         "If code merges `ledger_events` + `events`, verify usage of `crates/apm2-daemon/src/ledger_poll.rs` and `canonical_event_id` helper.",
+        "For `OrchestratorDomain` implementations, verify `apply_events`/`plan` are pure (no durable store I/O) and that checkpoint persistence happens before cursor advance.",
         "For persisted monotonic values, verify explicit rebase-on-load before irreversible decisions. Grep: `observed_monotonic_ns`, `deadline_monotonic_ns`, `MONO_EPOCH`, `Instant::now`."
       ]
     },
