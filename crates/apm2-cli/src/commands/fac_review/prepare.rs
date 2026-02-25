@@ -167,8 +167,8 @@ fn build_prepare_inline_content(
     }
 }
 
-/// Extract the content between the first `` ```yaml `` fence and its closing ``
-/// ``` ``.
+/// Extract the content between the first fenced YAML block and its closing
+/// fence in a markdown string.
 ///
 /// Returns the inner text (excluding the fence markers themselves) when found.
 fn extract_first_fenced_yaml_block(body: &str) -> Option<&str> {
