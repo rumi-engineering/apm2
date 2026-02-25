@@ -2733,7 +2733,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// through `handle_work_show_async`, which uses
     /// `tokio::task::spawn_blocking` to offload rusqlite I/O per
     /// INV-CQ-OK-003. All other message types delegate to the sync
-    /// [`Self::dispatch`] (no blocking I/O on those paths).
+    /// [`Self::dispatch`] via `block_in_place` so that any blocking
+    /// I/O in those handlers does not starve the async executor.
     pub async fn dispatch_async(
         &self,
         frame: &Bytes,
@@ -2773,7 +2774,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }
 
         // All non-WorkShow messages: delegate to the sync dispatcher.
-        self.dispatch(frame, ctx)
+        // INV-CQ-OK-003: The sync dispatch() contains handlers that perform
+        // blocking rusqlite I/O. We use block_in_place to yield the tokio
+        // executor thread to the blocking pool, preventing async executor
+        // starvation. spawn_blocking is not viable here because
+        // SessionDispatcher contains non-Clone atomics/mutexes, and
+        // &self is not 'static.
+        tokio::task::block_in_place(|| self.dispatch(frame, ctx))
     }
 
     /// Validates a session token from a request.

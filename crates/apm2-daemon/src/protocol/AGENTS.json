@@ -123,8 +123,8 @@
     {
       "id": "BEH-DAEMON-PROTO-020",
       "kind": "invariant",
-      "title": "WorkShow handlers use block_in_place for rusqlite offloading (INV-CQ-OK-003)",
-      "description": "get_spec_hash calls refresh_projection which runs rusqlite queries; offloaded via tokio::task::block_in_place to avoid forbidden Handle::current().block_on() in async contexts.",
+      "title": "WorkShow handlers use spawn_blocking for rusqlite offloading (INV-CQ-OK-003)",
+      "description": "get_spec_hash and CAS retrieve calls run rusqlite/filesystem I/O; offloaded via tokio::task::spawn_blocking in the async dispatch path. Non-WorkShow handlers are wrapped in block_in_place to prevent async executor starvation.",
       "rfc": ["RFC-0032"]
     },
     {

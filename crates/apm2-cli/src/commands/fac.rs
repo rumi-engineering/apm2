@@ -4627,7 +4627,7 @@ fn run_work_show(args: &WorkShowArgs, operator_socket: &Path, json_output: bool)
             // Build a structured envelope with top-level fields for automation.
             let spec_hash_hex = hex::encode(&response.spec_snapshot_hash);
 
-            // Extract title, rfc_id, status from the WorkSpec JSON for the
+            // Extract title and rfc_id from the WorkSpec JSON for the
             // envelope. WorkSpecV1 defines these as top-level fields.
             let title = spec_json
                 .get("title")
@@ -4637,16 +4637,11 @@ fn run_work_show(args: &WorkShowArgs, operator_socket: &Path, json_output: bool)
                 .get("rfc_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let status = spec_json
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNKNOWN");
 
             let output = serde_json::json!({
                 "work_id": response.work_id,
                 "title": title,
                 "rfc_id": rfc_id,
-                "status": status,
                 "spec_snapshot_hash": spec_hash_hex,
                 "work_spec": spec_json,
             });
