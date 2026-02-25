@@ -7600,7 +7600,8 @@ time.sleep(20)\n",
         }
 
         // Verify that the lane-local env tuple appears (proving the overrides
-        // are applied) and that all cargo-based phases (fmt, clippy, doc) use it.
+        // are applied) and that all cargo-based phases (fmt, clippy, doc gate
+        // via `cargo check`) use it.
         let expected_tuple = (
             expected[0].clone(),
             expected[1].clone(),
@@ -7613,7 +7614,7 @@ time.sleep(20)\n",
         );
 
         // Cargo-based phases must be present.
-        for expected_phase in ["fmt", "clippy", "doc"] {
+        for expected_phase in ["fmt", "clippy", "check"] {
             assert!(
                 phases.contains(expected_phase),
                 "missing cargo phase {expected_phase}"
