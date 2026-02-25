@@ -1,4 +1,5 @@
-//! End-to-end integration tests for the coordination system (RFC-0032::REQ-0055).
+//! End-to-end integration tests for the coordination system
+//! (RFC-0032::REQ-0055).
 //!
 //! This module provides integration tests that verify:
 //!
@@ -412,7 +413,8 @@ fn tck_00155_happy_path_produces_valid_completion() {
     );
 }
 
-/// RFC-0032::REQ-0055: Verify CAS-at-commit ordering (`SessionBound` BEFORE spawn).
+/// RFC-0032::REQ-0055: Verify CAS-at-commit ordering (`SessionBound` BEFORE
+/// spawn).
 ///
 /// This test verifies the NORMATIVE ordering per AD-COORD-006:
 /// 1. Controller emits `session_bound` event
@@ -799,8 +801,8 @@ fn tck_00155_receipt_hash_changes_with_content() {
     );
 }
 
-/// RFC-0032::REQ-0055: Verify `expected_transition_count` is included in `SessionBound`
-/// event.
+/// RFC-0032::REQ-0055: Verify `expected_transition_count` is included in
+/// `SessionBound` event.
 ///
 /// Per AD-COORD-006: The `expected_transition_count` field enables optimistic
 /// concurrency control by detecting stale bindings where the work item's state
@@ -905,7 +907,8 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
     );
 }
 
-/// RFC-0032::REQ-0055: Golden test vector for `SessionBound` event serialization.
+/// RFC-0032::REQ-0055: Golden test vector for `SessionBound` event
+/// serialization.
 ///
 /// Verifies that the JSON serialization format is stable and includes
 /// the `expected_transition_count` field.

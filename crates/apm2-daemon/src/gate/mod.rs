@@ -8,8 +8,8 @@
 //! spawning, and receipt collection. Session termination is a lifecycle-
 //! only signal for timeout polling (CSID-003).
 //!
-//! It also implements the [`MergeExecutor`] (RFC-0032::REQ-0144) which watches for
-//! all required gate receipts reaching PASS verdict and autonomously
+//! It also implements the [`MergeExecutor`] (RFC-0032::REQ-0144) which watches
+//! for all required gate receipts reaching PASS verdict and autonomously
 //! executes the merge via GitHub API, creates a signed `MergeReceipt`,
 //! and transitions work state to Completed.
 //!

@@ -361,7 +361,8 @@ impl CoordinationReceipt {
         let mut buf = Vec::with_capacity(1024);
 
         // Magic bytes for versioning (allows future format changes)
-        // CRv2: RFC-0016::REQ-0003 - replaced elapsed_ms/max_duration_ms with tick-based fields
+        // CRv2: RFC-0016::REQ-0003 - replaced elapsed_ms/max_duration_ms with
+        // tick-based fields
         buf.extend_from_slice(b"CRv2");
 
         // Coordination ID

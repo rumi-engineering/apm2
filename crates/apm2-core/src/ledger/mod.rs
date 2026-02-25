@@ -90,16 +90,16 @@ pub const COMMIT_NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum length for event type strings in commit notifications.
 ///
-/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable memory denial
-/// of service. This bound matches segment bounds in HEF topic grammar (64
-/// chars).
+/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable
+/// memory denial of service. This bound matches segment bounds in HEF topic
+/// grammar (64 chars).
 pub const MAX_EVENT_TYPE_LEN: usize = 64;
 
 /// Maximum length for namespace strings in commit notifications.
 ///
-/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable memory denial
-/// of service. This bound matches segment bounds in HEF topic grammar (64
-/// chars).
+/// Per RFC-0032::REQ-0100 security review: Unbounded string fields enable
+/// memory denial of service. This bound matches segment bounds in HEF topic
+/// grammar (64 chars).
 pub const MAX_NAMESPACE_LEN: usize = 64;
 
 /// Notification sent after a successful ledger commit.

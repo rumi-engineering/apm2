@@ -744,7 +744,8 @@ fn test_work_completed_stores_both_gate_and_merge_receipt_ids() {
     );
 }
 
-// RFC-0032::REQ-0271 Round 2: Bidirectional domain separation (INV-0113 + INV-0114)
+// RFC-0032::REQ-0271 Round 2: Bidirectional domain separation (INV-0113 +
+// INV-0114)
 
 #[test]
 fn test_work_completed_rejects_invalid_merge_receipt_id_prefix() {

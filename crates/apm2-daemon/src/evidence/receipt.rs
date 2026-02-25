@@ -565,9 +565,9 @@ pub struct ToolReceipt {
 
     /// Reference to the `TimeEnvelope` for this receipt (RFC-0016 HTF).
     ///
-    /// Per RFC-0016::REQ-0002, tool receipts include a time envelope reference for
-    /// temporal ordering and causality tracking. The referenced envelope
-    /// should be stored in CAS for verification.
+    /// Per RFC-0016::REQ-0002, tool receipts include a time envelope reference
+    /// for temporal ordering and causality tracking. The referenced
+    /// envelope should be stored in CAS for verification.
     pub time_envelope_ref: Option<TimeEnvelopeRef>,
 
     /// Optional signature (populated after signing).

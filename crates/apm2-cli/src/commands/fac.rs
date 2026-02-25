@@ -94,8 +94,8 @@ pub struct FacCommand {
     /// Bypass the service-user ownership gate for direct queue/receipt writes.
     ///
     /// By default, non-service-user processes are denied direct filesystem
-    /// writes to FAC queue and receipt directories (RFC-0032::REQ-0227). This flag
-    /// disables that check for backward compatibility and development.
+    /// writes to FAC queue and receipt directories (RFC-0032::REQ-0227). This
+    /// flag disables that check for backward compatibility and development.
     ///
     /// **NOT recommended for production deployments.** Use broker-mediated
     /// enqueue instead.
@@ -1728,9 +1728,9 @@ struct ServicesStatusResponse {
     pub worker_heartbeat: Option<apm2_core::fac::worker_heartbeat::HeartbeatStatus>,
     /// Broker health IPC status (if available).
     ///
-    /// RFC-0032::REQ-0248: Exposes broker version, readiness, and health independently
-    /// of systemd unit state. This is the source of truth for whether the
-    /// daemon's internal health checks are passing.
+    /// RFC-0032::REQ-0248: Exposes broker version, readiness, and health
+    /// independently of systemd unit state. This is the source of truth for
+    /// whether the daemon's internal health checks are passing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_health: Option<apm2_core::fac::broker_health_ipc::BrokerHealthIpcStatus>,
     /// Stale-lease reclaim blockers caused by orphaned systemd units.
@@ -3233,15 +3233,15 @@ fn run_services_status(_json_output: bool) -> u8 {
         }
     }
 
-    // RFC-0032::REQ-0248: Read broker health IPC for version + readiness assessment.
-    // This is the source of truth for whether the daemon's internal health
-    // checks are passing, independent of systemd unit state.
+    // RFC-0032::REQ-0248: Read broker health IPC for version + readiness
+    // assessment. This is the source of truth for whether the daemon's internal
+    // health checks are passing, independent of systemd unit state.
     let broker_health = fac_root
         .as_ref()
         .map(|root| apm2_core::fac::broker_health_ipc::read_broker_health(root));
 
-    // RFC-0032::REQ-0248: If broker health is available and reports unhealthy/degraded
-    // or is stale, mark overall status as degraded.
+    // RFC-0032::REQ-0248: If broker health is available and reports
+    // unhealthy/degraded or is stale, mark overall status as degraded.
     if let Some(ref bh) = broker_health {
         if bh.found && (!bh.fresh || bh.health_status != "healthy") {
             degraded = true;
@@ -8700,7 +8700,10 @@ mod tests {
     fn extract_tck_from_text_rejects_invalid_pattern() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
-        assert_eq!(extract_tck_from_text("ticket/rfc/RFC-0032::REQ-02680"), None);
+        assert_eq!(
+            extract_tck_from_text("ticket/rfc/RFC-0032::REQ-02680"),
+            None
+        );
     }
 
     #[test]

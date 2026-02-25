@@ -1239,7 +1239,8 @@ pub struct LaneInitProfileEntry {
     pub created: bool,
 }
 
-/// Receipt for lane reconciliation used by `apm2 fac doctor --fix` (RFC-0032::REQ-0195).
+/// Receipt for lane reconciliation used by `apm2 fac doctor --fix`
+/// (RFC-0032::REQ-0195).
 ///
 /// Records all reconciliation actions taken, lanes inspected, and outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1536,7 +1537,8 @@ impl LaneManager {
             boundary_id,
         };
 
-        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy evidence/).
+        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy
+        // evidence/).
         let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
@@ -1610,7 +1612,8 @@ impl LaneManager {
 
         let receipt = Self::build_reconcile_receipt(&lane_ids, actions);
 
-        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy evidence/).
+        // RFC-0032::REQ-0239: Persist receipt under receipts directory (not legacy
+        // evidence/).
         let receipt_dir = self.fac_root.join("receipts");
         create_dir_restricted(&receipt_dir)?;
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)
@@ -2368,7 +2371,8 @@ impl LaneManager {
         )
     }
 
-    /// Run lane cleanup with explicit log retention policy (RFC-0032::REQ-0221).
+    /// Run lane cleanup with explicit log retention policy
+    /// (RFC-0032::REQ-0221).
     ///
     /// Steps:
     /// 1. Reset workspace (`git reset --hard HEAD`)
@@ -2747,7 +2751,8 @@ impl LaneManager {
         Ok(())
     }
 
-    /// Enforce log retention policy on a lane's `logs/` directory (RFC-0032::REQ-0221).
+    /// Enforce log retention policy on a lane's `logs/` directory
+    /// (RFC-0032::REQ-0221).
     ///
     /// This is the post-job cleanup counterpart to the GC planner's
     /// `collect_lane_log_retention_targets`. It applies the same three

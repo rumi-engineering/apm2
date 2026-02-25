@@ -1,4 +1,5 @@
-//! RFC-0032::REQ-0146 E2E: Shutdown via `OperatorClient` over real operator socket.
+//! RFC-0032::REQ-0146 E2E: Shutdown via `OperatorClient` over real operator
+//! socket.
 //!
 //! This test proves that a daemon-like server, listening on a real Unix
 //! domain socket, correctly handles a Shutdown request sent through the

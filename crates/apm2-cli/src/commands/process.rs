@@ -289,9 +289,9 @@ pub fn info(socket_path: &Path, name: &str) -> Result<()> {
 /// token is not yet available in the CLI context, so this function returns
 /// an error indicating the feature is not yet fully implemented.
 pub fn logs(_socket_path: &Path, _name: &str, _lines: u32, _follow: bool) -> Result<()> {
-    // TODO(RFC-0032::REQ-0132): Implement log streaming once session token management
-    // is available in the CLI. The SessionClient.stream_logs method is ready,
-    // but we need a way to obtain a valid session token.
+    // TODO(RFC-0032::REQ-0132): Implement log streaming once session token
+    // management is available in the CLI. The SessionClient.stream_logs method
+    // is ready, but we need a way to obtain a valid session token.
     bail!("Log streaming requires session token (not yet available in CLI context)")
 }
 

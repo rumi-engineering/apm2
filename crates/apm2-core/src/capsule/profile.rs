@@ -1142,8 +1142,8 @@ impl AdmissionGate {
     ///
     /// # Runtime Wiring
     ///
-    /// RFC-0020::REQ-0030 landed the `PathRatchet` in the daemon broker which tracks
-    /// capsule admission status as one of the mandatory enforcement
+    /// RFC-0020::REQ-0030 landed the `PathRatchet` in the daemon broker which
+    /// tracks capsule admission status as one of the mandatory enforcement
     /// components at Tier2+. **Note**: Capsule admission is not yet wired
     /// at runtime; the ratchet reports it as `Unavailable` and denies
     /// Tier2+ until a future ticket integrates this gate into the broker

@@ -1372,7 +1372,8 @@ pub struct BoundarySpanV1 {
 /// post-effect path can invoke `finalize_post_effect_witness` with the
 /// actual seeds (not just their hashes). This closes the gap where the
 /// runtime path previously did ad-hoc hash-only validation instead of
-/// calling the kernel's canonical validator (QUALITY MAJOR 1, RFC-0020::REQ-0058).
+/// calling the kernel's canonical validator (QUALITY MAJOR 1,
+/// RFC-0020::REQ-0058).
 pub struct AdmissionResultV1 {
     /// Digest of the sealed `AdmissionBundleV1` CAS object
     /// (v1.1 `AdmissionBindingHash`).
@@ -1397,7 +1398,8 @@ pub struct AdmissionResultV1 {
     pub consume_record: AuthorityConsumeRecordV1,
     /// Boundary span for output mediation.
     pub boundary_span: BoundarySpanV1,
-    /// Leakage witness seed from plan time (RFC-0020::REQ-0058 QUALITY MAJOR 1).
+    /// Leakage witness seed from plan time (RFC-0020::REQ-0058 QUALITY MAJOR
+    /// 1).
     ///
     /// Carried through from the consumed plan so the runtime post-effect
     /// path can pass the actual seed (not just its hash) to

@@ -123,12 +123,6 @@
       "Verify queue/worker terminal flows preserve claimed lock continuity.",
       "Verify projections are rebuildable from ledger+CAS without local state files.",
       "Verify all large scans/decodes are bounded."
-    ],
-    "required_tests": [
-      "cargo test -p apm2-daemon --test tck_00412_publish_changeset_fail_closed",
-      "cargo test -p apm2-daemon tck_00639_frozen_work_pr_binding_conflict_rejects_different_pr_numbers -- --nocapture",
-      "cargo test -p apm2-core normalize_user_owned_dir_modes_ -- --nocapture",
-      "cargo test -p apm2-cli claimed_lock_is_retained_until_terminal_transition_finishes -- --nocapture"
     ]
   }
 }

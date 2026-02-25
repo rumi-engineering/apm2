@@ -1,8 +1,8 @@
 //! Durable content-addressed storage (CAS) for evidence artifacts.
 //!
 //! This module provides a filesystem-based CAS that persists artifacts across
-//! daemon restarts. Per RFC-0032::REQ-0095 and RFC-0018, evidence artifacts must be
-//! durable and content-addressed for FAC v0.
+//! daemon restarts. Per RFC-0032::REQ-0095 and RFC-0018, evidence artifacts
+//! must be durable and content-addressed for FAC v0.
 //!
 //! # Architecture
 //!
@@ -675,9 +675,9 @@ impl DurableCas {
 
     /// Recovers total size from persistent storage or recalculates it.
     ///
-    /// RFC-0032::REQ-0193: Uses [`crate::fs_safe::bounded_read`] for symlink refusal
-    /// (`O_NOFOLLOW`), bounded reads, and regular-file verification on the
-    /// total-size metadata file.
+    /// RFC-0032::REQ-0193: Uses [`crate::fs_safe::bounded_read`] for symlink
+    /// refusal (`O_NOFOLLOW`), bounded reads, and regular-file verification
+    /// on the total-size metadata file.
     fn recover_total_size(&self) -> Result<(), DurableCasError> {
         let size_file = self.metadata_path.join(TOTAL_SIZE_FILE);
 

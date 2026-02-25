@@ -71,7 +71,8 @@ pub const MAX_CONCURRENT_EPISODES: usize = 10_000;
 /// which is acceptable for daemon processes.
 ///
 /// The previous value of 100,000 could result in ~1.5GB heap usage, which
-/// risks OOM on resource-constrained nodes (RFC-0016::REQ-0002 review feedback).
+/// risks OOM on resource-constrained nodes (RFC-0016::REQ-0002 review
+/// feedback).
 pub const MAX_EVENTS_BUFFER_SIZE: usize = 10_000;
 
 /// Hash type (BLAKE3-256).
@@ -482,7 +483,8 @@ struct EpisodeEntry {
 /// // Stop the episode
 /// runtime.stop(&episode_id, TerminationClass::Success, timestamp_ns).await?;
 /// ```
-/// Type alias for workspace-rooted handler factory functions (RFC-0032::REQ-0113).
+/// Type alias for workspace-rooted handler factory functions
+/// (RFC-0032::REQ-0113).
 ///
 /// These factories take a workspace root path and produce handlers that are
 /// confined to that workspace. This is the preferred factory type for
@@ -517,12 +519,13 @@ pub struct EpisodeRuntime {
     cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Factories for creating tool handlers (legacy, CWD-rooted).
     ///
-    /// **DEPRECATED (RFC-0032::REQ-0113)**: Prefer `rooted_handler_factories` for
-    /// production use. These factories create handlers rooted to CWD, which
-    /// is a security anti-pattern.
+    /// **DEPRECATED (RFC-0032::REQ-0113)**: Prefer `rooted_handler_factories`
+    /// for production use. These factories create handlers rooted to CWD,
+    /// which is a security anti-pattern.
     #[allow(clippy::type_complexity)]
     handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
-    /// Factories for creating workspace-rooted tool handlers (RFC-0032::REQ-0113).
+    /// Factories for creating workspace-rooted tool handlers
+    /// (RFC-0032::REQ-0113).
     ///
     /// These factories take a workspace root path and produce handlers that are
     /// confined to that workspace. This is the preferred factory type for
@@ -530,7 +533,8 @@ pub struct EpisodeRuntime {
     rooted_handler_factories: RwLock<Vec<RootedHandlerFactory>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
-    /// Ledger event emitter for durable episode event persistence (RFC-0032::REQ-0115).
+    /// Ledger event emitter for durable episode event persistence
+    /// (RFC-0032::REQ-0115).
     ///
     /// Per REQ-0005, when present, episode events are streamed directly to the
     /// ledger as they occur (rather than buffered in memory). This enables:
@@ -786,7 +790,8 @@ impl EpisodeRuntime {
         self
     }
 
-    /// Sets the adapter registry for spawning agent CLI processes (RFC-0032::REQ-0151).
+    /// Sets the adapter registry for spawning agent CLI processes
+    /// (RFC-0032::REQ-0151).
     #[must_use]
     pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
@@ -1079,9 +1084,10 @@ impl EpisodeRuntime {
 
     /// Starts an episode, transitioning it from CREATED to RUNNING.
     ///
-    /// **DEPRECATED (RFC-0032::REQ-0113, RFC-0032::REQ-0128)**: Prefer `start_with_workspace` for
-    /// production use. This method uses CWD-rooted handlers, which is a
-    /// security anti-pattern that violates workspace isolation.
+    /// **DEPRECATED (RFC-0032::REQ-0113, RFC-0032::REQ-0128)**: Prefer
+    /// `start_with_workspace` for production use. This method uses
+    /// CWD-rooted handlers, which is a security anti-pattern that violates
+    /// workspace isolation.
     ///
     /// # Security Warning (RFC-0032::REQ-0128)
     ///
@@ -1873,7 +1879,8 @@ impl EpisodeRuntime {
     /// This is a convenience wrapper around [`Self::stop`] that additionally
     /// emits a `SessionTerminated` event to the ledger when a
     /// `ledger_emitter` is configured. This enables the `GateOrchestrator`
-    /// (RFC-0032::REQ-0142) to observe session termination and trigger gate lifecycle.
+    /// (RFC-0032::REQ-0142) to observe session termination and trigger gate
+    /// lifecycle.
     ///
     /// # Arguments
     ///
@@ -1901,7 +1908,8 @@ impl EpisodeRuntime {
         self.stop(episode_id, termination_class, timestamp_ns)
             .await?;
 
-        // RFC-0032::REQ-0149: Emit SessionTerminated event to ledger if emitter is configured
+        // RFC-0032::REQ-0149: Emit SessionTerminated event to ledger if emitter is
+        // configured
         if let Some(ref emitter) = self.ledger_emitter {
             let exit_code = match termination_class {
                 TerminationClass::Success => 0,
@@ -1940,7 +1948,8 @@ impl EpisodeRuntime {
         Ok(())
     }
 
-    /// Stops all running episodes with session context (RFC-0032::REQ-0149 BLOCKER 1).
+    /// Stops all running episodes with session context (RFC-0032::REQ-0149
+    /// BLOCKER 1).
     ///
     /// This method iterates all running episodes and stops each one, emitting
     /// `SessionTerminated` ledger events for all sessions. It is intended for
@@ -2356,7 +2365,8 @@ impl EpisodeRuntime {
         Ok(result)
     }
 
-    /// Records a tool result hash and emits a `ToolExecuted` event (RFC-0032::REQ-0114).
+    /// Records a tool result hash and emits a `ToolExecuted` event
+    /// (RFC-0032::REQ-0114).
     ///
     /// Per SEC-CTRL-FAC-0015, this method:
     /// 1. Accumulates the result hash in the episode's ordered collection
@@ -2445,10 +2455,12 @@ impl EpisodeRuntime {
         Ok(())
     }
 
-    /// Returns the accumulated result hashes for an episode (RFC-0032::REQ-0114).
+    /// Returns the accumulated result hashes for an episode
+    /// (RFC-0032::REQ-0114).
     ///
     /// The result hashes are returned in deterministic tool sequence order.
-    /// This is used for downstream indexing (RFC-0032::REQ-0120: `ToolLogIndexV1`).
+    /// This is used for downstream indexing (RFC-0032::REQ-0120:
+    /// `ToolLogIndexV1`).
     ///
     /// # Arguments
     ///
@@ -2469,9 +2481,9 @@ impl EpisodeRuntime {
     /// Emits a `LeaseIssueDenied` event for `SoD` violations and other spawn
     /// rejections.
     ///
-    /// Per RFC-0032::REQ-0074 and REQ-DCP-0006, this method emits a diagnostic event
-    /// when a spawn request is rejected due to policy violations such as
-    /// custody domain overlap.
+    /// Per RFC-0032::REQ-0074 and REQ-DCP-0006, this method emits a diagnostic
+    /// event when a spawn request is rejected due to policy violations such
+    /// as custody domain overlap.
     ///
     /// # Arguments
     ///
@@ -2655,7 +2667,8 @@ impl EpisodeRuntime {
             let episode_id_cloned = episode_id.clone();
             let payload_cloned = payload;
 
-            // Blocking I/O in async context must be spawned (RFC-0032::REQ-0115 Quality Review)
+            // Blocking I/O in async context must be spawned (RFC-0032::REQ-0115 Quality
+            // Review)
             let result = tokio::task::spawn_blocking(move || {
                 emitter.emit_episode_event(
                     &episode_id_cloned,
@@ -3790,8 +3803,8 @@ mod tests {
     // RFC-0016::REQ-0002: HolonicClock integration tests
     // =========================================================================
 
-    /// RFC-0016::REQ-0002: Verify that events include `time_envelope_ref` when clock is
-    /// provided.
+    /// RFC-0016::REQ-0002: Verify that events include `time_envelope_ref` when
+    /// clock is provided.
     #[tokio::test]
     async fn tck_00240_events_have_time_envelope_ref_with_clock() {
         use crate::htf::{ClockConfig, HolonicClock};
@@ -3840,7 +3853,8 @@ mod tests {
         }
     }
 
-    /// RFC-0016::REQ-0002: Verify that quarantine events also get `time_envelope_ref`.
+    /// RFC-0016::REQ-0002: Verify that quarantine events also get
+    /// `time_envelope_ref`.
     #[tokio::test]
     async fn tck_00240_quarantine_event_has_time_envelope_ref() {
         use crate::htf::{ClockConfig, HolonicClock};
@@ -3886,8 +3900,8 @@ mod tests {
         );
     }
 
-    /// RFC-0016::REQ-0002: Verify that events have `time_envelope_ref: None` when no
-    /// clock is provided (backward compatibility).
+    /// RFC-0016::REQ-0002: Verify that events have `time_envelope_ref: None`
+    /// when no clock is provided (backward compatibility).
     #[tokio::test]
     async fn tck_00240_events_have_no_time_envelope_ref_without_clock() {
         let runtime = EpisodeRuntime::new(test_config());
@@ -3907,8 +3921,8 @@ mod tests {
         );
     }
 
-    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` event is emitted when
-    /// using `with_clock_initialized`.
+    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` event is emitted
+    /// when using `with_clock_initialized`.
     #[tokio::test]
     async fn tck_00240_clock_profile_published_event() {
         use crate::htf::{ClockConfig, HolonicClock};
@@ -3956,8 +3970,8 @@ mod tests {
         }
     }
 
-    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` has `episode_id() ==
-    /// None`.
+    /// RFC-0016::REQ-0002: Verify that `ClockProfilePublished` has
+    /// `episode_id() == None`.
     #[tokio::test]
     async fn tck_00240_clock_profile_published_has_no_episode_id() {
         use crate::htf::{ClockConfig, HolonicClock};
@@ -3977,8 +3991,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0113: Verify that `start_with_workspace` correctly initializes
-    /// rooted handlers and that they are confined to the workspace.
+    /// RFC-0032::REQ-0113: Verify that `start_with_workspace` correctly
+    /// initializes rooted handlers and that they are confined to the
+    /// workspace.
     #[tokio::test]
     async fn tck_00319_start_with_workspace_roots_handlers() {
         use std::path::PathBuf;
@@ -4061,8 +4076,8 @@ mod tests {
     // RFC-0032::REQ-0139 BLOCKER: Episode stop/quarantine wires session termination
     // =========================================================================
 
-    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `session_registry` marks
-    /// the session as TERMINATED with correct reason and exit code.
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `session_registry`
+    /// marks the session as TERMINATED with correct reason and exit code.
     #[tokio::test]
     async fn tck_00385_stop_wires_session_terminated() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4128,8 +4143,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `BudgetExhausted` maps to
-    /// correct reason.
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with `BudgetExhausted`
+    /// maps to correct reason.
     #[tokio::test]
     async fn tck_00385_stop_budget_exhausted_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4182,7 +4197,8 @@ mod tests {
         assert_eq!(term_info.exit_classification, "FAILURE");
     }
 
-    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with Timeout maps correctly.
+    /// RFC-0032::REQ-0139 BLOCKER regression: `stop()` with Timeout maps
+    /// correctly.
     #[tokio::test]
     async fn tck_00385_stop_timeout_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4235,8 +4251,8 @@ mod tests {
         assert_eq!(term_info.exit_classification, "FAILURE");
     }
 
-    /// RFC-0032::REQ-0139 BLOCKER regression: `quarantine()` wires session termination
-    /// with "quarantined" reason.
+    /// RFC-0032::REQ-0139 BLOCKER regression: `quarantine()` wires session
+    /// termination with "quarantined" reason.
     #[tokio::test]
     async fn tck_00385_quarantine_wires_session_terminated() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4326,7 +4342,8 @@ mod tests {
         assert!(matches!(state, EpisodeState::Terminated { .. }));
     }
 
-    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Crashed maps to crash/FAILURE/exit 1.
+    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Crashed maps to
+    /// crash/FAILURE/exit 1.
     #[tokio::test]
     async fn tck_00385_stop_crashed_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4380,7 +4397,8 @@ mod tests {
         assert_eq!(term_info.exit_code, Some(1));
     }
 
-    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Killed maps to crash/FAILURE/exit 137.
+    /// RFC-0032::REQ-0139 BLOCKER: `stop()` with Killed maps to
+    /// crash/FAILURE/exit 137.
     #[tokio::test]
     async fn tck_00385_stop_killed_wires_reason() {
         use crate::episode::registry::InMemorySessionRegistry;
@@ -4493,8 +4511,8 @@ mod tests {
         }
     }
 
-    /// RFC-0032::REQ-0139 MAJOR 1: `stop()` returns `SessionTerminationFailed` when
-    /// `mark_terminated` fails, enforcing the fail-closed contract.
+    /// RFC-0032::REQ-0139 MAJOR 1: `stop()` returns `SessionTerminationFailed`
+    /// when `mark_terminated` fails, enforcing the fail-closed contract.
     #[tokio::test]
     async fn tck_00385_stop_propagates_mark_terminated_error() {
         let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);
@@ -4534,8 +4552,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0139 MAJOR 1: `quarantine()` returns `SessionTerminationFailed`
-    /// when `mark_terminated` fails, enforcing the fail-closed contract.
+    /// RFC-0032::REQ-0139 MAJOR 1: `quarantine()` returns
+    /// `SessionTerminationFailed` when `mark_terminated` fails, enforcing
+    /// the fail-closed contract.
     #[tokio::test]
     async fn tck_00385_quarantine_propagates_mark_terminated_error() {
         let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);

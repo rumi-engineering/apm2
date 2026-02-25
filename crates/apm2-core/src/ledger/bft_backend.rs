@@ -442,7 +442,8 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// Whether consensus is enabled.
     consensus_enabled: Arc<RwLock<bool>>,
 
-    /// Optional schema registry for `schema_digest` validation (RFC-0033::REQ-0054).
+    /// Optional schema registry for `schema_digest` validation
+    /// (RFC-0033::REQ-0054).
     ///
     /// When present, events with `schema_digest` are validated against this
     /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
@@ -457,7 +458,8 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// Per DD-HEF-0007: Ledger append MUST NOT block on pulse fanout.
     commit_notification_sender: Option<super::CommitNotificationSender>,
 
-    /// Optional consensus metrics for recording notification drops (RFC-0032::REQ-0100).
+    /// Optional consensus metrics for recording notification drops
+    /// (RFC-0032::REQ-0100).
     ///
     /// When present, `on_commit()` and `append_eventual()` will increment the
     /// `hef_notification_drops` counter when notifications are dropped due to
@@ -524,7 +526,8 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
 }
 
 impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
-    /// Creates a new BFT ledger backend with schema validation (RFC-0033::REQ-0054).
+    /// Creates a new BFT ledger backend with schema validation
+    /// (RFC-0033::REQ-0054).
     ///
     /// Events with `schema_digest` set will be validated against the provided
     /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
@@ -591,7 +594,8 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         self.commit_notification_sender = Some(sender);
     }
 
-    /// Sets the consensus metrics for recording notification drops (RFC-0032::REQ-0100).
+    /// Sets the consensus metrics for recording notification drops
+    /// (RFC-0032::REQ-0100).
     ///
     /// When set, the `hef_notification_drops` counter will be incremented when
     /// notifications are dropped due to channel full.
@@ -693,7 +697,8 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         self.append_with_consensus(namespace, event, metadata).await
     }
 
-    /// Validates an event's `schema_digest` against the registry (RFC-0033::REQ-0054).
+    /// Validates an event's `schema_digest` against the registry
+    /// (RFC-0033::REQ-0054).
     ///
     /// # Fail-Closed Behavior
     ///
@@ -1016,7 +1021,8 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                             // Notification sent successfully
                         },
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            // Channel full: increment hef_notification_drops metric (RFC-0032::REQ-0100)
+                            // Channel full: increment hef_notification_drops metric
+                            // (RFC-0032::REQ-0100)
                             if let Some(metrics) = &self.metrics {
                                 metrics.record_notification_drop();
                             }

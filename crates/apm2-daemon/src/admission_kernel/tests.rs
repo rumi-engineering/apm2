@@ -1728,7 +1728,8 @@ fn test_join_input_uses_verifier_anchor_not_client_hash() {
 }
 
 // =============================================================================
-// QUALITY MAJOR 1 (RFC-0032::REQ-0170): Zero-digest rejection for mandatory fields
+// QUALITY MAJOR 1 (RFC-0032::REQ-0170): Zero-digest rejection for mandatory
+// fields
 // =============================================================================
 
 #[test]
@@ -1845,7 +1846,8 @@ fn test_zero_provider_build_digest_denied() {
 }
 
 // =============================================================================
-// SECURITY BLOCKER 2 (RFC-0032::REQ-0170): Bounded deserialization for String fields
+// SECURITY BLOCKER 2 (RFC-0032::REQ-0170): Bounded deserialization for String
+// fields
 // =============================================================================
 
 #[test]
@@ -1895,7 +1897,8 @@ fn test_witness_seed_bounded_deserialization_rejects_oversized_provider_id() {
 }
 
 // =============================================================================
-// QUALITY MINOR 1 (RFC-0032::REQ-0170): risk_tier and pcac_policy in canonical digest
+// QUALITY MINOR 1 (RFC-0032::REQ-0170): risk_tier and pcac_policy in canonical
+// digest
 // =============================================================================
 
 #[test]
@@ -1929,7 +1932,8 @@ fn test_canonical_request_digest_differs_by_pcac_policy() {
 }
 
 // =============================================================================
-// RFC-0032::REQ-0171: AdmissionBundleV1 — sealed CAS bundle with no digest cycles
+// RFC-0032::REQ-0171: AdmissionBundleV1 — sealed CAS bundle with no digest
+// cycles
 // =============================================================================
 
 #[test]
@@ -2457,7 +2461,8 @@ fn test_outcome_index_validation_rejects_zero_bundle_digest() {
 }
 
 // =============================================================================
-// RFC-0032::REQ-0171: Digest cycle regression test — bundle never references receipts
+// RFC-0032::REQ-0171: Digest cycle regression test — bundle never references
+// receipts
 // =============================================================================
 
 #[test]
@@ -4276,8 +4281,8 @@ fn test_tck_00497_witness_evidence_json_round_trip() {
 }
 
 // =============================================================================
-// RFC-0032::REQ-0176 MAJOR 2: record_started must NOT be persisted before fallible
-// pre-effect steps (bundle validation). This test verifies that when
+// RFC-0032::REQ-0176 MAJOR 2: record_started must NOT be persisted before
+// fallible pre-effect steps (bundle validation). This test verifies that when
 // PCAC consume fails, the effect journal has NO Started entry.
 // =============================================================================
 
@@ -5589,10 +5594,11 @@ fn test_tck_00502_sequential_finalize_advances_anchor_monotonically() {
 /// effects regardless of which handler calls it (`RequestTool`, `EmitEvent`,
 /// or `PublishEvidence`).
 ///
-/// Regression test for RFC-0032::REQ-0177 round 4: the new `finalize_anti_rollback`
-/// calls in `EmitEvent` and `PublishEvidence` are gated on
-/// `admission_result.boundary_span.enforcement_tier`, which is `Monitor`
-/// for low-risk tiers. This test proves the monitor-tier no-op contract.
+/// Regression test for RFC-0032::REQ-0177 round 4: the new
+/// `finalize_anti_rollback` calls in `EmitEvent` and `PublishEvidence` are
+/// gated on `admission_result.boundary_span.enforcement_tier`, which is
+/// `Monitor` for low-risk tiers. This test proves the monitor-tier no-op
+/// contract.
 #[test]
 fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5665,7 +5671,8 @@ fn test_tck_00502_finalize_noop_for_monitor_tier_all_handler_paths() {
 }
 
 // =============================================================================
-// RFC-0032::REQ-0177 round 6: Bootstrap receipt, post-effect anchor, health probe
+// RFC-0032::REQ-0177 round 6: Bootstrap receipt, post-effect anchor, health
+// probe
 // =============================================================================
 
 /// Verifies that `DurableAntiRollbackAnchor` persists a bootstrap receipt

@@ -629,8 +629,8 @@ async fn tck_00403_fac_lifecycle_end_to_end() {
         tool_error.message
     );
 
-    // RFC-0032::REQ-0173: `EmitEvent` is an Actuate-intent session endpoint. When the
-    // PCAC lifecycle gate is wired (production constructor), it requires an
+    // RFC-0032::REQ-0173: `EmitEvent` is an Actuate-intent session endpoint. When
+    // the PCAC lifecycle gate is wired (production constructor), it requires an
     // authoritative governance policy root in the ledger. This minimal e2e
     // harness does not seed a governance policy event, so PCAC correctly
     // denies the request fail-closed. Both success (if governance policy
@@ -667,7 +667,8 @@ async fn tck_00403_fac_lifecycle_end_to_end() {
         },
     };
 
-    // RFC-0032::REQ-0173: Same PCAC fail-closed semantics apply to `PublishEvidence`.
+    // RFC-0032::REQ-0173: Same PCAC fail-closed semantics apply to
+    // `PublishEvidence`.
     let publish_evidence_succeeded = match session_client
         .publish_evidence(&spawn.session_token, b"tck-00403-evidence", 0, 0)
         .await

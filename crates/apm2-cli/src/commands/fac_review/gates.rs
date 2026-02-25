@@ -2156,9 +2156,9 @@ fn build_gates_job_spec(
     // Bind policy fields to the admitted FAC policy digest and bind the
     // specific job through request_id (= spec digest), preserving fail-closed
     // token verification while avoiding digest-domain mismatch.
-    // RFC-0032::REQ-0218: Derive intent from job kind for intent-bound token issuance.
-    // Thread FacPolicyV1.allowed_intents so the broker enforces the allowlist
-    // at issuance (fail-closed).
+    // RFC-0032::REQ-0218: Derive intent from job kind for intent-bound token
+    // issuance. Thread FacPolicyV1.allowed_intents so the broker enforces the
+    // allowlist at issuance (fail-closed).
     let intent = apm2_core::fac::job_spec::job_kind_to_intent(&spec.kind).ok_or_else(|| {
         format!(
             "cannot derive RFC-0028 intent binding for gates job kind `{}`",
@@ -4078,11 +4078,11 @@ fn run_execute_phase(
 
     // 6. Write attested results to gate cache for full runs only.
     if !quick {
-        // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate attestation.
-        // RFC-0032::REQ-0224 MAJOR-1: Include network policy hash in gate attestation
-        // to prevent cache reuse across network policy drift.
-        // Uses the effective policy-driven hashes computed above (before the
-        // profile was moved into the bounded test command builder).
+        // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate
+        // attestation. RFC-0032::REQ-0224 MAJOR-1: Include network policy hash
+        // in gate attestation to prevent cache reuse across network policy
+        // drift. Uses the effective policy-driven hashes computed above (before
+        // the profile was moved into the bounded test command builder).
         // RFC-0032::REQ-0196: `policy` is now computed before the evidence call so it
         // can also be used for cache-reuse attestation digest matching.
         let mut cache = GateCache::new(&sha);
@@ -4174,9 +4174,9 @@ fn run_execute_phase(
         // below, but is NOT persisted to disk.
         // (Previously: `cache.save()?;`)
 
-        // RFC-0032::REQ-0197: Persist v3 gate cache (the ONLY write path) for the manual
-        // `fac gates` path. This ensures consistent cache behavior across
-        // all execution entry points (pipeline and manual).
+        // RFC-0032::REQ-0197: Persist v3 gate cache (the ONLY write path) for the
+        // manual `fac gates` path. This ensures consistent cache behavior
+        // across all execution entry points (pipeline and manual).
         let v3_compound_key = compute_v3_compound_key(
             workspace_root,
             &sha,
@@ -4255,10 +4255,12 @@ fn run_execute_phase(
 
     assert_execute_ambient_mutation_invariant(workspace_root, &execute_workspace_fingerprint)?;
 
-    // RFC-0032::REQ-0258 S1: Compute cache hit/miss counts from evidence gate results.
+    // RFC-0032::REQ-0258 S1: Compute cache hit/miss counts from evidence gate
+    // results.
     let (cache_hit_count, cache_miss_count) = compute_cache_counts(&gate_results);
-    // RFC-0032::REQ-0258 MAJOR fix: track total evidence gate count for is_warm_run.
-    // Truncation is safe: LANE_EVIDENCE_GATES.len() is a small constant (< 10).
+    // RFC-0032::REQ-0258 MAJOR fix: track total evidence gate count for
+    // is_warm_run. Truncation is safe: LANE_EVIDENCE_GATES.len() is a small
+    // constant (< 10).
     #[allow(clippy::cast_possible_truncation)]
     let total_gate_count = gate_results.len() as u32;
 
@@ -4427,9 +4429,9 @@ fn compute_nextest_test_environment(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(policy, &ambient, apm2_home);
 
-    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
-    // XDG_CONFIG_HOME). For CLI gates, use the synthetic lane-00 directory
-    // under $APM2_HOME/private/fac/lanes/lane-00.
+    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR,
+    // XDG_CACHE_HOME, XDG_CONFIG_HOME). For CLI gates, use the synthetic
+    // lane-00 directory under $APM2_HOME/private/fac/lanes/lane-00.
     let fac_root = apm2_home.join("private/fac");
     let lane_dir = fac_root.join("lanes/lane-00");
     super::policy_loader::apply_review_lane_environment(
@@ -7634,7 +7636,8 @@ time.sleep(20)\n",
     }
 
     // =========================================================================
-    // RFC-0032::REQ-0197 round-5 BLOCKER fix: default full runs must NOT write v2 cache
+    // RFC-0032::REQ-0197 round-5 BLOCKER fix: default full runs must NOT write v2
+    // cache
     // =========================================================================
 
     /// Regression test: a `GateCache` constructed in-memory but never saved
@@ -7680,7 +7683,8 @@ time.sleep(20)\n",
     }
 
     // ========================================================================
-    // RFC-0032::REQ-0258 S4: Unit regression tests for is_warm_run and slo_violation
+    // RFC-0032::REQ-0258 S4: Unit regression tests for is_warm_run and
+    // slo_violation
     // ========================================================================
 
     #[test]

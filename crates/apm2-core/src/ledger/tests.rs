@@ -3203,12 +3203,12 @@ fn tck_00630_frozen_exists_events_empty_frozen_empty_noop() {
     }
 }
 
-/// Regression (RFC-0032::REQ-0259 R5): frozen snapshot has rows, canonical `events` is
-/// empty, but `ledger_events` has live rows (simulating truncation + rogue
-/// write).  The old code checked `live_legacy_rows` BEFORE `events_rows`
-/// inside the `frozen_exists` branch, allowing re-migration to bypass the
-/// fail-closed `MigrationPartialState` guard.  After the fix, `events_rows`
-/// is checked FIRST — this scenario must always fail closed.
+/// Regression (RFC-0032::REQ-0259 R5): frozen snapshot has rows, canonical
+/// `events` is empty, but `ledger_events` has live rows (simulating truncation
+/// + rogue write).  The old code checked `live_legacy_rows` BEFORE
+/// `events_rows` inside the `frozen_exists` branch, allowing re-migration to
+/// bypass the fail-closed `MigrationPartialState` guard.  After the fix,
+/// `events_rows` is checked FIRST — this scenario must always fail closed.
 #[test]
 fn tck_00630_frozen_nonempty_events_empty_live_legacy_nonzero_fails_closed() {
     let dir = TempDir::new().unwrap();
@@ -3345,8 +3345,8 @@ fn assert_genesis_migration_result(conn: &Connection, expected_events: i64) {
     assert_eq!(null_hashes, 0, "no NULL event_hash values after migration");
 }
 
-/// Regression (RFC-0032::REQ-0259 R6): empty frozen migration followed by new legacy
-/// rows must trigger a full migration from genesis, NOT return
+/// Regression (RFC-0032::REQ-0259 R6): empty frozen migration followed by new
+/// legacy rows must trigger a full migration from genesis, NOT return
 /// `already_migrated`.
 ///
 /// Scenario: migration runs on an empty `ledger_events` (creates empty frozen,

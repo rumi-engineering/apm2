@@ -4239,9 +4239,9 @@ mod tests {
     // BLOCKER 3: Integration evidence (end-to-end seal verification flow)
     // =========================================================================
 
-    // NOTE(RFC-0020::REQ-0019): EpochSealVerifier::verify_with_policy() is now wired
-    // into the daemon ToolBroker admission path (broker.rs). The verifier API
-    // enforces monotonicity, anti-equivocation, and signature verification.
+    // NOTE(RFC-0020::REQ-0019): EpochSealVerifier::verify_with_policy() is now
+    // wired into the daemon ToolBroker admission path (broker.rs). The verifier
+    // API enforces monotonicity, anti-equivocation, and signature verification.
     // Request-carried seals are consumed via BrokerToolRequest.epoch_seal.
 
     #[test]

@@ -22,9 +22,9 @@
 //!
 //! # Time Model (RFC-0016 HTF Compliance Review)
 //!
-//! **RFC-0016::REQ-0003 Review**: This module was reviewed for wall-clock time usage as
-//! part of RFC-0016 HTF compliance. **No wall-clock timing is used** in this
-//! module. All operations are purely deterministic transformations:
+//! **RFC-0016::REQ-0003 Review**: This module was reviewed for wall-clock time
+//! usage as part of RFC-0016 HTF compliance. **No wall-clock timing is used**
+//! in this module. All operations are purely deterministic transformations:
 //!
 //! - Canonicalization: Key sorting, string formatting
 //! - Atomic writes: File system operations (rename, fsync)

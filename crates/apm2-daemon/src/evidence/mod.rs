@@ -85,7 +85,8 @@ pub use binding::{EvidenceBinding, ToolEvidenceCollector};
 // Re-export CAS access facade types (RFC-0032::REQ-0108)
 pub use cas_access::{CasAccessError, CasAccessFacade, CasAccessType};
 // Re-export compaction types (RFC-0033::REQ-0038)
-// Note: ArtifactId and MAX_ARTIFACT_ID_LEN are re-exported from artifact module (RFC-0033::REQ-0037)
+// Note: ArtifactId and MAX_ARTIFACT_ID_LEN are re-exported from artifact module
+// (RFC-0033::REQ-0037)
 pub use compaction::{
     CompactionCounts, CompactionError, CompactionJob, CompactionJobBuilder, CompactionResult,
     CompactionStrategy, CompactionSummary, DEFAULT_COMPACTION_THRESHOLD_NS,
@@ -143,4 +144,5 @@ pub use verifier::{
     verify_receipt_self_signed, verify_receipt_with_bytes, verify_receipts_batch,
 };
 
-// Both RFC-0033::REQ-0037 (TTL/pinning) and RFC-0033::REQ-0038 (compaction) are now implemented.
+// Both RFC-0033::REQ-0037 (TTL/pinning) and RFC-0033::REQ-0038 (compaction) are
+// now implemented.

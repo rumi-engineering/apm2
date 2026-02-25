@@ -10,8 +10,8 @@
 //!   multiple receipt hashes are members of a single batch root. Each receipt
 //!   currently carries its own independent inclusion proof; the compact
 //!   shared-sibling wire shape (`proof_nodes[]` + `proof_structure`) from
-//!   RFC-0020 §9.5.5 is deferred to RFC-0020::REQ-0024. Correctness and acceptance
-//!   equivalence take priority.
+//!   RFC-0020 §9.5.5 is deferred to RFC-0020::REQ-0024. Correctness and
+//!   acceptance equivalence take priority.
 //! - [`ReceiptPointerVerifier`]: a unified verifier that accepts both direct
 //!   and batched semantics with equivalent acceptance behavior.
 //!
@@ -612,7 +612,8 @@ impl ReceiptPointerV1 {
 ///
 /// Target compact wire shape (`proof_nodes[]` + `proof_structure`) is
 /// deferred to RFC-0020::REQ-0024.
-// TODO(RFC-0020::REQ-0024): Implement compact shared-sibling multiproof wire shape per RFC-0020 §9.5.5.
+// TODO(RFC-0020::REQ-0024): Implement compact shared-sibling multiproof wire shape per RFC-0020
+// §9.5.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptMultiProofV1 {
     /// The batch Merkle root hash being proven against.

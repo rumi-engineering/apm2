@@ -402,7 +402,8 @@ async fn test_accept_validates_uid_at_connection_time() {
     drop(client);
 }
 
-/// Test full handshake succeeds after UID validation at accept (RFC-0032::REQ-0064).
+/// Test full handshake succeeds after UID validation at accept
+/// (RFC-0032::REQ-0064).
 ///
 /// This verifies that the handshake works correctly after UID authorization
 /// has already been performed at the `accept()` stage.
@@ -1238,7 +1239,8 @@ async fn protocol_dispatch_cutover_tag_routing() {
 /// This test documents the security invariant that JSON start bytes
 /// are outside the valid message type tag range, ensuring fail-closed
 /// behavior without explicit JSON detection code in the dispatchers.
-/// Updated for RFC-0032::REQ-0134: tag 5 is now valid (`WorkStatus` / `SessionStatus`).
+/// Updated for RFC-0032::REQ-0134: tag 5 is now valid (`WorkStatus` /
+/// `SessionStatus`).
 #[test]
 fn protocol_dispatch_cutover_json_tag_validation() {
     use apm2_daemon::protocol::dispatch::PrivilegedMessageType;

@@ -489,8 +489,8 @@ pub(super) fn log_retention_from_policy(policy: &FacPolicyV1) -> LogRetentionCon
 /// Run lane cleanup and emit cleanup receipts.
 /// On failure, mark the lane as corrupt.
 ///
-/// RFC-0032::REQ-0221 (CQ-BLOCKER-1 fix): Accepts a `LogRetentionConfig` to ensure
-/// post-job cleanup enforces the same retention policy as GC. The config
+/// RFC-0032::REQ-0221 (CQ-BLOCKER-1 fix): Accepts a `LogRetentionConfig` to
+/// ensure post-job cleanup enforces the same retention policy as GC. The config
 /// is derived from `FacPolicyV1` fields (`per_lane_log_max_bytes`,
 /// `per_job_log_ttl_days`, `keep_last_n_jobs_per_lane`).
 pub(super) fn execute_lane_cleanup(

@@ -346,8 +346,8 @@ pub(super) fn emit_job_receipt(
 /// Emit a unified `FacJobReceiptV1` with observed runtime cost metrics.
 ///
 /// Note: Most callers have been migrated to `commit_claimed_job_via_pipeline`
-/// (RFC-0032::REQ-0215 BLOCKER-1). This function is retained for future non-pipeline
-/// receipt emission paths.
+/// (RFC-0032::REQ-0215 BLOCKER-1). This function is retained for future
+/// non-pipeline receipt emission paths.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) fn emit_job_receipt_with_observed_cost(
@@ -397,7 +397,8 @@ pub(super) fn emit_job_receipt_with_observed_cost(
 /// Build a `FacJobReceiptV1` from the given parameters without persisting.
 ///
 /// This is the shared receipt construction logic used by both the direct
-/// persist path and the `ReceiptWritePipeline` commit path (RFC-0032::REQ-0215).
+/// persist path and the `ReceiptWritePipeline` commit path
+/// (RFC-0032::REQ-0215).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_job_receipt(
     spec: &FacJobSpecV1,
@@ -463,8 +464,8 @@ pub(super) fn build_job_receipt(
     }
     if let Some(trace) = containment {
         builder = builder.containment(trace.clone());
-        // RFC-0032::REQ-0222: Collect cgroup usage stats from the containment cgroup path.
-        // Best-effort: if stats cannot be read, observed_usage is None.
+        // RFC-0032::REQ-0222: Collect cgroup usage stats from the containment cgroup
+        // path. Best-effort: if stats cannot be read, observed_usage is None.
         if !trace.cgroup_path.is_empty() {
             let usage = apm2_core::fac::cgroup_stats::collect_cgroup_usage(&trace.cgroup_path);
             if !usage.is_empty() {

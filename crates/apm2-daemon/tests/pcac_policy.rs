@@ -1,4 +1,5 @@
-//! RFC-0020::REQ-0047: PCAC policy surface implementation and fail-closed defaults.
+//! RFC-0020::REQ-0047: PCAC policy surface implementation and fail-closed
+//! defaults.
 //!
 //! Verifies:
 //! - `PcacPolicyKnobs` struct has all required fields (lifecycle, evidence

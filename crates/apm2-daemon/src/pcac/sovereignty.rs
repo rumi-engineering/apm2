@@ -66,9 +66,9 @@ pub struct SovereigntyState {
 impl SovereigntyState {
     /// Refreshes the sovereignty epoch snapshot.
     ///
-    /// TODO(RFC-0020::REQ-0046): Wire this through a runtime IPC/projection update path.
-    /// For now this stub exists so daemon construction sites can track the
-    /// missing liveness plumbing explicitly.
+    /// TODO(RFC-0020::REQ-0046): Wire this through a runtime IPC/projection
+    /// update path. For now this stub exists so daemon construction sites
+    /// can track the missing liveness plumbing explicitly.
     pub fn refresh_epoch(&mut self, next_epoch: SovereigntyEpoch) {
         self.epoch = Some(next_epoch);
     }

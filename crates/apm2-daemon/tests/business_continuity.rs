@@ -1,5 +1,5 @@
-//! RFC-0020::REQ-0036: Business continuity, formal gates, and federation stop/rotation
-//! governance.
+//! RFC-0020::REQ-0036: Business continuity, formal gates, and federation
+//! stop/rotation governance.
 //!
 //! Evidence artifacts:
 //! - EVID-0036

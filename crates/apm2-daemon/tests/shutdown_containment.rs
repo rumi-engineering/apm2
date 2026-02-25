@@ -1,7 +1,8 @@
 //! RFC-0032::REQ-0146 Shutdown Containment Tests
 //!
 //! These integration tests verify the cancellation-safe shutdown design
-//! introduced by the RFC-0032::REQ-0146 BLOCKER fix. The key invariant under test:
+//! introduced by the RFC-0032::REQ-0146 BLOCKER fix. The key invariant under
+//! test:
 //!
 //! > **No child process may survive daemon exit**, even if the graceful
 //! > shutdown deadline expires and a `ProcessRunner` handle is dropped

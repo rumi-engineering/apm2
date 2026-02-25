@@ -307,8 +307,8 @@ fn replay_from_checkpoint_converges_to_identical_projection() {
     let work_id = "W-REPLAY-001";
     let actor_id = "actor:replay";
 
-    // RFC-0032::REQ-0276: ChangeSetPublished must be observed BEFORE review-start and
-    // completion gates (CSID-004 fail-closed latest-changeset admission).
+    // RFC-0032::REQ-0276: ChangeSetPublished must be observed BEFORE review-start
+    // and completion gates (CSID-004 fail-closed latest-changeset admission).
     let events = vec![
         dotted_opened_event(work_id, actor_id, 2_000, 1),
         dotted_transition_event(work_id, actor_id, "OPEN", "CLAIMED", "claim", 0, 2_100, 2),

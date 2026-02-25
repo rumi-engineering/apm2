@@ -1,4 +1,5 @@
-//! RFC-0020::REQ-0037: Umbrella rollout validation for FAC launch over subagents.
+//! RFC-0020::REQ-0037: Umbrella rollout validation for FAC launch over
+//! subagents.
 //!
 //! Cross-slice integration coverage:
 //! - Launch admission lineage (role/context hash binding)

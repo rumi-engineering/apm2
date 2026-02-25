@@ -631,8 +631,8 @@ pub const MAX_TICKET_ALIAS_INDEX_RESOLVED_SPEC_HASHES: usize =
 /// real `TCK-*` alias-to-`work_id` mappings.
 ///
 /// Real alias bindings require the operator layer or policy resolver to
-/// supply the `ticket_alias` field. See `TODO(RFC-0020::REQ-0044)` for the planned
-/// follow-up to wire real aliases through policy resolution.
+/// supply the `ticket_alias` field. See `TODO(RFC-0020::REQ-0044)` for the
+/// planned follow-up to wire real aliases through policy resolution.
 pub trait AliasReconciliationGate: Send + Sync {
     /// Runs alias reconciliation against the current projection state and
     /// returns whether promotion is permitted (zero defects).
@@ -1367,8 +1367,8 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
     }
 
     /// Resolves a ticket alias to a canonical `work_id` using the in-memory
-    /// alias index maintained during projection refresh (RFC-0032::REQ-0264, RFC-0032
-    /// Phase 1).
+    /// alias index maintained during projection refresh (RFC-0032::REQ-0264,
+    /// RFC-0032 Phase 1).
     ///
     /// # Fail-closed semantics
     ///

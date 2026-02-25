@@ -866,7 +866,8 @@ pub const MAX_TERMINATED_SESSIONS: usize = 256;
 /// to prevent unbounded memory growth.
 pub const TERMINATED_SESSION_TTL_SECS: u64 = 300; // 5 minutes
 
-/// Known termination reasons for session end-of-life (RFC-0032::REQ-0139, MAJOR 1).
+/// Known termination reasons for session end-of-life (RFC-0032::REQ-0139, MAJOR
+/// 1).
 ///
 /// This enum provides a strict allowlist of termination reasons that may
 /// appear in the `termination_reason` field of `SessionStatusResponse`.
@@ -944,7 +945,8 @@ impl std::fmt::Display for TerminationReason {
     }
 }
 
-/// A terminated session entry preserved for TTL-based cleanup (RFC-0032::REQ-0139).
+/// A terminated session entry preserved for TTL-based cleanup
+/// (RFC-0032::REQ-0139).
 #[derive(Debug, Clone)]
 struct TerminatedEntry {
     /// The termination details.
@@ -967,7 +969,8 @@ struct RegistryState {
     by_id: HashMap<String, SessionState>,
     /// Session ID lookup by ephemeral handle.
     by_handle: HashMap<String, String>,
-    /// Terminated session entries preserved for TTL-based queries (RFC-0032::REQ-0139).
+    /// Terminated session entries preserved for TTL-based queries
+    /// (RFC-0032::REQ-0139).
     ///
     /// Keyed by session ID. Entries are cleaned up when their TTL expires.
     terminated: HashMap<String, TerminatedEntry>,
@@ -1585,8 +1588,8 @@ impl From<PersistableSessionState> for SessionState {
     }
 }
 
-/// Serializable representation of a terminated session entry (RFC-0032::REQ-0139 BLOCKER
-/// 2).
+/// Serializable representation of a terminated session entry
+/// (RFC-0032::REQ-0139 BLOCKER 2).
 ///
 /// This struct pairs a terminated session's state with its termination info
 /// and absolute wall-clock timestamps so that terminated entries survive daemon
@@ -1629,8 +1632,8 @@ struct PersistableTerminatedEntry {
 
 /// Serializable state file format for persistent session registry.
 ///
-/// Per RFC-0032::REQ-0082 and DD-005, the state file is JSON for human readability
-/// and debugging.
+/// Per RFC-0032::REQ-0082 and DD-005, the state file is JSON for human
+/// readability and debugging.
 ///
 /// # Security (SEC-001)
 ///
@@ -1646,8 +1649,8 @@ struct PersistentStateFile {
     version: u32,
     /// Active sessions persisted to disk (without credentials).
     sessions: Vec<PersistableSessionState>,
-    /// Terminated sessions preserved for TTL-based queries (RFC-0032::REQ-0139 BLOCKER
-    /// 2).
+    /// Terminated sessions preserved for TTL-based queries (RFC-0032::REQ-0139
+    /// BLOCKER 2).
     ///
     /// Defaults to empty for backward compatibility with v1 state files that
     /// lack this field.
@@ -1735,9 +1738,9 @@ pub enum PersistentRegistryError {
 
 /// Persistent session registry for crash recovery.
 ///
-/// Per RFC-0032::REQ-0082 and DD-005, this registry wraps [`InMemorySessionRegistry`]
-/// and persists session state to a JSON file using atomic writes
-/// (write-to-temp + rename).
+/// Per RFC-0032::REQ-0082 and DD-005, this registry wraps
+/// [`InMemorySessionRegistry`] and persists session state to a JSON file using
+/// atomic writes (write-to-temp + rename).
 ///
 /// # Atomic Writes
 ///
@@ -2716,8 +2719,9 @@ mod session_registry_tests {
         assert_eq!(registry.session_count(), 0);
     }
 
-    /// RFC-0032::REQ-0138 Security BLOCKER: Verify that `remove_session` is durable --
-    /// a removed session must NOT reappear after a save/reload cycle.
+    /// RFC-0032::REQ-0138 Security BLOCKER: Verify that `remove_session` is
+    /// durable -- a removed session must NOT reappear after a save/reload
+    /// cycle.
     #[test]
     fn test_durable_remove_session_persists_after_reload() {
         use tempfile::NamedTempFile;
@@ -2767,9 +2771,10 @@ mod session_registry_tests {
         }
     }
 
-    /// RFC-0032::REQ-0138 Quality BLOCKER: Verify that evicted sessions returned by
-    /// `register_session` contain full `SessionState` (not just IDs), enabling
-    /// transactional rollback to restore them on spawn failure.
+    /// RFC-0032::REQ-0138 Quality BLOCKER: Verify that evicted sessions
+    /// returned by `register_session` contain full `SessionState` (not just
+    /// IDs), enabling transactional rollback to restore them on spawn
+    /// failure.
     #[test]
     fn test_register_session_returns_full_evicted_state() {
         let registry = InMemorySessionRegistry::new();
@@ -3397,7 +3402,8 @@ mod tck_00267 {
     // AC1: Sessions receive `LEASE_REVOKED` within 5s
     // =========================================================================
 
-    /// RFC-0032::REQ-0083 AC1: ``LEASE_REVOKED`` signal is sent to recovered sessions.
+    /// RFC-0032::REQ-0083 AC1: ``LEASE_REVOKED`` signal is sent to recovered
+    /// sessions.
     #[test]
     fn lease_revoked_signal_sent_to_recovered_sessions() {
         let registry = InMemorySessionRegistry::new();
@@ -3523,8 +3529,8 @@ mod tck_00267 {
         }
     }
 
-    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` message has correct reason for daemon
-    /// restart.
+    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` message has correct reason for
+    /// daemon restart.
     #[test]
     fn lease_revoked_has_daemon_restart_reason() {
         let session = make_session("sess-1", "handle-1", "lease-1");
@@ -3545,8 +3551,8 @@ mod tck_00267 {
         assert_eq!(signal.message, Some("Daemon restarted".to_string()));
     }
 
-    /// RFC-0032::REQ-0083: `RecoveryResult` converts to `RecoverSessionsResponse`
-    /// correctly.
+    /// RFC-0032::REQ-0083: `RecoveryResult` converts to
+    /// `RecoverSessionsResponse` correctly.
     #[test]
     fn recovery_result_to_proto_response() {
         let result = RecoveryResult {
@@ -3674,7 +3680,8 @@ mod tck_00267 {
         assert_eq!(recovery_manager_short.timeout(), Duration::from_millis(100));
     }
 
-    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` reasons cover all revocation scenarios.
+    /// RFC-0032::REQ-0083: ``LEASE_REVOKED`` reasons cover all revocation
+    /// scenarios.
     #[test]
     fn lease_revoked_reason_variants() {
         // Verify all reason variants are defined

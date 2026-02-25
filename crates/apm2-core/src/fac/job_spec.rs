@@ -11,7 +11,8 @@
 //!   (RFC-0032::REQ-0229).
 //! - [INV-JS-007] Control-lane `stop_revoke` jobs MUST carry `repo_id ==
 //!   "internal/control"` ([`CONTROL_LANE_REPO_ID`]).  Arbitrary repo IDs are
-//!   rejected fail-closed to prevent audit-trail corruption (RFC-0032::REQ-0229).
+//!   rejected fail-closed to prevent audit-trail corruption
+//!   (RFC-0032::REQ-0229).
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -1093,7 +1094,8 @@ impl Default for JobSpecValidationPolicy {
     }
 }
 
-/// Validates a `FacJobSpecV1` with policy-driven constraints (RFC-0032::REQ-0229).
+/// Validates a `FacJobSpecV1` with policy-driven constraints
+/// (RFC-0032::REQ-0229).
 ///
 /// Performs all checks from [`validate_job_spec`] plus:
 /// 1. `repo_id` allowlist enforcement (if policy specifies one).

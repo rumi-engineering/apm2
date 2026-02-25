@@ -990,7 +990,8 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
         // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
         // the original UTF-8 string from the proto `hash` bytes (lossless).
         //
-        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of hex-encoding.
+        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of
+        // hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -1088,7 +1089,8 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
         // String. None maps to empty string; Some(TimeEnvelopeRef) recovers
         // the original UTF-8 string from the proto `hash` bytes (lossless).
         //
-        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of hex-encoding.
+        // RFC-0020::REQ-0051 FIX: Recover original UTF-8 string instead of
+        // hex-encoding.
         let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -3673,7 +3675,8 @@ pub mod tests {
         assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
         assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
         assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
-        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original string.
+        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original
+        // string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -3686,8 +3689,8 @@ pub mod tests {
         assert_eq!(recovered, freeze);
     }
 
-    /// RFC-0020::REQ-0051: Verify that freeze with htf:tick format survives proto
-    /// roundtrip and signature verification still passes.
+    /// RFC-0020::REQ-0051: Verify that freeze with htf:tick format survives
+    /// proto roundtrip and signature verification still passes.
     #[test]
     fn test_intervention_freeze_proto_roundtrip_htf_tick_signature() {
         use ed25519_dalek::Verifier;
@@ -3752,7 +3755,8 @@ pub mod tests {
         assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
         assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
         assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
-        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original string.
+        // RFC-0020::REQ-0051: proto hash field stores raw UTF-8 bytes of the original
+        // string.
         let proto_time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
@@ -3765,8 +3769,8 @@ pub mod tests {
         assert_eq!(recovered, unfreeze);
     }
 
-    /// RFC-0020::REQ-0051: Verify that unfreeze with htf:tick format survives proto
-    /// roundtrip and signature verification still passes.
+    /// RFC-0020::REQ-0051: Verify that unfreeze with htf:tick format survives
+    /// proto roundtrip and signature verification still passes.
     #[test]
     fn test_intervention_unfreeze_proto_roundtrip_htf_tick_signature() {
         use ed25519_dalek::Verifier;
@@ -4479,7 +4483,11 @@ pub mod tests {
         // Child scopes under the namespace should also be frozen (hierarchical)
         assert!(registry.is_frozen("myorg:ticket").is_some());
         assert!(registry.is_frozen("myorg:rfc").is_some());
-        assert!(registry.is_frozen("myorg:ticket:RFC-0032::REQ-0059").is_some());
+        assert!(
+            registry
+                .is_frozen("myorg:ticket:RFC-0032::REQ-0059")
+                .is_some()
+        );
 
         // Other namespaces should not be frozen
         assert!(registry.is_frozen("otherorg").is_none());

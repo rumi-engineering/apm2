@@ -659,7 +659,8 @@ mod tests {
             artifact_size: 100,
             metadata: vec!["key=value".to_string()],
             // HTF time envelope reference (RFC-0016): not yet populated.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
         };
 
@@ -876,7 +877,8 @@ mod tests {
         TOOL_DECIDED_DOMAIN_PREFIX, TOOL_EXECUTED_DOMAIN_PREFIX, WORK_CLAIMED_DOMAIN_PREFIX,
     };
 
-    /// RFC-0032::REQ-0080: Verify `ToolDecided` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `ToolDecided` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -914,7 +916,8 @@ mod tests {
         assert_eq!(&bytes1[..prefix_len], b"apm2.event.tool_decided:");
     }
 
-    /// RFC-0032::REQ-0080: Verify `ToolExecuted` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `ToolExecuted` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -950,7 +953,8 @@ mod tests {
         assert_eq!(&bytes1[..prefix_len], b"apm2.event.tool_executed:");
     }
 
-    /// RFC-0032::REQ-0080: Verify `SessionTerminated` canonical bytes are deterministic.
+    /// RFC-0032::REQ-0080: Verify `SessionTerminated` canonical bytes are
+    /// deterministic.
     ///
     /// Golden vector test: same input must produce same output across runs.
     #[test]
@@ -1085,7 +1089,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles `ToolEvent`.
+    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles
+    /// `ToolEvent`.
     #[test]
     fn tck_00264_kernel_event_canonicalize_tool_event() {
         use super::super::{ToolEvent, tool_event};
@@ -1114,7 +1119,8 @@ mod tests {
         assert!(event.payload.is_some());
     }
 
-    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles `SessionEvent`.
+    /// RFC-0032::REQ-0080: Verify `KernelEvent` canonicalize handles
+    /// `SessionEvent`.
     #[test]
     fn tck_00264_kernel_event_canonicalize_session_event() {
         use super::super::{SessionEvent, session_event};
@@ -1141,7 +1147,8 @@ mod tests {
         assert!(event.payload.is_some());
     }
 
-    /// RFC-0032::REQ-0080: Verify domain prefix constants match RFC-0017 specification.
+    /// RFC-0032::REQ-0080: Verify domain prefix constants match RFC-0017
+    /// specification.
     #[test]
     fn tck_00264_domain_prefix_constants_match_rfc() {
         // These values are specified in RFC-0017 DD-006
@@ -1223,7 +1230,8 @@ mod tests {
         assert_eq!(bytes, bytes2, "Golden vector must be stable across runs");
     }
 
-    /// RFC-0032::REQ-0080: Golden vector for `SessionTerminated` with known bytes.
+    /// RFC-0032::REQ-0080: Golden vector for `SessionTerminated` with known
+    /// bytes.
     #[test]
     fn tck_00264_session_terminated_golden_vector() {
         use super::SessionTerminated;

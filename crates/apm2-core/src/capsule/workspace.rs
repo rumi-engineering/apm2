@@ -19,8 +19,8 @@
 //! error variant for use by future runtime callers that perform filesystem
 //! I/O. Symlink-safe runtime path resolution (using `symlink_metadata()`
 //! calls per CTR-1503 and filesystem-level TOCTOU checks) is **deferred to
-//! RFC-0020::REQ-0029**. This module currently provides only lexical path validation;
-//! it does NOT perform runtime symlink detection.
+//! RFC-0020::REQ-0029**. This module currently provides only lexical path
+//! validation; it does NOT perform runtime symlink detection.
 //!
 //! # Example
 //!

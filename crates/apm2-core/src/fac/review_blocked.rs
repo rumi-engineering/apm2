@@ -38,7 +38,7 @@
 //!     "recorder-001".to_string(),
 //!     Some([0x55; 32]), // capability_manifest_hash (RFC-0032::REQ-0119, optional)
 //!     Some([0x66; 32]), // context_pack_hash (RFC-0032::REQ-0119, optional)
-//!     vec![0x77; 32],   // role_spec_hash (RFC-0032::REQ-0169, optional for backward compatibility)
+//!     vec![0x77; 32], // role_spec_hash (RFC-0032::REQ-0169, optional for backward compatibility)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -158,7 +158,8 @@ pub enum ReasonCode {
     /// the taint policy denies the flow. Per REQ-0016, taint tracking prevents
     /// untrusted content from silently influencing high-risk decisions.
     TaintFlowDenied,
-    /// Merge conflict detected during autonomous merge execution (RFC-0032::REQ-0144).
+    /// Merge conflict detected during autonomous merge execution
+    /// (RFC-0032::REQ-0144).
     ///
     /// This code is emitted when the merge executor attempts a squash merge
     /// via the GitHub API and the merge fails due to a merge conflict.
@@ -319,13 +320,14 @@ pub struct ReviewBlockedRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub recorder_signature: [u8; 64],
-    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, RFC-0032::REQ-0119).
-    /// Binds the blocked event to the authority under which the review was
-    /// attempted.
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes,
+    /// RFC-0032::REQ-0119). Binds the blocked event to the authority under
+    /// which the review was attempted.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
-    /// to preserve signature verification for historical events.
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in
+    /// `canonical_bytes()` to preserve signature verification for
+    /// historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
         default,
@@ -337,15 +339,17 @@ pub struct ReviewBlockedRecorded {
     /// configuration.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
-    /// to preserve signature verification for historical events.
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in
+    /// `canonical_bytes()` to preserve signature verification for
+    /// historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub context_pack_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the `RoleSpecV2` in effect (32 bytes, RFC-0032::REQ-0169).
+    /// BLAKE3 hash of the `RoleSpecV2` in effect (32 bytes,
+    /// RFC-0032::REQ-0169).
     ///
     /// This field defaults to empty for backward compatibility with events
     /// created before RFC-0032::REQ-0169.
@@ -489,7 +493,8 @@ impl ReviewBlockedRecorded {
     /// - `blocked_log_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `recorder_actor_id` (len + bytes)
-    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if
+    ///   present)
     /// - `context_pack_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
     /// - `role_spec_hash` (bytes, RFC-0032::REQ-0169)
     ///
@@ -497,7 +502,8 @@ impl ReviewBlockedRecorded {
     ///
     /// The `capability_manifest_hash` and `context_pack_hash` fields are only
     /// included in the canonical encoding when they are `Some`. This preserves
-    /// signature verification for historical events created before RFC-0032::REQ-0119.
+    /// signature verification for historical events created before
+    /// RFC-0032::REQ-0119.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -523,12 +529,14 @@ impl ReviewBlockedRecorded {
         bytes.extend_from_slice(&(self.recorder_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.recorder_actor_id.as_bytes());
 
-        // 7. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward compat)
+        // 7. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward
+        //    compat)
         if let Some(ref hash) = self.capability_manifest_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 8. context_pack_hash (RFC-0032::REQ-0119, only if present for backward compat)
+        // 8. context_pack_hash (RFC-0032::REQ-0119, only if present for backward
+        //    compat)
         if let Some(ref hash) = self.context_pack_hash {
             bytes.extend_from_slice(hash);
         }
@@ -896,9 +904,9 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-14 are valid (0 is UNSPECIFIED per protobuf, RFC-0032::REQ-0118 added 9,
-        // RFC-0032::REQ-0119 added 10-11, RFC-0032::REQ-0121 added 12, RFC-0032::REQ-0130 added 13,
-        // RFC-0032::REQ-0144 added 14)
+        // Values 1-14 are valid (0 is UNSPECIFIED per protobuf, RFC-0032::REQ-0118
+        // added 9, RFC-0032::REQ-0119 added 10-11, RFC-0032::REQ-0121 added 12,
+        // RFC-0032::REQ-0130 added 13, RFC-0032::REQ-0144 added 14)
         for code in 1..=14u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
@@ -947,7 +955,8 @@ mod tests {
         // AdapterMisconfigured is NOT retryable - requires operator intervention
         // (RFC-0032::REQ-0121)
         assert!(!ReasonCode::AdapterMisconfigured.is_retryable());
-        // TaintFlowDenied is NOT retryable - requires policy change (RFC-0032::REQ-0130)
+        // TaintFlowDenied is NOT retryable - requires policy change
+        // (RFC-0032::REQ-0130)
         assert!(!ReasonCode::TaintFlowDenied.is_retryable());
     }
 
@@ -1279,8 +1288,8 @@ mod tests {
             ReasonCode::ContextPackInvalid.to_string(),
             "CONTEXT_PACK_INVALID"
         );
-        // RFC-0032::REQ-0118 reserved code 9 for MissingViewCommitment, so ContextPack codes are
-        // 10-11
+        // RFC-0032::REQ-0118 reserved code 9 for MissingViewCommitment, so ContextPack
+        // codes are 10-11
         assert_eq!(ReasonCode::ContextPackMissing.to_code(), 10);
         assert_eq!(ReasonCode::ContextPackInvalid.to_code(), 11);
         // Context pack errors are not retryable
@@ -1321,8 +1330,8 @@ mod tests {
 
     #[test]
     fn test_authority_binding_fields_in_signature() {
-        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and context_pack_hash
-        // are included in the signature
+        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and
+        // context_pack_hash are included in the signature
         let signer = Signer::generate();
         let event1 = ReviewBlockedRecorded::create(
             "blocked-001".to_string(),

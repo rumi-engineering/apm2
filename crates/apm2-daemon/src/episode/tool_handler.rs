@@ -1,8 +1,8 @@
 //! Tool handler trait and types for tool execution.
 //!
 //! This module defines the `ToolHandler` trait that tool implementations must
-//! satisfy per RFC-0033::REQ-0032. Handlers validate arguments, execute operations,
-//! and report resource consumption.
+//! satisfy per RFC-0033::REQ-0032. Handlers validate arguments, execute
+//! operations, and report resource consumption.
 //!
 //! # Architecture
 //!
@@ -74,13 +74,15 @@ pub const GIT_STATUS_MAX_BYTES: usize = 16 * 1024; // 16 KiB
 /// Maximum output lines for `git status` (500 per REQ-HEF-0010).
 pub const GIT_STATUS_MAX_LINES: usize = 500;
 
-/// Maximum output bytes for `ListFiles`/`Search` operations (RFC-0032::REQ-0109).
+/// Maximum output bytes for `ListFiles`/`Search` operations
+/// (RFC-0032::REQ-0109).
 ///
 /// Per RFC-0018 HEF requirements, navigation tool outputs are strictly bounded
 /// to prevent denial-of-service and ensure predictable resource consumption.
 pub const NAVIGATION_OUTPUT_MAX_BYTES: usize = 65_536; // 64 KiB
 
-/// Maximum output lines for `ListFiles`/`Search` operations (RFC-0032::REQ-0109).
+/// Maximum output lines for `ListFiles`/`Search` operations
+/// (RFC-0032::REQ-0109).
 pub const NAVIGATION_OUTPUT_MAX_LINES: usize = 2000;
 
 /// Maximum entries for `ListFiles` operations (RFC-0032::REQ-0109).

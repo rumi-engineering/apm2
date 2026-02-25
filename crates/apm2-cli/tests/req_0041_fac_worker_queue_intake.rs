@@ -1068,7 +1068,8 @@ fn test_gate_receipt_construction() {
     assert_eq!(receipt.executor_actor_id, "fac-worker");
     assert!(receipt.passed, "receipt should pass");
 
-    // RFC-0032::REQ-0223: Verify sandbox_hardening_hash is bound in the GateReceipt.
+    // RFC-0032::REQ-0223: Verify sandbox_hardening_hash is bound in the
+    // GateReceipt.
     assert_eq!(
         receipt.sandbox_hardening_hash.as_deref(),
         Some(sbx_hash),

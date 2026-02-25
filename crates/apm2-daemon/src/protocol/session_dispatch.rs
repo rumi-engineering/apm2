@@ -1,5 +1,5 @@
-//! Session-scoped endpoint dispatcher for RFC-0017 IPC (RFC-0032::REQ-0068, RFC-0032::REQ-0076,
-//! RFC-0032::REQ-0092).
+//! Session-scoped endpoint dispatcher for RFC-0017 IPC (RFC-0032::REQ-0068,
+//! RFC-0032::REQ-0076, RFC-0032::REQ-0092).
 //!
 //! This module implements the session-scoped endpoint dispatcher per DD-001 and
 //! RFC-0017. Session endpoints (RequestTool, EmitEvent, PublishEvidence,
@@ -35,9 +35,12 @@
 //! - [INV-SESS-003] Operator connections blocked from session handlers
 //! - [INV-SESS-004] Token validation uses constant-time HMAC comparison
 //!   (CTR-WH001)
-//! - [INV-RFC-0032::REQ-0076-001] Tool requests validated against capability manifest
-//! - [INV-RFC-0032::REQ-0076-002] Empty tool_allowlist denies all tools (fail-closed)
-//! - [INV-RFC-0032::REQ-0092-001] RequestTool requires manifest store (fail-closed)
+//! - [INV-RFC-0032::REQ-0076-001] Tool requests validated against capability
+//!   manifest
+//! - [INV-RFC-0032::REQ-0076-002] Empty tool_allowlist denies all tools
+//!   (fail-closed)
+//! - [INV-RFC-0032::REQ-0092-001] RequestTool requires manifest store
+//!   (fail-closed)
 //! - [INV-RFC-0032::REQ-0092-002] EmitEvent requires ledger (fail-closed)
 //! - [INV-RFC-0032::REQ-0092-003] PublishEvidence requires CAS (fail-closed)
 //! - [INV-RFC-0032::REQ-0092-004] StreamTelemetry disabled until implemented
@@ -610,8 +613,8 @@ fn sanitize_error_message(msg: &str) -> String {
 
 /// Trait for looking up capability manifests by session ID.
 ///
-/// Per RFC-0032::REQ-0076, the dispatcher needs to validate tool requests against
-/// the session's capability manifest. This trait abstracts the manifest
+/// Per RFC-0032::REQ-0076, the dispatcher needs to validate tool requests
+/// against the session's capability manifest. This trait abstracts the manifest
 /// storage to allow different implementations (in-memory, persistent, etc.).
 pub trait ManifestStore: Send + Sync {
     /// Retrieves the capability manifest for a session.
@@ -700,8 +703,8 @@ impl ManifestStore for InMemoryManifestStore {
 
 /// Thread-safe store for V1 capability manifests keyed by session ID.
 ///
-/// Per RFC-0020::REQ-0006 Security Review MAJOR 2, V1 manifests must be wired into
-/// the production actuation path. This store is shared between the
+/// Per RFC-0020::REQ-0006 Security Review MAJOR 2, V1 manifests must be wired
+/// into the production actuation path. This store is shared between the
 /// `PrivilegedDispatcher` (which mints and registers V1 manifests during
 /// `SpawnEpisode`) and the `SessionDispatcher` (which enforces V1 scope
 /// checks during `RequestTool`).
@@ -800,7 +803,8 @@ const fn is_zero_hash(value: &Hash) -> bool {
 /// quarantine budget and starving other sessions.
 const PER_SESSION_QUARANTINE_QUOTA: usize = MAX_QUARANTINED_BOUNDARY_CHANNELS / 8;
 
-/// RFC-0020::REQ-0055: Violation severity for priority-aware quarantine eviction.
+/// RFC-0020::REQ-0055: Violation severity for priority-aware quarantine
+/// eviction.
 ///
 /// Active unexpired quarantines with severity >= incoming entry's severity are
 /// never evicted. Only expired entries and lower-severity entries are
@@ -875,8 +879,8 @@ impl QuarantinedBoundaryChannel {
     }
 }
 
-/// RFC-0020::REQ-0055: Error returned when quarantine insertion is not possible due to
-/// saturation with no evictable entries.
+/// RFC-0020::REQ-0055: Error returned when quarantine insertion is not possible
+/// due to saturation with no evictable entries.
 ///
 /// Callers MUST deny the request when this error is returned (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -960,7 +964,8 @@ impl BoundaryChannelQuarantineState {
         removed_keys.len()
     }
 
-    /// RFC-0020::REQ-0055: Count of quarantine entries belonging to a specific session.
+    /// RFC-0020::REQ-0055: Count of quarantine entries belonging to a specific
+    /// session.
     fn session_entry_count(&self, session_id: &str) -> usize {
         self.channels
             .values()
@@ -968,8 +973,9 @@ impl BoundaryChannelQuarantineState {
             .count()
     }
 
-    /// RFC-0020::REQ-0055: Priority-aware quarantine insertion with saturation-safe
-    /// fail-closed semantics and per-session quota isolation.
+    /// RFC-0020::REQ-0055: Priority-aware quarantine insertion with
+    /// saturation-safe fail-closed semantics and per-session quota
+    /// isolation.
     ///
     /// # Eviction Strategy
     ///
@@ -1178,7 +1184,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
     /// `ToolResult` or Deny"
     broker: Option<SharedToolBroker<StubManifestLoader>>,
-    /// Per-session broker registry for capability/policy isolation (RFC-0032::REQ-0153).
+    /// Per-session broker registry for capability/policy isolation
+    /// (RFC-0032::REQ-0153).
     ///
     /// When configured, `RequestTool` resolves the broker by `session_id`.
     /// Missing session brokers are denied fail-closed.
@@ -1202,19 +1209,19 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     subscription_registry: Option<super::resource_governance::SharedSubscriptionRegistry>,
     /// Episode runtime for tool execution (RFC-0032::REQ-0110).
     ///
-    /// Per RFC-0032::REQ-0110, this is required to execute tools kernel-side and return
-    /// durable result references.
+    /// Per RFC-0032::REQ-0110, this is required to execute tools kernel-side
+    /// and return durable result references.
     episode_runtime: Option<Arc<EpisodeRuntime>>,
     /// Session registry for session status queries (RFC-0032::REQ-0134).
     ///
-    /// Per RFC-0032::REQ-0134, the session registry is used to look up session state
-    /// for `SessionStatus` queries.
+    /// Per RFC-0032::REQ-0134, the session registry is used to look up session
+    /// state for `SessionStatus` queries.
     session_registry: Option<Arc<dyn crate::session::SessionRegistry>>,
     /// Session telemetry store for tracking tool calls, events emitted,
     /// and session start time (RFC-0032::REQ-0138).
     ///
-    /// Per RFC-0032::REQ-0138, this store tracks per-session counters using atomic
-    /// operations. It is separate from the session registry because
+    /// Per RFC-0032::REQ-0138, this store tracks per-session counters using
+    /// atomic operations. It is separate from the session registry because
     /// `SessionState` must remain `Clone + Serialize + Deserialize`.
     telemetry_store: Option<Arc<crate::session::SessionTelemetryStore>>,
     /// Gate orchestrator for autonomous gate lifecycle (RFC-0032::REQ-0142).
@@ -1240,13 +1247,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
     /// Per-session stop conditions store (RFC-0020::REQ-0005 v3).
     ///
-    /// RFC-0020::REQ-0005 BLOCKER 1 v3 FIX: The pre-actuation gate was called with
-    /// `StopConditions::default()` and `current_episode_count=0`, meaning
-    /// `max_episodes` and `escalation_predicate` were never actually
-    /// checked.  This store holds real stop conditions per session, loaded
-    /// from the episode envelope at session spawn time.  The gate reads
-    /// from this store and passes real `current_episode_count` from the
-    /// session telemetry.
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3 FIX: The pre-actuation gate was called
+    /// with `StopConditions::default()` and `current_episode_count=0`,
+    /// meaning `max_episodes` and `escalation_predicate` were never
+    /// actually checked.  This store holds real stop conditions per
+    /// session, loaded from the episode envelope at session spawn time.
+    /// The gate reads from this store and passes real
+    /// `current_episode_count` from the session telemetry.
     stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
     /// Shared V1 manifest store for broker scope enforcement
     /// (RFC-0020::REQ-0006 Security Review MAJOR 2).
@@ -1260,7 +1267,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
     /// so that `SpawnEpisode` can mint and register V1 manifests.
     v1_manifest_store: Option<SharedV1ManifestStore>,
-    /// PCAC lifecycle gate for authority lifecycle enforcement (RFC-0020::REQ-0042).
+    /// PCAC lifecycle gate for authority lifecycle enforcement
+    /// (RFC-0020::REQ-0042).
     ///
     /// When set, every `RequestTool` invocation must pass through the
     /// lifecycle:
@@ -1270,7 +1278,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// In authoritative mode (`ledger` or `cas` configured), this gate is
     /// mandatory and missing wiring causes deny (fail-closed).
     pcac_lifecycle_gate: Option<Arc<crate::pcac::LifecycleGate>>,
-    /// Sovereignty state for Tier2+ authority composition checks (RFC-0020::REQ-0046).
+    /// Sovereignty state for Tier2+ authority composition checks
+    /// (RFC-0020::REQ-0046).
     ///
     /// When present and the lifecycle gate is configured with sovereignty
     /// checking, Tier2+ revalidation/consume stages enforce sovereignty epoch,
@@ -1278,8 +1287,8 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     sovereignty_state: Option<Arc<crate::pcac::SovereigntyState>>,
     /// Runtime taint policy for ingress checks on tool request arguments.
     ///
-    /// RFC-0020::REQ-0030: Production ingress paths must evaluate taint flow and deny
-    /// forbidden flows before actuation.
+    /// RFC-0020::REQ-0030: Production ingress paths must evaluate taint flow
+    /// and deny forbidden flows before actuation.
     taint_policy: Arc<TaintPolicy>,
     /// Policy switch for strict boundary witness enforcement.
     ///
@@ -1456,8 +1465,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
     ///
     /// **Note**: This creates a dispatcher without backing stores. Per
-    /// RFC-0032::REQ-0092, handlers will return fail-closed errors when their stores
-    /// are unavailable:
+    /// RFC-0032::REQ-0092, handlers will return fail-closed errors when their
+    /// stores are unavailable:
     /// - `RequestTool`: Returns `TOOL_NOT_ALLOWED` (no broker)
     /// - `EmitEvent`: Returns `SESSION_ERROR_INTERNAL` (no ledger)
     /// - `PublishEvidence`: Returns `SESSION_ERROR_INTERNAL` (no CAS)
@@ -1539,8 +1548,8 @@ impl SessionDispatcher<InMemoryManifestStore> {
 impl<M: ManifestStore> SessionDispatcher<M> {
     /// Creates a dispatcher with a manifest store for capability validation.
     ///
-    /// Per RFC-0032::REQ-0076, the manifest store is used to look up session capability
-    /// manifests for tool request validation.
+    /// Per RFC-0032::REQ-0076, the manifest store is used to look up session
+    /// capability manifests for tool request validation.
     #[must_use]
     pub fn with_manifest_store(token_minter: TokenMinter, manifest_store: Arc<M>) -> Self {
         Self {
@@ -1768,7 +1777,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the session registry for session status queries (RFC-0032::REQ-0134).
+    /// Sets the session registry for session status queries
+    /// (RFC-0032::REQ-0134).
     #[must_use]
     pub fn with_session_registry(
         mut self,
@@ -1789,7 +1799,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the gate orchestrator for autonomous gate lifecycle (RFC-0032::REQ-0142).
+    /// Sets the gate orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// When set, session termination via `ToolDecision::Terminate` triggers
     /// gate orchestration. Events from the orchestrator are persisted to
@@ -1870,10 +1881,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the shared V1 manifest store for RFC-0020::REQ-0006 scope enforcement.
+    /// Sets the shared V1 manifest store for RFC-0020::REQ-0006 scope
+    /// enforcement.
     ///
-    /// Per RFC-0020::REQ-0006 Security Review MAJOR 2, this store is shared with
-    /// `PrivilegedDispatcher` so that V1 manifests minted during
+    /// Per RFC-0020::REQ-0006 Security Review MAJOR 2, this store is shared
+    /// with `PrivilegedDispatcher` so that V1 manifests minted during
     /// `SpawnEpisode` are visible for scope enforcement in
     /// `handle_request_tool`.
     #[must_use]
@@ -1882,7 +1894,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    /// Sets the PCAC lifecycle gate for authority enforcement (RFC-0020::REQ-0042).
+    /// Sets the PCAC lifecycle gate for authority enforcement
+    /// (RFC-0020::REQ-0042).
     ///
     /// When set, every `RequestTool` invocation must pass through the
     /// split lifecycle:
@@ -2032,9 +2045,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
-            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
-            // JSON artifact, not a raw string or placeholder.
+            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in
+            // CAS. Per the DefectRecorded protocol, cas_hash must point to a
+            // full DefectRecord JSON artifact, not a raw string or placeholder.
             let defect_record = match DefectRecord::clock_regression(
                 &defect_id,
                 "system",
@@ -2118,9 +2131,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_bytes()
                 .to_vec();
 
-            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
-            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
-            // JSON artifact, not a raw description string.
+            // RFC-0032::REQ-0103 BLOCKER 1 FIX: Create structured DefectRecord and store in
+            // CAS. Per the DefectRecorded protocol, cas_hash must point to a
+            // full DefectRecord JSON artifact, not a raw description string.
             //
             // Note: DefectRecord::pack_miss requires a pack_hash, but for context misses
             // detected during session dispatch, we may not have the pack hash available.
@@ -6472,9 +6485,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # Performance
     ///
-    /// Per RFC-0032::REQ-0076 acceptance criteria, validation overhead must be <5ms p50.
-    /// The validation is O(n) where n = `tool_allowlist` length (bounded by
-    /// `MAX_TOOL_ALLOWLIST` = 100).
+    /// Per RFC-0032::REQ-0076 acceptance criteria, validation overhead must be
+    /// <5ms p50. The validation is O(n) where n = `tool_allowlist` length
+    /// (bounded by `MAX_TOOL_ALLOWLIST` = 100).
     ///
     /// # RFC-0032::REQ-0092: `ToolBroker` Integration
     ///
@@ -8111,8 +8124,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
         // Build BrokerToolRequest
 
-        // BLOCKER 1 FIX (RFC-0032::REQ-0092): Fail-closed if session ID is not valid for
-        // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
+        // BLOCKER 1 FIX (RFC-0032::REQ-0092): Fail-closed if session ID is not valid
+        // for EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
         // fallback that could cause cross-session ID collision. Return
         // SESSION_ERROR_INVALID instead.
         let episode_id = match EpisodeId::new(&token.session_id) {
@@ -11315,8 +11328,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Persist `AdmissionBundleV1` evidence to the ledger BEFORE the
-    /// session-endpoint effect (RFC-0032::REQ-0173, same pattern as RFC-0032::REQ-0172
-    /// `ToolActuation`).
+    /// session-endpoint effect (RFC-0032::REQ-0173, same pattern as
+    /// RFC-0032::REQ-0172 `ToolActuation`).
     ///
     /// Fail-closed: serialization or persistence failure denies the request.
     #[allow(clippy::result_large_err)]
@@ -11503,10 +11516,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # RFC-0032::REQ-0092: Real Ledger Persistence
     ///
-    /// Per RFC-0032::REQ-0092, this handler persists events to the ledger. Events are
-    /// signed and stored with HTF-compliant timestamps. The handler requires
-    /// a ledger to be configured; without it, returns `SESSION_ERROR_INTERNAL`
-    /// (fail-closed).
+    /// Per RFC-0032::REQ-0092, this handler persists events to the ledger.
+    /// Events are signed and stored with HTF-compliant timestamps. The
+    /// handler requires a ledger to be configured; without it, returns
+    /// `SESSION_ERROR_INTERNAL` (fail-closed).
     ///
     /// # RFC-0032::REQ-0173: `AdmissionKernel` Cutover
     ///
@@ -11598,7 +11611,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // INV-RFC-0032::REQ-0092-002: Require ledger for event persistence (fail-closed)
+        // INV-RFC-0032::REQ-0092-002: Require ledger for event persistence
+        // (fail-closed)
         let Some(ref ledger) = self.ledger else {
             error!(
                 session_id = %token.session_id,
@@ -11856,10 +11870,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # RFC-0032::REQ-0092: Real CAS Storage
     ///
-    /// Per RFC-0032::REQ-0092, this handler stores evidence artifacts in the durable
-    /// content-addressed store. Artifacts are stored with BLAKE3 content
-    /// addressing and verified on retrieval. The handler requires a CAS to be
-    /// configured; without it, returns `SESSION_ERROR_INTERNAL` (fail-closed).
+    /// Per RFC-0032::REQ-0092, this handler stores evidence artifacts in the
+    /// durable content-addressed store. Artifacts are stored with BLAKE3
+    /// content addressing and verified on retrieval. The handler requires a
+    /// CAS to be configured; without it, returns `SESSION_ERROR_INTERNAL`
+    /// (fail-closed).
     ///
     /// # RFC-0032::REQ-0173: `AdmissionKernel` Cutover
     ///
@@ -12211,9 +12226,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     ///
     /// # RFC-0032::REQ-0092: Fail-Closed (Not Implemented)
     ///
-    /// Per RFC-0032::REQ-0092 and SEC-CTRL-FAC-0015, `StreamTelemetry` is explicitly
-    /// disabled until a proper implementation is available. This handler
-    /// returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
+    /// Per RFC-0032::REQ-0092 and SEC-CTRL-FAC-0015, `StreamTelemetry` is
+    /// explicitly disabled until a proper implementation is available. This
+    /// handler returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
     ///
     /// # Security (INV-RFC-0032::REQ-0092-004)
     ///
@@ -12251,9 +12266,10 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "StreamTelemetry request rejected: not implemented (fail-closed)"
         );
 
-        // INV-RFC-0032::REQ-0092-004: StreamTelemetry disabled until implemented (fail-closed)
-        // Per SEC-CTRL-FAC-0015, we do not return stub responses for unimplemented
-        // functionality. Instead, we return a clear NOT_IMPLEMENTED error.
+        // INV-RFC-0032::REQ-0092-004: StreamTelemetry disabled until implemented
+        // (fail-closed) Per SEC-CTRL-FAC-0015, we do not return stub responses
+        // for unimplemented functionality. Instead, we return a clear
+        // NOT_IMPLEMENTED error.
         Ok(SessionResponse::error(
             SessionErrorCode::SessionErrorNotImplemented,
             "StreamTelemetry not implemented (fail-closed)",
@@ -12512,8 +12528,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// # Note: Subscription Registry
     ///
     /// This handler validates ACLs and returns accepted patterns, but actual
-    /// subscription registration and pulse delivery are handled by RFC-0032::REQ-0099
-    /// (resource governance) and RFC-0032::REQ-0100 (outbox + publisher).
+    /// subscription registration and pulse delivery are handled by
+    /// RFC-0032::REQ-0099 (resource governance) and RFC-0032::REQ-0100
+    /// (outbox + publisher).
     fn handle_subscribe_pulse(
         &self,
         payload: &[u8],
@@ -12618,8 +12635,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // unregister_connection with this ID when the connection closes.
         let connection_id = ctx.connection_id();
 
-        // RFC-0032::REQ-0099: Wire resource governance - register connection if not exists
-        // and add subscription with limit checks (only if registry is configured)
+        // RFC-0032::REQ-0099: Wire resource governance - register connection if not
+        // exists and add subscription with limit checks (only if registry is
+        // configured)
         if let Some(ref registry) = self.subscription_registry {
             if !accepted_patterns.is_empty() {
                 // Parse accepted patterns into TopicPattern
@@ -12809,8 +12827,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // RFC-0032::REQ-0099: Wire resource governance - remove subscription from registry
-        // Use connection_id from context for consistent tracking
+        // RFC-0032::REQ-0099: Wire resource governance - remove subscription from
+        // registry Use connection_id from context for consistent tracking
         let connection_id = ctx.connection_id();
 
         let removed = if let Some(ref registry) = self.subscription_registry {
@@ -12898,7 +12916,8 @@ pub fn encode_stream_logs_request(request: &StreamLogsRequest) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Encodes a `SubscribePulse` request to bytes for sending (RFC-0032::REQ-0098).
+/// Encodes a `SubscribePulse` request to bytes for sending
+/// (RFC-0032::REQ-0098).
 #[must_use]
 pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::SubscribePulse.tag()];
@@ -12906,7 +12925,8 @@ pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes 
     Bytes::from(buf)
 }
 
-/// Encodes an `UnsubscribePulse` request to bytes for sending (RFC-0032::REQ-0098).
+/// Encodes an `UnsubscribePulse` request to bytes for sending
+/// (RFC-0032::REQ-0098).
 #[must_use]
 pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::UnsubscribePulse.tag()];
@@ -14210,11 +14230,11 @@ mod tests {
     mod session_routing {
         use super::*;
 
-        /// RFC-0032::REQ-0092: `RequestTool` without manifest store returns fail-closed
-        /// error.
+        /// RFC-0032::REQ-0092: `RequestTool` without manifest store returns
+        /// fail-closed error.
         ///
-        /// Per INV-RFC-0032::REQ-0092-001, `RequestTool` requires a manifest store.
-        /// Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
+        /// Per INV-RFC-0032::REQ-0092-001, `RequestTool` requires a manifest
+        /// store. Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
         #[test]
         fn test_request_tool_routing_fail_closed() {
             let minter = test_minter();
@@ -14249,7 +14269,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0092: `EmitEvent` without ledger returns fail-closed error.
+        /// RFC-0032::REQ-0092: `EmitEvent` without ledger returns fail-closed
+        /// error.
         ///
         /// Per INV-RFC-0032::REQ-0092-002, `EmitEvent` requires a ledger.
         /// Without it, returns `SESSION_ERROR_INTERNAL`.
@@ -14286,7 +14307,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0092: `PublishEvidence` without CAS returns fail-closed error.
+        /// RFC-0032::REQ-0092: `PublishEvidence` without CAS returns
+        /// fail-closed error.
         ///
         /// Per INV-RFC-0032::REQ-0092-003, `PublishEvidence` requires a CAS.
         /// Without it, returns `SESSION_ERROR_INTERNAL`.
@@ -14635,8 +14657,8 @@ mod tests {
         }
     }
 
-    /// RFC-0032::REQ-0092: `StreamTelemetry` returns `NOT_IMPLEMENTED` even with missing
-    /// frame.
+    /// RFC-0032::REQ-0092: `StreamTelemetry` returns `NOT_IMPLEMENTED` even
+    /// with missing frame.
     ///
     /// Since `StreamTelemetry` is disabled (fail-closed), it doesn't validate
     /// the frame before rejecting with `NOT_IMPLEMENTED`.
@@ -14656,8 +14678,8 @@ mod tests {
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
         match response {
             SessionResponse::Error(err) => {
-                // Per RFC-0032::REQ-0092, StreamTelemetry is disabled, so returns NOT_IMPLEMENTED
-                // regardless of frame validation
+                // Per RFC-0032::REQ-0092, StreamTelemetry is disabled, so returns
+                // NOT_IMPLEMENTED regardless of frame validation
                 assert_eq!(
                     err.code,
                     SessionErrorCode::SessionErrorNotImplemented as i32,
@@ -17988,8 +18010,9 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0055: When all entries are unexpired and have the same severity as
-    /// the incoming entry, insertion must return `Err(Saturated)`.
+    /// RFC-0020::REQ-0055: When all entries are unexpired and have the same
+    /// severity as the incoming entry, insertion must return
+    /// `Err(Saturated)`.
     #[test]
     fn test_boundary_channel_quarantine_rejects_zero_timestamp() {
         let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(test_minter());
@@ -19081,7 +19104,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0098: Invalid patterns are rejected with `INVALID_PATTERN`.
+        /// RFC-0032::REQ-0098: Invalid patterns are rejected with
+        /// `INVALID_PATTERN`.
         #[test]
         fn test_invalid_pattern_rejected() {
             let minter = test_minter();
@@ -19307,7 +19331,8 @@ mod tests {
             assert!(encoded.len() > 1);
         }
 
-        /// RFC-0032::REQ-0098: Unsubscribe response encoding includes correct tag.
+        /// RFC-0032::REQ-0098: Unsubscribe response encoding includes correct
+        /// tag.
         #[test]
         fn test_unsubscribe_response_encoding() {
             let response =
@@ -19339,15 +19364,16 @@ mod tests {
         use crate::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
         use crate::session::{SessionRegistry, SessionState};
 
-        /// RFC-0032::REQ-0110: Verify fail-closed behavior when broker is configured but
-        /// holonic clock is missing.
+        /// RFC-0032::REQ-0110: Verify fail-closed behavior when broker is
+        /// configured but holonic clock is missing.
         ///
         /// Per SEC-CTRL-FAC-0015, the dispatcher must fail-closed when required
         /// infrastructure (clock, runtime) is missing. This test verifies the
         /// clock check happens before broker request.
         ///
-        /// RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Broker now requires a gate; this test
-        /// wires a default gate so the clock check is the first failure point.
+        /// RFC-0020::REQ-0005 BLOCKER 2 v2 FIX: Broker now requires a gate;
+        /// this test wires a default gate so the clock check is the
+        /// first failure point.
         #[test]
         fn test_request_tool_fails_closed_without_clock() {
             use crate::episode::preactuation::{PreActuationGate, StopAuthority};
@@ -20860,7 +20886,8 @@ mod tests {
             );
         }
 
-        /// RFC-0032::REQ-0128: Verify fail-closed behavior when no broker is configured.
+        /// RFC-0032::REQ-0128: Verify fail-closed behavior when no broker is
+        /// configured.
         ///
         /// When no broker is configured, the dispatcher returns a fail-closed
         /// error rather than falling back to legacy manifest validation.
@@ -21236,7 +21263,8 @@ mod tests {
                 let ledger = Arc::new(StubLedgerEventEmitter::new());
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> = ledger.clone();
 
-                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let (sovereignty_checker, sovereignty_state) =
@@ -21469,7 +21497,8 @@ mod tests {
                 let ledger_dyn: Arc<dyn LedgerEventEmitter> =
                     Arc::new(StubLedgerEventEmitter::new());
 
-                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let (sovereignty_checker, sovereignty_state) =
@@ -21701,8 +21730,8 @@ mod tests {
     // RFC-0032::REQ-0128: Broker Mediation Regression Tests
     // ========================================================================
 
-    /// RFC-0032::REQ-0128: Regression tests ensuring no tool executes without broker
-    /// mediation.
+    /// RFC-0032::REQ-0128: Regression tests ensuring no tool executes without
+    /// broker mediation.
     ///
     /// These tests verify that:
     /// 1. All tool requests go through the broker (fail-closed without it)
@@ -21711,7 +21740,8 @@ mod tests {
     mod tck_00336_broker_mediation_regression {
         use super::*;
 
-        /// RFC-0032::REQ-0128: Verify that ALL tool classes fail closed without broker.
+        /// RFC-0032::REQ-0128: Verify that ALL tool classes fail closed without
+        /// broker.
         ///
         /// This test ensures that no tool class has a special bypass path.
         #[test]
@@ -21779,7 +21809,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0128: Verify fail-closed behavior with no manifest store.
+        /// RFC-0032::REQ-0128: Verify fail-closed behavior with no manifest
+        /// store.
         ///
         /// When neither broker nor manifest store is configured, tool requests
         /// must still fail closed.
@@ -21816,8 +21847,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0128: Verify that manifest-only validation doesn't allow
-        /// execution.
+        /// RFC-0032::REQ-0128: Verify that manifest-only validation doesn't
+        /// allow execution.
         ///
         /// Even if a tool is in the manifest's allowlist, without a broker
         /// the request MUST be denied (no legacy manifest-based allow path).
@@ -22501,7 +22532,8 @@ mod tests {
                         None,
                     ),
                 );
-                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode (fail-closed).
+                // RFC-0020::REQ-0045: Wire PCAC gate — required in authoritative mode
+                // (fail-closed).
                 let pcac_kernel: Arc<dyn apm2_core::pcac::AuthorityJoinKernel> =
                     Arc::new(crate::pcac::InProcessKernel::new(1));
                 let pcac_gate = Arc::new(crate::pcac::LifecycleGate::new(pcac_kernel));
@@ -23264,7 +23296,8 @@ mod tests {
     }
 
     // ========================================================================
-    // RFC-0032::REQ-0149 Security BLOCKER 1: Post-termination revocation enforcement
+    // RFC-0032::REQ-0149 Security BLOCKER 1: Post-termination revocation
+    // enforcement
     // ========================================================================
 
     /// Regression tests proving `EmitEvent` and `PublishEvidence` are denied
@@ -23354,8 +23387,8 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0149 Security BLOCKER 1: `PublishEvidence` is denied after
-        /// `EndSession`.
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `PublishEvidence` is denied
+        /// after `EndSession`.
         ///
         /// A retained HMAC token must not be able to write artifacts to
         /// CAS after the session has been terminated.
@@ -23394,8 +23427,9 @@ mod tests {
             }
         }
 
-        /// RFC-0032::REQ-0149 Security BLOCKER 1: `SessionStatus` is still allowed after
-        /// `EndSession` (the only post-termination endpoint).
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `SessionStatus` is still
+        /// allowed after `EndSession` (the only post-termination
+        /// endpoint).
         ///
         /// This confirms the positive case: `SessionStatus` should still work
         /// for terminated sessions to allow agents to query final state.
@@ -23424,8 +23458,8 @@ mod tests {
             );
         }
 
-        /// RFC-0032::REQ-0149 Security BLOCKER 1: `EmitEvent` succeeds while session is
-        /// still active (positive test / no regression).
+        /// RFC-0032::REQ-0149 Security BLOCKER 1: `EmitEvent` succeeds while
+        /// session is still active (positive test / no regression).
         #[test]
         fn emit_event_succeeds_while_session_active() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -23797,8 +23831,8 @@ mod tests {
             }
         }
 
-        /// RFC-0020::REQ-0006 BLOCKER 1 v3: Authority confusion attack via userinfo
-        /// in URL. A URL like `https://trusted.com:443@evil.com/steal` must
+        /// RFC-0020::REQ-0006 BLOCKER 1 v3: Authority confusion attack via
+        /// userinfo in URL. A URL like `https://trusted.com:443@evil.com/steal` must
         /// be rejected because the actual network destination is `evil.com`,
         /// not `trusted.com`. The `url` crate correctly parses the authority
         /// and we deny any URL containing userinfo.
@@ -23855,9 +23889,9 @@ mod tests {
             }
         }
 
-        /// RFC-0020::REQ-0006 BLOCKER 1 v3: URL with username-only userinfo must
-        /// also be rejected. Even without a password, the presence of
-        /// userinfo indicates potential authority confusion.
+        /// RFC-0020::REQ-0006 BLOCKER 1 v3: URL with username-only userinfo
+        /// must also be rejected. Even without a password, the presence
+        /// of userinfo indicates potential authority confusion.
         #[test]
         fn v1_denies_url_with_username_only_userinfo() {
             let (dispatcher, minter) = setup_v1_dispatcher(
@@ -24220,9 +24254,10 @@ mod tests {
     // RFC-0020::REQ-0055: Priority-aware quarantine lifecycle tests
     // =====================================================================
 
-    /// RFC-0020::REQ-0055 (a): Adversarial flood of low-severity entries cannot evict
-    /// unexpired high-severity quarantine. A higher-severity entry CAN evict a
-    /// lower-severity entry, but a same-severity entry cannot (fail-closed).
+    /// RFC-0020::REQ-0055 (a): Adversarial flood of low-severity entries cannot
+    /// evict unexpired high-severity quarantine. A higher-severity entry
+    /// CAN evict a lower-severity entry, but a same-severity entry cannot
+    /// (fail-closed).
     #[test]
     fn tck_00489_adversarial_flood_cannot_evict_unexpired_high_severity_quarantine() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24322,8 +24357,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0055 (b): Higher-severity entry can evict lower-severity entry
-    /// when capacity is full and no expired entries exist.
+    /// RFC-0020::REQ-0055 (b): Higher-severity entry can evict lower-severity
+    /// entry when capacity is full and no expired entries exist.
     #[test]
     fn tck_00489_higher_severity_evicts_lower_severity_when_saturated() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24370,8 +24405,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0055 (c): Expired entries are evicted before active entries of any
-    /// severity.
+    /// RFC-0020::REQ-0055 (c): Expired entries are evicted before active
+    /// entries of any severity.
     #[test]
     fn tck_00489_expired_entries_evicted_before_active_entries() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24433,8 +24468,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0055 (d): Per-session quota isolation prevents cross-session
-    /// quarantine exhaustion.
+    /// RFC-0020::REQ-0055 (d): Per-session quota isolation prevents
+    /// cross-session quarantine exhaustion.
     #[test]
     fn tck_00489_per_session_quota_prevents_cross_session_exhaustion() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -24497,8 +24532,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0055 (e): Normal-path quarantine lifecycle works: insert, query,
-    /// TTL expiry, clearance.
+    /// RFC-0020::REQ-0055 (e): Normal-path quarantine lifecycle works: insert,
+    /// query, TTL expiry, clearance.
     #[test]
     fn tck_00489_normal_path_quarantine_lifecycle() {
         let mut state = BoundaryChannelQuarantineState::default();
@@ -26108,8 +26143,9 @@ mod tests {
         // PublishEvidence: deny on missing kernel for fail-closed
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0173, REQ-0026**: `PublishEvidence` MUST be denied in
-        /// authoritative mode when no authority lifecycle gate is wired.
+        /// **RFC-0032::REQ-0173, REQ-0026**: `PublishEvidence` MUST be denied
+        /// in authoritative mode when no authority lifecycle gate is
+        /// wired.
         #[test]
         fn publish_evidence_denied_when_kernel_missing_in_authoritative_mode() {
             let minter = test_minter();
@@ -26167,8 +26203,9 @@ mod tests {
             }
         }
 
-        /// **RFC-0032::REQ-0177 MAJOR-1**: `EmitEvent` must fail-safe when post-effect
-        /// anti-rollback finalization fails for fail-closed tiers.
+        /// **RFC-0032::REQ-0177 MAJOR-1**: `EmitEvent` must fail-safe when
+        /// post-effect anti-rollback finalization fails for fail-closed
+        /// tiers.
         #[test]
         fn emit_event_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -26260,8 +26297,9 @@ mod tests {
             }
         }
 
-        /// **RFC-0032::REQ-0177 MAJOR-1**: `PublishEvidence` must fail-safe when
-        /// post-effect anti-rollback finalization fails for fail-closed tiers.
+        /// **RFC-0032::REQ-0177 MAJOR-1**: `PublishEvidence` must fail-safe
+        /// when post-effect anti-rollback finalization fails for
+        /// fail-closed tiers.
         #[test]
         fn publish_evidence_fail_closed_finalize_failure_returns_error_and_opens_circuit() {
             use crate::htf::{ClockConfig, HolonicClock};
@@ -26359,10 +26397,10 @@ mod tests {
         // EmitEvent: non-authoritative mode does NOT require kernel
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0173**: `EmitEvent` in non-authoritative mode (no ledger/CAS
-        /// configured) should not be blocked by the kernel guard. The handler
-        /// will fail for other reasons (no ledger) but NOT from the kernel
-        /// guard.
+        /// **RFC-0032::REQ-0173**: `EmitEvent` in non-authoritative mode (no
+        /// ledger/CAS configured) should not be blocked by the kernel
+        /// guard. The handler will fail for other reasons (no ledger)
+        /// but NOT from the kernel guard.
         #[test]
         fn emit_event_non_authoritative_not_blocked_by_kernel_guard() {
             let minter = test_minter();
@@ -26400,8 +26438,8 @@ mod tests {
         // PublishEvidence: non-authoritative mode does NOT require kernel
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0173**: `PublishEvidence` in non-authoritative mode should
-        /// not be blocked by the kernel guard.
+        /// **RFC-0032::REQ-0173**: `PublishEvidence` in non-authoritative mode
+        /// should not be blocked by the kernel guard.
         #[test]
         fn publish_evidence_non_authoritative_not_blocked_by_kernel_guard() {
             let minter = test_minter();
@@ -26438,12 +26476,13 @@ mod tests {
         // EmitEvent: PCAC lifecycle gate enforces full lifecycle
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired (but not the
-        /// kernel), the handler MUST NOT trigger the kernel-missing denial
-        /// AND MUST enforce the full PCAC lifecycle (join -> revalidate ->
-        /// consume) before the effect. With all dependencies wired, the
-        /// PCAC lifecycle runs and the governance policy root check fires
-        /// as expected for `Tier2Plus` session endpoints.
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired (but not
+        /// the kernel), the handler MUST NOT trigger the kernel-missing
+        /// denial AND MUST enforce the full PCAC lifecycle (join ->
+        /// revalidate -> consume) before the effect. With all
+        /// dependencies wired, the PCAC lifecycle runs and the
+        /// governance policy root check fires as expected for
+        /// `Tier2Plus` session endpoints.
         #[test]
         fn emit_event_pcac_gate_enforces_lifecycle() {
             use crate::episode::preactuation::StopAuthority;
@@ -26529,8 +26568,9 @@ mod tests {
         // PublishEvidence: PCAC lifecycle gate enforces full lifecycle
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired, the handler
-        /// MUST enforce the full PCAC lifecycle for `PublishEvidence`.
+        /// **RFC-0032::REQ-0173**: When a PCAC lifecycle gate IS wired, the
+        /// handler MUST enforce the full PCAC lifecycle for
+        /// `PublishEvidence`.
         #[test]
         fn publish_evidence_pcac_gate_enforces_lifecycle() {
             use crate::episode::preactuation::StopAuthority;
@@ -27373,9 +27413,9 @@ mod tests {
         // RFC-0032::REQ-0176 BLOCKER: PublishEvidence must call record_completed
         // ----------------------------------------------------------------
 
-        /// **RFC-0032::REQ-0176**: After a successful `PublishEvidence` through the
-        /// `AdmissionKernel` path, the journal state for the request MUST
-        /// be `Completed`, not `Started`.
+        /// **RFC-0032::REQ-0176**: After a successful `PublishEvidence` through
+        /// the `AdmissionKernel` path, the journal state for the
+        /// request MUST be `Completed`, not `Started`.
         #[test]
         fn publish_evidence_records_completed_in_effect_journal() {
             let minter = test_minter();

@@ -1800,7 +1800,8 @@ mod tests {
     }
 
     // =========================================================================
-    // RFC-0032::REQ-0271 regression tests: merge_receipt_id / gate_receipt_id separation
+    // RFC-0032::REQ-0271 regression tests: merge_receipt_id / gate_receipt_id
+    // separation
     // =========================================================================
 
     #[test]

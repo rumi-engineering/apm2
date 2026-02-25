@@ -27,8 +27,9 @@
 //!
 //! # Divergence and Tamper Detection
 //!
-//! Divergence watchdog (RFC-0032::REQ-0059) and tamper detection (RFC-0032::REQ-0060) are
-//! implemented separately. This module focuses solely on write-only projection.
+//! Divergence watchdog (RFC-0032::REQ-0059) and tamper detection
+//! (RFC-0032::REQ-0060) are implemented separately. This module focuses solely
+//! on write-only projection.
 //!
 //! # Example
 //!
@@ -571,7 +572,8 @@ impl IdempotencyCache {
         )
         .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
 
-        // RFC-0032::REQ-0116 MAJOR FIX: Set permissions after file creation (for new files)
+        // RFC-0032::REQ-0116 MAJOR FIX: Set permissions after file creation (for new
+        // files)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1825,9 +1827,10 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
             "created PROJECTION_TAMPER defect"
         );
 
-        // RFC-0032::REQ-0103 MAJOR FIX: Create DefectRecorded event for ledger emission.
-        // Per the security review, on_tamper must emit a DefectRecorded event
-        // so that PROJECTION_TAMPER defects are recorded on the ledger.
+        // RFC-0032::REQ-0103 MAJOR FIX: Create DefectRecorded event for ledger
+        // emission. Per the security review, on_tamper must emit a
+        // DefectRecorded event so that PROJECTION_TAMPER defects are recorded
+        // on the ledger.
         //
         // We serialize the DefectRecord to JSON and compute the CAS hash.
         // The caller is responsible for storing in CAS and emitting to the ledger.

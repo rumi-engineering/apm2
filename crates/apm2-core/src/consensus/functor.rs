@@ -1,5 +1,6 @@
 // AGENT-AUTHORED
-//! Functorial observation law checks for admitted rewrites (RFC-0020::REQ-0022).
+//! Functorial observation law checks for admitted rewrites
+//! (RFC-0020::REQ-0022).
 //!
 //! This module encodes functorial law constraints for optimization rewrites
 //! over HSI observable semantics. A rewrite is admitted only when observation

@@ -422,9 +422,10 @@ pub(super) fn run_fac_worker_impl(
         },
     };
 
-    // RFC-0032::REQ-0216 MAJOR-1 fix: Load the actual boundary_id from FAC node identity
-    // instead of using a hardcoded constant. Falls back to FALLBACK_BOUNDARY_ID
-    // only when APM2 home cannot be resolved (no-home edge case).
+    // RFC-0032::REQ-0216 MAJOR-1 fix: Load the actual boundary_id from FAC node
+    // identity instead of using a hardcoded constant. Falls back to
+    // FALLBACK_BOUNDARY_ID only when APM2 home cannot be resolved (no-home edge
+    // case).
     let boundary_id = resolve_apm2_home()
         .and_then(|home| load_or_default_boundary_id(&home).ok())
         .unwrap_or_else(|| FALLBACK_BOUNDARY_ID.to_string());
@@ -716,8 +717,8 @@ pub(super) fn run_fac_worker_impl(
 
     let verifying_key = broker.verifying_key();
 
-    // RFC-0032::REQ-0190: Crash recovery — reconcile queue/claimed and lane leases on
-    // worker startup. Detects stale leases (PID dead, lock released) and
+    // RFC-0032::REQ-0190: Crash recovery — reconcile queue/claimed and lane leases
+    // on worker startup. Detects stale leases (PID dead, lock released) and
     // orphaned claimed jobs, then recovers them deterministically with receipts.
     {
         let _ = apm2_core::fac::sd_notify::notify_status("reconciling queue and lane state");
@@ -873,8 +874,8 @@ pub(super) fn run_fac_worker_impl(
     // threads or inotify instances.
     let continuous_runtime = should_start_background_runtime(once);
 
-    // RFC-0032::REQ-0248: Notify systemd that the worker is ready for continuous mode.
-    // In one-shot mode we still emit a status message but skip long-lived
+    // RFC-0032::REQ-0248: Notify systemd that the worker is ready for continuous
+    // mode. In one-shot mode we still emit a status message but skip long-lived
     // background runtime primitives.
     let _ = apm2_core::fac::sd_notify::notify_ready();
     let _ = if continuous_runtime {

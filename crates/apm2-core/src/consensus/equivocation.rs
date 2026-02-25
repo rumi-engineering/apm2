@@ -902,8 +902,8 @@ mod tck_00196_tests {
         proposal
     }
 
-    /// RFC-0033::REQ-0056: Test that equivocation is detected for same `seq_id` with
-    /// different hash.
+    /// RFC-0033::REQ-0056: Test that equivocation is detected for same `seq_id`
+    /// with different hash.
     #[test]
     fn tck_00196_detect_double_signing() {
         let mut detector = EquivocationDetector::new();
@@ -988,7 +988,8 @@ mod tck_00196_tests {
         }
     }
 
-    /// RFC-0033::REQ-0056: Test that valid proposals don't trigger false positives.
+    /// RFC-0033::REQ-0056: Test that valid proposals don't trigger false
+    /// positives.
     #[test]
     fn tck_00196_no_false_positives() {
         let mut detector = EquivocationDetector::new();

@@ -607,8 +607,8 @@ pub enum DenialReasonCode {
     PolicyAdmissionDenied,
     /// The economics profile hash from the FAC policy does not match the
     /// broker-admitted economics profile digest (INV-EADOPT-004,
-    /// RFC-0032::REQ-0234). Workers fail-closed when the economics profile hash is
-    /// not admitted.
+    /// RFC-0032::REQ-0234). Workers fail-closed when the economics profile hash
+    /// is not admitted.
     EconomicsAdmissionDenied,
     /// Patch content was denied by hardening validation (INV-PH-001
     /// through INV-PH-010, RFC-0032::REQ-0231). Path traversal, absolute paths,
@@ -629,7 +629,8 @@ pub enum DenialReasonCode {
     /// Denial reason code: `queue/quota_exceeded`.
     QueueQuotaExceeded,
     /// Duplicate gates submission for a repo/SHA that already has a
-    /// completed receipt in the same push freshness window (RFC-0032::REQ-0254 S8).
+    /// completed receipt in the same push freshness window (RFC-0032::REQ-0254
+    /// S8).
     AlreadyCompleted,
 }
 
@@ -643,11 +644,12 @@ pub struct ChannelBoundaryTrace {
     pub defect_count: u32,
     /// Bound and stringified defect classes.
     pub defect_classes: Vec<String>,
-    /// RFC-0032::REQ-0216: Hex-encoded FAC policy hash from decoded token binding.
+    /// RFC-0032::REQ-0216: Hex-encoded FAC policy hash from decoded token
+    /// binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_fac_policy_hash: Option<String>,
-    /// RFC-0032::REQ-0216: Hex-encoded canonicalizer tuple digest from decoded token
-    /// binding.
+    /// RFC-0032::REQ-0216: Hex-encoded canonicalizer tuple digest from decoded
+    /// token binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_canonicalizer_tuple_digest: Option<String>,
     /// RFC-0032::REQ-0216: Boundary identifier from decoded token binding.
@@ -671,9 +673,9 @@ pub struct QueueAdmissionTrace {
     pub queue_lane: String,
     /// Optional deny reason.
     pub defect_reason: Option<String>,
-    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission decision.
-    /// Present when the cost model provided the estimate; absent for legacy
-    /// receipts created before cost model integration.
+    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission
+    /// decision. Present when the cost model provided the estimate; absent
+    /// for legacy receipts created before cost model integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_estimate_ticks: Option<u64>,
 }
@@ -786,7 +788,8 @@ pub struct FacJobReceiptV1 {
     /// daemon clock service when HTF is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub htf_time_envelope_ns: Option<u64>,
-    /// Node fingerprint for deterministic ordering fallback (RFC-0032::REQ-0199).
+    /// Node fingerprint for deterministic ordering fallback
+    /// (RFC-0032::REQ-0199).
     ///
     /// Same semantics as `LaneProfileV1.node_fingerprint`. Used as the
     /// second component of the fallback ordering tuple per RFC-0019
@@ -800,21 +803,24 @@ pub struct FacJobReceiptV1 {
     /// changes on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_fingerprint: Option<String>,
-    /// Observed cgroup usage stats for economics calibration (RFC-0032::REQ-0222).
+    /// Observed cgroup usage stats for economics calibration
+    /// (RFC-0032::REQ-0222).
     ///
     /// Best-effort measurement of actual job resource consumption from the
     /// cgroup v2 hierarchy. Individual fields may be `None` if the
     /// corresponding stat could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_usage: Option<super::cgroup_stats::ObservedCgroupUsage>,
-    /// CLCK continuity attestation bit for terminal commit paths (RFC-0032::REQ-0268).
+    /// CLCK continuity attestation bit for terminal commit paths
+    /// (RFC-0032::REQ-0268).
     ///
     /// When present, this must be `true` and indicates that terminal commit
     /// executed under a continuous claimed-file lock (no release/reacquire
     /// gap between claim and terminal transition).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_lock_continuity_v1: Option<bool>,
-    /// Epoch timestamp when claimed-file lock was first acquired (RFC-0032::REQ-0268).
+    /// Epoch timestamp when claimed-file lock was first acquired
+    /// (RFC-0032::REQ-0268).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_lock_acquired_at_epoch_ms: Option<u64>,
     /// Phase where the claimed lock is released (RFC-0032::REQ-0268).
@@ -933,11 +939,12 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180
+        // receipts. A `0u8` presence marker is intentionally omitted when
+        // `moved_job_path` is `None`, matching the `canonicalizer_tuple_digest`
+        // pattern above, because older receipts encoded without this optional
+        // field at all and adding a trailing `0u8` would change their content
+        // hash.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
@@ -1285,11 +1292,12 @@ impl FacJobReceiptV1 {
         }
 
         bytes.extend_from_slice(&self.timestamp_secs.to_be_bytes());
-        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180 receipts.
-        // A `0u8` presence marker is intentionally omitted when `moved_job_path`
-        // is `None`, matching the `canonicalizer_tuple_digest` pattern above,
-        // because older receipts encoded without this optional field at all and
-        // adding a trailing `0u8` would change their content hash.
+        // Appended at end for backward compatibility with pre-RFC-0032::REQ-0180
+        // receipts. A `0u8` presence marker is intentionally omitted when
+        // `moved_job_path` is `None`, matching the `canonicalizer_tuple_digest`
+        // pattern above, because older receipts encoded without this optional
+        // field at all and adding a trailing `0u8` would change their content
+        // hash.
         if let Some(path) = &self.moved_job_path {
             bytes.push(1u8);
             bytes.extend_from_slice(&(path.len() as u32).to_be_bytes());
@@ -1999,7 +2007,8 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets the node fingerprint for deterministic ordering (RFC-0032::REQ-0199).
+    /// Sets the node fingerprint for deterministic ordering
+    /// (RFC-0032::REQ-0199).
     #[must_use]
     pub fn node_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
         self.node_fingerprint = Some(fingerprint.into());
@@ -2027,7 +2036,8 @@ impl FacJobReceiptV1Builder {
         self
     }
 
-    /// Sets claim-lock acquisition timestamp in epoch milliseconds (RFC-0032::REQ-0268).
+    /// Sets claim-lock acquisition timestamp in epoch milliseconds
+    /// (RFC-0032::REQ-0268).
     #[must_use]
     pub const fn claimed_lock_acquired_at_epoch_ms(mut self, epoch_ms: u64) -> Self {
         self.claimed_lock_acquired_at_epoch_ms = Some(epoch_ms);
@@ -3255,7 +3265,8 @@ impl From<GateReceipt> for GateReceiptProto {
             network_policy_hash: receipt.network_policy_hash,
             receipt_signature: receipt.receipt_signature.to_vec(),
             // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
             passed: receipt.passed,
         }
@@ -4748,11 +4759,11 @@ pub mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0209 MAJOR-1 fix: V1 canonical bytes must NOT emit an absence
-    /// marker (0u8) when `sccache_server_containment` is `None`. Historical
-    /// receipts signed before this field was added do not contain it, so
-    /// adding a trailing `0u8` would change their content hash and break
-    /// re-verification.
+    /// RFC-0032::REQ-0209 MAJOR-1 fix: V1 canonical bytes must NOT emit an
+    /// absence marker (0u8) when `sccache_server_containment` is `None`.
+    /// Historical receipts signed before this field was added do not
+    /// contain it, so adding a trailing `0u8` would change their content
+    /// hash and break re-verification.
     #[test]
     fn test_canonical_bytes_v1_backward_compat_without_server_containment() {
         // Create a receipt with a containment trace but NO server_containment.

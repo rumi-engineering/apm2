@@ -1210,7 +1210,8 @@ impl SiblingNode {
 ///
 /// The `entry_status` field is cryptographically bound by the ADS leaf
 /// commitment (`key || value_hash || entry_status`). This ensures the entry
-/// status is proof-derived and cannot be caller-asserted (RFC-0020::REQ-0010 Fix 4).
+/// status is proof-derived and cannot be caller-asserted (RFC-0020::REQ-0010
+/// Fix 4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirectoryProofV1 {
     kind: DirectoryProofKindV1,
@@ -2792,8 +2793,8 @@ fn hash_bytes(bytes: &[u8]) -> Hash {
 /// its content hash.
 ///
 /// Full CAS dereference + `IdentityProofV1::verify()` requires CAS
-/// transport integration, which is deferred to RFC-0020::REQ-0013 (verifier cache
-/// contract and invalidation correctness). Until then, the hash is bound
+/// transport integration, which is deferred to RFC-0020::REQ-0013 (verifier
+/// cache contract and invalidation correctness). Until then, the hash is bound
 /// into signed ledger event payloads for audit traceability.
 ///
 /// See `documents/work/waivers/WVR-0103.yaml` for the formal waiver.
@@ -3759,8 +3760,9 @@ mod tests {
 
         let key = derive_directory_key(holon_cert.holon_id());
         let value_hash = [0xAB; HASH_BYTES];
-        // RFC-0020::REQ-0010 Fix 4: Revoked status is now proof-derived, not caller-asserted.
-        // The directory proof itself carries DirectoryEntryStatus::Revoked.
+        // RFC-0020::REQ-0010 Fix 4: Revoked status is now proof-derived, not
+        // caller-asserted. The directory proof itself carries
+        // DirectoryEntryStatus::Revoked.
         let proof = DirectoryProofV1::new(
             DirectoryProofKindV1::Smt256CompressedV1,
             key,

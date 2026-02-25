@@ -473,8 +473,9 @@ pub enum DenyReason {
 
     /// Tool class is not in the manifest's tool allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, tools must be explicitly allowed in the manifest.
-    /// Empty `tool_allowlist` means no tools allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070, tools must be explicitly allowed in the
+    /// manifest. Empty `tool_allowlist` means no tools allowed
+    /// (fail-closed).
     ToolNotInAllowlist {
         /// The tool class that was denied.
         tool_class: ToolClass,
@@ -482,8 +483,9 @@ pub enum DenyReason {
 
     /// Write path is not in the manifest's write allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, write operations must target paths in the allowlist.
-    /// Empty `write_allowlist` means no writes allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070, write operations must target paths in the
+    /// allowlist. Empty `write_allowlist` means no writes allowed
+    /// (fail-closed).
     WritePathNotInAllowlist {
         /// The path that was denied.
         path: String,
@@ -491,8 +493,9 @@ pub enum DenyReason {
 
     /// Shell command is not in the manifest's shell allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, shell commands must match patterns in the allowlist.
-    /// Empty `shell_allowlist` means no shell commands allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070, shell commands must match patterns in the
+    /// allowlist. Empty `shell_allowlist` means no shell commands allowed
+    /// (fail-closed).
     ShellCommandNotInAllowlist {
         /// The shell command that was denied.
         command: String,
@@ -500,16 +503,16 @@ pub enum DenyReason {
 
     /// Write path is required but not provided.
     ///
-    /// Per RFC-0032::REQ-0070, when `write_allowlist` is configured, the request MUST
-    /// include a path for validation. Fail-closed semantics: missing field =
-    /// deny.
+    /// Per RFC-0032::REQ-0070, when `write_allowlist` is configured, the
+    /// request MUST include a path for validation. Fail-closed semantics:
+    /// missing field = deny.
     WritePathRequired,
 
     /// Shell command is required but not provided.
     ///
-    /// Per RFC-0032::REQ-0070, when `shell_allowlist` is configured, the request MUST
-    /// include a shell command for validation. Fail-closed semantics: missing
-    /// field = deny.
+    /// Per RFC-0032::REQ-0070, when `shell_allowlist` is configured, the
+    /// request MUST include a shell command for validation. Fail-closed
+    /// semantics: missing field = deny.
     ShellCommandRequired,
 }
 
@@ -1176,7 +1179,8 @@ impl CapabilityManifest {
 
     /// Checks if the given tool class is in the tool allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty
+    /// (fail-closed).
     #[must_use]
     pub fn is_tool_allowed(&self, tool_class: ToolClass) -> bool {
         if self.tool_allowlist.is_empty() {
@@ -1188,8 +1192,9 @@ impl CapabilityManifest {
 
     /// Checks if the given path is in the write allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
-    /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty
+    /// (fail-closed). The path must be a prefix match: `/workspace` allows
+    /// `/workspace/foo`.
     #[must_use]
     pub fn is_write_path_allowed(&self, path: &Path) -> bool {
         if self.write_allowlist.is_empty() {
@@ -1207,8 +1212,9 @@ impl CapabilityManifest {
     /// Checks if the given shell command matches a pattern in the shell
     /// allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
-    /// Patterns use simple glob matching with `*` as wildcard.
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty
+    /// (fail-closed). Patterns use simple glob matching with `*` as
+    /// wildcard.
     #[must_use]
     pub fn is_shell_command_allowed(&self, command: &str) -> bool {
         if self.shell_allowlist.is_empty() {
@@ -1242,8 +1248,9 @@ impl CapabilityManifest {
 
     /// Checks if the given topic is in the topic allowlist.
     ///
-    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty (fail-closed).
-    /// Only exact matches are allowed (Phase 1: no wildcard patterns).
+    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty
+    /// (fail-closed). Only exact matches are allowed (Phase 1: no wildcard
+    /// patterns).
     #[must_use]
     pub fn is_topic_allowed(&self, topic: &str) -> bool {
         if self.topic_allowlist.is_empty() {
@@ -1255,7 +1262,8 @@ impl CapabilityManifest {
 
     /// Checks if the given CAS hash is in the CAS hash allowlist.
     ///
-    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty (fail-closed).
+    /// Per RFC-0032::REQ-0108, returns `false` if the allowlist is empty
+    /// (fail-closed).
     #[must_use]
     pub fn is_cas_hash_allowed(&self, hash: &[u8; 32]) -> bool {
         if self.cas_hash_allowlist.is_empty() {
@@ -1293,8 +1301,10 @@ impl CapabilityManifest {
     /// This is the main entry point for capability validation. It checks:
     /// 1. Manifest expiration
     /// 2. RFC-0032::REQ-0070: Tool allowlist enforcement
-    /// 3. RFC-0032::REQ-0070: Write allowlist enforcement (for Write operations)
-    /// 4. RFC-0032::REQ-0070: Shell allowlist enforcement (for Execute operations)
+    /// 3. RFC-0032::REQ-0070: Write allowlist enforcement (for Write
+    ///    operations)
+    /// 4. RFC-0032::REQ-0070: Shell allowlist enforcement (for Execute
+    ///    operations)
     /// 5. Matching tool class
     /// 6. Path containment (for filesystem operations)
     /// 7. Size limits
@@ -1376,10 +1386,11 @@ impl CapabilityManifest {
             }
         }
 
-        // RFC-0032::REQ-0070: Check shell allowlist for Execute operations (fail-closed)
-        // SECURITY (SEC-SCP-FAC-0020): Always enforce shell allowlist check for Execute
-        // operations. If the allowlist is empty, is_shell_command_allowed returns
-        // false, correctly implementing fail-closed semantics per DD-004.
+        // RFC-0032::REQ-0070: Check shell allowlist for Execute operations
+        // (fail-closed) SECURITY (SEC-SCP-FAC-0020): Always enforce shell
+        // allowlist check for Execute operations. If the allowlist is empty,
+        // is_shell_command_allowed returns false, correctly implementing
+        // fail-closed semantics per DD-004.
         if request.tool_class == ToolClass::Execute {
             match &request.shell_command {
                 Some(command) => {
@@ -1857,8 +1868,8 @@ impl ToolRequest {
 
     /// Sets the shell command for Execute operations.
     ///
-    /// Per RFC-0032::REQ-0070, when `tool_class` is Execute, this command will be
-    /// validated against the manifest's `shell_allowlist`.
+    /// Per RFC-0032::REQ-0070, when `tool_class` is Execute, this command will
+    /// be validated against the manifest's `shell_allowlist`.
     #[must_use]
     pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
         self.shell_command = Some(command.into());
@@ -2489,8 +2500,8 @@ impl From<CapabilityError> for ManifestV1Error {
 
 /// Sealed proof token that can only be constructed by the policy resolver.
 ///
-/// Per RFC-0020::REQ-0006, this type prevents requester surfaces from constructing
-/// `CapabilityManifestV1` directly. Only code paths that hold a
+/// Per RFC-0020::REQ-0006, this type prevents requester surfaces from
+/// constructing `CapabilityManifestV1` directly. Only code paths that hold a
 /// `PolicyMintToken` can call `CapabilityManifestV1::mint()`.
 ///
 /// # Security
@@ -2545,7 +2556,8 @@ impl PolicyMintToken {
 ///
 /// # Contract References
 ///
-/// - RFC-0020::REQ-0006: Policy-only capability minting and broker scope enforcement
+/// - RFC-0020::REQ-0006: Policy-only capability minting and broker scope
+///   enforcement
 /// - AD-TOOL-002: Capability manifests as sealed references
 /// - CTR-1303: Bounded collections with `MAX_*` constants
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2561,9 +2573,9 @@ pub struct CapabilityManifestV1 {
 
     /// Allowed hosts for network operations.
     ///
-    /// Per RFC-0020::REQ-0006, host restrictions are enforced by the broker before
-    /// dispatching network tool requests. Empty means no hosts allowed
-    /// (fail-closed).
+    /// Per RFC-0020::REQ-0006, host restrictions are enforced by the broker
+    /// before dispatching network tool requests. Empty means no hosts
+    /// allowed (fail-closed).
     host_restrictions: Vec<String>,
 }
 
@@ -2869,8 +2881,8 @@ pub fn validate_manifest_scope_bounds(
 /// Validates that a `CapabilityManifest` scope is a strict subset of a
 /// policy-resolved [`ScopeBaseline`].
 ///
-/// Per RFC-0020::REQ-0006 Security Review MAJOR 1, cardinality-only checks allow
-/// scope laundering via same-cardinality substitution. This function
+/// Per RFC-0020::REQ-0006 Security Review MAJOR 1, cardinality-only checks
+/// allow scope laundering via same-cardinality substitution. This function
 /// enforces:
 ///
 /// 1. **Cardinality bounds** -- same as [`validate_manifest_scope_bounds`].
@@ -5653,7 +5665,8 @@ mod manifest_v1_tests {
     }
 
     // ========================================================================
-    // RFC-0020::REQ-0006 Security Review MAJOR 1: Strict-subset counterexample tests
+    // RFC-0020::REQ-0006 Security Review MAJOR 1: Strict-subset counterexample
+    // tests
     //
     // Verify that same-cardinality substitutions are rejected by
     // validate_manifest_scope_subset.

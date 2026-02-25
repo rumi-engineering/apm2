@@ -276,7 +276,8 @@ impl FirewallDecision {
         }
     }
 
-    /// Creates a new DENY event for a TOCTOU hash mismatch (RFC-0020::REQ-0029).
+    /// Creates a new DENY event for a TOCTOU hash mismatch
+    /// (RFC-0020::REQ-0029).
     #[must_use]
     pub fn deny_toctou_mismatch(manifest_id: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
@@ -356,7 +357,8 @@ impl FirewallDecision {
             rationale_code: rationale_with_path,
             budget_consumed,
             // HTF time envelope reference (RFC-0016): not yet populated by this method.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
             // Episode ID (RFC-0018, RFC-0032::REQ-0102): not populated by firewall validation.
             // The daemon episode runtime will populate this from episode context.
@@ -470,7 +472,8 @@ pub enum ContextFirewallError {
         max: usize,
     },
 
-    /// TOCTOU hash mismatch: runtime content differs from manifest (RFC-0020::REQ-0029).
+    /// TOCTOU hash mismatch: runtime content differs from manifest
+    /// (RFC-0020::REQ-0029).
     ///
     /// This indicates that the file content has been modified between manifest
     /// creation and the runtime read, which may indicate a TOCTOU attack.
@@ -783,7 +786,8 @@ impl ContextRiskTier {
     }
 }
 
-/// Policy for mapping risk tiers to firewall enforcement modes (RFC-0020::REQ-0029).
+/// Policy for mapping risk tiers to firewall enforcement modes
+/// (RFC-0020::REQ-0029).
 ///
 /// Per REQ-0029:
 /// - Tier3+ violations MUST terminate with mandatory defect emission
@@ -990,7 +994,8 @@ impl std::fmt::Display for ToctouMismatch {
 // FirewallViolationDefect (RFC-0020::REQ-0029)
 // =============================================================================
 
-/// Mandatory defect emission for Tier3+ firewall violations (RFC-0020::REQ-0029).
+/// Mandatory defect emission for Tier3+ firewall violations
+/// (RFC-0020::REQ-0029).
 ///
 /// Per REQ-0029, Tier3+ violations MUST terminate with mandatory defect
 /// emission. This struct captures the defect details for audit and event

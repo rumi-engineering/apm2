@@ -2,7 +2,8 @@
 //! CI guardrails: ban `NoOpVerifier` in default builds; enforce RFC-0028/0029
 //! fields present in execution receipts.
 //!
-//! These integration tests enforce the security invariants from RFC-0032::REQ-0205:
+//! These integration tests enforce the security invariants from
+//! RFC-0032::REQ-0205:
 //!
 //! 1. `NoOpVerifier` is gated behind `cfg(test)` / `feature =
 //!    "unsafe_no_verify"`. A PR that reintroduces `NoOpVerifier` usage in

@@ -65,9 +65,9 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // RFC-0032::REQ-0263: OpenWork (hsi.work.open) added as authoritative+idempotent+receipt.
     // RFC-0032::REQ-0266: PublishWorkContextEntry (hsi.work_context.publish) added as
     // authoritative+idempotent+receipt.
-    // RFC-0032::REQ-0265: ClaimWorkV2 (hsi.work.claim_v2) added as authoritative+idempotent+receipt.
-    // RFC-0032::REQ-0267: RecordWorkPrAssociation (hsi.work.record_pr_association) added as
-    // authoritative+idempotent+receipt.
+    // RFC-0032::REQ-0265: ClaimWorkV2 (hsi.work.claim_v2) added as
+    // authoritative+idempotent+receipt. RFC-0032::REQ-0267: RecordWorkPrAssociation
+    // (hsi.work.record_pr_association) added as authoritative+idempotent+receipt.
     // RFC-0032::REQ-0270: PublishWorkLoopProfile (hsi.work_loop_profile.publish) added as
     // authoritative+idempotent+receipt.
     // RFC-0032::REQ-0264: ResolveTicketAlias (hsi.work.resolve_ticket_alias) added as advisory.

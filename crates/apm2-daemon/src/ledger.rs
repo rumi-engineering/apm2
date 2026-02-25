@@ -341,7 +341,8 @@ impl SqliteLedgerEventEmitter {
         )
     }
 
-    // ---- Freeze-aware canonical read helpers (RFC-0032::REQ-0260 / Finding 1) ----
+    // ---- Freeze-aware canonical read helpers (RFC-0032::REQ-0260 / Finding 1)
+    // ----
     //
     // When the freeze guard is active, new events are written to the
     // canonical `events` table.  These helpers query that table and map
@@ -436,9 +437,10 @@ impl SqliteLedgerEventEmitter {
     /// Canonical-table query searching for an `evidence.published` event
     /// matching (`work_id`, `entry_id`) with category `WORK_CONTEXT_ENTRY`.
     ///
-    /// RFC-0032::REQ-0266 / BLOCKER fix: When the freeze guard is active, evidence
-    /// events are written to the canonical `events` table. This helper
-    /// ensures replay/idempotency lookup covers canonical-mode writes.
+    /// RFC-0032::REQ-0266 / BLOCKER fix: When the freeze guard is active,
+    /// evidence events are written to the canonical `events` table. This
+    /// helper ensures replay/idempotency lookup covers canonical-mode
+    /// writes.
     ///
     /// RFC-0032::REQ-0266 SECURITY FIX: Uses an indexed lookup via
     /// `json_extract(CAST(payload AS TEXT), '$.evidence_id')` (backed by
@@ -2416,7 +2418,8 @@ impl SqliteLedgerEventEmitter {
         Ok(())
     }
 
-    /// Query the latest `MergeReceipt` HEAD SHA from the ledger (RFC-0032::REQ-0147).
+    /// Query the latest `MergeReceipt` HEAD SHA from the ledger
+    /// (RFC-0032::REQ-0147).
     ///
     /// Scans the `ledger_events` table for the most recent event whose
     /// `event_type` matches a merge-receipt pattern and extracts the
@@ -2840,8 +2843,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
-    /// RFC-0032::REQ-0266 SECURITY FIX: Emit `evidence.published` with `evidence_id`
-    /// surfaced in the JSON envelope for UNIQUE index enforcement.
+    /// RFC-0032::REQ-0266 SECURITY FIX: Emit `evidence.published` with
+    /// `evidence_id` surfaced in the JSON envelope for UNIQUE index
+    /// enforcement.
     ///
     /// The canonical `events` table has a partial UNIQUE index on
     /// `json_extract(CAST(payload AS TEXT), '$.evidence_id') WHERE event_type =
@@ -3169,10 +3173,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .is_some()
     }
 
-    /// RFC-0032::REQ-0265 SECURITY FIX (Findings 5/8): Bounded SQL query for the
-    /// most recent `work_transitioned` event matching a `rationale_code`.
-    /// Uses `json_extract` at the database level to avoid O(N)
-    /// application-level JSON parsing.
+    /// RFC-0032::REQ-0265 SECURITY FIX (Findings 5/8): Bounded SQL query for
+    /// the most recent `work_transitioned` event matching a
+    /// `rationale_code`. Uses `json_extract` at the database level to avoid
+    /// O(N) application-level JSON parsing.
     fn get_latest_work_transition_by_rationale(
         &self,
         work_id: &str,
@@ -4094,8 +4098,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         time_envelope_ref: &str,
         pcac_lifecycle: Option<&PrivilegedPcacLifecycleArtifacts>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // RFC-0032::REQ-0115: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
-        // protocol compatibility across daemon/core boundary.
+        // RFC-0032::REQ-0115: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac
+        // for protocol compatibility across daemon/core boundary.
         // (Previously used daemon-local prefix; now aligned with core.)
 
         for (name, hash) in [
@@ -4336,8 +4340,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
-        // RFC-0032::REQ-0123: adapter_profile_hash provides ledger attribution for profile-based
-        // auditing
+        // RFC-0032::REQ-0123: adapter_profile_hash provides ledger attribution for
+        // profile-based auditing
         let payload = serde_json::json!({
             "event_type": "episode_run_attributed",
             "work_id": work_id,
@@ -4460,7 +4464,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
-    /// RFC-0032::REQ-0149 MAJOR 2: Transactional override for `emit_claim_lifecycle`.
+    /// RFC-0032::REQ-0149 MAJOR 2: Transactional override for
+    /// `emit_claim_lifecycle`.
     ///
     /// Wraps `WorkClaimed` + `WorkTransitioned(Open->Claimed)` in a single
     /// `SQLite` transaction to guarantee atomicity. On failure of either
@@ -4592,7 +4597,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(claimed_event)
     }
 
-    /// RFC-0032::REQ-0149 MAJOR 2: Transactional override for `emit_spawn_lifecycle`.
+    /// RFC-0032::REQ-0149 MAJOR 2: Transactional override for
+    /// `emit_spawn_lifecycle`.
     ///
     /// Wraps `SessionStarted` (with optional contract binding) +
     /// `WorkTransitioned(Claimed->InProgress)` in a single `SQLite`
@@ -4780,8 +4786,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
-    /// RFC-0020::REQ-0004: Emits a receipt with envelope bindings persisted in the
-    /// payload.
+    /// RFC-0020::REQ-0004: Emits a receipt with envelope bindings persisted in
+    /// the payload.
     ///
     /// Overrides the default to include `envelope_hash`,
     /// `capability_manifest_hash`, and `view_commitment_hash` in the
@@ -7330,8 +7336,8 @@ mod tests {
         assert!(result2.is_err(), "Should fail when table is dropped");
     }
 
-    /// RFC-0032::REQ-0131: Verify `SqliteLeaseValidator::get_gate_lease` retrieves
-    /// a full `GateLease` stored via `register_full_lease`.
+    /// RFC-0032::REQ-0131: Verify `SqliteLeaseValidator::get_gate_lease`
+    /// retrieves a full `GateLease` stored via `register_full_lease`.
     #[test]
     fn sqlite_lease_validator_get_gate_lease_roundtrip() {
         use crate::protocol::dispatch::LeaseValidator;
@@ -7370,8 +7376,8 @@ mod tests {
         assert_eq!(retrieved.executor_actor_id, "exec-rt");
     }
 
-    /// RFC-0032::REQ-0131: Verify `SqliteLeaseValidator::get_lease_work_id` returns
-    /// the correct `work_id` for a stored lease.
+    /// RFC-0032::REQ-0131: Verify `SqliteLeaseValidator::get_lease_work_id`
+    /// returns the correct `work_id` for a stored lease.
     #[test]
     fn sqlite_lease_validator_get_lease_work_id() {
         use crate::protocol::dispatch::LeaseValidator;
@@ -7396,8 +7402,9 @@ mod tests {
         );
     }
 
-    /// Regression (RFC-0032::REQ-0265): lease read APIs must resolve leases that were
-    /// written to canonical `events` while the validator is frozen.
+    /// Regression (RFC-0032::REQ-0265): lease read APIs must resolve leases
+    /// that were written to canonical `events` while the validator is
+    /// frozen.
     #[test]
     fn sqlite_lease_validator_frozen_reads_from_canonical_events() {
         use apm2_core::ledger::init_canonical_schema;
@@ -7482,9 +7489,10 @@ mod tests {
         );
     }
 
-    /// Regression (RFC-0032::REQ-0265): when frozen and both tables may contain matching
-    /// transitions, `get_latest_work_transition_by_rationale` must return the
-    /// newest event by timestamp across legacy + canonical tables.
+    /// Regression (RFC-0032::REQ-0265): when frozen and both tables may contain
+    /// matching transitions, `get_latest_work_transition_by_rationale` must
+    /// return the newest event by timestamp across legacy + canonical
+    /// tables.
     #[test]
     fn sqlite_work_transition_rationale_lookup_prefers_newer_canonical_event() {
         use apm2_core::ledger::init_canonical_schema;
@@ -7688,8 +7696,9 @@ mod tests {
     // RFC-0020::REQ-0002: Contract binding canonicalizer metadata tests
     // ====================================================================
 
-    /// RFC-0020::REQ-0002: `emit_session_started` includes canonicalizer metadata
-    /// in the persisted payload when a contract binding is provided.
+    /// RFC-0020::REQ-0002: `emit_session_started` includes canonicalizer
+    /// metadata in the persisted payload when a contract binding is
+    /// provided.
     #[test]
     fn emit_session_started_includes_canonicalizer_metadata() {
         use crate::hsi_contract::RiskTier;
@@ -7742,8 +7751,8 @@ mod tests {
         assert_eq!(canonicalizers[0]["version"], 1);
     }
 
-    /// RFC-0020::REQ-0002: `emit_spawn_lifecycle` includes canonicalizer metadata
-    /// in the persisted `SessionStarted` payload.
+    /// RFC-0020::REQ-0002: `emit_spawn_lifecycle` includes canonicalizer
+    /// metadata in the persisted `SessionStarted` payload.
     #[test]
     fn emit_spawn_lifecycle_includes_canonicalizer_metadata() {
         use crate::hsi_contract::RiskTier;
@@ -8775,8 +8784,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0260: After migration + freeze, lease validator writes route to
-    /// canonical `events` table.
+    /// RFC-0032::REQ-0260: After migration + freeze, lease validator writes
+    /// route to canonical `events` table.
     ///
     /// Verifies:
     /// 1. After migration, `freeze_legacy_writes` activates the guard.
@@ -8980,8 +8989,9 @@ mod tests {
         drop(conn_guard);
     }
 
-    /// RFC-0032::REQ-0260: BLOCKER 1 regression — canonical-mode DB (events > 0, no
-    /// frozen table) must still freeze and route writes to canonical events.
+    /// RFC-0032::REQ-0260: BLOCKER 1 regression — canonical-mode DB (events >
+    /// 0, no frozen table) must still freeze and route writes to canonical
+    /// events.
     ///
     /// Counterexample path that was previously unfrozen:
     /// 1. Startup: `init_schema_with_signing_key` creates `ledger_events`.
@@ -10003,8 +10013,9 @@ mod tests {
         let _ = emit_result; // used above for proof that emit succeeded
     }
 
-    /// RFC-0032::REQ-0275 regression: `get_events_since` must not skip canonical rows
-    /// under same-timestamp cursor collisions once `seq_id` crosses 9.
+    /// RFC-0032::REQ-0275 regression: `get_events_since` must not skip
+    /// canonical rows under same-timestamp cursor collisions once `seq_id`
+    /// crosses 9.
     ///
     /// This test also verifies backward compatibility for previously persisted
     /// unpadded cursor IDs by advancing the cursor as `canonical-<seq_id>`

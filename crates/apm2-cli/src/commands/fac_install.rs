@@ -1009,9 +1009,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0256 MAJOR-1: Symlink failure must produce non-zero exit code
-    /// unless --allow-partial is set. This is a unit-level assertion that
-    /// the exit code logic is correct given the boolean states.
+    /// RFC-0032::REQ-0256 MAJOR-1: Symlink failure must produce non-zero exit
+    /// code unless --allow-partial is set. This is a unit-level assertion
+    /// that the exit code logic is correct given the boolean states.
     #[test]
     fn symlink_failure_exit_code_logic() {
         // When symlink fails and allow_partial is false: non-zero exit.

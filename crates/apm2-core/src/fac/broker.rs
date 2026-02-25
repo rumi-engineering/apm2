@@ -1,8 +1,8 @@
 //! FAC Broker service: local authority for actuation tokens and economics
 //! envelopes.
 //!
-//! Implements RFC-0032::REQ-0178: a local broker authority responsible for FAC actuation
-//! authorization and economics/time authority.
+//! Implements RFC-0032::REQ-0178: a local broker authority responsible for FAC
+//! actuation authorization and economics/time authority.
 //!
 //! The broker is the **sole** issuer of:
 //! - RFC-0028 `ChannelContextToken` bound to `job_spec_digest` + `lease_id`
@@ -237,7 +237,8 @@ pub enum BrokerError {
     #[error("policy digest cannot be zero")]
     ZeroPolicyDigest,
 
-    /// The requested intent is not in the policy-allowed set (RFC-0032::REQ-0218).
+    /// The requested intent is not in the policy-allowed set
+    /// (RFC-0032::REQ-0218).
     #[error("intent not allowed by policy: {intent}")]
     IntentNotAllowed {
         /// The rejected intent string.
@@ -245,8 +246,8 @@ pub enum BrokerError {
     },
 
     /// Policy specifies an intent allowlist but no intent was provided
-    /// (RFC-0032::REQ-0218).  Fail-closed: intent-less tokens are not issued when
-    /// the policy requires intent binding.
+    /// (RFC-0032::REQ-0218).  Fail-closed: intent-less tokens are not issued
+    /// when the policy requires intent binding.
     #[error("intent required by policy but none provided")]
     IntentRequiredByPolicy,
 
@@ -288,7 +289,8 @@ pub struct BrokerState {
     pub convergence_horizon_hash: Hash,
     /// Convergence receipts for TP-EIO29-003 (bounded).
     pub convergence_receipts: Vec<ConvergenceReceipt>,
-    /// Monotonic health check sequence counter (INV-BH-013, RFC-0032::REQ-0235).
+    /// Monotonic health check sequence counter (INV-BH-013,
+    /// RFC-0032::REQ-0235).
     ///
     /// Persisted so that `BrokerHealthChecker` can resume from the last
     /// known sequence after a daemon restart, preventing replay of old
@@ -631,12 +633,13 @@ impl FacBroker {
     /// Advances the broker tick by 1 (monotonic) and resets the
     /// control-plane budget for the new window.
     ///
-    /// RFC-0032::REQ-0219: Each tick boundary starts a fresh budget window so that
-    /// rate limits are per-tick, not per-process-lifetime. Without this
-    /// reset, one burst permanently exhausts the budget (Security MAJOR).
+    /// RFC-0032::REQ-0219: Each tick boundary starts a fresh budget window so
+    /// that rate limits are per-tick, not per-process-lifetime. Without
+    /// this reset, one burst permanently exhausts the budget (Security
+    /// MAJOR).
     ///
-    /// RFC-0032::REQ-0217: Also evicts expired entries from the token-use ledger
-    /// to prevent unbounded growth.
+    /// RFC-0032::REQ-0217: Also evicts expired entries from the token-use
+    /// ledger to prevent unbounded growth.
     ///
     /// Returns the new tick value.
     #[must_use]

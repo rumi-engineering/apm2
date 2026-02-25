@@ -809,9 +809,9 @@ pub struct QueueAdmissionTrace {
     pub tp003_passed: bool,
     /// Current tick at evaluation time.
     pub evaluated_at_tick: u64,
-    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission decision.
-    /// Present when the cost model provided the estimate; absent for legacy
-    /// admission traces created before cost model integration.
+    /// RFC-0032::REQ-0188: Cost estimate (in ticks) used for this admission
+    /// decision. Present when the cost model provided the estimate; absent
+    /// for legacy admission traces created before cost model integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_estimate_ticks: Option<u64>,
 }
@@ -1141,9 +1141,10 @@ impl AntiEntropyBudget {
 
 /// Explicit policy for `stop_revoke` job admission under RFC-0028/0029.
 ///
-/// RFC-0032::REQ-0237: Defines the admission semantics for cancellation jobs. This
-/// policy is the single source of truth for how `stop_revoke` jobs are admitted
-/// under the RFC-0028 (security) and RFC-0029 (efficiency) constraints.
+/// RFC-0032::REQ-0237: Defines the admission semantics for cancellation jobs.
+/// This policy is the single source of truth for how `stop_revoke` jobs are
+/// admitted under the RFC-0028 (security) and RFC-0029 (efficiency)
+/// constraints.
 ///
 /// # Security Model
 ///
@@ -1219,9 +1220,10 @@ impl StopRevokeAdmissionPolicy {
 
 /// Structured admission trace for `stop_revoke` jobs recorded in receipts.
 ///
-/// RFC-0032::REQ-0237: Every `stop_revoke` admission decision produces this trace for
-/// audit and replay verification. The trace captures which policy provisions
-/// were exercised and whether anti-starvation guarantees were activated.
+/// RFC-0032::REQ-0237: Every `stop_revoke` admission decision produces this
+/// trace for audit and replay verification. The trace captures which policy
+/// provisions were exercised and whether anti-starvation guarantees were
+/// activated.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopRevokeAdmissionTrace {
@@ -3294,7 +3296,8 @@ mod tests {
     }
 
     // ========================================================================
-    // RFC-0032::REQ-0237: StopRevokeAdmissionPolicy and StopRevokeAdmissionTrace tests
+    // RFC-0032::REQ-0237: StopRevokeAdmissionPolicy and StopRevokeAdmissionTrace
+    // tests
     // ========================================================================
 
     #[test]

@@ -521,7 +521,8 @@ mod tck_00267 {
         assert!(!state3.is_active(), "Session-3 should not be active");
     }
 
-    /// RFC-0032::REQ-0083: Recovery state tracks last progress for resume cursor.
+    /// RFC-0032::REQ-0083: Recovery state tracks last progress for resume
+    /// cursor.
     #[test]
     fn recovery_state_tracks_resume_cursor() {
         let events = vec![
@@ -558,7 +559,8 @@ mod tck_00267 {
         assert_eq!(groups.get("session-3").unwrap().len(), 1);
     }
 
-    /// RFC-0032::REQ-0083: Session cursors collected for recovery point calculation.
+    /// RFC-0032::REQ-0083: Session cursors collected for recovery point
+    /// calculation.
     #[test]
     fn session_cursors_collected_for_recovery() {
         let events = vec![
@@ -619,7 +621,8 @@ mod tck_00267 {
         assert_eq!(state.event_count, 4);
     }
 
-    /// RFC-0032::REQ-0083: Events since a cursor can be counted for recovery assessment.
+    /// RFC-0032::REQ-0083: Events since a cursor can be counted for recovery
+    /// assessment.
     #[test]
     fn count_events_since_cursor() {
         let events = vec![

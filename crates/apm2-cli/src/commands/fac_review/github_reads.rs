@@ -41,8 +41,9 @@ pub(super) fn fetch_pr_head_sha(owner_repo: &str, pr_number: u32) -> Result<Stri
 /// Returns `Ok(Some(merged_at))` when the PR is merged, `Ok(None)` when it
 /// is still open/closed-without-merge, or `Err` on API failure.
 ///
-/// BF-002 (RFC-0032::REQ-0257): Used by the doctor wait loop to detect externally-
-/// merged PRs that the local lifecycle projection has not yet observed.
+/// BF-002 (RFC-0032::REQ-0257): Used by the doctor wait loop to detect
+/// externally- merged PRs that the local lifecycle projection has not yet
+/// observed.
 pub(super) fn fetch_pr_merged_at(
     owner_repo: &str,
     pr_number: u32,

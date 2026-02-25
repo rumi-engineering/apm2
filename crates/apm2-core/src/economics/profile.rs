@@ -628,7 +628,8 @@ mod tests {
         ));
     }
 
-    // RFC-0032::REQ-0219: EconomicsProfile validation rejects invalid control-plane limits.
+    // RFC-0032::REQ-0219: EconomicsProfile validation rejects invalid control-plane
+    // limits.
     #[test]
     fn with_control_plane_limits_rejects_over_cap_token_issuance() {
         use crate::fac::broker_rate_limits::{ControlPlaneLimits, MAX_TOKEN_ISSUANCE_LIMIT};

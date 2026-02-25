@@ -6892,7 +6892,11 @@ mod tests {
             vec!["merge", "delete", "status", "body"]
         );
         assert!(err.contains("merge_pr: merge failed"));
-        assert!(err.contains("delete_remote_branch `ticket/RFC-0019/RFC-0032::REQ-0251`: delete failed"));
+        assert!(
+            err.contains(
+                "delete_remote_branch `ticket/RFC-0019/RFC-0032::REQ-0251`: delete failed"
+            )
+        );
         assert!(err.contains("pr_body: body failed"));
     }
 

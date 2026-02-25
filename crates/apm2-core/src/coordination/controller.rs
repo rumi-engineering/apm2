@@ -102,7 +102,8 @@
 //!
 //! # References
 //!
-//! - RFC-0032::REQ-0050: Implement `CoordinationController` serial execution loop
+//! - RFC-0032::REQ-0050: Implement `CoordinationController` serial execution
+//!   loop
 //! - RFC-0016::REQ-0003: Convert coordination timeouts to tick-based tracking
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - RFC-0016: HTF Time Model (tick-based duration tracking)
@@ -608,10 +609,10 @@ impl CoordinationController {
     /// Validates that the provided tick's rate matches the configured budget
     /// tick rate.
     ///
-    /// Per RFC-0016::REQ-0003: All tick values within a coordination must use the same
-    /// tick rate as the budget to ensure replay-stable duration calculations.
-    /// Using ticks with different rates would cause temporal confusion where
-    /// elapsed time is computed incorrectly.
+    /// Per RFC-0016::REQ-0003: All tick values within a coordination must use
+    /// the same tick rate as the budget to ensure replay-stable duration
+    /// calculations. Using ticks with different rates would cause temporal
+    /// confusion where elapsed time is computed incorrectly.
     ///
     /// # Errors
     ///
@@ -906,7 +907,8 @@ impl CoordinationController {
     /// * `work_id` - The work item that was processed
     /// * `outcome` - The session outcome (Success or Failure)
     /// * `tokens_consumed` - Tokens consumed by the session
-    /// * `current_tick` - Current monotonic tick for elapsed time (RFC-0016::REQ-0003)
+    /// * `current_tick` - Current monotonic tick for elapsed time
+    ///   (RFC-0016::REQ-0003)
     /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
@@ -1060,7 +1062,8 @@ impl CoordinationController {
             },
         }
 
-        // Record work outcome in receipt builder if work item is complete (RFC-0032::REQ-0054)
+        // Record work outcome in receipt builder if work item is complete
+        // (RFC-0032::REQ-0054)
         if work_complete {
             // Get the tracking again (we need to re-borrow after mutation)
             let tracking = &self.work_tracking[self.work_index.saturating_sub(1)];
@@ -2512,7 +2515,8 @@ mod tests {
         ));
     }
 
-    /// RFC-0032::REQ-0051: Token budget enforced - coordination stops at `max_tokens`.
+    /// RFC-0032::REQ-0051: Token budget enforced - coordination stops at
+    /// `max_tokens`.
     ///
     /// Acceptance Criteria 3: Token budget enforced (when set).
     #[test]
@@ -2666,7 +2670,8 @@ mod tests {
         assert_eq!(controller.budget_usage.consumed_tokens, 4000);
     }
 
-    /// RFC-0032::REQ-0051: Budget priority ordering (Duration > Tokens > Episodes).
+    /// RFC-0032::REQ-0051: Budget priority ordering (Duration > Tokens >
+    /// Episodes).
     ///
     /// Per AD-COORD-013: When multiple budgets are exhausted, the highest
     /// priority one should be reported.
@@ -2863,7 +2868,8 @@ mod tests {
     // RFC-0032::REQ-0052: Stop Conditions and Circuit Breaker Logic Tests
     // =========================================================================
 
-    /// RFC-0032::REQ-0052: Circuit breaker triggers on 3 consecutive work item failures.
+    /// RFC-0032::REQ-0052: Circuit breaker triggers on 3 consecutive work item
+    /// failures.
     ///
     /// Acceptance Criteria 1: Circuit breaker triggers on 3 consecutive
     /// failures. Per AD-COORD-005 and AD-COORD-010: Circuit breaker tracks
@@ -3159,7 +3165,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0052: Integration test for circuit breaker with mock failures.
+    /// RFC-0032::REQ-0052: Integration test for circuit breaker with mock
+    /// failures.
     ///
     /// IT-COORD-STOP-001: Circuit breaker trigger test.
     #[test]
@@ -3797,8 +3804,8 @@ mod tests {
         ));
     }
 
-    /// RFC-0016::REQ-0003: `record_session_termination` rejects tick with mismatched
-    /// rate.
+    /// RFC-0016::REQ-0003: `record_session_termination` rejects tick with
+    /// mismatched rate.
     ///
     /// Validates that `record_session_termination()` returns `InvalidTickRate`
     /// when the provided tick has a different rate than the budget.
@@ -3833,7 +3840,8 @@ mod tests {
         ));
     }
 
-    /// RFC-0016::REQ-0003: Correct tick rate is accepted throughout coordination.
+    /// RFC-0016::REQ-0003: Correct tick rate is accepted throughout
+    /// coordination.
     ///
     /// Validates that all methods accept ticks with the correct rate.
     #[test]

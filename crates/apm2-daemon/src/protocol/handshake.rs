@@ -189,7 +189,8 @@ pub struct HelloAck {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub daemon_signing_public_key: String,
 
-    /// Whether a contract mismatch was detected and waived (RFC-0020::REQ-0002).
+    /// Whether a contract mismatch was detected and waived
+    /// (RFC-0020::REQ-0002).
     ///
     /// `true` if the client's `cli_contract_hash` differs from the
     /// daemon's active contract but the session was allowed to proceed
@@ -507,7 +508,8 @@ pub struct ServerHandshake {
     /// Risk tier for mismatch policy evaluation (RFC-0020::REQ-0002).
     risk_tier: crate::hsi_contract::RiskTier,
 
-    /// Mismatch outcome from the last `process_hello` call (RFC-0020::REQ-0002).
+    /// Mismatch outcome from the last `process_hello` call
+    /// (RFC-0020::REQ-0002).
     mismatch_outcome: Option<crate::hsi_contract::MismatchOutcome>,
 }
 
@@ -1426,7 +1428,8 @@ mod tests {
         assert_eq!(server.state(), HandshakeState::Failed);
     }
 
-    /// RFC-0020::REQ-0002 BLOCKER-2: Too many canonicalizer entries must be rejected.
+    /// RFC-0020::REQ-0002 BLOCKER-2: Too many canonicalizer entries must be
+    /// rejected.
     #[test]
     fn test_process_hello_rejects_too_many_canonicalizers() {
         let mut server =

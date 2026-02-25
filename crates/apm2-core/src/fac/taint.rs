@@ -1,5 +1,6 @@
 // AGENT-AUTHORED
-//! Taint tracking for prompt-injection resistance (RFC-0032::REQ-0130, REQ-0016).
+//! Taint tracking for prompt-injection resistance (RFC-0032::REQ-0130,
+//! REQ-0016).
 //!
 //! This module implements taint classification and flow policy enforcement
 //! for untrusted inputs flowing through the evidence pipeline. All content
@@ -48,8 +49,8 @@
 //!
 //! # Contract References
 //!
-//! - RFC-0032::REQ-0130: Security hardening: prompt-injection resistance via evidence
-//!   taint tracking
+//! - RFC-0032::REQ-0130: Security hardening: prompt-injection resistance via
+//!   evidence taint tracking
 //! - REQ-0016: Taint tracking prevents untrusted content from silently
 //!   influencing decisions
 //! - TB-0006: `ContextPack` Firewall Boundary

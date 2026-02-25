@@ -2,7 +2,8 @@
 //! Consensus cluster management CLI commands.
 //!
 //! This module implements the `apm2 consensus` subcommands for monitoring
-//! and managing the distributed consensus layer per RFC-0014 and RFC-0033::REQ-0053.
+//! and managing the distributed consensus layer per RFC-0014 and
+//! RFC-0033::REQ-0053.
 //!
 //! # Commands
 //!

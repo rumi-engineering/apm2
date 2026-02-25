@@ -1,4 +1,5 @@
-//! RFC-0020::REQ-0004: FAC receipt identity normalization and semantic idempotency.
+//! RFC-0020::REQ-0004: FAC receipt identity normalization and semantic
+//! idempotency.
 //!
 //! Verifies that duplicate `IngestReviewReceipt` requests replay the same
 //! authoritative event identity and preserve canonical ledger bindings.

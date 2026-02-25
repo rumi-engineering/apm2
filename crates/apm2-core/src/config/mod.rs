@@ -99,8 +99,9 @@ impl EcosystemConfig {
 
     /// Build a default config with environment-based auto-detection.
     ///
-    /// RFC-0032::REQ-0244: Enables config-less startup for the CLI layer. When no
-    /// `ecosystem.toml` exists, this method constructs a usable config by:
+    /// RFC-0032::REQ-0244: Enables config-less startup for the CLI layer. When
+    /// no `ecosystem.toml` exists, this method constructs a usable config
+    /// by:
     ///
     /// 1. Using XDG-standard default paths for all daemon paths.
     /// 2. Auto-detecting GitHub owner/repo from `git remote get-url origin`.
@@ -127,8 +128,8 @@ impl EcosystemConfig {
         // Detect GitHub owner/repo from CWD git remote
         let github_coords = crate::github::detect_github_owner_repo_from_cwd();
 
-        // Check for GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR FIX):
-        // env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
+        // Check for GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR
+        // FIX): env vars -> $CREDENTIALS_DIRECTORY/gh-token ->
         // $APM2_HOME/private/creds/gh-token
         let github_token_env = if resolve_github_token("GITHUB_TOKEN").is_some() {
             Some("GITHUB_TOKEN".to_string())
@@ -196,7 +197,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub projection: ProjectionConfig,
 
-    /// Path to durable content-addressed storage (CAS) directory (RFC-0032::REQ-0137).
+    /// Path to durable content-addressed storage (CAS) directory
+    /// (RFC-0032::REQ-0137).
     ///
     /// When provided alongside a ledger database, the daemon uses
     /// `with_persistence_and_cas()` to wire the session dispatcher with
@@ -393,7 +395,8 @@ pub struct ProjectionConfig {
     /// e.g., `$GITHUB_TOKEN` or use a credential profile.
     ///
     /// **Required when `enabled = true`**: Missing token is a fatal error
-    /// to prevent fail-open security issues (RFC-0032::REQ-0116 security review).
+    /// to prevent fail-open security issues (RFC-0032::REQ-0116 security
+    /// review).
     #[serde(default)]
     pub github_token_env: Option<String>,
 
@@ -407,9 +410,9 @@ pub struct ProjectionConfig {
 
     /// Path to persistent signer key file for projection receipts.
     ///
-    /// RFC-0032::REQ-0116 BLOCKER FIX: The projection worker requires a persistent
-    /// signing key to ensure receipt signatures remain valid across daemon
-    /// restarts. If not specified, defaults to
+    /// RFC-0032::REQ-0116 BLOCKER FIX: The projection worker requires a
+    /// persistent signing key to ensure receipt signatures remain valid
+    /// across daemon restarts. If not specified, defaults to
     /// `{state_file_dir}/projection_signer.key`.
     ///
     /// The key file contains the 32-byte Ed25519 secret key. It is created
@@ -698,10 +701,10 @@ pub struct DivergenceWatchdogSection {
 impl DivergenceWatchdogSection {
     /// Validate startup prerequisites for the divergence watchdog.
     ///
-    /// RFC-0032::REQ-0156: When the watchdog is enabled, a ledger database is mandatory.
-    /// The watchdog is a security control; allowing it to be enabled without
-    /// its required ledger database would silently disable divergence
-    /// detection, violating fail-closed posture.
+    /// RFC-0032::REQ-0156: When the watchdog is enabled, a ledger database is
+    /// mandatory. The watchdog is a security control; allowing it to be
+    /// enabled without its required ledger database would silently disable
+    /// divergence detection, violating fail-closed posture.
     ///
     /// `has_ledger_db` indicates whether a ledger database path was configured.
     ///
@@ -1037,7 +1040,8 @@ pub(crate) enum ResolvedGitHubTokenSource {
     Apm2CredentialFile,
 }
 
-/// Resolve a GitHub token value from available sources (RFC-0032::REQ-0244 MAJOR FIX).
+/// Resolve a GitHub token value from available sources (RFC-0032::REQ-0244
+/// MAJOR FIX).
 ///
 /// Resolution order:
 /// 1. Environment variable named by `env_var_name` (e.g., `GITHUB_TOKEN`).
@@ -1314,7 +1318,8 @@ mod tests {
         assert_eq!(config.processes.len(), 1);
     }
 
-    /// RFC-0032::REQ-0253: missing socket fields are auto-filled from runtime defaults.
+    /// RFC-0032::REQ-0253: missing socket fields are auto-filled from runtime
+    /// defaults.
     #[test]
     fn config_missing_socket_fields_uses_defaults() {
         let toml = r#"
@@ -1431,9 +1436,10 @@ mod tests {
         assert!(matches!(err, ConfigError::Validation(_)));
     }
 
-    /// RFC-0032::REQ-0177 MAJOR fix: validates that `validate_sink_profiles()` rejects
-    /// a single-sink configuration at startup, matching the economics gate
-    /// runtime requirement of >= 2 distinct sinks (REQ-0009).
+    /// RFC-0032::REQ-0177 MAJOR fix: validates that `validate_sink_profiles()`
+    /// rejects a single-sink configuration at startup, matching the
+    /// economics gate runtime requirement of >= 2 distinct sinks
+    /// (REQ-0009).
     #[test]
     fn test_validate_sink_profiles_rejects_single_sink() {
         let mut projection = ProjectionConfig::default();
@@ -1500,7 +1506,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0244: `from_env()` produces a valid default config with XDG paths.
+    /// RFC-0032::REQ-0244: `from_env()` produces a valid default config with
+    /// XDG paths.
     #[test]
     fn test_from_env_produces_defaults() {
         // from_env() should never panic regardless of environment state.
@@ -1606,8 +1613,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0244 SECURITY FIX: `read_credential_file_bounded` reads valid
-    /// credential files that are within the size bound.
+    /// RFC-0032::REQ-0244 SECURITY FIX: `read_credential_file_bounded` reads
+    /// valid credential files that are within the size bound.
     #[test]
     fn test_read_credential_file_bounded_reads_valid_file() {
         use secrecy::ExposeSecret;

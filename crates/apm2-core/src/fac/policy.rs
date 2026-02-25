@@ -237,7 +237,8 @@ pub struct FacPolicyV1 {
     #[serde(default = "default_economics_profile_hash")]
     pub economics_profile_hash: [u8; 32],
 
-    /// Sandbox hardening profile for systemd transient units (RFC-0032::REQ-0223).
+    /// Sandbox hardening profile for systemd transient units
+    /// (RFC-0032::REQ-0223).
     ///
     /// Defines which systemd security directives are applied to FAC job units.
     /// The default profile enables all hardening directives with safe defaults
@@ -261,7 +262,8 @@ pub struct FacPolicyV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<NetworkPolicy>,
 
-    /// Optional `repo_id` allowlist for job spec validation (RFC-0032::REQ-0229).
+    /// Optional `repo_id` allowlist for job spec validation
+    /// (RFC-0032::REQ-0229).
     ///
     /// When `Some`, only the listed `repo_id` values are accepted by
     /// policy-aware job spec validators.  When `None` (the default), any
@@ -269,9 +271,9 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because `None` is the MOST
     /// permissive option for this field, and the default is correct for
-    /// existing persisted policies that predate RFC-0032::REQ-0229.  The remaining
-    /// policy checks (`bytes_backend` allowlist, filesystem-path rejection)
-    /// are unconditional and do not depend on this field.
+    /// existing persisted policies that predate RFC-0032::REQ-0229.  The
+    /// remaining policy checks (`bytes_backend` allowlist, filesystem-path
+    /// rejection) are unconditional and do not depend on this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<String>>,
 
@@ -284,21 +286,22 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because `None` is the MOST
     /// permissive option for this field, and the default is correct for
-    /// existing persisted policies that predate RFC-0032::REQ-0218.  The fail-closed
-    /// enforcement is at the broker and worker layers when the field is
-    /// `Some`.
+    /// existing persisted policies that predate RFC-0032::REQ-0218.  The
+    /// fail-closed enforcement is at the broker and worker layers when the
+    /// field is `Some`.
     ///
     /// The list is bounded by [`super::job_spec::MAX_ALLOWED_INTENTS_SIZE`]
     /// at validation time (CTR-1303).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_intents: Option<Vec<super::job_spec::FacIntent>>,
 
-    /// Queue bounds policy controlling maximum pending queue size (RFC-0032::REQ-0228).
+    /// Queue bounds policy controlling maximum pending queue size
+    /// (RFC-0032::REQ-0228).
     ///
     /// Configures `max_pending_jobs`, `max_pending_bytes`, and optional
     /// `per_lane_max_pending_jobs` for enqueue-time enforcement. When not
-    /// present in persisted policy (pre-RFC-0032::REQ-0228 policies), defaults to
-    /// `QueueBoundsPolicy::default()` via `serde(default)`.
+    /// present in persisted policy (pre-RFC-0032::REQ-0228 policies), defaults
+    /// to `QueueBoundsPolicy::default()` via `serde(default)`.
     #[serde(default)]
     pub queue_bounds_policy: super::queue_bounds::QueueBoundsPolicy,
 
@@ -344,13 +347,13 @@ pub struct FacPolicyV1 {
     ///
     /// Note: `serde(default)` is safe here because the default is a
     /// conservative retention limit (100 MiB), not an unbounded value.
-    /// Existing policies that predate RFC-0032::REQ-0221 will default to a reasonable
-    /// cap.
+    /// Existing policies that predate RFC-0032::REQ-0221 will default to a
+    /// reasonable cap.
     #[serde(default = "default_per_lane_log_max_bytes")]
     pub per_lane_log_max_bytes: u64,
 
-    /// Days to retain per-job log directories before pruning (RFC-0032::REQ-0221).
-    /// Default: 7.
+    /// Days to retain per-job log directories before pruning
+    /// (RFC-0032::REQ-0221). Default: 7.
     ///
     /// Job log directories whose mtime is older than this TTL are eligible
     /// for pruning during GC. A value of 0 means "use default" (7 days).
@@ -619,16 +622,16 @@ impl FacPolicyV1 {
 /// 4. Remove all variables listed in `env_clear` (unconditional strip).
 /// 5. Apply `env_set` overrides (force-set specific key=value pairs).
 /// 6. Hardcoded safety: unconditionally strip `RUSTC_WRAPPER` and `SCCACHE_*`
-///    regardless of policy configuration (containment invariant, RFC-0032::REQ-0203).
-///    This step runs AFTER `env_set` to ensure policy overrides cannot
-///    re-introduce these variables.
+///    regardless of policy configuration (containment invariant,
+///    RFC-0032::REQ-0203). This step runs AFTER `env_set` to ensure policy
+///    overrides cannot re-introduce these variables.
 /// 7. If `deny_ambient_cargo_home` is true and `CARGO_HOME` was inherited from
 ///    the ambient environment, replace it with the managed path.
 /// 8. If `cargo_target_dir` is set in policy, force `CARGO_TARGET_DIR`.
 /// 9. If `sccache_enabled` is true in policy, inject `RUSTC_WRAPPER=sccache`
-///    and `SCCACHE_DIR` from the policy-resolved path (RFC-0032::REQ-0208). The caller
-///    is responsible for gating on containment verification before actually
-///    using the environment with sccache enabled.
+///    and `SCCACHE_DIR` from the policy-resolved path (RFC-0032::REQ-0208). The
+///    caller is responsible for gating on containment verification before
+///    actually using the environment with sccache enabled.
 ///
 /// The result is a deterministic `BTreeMap<String, String>` of environment
 /// variables suitable for passing to `Command::envs()` after clearing the

@@ -530,9 +530,9 @@ pub enum FreshnessDecision {
 
 /// Evaluates identity proof freshness against a configured policy.
 ///
-/// This is the core enforcement logic for RFC-0020::REQ-0015. It is deterministic
-/// and side-effect-free; defect/receipt emission is handled by the caller
-/// using the returned [`FreshnessOutcome`].
+/// This is the core enforcement logic for RFC-0020::REQ-0015. It is
+/// deterministic and side-effect-free; defect/receipt emission is handled by
+/// the caller using the returned [`FreshnessOutcome`].
 #[derive(Debug, Clone)]
 pub struct FreshnessEvaluator {
     policy: FreshnessPolicy,

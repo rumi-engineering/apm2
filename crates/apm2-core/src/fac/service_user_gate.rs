@@ -729,13 +729,13 @@ mod tests {
 
     // ── Service user identity resolution (RFC-0032::REQ-0227 round 16) ────────
 
-    /// RFC-0032::REQ-0227 round 16: Verify `resolve_service_user_identity` behavior
-    /// with the default service user (which typically does not exist in test
-    /// environments). We cannot set env vars without unsafe, so we test the
-    /// default behavior: the default `_apm2-job` user is unlikely to exist,
-    /// so we expect Err. If it does exist (CI environment with the user
-    /// provisioned), both uid and gid must be non-zero or the test is still
-    /// valid.
+    /// RFC-0032::REQ-0227 round 16: Verify `resolve_service_user_identity`
+    /// behavior with the default service user (which typically does not
+    /// exist in test environments). We cannot set env vars without unsafe,
+    /// so we test the default behavior: the default `_apm2-job` user is
+    /// unlikely to exist, so we expect Err. If it does exist (CI
+    /// environment with the user provisioned), both uid and gid must be
+    /// non-zero or the test is still valid.
     #[test]
     #[cfg(unix)]
     fn resolve_service_user_identity_default_user_behavior() {
@@ -758,8 +758,8 @@ mod tests {
         }
     }
 
-    /// RFC-0032::REQ-0227 round 16: Verify `ServiceUserIdentity` struct construction
-    /// and field access.
+    /// RFC-0032::REQ-0227 round 16: Verify `ServiceUserIdentity` struct
+    /// construction and field access.
     #[test]
     fn service_user_identity_struct_has_expected_fields() {
         let identity = ServiceUserIdentity {

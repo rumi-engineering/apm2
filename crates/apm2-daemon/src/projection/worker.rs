@@ -1505,7 +1505,8 @@ impl WorkIndex {
         .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
     }
 
-    /// Registers a work context entry in the projection table (RFC-0032::REQ-0266).
+    /// Registers a work context entry in the projection table
+    /// (RFC-0032::REQ-0266).
     ///
     /// Uses `INSERT OR IGNORE` to support idempotent replays: the primary key
     /// `(work_id, entry_id)` and the uniqueness constraint on
@@ -1783,8 +1784,8 @@ pub struct LedgerTailer {
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
-    /// RFC-0032::REQ-0266 / BLOCKER fix: Whether the canonical `events` table is
-    /// active (freeze mode). Detected lazily on first poll by checking
+    /// RFC-0032::REQ-0266 / BLOCKER fix: Whether the canonical `events` table
+    /// is active (freeze mode). Detected lazily on first poll by checking
     /// if the `events` table exists in `sqlite_master`. Once set, the
     /// tailer also queries canonical events to see freeze-mode writes.
     /// Uses `std::sync::atomic::AtomicU8` with three states:
@@ -1856,10 +1857,10 @@ impl LedgerTailer {
         }
     }
 
-    /// RFC-0032::REQ-0266 / BLOCKER fix: Detects whether the canonical `events` table
-    /// is active. Returns `true` if canonical mode is active (the `events`
-    /// table exists and has at least one row). Result is cached in an
-    /// `AtomicU8` to avoid repeated `sqlite_master` queries.
+    /// RFC-0032::REQ-0266 / BLOCKER fix: Detects whether the canonical `events`
+    /// table is active. Returns `true` if canonical mode is active (the
+    /// `events` table exists and has at least one row). Result is cached in
+    /// an `AtomicU8` to avoid repeated `sqlite_master` queries.
     ///
     /// States: 0 = unknown (probe required), 1 = legacy-only, 2 = canonical.
     fn is_canonical_active(conn: &Connection, mode: &std::sync::atomic::AtomicU8) -> bool {
@@ -2547,7 +2548,8 @@ pub struct ProjectionWorker {
     work_opened_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     authoritative_cas: Option<Arc<dyn ContentAddressedStore>>,
-    /// Durable buffer for recording admission decisions (RFC-0033::REQ-0062/00505).
+    /// Durable buffer for recording admission decisions
+    /// (RFC-0033::REQ-0062/00505).
     intent_buffer: Option<Arc<IntentBuffer>>,
     /// Continuity profile resolver for economics gate input assembly
     /// (RFC-0033::REQ-0065/00505).
@@ -2645,7 +2647,8 @@ impl ProjectionWorker {
         &self.work_index
     }
 
-    /// Returns a reference to the admission telemetry counters (RFC-0033::REQ-0063).
+    /// Returns a reference to the admission telemetry counters
+    /// (RFC-0033::REQ-0063).
     #[must_use]
     pub const fn telemetry(&self) -> &Arc<AdmissionTelemetry> {
         &self.telemetry
@@ -2695,7 +2698,8 @@ impl ProjectionWorker {
     }
 
     /// Sets the gate signer used to construct signed continuity window
-    /// and profile artifacts at economics gate evaluation time (RFC-0033::REQ-0063).
+    /// and profile artifacts at economics gate evaluation time
+    /// (RFC-0033::REQ-0063).
     ///
     /// The signer MUST be persistent (daemon lifecycle key), NOT random
     /// per-invocation, so that signed artifacts are reproducible for
@@ -2772,7 +2776,8 @@ impl ProjectionWorker {
             }
 
             // Process evidence.published events to index WORK_CONTEXT_ENTRY and
-            // WORK_LOOP_PROFILE entries (RFC-0032::REQ-0266, RFC-0032::REQ-0270: RFC-0032 projection)
+            // WORK_LOOP_PROFILE entries (RFC-0032::REQ-0266, RFC-0032::REQ-0270: RFC-0032
+            // projection)
             if let Err(e) = self.process_evidence_published().await {
                 warn!(error = %e, "Error processing evidence.published events");
             }
@@ -3261,7 +3266,8 @@ impl ProjectionWorker {
     ///
     /// Routes events by category:
     /// - `WORK_CONTEXT_ENTRY` -> `work_context` table (RFC-0032::REQ-0266)
-    /// - `WORK_LOOP_PROFILE` -> `work_active_loop_profile` table (RFC-0032::REQ-0270)
+    /// - `WORK_LOOP_PROFILE` -> `work_active_loop_profile` table
+    ///   (RFC-0032::REQ-0270)
     /// - All other categories are silently skipped (acknowledged without
     ///   indexing).
     ///
@@ -3332,7 +3338,8 @@ impl ProjectionWorker {
     /// - `WORK_CONTEXT_ENTRY`: extracts metadata and inserts into
     ///   `work_context` (RFC-0032::REQ-0266).
     /// - `WORK_LOOP_PROFILE`: extracts metadata and upserts into
-    ///   `work_active_loop_profile` with latest-wins semantics (RFC-0032::REQ-0270).
+    ///   `work_active_loop_profile` with latest-wins semantics
+    ///   (RFC-0032::REQ-0270).
     ///
     /// Unrecognized categories are silently skipped (return `Ok(())`).
     fn handle_evidence_published(
@@ -9600,9 +9607,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test: `LedgerTailer::poll_events`
-    /// discovers events written to the canonical `events` table when in
-    /// freeze mode.
+    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test:
+    /// `LedgerTailer::poll_events` discovers events written to the
+    /// canonical `events` table when in freeze mode.
     ///
     /// Proves: When both `ledger_events` (legacy) and `events` (canonical)
     /// tables exist, `poll_events` merges results from both sources and
@@ -9783,8 +9790,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test: When no canonical `events`
-    /// table exists, `poll_events` only returns legacy events (no error).
+    /// RFC-0032::REQ-0266 / BLOCKER-2 regression test: When no canonical
+    /// `events` table exists, `poll_events` only returns legacy events (no
+    /// error).
     #[test]
     fn test_tailer_poll_events_legacy_only_when_no_canonical_table() {
         let conn = create_test_db();
@@ -10044,7 +10052,8 @@ mod tests {
     }
 
     // ========================================================================
-    // RFC-0032::REQ-0270: work_active_loop_profile projection tests (RFC-0032 Phase 4)
+    // RFC-0032::REQ-0270: work_active_loop_profile projection tests (RFC-0032 Phase
+    // 4)
     // ========================================================================
 
     /// Verify `WORK_LOOP_PROFILE` events are correctly indexed in the

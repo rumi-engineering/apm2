@@ -994,9 +994,9 @@ pub struct ReviewCompletionResult {
     /// Optional for backward compatibility with events created before
     /// RFC-0032::REQ-0119.
     pub capability_manifest_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (RFC-0032::REQ-0119).
-    /// Optional for backward compatibility with events created before
-    /// RFC-0032::REQ-0119.
+    /// BLAKE3 hash of the sealed `ContextPackManifest` in effect
+    /// (RFC-0032::REQ-0119). Optional for backward compatibility with
+    /// events created before RFC-0032::REQ-0119.
     pub context_pack_hash: Option<[u8; 32]>,
 }
 

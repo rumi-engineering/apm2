@@ -1,4 +1,5 @@
-//! ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018, RFC-0032::REQ-0098).
+//! ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018,
+//! RFC-0032::REQ-0098).
 //!
 //! This module implements Access Control List (ACL) evaluation for pulse topic
 //! subscriptions, enforcing the default-deny security posture specified in

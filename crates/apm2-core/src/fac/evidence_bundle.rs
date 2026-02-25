@@ -43,19 +43,22 @@
 //!   carried in the envelope (RFC-0032::REQ-0210).
 //! - [INV-EB-008] Import independently verifies that when `exceeded_policy` is
 //!   false, actual values (`actual_export_bytes`, `actual_export_classes`,
-//!   `actual_leakage_bits`) are within the policy ceilings (RFC-0032::REQ-0210).
+//!   `actual_leakage_bits`) are within the policy ceilings
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-009] Import cross-checks `actual_export_classes` against the count
 //!   of `blob_refs` in the envelope plus fixed overhead (RFC-0032::REQ-0210).
 //! - [INV-EB-010] Import cross-checks `actual_leakage_bits` against the
 //!   `leakage_budget_receipt` in the boundary check (RFC-0032::REQ-0210).
 //! - [INV-EB-011] Export converges `actual_export_bytes` to match the final
-//!   serialized envelope size via iterative re-measurement (RFC-0032::REQ-0210).
+//!   serialized envelope size via iterative re-measurement
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-012] Import recomputes the canonical envelope byte size from the
 //!   serialized data and requires `actual_export_bytes` to match, preventing
 //!   forged byte values from bypassing policy enforcement (RFC-0032::REQ-0210).
 //! - [INV-EB-013] Export-time declassification validation always checks
 //!   `authorized_leakage_bits >= actual_leakage_bits` when a receipt is
-//!   present, regardless of which dimension triggered exceedance (RFC-0032::REQ-0210).
+//!   present, regardless of which dimension triggered exceedance
+//!   (RFC-0032::REQ-0210).
 //! - [INV-EB-014] Import rejects new-schema envelopes
 //!   (`EVIDENCE_BUNDLE_ENVELOPE_SCHEMA`) that are missing
 //!   `leakage_budget_decision`. Legacy envelopes (`EVIDENCE_BUNDLE_SCHEMA`) are
@@ -232,7 +235,8 @@ impl Default for LeakageBudgetPolicy {
     }
 }
 
-/// Declassification receipt for export-time budget overrides (RFC-0032::REQ-0210).
+/// Declassification receipt for export-time budget overrides
+/// (RFC-0032::REQ-0210).
 ///
 /// When an evidence export exceeds the configured [`LeakageBudgetPolicy`]
 /// ceilings, the caller must provide this receipt to authorize the export.
@@ -580,7 +584,8 @@ pub enum EvidenceBundleError {
         operation: String,
     },
 
-    /// Receipt signature verification failed during import (RFC-0032::REQ-0226).
+    /// Receipt signature verification failed during import
+    /// (RFC-0032::REQ-0226).
     ///
     /// Fail-closed: evidence bundle import requires a valid signed receipt
     /// envelope. This prevents forged or unsigned receipts from being
@@ -627,7 +632,8 @@ pub struct EvidenceBundleEnvelopeV1 {
     pub policy_binding: Option<BoundaryFlowPolicyBinding>,
     /// Content-addressed blob references (hex-encoded BLAKE3 hashes).
     pub blob_refs: Vec<String>,
-    /// Leakage budget decision from export-time enforcement (RFC-0032::REQ-0210).
+    /// Leakage budget decision from export-time enforcement
+    /// (RFC-0032::REQ-0210).
     ///
     /// Present when the export was subject to leakage budget policy
     /// enforcement. Import-side validation uses this to verify that the
@@ -704,7 +710,8 @@ pub struct BundleExportConfig {
     pub timing_channel_budget: Option<TimingChannelBudget>,
     /// Disclosure-control policy interlock binding.
     pub disclosure_policy_binding: Option<DisclosurePolicyBinding>,
-    /// Leakage budget policy ceiling for export-time enforcement (RFC-0032::REQ-0210).
+    /// Leakage budget policy ceiling for export-time enforcement
+    /// (RFC-0032::REQ-0210).
     ///
     /// **Required for new-schema output** (INV-EB-025): export fails closed
     /// when this is `None`. Callers must supply a policy, even if permissive
@@ -942,7 +949,8 @@ pub fn build_evidence_bundle_envelope(
     Ok(envelope)
 }
 
-/// INV-EB-006: Enforce leakage budget policy at export time (RFC-0032::REQ-0210).
+/// INV-EB-006: Enforce leakage budget policy at export time
+/// (RFC-0032::REQ-0210).
 ///
 /// Enforcement is deferred: the caller invokes this before the content
 /// hash is populated, records the preliminary decision, then — after
@@ -1113,7 +1121,8 @@ fn enforce_leakage_budget_final(
 /// the leakage-bit dimension itself exceeded its policy ceiling. This
 /// ensures export-time validation is consistent with import-time validation,
 /// which always checks `authorized_leakage_bits >= actual_leakage_bits`
-/// when declassification is authorized (RFC-0032::REQ-0210, security finding MINOR).
+/// when declassification is authorized (RFC-0032::REQ-0210, security finding
+/// MINOR).
 fn validate_declassification_receipt(
     declass: &DeclassificationExportReceipt,
     actual_bytes: u64,
@@ -1890,7 +1899,8 @@ fn validate_economics_traces(
     Ok(())
 }
 
-/// Validate the leakage budget decision embedded in the envelope (RFC-0032::REQ-0210).
+/// Validate the leakage budget decision embedded in the envelope
+/// (RFC-0032::REQ-0210).
 ///
 /// INV-EB-007: When a leakage budget decision is present, validate:
 /// - `actual_export_bytes` must equal the canonical envelope byte size
@@ -5553,8 +5563,8 @@ pub mod tests {
     }
 
     // =========================================================================
-    // RFC-0032::REQ-0210 MAJOR: Import rejects forged actual_export_bytes (canonical
-    // envelope byte size mismatch)
+    // RFC-0032::REQ-0210 MAJOR: Import rejects forged actual_export_bytes
+    // (canonical envelope byte size mismatch)
     // =========================================================================
 
     #[test]

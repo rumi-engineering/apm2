@@ -181,7 +181,8 @@ pub struct AdmissionKernelV1 {
     anti_rollback: Option<Arc<dyn AntiRollbackAnchor>>,
     /// Quarantine capacity guard (fail-closed on error for fail-closed tiers).
     quarantine_guard: Option<Arc<dyn QuarantineGuard>>,
-    /// Effect execution journal for crash-safe state tracking (RFC-0032::REQ-0176).
+    /// Effect execution journal for crash-safe state tracking
+    /// (RFC-0032::REQ-0176).
     ///
     /// When wired, the kernel records effect execution transitions
     /// (`Started` before effect dispatch, `Completed` after success)
@@ -343,7 +344,8 @@ impl AdmissionKernelV1 {
             provider_build_digest: self.witness_provider.provider_build_digest,
         };
 
-        // Phase E.1: Validate witness seeds at join (RFC-0020::REQ-0058 QUALITY BLOCKER 1).
+        // Phase E.1: Validate witness seeds at join (RFC-0020::REQ-0058 QUALITY BLOCKER
+        // 1).
         //
         // For fail-closed tiers: deny if seeds are zero, unbound, or have
         // reused nonces. This is the critical gate that prevents requests

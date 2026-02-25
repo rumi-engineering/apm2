@@ -47,10 +47,10 @@
 //! implemented, which will derive risk tiers from changeset metadata (file
 //! paths, module criticality, dependency fanout).
 //!
-//! **Waiver**: RFC-0032::REQ-0131 v9 MAJOR — Role-based tier mapping is a tracked
-//! transitional measure. The waiver scope is bounded to Phase 1 single-node
-//! operation and MUST NOT be carried forward into multi-tenant or cross-node
-//! federation without full RFC-0019 governance resolution.
+//! **Waiver**: RFC-0032::REQ-0131 v9 MAJOR — Role-based tier mapping is a
+//! tracked transitional measure. The waiver scope is bounded to Phase 1
+//! single-node operation and MUST NOT be carried forward into multi-tenant or
+//! cross-node federation without full RFC-0019 governance resolution.
 
 use apm2_core::fac::fac_workobject_implementor_v2_role_contract;
 use tracing::warn;

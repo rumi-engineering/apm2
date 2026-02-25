@@ -48,7 +48,8 @@ pub struct SchedulerStateV1 {
     /// Epoch seconds of persistence.
     pub persisted_at_secs: u64,
     /// RFC-0032::REQ-0188: Per-job-kind cost model for queue admission.
-    /// Optional for backward compatibility with pre-RFC-0032::REQ-0188 state files.
+    /// Optional for backward compatibility with pre-RFC-0032::REQ-0188 state
+    /// files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_model: Option<CostModelV1>,
     /// BLAKE3 content hash for integrity.

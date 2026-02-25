@@ -98,7 +98,8 @@ pub mod broker_rate_limits;
 pub mod builtin_profiles;
 pub mod builtin_roles;
 mod canonicalizer_tuple;
-/// Read-only bounded reader for APM2 daemon CAS filesystem layout (RFC-0032::REQ-0201).
+/// Read-only bounded reader for APM2 daemon CAS filesystem layout
+/// (RFC-0032::REQ-0201).
 pub mod cas_reader;
 /// Cgroup v2 usage accounting: cpu/mem/IO/tasks stats per job for economics
 /// calibration (RFC-0032::REQ-0222).
@@ -136,7 +137,8 @@ pub mod gc;
 /// Garbage-collection receipt schema and persistence helpers.
 #[allow(missing_docs)]
 pub mod gc_receipt;
-/// Non-interactive, lane-scoped GitHub CLI command builder (RFC-0032::REQ-0246).
+/// Non-interactive, lane-scoped GitHub CLI command builder
+/// (RFC-0032::REQ-0246).
 pub mod gh_cli;
 /// Git safety hardening for lane workspaces (RFC-0032::REQ-0230).
 pub mod git_hardening;
@@ -185,7 +187,8 @@ pub mod receipt_index;
 /// Receipt stream merge: set-union merge with deterministic ordering and
 /// conflict audit report (RFC-0032::REQ-0199).
 pub mod receipt_merge;
-/// Atomic receipt write pipeline for crash-safe job completion (RFC-0032::REQ-0215).
+/// Atomic receipt write pipeline for crash-safe job completion
+/// (RFC-0032::REQ-0215).
 pub mod receipt_pipeline;
 /// Crash recovery and reconciliation for queue/lane state on worker startup
 /// (RFC-0032::REQ-0190).
@@ -206,7 +209,8 @@ pub mod scheduler_state;
 pub mod sd_notify;
 pub mod selection_policy;
 pub mod serde_helpers;
-/// Service user ownership gate for receipt and queue directories (RFC-0032::REQ-0227).
+/// Service user ownership gate for receipt and queue directories
+/// (RFC-0032::REQ-0227).
 ///
 /// Enforces that only the FAC service user can directly write to queue and
 /// receipt directories. Non-service-user CLI processes must use broker-mediated
@@ -218,7 +222,8 @@ pub mod systemd_unit;
 pub mod taint;
 mod terminal_verifier;
 pub mod token_ledger;
-/// Toolchain fingerprint derivation, caching, and verification (RFC-0032::REQ-0194).
+/// Toolchain fingerprint derivation, caching, and verification
+/// (RFC-0032::REQ-0194).
 pub mod toolchain_fingerprint;
 pub mod transcript_binding;
 pub mod warm;
@@ -321,7 +326,8 @@ pub use ci_import::{
     CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
     MAX_WORKFLOW_RUN_ID_LENGTH, can_transition_to_ready_for_review, validate_ci_import,
 };
-// Re-export containment verification types (RFC-0032::REQ-0203, RFC-0032::REQ-0208, RFC-0032::REQ-0209)
+// Re-export containment verification types (RFC-0032::REQ-0203, RFC-0032::REQ-0208,
+// RFC-0032::REQ-0209)
 pub use containment::{
     ContainmentError, ContainmentMismatch, ContainmentTrace, ContainmentVerdict,
     MAX_CHILD_PROCESSES, MAX_CONTAINMENT_MISMATCHES, MAX_PROC_READ_SIZE, MAX_PROC_SCAN_ENTRIES,

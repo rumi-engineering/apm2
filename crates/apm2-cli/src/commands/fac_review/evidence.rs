@@ -44,9 +44,10 @@ use super::timeout_policy::{
 use super::types::now_iso8601;
 
 /// Env var keys unconditionally stripped from ALL gate phases as
-/// defense-in-depth against wrapper injection (RFC-0032::REQ-0185, RFC-0032::REQ-0203). These are
-/// stripped by `build_job_environment` at the policy level AND by
-/// `env_remove()` on the spawned `Command` for belt-and-suspenders containment.
+/// defense-in-depth against wrapper injection (RFC-0032::REQ-0185,
+/// RFC-0032::REQ-0203). These are stripped by `build_job_environment` at the
+/// policy level AND by `env_remove()` on the spawned `Command` for
+/// belt-and-suspenders containment.
 const WRAPPER_STRIP_KEYS: &[&str] = &["RUSTC_WRAPPER"];
 
 /// Prefix for env vars unconditionally stripped from ALL gate phases.
@@ -152,11 +153,11 @@ pub struct EvidenceGateOptions {
     /// progress instead of buffering all events until `run_evidence_gates`
     /// returns.
     pub on_gate_progress: Option<Box<dyn Fn(GateProgressEvent) + Send>>,
-    /// RFC-0032::REQ-0196 fix round 3: Gate resource policy for attestation digest
-    /// computation during cache-reuse decisions. When `Some`, enables
-    /// cache-reuse in `run_evidence_gates_with_lane_context` so that the
-    /// fail-closed receipt-binding policy is evaluated against attested cache
-    /// entries.
+    /// RFC-0032::REQ-0196 fix round 3: Gate resource policy for attestation
+    /// digest computation during cache-reuse decisions. When `Some`,
+    /// enables cache-reuse in `run_evidence_gates_with_lane_context` so
+    /// that the fail-closed receipt-binding policy is evaluated against
+    /// attested cache entries.
     pub gate_resource_policy: Option<GateResourcePolicy>,
 }
 
@@ -397,8 +398,9 @@ pub(super) fn cache_v3_root() -> Option<std::path::PathBuf> {
 }
 
 // cache_v2_root removed: v2 fallback loading disabled in evidence pipeline
-// ([INV-GCV3-001] RFC-0032::REQ-0197 MAJOR security fix round 4). V2 entries lack
-// RFC-0028/0029 binding proof and cannot satisfy v3 compound-key continuity.
+// ([INV-GCV3-001] RFC-0032::REQ-0197 MAJOR security fix round 4). V2 entries
+// lack RFC-0028/0029 binding proof and cannot satisfy v3 compound-key
+// continuity.
 
 /// Try to reuse from v3 cache; v2 is structurally excluded.
 ///
@@ -1214,11 +1216,13 @@ struct PipelineTestCommand {
     test_env: Vec<(String, String)>,
     /// Env var keys to remove from the spawned process environment.
     /// Prevents parent env inheritance of `sccache`/`RUSTC_WRAPPER` keys
-    /// that could bypass the bounded test's cgroup containment (RFC-0032::REQ-0203).
+    /// that could bypass the bounded test's cgroup containment
+    /// (RFC-0032::REQ-0203).
     env_remove_keys: Vec<String>,
     /// BLAKE3 hex hash of the effective `SandboxHardeningProfile` used for
     /// bounded test execution. Carried through so attestation binds to the
-    /// actual policy-driven profile, not a default (RFC-0032::REQ-0223 MAJOR-1 fix).
+    /// actual policy-driven profile, not a default (RFC-0032::REQ-0223 MAJOR-1
+    /// fix).
     sandbox_hardening_hash: String,
     /// BLAKE3 hex hash of the effective `NetworkPolicy` used for gate
     /// execution. Carried through so attestation binds to the actual
@@ -1273,10 +1277,10 @@ fn build_pipeline_test_command(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR, XDG_CACHE_HOME,
-    // XDG_CONFIG_HOME). Uses the lane directory from the actually-locked lane
-    // to maintain lock/env coupling (round 2 fix: was previously hardcoded
-    // to lane-00).
+    // RFC-0032::REQ-0225: Apply per-lane env isolation (HOME, TMPDIR,
+    // XDG_CACHE_HOME, XDG_CONFIG_HOME). Uses the lane directory from the
+    // actually-locked lane to maintain lock/env coupling (round 2 fix: was
+    // previously hardcoded to lane-00).
     super::policy_loader::apply_review_lane_environment(
         &mut policy_env,
         lane_dir,
@@ -1295,10 +1299,11 @@ fn build_pipeline_test_command(
     // so attestation binds to the actual policy-driven profile.
     let sandbox_hardening_hash = policy.sandbox_hardening.content_hash_hex();
 
-    // RFC-0032::REQ-0224: Resolve network policy for evidence gates with operator override.
-    // Compute the hash BEFORE the policy is moved into the bounded test command
-    // builder, so attestation binds to the actual policy-driven network posture
-    // (MAJOR-1 fix: attestation digest must change when network policy changes).
+    // RFC-0032::REQ-0224: Resolve network policy for evidence gates with operator
+    // override. Compute the hash BEFORE the policy is moved into the bounded
+    // test command builder, so attestation binds to the actual policy-driven
+    // network posture (MAJOR-1 fix: attestation digest must change when network
+    // policy changes).
     let evidence_network_policy =
         apm2_core::fac::resolve_network_policy("gates", policy.network_policy.as_ref());
     let network_policy_hash = evidence_network_policy.content_hash_hex();
@@ -1686,12 +1691,15 @@ fn build_rustfmt_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
 
 fn build_doc_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
     let mut command = vec![
+        "env".to_string(),
+        "RUSTFLAGS=-Dmissing_docs".to_string(),
         "cargo".to_string(),
-        "doc".to_string(),
+        "check".to_string(),
         "--offline".to_string(),
     ];
     append_scope_package_args(&mut command, scope);
-    command.push("--no-deps".to_string());
+    command.push("--all-targets".to_string());
+    command.push("--all-features".to_string());
     command
 }
 
@@ -1826,8 +1834,8 @@ fn build_gate_policy_env(
     let ambient: Vec<(String, String)> = std::env::vars().collect();
     let mut policy_env = build_job_environment(&policy, &ambient, &apm2_home);
 
-    // RFC-0032::REQ-0225: Apply per-lane env isolation for all evidence gate phases.
-    // Uses the lane directory from the actually-locked lane to maintain
+    // RFC-0032::REQ-0225: Apply per-lane env isolation for all evidence gate
+    // phases. Uses the lane directory from the actually-locked lane to maintain
     // lock/env coupling (round 2 fix: was previously hardcoded to lane-00).
     super::policy_loader::apply_review_lane_environment(
         &mut policy_env,
@@ -2019,10 +2027,10 @@ fn finalize_status_gate_run(
     // Force a final update to ensure all gate results are posted.
     updater.force_update(status);
 
-    // RFC-0032::REQ-0197: Persist v3 gate cache as the primary (receipt-indexed) store.
-    // V3 is written first and treated as the authoritative cache. V2 follows
-    // as backward-compatible fallback for push.rs / gates.rs callers that
-    // have not yet been migrated to v3.
+    // RFC-0032::REQ-0197: Persist v3 gate cache as the primary (receipt-indexed)
+    // store. V3 is written first and treated as the authoritative cache. V2
+    // follows as backward-compatible fallback for push.rs / gates.rs callers
+    // that have not yet been migrated to v3.
     if let Some(v3) = v3_gate_cache {
         // Populate v3 from the in-memory gate_cache entries (which contain
         // backfilled metadata from the step above). V3 entries are
@@ -2326,8 +2334,10 @@ pub(super) fn run_evidence_gates_with_lane_context(
 
     // Fastest-first ordering for cargo-backed gates.
     // rustfmt/doc/clippy/test are scoped or skipped based on cargo impact.
-    // doc is skipped for package-scoped pushes to stay within gate latency
-    // SLO (override with APM2_FAC_FORCE_DOC_GATE=1).
+    // doc gate uses `cargo check` + `-Dmissing_docs` to avoid generating
+    // `target/doc` artifacts while still enforcing documentation coverage.
+    // It remains skipped for package-scoped pushes to preserve latency SLO
+    // (override with APM2_FAC_FORCE_DOC_GATE=1).
     let phase2_gate_specs = vec![
         Phase2GateSpec {
             gate_name: "rustfmt",
@@ -2481,7 +2491,8 @@ pub(super) fn run_evidence_gates_with_lane_context(
     }
 
     // Phase 2: cargo fmt/doc/clippy — all receive the policy-filtered env
-    // and wrapper-stripping keys (RFC-0032::REQ-0185: defense-in-depth for all gates).
+    // and wrapper-stripping keys (RFC-0032::REQ-0185: defense-in-depth for all
+    // gates).
     //
     // RFC-0032::REQ-0224 BLOCKER fix: In full (non-quick) mode, wrap non-test gates
     // in systemd-run with network policy isolation directives to enforce
@@ -3097,7 +3108,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let pipeline_test_command =
         build_pipeline_test_command(workspace_root, &lane_context.lane_dir)?;
 
-    // RFC-0032::REQ-0197: Build v3 compound key and load v3 cache (with v2 fallback).
+    // RFC-0032::REQ-0197: Build v3 compound key and load v3 cache (with v2
+    // fallback).
     let v3_compound_key = compute_v3_compound_key(
         workspace_root,
         sha,
@@ -3124,9 +3136,9 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
     let mut v3_gate_cache = v3_compound_key
         .as_ref()
         .and_then(|ck| GateCacheV3::new(sha, ck.clone()).ok());
-    // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate attestation
-    // to prevent stale gate results from insecure environments being reused.
-    // Uses the effective policy-driven profile carried through
+    // RFC-0032::REQ-0223 MAJOR-3: Include sandbox hardening hash in gate
+    // attestation to prevent stale gate results from insecure environments
+    // being reused. Uses the effective policy-driven profile carried through
     // PipelineTestCommand (MAJOR-1 fix: was previously default()).
     let sandbox_hardening_hash = &pipeline_test_command.sandbox_hardening_hash;
     // RFC-0032::REQ-0224 MAJOR-1: Include network policy hash in gate attestation
@@ -3399,8 +3411,8 @@ pub(super) fn run_evidence_gates_with_status_with_lane_context(
         }
     }
 
-    // RFC-0032::REQ-0224 BLOCKER fix: Build bounded gate commands for non-test gates
-    // to enforce network-deny in the pipeline path (always full mode).
+    // RFC-0032::REQ-0224 BLOCKER fix: Build bounded gate commands for non-test
+    // gates to enforce network-deny in the pipeline path (always full mode).
     #[allow(clippy::type_complexity)]
     let pipeline_bounded_gate_specs: Vec<(String, Vec<String>, Vec<(String, String)>)> = {
         let apm2_home = apm2_core::github::resolve_apm2_home().ok_or_else(|| {
@@ -4132,9 +4144,10 @@ mod tests {
         assert!(nextest.contains("--offline"));
         assert!(nextest.contains("-p apm2-cli"));
         assert!(!nextest.contains("--workspace"));
-        assert!(doc.contains("cargo doc"));
+        assert!(doc.contains("env RUSTFLAGS=-Dmissing_docs cargo check"));
         assert!(doc.contains("-p apm2-cli"));
-        assert!(doc.contains("--no-deps"));
+        assert!(doc.contains("--all-targets"));
+        assert!(doc.contains("--all-features"));
         assert!(doc.contains("--offline"));
         assert!(!doc.contains("--workspace"));
         assert!(clippy.contains("cargo clippy"));
@@ -4454,7 +4467,8 @@ mod tests {
     }
 
     // =========================================================================
-    // RFC-0032::REQ-0197 BLOCKER regression: v3-only cache hits must succeed without v2
+    // RFC-0032::REQ-0197 BLOCKER regression: v3-only cache hits must succeed
+    // without v2
     // =========================================================================
 
     /// Prove that when v3 has a valid signed entry but v2 is absent,
@@ -4640,9 +4654,9 @@ mod tests {
     /// [INV-GCV3-001] Prove that when v3 misses and v2 has a signed entry,
     /// v2 fallback is denied for reuse (security: no binding continuity proof).
     ///
-    /// RFC-0032::REQ-0197 MAJOR fix: v2 entries lack RFC-0028/0029 binding proof and
-    /// cannot satisfy v3 compound-key continuity requirements. The gate
-    /// must be re-executed under v3 with full bindings.
+    /// RFC-0032::REQ-0197 MAJOR fix: v2 entries lack RFC-0028/0029 binding
+    /// proof and cannot satisfy v3 compound-key continuity requirements.
+    /// The gate must be re-executed under v3 with full bindings.
     #[test]
     fn v2_fallback_denied_when_v3_misses() {
         use apm2_core::crypto::Signer;

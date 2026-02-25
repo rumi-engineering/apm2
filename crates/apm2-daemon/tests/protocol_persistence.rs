@@ -88,8 +88,8 @@ async fn test_persistence_end_to_end() {
     }
 
     // 5. SpawnEpisode (to get session_id)
-    // RFC-0032::REQ-0091: Now that we have persistence, SpawnEpisode should validate the
-    // lease. For GateExecutor, it checks ledger events.
+    // RFC-0032::REQ-0091: Now that we have persistence, SpawnEpisode should
+    // validate the lease. For GateExecutor, it checks ledger events.
     // Our SqliteLeaseValidator queries ledger_events.
     // However, currently SqliteLeaseValidator checks for 'gate_lease_issued' event
     // type. ClaimWork emits 'work_claimed'.
@@ -195,9 +195,9 @@ async fn test_persistence_end_to_end() {
     };
 
     // 6. IssueCapability
-    // RFC-0032::REQ-0091: Verify that IssueCapability succeeds with persistent registry
-    // validation. The previous steps established a valid Implementer session
-    // (session_id) backed by a persistent work claim.
+    // RFC-0032::REQ-0091: Verify that IssueCapability succeeds with persistent
+    // registry validation. The previous steps established a valid Implementer
+    // session (session_id) backed by a persistent work claim.
     //
     // Only tested when the adapter spawn succeeds (i.e. `claude` is on PATH).
     if let Some(session_id) = maybe_session_id {

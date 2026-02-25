@@ -969,8 +969,8 @@ mod tests {
         }
     }
 
-    /// Test that UID validation uses constant-time comparison (RFC-0032::REQ-0064,
-    /// SEC-DCP-002).
+    /// Test that UID validation uses constant-time comparison
+    /// (RFC-0032::REQ-0064, SEC-DCP-002).
     ///
     /// This unit test verifies the constant-time comparison logic by testing
     /// that the XOR-based byte comparison works correctly for matching and

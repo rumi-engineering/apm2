@@ -933,11 +933,11 @@ impl WorkerOrchestrator {
             ));
         }
 
-        // Step 2.5: Enforce admitted policy binding (INV-PADOPT-004, RFC-0032::REQ-0214).
-        // Workers MUST fail-closed when the actuation token's policy binding
-        // does not match the admitted digest. This prevents policy drift where
-        // tokens issued under an old policy continue to authorize actuation
-        // after a new policy has been adopted.
+        // Step 2.5: Enforce admitted policy binding (INV-PADOPT-004,
+        // RFC-0032::REQ-0214). Workers MUST fail-closed when the actuation
+        // token's policy binding does not match the admitted digest. This
+        // prevents policy drift where tokens issued under an old policy
+        // continue to authorize actuation after a new policy has been adopted.
         if !apm2_core::fac::is_policy_hash_admitted(fac_root, policy_hash) {
             let reason = format!(
                 "policy hash not admitted (INV-PADOPT-004): worker policy_hash={policy_hash} is not \
@@ -1372,8 +1372,8 @@ impl WorkerOrchestrator {
 
         // Validate boundary check defects.
         let defects = validate_channel_boundary(&boundary_check);
-        // RFC-0032::REQ-0216: Include decoded token binding in the boundary trace for receipt
-        // audit.
+        // RFC-0032::REQ-0216: Include decoded token binding in the boundary trace for
+        // receipt audit.
         let boundary_trace = build_channel_boundary_trace_with_binding(
             &defects,
             boundary_check.token_binding.as_ref(),
@@ -2144,9 +2144,10 @@ impl WorkerOrchestrator {
             .compute_hash()
             .unwrap_or_else(|_| "b3-256:unknown".to_string());
 
-        // RFC-0032::REQ-0194: Use toolchain fingerprint from worker startup for lane lease.
-        // Worker startup is fail-closed (refuses to start without fingerprint), so
-        // this should always be Some. The unwrap_or is defensive only.
+        // RFC-0032::REQ-0194: Use toolchain fingerprint from worker startup for lane
+        // lease. Worker startup is fail-closed (refuses to start without
+        // fingerprint), so this should always be Some. The unwrap_or is
+        // defensive only.
         let toolchain_fp_for_lease = toolchain_fingerprint.unwrap_or("b3-256:unknown");
         let lane_lease = match build_running_lane_lease(
             &acquired_lane_id,
@@ -3025,7 +3026,8 @@ impl WorkerOrchestrator {
         // Persist the gate receipt alongside the completed job (before atomic commit).
         write_gate_receipt(queue_root, &claimed_file_name, &gate_receipt);
 
-        // RFC-0032::REQ-0194: Include toolchain fingerprint in the completed job receipt.
+        // RFC-0032::REQ-0194: Include toolchain fingerprint in the completed job
+        // receipt.
         if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
             fac_root,
             queue_root,

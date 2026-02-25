@@ -86,8 +86,8 @@ fn test_ensure_queue_dirs_creates_all() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 5: `ensure_queue_dirs` creates `broker_requests/` with
-/// mode 01733 (sticky + world-writable) on Unix.
+/// RFC-0032::REQ-0227 round 5: `ensure_queue_dirs` creates `broker_requests/`
+/// with mode 01733 (sticky + world-writable) on Unix.
 #[cfg(unix)]
 #[test]
 fn test_ensure_queue_dirs_broker_requests_mode_01733() {
@@ -109,8 +109,8 @@ fn test_ensure_queue_dirs_broker_requests_mode_01733() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 6: `ensure_queue_dirs` creates `queue/` with mode 0711
-/// (traverse-only for group/other) so non-service-user callers can reach
+/// RFC-0032::REQ-0227 round 6: `ensure_queue_dirs` creates `queue/` with mode
+/// 0711 (traverse-only for group/other) so non-service-user callers can reach
 /// `broker_requests/`.
 #[cfg(unix)]
 #[test]
@@ -2834,8 +2834,8 @@ fn test_other_errors_map_to_validation_failed() {
     );
 }
 
-/// RFC-0032::REQ-0215 MAJOR-1 regression: denied receipt + pending job must route
-/// to denied/, NOT completed/.
+/// RFC-0032::REQ-0215 MAJOR-1 regression: denied receipt + pending job must
+/// route to denied/, NOT completed/.
 ///
 /// Prior to fix round 4, the duplicate detection in the worker execution path
 /// used `has_receipt_for_job` (boolean) and unconditionally moved duplicates
@@ -3901,9 +3901,10 @@ fn promote_broker_request_uses_enqueue_lock() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 3: Regression test proving broker promotion respects
-/// non-default configured queue bounds policy. Uses `max_pending_jobs=1`
-/// so that with 1 existing pending job, broker promotion denies.
+/// RFC-0032::REQ-0227 round 3: Regression test proving broker promotion
+/// respects non-default configured queue bounds policy. Uses
+/// `max_pending_jobs=1` so that with 1 existing pending job, broker promotion
+/// denies.
 #[test]
 fn promote_broker_request_denied_by_configured_policy() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3999,9 +4000,9 @@ fn promote_broker_request_allowed_by_configured_policy_under_cap() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 9 BLOCKER fix: Verify that non-regular files (FIFOs)
-/// in `broker_requests/` are quarantined without attempting to open them.
-/// An attacker can create a FIFO in the world-writable `broker_requests/`
+/// RFC-0032::REQ-0227 round 9 BLOCKER fix: Verify that non-regular files
+/// (FIFOs) in `broker_requests/` are quarantined without attempting to open
+/// them. An attacker can create a FIFO in the world-writable `broker_requests/`
 /// (mode 01733) directory. Without the pre-open file type check, opening
 /// a FIFO blocks indefinitely (deadlocking the worker).
 #[test]
@@ -4102,8 +4103,8 @@ fn promote_broker_request_quarantines_symlink() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 5 MAJOR fix: `ServiceUserNotResolved` must produce a
-/// fail-closed error message, not a warning. This test exercises the
+/// RFC-0032::REQ-0227 round 5 MAJOR fix: `ServiceUserNotResolved` must produce
+/// a fail-closed error message, not a warning. This test exercises the
 /// error variant format string to ensure the error path compiles and
 /// produces the expected diagnostic message pattern.
 #[test]
@@ -4405,9 +4406,9 @@ fn ensure_queue_dirs_fresh_creation_sets_correct_modes() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 11 MAJOR regression: Pre-existing `broker_requests/`
-/// with an unsafe mode (0333 - world-writable, no sticky bit) must be
-/// hardened to 01733 by `ensure_queue_dirs` at worker startup.
+/// RFC-0032::REQ-0227 round 11 MAJOR regression: Pre-existing
+/// `broker_requests/` with an unsafe mode (0333 - world-writable, no sticky
+/// bit) must be hardened to 01733 by `ensure_queue_dirs` at worker startup.
 ///
 /// Steps:
 /// 1. Create `broker_requests/` with unsafe mode 0333.
@@ -4631,7 +4632,8 @@ fn ensure_queue_dirs_passes_relaxed_preflight_mode_check() {
 }
 
 // =========================================================================
-// Broker promotion: service-user-owned rewrite (RFC-0032::REQ-0227 round 12 BLOCKER)
+// Broker promotion: service-user-owned rewrite (RFC-0032::REQ-0227 round 12
+// BLOCKER)
 // =========================================================================
 
 /// RFC-0032::REQ-0227 round 12 BLOCKER fix: After broker promotion, the file in
@@ -4693,8 +4695,8 @@ fn promoted_broker_request_has_mode_0600_in_pending() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 12 BLOCKER fix: After promotion, the original broker
-/// request file must be removed from `broker_requests/`.
+/// RFC-0032::REQ-0227 round 12 BLOCKER fix: After promotion, the original
+/// broker request file must be removed from `broker_requests/`.
 #[test]
 fn promoted_broker_request_removes_original_file() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4814,8 +4816,8 @@ fn promote_via_rewrite_does_not_clobber_existing_pending() {
     );
 }
 
-/// RFC-0032::REQ-0227 round 12: Verify promoted file content matches validated input
-/// bytes.
+/// RFC-0032::REQ-0227 round 12: Verify promoted file content matches validated
+/// input bytes.
 #[test]
 fn promote_via_rewrite_preserves_content() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4843,8 +4845,8 @@ fn promote_via_rewrite_preserves_content() {
 // (RFC-0032::REQ-0227 round 16)
 // =========================================================================
 
-/// MAJOR fix (RFC-0032::REQ-0227 round 16): Filling `broker_requests/` with N junk
-/// entries (non-.json) plus 1 valid entry must still promote the valid
+/// MAJOR fix (RFC-0032::REQ-0227 round 16): Filling `broker_requests/` with N
+/// junk entries (non-.json) plus 1 valid entry must still promote the valid
 /// entry. Junk entries drain separately from the candidate cap.
 #[test]
 fn promote_broker_request_not_starved_by_junk_entries() {
@@ -4956,11 +4958,12 @@ fn promote_broker_request_respects_independent_caps() {
 // (RFC-0032::REQ-0227 round 16)
 // =========================================================================
 
-/// BLOCKER fix (RFC-0032::REQ-0227 round 16): Verify that `promote_broker_requests`
-/// successfully reads and promotes a file created with mode 0640 (the new
-/// broker file mode for cross-user deployments). In same-user tests (test
-/// process == broker file owner), the file is always readable. This test
-/// verifies the promotion path works end-to-end with the new mode.
+/// BLOCKER fix (RFC-0032::REQ-0227 round 16): Verify that
+/// `promote_broker_requests` successfully reads and promotes a file created
+/// with mode 0640 (the new broker file mode for cross-user deployments). In
+/// same-user tests (test process == broker file owner), the file is always
+/// readable. This test verifies the promotion path works end-to-end with the
+/// new mode.
 #[cfg(unix)]
 #[test]
 fn promote_broker_request_reads_mode_0640_file() {

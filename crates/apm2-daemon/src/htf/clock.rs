@@ -1360,8 +1360,8 @@ mod tests {
         }
     }
 
-    /// RFC-0016::REQ-0002 acceptance criterion: `observed_ledger_head()` returns
-    /// `LedgerTime` using `LedgerBackend::head()`.
+    /// RFC-0016::REQ-0002 acceptance criterion: `observed_ledger_head()`
+    /// returns `LedgerTime` using `LedgerBackend::head()`.
     #[tokio::test]
     async fn tck_00240_observed_ledger_head_with_in_memory_backend() {
         let backend = Arc::new(StubLedgerBackend::new(42));
@@ -1440,8 +1440,8 @@ mod tests {
     // RFC-0016::REQ-0002 Security: HLC drift protection
     // =========================================================================
 
-    /// RFC-0016::REQ-0002 security: Verify that malicious future HLC timestamps are
-    /// rejected.
+    /// RFC-0016::REQ-0002 security: Verify that malicious future HLC timestamps
+    /// are rejected.
     ///
     /// Per `documents/security/THREAT_MODEL.cac.json`, time is treated as an
     /// adversarial input. A
@@ -1490,8 +1490,8 @@ mod tests {
         }
     }
 
-    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps within acceptable drift
-    /// are accepted.
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps within
+    /// acceptable drift are accepted.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn tck_00240_receive_hlc_accepts_reasonable_drift() {
@@ -1521,8 +1521,8 @@ mod tests {
         assert!(updated.wall_ns >= reasonable_hlc.wall_ns);
     }
 
-    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps clearly past the boundary
-    /// are rejected.
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps clearly past the
+    /// boundary are rejected.
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn tck_00240_receive_hlc_past_boundary_drift() {
@@ -1551,8 +1551,8 @@ mod tests {
         );
     }
 
-    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps in the past are always
-    /// accepted (no drift concern).
+    /// RFC-0016::REQ-0002 security: Verify that HLC timestamps in the past are
+    /// always accepted (no drift concern).
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn tck_00240_receive_hlc_accepts_past_timestamps() {

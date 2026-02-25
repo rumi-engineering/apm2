@@ -102,9 +102,9 @@ pub const MAX_SEARCH_QUERY_LEN: usize = 1024;
 
 /// Maximum size for inline tool results (bytes).
 ///
-/// RFC-0032::REQ-0110: Security - enforces `DoS` protection per SEC-CTRL-FAC-0015.
-/// Inline results larger than this limit MUST be stored in CAS and
-/// referenced via `result_hash`. This prevents memory exhaustion from
+/// RFC-0032::REQ-0110: Security - enforces `DoS` protection per
+/// SEC-CTRL-FAC-0015. Inline results larger than this limit MUST be stored in
+/// CAS and referenced via `result_hash`. This prevents memory exhaustion from
 /// large tool outputs being held inline in IPC messages.
 pub const MAX_INLINE_RESULT_SIZE: usize = 64 * 1024; // 64 KB
 
@@ -161,8 +161,8 @@ pub struct BrokerToolRequest {
 
     /// Optional shell command for Execute operations.
     ///
-    /// Per RFC-0032::REQ-0070, when the tool class is Execute and the manifest has
-    /// a `shell_allowlist` configured, this field MUST be present for
+    /// Per RFC-0032::REQ-0070, when the tool class is Execute and the manifest
+    /// has a `shell_allowlist` configured, this field MUST be present for
     /// validation.
     pub shell_command: Option<String>,
 
@@ -197,7 +197,8 @@ pub struct BrokerToolRequest {
     /// to track monotonicity and detect equivocation.
     pub epoch_seal: Option<EpochSealV1>,
 
-    /// Optional typed tool operation for precondition enforcement (RFC-0020::REQ-0031).
+    /// Optional typed tool operation for precondition enforcement
+    /// (RFC-0020::REQ-0031).
     ///
     /// When present, the broker evaluates idempotency preconditions declared
     /// on this `ToolKind` **before** proceeding with capability/policy checks.
@@ -408,9 +409,9 @@ impl BrokerToolRequest {
 
     /// Sets the shell command for Execute operations.
     ///
-    /// Per RFC-0032::REQ-0070, when the tool class is Execute and `shell_allowlist` is
-    /// configured, this field is required for validation (fail-closed
-    /// semantics).
+    /// Per RFC-0032::REQ-0070, when the tool class is Execute and
+    /// `shell_allowlist` is configured, this field is required for
+    /// validation (fail-closed semantics).
     #[must_use]
     pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
         self.shell_command = Some(command.into());
@@ -465,7 +466,8 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the typed tool operation for precondition enforcement (RFC-0020::REQ-0031).
+    /// Sets the typed tool operation for precondition enforcement
+    /// (RFC-0020::REQ-0031).
     ///
     /// When set, the broker evaluates idempotency preconditions declared on
     /// this `ToolKind` before executing the tool. If the precondition fails,
@@ -476,7 +478,8 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the idempotency key for external deduplication (RFC-0032::REQ-0176).
+    /// Sets the idempotency key for external deduplication
+    /// (RFC-0032::REQ-0176).
     ///
     /// When set, external systems that support idempotency keys can use
     /// this to deduplicate effect execution during crash-recovery
@@ -1045,9 +1048,10 @@ impl fmt::Debug for Credential {
 
 impl PartialEq for Credential {
     fn eq(&self, other: &Self) -> bool {
-        // RFC-0032::REQ-0078: Use constant-time comparison to prevent timing side-channel
-        // attacks. Although credentials are primarily compared in test contexts,
-        // we use constant-time comparison as a defense-in-depth measure.
+        // RFC-0032::REQ-0078: Use constant-time comparison to prevent timing
+        // side-channel attacks. Although credentials are primarily compared in
+        // test contexts, we use constant-time comparison as a defense-in-depth
+        // measure.
         let a = self.0.expose_secret().as_bytes();
         let b = other.0.expose_secret().as_bytes();
 
@@ -1069,9 +1073,9 @@ impl Eq for Credential {}
 
 /// Session context for broker-mediated credential access.
 ///
-/// Per RFC-0032::REQ-0079 code review, session-specific state MUST NOT be stored in the
-/// `ToolBroker` struct to prevent cross-session credential leaks. Instead, the
-/// daemon passes session context to each `request()` call.
+/// Per RFC-0032::REQ-0079 code review, session-specific state MUST NOT be
+/// stored in the `ToolBroker` struct to prevent cross-session credential leaks.
+/// Instead, the daemon passes session context to each `request()` call.
 ///
 /// # Security
 ///
@@ -1153,7 +1157,8 @@ impl SessionContext {
 // VerifiedToolContent
 // =============================================================================
 
-/// TOCTOU-verified file content for a single broker request (RFC-0020::REQ-0029).
+/// TOCTOU-verified file content for a single broker request
+/// (RFC-0020::REQ-0029).
 ///
 /// Keys are normalized manifest-style paths. Values are the exact bytes that
 /// were hash-verified against the context manifest and are therefore safe to
@@ -1283,7 +1288,8 @@ pub enum ToolDecision {
         /// Resource budget to charge for this operation.
         budget_delta: BudgetDelta,
 
-        /// Optional credential for authenticated operations (RFC-0032::REQ-0078).
+        /// Optional credential for authenticated operations
+        /// (RFC-0032::REQ-0078).
         ///
         /// Per RFC-0017 TB-003, credentials are held by the daemon and
         /// mediated through the broker. When present, this credential
@@ -1542,8 +1548,8 @@ pub struct ToolResult {
 
     /// Reference to the `TimeEnvelope` for this result (RFC-0016 HTF).
     ///
-    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference for
-    /// temporal ordering and causality tracking.
+    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference
+    /// for temporal ordering and causality tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_envelope_ref: Option<TimeEnvelopeRef>,
 
@@ -1622,8 +1628,8 @@ impl ToolResult {
 
     /// Sets the time envelope for this result (RFC-0016 HTF).
     ///
-    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference for
-    /// temporal ordering and causality tracking. Both the preimage and
+    /// Per RFC-0016::REQ-0002, tool results include a time envelope reference
+    /// for temporal ordering and causality tracking. Both the preimage and
     /// reference are stored for verifiability.
     #[must_use]
     pub fn with_time_envelope(

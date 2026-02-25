@@ -621,7 +621,8 @@ mod tests {
     /// Regression: `read_boundary_id` (used by config show) must NOT create
     /// the `boundary_id` file or its parent directories when run against an
     /// empty APM2 home directory. This proves the read-only introspection
-    /// invariant required by RFC-0032::REQ-0240 (`out_of_scope: "Editing config"`).
+    /// invariant required by RFC-0032::REQ-0240 (`out_of_scope: "Editing
+    /// config"`).
     #[test]
     fn config_show_boundary_id_does_not_create_files_or_directories() {
         let home = tempfile::tempdir().expect("tempdir");

@@ -1360,7 +1360,8 @@ struct PersistedAnchorStateV1 {
     proof_hash: Hash,
 }
 
-/// Durable anti-rollback anchor provider (RFC-0019 REQ-0030, RFC-0032::REQ-0177).
+/// Durable anti-rollback anchor provider (RFC-0019 REQ-0030,
+/// RFC-0032::REQ-0177).
 ///
 /// Persists the external anchor state to a file using atomic write protocol
 /// (temp + rename). On `verify_committed()`, compares the requested anchor
@@ -1379,7 +1380,8 @@ struct PersistedAnchorStateV1 {
 /// - If the anchor state file is missing but a bootstrap receipt exists (anchor
 ///   was lost post-genesis), `latest()` and `verify_committed()` return
 ///   `TrustError::ExternalAnchorUnavailable` — NOT `NotInitialized` — denying
-///   fail-closed flows (RFC-0032::REQ-0177 BLOCKER fix: bootstrap/outage distinction).
+///   fail-closed flows (RFC-0032::REQ-0177 BLOCKER fix: bootstrap/outage
+///   distinction).
 /// - If the requested anchor regresses relative to persisted state,
 ///   `verify_committed()` returns `TrustError::ExternalAnchorMismatch`.
 /// - If the anchor height matches but the event hash differs (fork),

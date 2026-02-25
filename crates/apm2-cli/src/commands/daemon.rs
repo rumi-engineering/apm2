@@ -50,9 +50,9 @@ const USER_SYSTEMD_DIR: &str = ".config/systemd/user";
 /// Uses `Restart=always` + `WatchdogSec=300` for crash resilience.
 /// `LoadCredential` reads the GH token from the systemd credential store,
 /// ensuring tokens are never persisted in unit files (security policy).
-/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before considering
-/// the daemon started. The daemon calls `sd_notify::notify_ready()` after
-/// socket bind. `WatchdogSec=300` restarts the daemon if it fails to send
+/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before
+/// considering the daemon started. The daemon calls `sd_notify::notify_ready()`
+/// after socket bind. `WatchdogSec=300` restarts the daemon if it fails to send
 /// `WATCHDOG=1` within 5 minutes (the daemon pings every ~150s).
 const DAEMON_SERVICE_TEMPLATE: &str = "\
 [Unit]\n\
@@ -85,10 +85,10 @@ PrivateTmp=yes\n\
 WantedBy=default.target\n\
 ";
 
-/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before considering
-/// the worker started. The worker calls `sd_notify::notify_ready()` after
-/// broker connection. `WatchdogSec=300` restarts the worker if it fails to
-/// send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
+/// RFC-0032::REQ-0248: Type=notify so systemd waits for READY=1 before
+/// considering the worker started. The worker calls `sd_notify::notify_ready()`
+/// after broker connection. `WatchdogSec=300` restarts the worker if it fails
+/// to send `WATCHDOG=1` within 5 minutes (the worker pings every ~150s).
 /// Worker activation is wake-driven; degraded safety nudges use an internal
 /// bounded interval.
 const WORKER_SERVICE_TEMPLATE: &str = "\
@@ -424,7 +424,8 @@ fn run_user_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the daemon is running, starting it when necessary (RFC-0032::REQ-0244).
+/// Ensure the daemon is running, starting it when necessary
+/// (RFC-0032::REQ-0244).
 ///
 /// Called by all `apm2 fac` subcommands so the daemon auto-starts without
 /// manual intervention. Resolution order:
@@ -486,8 +487,8 @@ pub fn ensure_daemon_running(operator_socket: &Path, config_path: &Path) -> Resu
 
 /// Report health and prerequisite checks for daemon runtime.
 ///
-/// RFC-0032::REQ-0202: Enhanced with host capability, toolchain, security posture,
-/// and credentials posture checks.
+/// RFC-0032::REQ-0202: Enhanced with host capability, toolchain, security
+/// posture, and credentials posture checks.
 ///
 /// RFC-0032::REQ-0244 MAJOR-3 FIX: Includes a projection-worker liveness probe.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -965,8 +966,8 @@ pub fn collect_doctor_checks(
         has_error = true;
     }
 
-    // RFC-0032::REQ-0247: When --full/--include-secrets is set and App config exists,
-    // verify the private key is actually resolvable. A config file that
+    // RFC-0032::REQ-0247: When --full/--include-secrets is set and App config
+    // exists, verify the private key is actually resolvable. A config file that
     // references an inaccessible key should not report OK.
     if full {
         if let Some(ref cfg) = app_config {
@@ -2105,8 +2106,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK when
-    /// projection is disabled in config.
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK
+    /// when projection is disabled in config.
     #[test]
     fn projection_health_disabled_returns_ok() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2123,8 +2124,8 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR when
-    /// enabled but daemon not running.
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR
+    /// when enabled but daemon not running.
     #[test]
     fn projection_health_enabled_daemon_down_returns_error() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2142,8 +2143,8 @@ mod tests {
         assert!(result.message.contains("daemon is not running"));
     }
 
-    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR when
-    /// enabled but cache file missing.
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns ERROR
+    /// when enabled but cache file missing.
     #[test]
     fn projection_health_enabled_no_cache_returns_error() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2166,8 +2167,8 @@ mod tests {
         assert!(result.message.contains("projection cache not found"));
     }
 
-    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK when
-    /// enabled, daemon running, and cache exists.
+    /// RFC-0032::REQ-0244 MAJOR-3: projection worker health check returns OK
+    /// when enabled, daemon running, and cache exists.
     #[test]
     fn projection_health_enabled_with_cache_returns_ok() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2314,15 +2315,16 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// RFC-0032::REQ-0202: `check_binary_available` returns true for a known binary.
+    /// RFC-0032::REQ-0202: `check_binary_available` returns true for a known
+    /// binary.
     #[test]
     fn check_binary_available_true_for_known_binary() {
         // `true` is a shell built-in / binary available on all unix systems
         assert!(check_binary_available("true", &[]));
     }
 
-    /// RFC-0032::REQ-0202: `check_binary_available` returns false for a non-existent
-    /// binary.
+    /// RFC-0032::REQ-0202: `check_binary_available` returns false for a
+    /// non-existent binary.
     #[test]
     fn check_binary_available_false_for_missing_binary() {
         assert!(!check_binary_available(
@@ -2331,8 +2333,8 @@ mod tests {
         ));
     }
 
-    /// RFC-0032::REQ-0202 MAJOR-3: `check_binary_available` returns false when the
-    /// binary spawns but exits with a non-zero status (e.g. missing
+    /// RFC-0032::REQ-0202 MAJOR-3: `check_binary_available` returns false when
+    /// the binary spawns but exits with a non-zero status (e.g. missing
     /// subcommand).
     #[test]
     fn check_binary_available_false_for_failing_exit_status() {
@@ -2340,7 +2342,8 @@ mod tests {
         assert!(!check_binary_available("false", &[]));
     }
 
-    /// RFC-0032::REQ-0202: lane safety check returns OK when lane dir does not exist.
+    /// RFC-0032::REQ-0202: lane safety check returns OK when lane dir does not
+    /// exist.
     #[test]
     fn lane_safety_ok_when_no_lane_dir() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2391,8 +2394,8 @@ mod tests {
         assert!(result.message.contains("no symlinks"));
     }
 
-    /// RFC-0032::REQ-0202 MAJOR-2: lane safety detects `lanes_dir` itself being a
-    /// symlink.
+    /// RFC-0032::REQ-0202 MAJOR-2: lane safety detects `lanes_dir` itself being
+    /// a symlink.
     #[cfg(unix)]
     #[test]
     fn lane_safety_detects_root_symlink() {
@@ -2408,8 +2411,8 @@ mod tests {
         assert!(result.message.contains("is a symlink"));
     }
 
-    /// RFC-0032::REQ-0202 MAJOR-4: lane safety detects unsafe permissions (group/world
-    /// writable).
+    /// RFC-0032::REQ-0202 MAJOR-4: lane safety detects unsafe permissions
+    /// (group/world writable).
     #[cfg(unix)]
     #[test]
     fn lane_safety_detects_unsafe_permissions() {
@@ -2427,8 +2430,8 @@ mod tests {
         assert!(result.message.contains("unsafe permissions"));
     }
 
-    /// RFC-0032::REQ-0202 MAJOR-1: lane safety returns ERROR when scan limit is reached
-    /// (fail-closed).
+    /// RFC-0032::REQ-0202 MAJOR-1: lane safety returns ERROR when scan limit is
+    /// reached (fail-closed).
     #[cfg(unix)]
     #[test]
     fn lane_safety_errors_on_too_many_entries() {
@@ -2450,8 +2453,8 @@ mod tests {
         assert!(result.message.contains("too many entries"));
     }
 
-    /// RFC-0032::REQ-0202 R2 MINOR (security): dangling symlink on lanes root is
-    /// detected as ERROR, not silently treated as absent.
+    /// RFC-0032::REQ-0202 R2 MINOR (security): dangling symlink on lanes root
+    /// is detected as ERROR, not silently treated as absent.
     #[cfg(unix)]
     #[test]
     fn lane_safety_detects_dangling_root_symlink() {
@@ -2466,10 +2469,11 @@ mod tests {
         assert!(result.message.contains("is a symlink"));
     }
 
-    /// RFC-0032::REQ-0202 R2 MAJOR: lane scan is deterministic — sorting by name
-    /// ensures the same entries are always checked regardless of filesystem
-    /// iteration order. Here we verify that a symlink placed at a
-    /// lexicographically early name is always detected, even with many entries.
+    /// RFC-0032::REQ-0202 R2 MAJOR: lane scan is deterministic — sorting by
+    /// name ensures the same entries are always checked regardless of
+    /// filesystem iteration order. Here we verify that a symlink placed at
+    /// a lexicographically early name is always detected, even with many
+    /// entries.
     #[cfg(unix)]
     #[test]
     fn lane_safety_deterministic_scan_order() {
@@ -2567,8 +2571,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0256 MAJOR-2: Partial resolution (at least one matched, others
-    /// failed to resolve) produces WARN — degraded but not fatal.
+    /// RFC-0032::REQ-0256 MAJOR-2: Partial resolution (at least one matched,
+    /// others failed to resolve) produces WARN — degraded but not fatal.
     #[test]
     fn binary_alignment_partial_resolution_is_warn() {
         let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";
@@ -2601,8 +2605,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0256 MAJOR-2: All service binaries resolved and all digests
-    /// match produces OK status.
+    /// RFC-0032::REQ-0256 MAJOR-2: All service binaries resolved and all
+    /// digests match produces OK status.
     #[test]
     fn binary_alignment_all_match_is_ok() {
         let cli_digest = "aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666";

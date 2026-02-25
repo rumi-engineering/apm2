@@ -145,7 +145,8 @@ pub struct EpisodeStarted {
     /// Goal specification for this episode.
     goal_spec: Option<String>,
 
-    /// BLAKE3 hash of the `RoleSpecV1` governing this episode (RFC-0032::REQ-0124).
+    /// BLAKE3 hash of the `RoleSpecV1` governing this episode
+    /// (RFC-0032::REQ-0124).
     ///
     /// Per RFC-0019 Addendum, role specs are CAS-addressed artifacts. This hash
     /// provides attribution for which role's tool allowlist and budgets were in

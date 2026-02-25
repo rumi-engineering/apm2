@@ -360,7 +360,8 @@ pub struct ContainmentTrace {
     /// `false` when sccache is disabled by default or was auto-disabled.
     #[serde(default)]
     pub sccache_enabled: bool,
-    /// sccache version string if detected and sccache is enabled (RFC-0032::REQ-0208).
+    /// sccache version string if detected and sccache is enabled
+    /// (RFC-0032::REQ-0208).
     ///
     /// Populated by probing `sccache --version` when the policy enables
     /// sccache. Included in attestation for auditability.
@@ -1081,7 +1082,8 @@ pub fn check_sccache_containment_with_proc(
     }
 }
 
-/// Probes the sccache version by running `sccache --version` (RFC-0032::REQ-0208).
+/// Probes the sccache version by running `sccache --version`
+/// (RFC-0032::REQ-0208).
 ///
 /// Returns `Some(version_string)` if sccache is installed and responds
 /// within `SCCACHE_PROBE_TIMEOUT` (5 s), `None` if the probe fails

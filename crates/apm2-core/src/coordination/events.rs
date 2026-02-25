@@ -1207,7 +1207,8 @@ mod tests {
     // RFC-0032::REQ-0048 Specific Tests (Serde Round-Trip)
     // ========================================================================
 
-    /// RFC-0032::REQ-0048: Verify all event types serialize and deserialize correctly.
+    /// RFC-0032::REQ-0048: Verify all event types serialize and deserialize
+    /// correctly.
     #[test]
     fn tck_00148_events_serde_roundtrip() {
         // CoordinationStarted
@@ -1348,9 +1349,9 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// RFC-0032::REQ-0048: Test that `work_ids` queue size limit is enforced during
-    /// deserialization, preventing denial-of-service via oversized JSON
-    /// payloads.
+    /// RFC-0032::REQ-0048: Test that `work_ids` queue size limit is enforced
+    /// during deserialization, preventing denial-of-service via oversized
+    /// JSON payloads.
     #[test]
     fn test_coordination_started_queue_limit_serde() {
         // Build a JSON string with MAX_WORK_QUEUE_SIZE + 1 work_ids
@@ -1381,8 +1382,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0048: Test that the JSON `type` tag matches the `event_type()`
-    /// return value for all coordination event variants.
+    /// RFC-0032::REQ-0048: Test that the JSON `type` tag matches the
+    /// `event_type()` return value for all coordination event variants.
     ///
     /// This ensures protocol consistency between the serialized wire format
     /// and the programmatic event type constants.
@@ -1707,8 +1708,9 @@ mod tests {
     // Deserialization Boundary Protection Tests (Security Fix RFC-0032::REQ-0057)
     // ========================================================================
 
-    /// RFC-0032::REQ-0057: Test that oversized `missed_path` is truncated DURING
-    /// deserialization to prevent OOM attacks via malicious JSON payloads.
+    /// RFC-0032::REQ-0057: Test that oversized `missed_path` is truncated
+    /// DURING deserialization to prevent OOM attacks via malicious JSON
+    /// payloads.
     #[test]
     fn test_context_refinement_request_deserialization_truncates_oversized_path() {
         // Build a JSON string with an oversized missed_path
@@ -1769,8 +1771,8 @@ mod tests {
         assert!(!request.is_path_truncated());
     }
 
-    /// RFC-0032::REQ-0057: Test that deserialization handles UTF-8 multi-byte characters
-    /// correctly when truncating at a boundary.
+    /// RFC-0032::REQ-0057: Test that deserialization handles UTF-8 multi-byte
+    /// characters correctly when truncating at a boundary.
     #[test]
     fn test_context_refinement_request_deserialization_utf8_safe() {
         // Build a path with emoji where truncation would fall in the middle
@@ -1809,8 +1811,8 @@ mod tests {
         for _ in request.missed_path.chars() {}
     }
 
-    /// RFC-0032::REQ-0057: Test deserialization via `CoordinationEvent` enum also
-    /// truncates oversized paths.
+    /// RFC-0032::REQ-0057: Test deserialization via `CoordinationEvent` enum
+    /// also truncates oversized paths.
     #[test]
     fn test_coordination_event_deserialization_truncates_missed_path() {
         let oversized_path = "/".to_string() + &"a".repeat(MAX_MISSED_PATH_LENGTH + 500);
@@ -1842,8 +1844,8 @@ mod tests {
         assert!(request.is_path_truncated());
     }
 
-    /// RFC-0032::REQ-0057: Test that the exact boundary (`MAX_MISSED_PATH_LENGTH`) is
-    /// preserved without truncation.
+    /// RFC-0032::REQ-0057: Test that the exact boundary
+    /// (`MAX_MISSED_PATH_LENGTH`) is preserved without truncation.
     #[test]
     fn test_context_refinement_request_deserialization_exact_boundary() {
         // Path exactly at MAX_MISSED_PATH_LENGTH should NOT be truncated

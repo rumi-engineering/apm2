@@ -522,7 +522,8 @@ impl ReceiptWritePipeline {
         )
     }
 
-    /// Execute the atomic commit protocol with receipt signing (RFC-0032::REQ-0226).
+    /// Execute the atomic commit protocol with receipt signing
+    /// (RFC-0032::REQ-0226).
     ///
     /// Identical to [`commit`](Self::commit) but additionally persists a
     /// `SignedReceiptEnvelopeV1` alongside the receipt. The signed envelope
@@ -872,8 +873,8 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
 /// Iterates chars, accumulating `len_utf8()` bytes until the budget is
 /// reached. This ensures the result is always valid UTF-8 and never exceeds
 /// `max_bytes` bytes. Used for filesystem filename construction where limits
-/// are byte-based (255 bytes) rather than char-based (MINOR-1 fix, RFC-0032::REQ-0215
-/// round 8).
+/// are byte-based (255 bytes) rather than char-based (MINOR-1 fix,
+/// RFC-0032::REQ-0215 round 8).
 fn truncate_to_byte_budget(s: &str, max_bytes: usize) -> String {
     let mut byte_count: usize = 0;
     let mut result = String::new();

@@ -43,9 +43,11 @@
 //! - [`ProjectionReceipt`]: Signed proof of projection
 //! - [`ProjectedStatus`]: Status values that can be projected
 //! - [`IdempotencyKey`]: Key for idempotent projection operations
-//! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence (RFC-0032::REQ-0059)
+//! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence
+//!   (RFC-0032::REQ-0059)
 //! - [`FreezeRegistry`]: Tracks active intervention freezes
-//! - [`TamperEvent`]: Event emitted when tamper is detected (RFC-0032::REQ-0060)
+//! - [`TamperEvent`]: Event emitted when tamper is detected
+//!   (RFC-0032::REQ-0060)
 //! - [`TamperResult`]: Result of handling a tamper event
 //! - [`IntentBuffer`]: Durable SQLite-backed buffer for projection intents and
 //!   deferred replay backlog (RFC-0033::REQ-0062)

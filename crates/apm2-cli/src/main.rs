@@ -267,11 +267,11 @@ fn main() -> Result<()> {
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
-    // Validate kernel schema registration capability on startup (RFC-0033::REQ-0045).
-    // The CLI is short-lived, so we verify that kernel schemas CAN be registered
-    // correctly. The actual long-lived registry is maintained by the daemon.
-    // This ensures the CLI can validate schema-related operations before
-    // forwarding to the daemon.
+    // Validate kernel schema registration capability on startup
+    // (RFC-0033::REQ-0045). The CLI is short-lived, so we verify that kernel
+    // schemas CAN be registered correctly. The actual long-lived registry is
+    // maintained by the daemon. This ensures the CLI can validate
+    // schema-related operations before forwarding to the daemon.
     let registry = InMemorySchemaRegistry::new();
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -386,10 +386,10 @@ fn main() -> Result<()> {
         Commands::Coordinate(coordinate_args) => {
             // Coordinate commands use specific exit codes per RFC-0032::REQ-0053:
             // 0=success (WORK_COMPLETED), 1=aborted, 2=invalid_args
-            // RFC-0032::REQ-0136: Uses operator_socket for privileged ClaimWork/SpawnEpisode
-            // operations, and session_socket for session observation/polling.
-            // We use std::process::exit to bypass anyhow Result handling and
-            // ensure precise exit codes are returned.
+            // RFC-0032::REQ-0136: Uses operator_socket for privileged
+            // ClaimWork/SpawnEpisode operations, and session_socket for session
+            // observation/polling. We use std::process::exit to bypass anyhow
+            // Result handling and ensure precise exit codes are returned.
             let exit_code = commands::coordinate::run_coordinate(
                 &coordinate_args,
                 &operator_socket,
@@ -532,7 +532,8 @@ fn resolve_cli_socket_paths_with_runtime(
                     (default_operator, default_session)
                 }
             } else {
-                // RFC-0032::REQ-0244: Environment-based auto-config when no ecosystem.toml exists.
+                // RFC-0032::REQ-0244: Environment-based auto-config when no ecosystem.toml
+                // exists.
                 let env_config = apm2_core::config::EcosystemConfig::from_env();
                 (
                     normalize_operator_socket_path_with_runtime(

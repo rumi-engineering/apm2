@@ -1,8 +1,8 @@
 //! Token replay protection: broker-side one-time use ledger + revocation.
 //!
-//! Implements RFC-0032::REQ-0217: a bounded, TTL-evicting ledger that tracks issued
-//! and consumed token nonces to detect and deny replay attempts. The broker
-//! registers each nonce at issuance time in an `Issued` state; when the
+//! Implements RFC-0032::REQ-0217: a bounded, TTL-evicting ledger that tracks
+//! issued and consumed token nonces to detect and deny replay attempts. The
+//! broker registers each nonce at issuance time in an `Issued` state; when the
 //! worker validates and consumes the token, the entry transitions to
 //! `Consumed`. A second presentation of the same nonce is denied.
 //!

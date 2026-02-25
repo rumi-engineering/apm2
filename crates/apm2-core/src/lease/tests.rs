@@ -1218,7 +1218,8 @@ fn test_renewal_uses_event_timestamp() {
 // RFC-0016::REQ-0003: Tick-Based Expiry Tests for Reducer State
 // =============================================================================
 
-/// RFC-0016::REQ-0003: Tests for tick-based expiry detection in `LeaseReducerState`.
+/// RFC-0016::REQ-0003: Tests for tick-based expiry detection in
+/// `LeaseReducerState`.
 mod tck_00241 {
     use super::*;
     use crate::htf::HtfTick;
@@ -1229,8 +1230,8 @@ mod tck_00241 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases not included in tick-only
-    /// method.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases not included in
+    /// tick-only method.
     ///
     /// Legacy leases (without tick data) are NOT returned by
     /// `get_expired_but_active_at_tick`. Callers should use
@@ -1264,7 +1265,8 @@ mod tck_00241 {
         );
     }
 
-    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases use wall-clock fallback.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 Legacy leases use wall-clock
+    /// fallback.
     ///
     /// When using `get_expired_but_active_at_tick_or_wall`, legacy leases
     /// fall back to wall-clock comparison for expiry detection.
@@ -1347,7 +1349,8 @@ mod tck_00241 {
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
-    /// RFC-0016::REQ-0003: Wall time does not affect tick-based expiry detection.
+    /// RFC-0016::REQ-0003: Wall time does not affect tick-based expiry
+    /// detection.
     ///
     /// This verifies the core acceptance criterion: wall time changes
     /// do not affect lease validity when using tick-based expiry.
@@ -1435,7 +1438,8 @@ mod tck_00241 {
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
-    /// RFC-0016::REQ-0003: Tick timing validation in reducer rejects invalid events.
+    /// RFC-0016::REQ-0003: Tick timing validation in reducer rejects invalid
+    /// events.
     ///
     /// Events where `expires_at_tick <= issued_at_tick` should be rejected.
     #[test]

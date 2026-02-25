@@ -7,8 +7,8 @@
 /// bytes.
 ///
 /// This helper is used for backward-compatible optional hash fields
-/// (RFC-0032::REQ-0119). When the field is `None`, it is skipped in serialization. When
-/// deserializing, missing fields become `None`.
+/// (RFC-0032::REQ-0119). When the field is `None`, it is skipped in
+/// serialization. When deserializing, missing fields become `None`.
 pub mod option_hash32 {
     use serde::{Deserialize, Deserializer, Serializer};
 

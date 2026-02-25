@@ -1,8 +1,8 @@
 #![cfg(feature = "e2e-agent-tests")]
 #![allow(missing_docs)]
 // AGENT-AUTHORED (RFC-0032::REQ-0145)
-//! RFC-0032::REQ-0145: Autonomous FAC end-to-end integration test: full lifecycle
-//! without external tooling.
+//! RFC-0032::REQ-0145: Autonomous FAC end-to-end integration test: full
+//! lifecycle without external tooling.
 //!
 //! This test module exercises the complete FAC lifecycle through daemon
 //! components, verifying every state transition and ledger event from work

@@ -1,4 +1,5 @@
-//! RFC-0020::REQ-0040: Auditor/Orchestrator launch projection integration tests.
+//! RFC-0020::REQ-0040: Auditor/Orchestrator launch projection integration
+//! tests.
 //!
 //! Validates digest-first determinism, replay-consistent projection payloads,
 //! and fail-closed uncertainty semantics when lineage/liveness evidence is

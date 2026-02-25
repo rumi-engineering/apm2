@@ -111,9 +111,10 @@ pub enum ConsumeSessionError {
 
     /// Tool class not allowed in manifest.
     ///
-    /// Per RFC-0032::REQ-0070, tool requests are validated against the manifest's
-    /// `tool_allowlist`. This error is returned when the requested tool class
-    /// is not in the allowlist (fail-closed semantics).
+    /// Per RFC-0032::REQ-0070, tool requests are validated against the
+    /// manifest's `tool_allowlist`. This error is returned when the
+    /// requested tool class is not in the allowlist (fail-closed
+    /// semantics).
     #[error("tool class '{tool_class}' not in manifest allowlist for '{manifest_id}'")]
     ToolNotAllowed {
         /// The tool class that was denied.
@@ -124,9 +125,9 @@ pub enum ConsumeSessionError {
 
     /// Write path not allowed in manifest.
     ///
-    /// Per RFC-0032::REQ-0070, write operations are validated against the manifest's
-    /// `write_allowlist`. This error is returned when the write path is not
-    /// in the allowlist (fail-closed semantics).
+    /// Per RFC-0032::REQ-0070, write operations are validated against the
+    /// manifest's `write_allowlist`. This error is returned when the write
+    /// path is not in the allowlist (fail-closed semantics).
     #[error("write path '{path}' not in manifest allowlist for '{manifest_id}'")]
     WritePathNotAllowed {
         /// The path that was denied.
@@ -137,9 +138,9 @@ pub enum ConsumeSessionError {
 
     /// Shell command not allowed in manifest.
     ///
-    /// Per RFC-0032::REQ-0070, shell execution requests are validated against the
-    /// manifest's `shell_allowlist`. This error is returned when the command
-    /// does not match any allowed pattern (fail-closed semantics).
+    /// Per RFC-0032::REQ-0070, shell execution requests are validated against
+    /// the manifest's `shell_allowlist`. This error is returned when the
+    /// command does not match any allowed pattern (fail-closed semantics).
     #[error("shell command '{command}' not in manifest allowlist for '{manifest_id}'")]
     ShellCommandNotAllowed {
         /// The command that was denied.
@@ -535,7 +536,8 @@ pub fn validate_tool_request(
             Ok(())
         },
         tool_request::Tool::ShellExec(exec) => {
-            // RFC-0032::REQ-0070: Validate shell command against shell_allowlist (fail-closed)
+            // RFC-0032::REQ-0070: Validate shell command against shell_allowlist
+            // (fail-closed)
             if !manifest.is_shell_command_allowed(&exec.command) {
                 // SECURITY: Truncate command to prevent oversized error variants
                 let truncated_command = if exec.command.len() > 256 {

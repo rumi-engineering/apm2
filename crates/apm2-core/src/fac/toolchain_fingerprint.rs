@@ -1,5 +1,6 @@
 // AGENT-AUTHORED
-//! Toolchain fingerprint derivation, caching, and verification (RFC-0032::REQ-0194).
+//! Toolchain fingerprint derivation, caching, and verification
+//! (RFC-0032::REQ-0194).
 //!
 //! Computes a stable `b3-256:` BLAKE3 fingerprint of the build toolchain
 //! installed on this node: `rustc -Vv`, `cargo -V`, `cargo nextest --version`,

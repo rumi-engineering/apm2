@@ -1,4 +1,5 @@
-//! CAS access facade with capability allowlist enforcement (RFC-0032::REQ-0108).
+//! CAS access facade with capability allowlist enforcement
+//! (RFC-0032::REQ-0108).
 //!
 //! This module implements daemon-side CAS access control for session contexts.
 //! Per RFC-0018, session CAS reads are gated via capability manifest allowlist.
@@ -22,7 +23,8 @@
 //! - [INV-CAS-001] Session CAS reads are deny-by-default
 //! - [INV-CAS-002] Empty `cas_hash_allowlist` denies all reads (fail-closed)
 //! - [INV-CAS-003] Only exact hash matches are allowed
-//! - [INV-CAS-004] CAS writes are not gated (out of scope per RFC-0032::REQ-0108)
+//! - [INV-CAS-004] CAS writes are not gated (out of scope per
+//!   RFC-0032::REQ-0108)
 //!
 //! # Contract References
 //!
@@ -160,8 +162,8 @@ impl CasAccessFacade {
 
     /// Reads content from CAS with session-level access (allowlist gated).
     ///
-    /// Per RFC-0032::REQ-0108, session CAS reads are validated against the session's
-    /// capability manifest `cas_hash_allowlist`.
+    /// Per RFC-0032::REQ-0108, session CAS reads are validated against the
+    /// session's capability manifest `cas_hash_allowlist`.
     ///
     /// # Arguments
     ///
@@ -223,7 +225,8 @@ impl CasAccessFacade {
 
     /// Checks if content exists in CAS (session access).
     ///
-    /// Per RFC-0032::REQ-0108, this checks the allowlist before checking CAS existence.
+    /// Per RFC-0032::REQ-0108, this checks the allowlist before checking CAS
+    /// existence.
     ///
     /// # Arguments
     ///

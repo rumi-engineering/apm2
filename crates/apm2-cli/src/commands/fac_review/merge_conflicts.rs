@@ -342,7 +342,9 @@ CONFLICT (content): Merge conflict in baz/qux.rs
     #[test]
     fn docs_migration_conflict_is_ignored_when_json_successor_exists() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let successor = temp.path().join("documents/work/tickets/RFC-0032::REQ-0276.json");
+        let successor = temp
+            .path()
+            .join("documents/work/tickets/RFC-0032::REQ-0276.json");
         fs::create_dir_all(successor.parent().expect("parent")).expect("mkdir");
         fs::write(&successor, "{}").expect("write successor");
 

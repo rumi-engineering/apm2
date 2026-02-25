@@ -1,4 +1,5 @@
-//! RFC-0032::REQ-0137: Daemon session dispatcher CAS + ledger wiring integration tests.
+//! RFC-0032::REQ-0137: Daemon session dispatcher CAS + ledger wiring
+//! integration tests.
 //!
 //! This test module verifies that `DispatcherState::with_persistence_and_cas()`
 //! properly wires the session dispatcher with:
@@ -431,8 +432,8 @@ fn tck_00383_cas_directory_creation() {
 ///
 /// Returns `None` if the adapter spawn fails because the default adapter
 /// command (`claude`) is not installed on the test host.  Pre-fork PATH
-/// resolution (RFC-0032::REQ-0151) correctly rejects missing commands, so this is
-/// expected in CI environments without `claude` on PATH.
+/// resolution (RFC-0032::REQ-0151) correctly rejects missing commands, so this
+/// is expected in CI environments without `claude` on PATH.
 fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> Option<String> {
     let priv_dispatcher = dispatcher_state.privileged_dispatcher();
     let priv_ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {

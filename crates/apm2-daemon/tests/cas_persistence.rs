@@ -22,13 +22,14 @@ use apm2_daemon::episode::executor::ContentAddressedStore;
 use tempfile::TempDir;
 
 // =============================================================================
-// RFC-0032::REQ-0095: AC1 - Durable CAS persists artifacts across daemon restarts
+// RFC-0032::REQ-0095: AC1 - Durable CAS persists artifacts across daemon
+// restarts
 // =============================================================================
 
 /// Verify that content stored in the CAS survives a simulated daemon restart.
 ///
-/// Per RFC-0032::REQ-0095 AC1: Durable CAS persists artifacts across daemon restarts
-/// Verification: `cargo test -p apm2-daemon cas_persistence_restart`
+/// Per RFC-0032::REQ-0095 AC1: Durable CAS persists artifacts across daemon
+/// restarts Verification: `cargo test -p apm2-daemon cas_persistence_restart`
 #[test]
 fn cas_persistence_restart_basic() {
     let temp_dir = TempDir::new().unwrap();

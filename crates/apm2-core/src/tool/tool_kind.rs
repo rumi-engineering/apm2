@@ -966,13 +966,13 @@ pub struct ShellBridgePolicy {
     /// Whether Tier2+ routes are allowed to use shell execution at all.
     /// Defaults to `false` (deny).
     ///
-    /// **NOTE (RFC-0020::REQ-0031):** This field is currently unused in enforcement
-    /// because `check()` unconditionally denies Tier2+ shell execution per
-    /// CQ review requirements.  It is retained for forward-compatibility:
-    /// a future policy revision may gate Tier2+ shell access behind an
-    /// explicit opt-in flag, at which point this field will be consulted.
-    /// Removing it would be a breaking change to the serialized config
-    /// schema (`Serialize`/`Deserialize`).
+    /// **NOTE (RFC-0020::REQ-0031):** This field is currently unused in
+    /// enforcement because `check()` unconditionally denies Tier2+ shell
+    /// execution per CQ review requirements.  It is retained for
+    /// forward-compatibility: a future policy revision may gate Tier2+
+    /// shell access behind an explicit opt-in flag, at which point this
+    /// field will be consulted. Removing it would be a breaking change to
+    /// the serialized config schema (`Serialize`/`Deserialize`).
     tier2_plus_allowed: bool,
 }
 

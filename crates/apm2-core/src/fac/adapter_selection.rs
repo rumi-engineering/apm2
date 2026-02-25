@@ -7,8 +7,8 @@
 //! - policy hash
 //! - backoff epoch
 //!
-//! RFC-0032::REQ-0152 requires deterministic weighted routing so audit and replay can
-//! reproduce profile selection decisions exactly.
+//! RFC-0032::REQ-0152 requires deterministic weighted routing so audit and
+//! replay can reproduce profile selection decisions exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;

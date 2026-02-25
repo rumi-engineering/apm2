@@ -173,11 +173,11 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (RFC-0033::REQ-0032)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (RFC-0033::REQ-0030, RFC-0032::REQ-0070, RFC-0032::REQ-0074, RFC-0032::REQ-0111, RFC-0020::REQ-0006)
-// NOTE: PolicyMintToken is intentionally NOT re-exported. It is pub(crate) and
-// only accessible to daemon-internal code (specifically GovernancePolicyResolver
-// and state.rs). This prevents external crates and requester surfaces from
-// minting capabilities. See Security Review BLOCKER 1.
+// Re-export capability types (RFC-0033::REQ-0030, RFC-0032::REQ-0070, RFC-0032::REQ-0074,
+// RFC-0032::REQ-0111, RFC-0020::REQ-0006) NOTE: PolicyMintToken is intentionally NOT
+// re-exported. It is pub(crate) and only accessible to daemon-internal code (specifically
+// GovernancePolicyResolver and state.rs). This prevents external crates and requester surfaces
+// from minting capabilities. See Security Review BLOCKER 1.
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityManifestV1, CapabilityValidator, CustodyDomainError,
@@ -228,7 +228,8 @@ pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal}
 #[cfg(test)]
 #[allow(deprecated)]
 pub use handlers::register_stub_handlers;
-// Re-export handler types (RFC-0032::REQ-0093, RFC-0032::REQ-0109, RFC-0032::REQ-0113, RFC-0032::REQ-0129)
+// Re-export handler types (RFC-0032::REQ-0093, RFC-0032::REQ-0109, RFC-0032::REQ-0113,
+// RFC-0032::REQ-0129)
 pub use handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
     SandboxConfig, SearchHandler, WriteFileHandler, register_handlers_with_root,
@@ -249,7 +250,8 @@ pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
     RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
 };
-// Re-export registry types (RFC-0033::REQ-0029, RFC-0032::REQ-0121: profile-based selection, RFC-0032::REQ-0139: TTL)
+// Re-export registry types (RFC-0033::REQ-0029, RFC-0032::REQ-0121: profile-based selection,
+// RFC-0032::REQ-0139: TTL)
 pub use registry::{
     AdapterRegistry, AdapterRegistryError, InMemorySessionRegistry, PersistentRegistryError,
     PersistentSessionRegistry, TERMINATED_SESSION_TTL_SECS,

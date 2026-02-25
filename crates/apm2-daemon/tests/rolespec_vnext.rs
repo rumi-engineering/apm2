@@ -1,4 +1,5 @@
-//! RFC-0032::REQ-0166: FAC RoleSpec vNext rollout validation for WorkObject execution.
+//! RFC-0032::REQ-0166: FAC RoleSpec vNext rollout validation for WorkObject
+//! execution.
 //!
 //! Cross-slice integration coverage:
 //! - RoleSpec vNext selected by authoritative hash.

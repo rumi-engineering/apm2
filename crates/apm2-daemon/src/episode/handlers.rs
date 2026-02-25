@@ -1,8 +1,8 @@
 //! Real tool handlers for core tool classes (RFC-0032::REQ-0093).
 //!
 //! This module provides real implementations of the core tool handlers per
-//! RFC-0032::REQ-0093. These handlers perform actual I/O and command execution with
-//! strict bounds and security controls.
+//! RFC-0032::REQ-0093. These handlers perform actual I/O and command execution
+//! with strict bounds and security controls.
 //!
 //! # Implemented Handlers
 //!
@@ -281,7 +281,8 @@ fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerEr
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // RFC-0032::REQ-0113 SECURITY FIX: Do NOT break early on NotFound!
+                // RFC-0032::REQ-0113 SECURITY FIX: Do NOT break early on
+                // NotFound!
                 //
                 // Breaking here allows attackers to bypass symlink checks using
                 // paths like `nonexistent/symlink_to_etc/file`. The attacker
@@ -403,9 +404,9 @@ pub struct ReadFileHandler {
     root: PathBuf,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `ReadFileHandler::with_root()` with an explicit
-/// workspace path.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `ReadFileHandler::with_root()` with an
+/// explicit workspace path.
 #[cfg(test)]
 impl Default for ReadFileHandler {
     fn default() -> Self {
@@ -516,9 +517,9 @@ impl ReadFileHandler {
                 });
             }
         } else {
-            // RFC-0032::REQ-0113: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
-            // This ensures the kernel rejects symlinks at open time, closing the window
-            // between validation and access.
+            // RFC-0032::REQ-0113: Open file with O_NOFOLLOW to prevent TOCTOU symlink
+            // attacks This ensures the kernel rejects symlinks at open time,
+            // closing the window between validation and access.
             let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
                 ToolHandlerError::ExecutionFailed {
                     message: format!("failed to open file '{}': {}", read_args.path.display(), e),
@@ -644,9 +645,9 @@ pub struct WriteFileHandler {
     root: PathBuf,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `WriteFileHandler::with_root()` with an explicit
-/// workspace path.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `WriteFileHandler::with_root()` with an
+/// explicit workspace path.
 #[cfg(test)]
 impl Default for WriteFileHandler {
     fn default() -> Self {
@@ -1174,9 +1175,9 @@ pub struct ExecuteHandler {
     sandbox_config: SandboxConfig,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `ExecuteHandler::with_root()` with an explicit
-/// workspace path.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `ExecuteHandler::with_root()` with an
+/// explicit workspace path.
 #[cfg(test)]
 impl Default for ExecuteHandler {
     fn default() -> Self {
@@ -1350,8 +1351,8 @@ impl ToolHandler for ExecuteHandler {
             }
         }
 
-        // Set working directory with symlink-aware validation (RFC-0032::REQ-0113: TOCTOU
-        // mitigation) Canonicalize root for comparison
+        // Set working directory with symlink-aware validation (RFC-0032::REQ-0113:
+        // TOCTOU mitigation) Canonicalize root for comparison
         let canonical_root =
             std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
                 message: format!(
@@ -1431,8 +1432,8 @@ impl ToolHandler for ExecuteHandler {
         // other
         let per_stream_limit = MAX_TOOL_OUTPUT_SIZE / 2;
 
-        // RFC-0032::REQ-0129: Shared state for stall detection - tracks last output time
-        // across both stdout and stderr readers using atomic operations.
+        // RFC-0032::REQ-0129: Shared state for stall detection - tracks last output
+        // time across both stdout and stderr readers using atomic operations.
         // Note: truncation from u128 to u64 is safe here as millis since exec_start
         // will never approach u64::MAX in any reasonable execution.
         #[allow(clippy::cast_possible_truncation)]
@@ -1708,9 +1709,9 @@ pub struct GitOperationHandler {
     root: PathBuf,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `GitOperationHandler::with_root()` with an explicit
-/// workspace path.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `GitOperationHandler::with_root()` with an
+/// explicit workspace path.
 #[cfg(test)]
 impl Default for GitOperationHandler {
     fn default() -> Self {
@@ -1855,8 +1856,8 @@ impl ToolHandler for GitOperationHandler {
             cmd.env("XDG_CONFIG_HOME", xdg_config);
         }
 
-        // RFC-0032::REQ-0079: Set SSH_AUTH_SOCK if credential is provided and looks like a valid
-        // path
+        // RFC-0032::REQ-0079: Set SSH_AUTH_SOCK if credential is provided and looks
+        // like a valid path
         if let Some(cred) = credential {
             let secret = cred.expose_secret();
             // Validate path: absolute, no traversal, and in standard temp/runtime dirs
@@ -2288,9 +2289,9 @@ pub struct ListFilesHandler {
     root: PathBuf,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `ListFilesHandler::with_root()` with an explicit
-/// workspace path.
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `ListFilesHandler::with_root()` with an
+/// explicit workspace path.
 #[cfg(test)]
 impl Default for ListFilesHandler {
     fn default() -> Self {
@@ -2433,9 +2434,9 @@ impl ListFilesHandler {
             }
         })?;
 
-        // RFC-0032::REQ-0109: Bound the number of entries *scanned* (not just returned) to
-        // prevent denial-of-service on very large directories, especially when
-        // a pattern is set that matches rarely.
+        // RFC-0032::REQ-0109: Bound the number of entries *scanned* (not just returned)
+        // to prevent denial-of-service on very large directories, especially
+        // when a pattern is set that matches rarely.
         let mut scanned_entries = 0usize;
 
         while let Some(entry) =
@@ -2644,8 +2645,8 @@ pub struct SearchHandler {
     root: PathBuf,
 }
 
-/// RFC-0032::REQ-0113: Default implementation is restricted to test builds only.
-/// Production code MUST use `SearchHandler::with_root()` with an explicit
+/// RFC-0032::REQ-0113: Default implementation is restricted to test builds
+/// only. Production code MUST use `SearchHandler::with_root()` with an explicit
 /// workspace path.
 #[cfg(test)]
 impl Default for SearchHandler {
@@ -3203,8 +3204,8 @@ impl ToolHandler for SearchHandler {
 ///
 /// # Security Warning
 ///
-/// Per RFC-0032::REQ-0113, tool handlers MUST be rooted to an explicit workspace
-/// directory, not the daemon's CWD. Failure to do so can result in:
+/// Per RFC-0032::REQ-0113, tool handlers MUST be rooted to an explicit
+/// workspace directory, not the daemon's CWD. Failure to do so can result in:
 /// - Tool operations accessing daemon-local files
 /// - Path traversal attacks escaping the intended workspace
 /// - Reviewers observing incorrect filesystem state
@@ -3301,7 +3302,8 @@ pub fn register_handlers_with_root(
     // `register_handlers_with_root_and_sandbox` instead.
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    // RFC-0032::REQ-0129: This deprecated function uses permissive mode for backwards compat
+    // RFC-0032::REQ-0129: This deprecated function uses permissive mode for
+    // backwards compat
     executor.register_handler(Box::new(ExecuteHandler::with_root_permissive(
         &canonical_root,
     )))?;
@@ -3380,7 +3382,8 @@ pub fn register_handlers_with_root_and_sandbox(
     // Register all handlers with the canonical workspace root
     executor.register_handler(Box::new(ReadFileHandler::with_root(&canonical_root)))?;
     executor.register_handler(Box::new(WriteFileHandler::with_root(&canonical_root)))?;
-    // Use explicit sandbox config for ExecuteHandler (RFC-0032::REQ-0129: fail-closed)
+    // Use explicit sandbox config for ExecuteHandler (RFC-0032::REQ-0129:
+    // fail-closed)
     executor.register_handler(Box::new(ExecuteHandler::with_root_and_sandbox(
         &canonical_root,
         sandbox_config,

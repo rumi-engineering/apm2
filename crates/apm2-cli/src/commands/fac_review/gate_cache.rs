@@ -45,9 +45,9 @@ use crate::commands::fac_permissions;
 const CACHE_SCHEMA_V2: &str = "apm2.fac.gate_result_receipt.v2";
 const MAX_CACHE_READ_BYTES: usize = 1_048_576;
 
-/// Maximum length of `signature_hex` and `signer_id` fields (RFC-0032::REQ-0226).
-/// Ed25519 signature = 64 bytes = 128 hex chars; public key = 32 bytes = 64
-/// hex chars.  256 is generous but bounded.
+/// Maximum length of `signature_hex` and `signer_id` fields
+/// (RFC-0032::REQ-0226). Ed25519 signature = 64 bytes = 128 hex chars; public
+/// key = 32 bytes = 64 hex chars.  256 is generous but bounded.
 #[cfg(test)]
 const MAX_SIG_FIELD_LENGTH: usize = 256;
 
@@ -548,7 +548,8 @@ impl GateCache {
         Ok(())
     }
 
-    /// Sign all gate entries in this cache with the given signer (RFC-0032::REQ-0226).
+    /// Sign all gate entries in this cache with the given signer
+    /// (RFC-0032::REQ-0226).
     pub fn sign_all(&mut self, signer: &Signer) {
         let sha = self.sha.clone();
         for (gate_name, result) in &mut self.gates {
@@ -701,9 +702,9 @@ impl GateCache {
     /// Evaluate whether a cached gate result is safe to reuse (v2 path).
     ///
     /// [INV-GCV3-001] This v2 reuse check is no longer called from
-    /// production reuse decision paths (RFC-0032::REQ-0197 MAJOR fix). All reuse
-    /// decisions flow through v3 `check_reuse` which requires compound-key
-    /// binding proof. Retained for test compatibility.
+    /// production reuse decision paths (RFC-0032::REQ-0197 MAJOR fix). All
+    /// reuse decisions flow through v3 `check_reuse` which requires
+    /// compound-key binding proof. Retained for test compatibility.
     ///
     /// In default mode, signature verification is mandatory: unsigned or
     /// forged receipts are rejected (fail-closed, RFC-0032::REQ-0226).
@@ -747,7 +748,8 @@ impl GateCache {
             return ReuseDecision::miss("evidence_digest_missing");
         }
 
-        // RFC-0032::REQ-0226: Signature verification gate (fail-closed in default mode).
+        // RFC-0032::REQ-0226: Signature verification gate (fail-closed in default
+        // mode).
         if let Some(key) = verifying_key {
             match cached.verify(key, &self.sha, gate) {
                 Ok(()) => {},

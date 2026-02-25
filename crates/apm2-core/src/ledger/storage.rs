@@ -2094,9 +2094,9 @@ impl SqliteLedgerBackend {
 // INTENTIONAL DESIGN: Namespace parameter is ignored in this implementation.
 //
 // This SqliteLedgerBackend is a direct extraction of the existing Ledger struct
-// (RFC-0033::REQ-0044 scope: "No behavioral changes to existing code"). The namespace
-// parameter was added to the LedgerBackend trait API to enable future namespace
-// isolation per RFC-0014's architectural design.
+// (RFC-0033::REQ-0044 scope: "No behavioral changes to existing code"). The
+// namespace parameter was added to the LedgerBackend trait API to enable future
+// namespace isolation per RFC-0014's architectural design.
 //
 // The actual namespace isolation (table partitioning or separate databases per
 // namespace) is intentionally deferred to a future ticket. This approach:

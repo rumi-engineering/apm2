@@ -33,7 +33,8 @@
 //!   ([`TopicPattern`], [`validate_topic`]) (RFC-0018, RFC-0032::REQ-0097)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
 //! - [`session_token`]: Per-connection session tokens ([`SessionToken`],
-//!   [`TokenMinter`]) for authenticating session-scoped requests (RFC-0032::REQ-0066)
+//!   [`TokenMinter`]) for authenticating session-scoped requests
+//!   (RFC-0032::REQ-0066)
 //!
 //! # Wire Format
 //!
@@ -89,7 +90,8 @@
 //! - Handshake required before message exchange
 //! - Version mismatch terminates connection
 
-/// Connection handler for dual-socket ProtocolServer control plane (RFC-0032::REQ-0085).
+/// Connection handler for dual-socket ProtocolServer control plane
+/// (RFC-0032::REQ-0085).
 ///
 /// This module implements the connection handling logic including the mandatory
 /// Hello/HelloAck handshake as specified in DD-001/DD-008.
@@ -103,7 +105,8 @@ pub mod framing;
 pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
-/// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018, RFC-0032::REQ-0098).
+/// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018,
+/// RFC-0032::REQ-0098).
 pub mod pulse_acl;
 /// HEF Pulse Outbox and Publisher (RFC-0018, RFC-0032::REQ-0100).
 ///

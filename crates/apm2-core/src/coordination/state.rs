@@ -548,8 +548,8 @@ impl BudgetUsage {
 
     /// Checks if the duration budget is exhausted.
     ///
-    /// Per AD-COORD-004 and RFC-0016::REQ-0003: Returns `true` when `elapsed_ticks >=
-    /// max_duration_ticks`.
+    /// Per AD-COORD-004 and RFC-0016::REQ-0003: Returns `true` when
+    /// `elapsed_ticks >= max_duration_ticks`.
     ///
     /// # Arguments
     ///
@@ -701,7 +701,8 @@ impl BudgetUsage {
 
     /// Returns the remaining duration in ticks before budget exhaustion.
     ///
-    /// Per RFC-0016::REQ-0003: Duration tracking uses ticks for replay stability.
+    /// Per RFC-0016::REQ-0003: Duration tracking uses ticks for replay
+    /// stability.
     ///
     /// # Arguments
     ///
@@ -1269,7 +1270,8 @@ mod tests {
         assert_eq!(budget, restored);
     }
 
-    /// RFC-0032::REQ-0048, RFC-0016::REQ-0003: Test that zero budget values are rejected.
+    /// RFC-0032::REQ-0048, RFC-0016::REQ-0003: Test that zero budget values are
+    /// rejected.
     ///
     /// Per RFC-0012/TB-COORD-004 and RFC-0016::REQ-0003: `max_episodes`,
     /// `max_duration_ticks`, and `tick_rate_hz` are required positive integers.
@@ -1651,7 +1653,8 @@ mod tests {
     // RFC-0032::REQ-0048 Specific Tests (Serde Round-Trip)
     // ========================================================================
 
-    /// RFC-0032::REQ-0048: Verify all types serialize and deserialize correctly.
+    /// RFC-0032::REQ-0048: Verify all types serialize and deserialize
+    /// correctly.
     #[test]
     fn tck_00148_serde_roundtrip_all_types() {
         // CoordinationBudget
@@ -1971,8 +1974,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0048: Verify streaming deserializer rejects oversized arrays
-    /// without attempting full allocation.
+    /// RFC-0032::REQ-0048: Verify streaming deserializer rejects oversized
+    /// arrays without attempting full allocation.
     ///
     /// This test documents that the streaming visitor pattern prevents OOM
     /// by checking bounds during iteration rather than after full allocation.
@@ -2016,9 +2019,9 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0048: Test that `session_ids` size limit is enforced during
-    /// deserialization, preventing denial-of-service via oversized JSON
-    /// payloads in `WorkItemTracking`.
+    /// RFC-0032::REQ-0048: Test that `session_ids` size limit is enforced
+    /// during deserialization, preventing denial-of-service via oversized
+    /// JSON payloads in `WorkItemTracking`.
     #[test]
     fn test_work_tracking_session_ids_limit_serde() {
         // Build a session_ids array that exceeds the limit
@@ -2248,7 +2251,8 @@ mod tests {
         assert_eq!(usage.consumed_episodes, u32::MAX);
     }
 
-    /// RFC-0032::REQ-0051: Test remaining budget calculations at boundary conditions.
+    /// RFC-0032::REQ-0051: Test remaining budget calculations at boundary
+    /// conditions.
     #[test]
     fn tck_00151_remaining_budget_boundaries() {
         let budget =
@@ -2277,7 +2281,8 @@ mod tests {
         assert_eq!(usage_over_limit.remaining_tokens(&budget), Some(0));
     }
 
-    /// RFC-0032::REQ-0051: Test budget usage with large values (near `u64::MAX`).
+    /// RFC-0032::REQ-0051: Test budget usage with large values (near
+    /// `u64::MAX`).
     #[test]
     fn tck_00151_budget_large_values() {
         // Create budget with large values
@@ -2311,7 +2316,8 @@ mod tests {
         assert!(usage.is_token_budget_exhausted(&budget));
     }
 
-    /// RFC-0032::REQ-0051: Test budget usage serde roundtrip preserves helper behavior.
+    /// RFC-0032::REQ-0051: Test budget usage serde roundtrip preserves helper
+    /// behavior.
     #[test]
     fn tck_00151_budget_usage_serde_roundtrip() {
         let budget =
@@ -2377,7 +2383,8 @@ mod tests {
         assert_eq!(usage.tick_rate_hz, 1_000_000);
     }
 
-    /// RFC-0016::REQ-0003: `BudgetUsage` allows same tick rate on subsequent updates.
+    /// RFC-0016::REQ-0003: `BudgetUsage` allows same tick rate on subsequent
+    /// updates.
     ///
     /// When the same rate is used, updates should succeed.
     #[test]
@@ -2415,7 +2422,8 @@ mod tests {
         ));
     }
 
-    /// RFC-0016::REQ-0003: `BudgetUsage` from Default still allows rate assignment.
+    /// RFC-0016::REQ-0003: `BudgetUsage` from Default still allows rate
+    /// assignment.
     ///
     /// Default-constructed `BudgetUsage` has `tick_rate_hz` = 0, allowing
     /// first-time assignment.
@@ -2454,8 +2462,8 @@ mod tests {
     // RFC-0016::REQ-0003: Legacy JSON Deserialization Tests
     // =========================================================================
 
-    /// RFC-0016::REQ-0003: Verify legacy JSON deserialization works by defaulting
-    /// `tick_rate_hz` to 1000.
+    /// RFC-0016::REQ-0003: Verify legacy JSON deserialization works by
+    /// defaulting `tick_rate_hz` to 1000.
     #[test]
     fn tck_00242_legacy_json_deserialization() {
         // Legacy Budget JSON (missing tick_rate_hz)

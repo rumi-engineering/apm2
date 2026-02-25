@@ -472,7 +472,8 @@ pub struct SpawnResponse {
     pub session_token: String,
 }
 
-/// Response for session-scoped episode status (RFC-0032::REQ-0090, RFC-0032::REQ-0134).
+/// Response for session-scoped episode status (RFC-0032::REQ-0090,
+/// RFC-0032::REQ-0134).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStatusResponse {

@@ -15,7 +15,8 @@
 //!
 //! # References
 //!
-//! - RFC-0032::REQ-0049: Implement `CoordinationReducer` with determinism property tests
+//! - RFC-0032::REQ-0049: Implement `CoordinationReducer` with determinism
+//!   property tests
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 
 // Test code uses proptest which generates patterns that trigger these lints.

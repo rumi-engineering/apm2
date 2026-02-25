@@ -1,8 +1,8 @@
 //! Tool executor for budget-enforced tool execution.
 //!
-//! This module implements the `ToolExecutor` per RFC-0033::REQ-0032. The executor
-//! charges budget before execution, dispatches to tool handlers, stores
-//! results in CAS, and tracks execution duration.
+//! This module implements the `ToolExecutor` per RFC-0033::REQ-0032. The
+//! executor charges budget before execution, dispatches to tool handlers,
+//! stores results in CAS, and tracks execution duration.
 //!
 //! # Architecture
 //!
@@ -277,7 +277,8 @@ impl ExecutionContext {
         self
     }
 
-    /// Attaches an idempotency key for external deduplication (RFC-0032::REQ-0176).
+    /// Attaches an idempotency key for external deduplication
+    /// (RFC-0032::REQ-0176).
     #[must_use]
     pub fn with_idempotency_key(mut self, key: Option<String>) -> Self {
         self.idempotency_key = key;
@@ -293,8 +294,8 @@ impl ExecutionContext {
 ///
 /// The executor manages tool handler registration, budget charging,
 /// execution dispatch, and result storage. Per RFC-0016 (HTF) and
-/// RFC-0016::REQ-0002, tool executions are stamped with `TimeEnvelope` references
-/// for temporal ordering and causality tracking.
+/// RFC-0016::REQ-0002, tool executions are stamped with `TimeEnvelope`
+/// references for temporal ordering and causality tracking.
 ///
 /// # Lifecycle
 ///
@@ -582,7 +583,8 @@ impl ToolExecutor {
             "budget charged"
         );
 
-        // Step 4: Pre-invalidate cache for state-modifying tools (RFC-0032::REQ-0127 fix)
+        // Step 4: Pre-invalidate cache for state-modifying tools (RFC-0032::REQ-0127
+        // fix)
         //
         // State-modifying tools (Write, Execute, Git, Artifact) may modify the
         // workspace even if they return an error. For example, a partial `git pull`
@@ -633,8 +635,8 @@ impl ToolExecutor {
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
-        // RFC-0032::REQ-0127: Update cache for read-only tools (cache_key is only set for
-        // Read/Search) Note: State-modifying tools (Write, Execute, Git)
+        // RFC-0032::REQ-0127: Update cache for read-only tools (cache_key is only set
+        // for Read/Search) Note: State-modifying tools (Write, Execute, Git)
         // already invalidated the cache before execution (Step 4), so we don't
         // need to invalidate again here.
         if let Some(cache) = &self.output_cache {

@@ -86,8 +86,9 @@ const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
 
 /// Stores all builtin adapter profiles in CAS and returns `profile_id` -> hash.
 ///
-/// RFC-0032::REQ-0152 requires all builtin profiles to be addressable in CAS at daemon
-/// startup so hash-based selection and explicit overrides can resolve them.
+/// RFC-0032::REQ-0152 requires all builtin profiles to be addressable in CAS at
+/// daemon startup so hash-based selection and explicit overrides can resolve
+/// them.
 fn seed_builtin_profiles_in_cas(
     cas: &dyn apm2_core::evidence::ContentAddressedStore,
 ) -> Result<HashMap<String, [u8; 32]>, String> {
@@ -240,8 +241,8 @@ fn derive_pcac_consume_log_path(sqlite_conn: &Arc<Mutex<Connection>>) -> Result<
 /// Returns the bootstrap sovereignty enforcement mode used during daemon
 /// construction.
 ///
-/// TODO(RFC-0020::REQ-0046): Load this mode from runtime governance/policy projection
-/// instead of a transitional static default.
+/// TODO(RFC-0020::REQ-0046): Load this mode from runtime governance/policy
+/// projection instead of a transitional static default.
 const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::SovereigntyEnforcementMode {
     apm2_core::pcac::SovereigntyEnforcementMode::Strict
 }
@@ -249,8 +250,8 @@ const fn bootstrap_sovereignty_enforcement_mode() -> apm2_core::pcac::Sovereignt
 /// Builds the bootstrap sovereignty state snapshot for session dispatcher
 /// wiring.
 ///
-/// TODO(RFC-0020::REQ-0046): Hydrate and wire authoritative sovereignty state via
-/// runtime IPC/projection updates.
+/// TODO(RFC-0020::REQ-0046): Hydrate and wire authoritative sovereignty state
+/// via runtime IPC/projection updates.
 ///
 /// NOTE: Tier2+ requests are denied fail-closed by default because no runtime
 /// sovereignty state is hydrated. This is intentional — the operator must
@@ -470,7 +471,8 @@ const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 30_000;
 const GOVERNANCE_FRESHNESS_THRESHOLD_MS: u64 = 120;
 
 // ============================================================================
-// RFC-0032::REQ-0089: Fail-Closed Manifest Store (kept for potential future use)
+// RFC-0032::REQ-0089: Fail-Closed Manifest Store (kept for potential future
+// use)
 // ============================================================================
 
 /// A manifest store that always returns `None`, enforcing fail-closed behavior.
@@ -545,14 +547,16 @@ pub struct DispatcherState {
     /// registered during spawn are accessible for tool validation.
     session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
 
-    /// Gate execution orchestrator for autonomous gate lifecycle (RFC-0032::REQ-0142).
+    /// Gate execution orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// Gate start is publication-driven via
     /// [`GateOrchestrator::start_for_changeset`]. Session termination only
     /// triggers timeout polling via [`Self::poll_gate_lifecycle`] (CSID-003).
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
 
-    /// Merge executor for autonomous merge after gate approval (RFC-0032::REQ-0144).
+    /// Merge executor for autonomous merge after gate approval
+    /// (RFC-0032::REQ-0144).
     ///
     /// When set, the merge executor is available for triggering the
     /// autonomous merge lifecycle when all gate receipts reach PASS verdict.
@@ -560,7 +564,8 @@ pub struct DispatcherState {
     /// creates a signed `MergeReceipt`, and transitions work to Completed.
     merge_executor: Option<Arc<MergeExecutor>>,
 
-    /// Shared stop authority for runtime mutation (RFC-0020::REQ-0005 MAJOR 2 FIX).
+    /// Shared stop authority for runtime mutation (RFC-0020::REQ-0005 MAJOR 2
+    /// FIX).
     ///
     /// Stored as `Arc` so operator/governance control-plane paths can
     /// mutate stop flags at runtime (e.g., set emergency stop) and the
@@ -585,8 +590,8 @@ pub struct DispatcherState {
     /// Runtime anti-entropy economics hook wired to the production PCAC gate.
     anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>>,
 
-    /// RFC-0020::REQ-0051: Shared divergence watchdog for IPC-accessible unfreeze and
-    /// durable recovery evidence registration.
+    /// RFC-0020::REQ-0051: Shared divergence watchdog for IPC-accessible
+    /// unfreeze and durable recovery evidence registration.
     ///
     /// When present, operator IPC handlers can call
     /// `register_durable_recovery_evidence`, `create_unfreeze`, and
@@ -636,25 +641,27 @@ impl DispatcherState {
         // tool requests will be denied (fail-closed behavior in handle_request_tool).
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // RFC-0032::REQ-0089: Create session registry (stub for now, use with_session_registry
-        // for real)
+        // RFC-0032::REQ-0089: Create session registry (stub for now, use
+        // with_session_registry for real)
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
-        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain hazard
-        // (RSK-2503)
+        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain
+        // hazard (RSK-2503)
         let clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("failed to create default clock"),
         );
 
-        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
-        // RFC-0032::REQ-0089 BLOCKER 1 & 2: Create privileged dispatcher with shared state
+        // RFC-0032::REQ-0089 BLOCKER 1 & 2: Create privileged dispatcher with shared
+        // state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
@@ -681,18 +688,19 @@ impl DispatcherState {
         // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and manifest
-        // store This ensures:
+        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and
+        // manifest store This ensures:
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
         // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
-        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -738,22 +746,23 @@ impl DispatcherState {
         // RFC-0032::REQ-0089 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain hazard
-        // (RSK-2503)
+        // RFC-0032::REQ-0091: Create shared HolonicClock to prevent mixed clock domain
+        // hazard (RSK-2503)
         let clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("failed to create default clock"),
         );
 
-        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // RFC-0032::REQ-0133: Create credential store for credential management
         let credential_store = Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
-        // RFC-0032::REQ-0089 BLOCKER 1: Create privileged dispatcher with global session
-        // registry
+        // RFC-0032::REQ-0089 BLOCKER 1: Create privileged dispatcher with global
+        // session registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
@@ -780,16 +789,17 @@ impl DispatcherState {
         // RFC-0032::REQ-0138: Create shared telemetry store for session counters
         let telemetry_store = Arc::new(SessionTelemetryStore::new());
 
-        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and manifest
-        // store
+        // RFC-0032::REQ-0089: Create session dispatcher with same token minter and
+        // manifest store
         // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
-        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and SessionStatus queries
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -871,15 +881,16 @@ impl DispatcherState {
             .as_ref()
             .map(|key| key.verifying_key().to_bytes());
 
-        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // RFC-0032::REQ-0134: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
-        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
-        // stop()/quarantine() can call mark_terminated() in production.
+        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so
+        // that stop()/quarantine() can call mark_terminated() in production.
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // RFC-0032::REQ-0133: Create credential store for credential management
@@ -910,10 +921,11 @@ impl DispatcherState {
                 signing_key,
             ));
 
-            // RFC-0032::REQ-0113 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
-            // All file/execute handlers MUST use rooted factories that receive the
-            // workspace root at episode start time. This ensures handlers are isolated
-            // to the episode's workspace, not the daemon's CWD.
+            // RFC-0032::REQ-0113 SECURITY: Configure EpisodeRuntime with workspace-rooted
+            // handlers All file/execute handlers MUST use rooted factories that
+            // receive the workspace root at episode start time. This ensures
+            // handlers are isolated to the episode's workspace, not the
+            // daemon's CWD.
             let mut episode_runtime = EpisodeRuntime::new(EpisodeRuntimeConfig::default());
             episode_runtime = episode_runtime
                 // ReadFileHandler - reads files within workspace
@@ -1065,8 +1077,8 @@ impl DispatcherState {
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
-        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         // RFC-0020::REQ-0005 v4: Wire stop conditions store into privileged dispatcher
         privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
@@ -1076,11 +1088,12 @@ impl DispatcherState {
 
         // RFC-0032::REQ-0099: Share subscription registry for HEF resource governance
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
-        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and SessionStatus queries
-        // RFC-0020::REQ-0005: Wire pre-actuation gate, stop authority, and stop conditions store
-        // RFC-0020::REQ-0006: Wire V1 manifest store for scope enforcement
-        // RFC-0020::REQ-0045: Authoritative persistence mode requires durable consume
-        // enforcement and lifecycle gate wiring.
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries RFC-0020::REQ-0005: Wire pre-actuation gate,
+        // stop authority, and stop conditions store RFC-0020::REQ-0006: Wire V1
+        // manifest store for scope enforcement RFC-0020::REQ-0045:
+        // Authoritative persistence mode requires durable consume enforcement
+        // and lifecycle gate wiring.
         let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
@@ -1378,20 +1391,22 @@ impl DispatcherState {
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
-        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource governance
+        // RFC-0032::REQ-0099: Create shared subscription registry for HEF resource
+        // governance
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
         // RFC-0032::REQ-0134: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
-        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so that
-        // stop()/quarantine() can call mark_terminated() in production.
+        // RFC-0032::REQ-0139 BLOCKER 1: Clone session_registry for EpisodeRuntime so
+        // that stop()/quarantine() can call mark_terminated() in production.
         let session_registry_for_runtime = Arc::clone(&session_registry);
 
         // RFC-0032::REQ-0110: Create durable CAS
         // Keep the concrete type so we can upcast to both executor and evidence
-        // CAS traits (RFC-0032::REQ-0156: dispatcher needs evidence::ContentAddressedStore).
+        // CAS traits (RFC-0032::REQ-0156: dispatcher needs
+        // evidence::ContentAddressedStore).
         let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
         let durable_cas = Arc::new(DurableCas::new(cas_config)?);
         // Coerce to executor::ContentAddressedStore (infallible, daemon-local)
@@ -1487,9 +1502,9 @@ impl DispatcherState {
             // call mark_terminated() in production.
             .with_session_registry(session_registry_for_runtime);
 
-        // RFC-0032::REQ-0151: Create adapter registry with explicit adapter registrations.
-        // MAJOR fix: Use explicit new() + register() instead of deprecated
-        // with_defaults() to avoid ambient defaults (DoD requires
+        // RFC-0032::REQ-0151: Create adapter registry with explicit adapter
+        // registrations. MAJOR fix: Use explicit new() + register() instead of
+        // deprecated with_defaults() to avoid ambient defaults (DoD requires
         // profile-explicit production path).
         let mut adapter_registry = crate::episode::AdapterRegistry::new();
         adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
@@ -1601,8 +1616,8 @@ impl DispatcherState {
         let governance_freshness_monitor =
             Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
-        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for SpawnEpisode
-        // registration
+        // RFC-0032::REQ-0138: Wire telemetry store into privileged dispatcher for
+        // SpawnEpisode registration
         // RFC-0020::REQ-0005 v4: Wire stop conditions store into privileged dispatcher
         privileged_dispatcher = privileged_dispatcher
             .with_telemetry_store(Arc::clone(&telemetry_store))
@@ -1612,11 +1627,12 @@ impl DispatcherState {
 
         // RFC-0032::REQ-0110: Wire SessionDispatcher with all production dependencies
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
-        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and SessionStatus queries
-        // RFC-0020::REQ-0005: Wire pre-actuation gate, stop authority, stop conditions store
-        // RFC-0020::REQ-0006: Wire V1 manifest store for scope enforcement
-        // RFC-0020::REQ-0045 BLOCKER 1 FIX: Wire DurableKernel + FileBackedConsumeIndex
-        // in production constructor. The consume log path is co-located inside
+        // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
+        // SessionStatus queries RFC-0020::REQ-0005: Wire pre-actuation gate,
+        // stop authority, stop conditions store RFC-0020::REQ-0006: Wire V1
+        // manifest store for scope enforcement RFC-0020::REQ-0045 BLOCKER 1
+        // FIX: Wire DurableKernel + FileBackedConsumeIndex in production
+        // constructor. The consume log path is co-located inside
         // the CAS directory to ensure per-instance isolation.
         let consume_log_path = cas_path.as_ref().join("pcac_consume.log");
         let durable_index = crate::pcac::FileBackedConsumeIndex::open(
@@ -1893,8 +1909,8 @@ impl DispatcherState {
         self
     }
 
-    /// RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the event
-    /// emitter and lease validator.
+    /// RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the
+    /// event emitter and lease validator.
     ///
     /// Called from daemon startup after RFC-0032 Phase 0 migration completes.
     /// After this call, all new appends route to the canonical `events` table.
@@ -1961,7 +1977,8 @@ impl DispatcherState {
         self
     }
 
-    /// Sets the gate orchestrator for autonomous gate lifecycle (RFC-0032::REQ-0142).
+    /// Sets the gate orchestrator for autonomous gate lifecycle
+    /// (RFC-0032::REQ-0142).
     ///
     /// Gate start is publication-driven via
     /// [`GateOrchestrator::start_for_changeset`]. Session termination only
@@ -2096,8 +2113,8 @@ impl DispatcherState {
         self.privileged_dispatcher.event_emitter()
     }
 
-    /// Returns the shared stop authority for runtime mutation (RFC-0020::REQ-0005
-    /// MAJOR 2 FIX).
+    /// Returns the shared stop authority for runtime mutation
+    /// (RFC-0020::REQ-0005 MAJOR 2 FIX).
     ///
     /// Operator/governance control-plane paths use this to flip stop flags
     /// at runtime.  Changes are immediately visible to the pre-actuation
@@ -2310,7 +2327,8 @@ impl DaemonStateHandle {
     }
 
     /// Get a reference to the schema registry.
-    /// Will be used by future handlers for schema validation (RFC-0033::REQ-0045).
+    /// Will be used by future handlers for schema validation
+    /// (RFC-0033::REQ-0045).
     #[must_use]
     #[allow(dead_code)]
     pub const fn schema_registry(&self) -> &InMemorySchemaRegistry {
@@ -2347,7 +2365,8 @@ impl DaemonStateHandle {
         self.inner.read().await
     }
 
-    /// Try to get read access to the inner state without blocking (RFC-0032::REQ-0132).
+    /// Try to get read access to the inner state without blocking
+    /// (RFC-0032::REQ-0132).
     ///
     /// Returns `None` if the write lock is currently held. This is used by
     /// synchronous dispatch handlers that cannot `.await`.
@@ -2356,7 +2375,8 @@ impl DaemonStateHandle {
         self.inner.try_read().ok()
     }
 
-    /// Try to get write access to the inner state without blocking (RFC-0032::REQ-0132).
+    /// Try to get write access to the inner state without blocking
+    /// (RFC-0032::REQ-0132).
     ///
     /// Returns `None` if any lock (read or write) is currently held. This is
     /// used by synchronous dispatch handlers for process state mutations

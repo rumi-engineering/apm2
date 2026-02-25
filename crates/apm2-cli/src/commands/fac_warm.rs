@@ -24,9 +24,10 @@
 //! - [INV-WARM-CLI-004] Broker health gate is opened before token issuance
 //!   (fail-closed on missing/stale authority).
 //! - [INV-WARM-CLI-005] Warm specs are validated against the FAC policy-derived
-//!   `JobSpecValidationPolicy` before enqueue (RFC-0032::REQ-0229). This enforces
-//!   `repo_id` allowlist, `bytes_backend` allowlist, and filesystem-path
-//!   rejection at enqueue time, matching the gates enqueue path.
+//!   `JobSpecValidationPolicy` before enqueue (RFC-0032::REQ-0229). This
+//!   enforces `repo_id` allowlist, `bytes_backend` allowlist, and
+//!   filesystem-path rejection at enqueue time, matching the gates enqueue
+//!   path.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -469,9 +470,9 @@ fn build_warm_job_spec(
         .map_err(|e| format!("token ledger WAL persist on issuance: {e}"))?;
     spec.actuation.channel_context_token = Some(token);
 
-    // RFC-0032::REQ-0229: Validate the warm spec against the policy-derived validation
-    // policy before enqueue, failing closed on validation error.  This mirrors
-    // the gates enqueue path (INV-JS-005).
+    // RFC-0032::REQ-0229: Validate the warm spec against the policy-derived
+    // validation policy before enqueue, failing closed on validation error.
+    // This mirrors the gates enqueue path (INV-JS-005).
     validate_job_spec_with_policy(&spec, job_spec_policy)
         .map_err(|e| format!("validate warm job spec: {e}"))?;
 

@@ -842,7 +842,8 @@ mod tests {
     }
 
     /// UT-00507-18: Malformed hex key in TOML causes startup failure.
-    /// RFC-0032::REQ-0177: requires >= 2 sinks, so a valid secondary is included.
+    /// RFC-0032::REQ-0177: requires >= 2 sinks, so a valid secondary is
+    /// included.
     #[test]
     fn toml_malformed_key_fails_at_parse_time() {
         let key_hex_2 = valid_test_key_hex_2();

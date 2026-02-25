@@ -855,24 +855,24 @@ pub struct ContextPackManifest {
 
     /// Allowlist of tool classes that can be invoked.
     ///
-    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, tool requests are validated against
-    /// this allowlist. Empty means no tools allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, tool requests are validated
+    /// against this allowlist. Empty means no tools allowed (fail-closed).
     #[serde(default)]
     pub tool_allowlist: Vec<ToolClass>,
 
     /// Allowlist of filesystem paths that can be written to.
     ///
-    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, write operations are validated against
-    /// this allowlist. Paths should be absolute and normalized. Empty means
-    /// no writes allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, write operations are validated
+    /// against this allowlist. Paths should be absolute and normalized.
+    /// Empty means no writes allowed (fail-closed).
     #[serde(default)]
     pub write_allowlist: Vec<std::path::PathBuf>,
 
     /// Allowlist of shell command patterns that can be executed.
     ///
-    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, shell execution requests are validated
-    /// against this allowlist. Patterns may use glob syntax. Empty means no
-    /// shell allowed (fail-closed).
+    /// Per RFC-0032::REQ-0070 and REQ-DCP-0002, shell execution requests are
+    /// validated against this allowlist. Patterns may use glob syntax.
+    /// Empty means no shell allowed (fail-closed).
     #[serde(default)]
     pub shell_allowlist: Vec<String>,
 
@@ -985,8 +985,9 @@ impl ContextPackManifest {
 
     /// Checks if the given path is in the write allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
-    /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty
+    /// (fail-closed). The path must be a prefix match: `/workspace` allows
+    /// `/workspace/foo`.
     #[must_use]
     pub fn is_write_path_allowed(&self, path: &std::path::Path) -> bool {
         if self.write_allowlist.is_empty() {
@@ -1003,8 +1004,9 @@ impl ContextPackManifest {
     /// Checks if the given shell command matches a pattern in the shell
     /// allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty (fail-closed).
-    /// Patterns use simple glob matching with `*` as wildcard.
+    /// Per RFC-0032::REQ-0070, returns `false` if the allowlist is empty
+    /// (fail-closed). Patterns use simple glob matching with `*` as
+    /// wildcard.
     #[must_use]
     pub fn is_shell_command_allowed(&self, command: &str) -> bool {
         if self.shell_allowlist.is_empty() {
@@ -1022,8 +1024,8 @@ impl ContextPackManifest {
     /// Computes the manifest hash from the manifest fields.
     ///
     /// The hash is computed over the canonical representation of all fields
-    /// except the hash itself. Per RFC-0032::REQ-0070, all allowlists are sorted for
-    /// deterministic ordering.
+    /// except the hash itself. Per RFC-0032::REQ-0070, all allowlists are
+    /// sorted for deterministic ordering.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     fn compute_manifest_hash(
@@ -1598,7 +1600,8 @@ impl ContextPackManifestBuilder {
 
     /// Sets the write allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, only writes to paths in this allowlist are permitted.
+    /// Per RFC-0032::REQ-0070, only writes to paths in this allowlist are
+    /// permitted.
     #[must_use]
     pub fn write_allowlist(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.write_allowlist = paths;
@@ -1614,8 +1617,8 @@ impl ContextPackManifestBuilder {
 
     /// Sets the shell allowlist.
     ///
-    /// Per RFC-0032::REQ-0070, only shell commands matching patterns in this allowlist
-    /// can be executed.
+    /// Per RFC-0032::REQ-0070, only shell commands matching patterns in this
+    /// allowlist can be executed.
     #[must_use]
     pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
         self.shell_allowlist = patterns;
@@ -2918,8 +2921,8 @@ pub mod tests {
         assert_eq!(seal_hash, manifest.manifest_hash());
     }
 
-    /// RFC-0032::REQ-0071: Verify seal hash is deterministic (same entries produce same
-    /// hash).
+    /// RFC-0032::REQ-0071: Verify seal hash is deterministic (same entries
+    /// produce same hash).
     #[test]
     fn tck_00255_seal_hash_is_deterministic() {
         // Build two manifests with identical content
@@ -2957,8 +2960,8 @@ pub mod tests {
         assert_eq!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// RFC-0032::REQ-0071: Verify modification after sealing is detected (hash mismatch
-    /// causes rejection).
+    /// RFC-0032::REQ-0071: Verify modification after sealing is detected (hash
+    /// mismatch causes rejection).
     #[test]
     fn tck_00255_modification_after_sealing_detected() {
         // Create a manifest with manually corrupted hash via JSON
@@ -3000,7 +3003,8 @@ pub mod tests {
         assert!(recovered.verify_seal().is_ok());
     }
 
-    /// RFC-0032::REQ-0071: Verify different entries produce different seal hashes.
+    /// RFC-0032::REQ-0071: Verify different entries produce different seal
+    /// hashes.
     #[test]
     fn tck_00255_different_entries_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3023,7 +3027,8 @@ pub mod tests {
         assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// RFC-0032::REQ-0071: Verify different content hashes produce different seal.
+    /// RFC-0032::REQ-0071: Verify different content hashes produce different
+    /// seal.
     #[test]
     fn tck_00255_different_content_hash_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3046,7 +3051,8 @@ pub mod tests {
         assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
     }
 
-    /// RFC-0032::REQ-0071: Verify different access levels produce different seal.
+    /// RFC-0032::REQ-0071: Verify different access levels produce different
+    /// seal.
     #[test]
     fn tck_00255_different_access_level_different_seal() {
         let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
@@ -3082,7 +3088,8 @@ pub mod tests {
         assert!(manifest.verify_seal().is_ok());
     }
 
-    /// RFC-0032::REQ-0071: Verify different insertion orders produce the same seal hash.
+    /// RFC-0032::REQ-0071: Verify different insertion orders produce the same
+    /// seal hash.
     ///
     /// This is the critical test for deterministic hashing: entries are sorted
     /// by path before hashing, so insertion order should not affect the result.

@@ -1,5 +1,5 @@
-//! RFC-0032::REQ-0092: Session dispatcher viability - `RequestTool` execution + real
-//! `EmitEvent`/`PublishEvidence`
+//! RFC-0032::REQ-0092: Session dispatcher viability - `RequestTool` execution +
+//! real `EmitEvent`/`PublishEvidence`
 //!
 //! This test module verifies the session dispatcher's viability with:
 //! - `RequestTool` execution via manifest validation (no stub Allow path)
@@ -77,16 +77,18 @@ fn make_session_ctx() -> ConnectionContext {
 
 /// Creates a test clock for session dispatcher tests.
 ///
-/// Per RFC-0032::REQ-0092 MAJOR 2 FIX, the session dispatcher now fails-closed when
-/// no clock is configured. Tests that use `EmitEvent` must configure a clock.
+/// Per RFC-0032::REQ-0092 MAJOR 2 FIX, the session dispatcher now fails-closed
+/// when no clock is configured. Tests that use `EmitEvent` must configure a
+/// clock.
 fn test_clock() -> Arc<HolonicClock> {
     Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("failed to create test clock"))
 }
 
 /// Creates a test PCAC lifecycle gate for dispatchers in authoritative mode.
 ///
-/// Per RFC-0032::REQ-0173, `EmitEvent`/`PublishEvidence` in authoritative mode require
-/// an authority lifecycle gate (kernel or PCAC). This helper provides one.
+/// Per RFC-0032::REQ-0173, `EmitEvent`/`PublishEvidence` in authoritative mode
+/// require an authority lifecycle gate (kernel or PCAC). This helper provides
+/// one.
 fn test_pcac_gate() -> Arc<LifecycleGate> {
     Arc::new(LifecycleGate::new(Arc::new(InProcessKernel::new(1))))
 }
@@ -144,7 +146,8 @@ fn test_tool_argument_taint_policy() -> TaintPolicy {
         level: None,
         target: Some(TargetContext::ToolArgument),
         allow: true,
-        rationale: "RFC-0032::REQ-0092 tests focus on dispatcher wiring, not taint policy".to_string(),
+        rationale: "RFC-0032::REQ-0092 tests focus on dispatcher wiring, not taint policy"
+            .to_string(),
     })
 }
 
@@ -156,7 +159,8 @@ fn test_tool_argument_taint_policy() -> TaintPolicy {
 /// Verify `RequestTool` with configured manifest store returns fail-closed
 /// error when tool broker is unavailable.
 ///
-/// RFC-0032::REQ-0127: Legacy manifest store validation removed; tool broker required.
+/// RFC-0032::REQ-0127: Legacy manifest store validation removed; tool broker
+/// required.
 #[test]
 fn session_request_tool_exec_allow_with_manifest() {
     let minter = test_minter();
@@ -200,7 +204,8 @@ fn session_request_tool_exec_allow_with_manifest() {
 
 /// Verify `RequestTool` returns fail-closed error when tool broker unavailable.
 ///
-/// RFC-0032::REQ-0127: Legacy manifest store validation removed; tool broker required.
+/// RFC-0032::REQ-0127: Legacy manifest store validation removed; tool broker
+/// required.
 #[test]
 fn session_request_tool_exec_deny_not_in_allowlist() {
     let minter = test_minter();
@@ -598,9 +603,9 @@ fn session_event_evidence_persist_full_config_integration() {
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute]);
     store.register("session-001", manifest);
 
-    // Create fully-configured dispatcher with clock and PCAC gate (RFC-0032::REQ-0173)
-    // RFC-0032::REQ-0173: PCAC lifecycle enforcement requires session_registry and
-    // stop_authority dependencies.
+    // Create fully-configured dispatcher with clock and PCAC gate
+    // (RFC-0032::REQ-0173) RFC-0032::REQ-0173: PCAC lifecycle enforcement
+    // requires session_registry and stop_authority dependencies.
     let dispatcher = SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas)
         .with_clock(clock)
         .with_taint_policy(test_tool_argument_taint_policy())
@@ -610,7 +615,8 @@ fn session_event_evidence_persist_full_config_integration() {
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
-    // Test RequestTool - RFC-0032::REQ-0127: now returns broker unavailable (fail-closed)
+    // Test RequestTool - RFC-0032::REQ-0127: now returns broker unavailable
+    // (fail-closed)
     let tool_request = RequestToolRequest {
         session_token: serde_json::to_string(&token).unwrap(),
         tool_id: "write".to_string(),
@@ -790,7 +796,8 @@ fn session_event_evidence_persist_publish_evidence_retention_hints() {
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
     let ledger = Arc::new(StubLedgerEventEmitter::new());
 
-    // RFC-0032::REQ-0173: PCAC lifecycle enforcement requires all authoritative deps.
+    // RFC-0032::REQ-0173: PCAC lifecycle enforcement requires all authoritative
+    // deps.
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
         .with_cas(cas)
         .with_ledger(ledger)

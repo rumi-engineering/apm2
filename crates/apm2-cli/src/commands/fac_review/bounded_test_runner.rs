@@ -148,8 +148,8 @@ pub fn build_bounded_test_command(
 
     // Convert CLI limits to core properties for unified command
     // construction. Uses the policy-driven sandbox hardening profile
-    // and network policy (RFC-0032::REQ-0223, RFC-0032::REQ-0224) instead of hard-coding
-    // defaults.
+    // and network policy (RFC-0032::REQ-0223, RFC-0032::REQ-0224) instead of
+    // hard-coding defaults.
     let properties = limits_to_properties(limits, sandbox_hardening, network_policy)?;
 
     // Select execution backend: user-mode (requires D-Bus session) or
@@ -241,7 +241,8 @@ pub fn build_bounded_test_command(
 }
 
 /// Build a bounded gate command for non-test evidence gates (rustfmt, clippy,
-/// doc) that applies network policy isolation via `systemd-run` (RFC-0032::REQ-0224).
+/// doc) that applies network policy isolation via `systemd-run`
+/// (RFC-0032::REQ-0224).
 ///
 /// This ensures ALL evidence gate phases — not only the bounded test phase —
 /// run under network-deny when the default policy is active. Uses the same
@@ -358,8 +359,8 @@ fn append_systemd_setenv_args(command: &mut Vec<String>, setenv_pairs: &[(String
 
 /// Build `--setenv` pairs from a policy-computed environment.
 ///
-/// RFC-0032::REQ-0204: This replaces the previous ad-hoc allowlist approach. The
-/// caller provides a pre-computed environment from `FacPolicyV1` (via
+/// RFC-0032::REQ-0204: This replaces the previous ad-hoc allowlist approach.
+/// The caller provides a pre-computed environment from `FacPolicyV1` (via
 /// `build_job_environment`), and this function forwards all entries as
 /// `--setenv` arguments after applying defense-in-depth stripping of
 /// `RUSTC_WRAPPER` and `SCCACHE_*` (INV-ENV-008).

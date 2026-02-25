@@ -44,14 +44,14 @@ pub struct GateResourcePolicy {
     pub test_parallelism: Option<u32>,
     pub bounded_runner: bool,
     /// BLAKE3 hash of the `SandboxHardeningProfile` used for gate execution
-    /// (RFC-0032::REQ-0223 MAJOR-3). Ensures the attestation digest changes when the
-    /// hardening profile is modified, preventing stale gate result reuse
-    /// from insecure environments.
+    /// (RFC-0032::REQ-0223 MAJOR-3). Ensures the attestation digest changes
+    /// when the hardening profile is modified, preventing stale gate result
+    /// reuse from insecure environments.
     pub sandbox_hardening: Option<String>,
     /// BLAKE3 hash of the `NetworkPolicy` used for gate execution
-    /// (RFC-0032::REQ-0224 MAJOR-1). Ensures the attestation digest changes when the
-    /// network policy toggles between allow and deny, preventing cache
-    /// reuse across policy drift.
+    /// (RFC-0032::REQ-0224 MAJOR-1). Ensures the attestation digest changes
+    /// when the network policy toggles between allow and deny, preventing
+    /// cache reuse across policy drift.
     pub network_policy_hash: Option<String>,
 }
 
@@ -480,11 +480,14 @@ pub fn gate_command_for_attestation(
             "warnings".to_string(),
         ]),
         "doc" => Some(vec![
+            "env".to_string(),
+            "RUSTFLAGS=-Dmissing_docs".to_string(),
             "cargo".to_string(),
-            "doc".to_string(),
+            "check".to_string(),
             "--offline".to_string(),
             "--workspace".to_string(),
-            "--no-deps".to_string(),
+            "--all-targets".to_string(),
+            "--all-features".to_string(),
         ]),
         "test" => Some(test_command_override.map_or_else(build_nextest_command, <[_]>::to_vec)),
         "test_safety_guard" => Some(vec![
@@ -605,6 +608,26 @@ mod tests {
         assert!(
             paths.contains(&".cargo/config.toml"),
             "doc gate must include .cargo/config.toml; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn doc_gate_command_enforces_missing_docs_without_generating_rustdoc_artifacts() {
+        let workspace_root = std::env::current_dir().expect("cwd");
+        let command =
+            gate_command_for_attestation(&workspace_root, "doc", None).expect("doc command");
+        let rendered = command.join(" ");
+        assert!(
+            rendered.contains("env RUSTFLAGS=-Dmissing_docs cargo check"),
+            "doc gate should use cargo check with missing_docs enforcement, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("--all-targets") && rendered.contains("--all-features"),
+            "doc gate should lint all targets/features, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("cargo doc"),
+            "doc gate must not generate rustdoc artifacts, got: {rendered}"
         );
     }
 
@@ -745,7 +768,8 @@ mod tests {
         );
     }
 
-    // --- RFC-0032::REQ-0200: attestation schema version bump + file-content binding ---
+    // --- RFC-0032::REQ-0200: attestation schema version bump + file-content
+    // binding ---
 
     #[test]
     fn attestation_schema_is_v2() {

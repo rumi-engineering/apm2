@@ -1604,19 +1604,20 @@ impl std::error::Error for TemporalArbitrationError {}
 /// Executes the full `join -> revalidate -> consume` sequence. If any stage
 /// fails, the deny is returned and no side effect may execute.
 ///
-/// RFC-0020::REQ-0046: When a `SovereigntyChecker` is configured, Tier2+ operations
-/// are additionally validated against sovereignty state during revalidate
-/// and consume stages.
+/// RFC-0020::REQ-0046: When a `SovereigntyChecker` is configured, Tier2+
+/// operations are additionally validated against sovereignty state during
+/// revalidate and consume stages.
 pub struct LifecycleGate {
     kernel: Arc<dyn AuthorityJoinKernel>,
     /// Optional reference to the in-process kernel for production tick
     /// advancement. When set, `advance_tick` calls are forwarded so
     /// freshness checks observe monotonic runtime time.
     tick_kernel: Option<Arc<InProcessKernel>>,
-    /// Optional sovereignty checker for Tier2+ enforcement (RFC-0020::REQ-0046).
+    /// Optional sovereignty checker for Tier2+ enforcement
+    /// (RFC-0020::REQ-0046).
     sovereignty_checker: Option<super::sovereignty::SovereigntyChecker>,
-    /// Optional stop authority for sovereignty freeze actuation (RFC-0020::REQ-0046
-    /// security review BLOCKER 1).
+    /// Optional stop authority for sovereignty freeze actuation
+    /// (RFC-0020::REQ-0046 security review BLOCKER 1).
     ///
     /// When a sovereignty denial carries a `containment_action`, the gate
     /// actuates the freeze via this authority before returning the denial.
@@ -1693,7 +1694,8 @@ impl LifecycleGate {
         }
     }
 
-    /// Creates a new lifecycle gate with sovereignty enforcement (RFC-0020::REQ-0046).
+    /// Creates a new lifecycle gate with sovereignty enforcement
+    /// (RFC-0020::REQ-0046).
     ///
     /// When a sovereignty checker is provided, Tier2+ operations are
     /// validated against sovereignty state during revalidate and consume.

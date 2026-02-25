@@ -1,9 +1,9 @@
 //! Connection handler for dual-socket `ProtocolServer` control plane.
 //!
 //! This module implements the connection handling logic for the daemon's
-//! `ProtocolServer`-only control plane (RFC-0032::REQ-0085/RFC-0032::REQ-0086). It performs the
-//! mandatory Hello/HelloAck handshake as specified in DD-001/DD-008 before
-//! processing any protobuf messages.
+//! `ProtocolServer`-only control plane (RFC-0032::REQ-0085/RFC-0032::REQ-0086).
+//! It performs the mandatory Hello/HelloAck handshake as specified in
+//! DD-001/DD-008 before processing any protobuf messages.
 //!
 //! # Protocol Compliance
 //!
@@ -390,8 +390,9 @@ pub async fn perform_handshake(
     connection: &mut Connection,
     config: &HandshakeConfig,
 ) -> Result<HandshakeResult> {
-    // RFC-0020::REQ-0002 BLOCKER-1: Wire real contract binding into ServerHandshake.
-    // Use the server's manifest hash, canonicalizers, and risk tier from config.
+    // RFC-0020::REQ-0002 BLOCKER-1: Wire real contract binding into
+    // ServerHandshake. Use the server's manifest hash, canonicalizers, and risk
+    // tier from config.
     let mut handshake = ServerHandshake::new(server_info())
         .with_server_contract_hash(&config.server_contract_hash)
         .with_server_canonicalizers(config.server_canonicalizers.clone())
@@ -618,8 +619,8 @@ mod tests {
         assert!(matches!(result, HandshakeResult::Failed));
     }
 
-    /// RFC-0020::REQ-0002: Test Tier2 denial through `perform_handshake` integration
-    /// path.
+    /// RFC-0020::REQ-0002: Test Tier2 denial through `perform_handshake`
+    /// integration path.
     #[tokio::test]
     async fn test_perform_handshake_tier2_contract_mismatch_denied() {
         use crate::protocol::handshake::{HandshakeErrorCode, Hello};
@@ -777,7 +778,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0002: Test that successful handshake returns contract binding.
+    /// RFC-0020::REQ-0002: Test that successful handshake returns contract
+    /// binding.
     #[tokio::test]
     async fn test_perform_handshake_returns_contract_binding() {
         use crate::protocol::handshake::Hello;
@@ -1111,7 +1113,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0003: Verify that dispatch succeeds after full phase progression.
+    /// RFC-0020::REQ-0003: Verify that dispatch succeeds after full phase
+    /// progression.
     #[test]
     fn test_privileged_dispatch_succeeds_after_session_open() {
         use super::super::dispatch::{
@@ -1180,7 +1183,8 @@ mod tests {
         }
     }
 
-    /// RFC-0020::REQ-0003: Verify that unknown session message type tags are rejected.
+    /// RFC-0020::REQ-0003: Verify that unknown session message type tags are
+    /// rejected.
     #[test]
     fn test_unknown_session_message_type_returns_none() {
         use super::super::session_dispatch::SessionMessageType;
@@ -1204,8 +1208,8 @@ mod tests {
         }
     }
 
-    /// RFC-0020::REQ-0003: Verify that unknown `HandshakeErrorCode` variants are
-    /// rejected during deserialization (fail-closed).
+    /// RFC-0020::REQ-0003: Verify that unknown `HandshakeErrorCode` variants
+    /// are rejected during deserialization (fail-closed).
     #[test]
     fn test_unknown_handshake_error_code_fails_closed() {
         use super::super::handshake::HandshakeErrorCode;
@@ -1276,8 +1280,8 @@ mod tests {
         assert!(result.is_ok(), "Valid payload within bounds must decode");
     }
 
-    /// RFC-0020::REQ-0003: Verify that unknown fields in `HelloNack` JSON are rejected
-    /// (`deny_unknown_fields`).
+    /// RFC-0020::REQ-0003: Verify that unknown fields in `HelloNack` JSON are
+    /// rejected (`deny_unknown_fields`).
     #[test]
     fn test_signed_json_rejects_unknown_fields_hello_nack() {
         use super::super::handshake::HelloNack;
@@ -1291,7 +1295,8 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0003: Verify that default `DecodeConfig` constants are reasonable.
+    /// RFC-0020::REQ-0003: Verify that default `DecodeConfig` constants are
+    /// reasonable.
     #[test]
     fn test_decode_config_defaults_are_bounded() {
         use super::super::messages::{

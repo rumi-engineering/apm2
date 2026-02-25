@@ -19,8 +19,8 @@
 //! # References
 //!
 //! - RFC-0032::REQ-0053: Implement apm2 coordinate CLI command
-//! - RFC-0016::REQ-0006: HTF CLI rendering of ticks/ledger windows with bounded wall
-//!   overlay
+//! - RFC-0016::REQ-0006: HTF CLI rendering of ticks/ledger windows with bounded
+//!   wall overlay
 //! - RFC-0032::REQ-0136: Wire coordinate command to daemon integration
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
 //! - RFC-0016: Hierarchical Time Framework
@@ -696,8 +696,8 @@ const SESSION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Conservative token estimation rate: tokens per second of wall-clock time.
 ///
 /// **Fallback only**: When the daemon reports `actual_tokens_consumed` via
-/// `SessionStatus` (RFC-0032::REQ-0138/RFC-0032::REQ-0140), that value is used instead. This
-/// rate is only applied when `actual_tokens_consumed` is `None`.
+/// `SessionStatus` (RFC-0032::REQ-0138/RFC-0032::REQ-0140), that value is used
+/// instead. This rate is only applied when `actual_tokens_consumed` is `None`.
 ///
 /// The rate (100 tokens/sec) is deliberately over-estimated to ensure budget
 /// enforcement errs on the side of caution — modern LLM agents routinely
@@ -1583,8 +1583,8 @@ mod tests {
         assert_eq!(work_ids[1], "work-2");
     }
 
-    /// RFC-0032::REQ-0053: Test malformed JSON in work-query is rejected (security
-    /// fix).
+    /// RFC-0032::REQ-0053: Test malformed JSON in work-query is rejected
+    /// (security fix).
     ///
     /// Per security review: If input looks like JSON (starts with `[`) but
     /// fails to parse, we must return an error instead of falling back to
@@ -1720,23 +1720,24 @@ mod tests {
     // HTF Compliance Tests (RFC-0016::REQ-0006)
     // =========================================================================
 
-    /// RFC-0016::REQ-0006: Verify tick-based duration takes precedence over wall-clock
-    /// ms.
+    /// RFC-0016::REQ-0006: Verify tick-based duration takes precedence over
+    /// wall-clock ms.
     ///
     /// Per RFC-0016: Ticks are authoritative for duration/budget enforcement.
     /// When `max_duration_ticks` is provided, it takes precedence over
     /// `max_duration_ms`.
     ///
     /// Note: This test verifies the receipt contains correct tick values.
-    /// With RFC-0032::REQ-0136 daemon integration, the function always returns a receipt
-    /// (even when daemon is unavailable - it just aborts).
+    /// With RFC-0032::REQ-0136 daemon integration, the function always returns
+    /// a receipt (even when daemon is unavailable - it just aborts).
     #[test]
     fn tck_00247_tick_duration_takes_precedence() {
         let mut args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
         args.max_duration_ticks = Some(5_000_000); // 5M ticks = 5s at 1MHz
 
-        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon unavailable
-        // The receipt will have ABORTED status but correct budget ceiling values
+        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon
+        // unavailable The receipt will have ABORTED status but correct budget
+        // ceiling values
         let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(
             result.is_ok(),
@@ -1750,7 +1751,8 @@ mod tests {
         assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
-    /// RFC-0016::REQ-0006: Verify zero ticks is rejected (tick authority validation).
+    /// RFC-0016::REQ-0006: Verify zero ticks is rejected (tick authority
+    /// validation).
     ///
     /// Per RFC-0016: Zero duration is invalid for any authority clock domain.
     #[test]
@@ -1768,18 +1770,21 @@ mod tests {
         }
     }
 
-    /// RFC-0016::REQ-0006: Verify wall-clock ms fallback when ticks not provided.
+    /// RFC-0016::REQ-0006: Verify wall-clock ms fallback when ticks not
+    /// provided.
     ///
     /// Per RFC-0016: ms input is converted to ticks for internal use.
     /// This maintains backward compatibility while enforcing tick authority.
     ///
-    /// Note: With RFC-0032::REQ-0136 daemon integration, the function always returns a
-    /// receipt (even when daemon is unavailable - it just aborts).
+    /// Note: With RFC-0032::REQ-0136 daemon integration, the function always
+    /// returns a receipt (even when daemon is unavailable - it just
+    /// aborts).
     #[test]
     fn tck_00247_ms_converted_to_ticks() {
         let args = test_args_with_defaults(Some(vec!["work-1".to_string()]), 10, 1_000);
 
-        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon unavailable
+        // With RFC-0032::REQ-0136, the function returns Ok(receipt) even when daemon
+        // unavailable
         let result = run_coordinate_inner(&args, &test_socket_path(), &test_socket_path());
         assert!(
             result.is_ok(),
@@ -1793,8 +1798,8 @@ mod tests {
         assert_eq!(receipt.stop_condition, "ABORTED");
     }
 
-    /// RFC-0016::REQ-0006: Verify receipt includes both ticks (authority) and ms
-    /// (overlay).
+    /// RFC-0016::REQ-0006: Verify receipt includes both ticks (authority) and
+    /// ms (overlay).
     ///
     /// Per RFC-0016: Wall time is permitted as observational overlay for
     /// display. Receipts should include both tick-based values
@@ -2282,7 +2287,8 @@ mod tests {
         }
     }
 
-    /// RFC-0032::REQ-0136: Workspace root validation rejects non-existent paths.
+    /// RFC-0032::REQ-0136: Workspace root validation rejects non-existent
+    /// paths.
     #[test]
     fn tck_00346_workspace_root_rejects_nonexistent() {
         let result = validate_workspace_root(Some("/nonexistent/path/that/does/not/exist"));
@@ -2350,8 +2356,8 @@ mod tests {
         assert!(BLOCKED_WORKSPACE_ROOTS.contains(&"/var"));
     }
 
-    /// RFC-0032::REQ-0136: Workspace root validation blocks subdirectories of sensitive
-    /// paths.
+    /// RFC-0032::REQ-0136: Workspace root validation blocks subdirectories of
+    /// sensitive paths.
     ///
     /// Security fix: `starts_with` (path-component-aware) blocks `/var/log`,
     /// `/etc/ssh`, etc. — not just the exact blocked roots.
@@ -2417,7 +2423,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// RFC-0032::REQ-0140: Crash termination maps to Failure regardless of exit code.
+    /// RFC-0032::REQ-0140: Crash termination maps to Failure regardless of exit
+    /// code.
     #[test]
     fn tck_00386_crash_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("crash"), Some(0));
@@ -2430,7 +2437,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// RFC-0032::REQ-0140: Timeout termination maps to Failure regardless of exit code.
+    /// RFC-0032::REQ-0140: Timeout termination maps to Failure regardless of
+    /// exit code.
     #[test]
     fn tck_00386_timeout_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("timeout"), Some(0));
@@ -2454,7 +2462,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// RFC-0032::REQ-0140: Missing termination reason maps to Failure (fail-closed).
+    /// RFC-0032::REQ-0140: Missing termination reason maps to Failure
+    /// (fail-closed).
     #[test]
     fn tck_00386_no_reason_maps_to_failure() {
         let outcome = map_termination_to_outcome(None, Some(0));
@@ -2464,7 +2473,8 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Failure);
     }
 
-    /// RFC-0032::REQ-0140: Unknown termination reason maps to Failure (fail-closed).
+    /// RFC-0032::REQ-0140: Unknown termination reason maps to Failure
+    /// (fail-closed).
     #[test]
     fn tck_00386_unknown_reason_maps_to_failure() {
         let outcome = map_termination_to_outcome(Some("alien_abduction"), Some(0));
@@ -2500,7 +2510,8 @@ mod tests {
         assert_eq!(tokens, MIN_TOKENS_PER_SESSION);
     }
 
-    /// RFC-0032::REQ-0140: Falls back to wall-clock estimate when actual is unavailable.
+    /// RFC-0032::REQ-0140: Falls back to wall-clock estimate when actual is
+    /// unavailable.
     #[test]
     fn tck_00386_resolve_tokens_falls_back_to_estimate() {
         // No actual tokens: should use wall-clock estimate

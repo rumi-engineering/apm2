@@ -1247,7 +1247,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Input Validation Tests - MEDIUM: Unbounded Memory Prevention (RFC-0011::REQ-0015)
+    // Input Validation Tests - MEDIUM: Unbounded Memory Prevention
+    // (RFC-0011::REQ-0015)
     // =========================================================================
 
     /// Test that `defect_id` exceeding `MAX_DEFECT_ID_LENGTH` is rejected.

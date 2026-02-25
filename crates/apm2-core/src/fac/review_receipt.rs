@@ -691,12 +691,14 @@ pub struct ReviewReceiptRecorded {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub reviewer_signature: [u8; 64],
-    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, RFC-0032::REQ-0119).
-    /// Binds the receipt to the authority under which the review was performed.
+    /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes,
+    /// RFC-0032::REQ-0119). Binds the receipt to the authority under which
+    /// the review was performed.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
-    /// to preserve signature verification for historical events.
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in
+    /// `canonical_bytes()` to preserve signature verification for
+    /// historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
         default,
@@ -704,24 +706,28 @@ pub struct ReviewReceiptRecorded {
     )]
     pub capability_manifest_hash: Option<[u8; 32]>,
     /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
-    /// RFC-0032::REQ-0119). Binds the receipt to the context firewall configuration.
+    /// RFC-0032::REQ-0119). Binds the receipt to the context firewall
+    /// configuration.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before RFC-0032::REQ-0119. When `None`, it is not included in `canonical_bytes()`
-    /// to preserve signature verification for historical events.
+    /// before RFC-0032::REQ-0119. When `None`, it is not included in
+    /// `canonical_bytes()` to preserve signature verification for
+    /// historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     pub context_pack_hash: Option<[u8; 32]>,
-    /// BLAKE3 hash of the `RoleSpecV1` in effect (32 bytes, RFC-0032::REQ-0124).
-    /// Binds the receipt to the role specification under which the review was
-    /// performed, enabling attribution and tool-call conformance verification.
+    /// BLAKE3 hash of the `RoleSpecV1` in effect (32 bytes,
+    /// RFC-0032::REQ-0124). Binds the receipt to the role specification
+    /// under which the review was performed, enabling attribution and
+    /// tool-call conformance verification.
     ///
     /// This field is `Option` for backward compatibility with events created
-    /// before RFC-0032::REQ-0124. When `None`, it is not included in `canonical_bytes()`
-    /// to preserve signature verification for historical events.
+    /// before RFC-0032::REQ-0124. When `None`, it is not included in
+    /// `canonical_bytes()` to preserve signature verification for
+    /// historical events.
     #[serde(
         with = "crate::fac::serde_helpers::option_hash32",
         default,
@@ -845,7 +851,8 @@ impl ReviewReceiptRecorded {
     /// - `artifact_bundle_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `reviewer_actor_id` (len + bytes)
-    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
+    /// - `capability_manifest_hash` (32 bytes, RFC-0032::REQ-0119, only if
+    ///   present)
     /// - `context_pack_hash` (32 bytes, RFC-0032::REQ-0119, only if present)
     /// - `role_spec_hash` (32 bytes, RFC-0032::REQ-0124, only if present)
     ///
@@ -877,12 +884,14 @@ impl ReviewReceiptRecorded {
         bytes.extend_from_slice(&(self.reviewer_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.reviewer_actor_id.as_bytes());
 
-        // 6. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward compat)
+        // 6. capability_manifest_hash (RFC-0032::REQ-0119, only if present for backward
+        //    compat)
         if let Some(ref hash) = self.capability_manifest_hash {
             bytes.extend_from_slice(hash);
         }
 
-        // 7. context_pack_hash (RFC-0032::REQ-0119, only if present for backward compat)
+        // 7. context_pack_hash (RFC-0032::REQ-0119, only if present for backward
+        //    compat)
         if let Some(ref hash) = self.context_pack_hash {
             bytes.extend_from_slice(hash);
         }
@@ -1033,7 +1042,8 @@ impl ReviewReceiptRecordedBuilder {
         let reviewer_actor_id = self
             .reviewer_actor_id
             .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
-        // These are optional for backward compatibility (RFC-0032::REQ-0119/RFC-0032::REQ-0124)
+        // These are optional for backward compatibility
+        // (RFC-0032::REQ-0119/RFC-0032::REQ-0124)
         let capability_manifest_hash = self.capability_manifest_hash;
         let context_pack_hash = self.context_pack_hash;
         let role_spec_hash = self.role_spec_hash;
@@ -1518,8 +1528,8 @@ mod tests {
 
     #[test]
     fn test_authority_binding_fields_in_receipt_signature() {
-        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and context_pack_hash
-        // are included in the signature
+        // RFC-0032::REQ-0119: Verify that capability_manifest_hash and
+        // context_pack_hash are included in the signature
         let signer = Signer::generate();
         let event1 = ReviewReceiptRecorded::create(
             "RR-001".to_string(),

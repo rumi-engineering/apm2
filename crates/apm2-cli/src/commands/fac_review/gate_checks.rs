@@ -403,7 +403,11 @@ pub fn run_test_safety_guard(workspace_root: &Path) -> Result<CheckExecution, St
     let targets = collect_test_safety_targets(workspace_root)?;
 
     let mut output = String::new();
-    writeln!(output, "INFO: === Test Safety Guard (RFC-0032::REQ-0157) ===").ok();
+    writeln!(
+        output,
+        "INFO: === Test Safety Guard (RFC-0032::REQ-0157) ==="
+    )
+    .ok();
     writeln!(output, "INFO: Scanning {} file(s)", targets.len()).ok();
     writeln!(
         output,

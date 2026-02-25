@@ -728,7 +728,8 @@ mod tck_00241 {
         assert_eq!(lease.ticks_remaining(&tick(1500)), 0);
     }
 
-    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 wall-clock fallback for legacy leases.
+    /// RFC-0016::REQ-0003: SEC-CTRL-FAC-0015 wall-clock fallback for legacy
+    /// leases.
     ///
     /// Legacy leases should use wall-clock comparison when tick data is
     /// not available. This provides a migration path for existing leases.
@@ -918,7 +919,8 @@ mod tck_00241 {
         assert!(!lease.is_legacy_lease());
     }
 
-    /// RFC-0016::REQ-0003: Tick-based lease uses tick comparison, ignores wall time.
+    /// RFC-0016::REQ-0003: Tick-based lease uses tick comparison, ignores wall
+    /// time.
     ///
     /// When tick data is present, `is_expired_at_tick_or_wall` uses tick
     /// comparison and ignores the wall time parameter.
@@ -963,7 +965,8 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
     }
 
-    /// RFC-0016::REQ-0003: Terminal lease returns false from all expiry methods.
+    /// RFC-0016::REQ-0003: Terminal lease returns false from all expiry
+    /// methods.
     #[test]
     fn terminal_lease_not_expired_in_combined_method() {
         let mut lease = Lease::new_with_ticks(

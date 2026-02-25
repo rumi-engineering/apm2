@@ -2295,7 +2295,8 @@ fn compute_join_hash_changes_on_pointer_only_waiver_hash() {
 }
 
 // =============================================================================
-// RFC-0020::REQ-0046 MAJOR 3: LedgerAnchorDrift and CertificateExpired in consume
+// RFC-0020::REQ-0046 MAJOR 3: LedgerAnchorDrift and CertificateExpired in
+// consume
 // =============================================================================
 
 #[test]
@@ -2795,7 +2796,8 @@ fn post_hard_freeze_blocks_subsequent_valid_requests() {
 }
 
 // =============================================================================
-// RFC-0020::REQ-0046 Security Review MAJOR 1: Future-dated epoch in lifecycle gate
+// RFC-0020::REQ-0046 Security Review MAJOR 1: Future-dated epoch in lifecycle
+// gate
 // =============================================================================
 
 #[test]
@@ -3159,8 +3161,8 @@ fn clock_backed_kernel_advance_tick_sets_floor() {
 /// errors. This is the structural guarantee that prevents fail-open on
 /// clock regression: the error MUST be handled at each call site.
 ///
-/// RFC-0020::REQ-0046 security BLOCKER fix: Previously, `current_tick()` returned
-/// `u64` and fell back to `0` on clock regression. Tick `0` caused
+/// RFC-0020::REQ-0046 security BLOCKER fix: Previously, `current_tick()`
+/// returned `u64` and fell back to `0` on clock regression. Tick `0` caused
 /// certificate expiry checks (`0 > expires_at_tick`) to evaluate `false`,
 /// accepting expired certificates (fail-open). By returning `Result`,
 /// clock errors now propagate as authority denials (fail-closed).

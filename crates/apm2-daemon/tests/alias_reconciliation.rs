@@ -1,5 +1,5 @@
-//! RFC-0032::REQ-0164: Alias reconciliation and snapshot-emitter sunset integration
-//! tests.
+//! RFC-0032::REQ-0164: Alias reconciliation and snapshot-emitter sunset
+//! integration tests.
 //!
 //! Validates that:
 //! - Alias/`work_id` projection mismatch count is zero at promotion gate when

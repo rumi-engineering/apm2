@@ -126,7 +126,8 @@ pub fn reviewer_v0_manifest_hash() -> &'static [u8; 32] {
 /// - [INV-RFC-0032::REQ-0111-001] All granted capabilities are read-only
 /// - [INV-RFC-0032::REQ-0111-002] Write, Execute, Network, Inference are NOT in
 ///   allowlist
-/// - [INV-RFC-0032::REQ-0111-003] Manifest validates successfully on construction
+/// - [INV-RFC-0032::REQ-0111-003] Manifest validates successfully on
+///   construction
 ///
 /// # Errors
 ///

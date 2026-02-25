@@ -120,7 +120,8 @@ struct Args {
     #[arg(long)]
     ledger_db: Option<PathBuf>,
 
-    /// Path to durable content-addressed storage (CAS) directory (RFC-0032::REQ-0137)
+    /// Path to durable content-addressed storage (CAS) directory
+    /// (RFC-0032::REQ-0137)
     ///
     /// When provided with `--ledger-db`, enables full session dispatcher wiring
     /// via `with_persistence_and_cas()`. The directory is created with mode
@@ -159,7 +160,8 @@ struct DaemonConfig {
     state_file_path: PathBuf,
     /// Ledger database path (`SQLite`).
     ledger_db_path: Option<PathBuf>,
-    /// CAS directory path for durable content-addressed storage (RFC-0032::REQ-0137).
+    /// CAS directory path for durable content-addressed storage
+    /// (RFC-0032::REQ-0137).
     cas_path: Option<PathBuf>,
     /// Port for Prometheus metrics HTTP endpoint (RFC-0032::REQ-0084).
     metrics_port: u16,
@@ -362,9 +364,9 @@ mod daemon_config_tests {
 
 /// Write PID file atomically.
 ///
-/// RFC-0032::REQ-0193: Uses [`apm2_daemon::fs_safe::atomic_write`] for crash-safe
-/// PID file creation (temp + fsync + rename). Parent directory is created
-/// with mode 0700 (restrictive permissions).
+/// RFC-0032::REQ-0193: Uses [`apm2_daemon::fs_safe::atomic_write`] for
+/// crash-safe PID file creation (temp + fsync + rename). Parent directory is
+/// created with mode 0700 (restrictive permissions).
 fn write_pid_file(pid_path: &PathBuf) -> Result<()> {
     apm2_daemon::fs_safe::atomic_write(pid_path, std::process::id().to_string().as_bytes())
         .context("failed to write PID file atomically")?;
@@ -383,7 +385,8 @@ fn remove_pid_file(pid_path: &PathBuf) {
 
 /// Load or create a persistent signer key for projection receipts.
 ///
-/// RFC-0032::REQ-0116 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
+/// RFC-0032::REQ-0116 BLOCKER FIX: Non-Persistent Signer for Projection
+/// Receipts
 ///
 /// The projection worker requires a persistent signing key to ensure receipt
 /// signatures remain valid across daemon restarts. This function:
@@ -971,7 +974,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // RFC-0032::REQ-0244 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from CWD.
+    // RFC-0032::REQ-0244 MAJOR-1 FIX: Do NOT auto-detect GitHub owner/repo from
+    // CWD.
     //
     // The daemon is a user-singleton (fixed XDG socket path). Binding it to
     // the CWD at startup causes cross-context pollution: if the user starts
@@ -985,8 +989,8 @@ fn main() -> Result<()> {
 
     // Daemonize if requested - MUST happen before any async runtime!
     //
-    // This is the critical fix for RFC-0032::REQ-0087. By daemonizing here, we ensure
-    // fork() is called when only the main thread exists.
+    // This is the critical fix for RFC-0032::REQ-0087. By daemonizing here, we
+    // ensure fork() is called when only the main thread exists.
     if !args.no_daemon {
         match daemonize() {
             // Successfully daemonized (true) or platform doesn't support it (false)
@@ -1152,8 +1156,8 @@ async fn async_main(args: Args) -> Result<()> {
 
     let supervisor = init_supervisor(&daemon_config.config);
 
-    // RFC-0032::REQ-0084: Initialize Prometheus metrics registry early so we can pass it
-    // to DaemonStateHandle. This allows handlers to record IPC metrics.
+    // RFC-0032::REQ-0084: Initialize Prometheus metrics registry early so we can
+    // pass it to DaemonStateHandle. This allows handlers to record IPC metrics.
     let metrics_registry = if daemon_config.metrics_disabled {
         None
     } else {
@@ -1161,7 +1165,8 @@ async fn async_main(args: Args) -> Result<()> {
     };
 
     // Create shared state with schema registry and session registry
-    // The registries persist for the daemon's lifetime (RFC-0033::REQ-0045, RFC-0032::REQ-0082)
+    // The registries persist for the daemon's lifetime (RFC-0033::REQ-0045,
+    // RFC-0032::REQ-0082)
     //
     // RFC-0032::REQ-0082: Use persistent session registry for crash recovery.
     // The state file path is configured via CLI or ecosystem config.
@@ -1171,7 +1176,8 @@ async fn async_main(args: Args) -> Result<()> {
             supervisor,
             registry, // Pass the registry created during bootstrap
             &daemon_config.state_file_path,
-            metrics_registry.clone(), // RFC-0032::REQ-0084: Pass metrics registry for handler access
+            metrics_registry.clone(), /* RFC-0032::REQ-0084: Pass metrics registry for handler
+                                       * access */
         )
         .context("failed to initialize persistent session registry")?,
     );
@@ -1192,8 +1198,8 @@ async fn async_main(args: Args) -> Result<()> {
     let lifecycle_signing_key_bytes = ledger_signing_key.to_bytes();
 
     // Initialize persistent ledger if configured (RFC-0032::REQ-0091)
-    // RFC-0032::REQ-0141: Moved BEFORE crash recovery so that LEASE_REVOKED events can
-    // be emitted to the ledger during recovery.
+    // RFC-0032::REQ-0141: Moved BEFORE crash recovery so that LEASE_REVOKED events
+    // can be emitted to the ledger during recovery.
     let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
         info!("Opening ledger database at {:?}", path);
         let conn = Connection::open(path).context("failed to open ledger database")?;
@@ -1311,8 +1317,8 @@ async fn async_main(args: Args) -> Result<()> {
     // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
     // spawned via IPC are visible to daemon's persistent state.
     //
-    // RFC-0032::REQ-0091: Use with_persistence to wire real governance/ledger components if
-    // available.
+    // RFC-0032::REQ-0091: Use with_persistence to wire real governance/ledger
+    // components if available.
     // RFC-0032::REQ-0132: Wire daemon state into dispatcher for process management.
     // This enables ListProcesses, ProcessStatus, StartProcess, StopProcess,
     // RestartProcess, and ReloadProcess handlers to query the Supervisor.
@@ -1367,18 +1373,21 @@ async fn async_main(args: Args) -> Result<()> {
         .with_token_binding_config(boundary_id.clone(), [0u8; 32]),
     );
 
-    // RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the event emitter
-    // and lease validator. After this, all new appends route to canonical `events`.
-    // This MUST happen after init_canonical_schema + migrate_legacy_ledger_events
-    // (above) to ensure the `events` table exists.
+    // RFC-0032::REQ-0260: Freeze legacy `ledger_events` writes on both the event
+    // emitter and lease validator. After this, all new appends route to
+    // canonical `events`. This MUST happen after init_canonical_schema +
+    // migrate_legacy_ledger_events (above) to ensure the `events` table exists.
     if sqlite_conn.is_some() {
         if let Err(e) = dispatcher_state.freeze_legacy_writes() {
             warn!(error = %e, "freeze_legacy_writes failed (writes blocked, fail-closed)");
         }
-        info!("RFC-0032::REQ-0260: Legacy ledger writes frozen; new appends route to canonical events");
+        info!(
+            "RFC-0032::REQ-0260: Legacy ledger writes frozen; new appends route to canonical events"
+        );
     }
 
-    // RFC-0032::REQ-0142: Wire gate orchestrator into daemon for autonomous gate lifecycle.
+    // RFC-0032::REQ-0142: Wire gate orchestrator into daemon for autonomous gate
+    // lifecycle.
     //
     // The orchestrator is instantiated with the daemon lifecycle signing key
     // and wired into the DispatcherState for lifecycle timeout polling.
@@ -1700,8 +1709,8 @@ async fn async_main(args: Args) -> Result<()> {
         });
     }
 
-    // RFC-0032::REQ-0116: Start projection worker if ledger and projection are configured.
-    // The projection worker:
+    // RFC-0032::REQ-0116: Start projection worker if ledger and projection are
+    // configured. The projection worker:
     // - Tails the ledger for ReviewReceiptRecorded events
     // - Maintains work index (changeset -> work_id -> PR)
     // - Projects review results to GitHub (status + comment)
@@ -1827,7 +1836,8 @@ async fn async_main(args: Args) -> Result<()> {
                     );
 
                     // Determine cache path for idempotency
-                    // RFC-0032::REQ-0116 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path
+                    // RFC-0032::REQ-0116 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent
+                    // path
                     let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
                         || {
                             daemon_config.state_file_path.parent().map_or_else(
@@ -2064,10 +2074,10 @@ async fn async_main(args: Args) -> Result<()> {
     //   - Divergence watchdog must be enabled in ecosystem config
     //   - GitHub token must be available via environment variable
     //
-    // RFC-0020::REQ-0051: The watchdog is wrapped in Arc so both the background polling
-    // task and the DispatcherState share the same instance, enabling IPC
-    // handlers to call register_durable_recovery_evidence / create_unfreeze /
-    // apply_unfreeze.
+    // RFC-0020::REQ-0051: The watchdog is wrapped in Arc so both the background
+    // polling task and the DispatcherState share the same instance, enabling
+    // IPC handlers to call register_durable_recovery_evidence / create_unfreeze
+    // / apply_unfreeze.
     let watchdog_arc_for_dispatcher: Option<Arc<DivergenceWatchdog<SystemTimeSource>>> = {
         let dw_config = &daemon_config.config.daemon.divergence_watchdog;
         if dw_config.enabled {
@@ -2085,8 +2095,8 @@ async fn async_main(args: Args) -> Result<()> {
                 ));
             }
 
-            // Resolve GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR FIX):
-            // env var -> $CREDENTIALS_DIRECTORY/gh-token ->
+            // Resolve GitHub token via unified resolution chain (RFC-0032::REQ-0244 MAJOR
+            // FIX): env var -> $CREDENTIALS_DIRECTORY/gh-token ->
             // $APM2_HOME/private/creds/gh-token
             let token_env_raw = dw_config
                 .github_token_env
@@ -2783,9 +2793,9 @@ async fn perform_crash_recovery(
 
     let timeout = Duration::from_millis(u64::from(DEFAULT_RECOVERY_TIMEOUT_MS));
 
-    // RFC-0032::REQ-0141: Load persisted sessions from the DaemonStateHandle's session
-    // registry. The PersistentSessionRegistry was populated from the state file
-    // during `DaemonStateHandle::new_with_persistent_sessions`.
+    // RFC-0032::REQ-0141: Load persisted sessions from the DaemonStateHandle's
+    // session registry. The PersistentSessionRegistry was populated from the
+    // state file during `DaemonStateHandle::new_with_persistent_sessions`.
     let session_registry = state.session_registry();
     let collected = apm2_daemon::episode::crash_recovery::collect_sessions(session_registry);
 
@@ -2806,8 +2816,9 @@ async fn perform_crash_recovery(
         "Found stale sessions from previous daemon instance"
     );
 
-    // RFC-0032::REQ-0141: Create a ledger event emitter for emitting LEASE_REVOKED events.
-    // If no SQLite connection is available, we log but do not persist events.
+    // RFC-0032::REQ-0141: Create a ledger event emitter for emitting LEASE_REVOKED
+    // events. If no SQLite connection is available, we log but do not persist
+    // events.
     //
     // Security Review v5 MAJOR 2: Use the daemon-lifecycle signing key (passed
     // in from async_main) instead of generating a separate ephemeral key. This
@@ -2833,8 +2844,8 @@ async fn perform_crash_recovery(
                 )
             })?;
 
-    // RFC-0032::REQ-0141: Perform crash recovery -- emit LEASE_REVOKED events and clean
-    // up work claims for each stale session.
+    // RFC-0032::REQ-0141: Perform crash recovery -- emit LEASE_REVOKED events and
+    // clean up work claims for each stale session.
     let result = apm2_daemon::episode::crash_recovery::recover_stale_sessions(
         &collected.sessions,
         emitter.as_ref(),
@@ -3047,10 +3058,10 @@ async fn run_socket_manager_server(
 ///
 /// # JSON Downgrade Rejection (DD-009)
 ///
-/// Per RFC-0032::REQ-0089 and DD-009, JSON frames are rejected before reaching handlers.
-/// The tag-based routing validates that the first byte is a valid message type
-/// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
-/// (0x7B = 123) are rejected as unknown message types. Protocol errors
+/// Per RFC-0032::REQ-0089 and DD-009, JSON frames are rejected before reaching
+/// handlers. The tag-based routing validates that the first byte is a valid
+/// message type tag (1-4 for privileged, 1-4 for session). JSON frames starting
+/// with `{` (0x7B = 123) are rejected as unknown message types. Protocol errors
 /// terminate the connection immediately.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
@@ -3173,9 +3184,9 @@ async fn handle_dual_socket_connection(
     let privileged_dispatcher = dispatcher_state.privileged_dispatcher();
     let session_dispatcher = dispatcher_state.session_dispatcher();
 
-    // RFC-0032::REQ-0099: Get subscription registry for connection cleanup on close.
-    // When the connection closes, we MUST call unregister_connection to free
-    // the connection slot and prevent DoS via connection slot exhaustion.
+    // RFC-0032::REQ-0099: Get subscription registry for connection cleanup on
+    // close. When the connection closes, we MUST call unregister_connection to
+    // free the connection slot and prevent DoS via connection slot exhaustion.
     let subscription_registry = dispatcher_state.subscription_registry();
     let connection_id = ctx.connection_id().to_string();
 

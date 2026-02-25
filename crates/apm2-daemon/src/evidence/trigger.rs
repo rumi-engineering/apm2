@@ -311,7 +311,8 @@ impl PersistTrigger {
         }
     }
 
-    /// Creates a taint flow denied trigger from a `TaintViolation` (RFC-0032::REQ-0130).
+    /// Creates a taint flow denied trigger from a `TaintViolation`
+    /// (RFC-0032::REQ-0130).
     #[must_use]
     pub fn taint_flow_denied(
         source: impl Into<String>,

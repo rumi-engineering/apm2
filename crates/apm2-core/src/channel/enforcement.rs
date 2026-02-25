@@ -293,8 +293,8 @@ pub const MAX_TOKEN_BOUNDARY_ID_LENGTH: usize = 256;
 /// The optional `intent` field binds the token to a specific RFC-0028 typed
 /// intent class.  When present, the worker MUST verify that the token intent
 /// matches the job kind before execution (fail-closed).  Tokens without an
-/// intent field are accepted for backwards compatibility with pre-RFC-0032::REQ-0218
-/// tokens; the worker logs a warning but does not deny.
+/// intent field are accepted for backwards compatibility with
+/// pre-RFC-0032::REQ-0218 tokens; the worker logs a warning but does not deny.
 ///
 /// RFC-0032::REQ-0217: Added `nonce` field for single-use replay protection.
 /// The broker records each nonce in its token-use ledger at issuance time;
@@ -315,7 +315,8 @@ pub struct TokenBindingV1 {
     /// RFC-0028 typed intent class bound to this token (RFC-0032::REQ-0218).
     ///
     /// When `Some`, the worker MUST verify that this intent matches the
-    /// expected intent for the job kind.  `None` for pre-RFC-0032::REQ-0218 tokens.
+    /// expected intent for the job kind.  `None` for pre-RFC-0032::REQ-0218
+    /// tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
     /// RFC-0032::REQ-0217: Single-use nonce for replay protection.
@@ -324,8 +325,9 @@ pub struct TokenBindingV1 {
     /// token-use ledger. Workers validate this nonce against the broker's
     /// ledger (or local revocation state) to detect replay attempts.
     ///
-    /// Defaults to `None` for backwards compatibility with pre-RFC-0032::REQ-0217
-    /// tokens. When `Some`, the nonce MUST be checked against the ledger.
+    /// Defaults to `None` for backwards compatibility with
+    /// pre-RFC-0032::REQ-0217 tokens. When `Some`, the nonce MUST be
+    /// checked against the ledger.
     #[serde(default)]
     pub nonce: Option<[u8; 32]>,
 }
@@ -691,7 +693,8 @@ pub fn issue_channel_context_token(
     )
 }
 
-/// Issues a base64-encoded channel context token with RFC-0032::REQ-0216 token binding.
+/// Issues a base64-encoded channel context token with RFC-0032::REQ-0216 token
+/// binding.
 ///
 /// # Errors
 ///
@@ -716,8 +719,8 @@ pub fn issue_channel_context_token_with_token_binding(
     )
 }
 
-/// Issues a base64-encoded channel context token with RFC-0032::REQ-0216 token binding
-/// and an explicit wall-clock expiry window.
+/// Issues a base64-encoded channel context token with RFC-0032::REQ-0216 token
+/// binding and an explicit wall-clock expiry window.
 ///
 /// This is used by broker-mediated FAC queue paths where enqueue-to-claim delay
 /// can exceed the default short-lived token window.
@@ -805,8 +808,8 @@ fn issue_channel_context_token_with_binding(
 ///
 /// When provided, `decode_channel_context_token` enforces that the token's
 /// binding fields match these expected values. Missing expected bindings
-/// skip the corresponding check (backwards compatibility with pre-RFC-0032::REQ-0216
-/// tokens).
+/// skip the corresponding check (backwards compatibility with
+/// pre-RFC-0032::REQ-0216 tokens).
 pub struct ExpectedTokenBinding<'a> {
     /// Expected FAC policy hash.
     pub fac_policy_hash: &'a [u8; 32],
@@ -817,9 +820,9 @@ pub struct ExpectedTokenBinding<'a> {
     /// Current broker tick for tick-based expiry check.
     pub current_tick: u64,
     /// Expected RFC-0028 intent string for intent binding validation
-    /// (RFC-0032::REQ-0218).  When `Some`, the token's `intent` field MUST match
-    /// exactly.  When `None`, intent validation is skipped (pre-RFC-0032::REQ-0218
-    /// compatibility).
+    /// (RFC-0032::REQ-0218).  When `Some`, the token's `intent` field MUST
+    /// match exactly.  When `None`, intent validation is skipped
+    /// (pre-RFC-0032::REQ-0218 compatibility).
     pub expected_intent: Option<&'a str>,
 }
 
@@ -846,7 +849,8 @@ pub fn decode_channel_context_token(
     )
 }
 
-/// Decodes and verifies a channel context token with RFC-0032::REQ-0216 binding checks.
+/// Decodes and verifies a channel context token with RFC-0032::REQ-0216 binding
+/// checks.
 ///
 /// When `expected_binding` is `Some`, validates the token's binding fields
 /// (`fac_policy_hash`, `canonicalizer_tuple_digest`, `boundary_id`, tick

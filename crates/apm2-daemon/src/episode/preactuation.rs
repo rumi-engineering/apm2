@@ -1105,9 +1105,9 @@ impl std::error::Error for ReplayViolation {}
 /// `SessionDispatcher::handle_broker_decision` before accepting an `Allow`
 /// actuation response.
 ///
-/// TODO(RFC-0020::REQ-0010, RFC-0020 §3.1.1): Extend this from per-request production
-/// verification to the full replay/evidence ingestion pipeline so multi-entry
-/// historical traces are verified before evidence acceptance.
+/// TODO(RFC-0020::REQ-0010, RFC-0020 §3.1.1): Extend this from per-request
+/// production verification to the full replay/evidence ingestion pipeline so
+/// multi-entry historical traces are verified before evidence acceptance.
 pub struct ReplayVerifier;
 
 impl ReplayVerifier {
@@ -2241,7 +2241,8 @@ mod tests {
     }
 
     // =========================================================================
-    // RFC-0020::REQ-0005 MAJOR 3 v2 FIX: ReplayVerifier integration test (EVID-0305)
+    // RFC-0020::REQ-0005 MAJOR 3 v2 FIX: ReplayVerifier integration test
+    // (EVID-0305)
     // =========================================================================
 
     /// Integration-style test exercising `ReplayVerifier::verify` on a
@@ -2393,8 +2394,9 @@ mod tests {
         );
     }
 
-    /// RFC-0020::REQ-0005 BLOCKER 1 v3: When the escalation predicate is non-empty,
-    /// the gate MUST deny with `StopActive { class: EscalationTriggered }`.
+    /// RFC-0020::REQ-0005 BLOCKER 1 v3: When the escalation predicate is
+    /// non-empty, the gate MUST deny with `StopActive { class:
+    /// EscalationTriggered }`.
     #[test]
     fn test_gate_denies_when_escalation_predicate_set() {
         let authority = Arc::new(StopAuthority::new());

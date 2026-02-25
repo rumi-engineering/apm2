@@ -1331,7 +1331,8 @@ impl OperatorClient {
         Self::decode_open_work_response(&response_frame)
     }
 
-    /// Claims an existing work item via RFC-0032 `ClaimWorkV2` (RFC-0032::REQ-0265).
+    /// Claims an existing work item via RFC-0032 `ClaimWorkV2`
+    /// (RFC-0032::REQ-0265).
     ///
     /// `ClaimWorkV2` claims an already opened work item and returns a
     /// role-scoped issued claim lease.
@@ -3197,7 +3198,8 @@ impl SessionClient {
         Self::decode_session_status_response(&response_frame)
     }
 
-    /// Queries the status of a session with termination details (RFC-0032::REQ-0139).
+    /// Queries the status of a session with termination details
+    /// (RFC-0032::REQ-0139).
     ///
     /// This is equivalent to [`session_status`](Self::session_status) but
     /// clarifies that the response may include termination information when

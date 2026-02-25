@@ -1,4 +1,5 @@
-//! RFC-0032::REQ-0158: `PublishChangeSet` fail-closed closure integration tests.
+//! RFC-0032::REQ-0158: `PublishChangeSet` fail-closed closure integration
+//! tests.
 //!
 //! Exercises production dispatcher wiring via `DispatcherState` constructors:
 //! - CAS configured: publish succeeds and semantic idempotency replays

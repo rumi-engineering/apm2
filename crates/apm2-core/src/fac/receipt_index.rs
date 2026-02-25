@@ -716,7 +716,8 @@ pub fn list_receipt_headers(receipts_dir: &Path) -> ListReceiptHeadersResult {
     }
 }
 
-/// Load a `FacJobReceiptV1` from the receipt store by content hash (RFC-0032::REQ-0206).
+/// Load a `FacJobReceiptV1` from the receipt store by content hash
+/// (RFC-0032::REQ-0206).
 ///
 /// Reads the receipt file at `receipts_dir/{content_hash}.json` with bounded
 /// I/O and `O_NOFOLLOW`. Returns `None` if the file is missing, oversized,
@@ -1809,7 +1810,8 @@ mod tests {
     }
 
     // =========================================================================
-    // RFC-0032::REQ-0215 MAJOR-1 regression: is_valid_digest must accept b3-256: prefix
+    // RFC-0032::REQ-0215 MAJOR-1 regression: is_valid_digest must accept b3-256:
+    // prefix
     // =========================================================================
 
     #[test]

@@ -91,7 +91,8 @@ pub const PULSE_EVENT_TAG: u8 = 68;
 /// A typical work session produces ~10-100 changesets, so 10,000 entries
 /// provides ample headroom while bounding memory to ~1MB worst case.
 ///
-/// Security: Prevents `DoS` via unbounded memory growth (RFC-0032::REQ-0100 review).
+/// Security: Prevents `DoS` via unbounded memory growth (RFC-0032::REQ-0100
+/// review).
 pub const MAX_CHANGESET_MAP_ENTRIES: usize = 10_000;
 
 /// Maximum payload bytes processed by bridge fallback routing.
@@ -168,8 +169,9 @@ pub struct PulsePublisher {
     /// implementation, this would be wired to the actual connection write
     /// halves.
     ///
-    /// NOTE: For RFC-0032::REQ-0100, we define the interface. Full wiring to connection
-    /// handlers will be completed when the connection lifecycle is integrated.
+    /// NOTE: For RFC-0032::REQ-0100, we define the interface. Full wiring to
+    /// connection handlers will be completed when the connection lifecycle
+    /// is integrated.
     connection_senders: Arc<std::sync::RwLock<std::collections::HashMap<String, PulseFrameSender>>>,
 
     /// Current ledger head (updated as notifications are processed).
@@ -184,9 +186,9 @@ pub struct PulsePublisher {
 
 /// Result of a non-blocking pulse send attempt.
 ///
-/// Per RFC-0032::REQ-0100 security review: `send_pulse` must be non-blocking to prevent
-/// head-of-line blocking denial of service. A slow consumer on one connection
-/// must not stall pulse delivery to other connections.
+/// Per RFC-0032::REQ-0100 security review: `send_pulse` must be non-blocking to
+/// prevent head-of-line blocking denial of service. A slow consumer on one
+/// connection must not stall pulse delivery to other connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendResult {
     /// Pulse was successfully queued for delivery.

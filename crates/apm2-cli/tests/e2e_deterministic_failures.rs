@@ -1,5 +1,5 @@
-//! RFC-0032::REQ-0249 -- Integration tests: deterministic failures (no hangs) + secrets
-//! posture.
+//! RFC-0032::REQ-0249 -- Integration tests: deterministic failures (no hangs) +
+//! secrets posture.
 //!
 //! This module contains two classes of tests:
 //!

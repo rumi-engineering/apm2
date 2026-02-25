@@ -1387,8 +1387,9 @@ impl CapabilityProof {
 
     /// Performs full authority verification including ledger state checks.
     ///
-    /// This method provides complete verification as required by RFC-0033::REQ-0059:
-    /// "Verification uses ledger state + signature chain"
+    /// This method provides complete verification as required by
+    /// RFC-0033::REQ-0059: "Verification uses ledger state + signature
+    /// chain"
     ///
     /// # Verification Steps
     ///

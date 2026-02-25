@@ -448,8 +448,9 @@ impl TopicDeriver {
             // Gate receipts -> gate.<work_id>.<changeset_digest>.<gate_id> (RFC-0032::REQ-0101)
             "gate.receipt" => self.derive_gate_topic(event, &sanitized_namespace),
 
-            // Session events -> episode.<episode_id>.lifecycle if episode_id present (RFC-0032::REQ-0102)
-            // Falls back to namespace.lifecycle for non-episode sessions
+            // Session events -> episode.<episode_id>.lifecycle if episode_id present
+            // (RFC-0032::REQ-0102) Falls back to namespace.lifecycle for non-episode
+            // sessions
             "session.started"
             | "session.progress"
             | "session.terminated"
@@ -2569,7 +2570,8 @@ mod tests {
     }
 
     // ========================================================================
-    // WorkGraphEvent Topic Derivation Tests (RFC-0032::REQ-0269, drift barrier D1.2)
+    // WorkGraphEvent Topic Derivation Tests (RFC-0032::REQ-0269, drift barrier
+    // D1.2)
     // ========================================================================
 
     mod work_graph_topics {

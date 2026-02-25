@@ -82,7 +82,8 @@ pub const MAX_STORED_KEYS: usize = 100;
 /// This bounds the in-memory token store to prevent memory exhaustion attacks.
 pub const MAX_STORED_TOKENS: usize = 100;
 
-/// Maximum size for a single GitHub token in bytes (CTR-1303, RFC-0032::REQ-0078).
+/// Maximum size for a single GitHub token in bytes (CTR-1303,
+/// RFC-0032::REQ-0078).
 ///
 /// GitHub tokens are typically under 100 bytes. 4KB is generous while
 /// preventing unbounded allocation from malicious input.
@@ -471,8 +472,9 @@ impl KeyManifest {
     /// Returns an empty manifest if the file doesn't exist. Fails closed
     /// on parse errors per CTR-2003.
     ///
-    /// RFC-0032::REQ-0193: Uses [`fs_safe::bounded_read_json`] for symlink refusal
-    /// (`O_NOFOLLOW`), bounded reads (size cap), and regular-file verification.
+    /// RFC-0032::REQ-0193: Uses [`fs_safe::bounded_read_json`] for symlink
+    /// refusal (`O_NOFOLLOW`), bounded reads (size cap), and regular-file
+    /// verification.
     fn load() -> Result<Self, KeychainError> {
         let path = Self::path().ok_or(KeychainError::NoHomeDirectory)?;
         Self::load_from_path(&path)
@@ -596,8 +598,8 @@ impl OsKeychain {
 
     /// Loads manifest from a specific path.
     ///
-    /// RFC-0032::REQ-0193: Delegates to [`KeyManifest::load_from_path`] which uses
-    /// safe I/O primitives (symlink refusal, bounded reads).
+    /// RFC-0032::REQ-0193: Delegates to [`KeyManifest::load_from_path`] which
+    /// uses safe I/O primitives (symlink refusal, bounded reads).
     fn load_manifest_from_path(path: &Path) -> Result<KeyManifest, KeychainError> {
         KeyManifest::load_from_path(path)
     }
@@ -1069,8 +1071,8 @@ impl SigningKeyStore for InMemoryKeyStore {
 // InMemoryGitHubCredentialStore (RFC-0032::REQ-0078)
 //
 // NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
-// Per RFC-0032::REQ-0078 security review, in-memory credential stores must not be
-// available in production builds. Production code MUST use OsKeychain.
+// Per RFC-0032::REQ-0078 security review, in-memory credential stores must not
+// be available in production builds. Production code MUST use OsKeychain.
 // =============================================================================
 
 /// In-memory GitHub credential store for testing.
@@ -1169,8 +1171,8 @@ impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
 // InMemorySshCredentialStore (RFC-0032::REQ-0079)
 //
 // NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
-// Per RFC-0032::REQ-0079 security review, in-memory credential stores must not be
-// available in production builds. Production code MUST use OsKeychain.
+// Per RFC-0032::REQ-0079 security review, in-memory credential stores must not
+// be available in production builds. Production code MUST use OsKeychain.
 // =============================================================================
 
 /// In-memory SSH credential store for testing.

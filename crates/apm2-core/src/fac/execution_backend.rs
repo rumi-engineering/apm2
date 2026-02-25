@@ -1200,7 +1200,8 @@ mod tests {
         let props = test_properties();
         let list = build_property_list(&props, ExecutionBackend::SystemMode);
 
-        // All default sandbox hardening directives must be present (RFC-0032::REQ-0223).
+        // All default sandbox hardening directives must be present
+        // (RFC-0032::REQ-0223).
         assert!(
             list.contains(&"NoNewPrivileges=yes".to_string()),
             "missing NoNewPrivileges in property list"

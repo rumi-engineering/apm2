@@ -138,7 +138,8 @@ pub fn plan_gc(
 /// Create a garbage-collection plan with explicit log retention policy.
 ///
 /// This is the extended version of [`plan_gc`] that accepts a
-/// [`LogRetentionConfig`] for per-lane log retention pruning (RFC-0032::REQ-0221).
+/// [`LogRetentionConfig`] for per-lane log retention pruning
+/// (RFC-0032::REQ-0221).
 ///
 /// # Errors
 ///
@@ -186,8 +187,8 @@ pub fn plan_gc_with_log_retention(
         });
     }
 
-    // RFC-0032::REQ-0239 review fix: legacy evidence/ and legacy/ directories are NOT
-    // GC targets. The evidence/ directory is cleaned up by the migration
+    // RFC-0032::REQ-0239 review fix: legacy evidence/ and legacy/ directories are
+    // NOT GC targets. The evidence/ directory is cleaned up by the migration
     // itself (removed after all files are moved). The legacy/ directory
     // contains read-only migrated evidence that must be retained
     // indefinitely for audit purposes.
@@ -1021,9 +1022,9 @@ pub fn execute_gc(plan: &GcPlan) -> GcReceiptV1 {
     let mut errors = Vec::new();
 
     for target in &plan.targets {
-        // RFC-0032::REQ-0233: Index compaction is handled separately from file deletion.
-        // The compaction step prunes stale entries in-place and persists the
-        // compacted index; it does not delete the index file.
+        // RFC-0032::REQ-0233: Index compaction is handled separately from file
+        // deletion. The compaction step prunes stale entries in-place and
+        // persists the compacted index; it does not delete the index file.
         if matches!(
             target.kind,
             crate::fac::gc_receipt::GcActionKind::IndexCompaction

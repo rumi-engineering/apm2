@@ -340,9 +340,9 @@ pub(super) fn promote_broker_requests(queue_root: &Path, bounds_policy: &QueueBo
     // the caller (run_fac_worker). This ensures broker-mediated
     // promotion enforces the same configured limits as enqueue_direct.
 
-    // MAJOR fix (RFC-0032::REQ-0227 round 16): Separate candidate counting from junk
-    // draining. Only CANDIDATE entries (regular files with .json extension that
-    // pass filename validation) count toward MAX_BROKER_REQUESTS_PROMOTE.
+    // MAJOR fix (RFC-0032::REQ-0227 round 16): Separate candidate counting from
+    // junk draining. Only CANDIDATE entries (regular files with .json extension
+    // that pass filename validation) count toward MAX_BROKER_REQUESTS_PROMOTE.
     // Non-candidate entries (wrong extension, non-regular files, unreadable
     // metadata) are quarantined without consuming the promotion budget, up to
     // MAX_JUNK_DRAIN_PER_CYCLE. This prevents an attacker from filling
@@ -1348,18 +1348,18 @@ pub(super) fn resolve_fac_root() -> Result<PathBuf, String> {
 /// Ensures all required queue subdirectories exist with deterministic
 /// secure permissions, regardless of the process umask.
 ///
-/// RFC-0032::REQ-0227 round 6: Creates `queue/` itself with mode 0711 (owner rwx,
-/// group/other execute-only) so non-service-user callers can traverse to
+/// RFC-0032::REQ-0227 round 6: Creates `queue/` itself with mode 0711 (owner
+/// rwx, group/other execute-only) so non-service-user callers can traverse to
 /// reach `broker_requests/`. The `private/fac/` parent remains 0700.
 ///
-/// RFC-0032::REQ-0227 round 11 BLOCKER fix: After `create_dir_all` for each queue
-/// subdir, explicitly calls `set_permissions` to set mode 0711
+/// RFC-0032::REQ-0227 round 11 BLOCKER fix: After `create_dir_all` for each
+/// queue subdir, explicitly calls `set_permissions` to set mode 0711
 /// (traverse-only). This prevents umask-derived default modes (e.g.,
 /// 0775 from umask 0o002) from causing `validate_directory_mode_only`
 /// failures during the relaxed preflight path.
 ///
-/// RFC-0032::REQ-0227 round 11 MAJOR fix: `broker_requests/` permissions are now
-/// enforced unconditionally at every startup, not just when newly
+/// RFC-0032::REQ-0227 round 11 MAJOR fix: `broker_requests/` permissions are
+/// now enforced unconditionally at every startup, not just when newly
 /// created. Pre-existing `broker_requests/` with unsafe modes (e.g.,
 /// 0333 — world-writable without sticky) are hardened to 01733.
 #[cfg(unix)]
@@ -1488,11 +1488,11 @@ pub(super) fn ensure_queue_dirs(queue_root: &Path) -> Result<(), String> {
         fs::create_dir_all(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     }
 
-    // RFC-0032::REQ-0227 round 5 BLOCKER fix: Create broker_requests/ with mode 01733
-    // (sticky bit + world-writable). Non-service-user callers use the broker
-    // fallback to drop job specs into this directory. The sticky bit prevents
-    // callers from deleting each other's files while still allowing writes.
-    // Mode 01733 = owner rwx, group wx, others wx, sticky bit set.
+    // RFC-0032::REQ-0227 round 5 BLOCKER fix: Create broker_requests/ with mode
+    // 01733 (sticky bit + world-writable). Non-service-user callers use the
+    // broker fallback to drop job specs into this directory. The sticky bit
+    // prevents callers from deleting each other's files while still allowing
+    // writes. Mode 01733 = owner rwx, group wx, others wx, sticky bit set.
     //
     // DirBuilder::mode() is subject to the process umask, so we must
     // explicitly chmod after creation to ensure the exact mode is applied.

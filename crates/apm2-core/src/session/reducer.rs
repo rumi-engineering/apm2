@@ -594,7 +594,8 @@ pub mod helpers {
             resume_cursor,
             restart_attempt,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
             // Episode ID (RFC-0018, RFC-0032::REQ-0102): not populated by this helper.
             // The daemon episode runtime will populate this field at runtime.
@@ -686,7 +687,8 @@ pub mod helpers {
             rationale_code: rationale_code.to_string(),
             final_entropy,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
             // Episode ID (RFC-0018, RFC-0032::REQ-0102): not populated by this helper.
             // The daemon episode runtime will populate this field at runtime.
@@ -750,7 +752,8 @@ pub mod helpers {
             reason: reason.to_string(),
             quarantine_until,
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
-            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime boundaries.
+            // The daemon clock service (RFC-0016::REQ-0002) will stamp envelopes at runtime
+            // boundaries.
             time_envelope_ref: None,
             issued_at_tick,
             expires_at_tick,
@@ -2063,8 +2066,8 @@ mod unit_tests {
     // Quarantine Expiry Enforcement Tests (RFC-0016::REQ-0003)
     // ========================================================================
 
-    /// RFC-0016::REQ-0003: Tests that a session restart is rejected while quarantine
-    /// is still active (wall-clock legacy quarantine).
+    /// RFC-0016::REQ-0003: Tests that a session restart is rejected while
+    /// quarantine is still active (wall-clock legacy quarantine).
     #[test]
     #[allow(deprecated)]
     fn tck_00243_quarantine_expiry_legacy_rejects_early_restart() {
@@ -2123,8 +2126,8 @@ mod unit_tests {
         );
     }
 
-    /// RFC-0016::REQ-0003: Tests that a session restart is allowed after quarantine
-    /// expires (wall-clock legacy quarantine).
+    /// RFC-0016::REQ-0003: Tests that a session restart is allowed after
+    /// quarantine expires (wall-clock legacy quarantine).
     #[test]
     #[allow(deprecated)]
     fn tck_00243_quarantine_expiry_legacy_allows_restart_after_expiry() {
@@ -2177,8 +2180,9 @@ mod unit_tests {
         assert!(reducer.state().get("session-1").unwrap().is_active());
     }
 
-    /// RFC-0016::REQ-0003: Tests that tick-based quarantine restarts fail closed until
-    /// proper tick resolution (RFC-0016::REQ-0002 `HolonicClock`) is available.
+    /// RFC-0016::REQ-0003: Tests that tick-based quarantine restarts fail
+    /// closed until proper tick resolution (RFC-0016::REQ-0002
+    /// `HolonicClock`) is available.
     ///
     /// SECURITY FIX: Wall-clock to tick approximation is fundamentally broken
     /// due to epoch mismatch (Unix epoch vs boot-relative ticks). Until we can
@@ -2220,7 +2224,8 @@ mod unit_tests {
 
         // Try to restart with time_envelope_ref
         // SEC-HTF-003: Even with time_envelope_ref, we cannot resolve the tick
-        // until RFC-0016::REQ-0002 (HolonicClock) is integrated, so we must fail closed.
+        // until RFC-0016::REQ-0002 (HolonicClock) is integrated, so we must fail
+        // closed.
         let restart_payload = helpers::session_started_payload_with_htf(
             "session-1",
             "actor-1",
@@ -2244,12 +2249,13 @@ mod unit_tests {
         );
     }
 
-    /// RFC-0016::REQ-0003: Tests that tick-based quarantine restarts fail closed even
-    /// when the wall-clock time suggests expiry has passed.
+    /// RFC-0016::REQ-0003: Tests that tick-based quarantine restarts fail
+    /// closed even when the wall-clock time suggests expiry has passed.
     ///
-    /// SECURITY FIX: Until RFC-0016::REQ-0002 (`HolonicClock`) provides proper tick
-    /// resolution, we cannot verify tick-based quarantine expiry securely.
-    /// This test ensures we fail closed regardless of wall-clock time.
+    /// SECURITY FIX: Until RFC-0016::REQ-0002 (`HolonicClock`) provides proper
+    /// tick resolution, we cannot verify tick-based quarantine expiry
+    /// securely. This test ensures we fail closed regardless of wall-clock
+    /// time.
     #[test]
     fn tck_00243_quarantine_expiry_tick_based_fails_closed_even_after_wall_clock_expiry() {
         let mut reducer = SessionReducer::new();
@@ -2362,8 +2368,8 @@ mod unit_tests {
         );
     }
 
-    /// RFC-0016::REQ-0003: Tests that terminated sessions can still be restarted
-    /// (quarantine check only applies to Quarantined state).
+    /// RFC-0016::REQ-0003: Tests that terminated sessions can still be
+    /// restarted (quarantine check only applies to Quarantined state).
     #[test]
     fn tck_00243_terminated_session_restart_not_blocked() {
         let mut reducer = SessionReducer::new();

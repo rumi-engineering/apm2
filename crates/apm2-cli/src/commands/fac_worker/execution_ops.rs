@@ -1128,7 +1128,8 @@ pub(super) fn handle_stop_revoke(
                 reason: deny_reason,
             };
         }
-        // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation receipt.
+        // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation
+        // receipt.
         if let Ok(signer) = fac_key_material::load_or_generate_persistent_signer(fac_root) {
             let content_hash = apm2_core::fac::compute_job_receipt_content_hash(&receipt);
             let envelope = apm2_core::fac::sign_receipt(&content_hash, &signer, "fac-worker");
@@ -1187,9 +1188,9 @@ pub(super) fn handle_stop_revoke(
     }
     eprintln!("worker: stop_revoke: moved target {target_job_id} to cancelled/");
 
-    // Step 4: RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic commit.
-    // Receipt persistence, index update, and job move happen in a crash-safe
-    // order via a single ReceiptWritePipeline::commit() call.
+    // Step 4: RFC-0032::REQ-0215 BLOCKER-1: Use ReceiptWritePipeline for atomic
+    // commit. Receipt persistence, index update, and job move happen in a
+    // crash-safe order via a single ReceiptWritePipeline::commit() call.
     let observed = observed_cost_from_elapsed(job_wall_start.elapsed());
     if let Err(commit_err) = commit_claimed_job_via_pipeline_with_guard(
         fac_root,
@@ -1342,9 +1343,10 @@ pub(super) fn execute_warm_job(
     };
 
     // Set up CARGO_HOME and CARGO_TARGET_DIR within the lane.
-    // RFC-0032::REQ-0194: Namespace CARGO_TARGET_DIR by toolchain fingerprint so that
-    // toolchain changes get a fresh build directory, preventing stale artifacts
-    // from a different compiler version from corrupting incremental builds.
+    // RFC-0032::REQ-0194: Namespace CARGO_TARGET_DIR by toolchain fingerprint so
+    // that toolchain changes get a fresh build directory, preventing stale
+    // artifacts from a different compiler version from corrupting incremental
+    // builds.
     let cargo_home = lane_dir.join("cargo_home");
     // Defensive: if fingerprint is somehow invalid (should not happen since
     // worker startup validates it), fall back to plain "target".
@@ -1467,12 +1469,12 @@ pub(super) fn execute_warm_job(
         );
     }
 
-    // RFC-0032::REQ-0209 BLOCKER-1 fix: If the server containment protocol auto-disabled
-    // sccache, strip RUSTC_WRAPPER and SCCACHE_* from the hardened environment.
-    // `build_job_environment` injects these when `policy.sccache_enabled` is true,
-    // but the containment protocol may have determined that the server is
-    // untrusted. Fail-closed: an untrusted server MUST NOT be used for
-    // compilation.
+    // RFC-0032::REQ-0209 BLOCKER-1 fix: If the server containment protocol
+    // auto-disabled sccache, strip RUSTC_WRAPPER and SCCACHE_* from the
+    // hardened environment. `build_job_environment` injects these when
+    // `policy.sccache_enabled` is true, but the containment protocol may have
+    // determined that the server is untrusted. Fail-closed: an untrusted server
+    // MUST NOT be used for compilation.
     if !effective_sccache_enabled && policy.sccache_enabled {
         eprintln!(
             "worker: warm job {}: sccache auto-disabled by containment — \
@@ -1483,11 +1485,11 @@ pub(super) fn execute_warm_job(
         hardened_env.retain(|key, _| !key.starts_with("SCCACHE_"));
     }
 
-    // RFC-0032::REQ-0245: Plumb credential mount metadata into execution environment.
-    // This selectively re-introduces credential env vars (for example
-    // GITHUB_TOKEN) after policy default-deny filtering when a validated
-    // credential mount is available. Secret values are resolved at runtime and
-    // are never serialized into receipts/job specs.
+    // RFC-0032::REQ-0245: Plumb credential mount metadata into execution
+    // environment. This selectively re-introduces credential env vars (for
+    // example GITHUB_TOKEN) after policy default-deny filtering when a
+    // validated credential mount is available. Secret values are resolved at
+    // runtime and are never serialized into receipts/job specs.
     if let Some(credential_mount) = build_github_credential_mount() {
         if let Err(error) =
             apply_credential_mount_to_env(&credential_mount, &mut hardened_env, &ambient_env)

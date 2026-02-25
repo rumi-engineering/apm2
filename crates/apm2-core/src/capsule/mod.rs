@@ -14,15 +14,15 @@
 //!
 //! Runtime wiring into the daemon episode spawn path:
 //!
-//! - **RFC-0020::REQ-0029**: Context firewall -- implements symlink-safe runtime path
-//!   resolution with filesystem-level TOCTOU checks in the daemon actuation
-//!   path.
-//! - **RFC-0020::REQ-0030**: No-bypass path ratchet -- the `PathRatchet` in the daemon
-//!   broker enforces that all enforcement components (broker, capability,
-//!   context firewall, capsule admission) are checked before tool actuation.
-//!   Broker/capability/context-firewall are mandatory at Tier2+; capsule
-//!   admission is mandatory at Tier3+ per REQ-0028. Capsule admission is
-//!   defined but **not yet integrated into the broker actuation path**. The
+//! - **RFC-0020::REQ-0029**: Context firewall -- implements symlink-safe
+//!   runtime path resolution with filesystem-level TOCTOU checks in the daemon
+//!   actuation path.
+//! - **RFC-0020::REQ-0030**: No-bypass path ratchet -- the `PathRatchet` in the
+//!   daemon broker enforces that all enforcement components (broker,
+//!   capability, context firewall, capsule admission) are checked before tool
+//!   actuation. Broker/capability/context-firewall are mandatory at Tier2+;
+//!   capsule admission is mandatory at Tier3+ per REQ-0028. Capsule admission
+//!   is defined but **not yet integrated into the broker actuation path**. The
 //!   `PathRatchet` reports capsule as `Unavailable` and denies Tier3+ until a
 //!   future ticket wires `AdmissionGate::check` into the broker path.
 //!

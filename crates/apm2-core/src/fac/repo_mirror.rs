@@ -22,10 +22,14 @@
 //! - workspaces are fully cleaned with `safe_rmtree_v1` before checkout
 //! - post-checkout git hardening disables hooks and refuses unsafe configs
 //!   (RFC-0032::REQ-0230)
-//! - mirror updates are serialized via per-mirror file lock (RFC-0032::REQ-0232)
-//! - remote URLs are validated against a policy-driven allowlist (RFC-0032::REQ-0232)
-//! - git fetch/clone operations are bounded by wall-clock timeout (RFC-0032::REQ-0232)
-//! - mirror paths are validated to contain no symlink components (RFC-0032::REQ-0232)
+//! - mirror updates are serialized via per-mirror file lock
+//!   (RFC-0032::REQ-0232)
+//! - remote URLs are validated against a policy-driven allowlist
+//!   (RFC-0032::REQ-0232)
+//! - git fetch/clone operations are bounded by wall-clock timeout
+//!   (RFC-0032::REQ-0232)
+//! - mirror paths are validated to contain no symlink components
+//!   (RFC-0032::REQ-0232)
 //! - mirror updates emit receipts with before/after refs (RFC-0032::REQ-0232)
 
 use std::collections::HashMap;

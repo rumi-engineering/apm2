@@ -1313,7 +1313,10 @@ mod tests {
 
         let result = gate.admit(request).unwrap();
 
-        assert_eq!(result.receipt.dcp_id, "dcp://org/project/ticket/RFC-0011::REQ-0002");
+        assert_eq!(
+            result.receipt.dcp_id,
+            "dcp://org/project/ticket/RFC-0011::REQ-0002"
+        );
         assert_eq!(result.receipt.artifact_kind, ArtifactKind::Ticket);
         assert!(!result.receipt.new_hash.is_empty());
         assert_eq!(result.receipt.new_hash.len(), 64); // BLAKE3 hex
@@ -2496,8 +2499,9 @@ mod tests {
     #[test]
     fn test_extract_scope_value_dcp_uri() {
         // Standard DCP URI format: dcp://org/repo/artifact/id
-        let scope =
-            AdmissionGate::<MemoryCas>::extract_scope_value("dcp://myorg/myrepo/ticket/RFC-0032::REQ-0059");
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value(
+            "dcp://myorg/myrepo/ticket/RFC-0032::REQ-0059",
+        );
         assert_eq!(scope, "myorg/myrepo");
     }
 
@@ -2527,7 +2531,8 @@ mod tests {
     #[test]
     fn test_extract_scope_value_colon_separated() {
         // Colon-separated format: org:kind:id
-        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("myorg:ticket:RFC-0032::REQ-0059");
+        let scope =
+            AdmissionGate::<MemoryCas>::extract_scope_value("myorg:ticket:RFC-0032::REQ-0059");
         assert_eq!(scope, "myorg:ticket");
     }
 

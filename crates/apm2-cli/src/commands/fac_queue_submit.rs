@@ -32,7 +32,8 @@ use crate::commands::{fac_key_material, fac_secure_io};
 pub(super) const QUEUE_DIR: &str = "queue";
 /// Queue pending subdirectory.
 pub(super) const PENDING_DIR: &str = "pending";
-/// Broker requests subdirectory for non-service-user submissions (RFC-0032::REQ-0227).
+/// Broker requests subdirectory for non-service-user submissions
+/// (RFC-0032::REQ-0227).
 ///
 /// Non-service-user processes write job specs here instead of directly to
 /// `pending/`. The FAC worker (running as the service user) picks up
@@ -204,20 +205,20 @@ pub(super) fn load_or_init_policy(
 ///
 /// # Flow
 ///
-/// 1. **Service user gate (RFC-0032::REQ-0227)**: Check whether the current process is
-///    the FAC service user. If yes (or if `--unsafe-local-write` is active),
-///    write directly to `queue/pending/`.
+/// 1. **Service user gate (RFC-0032::REQ-0227)**: Check whether the current
+///    process is the FAC service user. If yes (or if `--unsafe-local-write` is
+///    active), write directly to `queue/pending/`.
 ///
 /// 2. **Broker-mediated fallback**: If the service user gate denies (because
 ///    the caller is not the service user), write to `queue/broker_requests/`
 ///    instead. The FAC worker (running as the service user) picks up requests
 ///    from this directory and moves them into `pending/` after validation. This
-///    fulfills the RFC-0032::REQ-0227 `DoD`: "CLI still works via broker-mediated
-///    enqueue."
+///    fulfills the RFC-0032::REQ-0227 `DoD`: "CLI still works via
+///    broker-mediated enqueue."
 ///
-/// 3. **Queue bounds (RFC-0032::REQ-0228)**: For direct writes to `pending/`, the
-///    pending queue must not exceed `max_pending_jobs` or `max_pending_bytes`
-///    as configured by the provided [`QueueBoundsPolicy`].
+/// 3. **Queue bounds (RFC-0032::REQ-0228)**: For direct writes to `pending/`,
+///    the pending queue must not exceed `max_pending_jobs` or
+///    `max_pending_bytes` as configured by the provided [`QueueBoundsPolicy`].
 ///
 /// A process-level lockfile (`queue/.enqueue.lock`) is held for the
 /// full check-write critical section to prevent concurrent `apm2 fac`
@@ -262,9 +263,10 @@ pub(super) fn enqueue_job(
             ref service_user,
             ref reason,
         }) if write_mode == QueueWriteMode::ServiceUserOnly => {
-            // RFC-0032::REQ-0227 round 10 MAJOR fix (security review): ServiceUserNotResolved
-            // in ServiceUserOnly mode is a HARD error, not a broker fallback.
-            // The service user identity cannot be confirmed, so we must fail-closed.
+            // RFC-0032::REQ-0227 round 10 MAJOR fix (security review):
+            // ServiceUserNotResolved in ServiceUserOnly mode is a HARD error,
+            // not a broker fallback. The service user identity cannot be
+            // confirmed, so we must fail-closed.
             //
             // Rationale: ServiceUserNotResolved means "I cannot determine who
             // the service user is" — this is an unresolvable trust question.
@@ -318,9 +320,9 @@ fn enqueue_direct(
     let pending_dir = queue_root.join(PENDING_DIR);
     fs::create_dir_all(&pending_dir).map_err(|err| format!("create pending dir: {err}"))?;
 
-    // RFC-0032::REQ-0227 round 8: Harden queue root and pending directory permissions
-    // immediately after creation. Mode 0711 allows traversal but prevents
-    // world-listing of queue artifacts.
+    // RFC-0032::REQ-0227 round 8: Harden queue root and pending directory
+    // permissions immediately after creation. Mode 0711 allows traversal but
+    // prevents world-listing of queue artifacts.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -330,11 +332,11 @@ fn enqueue_direct(
             .map_err(|err| format!("harden pending dir mode to 0711: {err}"))?;
     }
 
-    // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Ensure all queue subdirectories
-    // exist with deterministic, hardened permissions. Propagate create/chmod
-    // failures (fail-closed) instead of silently ignoring them. Each subdir
-    // gets mode 0711 (traversal-only for group/other), and broker_requests
-    // gets mode 01733 (sticky + write-only for group/other).
+    // CODE-QUALITY fix (RFC-0032::REQ-0227 round 17): Ensure all queue
+    // subdirectories exist with deterministic, hardened permissions. Propagate
+    // create/chmod failures (fail-closed) instead of silently ignoring them.
+    // Each subdir gets mode 0711 (traversal-only for group/other), and
+    // broker_requests gets mode 01733 (sticky + write-only for group/other).
     for subdir in &[
         "claimed",
         "completed",
@@ -379,8 +381,9 @@ fn enqueue_direct(
         ));
     }
 
-    // RFC-0032::REQ-0228: Validate and enforce queue bounds before writing the job spec.
-    // Policy is loaded from the persisted FAC configuration by the caller.
+    // RFC-0032::REQ-0228: Validate and enforce queue bounds before writing the job
+    // spec. Policy is loaded from the persisted FAC configuration by the
+    // caller.
     queue_bounds_policy
         .validate()
         .map_err(|err| format!("queue bounds policy validation failed: {err}"))?;
@@ -478,10 +481,10 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
         )
     })?;
 
-    // RFC-0032::REQ-0227 round 9 MAJOR fix: Only chmod directories that this process
-    // just created. For pre-existing directories (owned by the service user),
-    // validate the existing mode is acceptable instead of attempting chmod
-    // (which returns EPERM for non-owner callers). This makes the broker
+    // RFC-0032::REQ-0227 round 9 MAJOR fix: Only chmod directories that this
+    // process just created. For pre-existing directories (owned by the service
+    // user), validate the existing mode is acceptable instead of attempting
+    // chmod (which returns EPERM for non-owner callers). This makes the broker
     // fallback work for non-service-user processes.
     #[cfg(unix)]
     {
@@ -573,8 +576,8 @@ fn enqueue_via_broker_requests(queue_root: &Path, spec: &FacJobSpecV1) -> Result
     let filename = format!("{}.json", spec.job_id);
     let target = broker_dir.join(&filename);
 
-    // SECURITY fix (RFC-0032::REQ-0227 round 17): Resolve service user GID so we can
-    // set the file's group to the service user, enabling the worker to read
+    // SECURITY fix (RFC-0032::REQ-0227 round 17): Resolve service user GID so we
+    // can set the file's group to the service user, enabling the worker to read
     // broker files in cross-user deployments. Fail-closed: if the service
     // user is not resolvable, return an error instead of falling back to
     // world-readable mode 0644. The 0644 fallback was fail-open because job
@@ -1041,10 +1044,11 @@ mod tests {
         assert_eq!(parsed.job_id, "test-broker-001");
     }
 
-    /// SECURITY fix (RFC-0032::REQ-0227 round 17): Broker enqueue now fails closed
-    /// when the service user is not resolvable. In test environments where
-    /// `_apm2-job` does not exist, `enqueue_via_broker_requests` returns an
-    /// error instead of falling back to world-readable mode 0644.
+    /// SECURITY fix (RFC-0032::REQ-0227 round 17): Broker enqueue now fails
+    /// closed when the service user is not resolvable. In test environments
+    /// where `_apm2-job` does not exist, `enqueue_via_broker_requests`
+    /// returns an error instead of falling back to world-readable mode
+    /// 0644.
     ///
     /// The previous 0644 fallback was fail-open: job filenames are not
     /// opaque random UUIDs and can be guessed, so world-readable files in
@@ -1393,13 +1397,14 @@ mod tests {
         );
     }
 
-    // ── Broker fallback with pre-existing directories (RFC-0032::REQ-0227 round 9) ──
+    // ── Broker fallback with pre-existing directories (RFC-0032::REQ-0227 round 9)
+    // ──
 
-    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must succeed when
-    /// queue directories already exist with correct modes. Previously, the
-    /// function unconditionally called chmod, which returns EPERM for non-owner
-    /// callers. Now it only chmods newly-created dirs and validates existing
-    /// ones.
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// succeed when queue directories already exist with correct modes.
+    /// Previously, the function unconditionally called chmod, which returns
+    /// EPERM for non-owner callers. Now it only chmods newly-created dirs
+    /// and validates existing ones.
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_succeeds_with_preexisting_correct_mode_dirs() {
@@ -1436,8 +1441,9 @@ mod tests {
         assert!(path.exists(), "broker request file should exist");
     }
 
-    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must reject
-    /// pre-existing directories with unsafe modes (group/other read).
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// reject pre-existing directories with unsafe modes (group/other
+    /// read).
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_rejects_preexisting_unsafe_queue_root() {
@@ -1467,8 +1473,8 @@ mod tests {
         );
     }
 
-    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must reject
-    /// pre-existing `broker_requests/` with group/other read bits.
+    /// RFC-0032::REQ-0227 round 9 MAJOR fix: Broker-mediated enqueue must
+    /// reject pre-existing `broker_requests/` with group/other read bits.
     #[cfg(unix)]
     #[test]
     fn enqueue_via_broker_requests_rejects_preexisting_readable_broker_dir() {

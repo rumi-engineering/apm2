@@ -212,7 +212,8 @@ pub struct WorkSpecV1 {
     /// Canonical work identifier (e.g., `W-<uuid>`).
     pub work_id: String,
 
-    /// Optional ticket alias (e.g., `RFC-0032::REQ-0250`). Not the canonical ID.
+    /// Optional ticket alias (e.g., `RFC-0032::REQ-0250`). Not the canonical
+    /// ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_alias: Option<String>,
 

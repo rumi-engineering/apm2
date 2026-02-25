@@ -4171,17 +4171,23 @@ mod tests {
 
     #[test]
     fn validate_explicit_ticket_alias_binding_accepts_matching_resolution() {
-        let alias =
-            validate_explicit_ticket_alias_binding("W-12345678", "RFC-0032::REQ-0268", Some("W-12345678"))
-                .expect("matching alias resolution should be accepted");
+        let alias = validate_explicit_ticket_alias_binding(
+            "W-12345678",
+            "RFC-0032::REQ-0268",
+            Some("W-12345678"),
+        )
+        .expect("matching alias resolution should be accepted");
         assert_eq!(alias, "RFC-0032::REQ-0268");
     }
 
     #[test]
     fn validate_explicit_ticket_alias_binding_rejects_mismatched_resolution() {
-        let err =
-            validate_explicit_ticket_alias_binding("W-12345678", "RFC-0032::REQ-0268", Some("W-87654321"))
-                .expect_err("mismatched alias resolution must fail closed");
+        let err = validate_explicit_ticket_alias_binding(
+            "W-12345678",
+            "RFC-0032::REQ-0268",
+            Some("W-87654321"),
+        )
+        .expect_err("mismatched alias resolution must fail closed");
         assert!(err.contains("`--work-id` mismatch"));
     }
 
@@ -4264,9 +4270,12 @@ ticket_alias: ticket-640
             work_id: "W-RFC-0032::REQ-0268-R2".to_string(),
             ticket_alias: Some("RFC-0032::REQ-0268".to_string()),
         };
-        let err =
-            enforce_authoritative_pr_work_binding(Some(805), Some(&authoritative), "W-RFC-0032::REQ-0268")
-                .expect_err("mismatched candidate must fail closed");
+        let err = enforce_authoritative_pr_work_binding(
+            Some(805),
+            Some(&authoritative),
+            "W-RFC-0032::REQ-0268",
+        )
+        .expect_err("mismatched candidate must fail closed");
         assert!(err.contains("existing PR #805"));
         assert!(err.contains("W-RFC-0032::REQ-0268-R2"));
     }
@@ -5316,7 +5325,10 @@ ticket_alias: ticket-640
     fn extract_tck_from_text_rejects_invalid_variants() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-412"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00412"), None);
-        assert_eq!(extract_tck_from_text("ticket/rfc/RFC-0032::REQ-01583"), None);
+        assert_eq!(
+            extract_tck_from_text("ticket/rfc/RFC-0032::REQ-01583"),
+            None
+        );
     }
 
     #[test]

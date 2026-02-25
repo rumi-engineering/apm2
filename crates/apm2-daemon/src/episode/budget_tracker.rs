@@ -1,8 +1,8 @@
 //! Budget tracking for episode resource management.
 //!
-//! This module implements the `BudgetTracker` per RFC-0033::REQ-0032. The tracker
-//! manages resource consumption during episode execution, enforcing limits
-//! from the episode envelope.
+//! This module implements the `BudgetTracker` per RFC-0033::REQ-0032. The
+//! tracker manages resource consumption during episode execution, enforcing
+//! limits from the episode envelope.
 //!
 //! # Architecture
 //!

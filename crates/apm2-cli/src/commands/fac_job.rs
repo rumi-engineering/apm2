@@ -748,7 +748,8 @@ fn emit_cancellation_receipt(
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
 
-    // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation
+    // receipt.
     if let Ok(signer) =
         crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
     {
@@ -791,8 +792,8 @@ fn emit_cancellation_requested_receipt(
     let receipts_dir = fac_root.join(FAC_RECEIPTS_DIR);
     let result = persist_content_addressed_receipt(&receipts_dir, &receipt)?;
 
-    // RFC-0032::REQ-0226: Best-effort signed envelope alongside cancellation-requested
-    // receipt.
+    // RFC-0032::REQ-0226: Best-effort signed envelope alongside
+    // cancellation-requested receipt.
     if let Ok(signer) =
         crate::commands::fac_key_material::load_or_generate_persistent_signer(fac_root)
     {
