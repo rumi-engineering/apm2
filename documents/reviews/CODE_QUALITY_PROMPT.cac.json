@@ -124,7 +124,7 @@
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history", "work_scope"]
             },
             {
               "action": "on_failure",
@@ -154,7 +154,7 @@
             },
             {
               "action": "read_work_scope",
-              "rule": "Identify the work identifier from commit messages (convention: 'W-...' daemon work_id or 'TCK-XXXXX' alias). Run `apm2 fac work show --work-id <id>` to retrieve the work object. From the work object, extract: `requirement_ids` (list of RFC requirement node IDs, e.g. 'RFC-0032::REQ-0041'), `scope.in_scope`, `scope.out_of_scope`, and `definition_of_done.criteria`. For each requirement_id, read the corresponding requirement node from the RFC JSON at `documents/rfcs/RFC-XXXX.cac.rfc_doc.v1.json` and extract its `statement` and `acceptance` fields. These form the requirements baseline for completeness checking in STEP_3. If no work object is found, derive requirements from RFC nodes referenced in the diff's AGENTS.json or commit messages."
+              "rule": "Read the `work_scope` field from the prepare JSON output (it is already present — do not run any additional CLI commands). When non-null, it contains: `work_id` (canonical work identifier), `ticket_alias`, `rfc_id` (which RFC governs this work). Load `documents/rfcs/{rfc_id}.cac.rfc_doc.v1.json` to access the full requirement tree for this RFC. `requirement_ids` and `requirements` are reserved for future population — if empty, derive requirements from the RFC document directly. When `work_scope` is null (external PR, fork PR, or offline), skip this step."
             },
             {
               "action": "selective_read",
