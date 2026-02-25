@@ -1294,7 +1294,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 
-    // Valid session message types are 1-6, plus HEF range 64-68
+    // Valid session message types are 1-7, plus HEF range 64-68
     // Tags 1-4: Original session endpoints
     assert!(SessionMessageType::from_tag(1).is_some()); // RequestTool
     assert!(SessionMessageType::from_tag(2).is_some()); // EmitEvent
@@ -1304,7 +1304,9 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(SessionMessageType::from_tag(5).is_some()); // StreamLogs
     // Tag 6: RFC-0032::REQ-0134 SessionStatus
     assert!(SessionMessageType::from_tag(6).is_some()); // SessionStatus
-    assert!(SessionMessageType::from_tag(7).is_none()); // Invalid (gap before HEF)
+    // Tag 7: RFC-0032 WorkShow (shared route, also IPC-PRIV-081)
+    assert!(SessionMessageType::from_tag(7).is_some()); // WorkShow
+    assert!(SessionMessageType::from_tag(8).is_none()); // Invalid (gap before HEF)
     // Tags 64-68: HEF Pulse Plane
     assert!(SessionMessageType::from_tag(64).is_some()); // SubscribePulse
     assert!(SessionMessageType::from_tag(66).is_some()); // UnsubscribePulse
