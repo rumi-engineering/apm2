@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_extract_first_fenced_yaml_block_finds_schema() {
-        let body = r#"Some PR description text.
+        let body = r"Some PR description text.
 
 ```yaml
 schema: apm2.fac_push_metadata.v1
@@ -1400,7 +1400,7 @@ branch: ticket/RFC-0019/TCK-12345
 ```
 
 More text after the block.
-"#;
+";
         let yaml = extract_first_fenced_yaml_block(body).expect("should find yaml block");
         assert!(
             yaml.contains("work_id: W-TCK-12345"),
@@ -1462,7 +1462,7 @@ More text after the block.
         assert_eq!(
             node.pointer("/data/acceptance")
                 .and_then(serde_json::Value::as_array)
-                .map(|arr| arr.len()),
+                .map(Vec::len),
             Some(2),
         );
     }
