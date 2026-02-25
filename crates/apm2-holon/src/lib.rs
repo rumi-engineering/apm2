@@ -89,6 +89,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 
 pub mod artifact;
 pub mod context;
