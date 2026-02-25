@@ -101,7 +101,7 @@
     {
       "id": "BEH-DAEMON-GATE-017",
       "kind": "invariant",
-      "title": "SqliteTimeoutLedgerReader.poll delegates to shared ledger_poll module (TCK-00675)",
+      "title": "SqliteTimeoutLedgerReader.poll_async delegates to poll_events_async via spawn_blocking (INV-CQ-OK-003)",
       "rfc": ["RFC-0020"]
     },
     {

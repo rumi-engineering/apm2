@@ -342,6 +342,12 @@ enum TimeoutObservedKind {
     AllCompleted {
         work_id: String,
     },
+    /// A polled row that could not be parsed. Emitted so the cursor advances
+    /// past the malformed row (the `CursorEvent` position is preserved),
+    /// preventing re-processing of the same row on every tick.
+    Skipped {
+        reason: String,
+    },
 }
 
 impl CursorEvent<CompositeCursor> for TimeoutObservedEvent {
@@ -998,6 +1004,10 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
                 TimeoutObservedKind::AllCompleted { work_id } => {
                     self.remove_work_leases(work_id)?;
                 },
+                TimeoutObservedKind::Skipped { .. } => {
+                    // Intentionally ignored -- the event exists only to
+                    // advance the cursor past the malformed row.
+                },
             }
         }
         Ok(())
@@ -1098,7 +1108,7 @@ impl LedgerReader<TimeoutObservedEvent> for TimeoutLedgerReader {
         limit: usize,
     ) -> Result<Vec<TimeoutObservedEvent>, Self::Error> {
         match self {
-            Self::Sqlite(reader) => reader.poll(cursor, limit),
+            Self::Sqlite(reader) => reader.poll_async(cursor, limit).await,
             Self::Memory(_reader) => Ok(Vec::new()),
         }
     }
@@ -1126,13 +1136,18 @@ impl SqliteTimeoutLedgerReader {
     }
 
     /// Polls the ledger for timeout-relevant events using the shared
-    /// [`crate::ledger_poll::poll_events_blocking`] module, then maps each
-    /// [`crate::protocol::dispatch::SignedLedgerEvent`] to a
+    /// [`crate::ledger_poll::poll_events_async`] module (offloads blocking
+    /// `SQLite` I/O to `tokio::task::spawn_blocking` per `INV-CQ-OK-003`), then
+    /// maps each [`crate::protocol::dispatch::SignedLedgerEvent`] to a
     /// [`TimeoutObservedEvent`] via the existing `parse_*` helpers.
+    ///
+    /// Malformed rows that fail to parse are logged and emitted as
+    /// [`TimeoutObservedKind::Skipped`] so the cursor advances past them,
+    /// preventing the deadlock described in `BEH-DAEMON-GATE-016`.
     ///
     /// This replaces the previous 8 per-type query functions with a single
     /// unified call (TCK-00675).
-    fn poll(
+    async fn poll_async(
         &self,
         cursor: &CompositeCursor,
         limit: usize,
@@ -1143,44 +1158,86 @@ impl SqliteTimeoutLedgerReader {
 
         let cursor_ts_i64 = i64::try_from(cursor.timestamp_ns)
             .map_err(|_| "cursor timestamp exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
 
-        let signed_events = ledger_poll::poll_events_blocking(
-            &guard,
-            TIMEOUT_EVENT_TYPES,
+        let event_types: Vec<String> = TIMEOUT_EVENT_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        // Offload blocking SQLite I/O to spawn_blocking via the shared
+        // ledger_poll module (INV-CQ-OK-003).
+        let signed_events = ledger_poll::poll_events_async(
+            Arc::clone(&self.conn),
+            event_types,
             cursor_ts_i64,
-            &cursor.event_id,
+            cursor.event_id.clone(),
             limit,
-        )?;
+        )
+        .await?;
 
         // Map SignedLedgerEvent -> TimeoutObservedEvent using existing parsers.
+        // Malformed rows are logged and emitted as Skipped to preserve cursor
+        // advancement (BEH-DAEMON-GATE-016 resilience).
         let mut out = Vec::with_capacity(signed_events.len());
         for event in signed_events {
             let kind = match event.event_type.as_str() {
-                "gate_lease_issued" => {
-                    let (lease, gate_type) = parse_gate_lease_payload(&event.payload)?;
-                    TimeoutObservedKind::LeaseIssued {
+                "gate_lease_issued" => match parse_gate_lease_payload(&event.payload) {
+                    Ok((lease, gate_type)) => TimeoutObservedKind::LeaseIssued {
                         lease: Box::new(lease),
                         gate_type,
-                    }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            "skipping malformed timeout row: {e}"
+                        );
+                        TimeoutObservedKind::Skipped { reason: e }
+                    },
                 },
-                "gate.timed_out" => {
-                    let lease_id = parse_timed_out_lease_id(&event.payload)?;
-                    TimeoutObservedKind::TimedOut { lease_id }
+                "gate.timed_out" => match parse_timed_out_lease_id(&event.payload) {
+                    Ok(lease_id) => TimeoutObservedKind::TimedOut { lease_id },
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            "skipping malformed timeout row: {e}"
+                        );
+                        TimeoutObservedKind::Skipped { reason: e }
+                    },
                 },
                 "gate.receipt" | "GateReceipt" | "gate_receipt" => {
-                    let lease_id = parse_gate_receipt_lease_id(&event.payload)?;
-                    TimeoutObservedKind::GateReceiptFinalized { lease_id }
+                    match parse_gate_receipt_lease_id(&event.payload) {
+                        Ok(lease_id) => TimeoutObservedKind::GateReceiptFinalized { lease_id },
+                        Err(e) => {
+                            tracing::warn!(
+                                event_id = %event.event_id,
+                                event_type = %event.event_type,
+                                "skipping malformed timeout row: {e}"
+                            );
+                            TimeoutObservedKind::Skipped { reason: e }
+                        },
+                    }
                 },
-                "gate.all_completed" => {
-                    let work_id = parse_all_completed_work_id(&event.payload)?;
-                    TimeoutObservedKind::AllCompleted { work_id }
+                "gate.all_completed" => match parse_all_completed_work_id(&event.payload) {
+                    Ok(work_id) => TimeoutObservedKind::AllCompleted { work_id },
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            "skipping malformed timeout row: {e}"
+                        );
+                        TimeoutObservedKind::Skipped { reason: e }
+                    },
                 },
                 other => {
-                    return Err(format!("unexpected event type from ledger_poll: {other}"));
+                    let reason = format!("unexpected event type from ledger_poll: {other}");
+                    tracing::warn!(
+                        event_id = %event.event_id,
+                        event_type = %event.event_type,
+                        "skipping malformed timeout row: {reason}"
+                    );
+                    TimeoutObservedKind::Skipped { reason }
                 },
             };
             out.push(TimeoutObservedEvent {
@@ -2401,6 +2458,232 @@ mod tests {
         assert!(
             rebased.is_timed_out(now_mono),
             "rebased expired lease must still be timed out"
+        );
+    }
+
+    /// Helper: creates ledger tables required by `poll_events_blocking`.
+    fn create_ledger_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE ledger_events (
+                 event_id   TEXT NOT NULL,
+                 event_type TEXT NOT NULL,
+                 work_id    TEXT NOT NULL DEFAULT '',
+                 actor_id   TEXT NOT NULL DEFAULT '',
+                 payload    BLOB NOT NULL DEFAULT X'',
+                 signature  BLOB NOT NULL DEFAULT X'',
+                 timestamp_ns INTEGER NOT NULL
+             );",
+        )
+        .expect("create ledger_events table");
+    }
+
+    /// BEH-DAEMON-GATE-016: Malformed timeout rows must be skipped (emitted
+    /// as `Skipped`) so the cursor advances past corrupted data instead of
+    /// deadlocking the timeout kernel.
+    #[tokio::test]
+    async fn malformed_row_skipped_and_cursor_advances() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            create_ledger_tables(&guard);
+        }
+
+        // Insert a valid gate.timed_out event.
+        let valid_payload = serde_json::to_vec(&serde_json::json!({"lease_id": "lease-ok-1"}))
+            .expect("serialize valid payload");
+        // Insert a malformed gate.timed_out event (missing lease_id field).
+        let malformed_payload = serde_json::to_vec(&serde_json::json!({"not_lease_id": "bad"}))
+            .expect("serialize malformed payload");
+        // Insert a valid gate.all_completed event after the malformed one.
+        let valid_payload_2 = serde_json::to_vec(&serde_json::json!({"work_id": "W-done-1"}))
+            .expect("serialize valid payload 2");
+
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, '', '', ?3, X'', ?4)",
+                    params!["evt-1", "gate.timed_out", &valid_payload, 100_i64],
+                )
+                .expect("insert valid event");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, '', '', ?3, X'', ?4)",
+                    params!["evt-2", "gate.timed_out", &malformed_payload, 200_i64],
+                )
+                .expect("insert malformed event");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, '', '', ?3, X'', ?4)",
+                    params!["evt-3", "gate.all_completed", &valid_payload_2, 300_i64],
+                )
+                .expect("insert second valid event");
+        }
+
+        let reader = SqliteTimeoutLedgerReader::new(Arc::clone(&conn));
+        let cursor = CompositeCursor {
+            timestamp_ns: 0,
+            event_id: String::new(),
+        };
+
+        let events = reader
+            .poll_async(&cursor, 100)
+            .await
+            .expect("poll_async must not error on malformed rows");
+
+        // All 3 rows must be returned: 2 parsed + 1 skipped.
+        assert_eq!(
+            events.len(),
+            3,
+            "all 3 events must be returned (including skipped)"
+        );
+
+        // First event: valid TimedOut.
+        assert!(
+            matches!(events[0].kind, TimeoutObservedKind::TimedOut { ref lease_id } if lease_id == "lease-ok-1"),
+            "first event should be valid TimedOut, got: {:?}",
+            events[0].kind
+        );
+
+        // Second event: Skipped (malformed payload).
+        assert!(
+            matches!(events[1].kind, TimeoutObservedKind::Skipped { .. }),
+            "second event should be Skipped due to malformed payload, got: {:?}",
+            events[1].kind
+        );
+        // Verify the skipped event still carries cursor metadata.
+        assert_eq!(
+            events[1].event_id, "evt-2",
+            "skipped event must preserve event_id for cursor advancement"
+        );
+        assert_eq!(
+            events[1].timestamp_ns, 200,
+            "skipped event must preserve timestamp_ns for cursor advancement"
+        );
+
+        // Third event: valid AllCompleted.
+        assert!(
+            matches!(events[2].kind, TimeoutObservedKind::AllCompleted { ref work_id } if work_id == "W-done-1"),
+            "third event should be valid AllCompleted, got: {:?}",
+            events[2].kind
+        );
+
+        // Verify cursor would advance past the malformed row:
+        // The last event has timestamp_ns=300, which is strictly after the
+        // malformed row at 200. This ensures the cursor will not revisit it.
+        let last_cursor = events.last().unwrap().cursor();
+        assert!(
+            last_cursor.timestamp_ns > 200,
+            "cursor must advance past the malformed row"
+        );
+    }
+
+    /// `INV-CQ-OK-003`: `SqliteTimeoutLedgerReader::poll_async` offloads
+    /// blocking `SQLite` I/O to `spawn_blocking` via `poll_events_async`.
+    /// This test verifies the async path returns correct results.
+    #[tokio::test]
+    async fn poll_async_offloads_sqlite_io_to_spawn_blocking() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            create_ledger_tables(&guard);
+        }
+
+        let payload = serde_json::to_vec(&serde_json::json!({"lease_id": "lease-async-1"}))
+            .expect("serialize payload");
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, '', '', ?3, X'', ?4)",
+                    params!["evt-async-1", "gate.timed_out", &payload, 500_i64],
+                )
+                .expect("insert event");
+        }
+
+        let reader = SqliteTimeoutLedgerReader::new(Arc::clone(&conn));
+        let cursor = CompositeCursor {
+            timestamp_ns: 0,
+            event_id: String::new(),
+        };
+
+        // poll_async should return the event correctly from spawn_blocking.
+        let events = reader
+            .poll_async(&cursor, 10)
+            .await
+            .expect("poll_async should succeed");
+
+        assert_eq!(events.len(), 1, "expected exactly 1 event");
+        assert!(
+            matches!(events[0].kind, TimeoutObservedKind::TimedOut { ref lease_id } if lease_id == "lease-async-1"),
+            "event should be TimedOut with correct lease_id, got: {:?}",
+            events[0].kind
+        );
+        assert_eq!(events[0].event_id, "evt-async-1");
+        assert_eq!(events[0].timestamp_ns, 500);
+    }
+
+    /// Regression: unexpected event types from the ledger are skipped rather
+    /// than causing a fatal error that would stall the timeout kernel.
+    #[tokio::test]
+    async fn unexpected_event_type_skipped() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
+        ));
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            create_ledger_tables(&guard);
+        }
+
+        // Insert an event with a type that is in the query filter but has
+        // a completely unexpected value (shouldn't happen, but defense in
+        // depth). We use "gate_lease_issued" but with garbage payload.
+        let garbage_payload = b"this is not json";
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+                     VALUES (?1, ?2, '', '', ?3, X'', ?4)",
+                    params![
+                        "evt-garbage-1",
+                        "gate_lease_issued",
+                        &garbage_payload[..],
+                        100_i64
+                    ],
+                )
+                .expect("insert garbage event");
+        }
+
+        let reader = SqliteTimeoutLedgerReader::new(Arc::clone(&conn));
+        let cursor = CompositeCursor {
+            timestamp_ns: 0,
+            event_id: String::new(),
+        };
+
+        let events = reader
+            .poll_async(&cursor, 10)
+            .await
+            .expect("poll_async must not error on garbage payloads");
+
+        assert_eq!(events.len(), 1, "garbage row must still be returned");
+        assert!(
+            matches!(events[0].kind, TimeoutObservedKind::Skipped { .. }),
+            "garbage row must be Skipped, got: {:?}",
+            events[0].kind
         );
     }
 }
