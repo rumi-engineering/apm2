@@ -97,6 +97,12 @@
       "kind": "safety",
       "title": "Malformed-row resilience: parse errors advance cursor, not deadlock",
       "rfc": ["RFC-0019"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-017",
+      "kind": "invariant",
+      "title": "SqliteTimeoutLedgerReader.poll delegates to shared ledger_poll module (TCK-00675)",
+      "rfc": ["RFC-0020"]
     }
   ]
 }

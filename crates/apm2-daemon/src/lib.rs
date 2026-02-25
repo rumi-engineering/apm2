@@ -65,6 +65,12 @@ pub mod hsi_contract;
 pub mod htf;
 pub mod identity;
 pub mod ledger;
+/// Shared freeze-aware ledger polling module (TCK-00675).
+///
+/// Consolidates the duplicated SQL query logic for polling events from both
+/// the legacy `ledger_events` table and the canonical `events` table
+/// introduced by RFC-0032 freeze mode.
+pub mod ledger_poll;
 pub mod metrics;
 pub mod pcac;
 pub mod projection;

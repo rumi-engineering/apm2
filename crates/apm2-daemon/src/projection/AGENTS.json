@@ -90,8 +90,8 @@
     {
       "id": "BEH-DAEMON-PROJ-015",
       "kind": "invariant",
-      "title": "Canonical mode detection cached after first probe per poll cycle",
-      "rfc": ["RFC-0017"]
+      "title": "LedgerTailer.poll_events delegates to shared ledger_poll module (TCK-00675)",
+      "rfc": ["RFC-0020"]
     },
     {
       "id": "BEH-DAEMON-PROJ-016",

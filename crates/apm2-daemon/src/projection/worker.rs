@@ -73,7 +73,6 @@ use apm2_core::economics::{
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, advance_cursor_with_event, is_after_cursor,
-    sort_and_truncate_events,
 };
 use apm2_core::pcac::{
     AuthorityDenyClass, AuthorityJoinInputV1, BoundaryIntentClass, DeterminismClass,
@@ -1784,13 +1783,6 @@ pub struct LedgerTailer {
     last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
-    /// RFC-0032::REQ-0266 / BLOCKER fix: Whether the canonical `events` table
-    /// is active (freeze mode). Detected lazily on first poll by checking
-    /// if the `events` table exists in `sqlite_master`. Once set, the
-    /// tailer also queries canonical events to see freeze-mode writes.
-    /// Uses `std::sync::atomic::AtomicU8` with three states:
-    /// 0 = unknown, 1 = legacy-only, 2 = canonical-active.
-    canonical_mode: std::sync::atomic::AtomicU8,
 }
 
 impl LedgerTailer {
@@ -1834,7 +1826,6 @@ impl LedgerTailer {
             last_processed_ns,
             last_event_id,
             tailer_id: tailer_id.to_string(),
-            canonical_mode: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -1853,144 +1844,6 @@ impl LedgerTailer {
             last_processed_ns: timestamp_ns,
             last_event_id: String::new(),
             tailer_id: DEFAULT_TAILER_ID.to_string(),
-            canonical_mode: std::sync::atomic::AtomicU8::new(0),
-        }
-    }
-
-    /// RFC-0032::REQ-0266 / BLOCKER fix: Detects whether the canonical `events`
-    /// table is active. Returns `true` if canonical mode is active (the
-    /// `events` table exists and has at least one row). Result is cached in
-    /// an `AtomicU8` to avoid repeated `sqlite_master` queries.
-    ///
-    /// States: 0 = unknown (probe required), 1 = legacy-only, 2 = canonical.
-    fn is_canonical_active(conn: &Connection, mode: &std::sync::atomic::AtomicU8) -> bool {
-        use std::sync::atomic::Ordering;
-        let current = mode.load(Ordering::Acquire);
-        if current == 2 {
-            return true;
-        }
-        if current == 1 {
-            return false;
-        }
-        // Probe: check if `events` table exists in sqlite_master.
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                 WHERE type = 'table' AND name = 'events')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if exists {
-            mode.store(2, Ordering::Release);
-            true
-        } else {
-            mode.store(1, Ordering::Release);
-            false
-        }
-    }
-
-    /// RFC-0032::REQ-0266 / BLOCKER fix: Polls the canonical `events` table for
-    /// events matching the given type and cursor, using the same composite
-    /// cursor semantics as the legacy poll.
-    ///
-    /// Column mapping: `events.session_id` → `work_id`,
-    /// `events.seq_id` → synthesised `"canonical-{seq_id:020}"` `event_id`.
-    ///
-    /// ## Cursor correctness (MAJOR fix: timestamp collision cursor skip)
-    ///
-    /// The synthesised `event_id` uses a **20-digit zero-padded** `seq_id`
-    /// (e.g. `canonical-00000000000000000042`) so that lexicographic ordering
-    /// matches the underlying numeric `seq_id ASC` ordering. Without zero-
-    /// padding, `"canonical-10"` would sort **before** `"canonical-9"` in
-    /// string comparison, causing the cursor to skip rows with `seq_id >= 10`
-    /// when a same-timestamp batch page boundary falls between single-digit
-    /// and multi-digit `seq_id` values.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    fn poll_canonical_events(
-        conn: &Connection,
-        event_type: &str,
-        last_processed_ns: u64,
-        last_event_id: &str,
-        limit: usize,
-    ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
-        // Map the canonical row to a `SignedLedgerEvent` with synthesised
-        // event_id = "canonical-{seq_id:020}" (zero-padded for
-        // lexicographic == numeric ordering).
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SignedLedgerEvent> {
-            let seq_id: i64 = row.get(0)?;
-            Ok(SignedLedgerEvent {
-                event_id: format!("canonical-{seq_id:020}"),
-                event_type: row.get(1)?,
-                work_id: row.get(2)?, // session_id maps to work_id
-                actor_id: row.get(3)?,
-                payload: row.get(4)?,
-                signature: row.get(5)?,
-                timestamp_ns: row.get::<_, i64>(6)? as u64,
-            })
-        };
-
-        if last_event_id.is_empty() {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                            COALESCE(signature, X''), timestamp_ns \
-                     FROM events \
-                     WHERE event_type = ?1 AND timestamp_ns > ?2 \
-                     ORDER BY timestamp_ns ASC, seq_id ASC \
-                     LIMIT ?3",
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
-
-            let events = stmt
-                .query_map(
-                    params![event_type, last_processed_ns as i64, limit as i64],
-                    map_row,
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            Ok(events)
-        } else {
-            // For composite cursor with canonical events: the last_event_id
-            // may be a legacy event_id or a "canonical-{seq_id:020}" string.
-            //
-            // MAJOR FIX (cursor skip under timestamp collision):
-            // Use zero-padded synthesised canonical event_id in SQL so
-            // string `>` comparison matches numeric `seq_id ASC` ordering.
-            // The SQL pads `seq_id` with `SUBSTR('00000000000000000000', 1,
-            // 20 - LENGTH(CAST(seq_id AS TEXT)))` to produce a 20-char
-            // zero-padded number, then prefixes `'canonical-'`.
-            let mut stmt = conn
-                .prepare(
-                    "SELECT seq_id, event_type, session_id, actor_id, payload, \
-                            COALESCE(signature, X''), timestamp_ns \
-                     FROM events \
-                     WHERE event_type = ?1 AND ( \
-                         timestamp_ns > ?2 OR \
-                         (timestamp_ns = ?2 AND \
-                          ('canonical-' || SUBSTR('00000000000000000000', 1, \
-                              20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?3) \
-                     ) \
-                     ORDER BY timestamp_ns ASC, seq_id ASC \
-                     LIMIT ?4",
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
-
-            let events = stmt
-                .query_map(
-                    params![
-                        event_type,
-                        last_processed_ns as i64,
-                        last_event_id,
-                        limit as i64
-                    ],
-                    map_row,
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            Ok(events)
         }
     }
 
@@ -2047,6 +1900,10 @@ impl LedgerTailer {
     /// each event. This ensures at-least-once delivery semantics:
     /// - If the daemon crashes before acknowledgment, events are redelivered
     /// - Idempotency is achieved via `comment_receipts` and `IdempotencyCache`
+    ///
+    /// Delegates to [`crate::ledger_poll::poll_events_blocking`] for the
+    /// unified freeze-aware query, eliminating duplicated legacy+canonical
+    /// SQL (TCK-00675).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     pub fn poll_events(
         &mut self,
@@ -2058,101 +1915,14 @@ impl LedgerTailer {
             .lock()
             .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
-        // MAJOR FIX: Use composite cursor (timestamp_ns, event_id) to handle
-        // timestamp collisions. The query selects events where:
-        // - timestamp > last_timestamp, OR
-        // - timestamp == last_timestamp AND event_id > last_event_id (only if
-        //   last_event_id is set)
-        // This ensures no events are skipped when multiple events share a timestamp.
-        //
-        // When last_event_id is empty (e.g., from_timestamp or fresh start), we only
-        // use timestamp comparison to maintain backward compatibility and
-        // correct semantics: timestamp_ns > last means "everything after this
-        // timestamp".
-        let query = if self.last_event_id.is_empty() {
-            // No event_id cursor - use timestamp-only comparison
-            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = ?1 AND timestamp_ns > ?2
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        } else {
-            // Have event_id cursor - use composite comparison
-            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = ?1 AND (
-                 timestamp_ns > ?2 OR
-                 (timestamp_ns = ?2 AND event_id > ?3)
-             )
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?4"
-        };
-
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
-
-        let mut events = if self.last_event_id.is_empty() {
-            stmt.query_map(
-                params![event_type, self.last_processed_ns as i64, limit as i64],
-                |row| {
-                    Ok(SignedLedgerEvent {
-                        event_id: row.get(0)?,
-                        event_type: row.get(1)?,
-                        work_id: row.get(2)?,
-                        actor_id: row.get(3)?,
-                        payload: row.get(4)?,
-                        signature: row.get(5)?,
-                        timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    })
-                },
-            )
-            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>()
-        } else {
-            stmt.query_map(
-                params![
-                    event_type,
-                    self.last_processed_ns as i64,
-                    &self.last_event_id,
-                    limit as i64
-                ],
-                |row| {
-                    Ok(SignedLedgerEvent {
-                        event_id: row.get(0)?,
-                        event_type: row.get(1)?,
-                        work_id: row.get(2)?,
-                        actor_id: row.get(3)?,
-                        payload: row.get(4)?,
-                        signature: row.get(5)?,
-                        timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    })
-                },
-            )
-            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>()
-        };
-
-        // RFC-0032::REQ-0266 / BLOCKER fix: When canonical mode is active, also
-        // poll the canonical `events` table and merge results by
-        // (timestamp_ns, event_id) ordering. This ensures the tailer
-        // observes freeze-mode writes.
-        if Self::is_canonical_active(&conn, &self.canonical_mode) {
-            let canonical = Self::poll_canonical_events(
-                &conn,
-                event_type,
-                self.last_processed_ns,
-                &self.last_event_id,
-                limit,
-            )?;
-            if !canonical.is_empty() {
-                events.extend(canonical);
-                // Reuse kernel cursor ordering helper after legacy+canonical merge.
-                events = sort_and_truncate_events(events, limit);
-            }
-        }
+        let events = crate::ledger_poll::poll_events_blocking(
+            &conn,
+            &[event_type],
+            self.last_processed_ns as i64,
+            &self.last_event_id,
+            limit,
+        )
+        .map_err(ProjectionWorkerError::DatabaseError)?;
 
         // NOTE: Watermark is NOT advanced here. Caller must call acknowledge()
         // after successful processing to ensure at-least-once delivery.
@@ -2201,11 +1971,8 @@ impl LedgerTailer {
 
     /// Async wrapper for `poll_events` that uses `spawn_blocking`.
     ///
-    /// This avoids blocking the async runtime during `SQLite` I/O
-    /// (Major fix: Thread blocking in async context).
-    ///
-    /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
-    /// Uses composite cursor (`timestamp_ns`, `event_id`) in the query.
+    /// Delegates to [`crate::ledger_poll::poll_events_async`] for the
+    /// unified freeze-aware query (TCK-00675).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     pub async fn poll_events_async(
         &self,
@@ -2214,143 +1981,18 @@ impl LedgerTailer {
     ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
         let conn = Arc::clone(&self.conn);
         let event_type = event_type.to_string();
-        let last_processed_ns = self.last_processed_ns;
-        let last_event_id = self.last_event_id.clone();
-        // RFC-0032::REQ-0266 / BLOCKER fix: Snapshot canonical_mode before spawning so
-        // the blocking closure can detect freeze-mode writes. The probe
-        // result is returned alongside events so we can cache it.
-        let canonical_mode_snapshot = self
-            .canonical_mode
-            .load(std::sync::atomic::Ordering::Acquire);
+        let cursor_ts_ns = self.last_processed_ns as i64;
+        let cursor_event_id = self.last_event_id.clone();
 
-        // Return (events, detected_canonical_mode) from spawn_blocking.
-        let result = tokio::task::spawn_blocking(move || {
-            let conn_guard = conn.lock().map_err(|e| {
-                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-            })?;
-
-            // MAJOR FIX: Use composite cursor (timestamp_ns, event_id)
-            // When last_event_id is empty, use timestamp-only comparison for backward
-            // compat.
-            let query = if last_event_id.is_empty() {
-                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                 FROM ledger_events
-                 WHERE event_type = ?1 AND timestamp_ns > ?2
-                 ORDER BY timestamp_ns ASC, event_id ASC
-                 LIMIT ?3"
-            } else {
-                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                 FROM ledger_events
-                 WHERE event_type = ?1 AND (
-                     timestamp_ns > ?2 OR
-                     (timestamp_ns = ?2 AND event_id > ?3)
-                 )
-                 ORDER BY timestamp_ns ASC, event_id ASC
-                 LIMIT ?4"
-            };
-
-            let mut stmt = conn_guard
-                .prepare(query)
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
-
-            let mut events = if last_event_id.is_empty() {
-                stmt.query_map(
-                    params![event_type, last_processed_ns as i64, limit as i64],
-                    |row| {
-                        Ok(SignedLedgerEvent {
-                            event_id: row.get(0)?,
-                            event_type: row.get(1)?,
-                            work_id: row.get(2)?,
-                            actor_id: row.get(3)?,
-                            payload: row.get(4)?,
-                            signature: row.get(5)?,
-                            timestamp_ns: row.get::<_, i64>(6)? as u64,
-                        })
-                    },
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>()
-            } else {
-                stmt.query_map(
-                    params![
-                        event_type,
-                        last_processed_ns as i64,
-                        &last_event_id,
-                        limit as i64
-                    ],
-                    |row| {
-                        Ok(SignedLedgerEvent {
-                            event_id: row.get(0)?,
-                            event_type: row.get(1)?,
-                            work_id: row.get(2)?,
-                            actor_id: row.get(3)?,
-                            payload: row.get(4)?,
-                            signature: row.get(5)?,
-                            timestamp_ns: row.get::<_, i64>(6)? as u64,
-                        })
-                    },
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>()
-            };
-
-            // RFC-0032::REQ-0266 / BLOCKER fix: When canonical mode is active (or
-            // unknown and detected by probing), also poll canonical events.
-            let canonical_active = if canonical_mode_snapshot == 2 {
-                true
-            } else if canonical_mode_snapshot == 1 {
-                false
-            } else {
-                // Probe: check if `events` table exists.
-                conn_guard
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                         WHERE type = 'table' AND name = 'events')",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(false)
-            };
-
-            // Encode detected mode for caching: 2 = canonical, 1 = legacy.
-            let detected: u8 = if canonical_active {
-                2
-            } else if canonical_mode_snapshot == 0 {
-                1
-            } else {
-                canonical_mode_snapshot
-            };
-
-            if canonical_active {
-                let canonical = Self::poll_canonical_events(
-                    &conn_guard,
-                    &event_type,
-                    last_processed_ns,
-                    &last_event_id,
-                    limit,
-                )?;
-                if !canonical.is_empty() {
-                    events.extend(canonical);
-                    events = sort_and_truncate_events(events, limit);
-                }
-            }
-
-            Ok((events, detected))
-        })
+        crate::ledger_poll::poll_events_async(
+            conn,
+            vec![event_type],
+            cursor_ts_ns,
+            cursor_event_id,
+            limit,
+        )
         .await
-        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?;
-
-        let (events, detected_mode) = result?;
-
-        // Cache the detected canonical mode for future polls.
-        if canonical_mode_snapshot == 0 && detected_mode != 0 {
-            self.canonical_mode
-                .store(detected_mode, std::sync::atomic::Ordering::Release);
-        }
-
-        Ok(events)
+        .map_err(ProjectionWorkerError::DatabaseError)
     }
 
     /// Async wrapper for `acknowledge` that uses `spawn_blocking`.

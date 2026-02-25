@@ -14,7 +14,7 @@ use apm2_core::fac::GateLease;
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, CursorStore, EffectExecutionState, EffectJournal,
     ExecutionOutcome, InDoubtResolution, IntentStore, LedgerReader, OrchestratorDomain,
-    ReceiptWriter, TickConfig, TickReport, is_after_cursor, run_tick,
+    ReceiptWriter, TickConfig, TickReport, run_tick,
 };
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -922,6 +922,17 @@ impl LedgerReader<TimeoutObservedEvent> for TimeoutLedgerReader {
     }
 }
 
+/// All event types the timeout kernel observes. Used as the union set for
+/// the shared [`crate::ledger_poll::poll_events_blocking`] call.
+const TIMEOUT_EVENT_TYPES: &[&str] = &[
+    "gate_lease_issued",
+    "gate.timed_out",
+    "gate.receipt",
+    "GateReceipt",
+    "gate_receipt",
+    "gate.all_completed",
+];
+
 #[derive(Debug)]
 struct SqliteTimeoutLedgerReader {
     conn: Arc<Mutex<Connection>>,
@@ -932,6 +943,13 @@ impl SqliteTimeoutLedgerReader {
         Self { conn }
     }
 
+    /// Polls the ledger for timeout-relevant events using the shared
+    /// [`crate::ledger_poll::poll_events_blocking`] module, then maps each
+    /// [`crate::protocol::dispatch::SignedLedgerEvent`] to a
+    /// [`TimeoutObservedEvent`] via the existing `parse_*` helpers.
+    ///
+    /// This replaces the previous 8 per-type query functions with a single
+    /// unified call (TCK-00675).
     fn poll(
         &self,
         cursor: &CompositeCursor,
@@ -941,8 +959,6 @@ impl SqliteTimeoutLedgerReader {
             return Ok(Vec::new());
         }
 
-        let limit_i64 =
-            i64::try_from(limit).map_err(|_| "observe limit exceeds i64 range".to_string())?;
         let cursor_ts_i64 = i64::try_from(cursor.timestamp_ns)
             .map_err(|_| "cursor timestamp exceeds i64 range".to_string())?;
         let guard = self
@@ -950,580 +966,45 @@ impl SqliteTimeoutLedgerReader {
             .lock()
             .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
 
-        let mut out = Vec::new();
-        out.extend(Self::query_lease_issued_legacy(
+        let signed_events = crate::ledger_poll::poll_events_blocking(
             &guard,
+            TIMEOUT_EVENT_TYPES,
             cursor_ts_i64,
             &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_lease_issued_canonical(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_timed_out_legacy(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_timed_out_canonical(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_gate_receipt_legacy(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_gate_receipt_canonical(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_all_completed_legacy(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.extend(Self::query_all_completed_canonical(
-            &guard,
-            cursor_ts_i64,
-            &cursor.event_id,
-            limit_i64,
-        )?);
-        out.retain(|event| is_after_cursor(event, cursor));
-        out.sort_by(|a, b| {
-            a.timestamp_ns
-                .cmp(&b.timestamp_ns)
-                .then_with(|| a.event_id.cmp(&b.event_id))
-        });
-        out.truncate(limit);
-        Ok(out)
-    }
+            limit,
+        )?;
 
-    fn query_lease_issued_legacy(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let query = if cursor_event_id.is_empty() {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate_lease_issued' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate_lease_issued'
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND event_id > ?2))
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare legacy lease query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute legacy lease query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate legacy lease rows: {e}"))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy lease event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy lease payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode legacy lease timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "legacy lease timestamp is negative".to_string())?;
-            let (lease, gate_type) = parse_gate_lease_payload(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id,
-                kind: TimeoutObservedKind::LeaseIssued {
-                    lease: Box::new(lease),
-                    gate_type,
+        // Map SignedLedgerEvent -> TimeoutObservedEvent using existing parsers.
+        let mut out = Vec::with_capacity(signed_events.len());
+        for event in signed_events {
+            let kind = match event.event_type.as_str() {
+                "gate_lease_issued" => {
+                    let (lease, gate_type) = parse_gate_lease_payload(&event.payload)?;
+                    TimeoutObservedKind::LeaseIssued {
+                        lease: Box::new(lease),
+                        gate_type,
+                    }
                 },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_lease_issued_canonical(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let table_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        if table_exists.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let query = if cursor_event_id.is_empty() {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate_lease_issued' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate_lease_issued'
-               AND (
-                 timestamp_ns > ?1 OR
-                 (timestamp_ns = ?1 AND
-                  ('canonical-' || SUBSTR('00000000000000000000', 1, 20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?2)
-               )
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare canonical lease query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute canonical lease query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate canonical lease rows: {e}"))?
-        {
-            let seq_id: i64 = row
-                .get(0)
-                .map_err(|e| format!("failed to decode canonical seq_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode canonical lease payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode canonical lease timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "canonical lease timestamp is negative".to_string())?;
-            let (lease, gate_type) = parse_gate_lease_payload(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id: format!("canonical-{seq_id:020}"),
-                kind: TimeoutObservedKind::LeaseIssued {
-                    lease: Box::new(lease),
-                    gate_type,
+                "gate.timed_out" => {
+                    let lease_id = parse_timed_out_lease_id(&event.payload)?;
+                    TimeoutObservedKind::TimedOut { lease_id }
                 },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_timed_out_legacy(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let query = if cursor_event_id.is_empty() {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate.timed_out' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate.timed_out'
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND event_id > ?2))
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare legacy timeout query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute legacy timeout query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate legacy timeout rows: {e}"))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy timeout event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy timeout payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode legacy timeout timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "legacy timeout timestamp is negative".to_string())?;
-            let lease_id = parse_timed_out_lease_id(&payload)?;
+                "gate.receipt" | "GateReceipt" | "gate_receipt" => {
+                    let lease_id = parse_gate_receipt_lease_id(&event.payload)?;
+                    TimeoutObservedKind::GateReceiptFinalized { lease_id }
+                },
+                "gate.all_completed" => {
+                    let work_id = parse_all_completed_work_id(&event.payload)?;
+                    TimeoutObservedKind::AllCompleted { work_id }
+                },
+                other => {
+                    return Err(format!("unexpected event type from ledger_poll: {other}"));
+                },
+            };
             out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id,
-                kind: TimeoutObservedKind::TimedOut { lease_id },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_timed_out_canonical(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let table_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        if table_exists.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let query = if cursor_event_id.is_empty() {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate.timed_out' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate.timed_out'
-               AND (
-                 timestamp_ns > ?1 OR
-                 (timestamp_ns = ?1 AND
-                  ('canonical-' || SUBSTR('00000000000000000000', 1, 20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?2)
-               )
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare canonical timeout query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute canonical timeout query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate canonical timeout rows: {e}"))?
-        {
-            let seq_id: i64 = row
-                .get(0)
-                .map_err(|e| format!("failed to decode canonical timeout seq_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode canonical timeout payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode canonical timeout timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "canonical timeout timestamp is negative".to_string())?;
-            let lease_id = parse_timed_out_lease_id(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id: format!("canonical-{seq_id:020}"),
-                kind: TimeoutObservedKind::TimedOut { lease_id },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_gate_receipt_legacy(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let query = if cursor_event_id.is_empty() {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type IN ('gate.receipt', 'GateReceipt', 'gate_receipt')
-               AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type IN ('gate.receipt', 'GateReceipt', 'gate_receipt')
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND event_id > ?2))
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare legacy gate receipt query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute legacy gate receipt query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate legacy gate receipt rows: {e}"))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy gate receipt event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy gate receipt payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode legacy gate receipt timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "legacy gate receipt timestamp is negative".to_string())?;
-            let lease_id = parse_gate_receipt_lease_id(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id,
-                kind: TimeoutObservedKind::GateReceiptFinalized { lease_id },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_gate_receipt_canonical(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let table_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        if table_exists.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let query = if cursor_event_id.is_empty() {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type IN ('gate.receipt', 'GateReceipt', 'gate_receipt')
-               AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type IN ('gate.receipt', 'GateReceipt', 'gate_receipt')
-               AND (
-                 timestamp_ns > ?1 OR
-                 (timestamp_ns = ?1 AND
-                  ('canonical-' || SUBSTR('00000000000000000000', 1, 20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?2)
-               )
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare canonical gate receipt query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute canonical gate receipt query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate canonical gate receipt rows: {e}"))?
-        {
-            let seq_id: i64 = row
-                .get(0)
-                .map_err(|e| format!("failed to decode canonical gate receipt seq_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode canonical gate receipt payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode canonical gate receipt timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "canonical gate receipt timestamp is negative".to_string())?;
-            let lease_id = parse_gate_receipt_lease_id(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id: format!("canonical-{seq_id:020}"),
-                kind: TimeoutObservedKind::GateReceiptFinalized { lease_id },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_all_completed_legacy(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let query = if cursor_event_id.is_empty() {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate.all_completed' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT event_id, payload, timestamp_ns
-             FROM ledger_events
-             WHERE event_type = 'gate.all_completed'
-               AND (timestamp_ns > ?1 OR (timestamp_ns = ?1 AND event_id > ?2))
-             ORDER BY timestamp_ns ASC, event_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare legacy all-completed query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute legacy all-completed query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate legacy all-completed rows: {e}"))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| format!("failed to decode legacy all-completed event_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode legacy all-completed payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode legacy all-completed timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "legacy all-completed timestamp is negative".to_string())?;
-            let work_id = parse_all_completed_work_id(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id,
-                kind: TimeoutObservedKind::AllCompleted { work_id },
-            });
-        }
-        Ok(out)
-    }
-
-    fn query_all_completed_canonical(
-        conn: &Connection,
-        cursor_ts_i64: i64,
-        cursor_event_id: &str,
-        limit_i64: i64,
-    ) -> Result<Vec<TimeoutObservedEvent>, String> {
-        let table_exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events' LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to detect canonical events table: {e}"))?;
-        if table_exists.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let query = if cursor_event_id.is_empty() {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate.all_completed' AND timestamp_ns > ?1
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?2"
-        } else {
-            "SELECT seq_id, payload, timestamp_ns
-             FROM events
-             WHERE event_type = 'gate.all_completed'
-               AND (
-                 timestamp_ns > ?1 OR
-                 (timestamp_ns = ?1 AND
-                  ('canonical-' || SUBSTR('00000000000000000000', 1, 20 - LENGTH(CAST(seq_id AS TEXT))) || CAST(seq_id AS TEXT)) > ?2)
-               )
-             ORDER BY timestamp_ns ASC, seq_id ASC
-             LIMIT ?3"
-        };
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| format!("failed to prepare canonical all-completed query: {e}"))?;
-        let mut rows = if cursor_event_id.is_empty() {
-            stmt.query(params![cursor_ts_i64, limit_i64])
-        } else {
-            stmt.query(params![cursor_ts_i64, cursor_event_id, limit_i64])
-        }
-        .map_err(|e| format!("failed to execute canonical all-completed query: {e}"))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("failed to iterate canonical all-completed rows: {e}"))?
-        {
-            let seq_id: i64 = row
-                .get(0)
-                .map_err(|e| format!("failed to decode canonical all-completed seq_id: {e}"))?;
-            let payload: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("failed to decode canonical all-completed payload: {e}"))?;
-            let ts_i64: i64 = row
-                .get(2)
-                .map_err(|e| format!("failed to decode canonical all-completed timestamp: {e}"))?;
-            let timestamp_ns = u64::try_from(ts_i64)
-                .map_err(|_| "canonical all-completed timestamp is negative".to_string())?;
-            let work_id = parse_all_completed_work_id(&payload)?;
-            out.push(TimeoutObservedEvent {
-                timestamp_ns,
-                event_id: format!("canonical-{seq_id:020}"),
-                kind: TimeoutObservedKind::AllCompleted { work_id },
+                timestamp_ns: event.timestamp_ns,
+                event_id: event.event_id,
+                kind,
             });
         }
         Ok(out)
