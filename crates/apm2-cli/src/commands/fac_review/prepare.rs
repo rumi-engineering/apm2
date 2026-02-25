@@ -16,6 +16,29 @@ use crate::exit_codes::codes as exit_codes;
 const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
 const PREPARE_INLINE_LINE_LIMIT: usize = 2_000;
 
+/// A single expanded requirement node extracted from an RFC document.
+#[derive(Debug, Serialize)]
+struct RequirementNode {
+    id: String,
+    statement: String,
+    acceptance: serde_json::Value,
+}
+
+/// Work scope context embedded in the prepare summary.
+///
+/// Present when the PR body contains a valid `apm2.fac_push_metadata.v1` block
+/// and the daemon work object and RFC requirement nodes are reachable.
+/// Absent (`null`) for external PRs or when any step fails (graceful
+/// degradation).
+#[derive(Debug, Serialize)]
+struct WorkScopeContext {
+    work_id: String,
+    ticket_alias: Option<String>,
+    rfc_id: Option<String>,
+    requirement_ids: Vec<String>,
+    requirements: Vec<RequirementNode>,
+}
+
 #[derive(Debug, Serialize)]
 struct PrepareArtifactMetadata {
     path: String,
@@ -46,6 +69,7 @@ struct PrepareSummary {
     diff_content: String,
     commit_history_content: String,
     temp_dir: String,
+    work_scope: Option<WorkScopeContext>,
 }
 
 #[derive(Debug)]
@@ -143,6 +167,195 @@ fn build_prepare_inline_content(
     }
 }
 
+/// Extract the content between the first `` ```yaml `` fence and its closing ``
+/// ``` ``.
+///
+/// Returns the inner text (excluding the fence markers themselves) when found.
+fn extract_first_fenced_yaml_block(body: &str) -> Option<&str> {
+    let open_marker = "```yaml";
+    let open_start = body.find(open_marker)?;
+    let content_start = open_start.checked_add(open_marker.len())?;
+    // Skip past the newline following the opening marker.
+    let after_open = body.get(content_start..)?;
+    let newline_offset = after_open.find('\n')?;
+    let inner_start = content_start.checked_add(newline_offset)?.checked_add(1)?;
+    // Find the closing fence.
+    let remaining = body.get(inner_start..)?;
+    let close_offset = remaining.find("```")?;
+    body.get(inner_start..inner_start.checked_add(close_offset)?)
+}
+
+/// Recursively walk a JSON value to find a node with `"type": "requirement"`
+/// and matching `"id"`.
+fn find_requirement_node<'a>(
+    json: &'a serde_json::Value,
+    id: &str,
+) -> Option<&'a serde_json::Value> {
+    match json {
+        serde_json::Value::Object(map) => {
+            let is_requirement = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t == "requirement");
+            let id_matches = map
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| v == id);
+            if is_requirement && id_matches {
+                return Some(json);
+            }
+            for value in map.values() {
+                if let Some(found) = find_requirement_node(value, id) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_requirement_node(item, id) {
+                    return Some(found);
+                }
+            }
+            None
+        },
+        _ => None,
+    }
+}
+
+/// Expand a single requirement ID into a [`RequirementNode`] by loading the
+/// corresponding RFC JSON document from the repository.
+fn expand_requirement_node(repo_root: &Path, requirement_id: &str) -> Option<RequirementNode> {
+    let (rfc_prefix, _) = requirement_id.split_once("::")?;
+    let rfc_path = repo_root
+        .join("documents")
+        .join("rfcs")
+        .join(format!("{rfc_prefix}.cac.rfc_doc.v1.json"));
+    let rfc_bytes = fs::read(&rfc_path).ok()?;
+    let rfc_json: serde_json::Value = serde_json::from_slice(&rfc_bytes).ok()?;
+    let node = find_requirement_node(&rfc_json, requirement_id)?;
+    let statement = node
+        .pointer("/data/statement")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let acceptance = node
+        .pointer("/data/acceptance")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some(RequirementNode {
+        id: requirement_id.to_string(),
+        statement,
+        acceptance,
+    })
+}
+
+/// Attempt to enrich prepare output with the work scope for this PR.
+///
+/// Resolution steps:
+/// 1. Fetch PR body from GitHub API (`gh api
+///    /repos/{owner_repo}/pulls/{pr_number}`)
+/// 2. Parse the `apm2.fac_push_metadata.v1` YAML block -> extract `work_id`,
+///    `ticket_alias`
+/// 3. Call `apm2 fac work show --work-id <work_id> --json` subprocess -> get
+///    WorkSpecV1 JSON
+/// 4. Extract `requirement_ids` from work spec binds
+/// 5. Expand each requirement node from the corresponding RFC JSON
+/// 6. Return `Some(WorkScopeContext{...})`
+///
+/// Returns `None` on any failure -- graceful degradation for external PRs or
+/// offline mode.
+fn fetch_work_scope(
+    owner_repo: &str,
+    pr_number: u32,
+    repo_root: &Path,
+) -> Option<WorkScopeContext> {
+    let pr_body = fetch_pr_body(owner_repo, pr_number)?;
+    let yaml_block = extract_first_fenced_yaml_block(&pr_body)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(yaml_block).ok()?;
+
+    // Verify schema marker before trusting content.
+    let schema = yaml_value
+        .get("schema")
+        .and_then(serde_yaml::Value::as_str)?;
+    if schema != "apm2.fac_push_metadata.v1" {
+        return None;
+    }
+
+    let work_id = yaml_value
+        .get("work_id")
+        .and_then(serde_yaml::Value::as_str)?
+        .to_string();
+    let ticket_alias = yaml_value
+        .get("ticket_alias")
+        .and_then(serde_yaml::Value::as_str)
+        .map(String::from);
+
+    let (rfc_id, requirement_ids) = fetch_work_object_binds(&work_id)?;
+
+    let requirements: Vec<RequirementNode> = requirement_ids
+        .iter()
+        .filter_map(|req_id| expand_requirement_node(repo_root, req_id))
+        .collect();
+
+    Some(WorkScopeContext {
+        work_id,
+        ticket_alias,
+        rfc_id,
+        requirement_ids,
+        requirements,
+    })
+}
+
+/// Fetch the PR body from the GitHub API via the `gh` CLI.
+fn fetch_pr_body(owner_repo: &str, pr_number: u32) -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("/repos/{owner_repo}/pulls/{pr_number}"),
+            "--jq",
+            ".body",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(output.stdout).ok()?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(body)
+}
+
+/// Call `apm2 fac work show` to retrieve the work object and extract binds.
+///
+/// Returns `(rfc_id, requirement_ids)` on success.
+fn fetch_work_object_binds(work_id: &str) -> Option<(Option<String>, Vec<String>)> {
+    let output = Command::new("apm2")
+        .args(["fac", "work", "show", "--work-id", work_id, "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let requirement_ids: Vec<String> = json
+        .pointer("/work_spec/ticket_meta/binds/requirements")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let rfc_id = json
+        .pointer("/work_spec/ticket_meta/binds/rfc_id")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    Some((rfc_id, requirement_ids))
+}
+
 pub fn run_prepare(
     repo: &str,
     pr_number: Option<u32>,
@@ -210,6 +423,8 @@ pub fn run_prepare(
     let diff_lines = count_text_lines(&diff);
     let commit_history_lines = count_text_lines(&commit_history);
 
+    let work_scope = fetch_work_scope(&owner_repo, resolved_pr, &repo_root);
+
     let summary = PrepareSummary {
         schema: PREPARE_SCHEMA.to_string(),
         repo: owner_repo.clone(),
@@ -242,6 +457,7 @@ pub fn run_prepare(
         diff_content: inline_payload.diff_content,
         commit_history_content: inline_payload.commit_history_content,
         temp_dir: prepared_dir.display().to_string(),
+        work_scope,
     };
 
     if json_output {
@@ -693,8 +909,8 @@ mod tests {
     use super::{
         OwnedResolvedHead, PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content,
         cleanup_prepared_review_inputs_at, count_text_lines, ensure_prepare_head_alignment,
-        prepared_review_dir_from_root, resolve_base_ref_for_pr_with, resolve_head_sha_with,
-        sha_is_locally_reachable,
+        extract_first_fenced_yaml_block, find_requirement_node, prepared_review_dir_from_root,
+        resolve_base_ref_for_pr_with, resolve_head_sha_with, sha_is_locally_reachable,
     };
 
     #[test]
@@ -1170,5 +1386,107 @@ mod tests {
         assert_eq!(count_text_lines(""), 0);
         assert_eq!(count_text_lines("single"), 1);
         assert_eq!(count_text_lines("a\nb\n"), 2);
+    }
+
+    #[test]
+    fn test_extract_first_fenced_yaml_block_finds_schema() {
+        let body = r#"Some PR description text.
+
+```yaml
+schema: apm2.fac_push_metadata.v1
+work_id: W-TCK-12345
+ticket_alias: TCK-12345
+branch: ticket/RFC-0019/TCK-12345
+```
+
+More text after the block.
+"#;
+        let yaml = extract_first_fenced_yaml_block(body).expect("should find yaml block");
+        assert!(
+            yaml.contains("work_id: W-TCK-12345"),
+            "extracted block must contain work_id"
+        );
+        assert!(
+            yaml.contains("schema: apm2.fac_push_metadata.v1"),
+            "extracted block must contain schema"
+        );
+        assert!(
+            !yaml.contains("```"),
+            "extracted block must not contain fence markers"
+        );
+
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(yaml).expect("extracted block must parse as YAML");
+        assert_eq!(
+            parsed.get("work_id").and_then(serde_yaml::Value::as_str),
+            Some("W-TCK-12345"),
+        );
+    }
+
+    #[test]
+    fn test_find_requirement_node_finds_nested_node() {
+        let rfc_json: serde_json::Value = serde_json::json!({
+            "type": "rfc_doc",
+            "children": [
+                {
+                    "type": "section",
+                    "children": [
+                        {
+                            "type": "requirement",
+                            "id": "RFC-0032::REQ-0041",
+                            "data": {
+                                "statement": "Test statement",
+                                "acceptance": ["criterion_a", "criterion_b"]
+                            }
+                        },
+                        {
+                            "type": "requirement",
+                            "id": "RFC-0032::REQ-0042",
+                            "data": {
+                                "statement": "Other statement",
+                                "acceptance": []
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let node = find_requirement_node(&rfc_json, "RFC-0032::REQ-0041")
+            .expect("must find nested requirement node");
+        assert_eq!(
+            node.pointer("/data/statement")
+                .and_then(serde_json::Value::as_str),
+            Some("Test statement"),
+        );
+        assert_eq!(
+            node.pointer("/data/acceptance")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.len()),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn test_find_requirement_node_returns_none_for_missing_id() {
+        let rfc_json: serde_json::Value = serde_json::json!({
+            "type": "rfc_doc",
+            "children": [
+                {
+                    "type": "requirement",
+                    "id": "RFC-0032::REQ-0001",
+                    "data": {
+                        "statement": "Only requirement",
+                        "acceptance": []
+                    }
+                }
+            ]
+        });
+
+        let result = find_requirement_node(&rfc_json, "RFC-0032::REQ-9999");
+        assert!(
+            result.is_none(),
+            "must return None for unknown requirement ID"
+        );
     }
 }

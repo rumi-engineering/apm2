@@ -93,7 +93,7 @@
             {
               "action": "parse_json",
               "from": "prepare_json",
-              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history"]
+              "extract": ["pr_number", "diff_path", "commit_history_path", "diff_content", "commit_history_content", "output_mode", "inline_line_limit", "inline_line_count", "omitted_line_count", "diff", "commit_history", "work_scope"]
             },
             {
               "action": "on_failure",
@@ -120,6 +120,10 @@
             {
               "action": "read_module_agents",
               "rule": "For each crate/module touched by the PR diff, locate and read its AGENTS.json (if it exists) in full. These files follow the apm2.agents_context.v1 schema (see documents/schemas/apm2.agents_context.v1.schema.json) and can be queried with jq — e.g. `jq '[.behaviors[] | select(.kind==\"safety\")]'`. They contain module-specific invariants and safety properties whose violation constitutes a security finding."
+            },
+            {
+              "action": "read_work_scope",
+              "rule": "Read work scope from the `work_scope` field in the prepare JSON output. If `work_scope` is non-null, it contains `requirement_ids` and `requirements` (expanded nodes with `statement` and `acceptance`). Check whether any of the requirements have security implications (domain, fail_closed, edge_cases fields) and flag them as additional attack surface context for STEP_3."
             },
             {
               "action": "selective_read",
