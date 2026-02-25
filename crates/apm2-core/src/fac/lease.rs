@@ -308,6 +308,71 @@ impl GateLease {
         bytes
     }
 
+    /// Validates the structural invariants of a deserialized `GateLease`.
+    ///
+    /// Checks that all string fields are within `MAX_STRING_LENGTH` and that
+    /// temporal bounds are logically consistent (`issued_at < expires_at`).
+    ///
+    /// This method MUST be called after every deserialization of a `GateLease`
+    /// from an untrusted source (SQLite, JSON, wire) to prevent
+    /// denial-of-service via oversized fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::StringTooLong`] if any string field exceeds the
+    /// maximum length.
+    /// Returns [`LeaseError::InvalidData`] if temporal bounds are inconsistent.
+    pub fn validate(&self) -> Result<(), LeaseError> {
+        let fields: &[(&str, &str)] = &[
+            ("lease_id", &self.lease_id),
+            ("work_id", &self.work_id),
+            ("gate_id", &self.gate_id),
+            ("executor_actor_id", &self.executor_actor_id),
+            ("issuer_actor_id", &self.issuer_actor_id),
+            ("time_envelope_ref", &self.time_envelope_ref),
+        ];
+        for &(name, value) in fields {
+            if value.len() > MAX_STRING_LENGTH {
+                return Err(LeaseError::StringTooLong {
+                    field: match name {
+                        "lease_id" => "lease_id",
+                        "work_id" => "work_id",
+                        "gate_id" => "gate_id",
+                        "executor_actor_id" => "executor_actor_id",
+                        "issuer_actor_id" => "issuer_actor_id",
+                        "time_envelope_ref" => "time_envelope_ref",
+                        _ => "unknown",
+                    },
+                    actual: value.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+        if let Some(ref ext) = self.aat_extension {
+            if ext.rcp_profile_id.len() > MAX_STRING_LENGTH {
+                return Err(LeaseError::StringTooLong {
+                    field: "aat_extension.rcp_profile_id",
+                    actual: ext.rcp_profile_id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if ext.selection_policy_id.len() > MAX_STRING_LENGTH {
+                return Err(LeaseError::StringTooLong {
+                    field: "aat_extension.selection_policy_id",
+                    actual: ext.selection_policy_id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+        if self.issued_at >= self.expires_at {
+            return Err(LeaseError::InvalidData(format!(
+                "issued_at ({}) must be less than expires_at ({})",
+                self.issued_at, self.expires_at
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates that the given timestamp falls within the lease's temporal
     /// bounds.
     ///
@@ -1282,6 +1347,66 @@ pub mod tests {
 
         // After expires_at
         assert!(!lease.validate_temporal_bounds(2001));
+    }
+
+    #[test]
+    fn test_validate_valid_lease() {
+        let signer = Signer::generate();
+        let lease = create_test_lease(&signer);
+        assert!(
+            lease.validate().is_ok(),
+            "well-formed lease should pass validate()"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_lease_id() {
+        let signer = Signer::generate();
+        let mut lease = create_test_lease(&signer);
+        lease.lease_id = "x".repeat(MAX_STRING_LENGTH + 1);
+        let err = lease.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LeaseError::StringTooLong {
+                    field: "lease_id",
+                    ..
+                }
+            ),
+            "expected StringTooLong for lease_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_work_id() {
+        let signer = Signer::generate();
+        let mut lease = create_test_lease(&signer);
+        lease.work_id = "x".repeat(MAX_STRING_LENGTH + 1);
+        let err = lease.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LeaseError::StringTooLong {
+                    field: "work_id",
+                    ..
+                }
+            ),
+            "expected StringTooLong for work_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_temporal_bounds() {
+        let signer = Signer::generate();
+        let mut lease = create_test_lease(&signer);
+        // Set issued_at >= expires_at
+        lease.issued_at = 2000;
+        lease.expires_at = 1000;
+        let err = lease.validate().unwrap_err();
+        assert!(
+            matches!(err, LeaseError::InvalidData(..)),
+            "expected InvalidData for inconsistent temporal bounds, got: {err}"
+        );
     }
 
     #[test]

@@ -211,6 +211,12 @@
       "kind": "safety",
       "title": "health_seq uses checked_add; overflow persists synthetic FAILED receipt (terminal)",
       "rfc": ["RFC-0029"]
+    },
+    {
+      "id": "BEH-CORE-FAC-036",
+      "kind": "safety",
+      "title": "GateLease::validate() checks all string fields against MAX_STRING_LENGTH and temporal bound consistency",
+      "rfc": ["RFC-0020"]
     }
   ]
 }

@@ -57,6 +57,9 @@
 //!   `KeySetIdV1`, `CellIdV1`, `HolonIdV1`) for RFC-0020
 //! - [`fs_safe`]: Safe atomic file I/O primitives (atomic write, symlink
 //!   refusal, bounded JSON read) for queue/lease/receipt state files
+//! - [`orchestrator_runtime`]: Shared `SQLite` adapter kit for orchestrator
+//!   kernel storage (cursor, intent, effect journal) with multi-tenant
+//!   `orchestrator_id` keying
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
 pub mod admission_kernel;
@@ -79,6 +82,7 @@ pub mod ledger;
 /// introduced by RFC-0032 freeze mode.
 pub mod ledger_poll;
 pub mod metrics;
+pub mod orchestrator_runtime;
 pub mod pcac;
 pub mod projection;
 pub mod protocol;
