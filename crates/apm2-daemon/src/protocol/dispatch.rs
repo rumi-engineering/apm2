@@ -11749,11 +11749,11 @@ impl PrivilegedDispatcher {
     /// Identical to [`Self::dispatch`] except that `WorkShow` is routed
     /// through `handle_work_show_async`, which uses
     /// `tokio::task::spawn_blocking` to offload rusqlite I/O per
-    /// INV-CQ-OK-003. All other message types delegate to the sync
-    /// [`Self::dispatch`] via `block_in_place` so that any blocking
-    /// I/O in those handlers does not starve the async executor.
+    /// INV-CQ-OK-003. All other message types are also offloaded via
+    /// `spawn_blocking` by cloning the `Arc<Self>` receiver, ensuring no
+    /// blocking rusqlite I/O ever runs on a tokio worker thread.
     pub async fn dispatch_async(
-        &self,
+        self: &Arc<Self>,
         frame: &Bytes,
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
@@ -11805,14 +11805,23 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // All non-WorkShow messages: delegate to the sync dispatcher.
+        // All non-WorkShow messages: offload to spawn_blocking.
         // INV-CQ-OK-003: The sync dispatch() contains handlers that perform
-        // blocking rusqlite I/O. We use block_in_place to yield the tokio
-        // executor thread to the blocking pool, preventing async executor
-        // starvation. spawn_blocking is not viable here because
-        // PrivilegedDispatcher contains non-Clone atomics/mutexes, and
-        // &self is not 'static.
-        tokio::task::block_in_place(|| self.dispatch(frame, ctx))
+        // blocking rusqlite I/O. We clone the Arc<Self> and move owned
+        // copies of frame + ctx into spawn_blocking so the closure is
+        // 'static + Send, preventing async executor starvation.
+        let this = Arc::clone(self);
+        let frame = frame.clone();
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || this.dispatch(&frame, &ctx))
+            .await
+            .unwrap_or_else(|join_err| {
+                tracing::error!("privileged dispatch task panicked: {join_err}");
+                Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    "internal dispatch error".to_string(),
+                ))
+            })
     }
 
     /// Handles `ClaimWork` requests (IPC-PRIV-001).

@@ -4571,7 +4571,7 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
 ///
 /// Retrieves full `WorkSpecV1` JSON from daemon CAS for a given `work_id`.
 /// Output is valid JSON with at minimum: `work_id`, `title`, `rfc_id`,
-/// `status`.
+/// `spec_snapshot_hash`, `work_spec`.
 fn run_work_show(args: &WorkShowArgs, operator_socket: &Path, json_output: bool) -> u8 {
     // Validate work_id is non-empty (fail-closed)
     if args.work_id.is_empty() {
