@@ -43,7 +43,7 @@ use apm2_core::htf::{
 use apm2_core::liveness::{
     LivenessGateDenial, LivenessHeartbeatReceiptV1, check_liveness_for_progression,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -140,7 +140,7 @@ impl Clock for SystemClock {
 ///
 /// Each published changeset triggers execution of all required gate types
 /// via [`GateOrchestrator::start_for_changeset`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GateType {
     /// Agent Acceptance Testing gate.
     Aat,

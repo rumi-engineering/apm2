@@ -4,7 +4,7 @@
 //! shared `apm2_core::orchestrator_kernel` harness:
 //! Observe -> Plan -> Execute -> Receipt.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -21,9 +21,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, GateType};
 use crate::ledger::SqliteLedgerEventEmitter;
+use crate::orchestrator_runtime::sqlite::{
+    IntentKeyed, SqliteCursorStore, SqliteEffectJournal, SqliteIntentStore,
+    init_orchestrator_runtime_schema,
+};
+use crate::orchestrator_runtime::{MemoryCursorStore, MemoryEffectJournal, MemoryIntentStore};
 use crate::protocol::dispatch::LedgerEventEmitter;
 
-const TIMEOUT_CURSOR_KEY: i64 = 1;
 const TIMEOUT_PERSISTOR_SESSION_ID: &str = "gate-timeout-poller";
 const TIMEOUT_PERSISTOR_ACTOR_ID: &str = "orchestrator:timeout-poller";
 
@@ -56,19 +60,145 @@ pub enum GateTimeoutKernelError {
     Tick(String),
 }
 
+/// The canonical orchestrator ID used for the gate timeout kernel in the
+/// shared `orchestrator_kernel_*` tables.
+const GATE_TIMEOUT_ORCHESTRATOR_ID: &str = "gate_timeout_kernel";
+
 /// Durable timeout-kernel runtime state.
 pub struct GateTimeoutKernel {
     domain: GateTimeoutDomain,
     ledger_reader: TimeoutLedgerReader,
-    cursor_store: TimeoutCursorStore,
-    intent_store: TimeoutIntentStore,
-    effect_journal: GateTimeoutEffectJournal,
+    cursor_store: TimeoutCursorStoreEnum,
+    intent_store: TimeoutIntentStoreEnum,
+    effect_journal: TimeoutEffectJournalEnum,
     receipt_writer: GateTimeoutReceiptWriter,
     tick_config: TickConfig,
 }
 
+/// Dispatch enum for cursor store: `SQLite` (shared) or Memory.
+#[derive(Debug)]
+enum TimeoutCursorStoreEnum {
+    Sqlite(SqliteCursorStore<CompositeCursor>),
+    Memory(MemoryCursorStore<CompositeCursor>),
+}
+
+impl CursorStore<CompositeCursor> for TimeoutCursorStoreEnum {
+    type Error = String;
+
+    async fn load(&self) -> Result<CompositeCursor, Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.load().await,
+            Self::Memory(store) => store.load().await,
+        }
+    }
+
+    async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.save(cursor).await,
+            Self::Memory(store) => store.save(cursor).await,
+        }
+    }
+}
+
+/// Dispatch enum for intent store: `SQLite` (shared) or Memory.
+#[derive(Debug)]
+enum TimeoutIntentStoreEnum {
+    Sqlite(SqliteIntentStore<GateTimeoutIntent>),
+    Memory(MemoryIntentStore<GateTimeoutIntent>),
+}
+
+impl IntentStore<GateTimeoutIntent, String> for TimeoutIntentStoreEnum {
+    type Error = String;
+
+    async fn enqueue_many(&self, intents: &[GateTimeoutIntent]) -> Result<usize, Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.enqueue_many(intents).await,
+            Self::Memory(store) => store.enqueue_many(intents).await,
+        }
+    }
+
+    async fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateTimeoutIntent>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.dequeue_batch(limit).await,
+            Self::Memory(store) => store.dequeue_batch(limit).await,
+        }
+    }
+
+    async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.mark_done(key).await,
+            Self::Memory(store) => store.mark_done(key).await,
+        }
+    }
+
+    async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.mark_blocked(key, reason).await,
+            Self::Memory(store) => store.mark_blocked(key, reason).await,
+        }
+    }
+
+    async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => store.mark_retryable(key, reason).await,
+            Self::Memory(store) => store.mark_retryable(key, reason).await,
+        }
+    }
+}
+
+/// Dispatch enum for effect journal: `SQLite` (shared) or Memory.
+#[derive(Debug)]
+enum TimeoutEffectJournalEnum {
+    Sqlite(SqliteEffectJournal),
+    Memory(MemoryEffectJournal),
+}
+
+impl EffectJournal<String> for TimeoutEffectJournalEnum {
+    type Error = String;
+
+    async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
+        match self {
+            Self::Sqlite(j) => j.query_state(key).await,
+            Self::Memory(j) => j.query_state(key).await,
+        }
+    }
+
+    async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(j) => j.record_started(key).await,
+            Self::Memory(j) => j.record_started(key).await,
+        }
+    }
+
+    async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(j) => j.record_completed(key).await,
+            Self::Memory(j) => j.record_completed(key).await,
+        }
+    }
+
+    async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(j) => j.record_retryable(key).await,
+            Self::Memory(j) => j.record_retryable(key).await,
+        }
+    }
+
+    async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
+        match self {
+            Self::Sqlite(j) => j.resolve_in_doubt(key).await,
+            Self::Memory(j) => j.resolve_in_doubt(key).await,
+        }
+    }
+}
+
 impl GateTimeoutKernel {
     /// Creates a new timeout kernel instance.
+    ///
+    /// When `sqlite_conn` is `Some`, this initializes the shared
+    /// `orchestrator_kernel_*` schema, runs the legacy migration, and
+    /// creates shared `SQLite` adapters. When `None`, in-memory adapters
+    /// are used (for tests).
     pub fn new(
         orchestrator: Arc<GateOrchestrator>,
         sqlite_conn: Option<&Arc<Mutex<Connection>>>,
@@ -76,21 +206,43 @@ impl GateTimeoutKernel {
         fac_root: &Path,
         config: GateTimeoutKernelConfig,
     ) -> Result<Self, GateTimeoutKernelError> {
-        let cursor_store = if let Some(conn) = sqlite_conn {
-            TimeoutCursorStore::Sqlite(SqliteTimeoutCursorStore::new(Arc::clone(conn)).map_err(
-                |e| GateTimeoutKernelError::Init(format!("cursor store setup failed: {e}")),
-            )?)
-        } else {
-            TimeoutCursorStore::Memory(MemoryTimeoutCursorStore::default())
-        };
+        // Initialize shared schema and run legacy migration for SQLite mode.
+        if let Some(conn) = sqlite_conn {
+            let guard = conn
+                .lock()
+                .map_err(|e| GateTimeoutKernelError::Init(format!("lock poisoned: {e}")))?;
+            init_orchestrator_runtime_schema(&guard).map_err(|e| {
+                GateTimeoutKernelError::Init(format!("shared schema init failed: {e}"))
+            })?;
+            drop(guard);
+            migrate_legacy_cursor(conn).map_err(|e| {
+                GateTimeoutKernelError::Init(format!("cursor migration failed: {e}"))
+            })?;
+            migrate_legacy_intents(conn).map_err(|e| {
+                GateTimeoutKernelError::Init(format!("intent migration failed: {e}"))
+            })?;
+        }
 
-        let intent_store = if let Some(conn) = sqlite_conn {
-            TimeoutIntentStore::Sqlite(SqliteTimeoutIntentStore::new(Arc::clone(conn)).map_err(
-                |e| GateTimeoutKernelError::Init(format!("intent store setup failed: {e}")),
-            )?)
-        } else {
-            TimeoutIntentStore::Memory(MemoryTimeoutIntentStore::default())
-        };
+        let cursor_store = sqlite_conn.map_or_else(
+            || TimeoutCursorStoreEnum::Memory(MemoryCursorStore::default()),
+            |conn| {
+                TimeoutCursorStoreEnum::Sqlite(SqliteCursorStore::new(
+                    Arc::clone(conn),
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                ))
+            },
+        );
+
+        let intent_store = sqlite_conn.map_or_else(
+            || TimeoutIntentStoreEnum::Memory(MemoryIntentStore::default()),
+            |conn| {
+                TimeoutIntentStoreEnum::Sqlite(SqliteIntentStore::new(
+                    Arc::clone(conn),
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                ))
+            },
+        );
+
         let observed_lease_store = if let Some(conn) = sqlite_conn {
             TimeoutObservedLeaseStore::Sqlite(
                 SqliteTimeoutObservedLeaseStore::new(Arc::clone(conn)).map_err(|e| {
@@ -107,9 +259,22 @@ impl GateTimeoutKernel {
                 fac_root.display()
             ))
         })?;
-        let journal_path = fac_root.join("gate_timeout_effect_journal.sqlite");
-        let effect_journal =
-            GateTimeoutEffectJournal::open(&journal_path).map_err(GateTimeoutKernelError::Init)?;
+
+        // Effect journal: use shared table via the main connection. Migrate
+        // from the legacy separate sqlite file if it exists.
+        let effect_journal = if let Some(conn) = sqlite_conn {
+            let journal_path = fac_root.join("gate_timeout_effect_journal.sqlite");
+            migrate_legacy_effect_journal(conn, &journal_path).map_err(|e| {
+                GateTimeoutKernelError::Init(format!("effect journal migration failed: {e}"))
+            })?;
+            TimeoutEffectJournalEnum::Sqlite(SqliteEffectJournal::new(
+                Arc::clone(conn),
+                GATE_TIMEOUT_ORCHESTRATOR_ID,
+            ))
+        } else {
+            TimeoutEffectJournalEnum::Memory(MemoryEffectJournal::new())
+        };
+
         let terminal_checker = sqlite_conn.map_or_else(
             || TimeoutTerminalChecker::Memory(MemoryTimeoutTerminalChecker),
             |conn| {
@@ -187,7 +352,7 @@ impl CursorEvent<CompositeCursor> for TimeoutObservedEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct GateTimeoutIntent {
     lease: GateLease,
     gate_type: GateType,
@@ -196,6 +361,12 @@ struct GateTimeoutIntent {
 impl GateTimeoutIntent {
     fn key(&self) -> String {
         self.lease.lease_id.clone()
+    }
+}
+
+impl IntentKeyed for GateTimeoutIntent {
+    fn intent_key(&self) -> String {
+        self.key()
     }
 }
 
@@ -1014,569 +1185,288 @@ impl SqliteTimeoutLedgerReader {
 #[derive(Debug)]
 struct MemoryTimeoutLedgerReader;
 
-#[derive(Debug)]
-enum TimeoutCursorStore {
-    Sqlite(SqliteTimeoutCursorStore),
-    Memory(MemoryTimeoutCursorStore),
-}
+// ---------------------------------------------------------------------------
+// Legacy migration helpers
+// ---------------------------------------------------------------------------
 
-impl CursorStore<CompositeCursor> for TimeoutCursorStore {
-    type Error = String;
+/// Migrate legacy `gate_timeout_kernel_cursor` table to shared
+/// `orchestrator_kernel_cursors`.
+///
+/// Only copies if target row does not yet exist for `gate_timeout_kernel`.
+/// Idempotent: safe to call on every startup.
+fn migrate_legacy_cursor(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("cursor migration lock poisoned: {e}"))?;
 
-    async fn load(&self) -> Result<CompositeCursor, Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.load(),
-            Self::Memory(store) => store.load(),
-        }
-    }
-
-    async fn save(&self, cursor: &CompositeCursor) -> Result<(), Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.save(cursor),
-            Self::Memory(store) => store.save(cursor),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SqliteTimeoutCursorStore {
-    conn: Arc<Mutex<Connection>>,
-}
-
-impl SqliteTimeoutCursorStore {
-    fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
-        let guard = conn
-            .lock()
-            .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "CREATE TABLE IF NOT EXISTS gate_timeout_kernel_cursor (
-                    cursor_key INTEGER PRIMARY KEY CHECK (cursor_key = 1),
-                    timestamp_ns INTEGER NOT NULL,
-                    event_id TEXT NOT NULL
-                )",
-                [],
-            )
-            .map_err(|e| format!("failed to create gate_timeout_kernel_cursor: {e}"))?;
-        drop(guard);
-        Ok(Self { conn })
-    }
-
-    fn load(&self) -> Result<CompositeCursor, String> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
-        let row: Option<(i64, String)> = guard
-            .query_row(
-                "SELECT timestamp_ns, event_id
-                 FROM gate_timeout_kernel_cursor
-                 WHERE cursor_key = ?1",
-                params![TIMEOUT_CURSOR_KEY],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| format!("failed to load timeout cursor: {e}"))?;
-        let Some((timestamp_ns, event_id)) = row else {
-            return Ok(CompositeCursor::default());
-        };
-        let timestamp_ns = u64::try_from(timestamp_ns)
-            .map_err(|_| "timeout cursor timestamp is negative".to_string())?;
-        Ok(CompositeCursor {
-            timestamp_ns,
-            event_id,
-        })
-    }
-
-    fn save(&self, cursor: &CompositeCursor) -> Result<(), String> {
-        let timestamp_ns = i64::try_from(cursor.timestamp_ns)
-            .map_err(|_| "timeout cursor timestamp exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "INSERT INTO gate_timeout_kernel_cursor (cursor_key, timestamp_ns, event_id)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(cursor_key) DO UPDATE SET
-                   timestamp_ns = excluded.timestamp_ns,
-                   event_id = excluded.event_id",
-                params![TIMEOUT_CURSOR_KEY, timestamp_ns, &cursor.event_id],
-            )
-            .map_err(|e| format!("failed to save timeout cursor: {e}"))?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
-struct MemoryTimeoutCursorStore {
-    cursor: Mutex<CompositeCursor>,
-}
-
-impl MemoryTimeoutCursorStore {
-    fn load(&self) -> Result<CompositeCursor, String> {
-        Ok(self
-            .cursor
-            .lock()
-            .map_err(|e| format!("memory cursor lock poisoned: {e}"))?
-            .clone())
-    }
-
-    fn save(&self, cursor: &CompositeCursor) -> Result<(), String> {
-        *self
-            .cursor
-            .lock()
-            .map_err(|e| format!("memory cursor lock poisoned: {e}"))? = cursor.clone();
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-enum TimeoutIntentStore {
-    Sqlite(SqliteTimeoutIntentStore),
-    Memory(MemoryTimeoutIntentStore),
-}
-
-impl IntentStore<GateTimeoutIntent, String> for TimeoutIntentStore {
-    type Error = String;
-
-    async fn enqueue_many(&self, intents: &[GateTimeoutIntent]) -> Result<usize, Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.enqueue_many(intents),
-            Self::Memory(store) => store.enqueue_many(intents),
-        }
-    }
-
-    async fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateTimeoutIntent>, Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.dequeue_batch(limit),
-            Self::Memory(store) => store.dequeue_batch(limit),
-        }
-    }
-
-    async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.mark_done(key),
-            Self::Memory(store) => store.mark_done(key),
-        }
-    }
-
-    async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.mark_blocked(key, reason),
-            Self::Memory(store) => store.mark_blocked(key, reason),
-        }
-    }
-
-    async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
-        match self {
-            Self::Sqlite(store) => store.mark_retryable(key, reason),
-            Self::Memory(store) => store.mark_retryable(key, reason),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SqliteTimeoutIntentStore {
-    conn: Arc<Mutex<Connection>>,
-}
-
-impl SqliteTimeoutIntentStore {
-    fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
-        {
-            let guard = conn
-                .lock()
-                .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-            let column_names: Vec<String> = {
-                let mut stmt = guard
-                    .prepare("PRAGMA table_info(gate_timeout_intents)")
-                    .map_err(|e| format!("failed to inspect gate_timeout_intents schema: {e}"))?;
-                stmt.query_map([], |row| row.get::<_, String>(1))
-                    .map_err(|e| format!("failed to query gate_timeout_intents columns: {e}"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("failed to decode gate_timeout_intents columns: {e}"))?
-            };
-            if !column_names.is_empty() && !column_names.iter().any(|name| name == "lease_json") {
-                guard
-                    .execute("DROP TABLE gate_timeout_intents", [])
-                    .map_err(|e| format!("failed to migrate gate_timeout_intents schema: {e}"))?;
-            }
-            guard
-                .execute(
-                    "CREATE TABLE IF NOT EXISTS gate_timeout_intents (
-                        intent_key TEXT PRIMARY KEY,
-                        work_id TEXT NOT NULL,
-                        gate_type TEXT NOT NULL,
-                        lease_json TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK(state IN ('pending', 'done', 'blocked')),
-                        blocked_reason TEXT,
-                        created_at_ns INTEGER NOT NULL,
-                        updated_at_ns INTEGER NOT NULL
-                    )",
-                    [],
-                )
-                .map_err(|e| format!("failed to create gate_timeout_intents: {e}"))?;
-            guard
-                .execute(
-                    "CREATE INDEX IF NOT EXISTS idx_gate_timeout_intents_pending
-                     ON gate_timeout_intents(state, created_at_ns, intent_key)",
-                    [],
-                )
-                .map_err(|e| format!("failed to create idx_gate_timeout_intents_pending: {e}"))?;
-        }
-        Ok(Self { conn })
-    }
-
-    fn enqueue_many(&self, intents: &[GateTimeoutIntent]) -> Result<usize, String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        let tx = guard
-            .unchecked_transaction()
-            .map_err(|e| format!("failed to begin timeout intent transaction: {e}"))?;
-        let mut inserted = 0usize;
-        for intent in intents {
-            let key = intent.key();
-            let gate_type = gate_type_label(intent.gate_type);
-            let rows = tx
-                .execute(
-                    "INSERT OR IGNORE INTO gate_timeout_intents
-                     (intent_key, work_id, gate_type, lease_json, state, blocked_reason, created_at_ns, updated_at_ns)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, ?6)",
-                    params![
-                        key,
-                        &intent.lease.work_id,
-                        gate_type,
-                        serde_json::to_string(&intent.lease)
-                            .map_err(|e| format!("failed to encode timeout lease intent: {e}"))?,
-                        now_ns,
-                        now_ns
-                    ],
-                )
-                .map_err(|e| format!("failed to enqueue timeout intent: {e}"))?;
-            inserted = inserted.saturating_add(rows);
-        }
-        tx.commit()
-            .map_err(|e| format!("failed to commit timeout intent transaction: {e}"))?;
-        Ok(inserted)
-    }
-
-    fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateTimeoutIntent>, String> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let limit_i64 =
-            i64::try_from(limit).map_err(|_| "execute limit exceeds i64 range".to_string())?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        let mut stmt = guard
-            .prepare(
-                "SELECT lease_json, gate_type
-                 FROM gate_timeout_intents
-                 WHERE state = 'pending'
-                 ORDER BY created_at_ns ASC, intent_key ASC
-                 LIMIT ?1",
-            )
-            .map_err(|e| format!("failed to prepare timeout dequeue query: {e}"))?;
-        let rows = stmt
-            .query_map(params![limit_i64], |row| {
-                let lease_json: String = row.get(0)?;
-                let gate_type_raw: String = row.get(1)?;
-                Ok((lease_json, gate_type_raw))
-            })
-            .map_err(|e| format!("failed to query timeout intents: {e}"))?;
-
-        let mut intents = Vec::new();
-        for row in rows {
-            let (lease_json, gate_type_raw) =
-                row.map_err(|e| format!("failed to decode timeout intent row: {e}"))?;
-            let Some(gate_type) = parse_gate_type(&gate_type_raw) else {
-                return Err(format!(
-                    "unknown gate_type '{gate_type_raw}' in timeout intents"
-                ));
-            };
-            let lease: GateLease = serde_json::from_str(&lease_json)
-                .map_err(|e| format!("failed to decode timeout lease intent json: {e}"))?;
-            intents.push(GateTimeoutIntent { lease, gate_type });
-        }
-        Ok(intents)
-    }
-
-    fn mark_done(&self, key: &str) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "UPDATE gate_timeout_intents
-                 SET state = 'done', blocked_reason = NULL, updated_at_ns = ?2
-                 WHERE intent_key = ?1",
-                params![key, now_ns],
-            )
-            .map_err(|e| format!("failed to mark timeout intent done: {e}"))?;
-        Ok(())
-    }
-
-    fn mark_blocked(&self, key: &str, reason: &str) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "UPDATE gate_timeout_intents
-                 SET state = 'blocked', blocked_reason = ?2, updated_at_ns = ?3
-                 WHERE intent_key = ?1",
-                params![key, reason, now_ns],
-            )
-            .map_err(|e| format!("failed to mark timeout intent blocked: {e}"))?;
-        Ok(())
-    }
-
-    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
-        let now_ns = epoch_now_ns_i64()?;
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "UPDATE gate_timeout_intents
-                 SET state = 'pending', blocked_reason = NULL,
-                     created_at_ns = ?2, updated_at_ns = ?2
-                 WHERE intent_key = ?1",
-                params![key, now_ns],
-            )
-            .map_err(|e| format!("failed to mark timeout intent retryable: {e}"))?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
-struct MemoryTimeoutIntentStore {
-    pending: Mutex<VecDeque<GateTimeoutIntent>>,
-    states: Mutex<HashMap<String, String>>,
-    intents: Mutex<HashMap<String, GateTimeoutIntent>>,
-}
-
-impl MemoryTimeoutIntentStore {
-    fn enqueue_many(&self, intents: &[GateTimeoutIntent]) -> Result<usize, String> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        let mut states = self
-            .states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?;
-        let mut intents_by_key = self
-            .intents
-            .lock()
-            .map_err(|e| format!("memory intent index lock poisoned: {e}"))?;
-        let mut inserted = 0usize;
-        for intent in intents {
-            let key = intent.key();
-            if states.contains_key(&key) {
-                continue;
-            }
-            states.insert(key.clone(), "pending".to_string());
-            intents_by_key.insert(key, intent.clone());
-            pending.push_back(intent.clone());
-            inserted = inserted.saturating_add(1);
-        }
-        Ok(inserted)
-    }
-
-    fn dequeue_batch(&self, limit: usize) -> Result<Vec<GateTimeoutIntent>, String> {
-        let pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        Ok(pending.iter().take(limit).cloned().collect())
-    }
-
-    fn remove_pending(&self, key: &str) -> Result<(), String> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        pending.retain(|intent| intent.key() != key);
-        Ok(())
-    }
-
-    fn mark_done(&self, key: &str) -> Result<(), String> {
-        self.remove_pending(key)?;
-        self.states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "done".to_string());
-        Ok(())
-    }
-
-    fn mark_blocked(&self, key: &str, _reason: &str) -> Result<(), String> {
-        self.remove_pending(key)?;
-        self.states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "blocked".to_string());
-        Ok(())
-    }
-
-    fn mark_retryable(&self, key: &str, _reason: &str) -> Result<(), String> {
-        self.states
-            .lock()
-            .map_err(|e| format!("memory intent states lock poisoned: {e}"))?
-            .insert(key.to_string(), "pending".to_string());
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|e| format!("memory intent pending lock poisoned: {e}"))?;
-        if pending.iter().any(|intent| intent.key() == key) {
-            return Ok(());
-        }
-        let intent = self
-            .intents
-            .lock()
-            .map_err(|e| format!("memory intent index lock poisoned: {e}"))?
-            .get(key)
-            .cloned()
-            .ok_or_else(|| format!("missing memory timeout intent for key '{key}'"))?;
-        pending.push_back(intent);
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct GateTimeoutEffectJournal {
-    conn: Arc<Mutex<Connection>>,
-}
-
-impl GateTimeoutEffectJournal {
-    fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path)
-            .map_err(|e| format!("failed to open timeout effect journal sqlite db: {e}"))?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gate_timeout_effect_journal_state (
-                intent_key TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'unknown')),
-                updated_at_ns INTEGER NOT NULL
-            )",
+    // Check if legacy table exists.
+    let legacy_exists: bool = guard
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name = 'gate_timeout_kernel_cursor' LIMIT 1",
             [],
+            |_| Ok(true),
         )
-        .map_err(|e| format!("failed to create gate_timeout_effect_journal_state table: {e}"))?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        .optional()
+        .map_err(|e| format!("cursor migration: failed to check legacy table: {e}"))?
+        .unwrap_or(false);
+    if !legacy_exists {
+        return Ok(());
     }
 
-    fn load_state(&self, key: &str) -> Result<Option<String>, String> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
-        guard
-            .query_row(
-                "SELECT state
-                 FROM gate_timeout_effect_journal_state
-                 WHERE intent_key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("failed to load timeout effect state for key '{key}': {e}"))
+    // Check if target already has a row for this orchestrator.
+    let target_exists: bool = guard
+        .query_row(
+            "SELECT 1 FROM orchestrator_kernel_cursors
+             WHERE orchestrator_id = ?1 LIMIT 1",
+            params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| format!("cursor migration: failed to check target: {e}"))?
+        .unwrap_or(false);
+    if target_exists {
+        return Ok(());
     }
 
-    fn upsert_state(&self, key: &str, state: &str, updated_at_ns: i64) -> Result<(), String> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "INSERT INTO gate_timeout_effect_journal_state (intent_key, state, updated_at_ns)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(intent_key) DO UPDATE SET
-                     state = excluded.state,
-                     updated_at_ns = excluded.updated_at_ns",
-                params![key, state, updated_at_ns],
-            )
-            .map_err(|e| {
-                format!("failed to upsert timeout effect state='{state}' for key '{key}': {e}")
-            })?;
-        Ok(())
-    }
+    // Read legacy cursor.
+    let row: Option<(i64, String)> = guard
+        .query_row(
+            "SELECT timestamp_ns, event_id FROM gate_timeout_kernel_cursor
+             WHERE cursor_key = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("cursor migration: failed to read legacy cursor: {e}"))?;
 
-    fn delete_state(&self, key: &str) -> Result<(), String> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("timeout effect journal lock poisoned: {e}"))?;
+    if let Some((timestamp_ns, event_id)) = row {
+        let cursor = CompositeCursor {
+            timestamp_ns: u64::try_from(timestamp_ns).unwrap_or(0),
+            event_id,
+        };
+        let json = serde_json::to_string(&cursor)
+            .map_err(|e| format!("cursor migration: failed to encode cursor: {e}"))?;
+        let now_ns = epoch_now_ns_i64()?;
         guard
             .execute(
-                "DELETE FROM gate_timeout_effect_journal_state WHERE intent_key = ?1",
-                params![key],
+                "INSERT OR IGNORE INTO orchestrator_kernel_cursors
+                 (orchestrator_id, cursor_json, updated_at_ns)
+                 VALUES (?1, ?2, ?3)",
+                params![GATE_TIMEOUT_ORCHESTRATOR_ID, &json, now_ns],
             )
-            .map_err(|e| format!("failed to delete timeout effect state for key '{key}': {e}"))?;
-        Ok(())
+            .map_err(|e| format!("cursor migration: failed to insert: {e}"))?;
     }
+    Ok(())
 }
 
-impl EffectJournal<String> for GateTimeoutEffectJournal {
-    type Error = String;
+/// Migrate legacy `gate_timeout_intents` table to shared
+/// `orchestrator_kernel_intents`.
+///
+/// Only copies if target has no rows for `gate_timeout_kernel`.
+/// Idempotent: safe to call on every startup.
+fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("intent migration lock poisoned: {e}"))?;
 
-    async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
-        let state = self.load_state(key.as_str())?;
-        Ok(match state.as_deref() {
-            None => EffectExecutionState::NotStarted,
-            Some("completed") => EffectExecutionState::Completed,
-            // Any non-terminal marker is in-doubt for timeout effects and is
-            // handled fail-closed via explicit `resolve_in_doubt`.
-            Some(_) => EffectExecutionState::Unknown,
+    // Check if legacy table exists.
+    let legacy_exists: bool = guard
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name = 'gate_timeout_intents' LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| format!("intent migration: failed to check legacy table: {e}"))?
+        .unwrap_or(false);
+    if !legacy_exists {
+        return Ok(());
+    }
+
+    // Check if target already has rows for this orchestrator.
+    let count: i64 = guard
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_kernel_intents
+             WHERE orchestrator_id = ?1",
+            params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("intent migration: failed to count target rows: {e}"))?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    // Copy pending/blocked rows from legacy table. The legacy schema has
+    // state values 'pending', 'done', 'blocked'. The shared schema uses
+    // 'pending', 'completed', 'blocked'. Map 'done' -> 'completed'.
+    let mut stmt = guard
+        .prepare(
+            "SELECT intent_key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns
+             FROM gate_timeout_intents
+             WHERE state IN ('pending', 'done', 'blocked')",
+        )
+        .map_err(|e| format!("intent migration: failed to prepare legacy query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let key: String = row.get(0)?;
+            let lease_json: String = row.get(1)?;
+            let state: String = row.get(2)?;
+            let blocked_reason: Option<String> = row.get(3)?;
+            let created_at_ns: i64 = row.get(4)?;
+            let updated_at_ns: i64 = row.get(5)?;
+            Ok((
+                key,
+                lease_json,
+                state,
+                blocked_reason,
+                created_at_ns,
+                updated_at_ns,
+            ))
         })
-    }
+        .map_err(|e| format!("intent migration: failed to query legacy intents: {e}"))?;
 
-    async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
-        if matches!(self.load_state(key.as_str())?.as_deref(), Some("completed")) {
-            return Ok(());
-        }
-        self.upsert_state(key.as_str(), "started", epoch_now_ns_i64()?)
+    for row in rows {
+        let (key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) =
+            row.map_err(|e| format!("intent migration: failed to decode legacy row: {e}"))?;
+        let mapped_state = match state.as_str() {
+            "done" => "completed",
+            other => other,
+        };
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                 (orchestrator_id, intent_key, intent_json, state,
+                  created_at_ns, updated_at_ns, blocked_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                    &key,
+                    &lease_json,
+                    mapped_state,
+                    created_at_ns,
+                    updated_at_ns,
+                    &blocked_reason
+                ],
+            )
+            .map_err(|e| format!("intent migration: failed to insert intent: {e}"))?;
     }
-
-    async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
-        self.upsert_state(key.as_str(), "completed", epoch_now_ns_i64()?)
-    }
-
-    async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
-        let state = self.load_state(key.as_str())?;
-        match state.as_deref() {
-            Some("started") => self.delete_state(key.as_str()),
-            Some("completed") => Err(format!(
-                "cannot mark timeout effect retryable for completed key '{key}'"
-            )),
-            Some(other) => Err(format!(
-                "cannot mark timeout effect retryable from state '{other}' for key '{key}'"
-            )),
-            None => Err(format!(
-                "cannot mark timeout effect retryable for unknown key '{key}'"
-            )),
-        }
-    }
-
-    async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
-        self.upsert_state(key.as_str(), "unknown", epoch_now_ns_i64()?)?;
-        Ok(InDoubtResolution::Deny {
-            reason: "timeout effect state is in-doubt; manual reconciliation required".to_string(),
-        })
-    }
+    Ok(())
 }
+
+/// Migrate legacy `gate_timeout_effect_journal.sqlite` file to the shared
+/// `orchestrator_kernel_effect_journal` table in the main connection.
+///
+/// If the legacy file exists and the target has no rows, reads all rows from
+/// the legacy file, inserts them treating `started`/`unknown` as `unknown`
+/// (fail-closed), then renames the file to `.migrated`.
+///
+/// Idempotent: safe to call on every startup.
+fn migrate_legacy_effect_journal(
+    conn: &Arc<Mutex<Connection>>,
+    legacy_path: &Path,
+) -> Result<(), String> {
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let guard = conn
+        .lock()
+        .map_err(|e| format!("effect journal migration lock poisoned: {e}"))?;
+
+    // Check if target already has rows for this orchestrator.
+    let count: i64 = guard
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal
+             WHERE orchestrator_id = ?1",
+            params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("effect journal migration: failed to count target rows: {e}"))?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    // Open legacy DB and read rows.
+    let legacy_conn = Connection::open(legacy_path)
+        .map_err(|e| format!("effect journal migration: failed to open legacy db: {e}"))?;
+
+    // Check if the legacy table exists.
+    let legacy_table_exists: bool = legacy_conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name = 'gate_timeout_effect_journal_state' LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| format!("effect journal migration: failed to check legacy table: {e}"))?
+        .unwrap_or(false);
+    if !legacy_table_exists {
+        // Legacy file exists but has no table: just rename.
+        drop(legacy_conn);
+        let migrated_path = legacy_path.with_extension("sqlite.migrated");
+        std::fs::rename(legacy_path, &migrated_path)
+            .map_err(|e| format!("effect journal migration: failed to rename legacy file: {e}"))?;
+        return Ok(());
+    }
+
+    let mut stmt = legacy_conn
+        .prepare(
+            "SELECT intent_key, state, updated_at_ns
+             FROM gate_timeout_effect_journal_state",
+        )
+        .map_err(|e| format!("effect journal migration: failed to prepare legacy query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let key: String = row.get(0)?;
+            let state: String = row.get(1)?;
+            let updated_at_ns: i64 = row.get(2)?;
+            Ok((key, state, updated_at_ns))
+        })
+        .map_err(|e| format!("effect journal migration: failed to query legacy rows: {e}"))?;
+
+    let now_ns = epoch_now_ns_i64()?;
+    for row in rows {
+        let (key, state, updated_at_ns) =
+            row.map_err(|e| format!("effect journal migration: failed to decode legacy row: {e}"))?;
+        // Fail-closed: treat started/unknown as unknown.
+        let mapped_state = match state.as_str() {
+            "completed" => "completed",
+            _ => "unknown",
+        };
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
+                 (orchestrator_id, intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                    &key,
+                    mapped_state,
+                    if mapped_state == "unknown" {
+                        now_ns
+                    } else {
+                        updated_at_ns
+                    }
+                ],
+            )
+            .map_err(|e| format!("effect journal migration: failed to insert: {e}"))?;
+    }
+
+    // Close legacy DB and rename file.
+    drop(stmt);
+    drop(legacy_conn);
+    let migrated_path = legacy_path.with_extension("sqlite.migrated");
+    std::fs::rename(legacy_path, &migrated_path)
+        .map_err(|e| format!("effect journal migration: failed to rename legacy file: {e}"))?;
+
+    Ok(())
+}
+
+// (Legacy bespoke stores removed — now using shared orchestrator_runtime
+// adapters.)
 
 #[derive(Debug)]
 struct GateTimeoutReceiptWriter {
@@ -1910,13 +1800,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sqlite_intent_store_retryable_moves_intent_to_back() {
+    #[tokio::test]
+    async fn sqlite_intent_store_retryable_moves_intent_to_back() {
         let conn = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory sqlite open should succeed"),
         ));
-        let store =
-            SqliteTimeoutIntentStore::new(Arc::clone(&conn)).expect("intent store init succeeds");
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            init_orchestrator_runtime_schema(&guard).expect("schema init succeeds");
+        }
+        let store = SqliteIntentStore::<GateTimeoutIntent>::new(
+            Arc::clone(&conn),
+            GATE_TIMEOUT_ORCHESTRATOR_ID,
+        );
         let intent_a = GateTimeoutIntent {
             lease: sample_gate_lease("lease-retry-a", 1_000),
             gate_type: GateType::Quality,
@@ -1930,24 +1826,29 @@ mod tests {
 
         store
             .enqueue_many(&[intent_a, intent_b])
+            .await
             .expect("enqueue_many succeeds");
         {
             let guard = conn.lock().expect("sqlite lock should succeed");
             guard
                 .execute(
-                    "UPDATE gate_timeout_intents SET created_at_ns = ?2 WHERE intent_key = ?1",
-                    params![&key_a, 10_i64],
+                    "UPDATE orchestrator_kernel_intents
+                     SET created_at_ns = ?2
+                     WHERE orchestrator_id = ?3 AND intent_key = ?1",
+                    params![&key_a, 10_i64, GATE_TIMEOUT_ORCHESTRATOR_ID],
                 )
                 .expect("seed created_at_ns for intent_a");
             guard
                 .execute(
-                    "UPDATE gate_timeout_intents SET created_at_ns = ?2 WHERE intent_key = ?1",
-                    params![&key_b, 20_i64],
+                    "UPDATE orchestrator_kernel_intents
+                     SET created_at_ns = ?2
+                     WHERE orchestrator_id = ?3 AND intent_key = ?1",
+                    params![&key_b, 20_i64, GATE_TIMEOUT_ORCHESTRATOR_ID],
                 )
                 .expect("seed created_at_ns for intent_b");
         }
 
-        let first = store.dequeue_batch(1).expect("dequeue first intent");
+        let first = store.dequeue_batch(1).await.expect("dequeue first intent");
         assert_eq!(first.len(), 1, "exactly one intent dequeued");
         assert_eq!(
             first[0].key(),
@@ -1957,8 +1858,9 @@ mod tests {
 
         store
             .mark_retryable(&key_a, "retry")
+            .await
             .expect("mark_retryable succeeds");
-        let second = store.dequeue_batch(1).expect("dequeue second intent");
+        let second = store.dequeue_batch(1).await.expect("dequeue second intent");
         assert_eq!(second.len(), 1, "exactly one intent dequeued");
         assert_eq!(
             second[0].key(),

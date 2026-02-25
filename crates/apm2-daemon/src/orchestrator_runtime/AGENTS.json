@@ -1,0 +1,60 @@
+{
+  "schema": "apm2.agents_context.v1",
+  "module": "crates/apm2-daemon/src/orchestrator_runtime",
+  "behaviors": [
+    {
+      "id": "BEH-DAEMON-OKRT-001",
+      "kind": "invariant",
+      "title": "All SQLite adapter methods use spawn_blocking for rusqlite calls",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-002",
+      "kind": "invariant",
+      "title": "Multi-tenant tables keyed by orchestrator_id for isolation",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-003",
+      "kind": "invariant",
+      "title": "Intent enqueue uses INSERT OR IGNORE for idempotency",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-004",
+      "kind": "invariant",
+      "title": "Intent dequeue ordered by (created_at_ns ASC, intent_key ASC) for FIFO",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-005",
+      "kind": "invariant",
+      "title": "mark_retryable sets created_at_ns = now to move intent to back of queue",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-006",
+      "kind": "safety",
+      "title": "resolve_in_doubt returns Deny with reason (fail-closed on ambiguity)",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-007",
+      "kind": "safety",
+      "title": "Enqueue and dequeue batches bounded by MAX_ENQUEUE_BATCH and MAX_DEQUEUE_BATCH",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-008",
+      "kind": "invariant",
+      "title": "Legacy migration is idempotent and only copies when target is empty",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-009",
+      "kind": "safety",
+      "title": "Legacy effect journal migration treats started/unknown as unknown (fail-closed)",
+      "rfc": ["RFC-0020"]
+    }
+  ]
+}

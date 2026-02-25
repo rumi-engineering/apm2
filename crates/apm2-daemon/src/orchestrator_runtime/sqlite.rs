@@ -1,0 +1,957 @@
+//! `SQLite` adapters for orchestrator kernel storage traits.
+//!
+//! All adapters are keyed by `orchestrator_id` for multi-tenant use of a
+//! single database. All async trait methods use `tokio::task::spawn_blocking`
+//! to avoid blocking the tokio executor with rusqlite calls.
+
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use apm2_core::orchestrator_kernel::{
+    CursorStore, EffectExecutionState, EffectJournal, InDoubtResolution, IntentStore, KernelCursor,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// Maximum number of intents returned by a single `dequeue_batch` call.
+///
+/// This bounds the in-memory allocation from a single SQL query result set.
+const MAX_DEQUEUE_BATCH: usize = 4096;
+
+/// Maximum number of intents that can be enqueued in a single `enqueue_many`
+/// call. This bounds the transaction size and prevents unbounded write batches.
+const MAX_ENQUEUE_BATCH: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Schema init
+// ---------------------------------------------------------------------------
+
+/// Initializes shared orchestrator kernel tables in the given `SQLite`
+/// connection. Safe to call multiple times (idempotent `CREATE TABLE IF NOT
+/// EXISTS`).
+///
+/// # Errors
+///
+/// Returns `Err` if any DDL statement fails.
+pub fn init_orchestrator_runtime_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orchestrator_kernel_cursors (
+            orchestrator_id TEXT PRIMARY KEY,
+            cursor_json TEXT NOT NULL,
+            updated_at_ns INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS orchestrator_kernel_intents (
+            orchestrator_id TEXT NOT NULL,
+            intent_key TEXT NOT NULL,
+            intent_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','blocked','completed')),
+            created_at_ns INTEGER NOT NULL,
+            updated_at_ns INTEGER NOT NULL,
+            blocked_reason TEXT,
+            PRIMARY KEY(orchestrator_id, intent_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS ok_intents_pending_idx
+            ON orchestrator_kernel_intents(orchestrator_id, state, created_at_ns, intent_key);
+
+        CREATE TABLE IF NOT EXISTS orchestrator_kernel_effect_journal (
+            orchestrator_id TEXT NOT NULL,
+            intent_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('started','completed','unknown')),
+            updated_at_ns INTEGER NOT NULL,
+            PRIMARY KEY(orchestrator_id, intent_key)
+        );",
+    )
+    .map_err(|e| format!("failed to init orchestrator runtime schema: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Time helper
+// ---------------------------------------------------------------------------
+
+fn epoch_now_ns_i64() -> Result<i64, String> {
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    i64::try_from(ns).map_err(|_| "current epoch timestamp exceeds i64 range".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// SqliteCursorStore
+// ---------------------------------------------------------------------------
+
+/// `SQLite`-backed durable cursor store.
+///
+/// Stores cursor state as JSON in `orchestrator_kernel_cursors`, keyed by
+/// `orchestrator_id`.
+///
+/// # Synchronization protocol
+///
+/// The inner `Arc<Mutex<Connection>>` is shared across all adapters for the
+/// same orchestrator. The Mutex ensures exclusive access for the duration of
+/// each `SQLite` operation. All async methods use `spawn_blocking` to avoid
+/// holding the lock across `.await` points.
+#[derive(Debug, Clone)]
+pub struct SqliteCursorStore<C: KernelCursor> {
+    conn: Arc<Mutex<Connection>>,
+    orchestrator_id: String,
+    _cursor: PhantomData<C>,
+}
+
+impl<C: KernelCursor> SqliteCursorStore<C> {
+    /// Creates a new cursor store for the given orchestrator.
+    #[must_use]
+    pub fn new(conn: Arc<Mutex<Connection>>, orchestrator_id: &str) -> Self {
+        Self {
+            conn,
+            orchestrator_id: orchestrator_id.to_string(),
+            _cursor: PhantomData,
+        }
+    }
+
+    fn load_sync(&self) -> Result<C, String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
+        let row: Option<String> = guard
+            .query_row(
+                "SELECT cursor_json FROM orchestrator_kernel_cursors
+                 WHERE orchestrator_id = ?1",
+                params![&self.orchestrator_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to load cursor for '{}': {e}", self.orchestrator_id))?;
+        row.map_or_else(
+            || Ok(C::default()),
+            |json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    format!(
+                        "failed to decode cursor json for '{}': {e}",
+                        self.orchestrator_id
+                    )
+                })
+            },
+        )
+    }
+
+    fn save_sync(&self, cursor: &C) -> Result<(), String> {
+        let json = serde_json::to_string(cursor).map_err(|e| {
+            format!(
+                "failed to encode cursor json for '{}': {e}",
+                self.orchestrator_id
+            )
+        })?;
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "INSERT INTO orchestrator_kernel_cursors
+                     (orchestrator_id, cursor_json, updated_at_ns)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(orchestrator_id) DO UPDATE SET
+                     cursor_json = excluded.cursor_json,
+                     updated_at_ns = excluded.updated_at_ns",
+                params![&self.orchestrator_id, &json, now_ns],
+            )
+            .map_err(|e| format!("failed to save cursor for '{}': {e}", self.orchestrator_id))?;
+        Ok(())
+    }
+}
+
+impl<C: KernelCursor> CursorStore<C> for SqliteCursorStore<C> {
+    type Error = String;
+
+    async fn load(&self) -> Result<C, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.load_sync())
+            .await
+            .map_err(|e| format!("cursor store spawn_blocking join failed: {e}"))?
+    }
+
+    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let cursor = cursor.clone();
+        tokio::task::spawn_blocking(move || this.save_sync(&cursor))
+            .await
+            .map_err(|e| format!("cursor store spawn_blocking join failed: {e}"))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SqliteIntentStore
+// ---------------------------------------------------------------------------
+
+/// Intent key extraction trait.
+///
+/// Types implementing `IntentKeyed` expose a stable string key used for
+/// idempotency (INSERT OR IGNORE) and queue management.
+pub trait IntentKeyed {
+    /// Returns the stable intent key for this intent.
+    fn intent_key(&self) -> String;
+}
+
+/// `SQLite`-backed durable intent queue.
+///
+/// Stores intents as JSON in `orchestrator_kernel_intents`, keyed by
+/// `(orchestrator_id, intent_key)`.
+///
+/// # Synchronization protocol
+///
+/// Same as [`SqliteCursorStore`]: shared `Arc<Mutex<Connection>>`, Mutex for
+/// exclusive access, `spawn_blocking` for all async methods.
+#[derive(Debug, Clone)]
+pub struct SqliteIntentStore<I>
+where
+    I: Serialize + DeserializeOwned + IntentKeyed + Send + Sync + 'static,
+{
+    conn: Arc<Mutex<Connection>>,
+    orchestrator_id: String,
+    _intent: PhantomData<I>,
+}
+
+impl<I> SqliteIntentStore<I>
+where
+    I: Serialize + DeserializeOwned + IntentKeyed + Send + Sync + 'static,
+{
+    /// Creates a new intent store for the given orchestrator.
+    #[must_use]
+    pub fn new(conn: Arc<Mutex<Connection>>, orchestrator_id: &str) -> Self {
+        Self {
+            conn,
+            orchestrator_id: orchestrator_id.to_string(),
+            _intent: PhantomData,
+        }
+    }
+
+    fn enqueue_many_sync(&self, intents: &[I]) -> Result<usize, String> {
+        if intents.len() > MAX_ENQUEUE_BATCH {
+            return Err(format!(
+                "enqueue_many batch size {} exceeds MAX_ENQUEUE_BATCH {}",
+                intents.len(),
+                MAX_ENQUEUE_BATCH
+            ));
+        }
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        let tx = guard
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin intent enqueue transaction: {e}"))?;
+        let mut inserted = 0usize;
+        for intent in intents {
+            let key = intent.intent_key();
+            let json = serde_json::to_string(intent)
+                .map_err(|e| format!("failed to encode intent json: {e}"))?;
+            let rows = tx
+                .execute(
+                    "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                     (orchestrator_id, intent_key, intent_json, state,
+                      created_at_ns, updated_at_ns, blocked_reason)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL)",
+                    params![&self.orchestrator_id, &key, &json, now_ns, now_ns],
+                )
+                .map_err(|e| format!("failed to enqueue intent: {e}"))?;
+            inserted = inserted.saturating_add(rows);
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit intent enqueue transaction: {e}"))?;
+        Ok(inserted)
+    }
+
+    fn dequeue_batch_sync(&self, limit: usize) -> Result<Vec<I>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.min(MAX_DEQUEUE_BATCH);
+        let limit_i64 = i64::try_from(capped_limit)
+            .map_err(|_| "dequeue limit exceeds i64 range".to_string())?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        let mut stmt = guard
+            .prepare(
+                "SELECT intent_json FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1 AND state = 'pending'
+                 ORDER BY created_at_ns ASC, intent_key ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("failed to prepare intent dequeue query: {e}"))?;
+        let rows = stmt
+            .query_map(params![&self.orchestrator_id, limit_i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| format!("failed to query pending intents: {e}"))?;
+        let mut intents = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| format!("failed to decode intent row: {e}"))?;
+            let intent: I = serde_json::from_str(&json)
+                .map_err(|e| format!("failed to decode intent json: {e}"))?;
+            intents.push(intent);
+        }
+        Ok(intents)
+    }
+
+    fn mark_done_sync(&self, key: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "UPDATE orchestrator_kernel_intents
+                 SET state = 'completed', blocked_reason = NULL, updated_at_ns = ?3
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key, now_ns],
+            )
+            .map_err(|e| format!("failed to mark intent done: {e}"))?;
+        Ok(())
+    }
+
+    fn mark_blocked_sync(&self, key: &str, reason: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "UPDATE orchestrator_kernel_intents
+                 SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key, reason, now_ns],
+            )
+            .map_err(|e| format!("failed to mark intent blocked: {e}"))?;
+        Ok(())
+    }
+
+    fn mark_retryable_sync(&self, key: &str, _reason: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        // Retryable MUST set created_at_ns = now to move to back of queue.
+        guard
+            .execute(
+                "UPDATE orchestrator_kernel_intents
+                 SET state = 'pending', blocked_reason = NULL,
+                     created_at_ns = ?3, updated_at_ns = ?3
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key, now_ns],
+            )
+            .map_err(|e| format!("failed to mark intent retryable: {e}"))?;
+        Ok(())
+    }
+}
+
+impl<I> IntentStore<I, String> for SqliteIntentStore<I>
+where
+    I: Serialize + DeserializeOwned + IntentKeyed + Clone + Send + Sync + 'static,
+{
+    type Error = String;
+
+    async fn enqueue_many(&self, intents: &[I]) -> Result<usize, Self::Error> {
+        let this = self.clone();
+        let intents: Vec<I> = intents.to_vec();
+        tokio::task::spawn_blocking(move || this.enqueue_many_sync(&intents))
+            .await
+            .map_err(|e| format!("intent store spawn_blocking join failed: {e}"))?
+    }
+
+    async fn dequeue_batch(&self, limit: usize) -> Result<Vec<I>, Self::Error> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.dequeue_batch_sync(limit))
+            .await
+            .map_err(|e| format!("intent store spawn_blocking join failed: {e}"))?
+    }
+
+    async fn mark_done(&self, key: &String) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.mark_done_sync(&key))
+            .await
+            .map_err(|e| format!("intent store spawn_blocking join failed: {e}"))?
+    }
+
+    async fn mark_blocked(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || this.mark_blocked_sync(&key, &reason))
+            .await
+            .map_err(|e| format!("intent store spawn_blocking join failed: {e}"))?
+    }
+
+    async fn mark_retryable(&self, key: &String, reason: &str) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || this.mark_retryable_sync(&key, &reason))
+            .await
+            .map_err(|e| format!("intent store spawn_blocking join failed: {e}"))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SqliteEffectJournal
+// ---------------------------------------------------------------------------
+
+/// `SQLite`-backed effect idempotency journal.
+///
+/// Stores effect state in `orchestrator_kernel_effect_journal`, keyed by
+/// `(orchestrator_id, intent_key)`.
+///
+/// # Synchronization protocol
+///
+/// Same as [`SqliteCursorStore`]: shared `Arc<Mutex<Connection>>`, Mutex for
+/// exclusive access, `spawn_blocking` for all async methods.
+#[derive(Debug, Clone)]
+pub struct SqliteEffectJournal {
+    conn: Arc<Mutex<Connection>>,
+    orchestrator_id: String,
+}
+
+impl SqliteEffectJournal {
+    /// Creates a new effect journal for the given orchestrator.
+    #[must_use]
+    pub fn new(conn: Arc<Mutex<Connection>>, orchestrator_id: &str) -> Self {
+        Self {
+            conn,
+            orchestrator_id: orchestrator_id.to_string(),
+        }
+    }
+
+    fn query_state_sync(&self, key: &str) -> Result<EffectExecutionState, String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
+        let row: Option<String> = guard
+            .query_row(
+                "SELECT state FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("failed to query effect state for '{key}': {e}"))?;
+        Ok(match row.as_deref() {
+            None => EffectExecutionState::NotStarted,
+            Some("completed") => EffectExecutionState::Completed,
+            // Any non-terminal marker is in-doubt and is handled fail-closed
+            // via explicit `resolve_in_doubt`.
+            Some(_) => EffectExecutionState::Unknown,
+        })
+    }
+
+    fn record_started_sync(&self, key: &str) -> Result<(), String> {
+        // Idempotent: if already completed, do not regress.
+        if matches!(self.query_state_sync(key)?, EffectExecutionState::Completed) {
+            return Ok(());
+        }
+        self.upsert_state(key, "started")
+    }
+
+    fn record_completed_sync(&self, key: &str) -> Result<(), String> {
+        self.upsert_state(key, "completed")
+    }
+
+    fn record_retryable_sync(&self, key: &str) -> Result<(), String> {
+        let current = self.query_state_sync(key)?;
+        match current {
+            EffectExecutionState::NotStarted => Err(format!(
+                "cannot mark effect retryable for unknown key '{key}'"
+            )),
+            EffectExecutionState::Completed => Err(format!(
+                "cannot mark effect retryable for completed key '{key}'"
+            )),
+            // Started or Unknown: clear the fence so re-execution is possible.
+            EffectExecutionState::Started | EffectExecutionState::Unknown => self.delete_state(key),
+        }
+    }
+
+    fn resolve_in_doubt_sync(&self, key: &str) -> Result<InDoubtResolution, String> {
+        // Fail-closed: mark the state as unknown and deny.
+        self.upsert_state(key, "unknown")?;
+        Ok(InDoubtResolution::Deny {
+            reason: "effect execution state is in-doubt; manual reconciliation required"
+                .to_string(),
+        })
+    }
+
+    fn upsert_state(&self, key: &str, state: &str) -> Result<(), String> {
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "INSERT INTO orchestrator_kernel_effect_journal
+                     (orchestrator_id, intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(orchestrator_id, intent_key) DO UPDATE SET
+                     state = excluded.state,
+                     updated_at_ns = excluded.updated_at_ns",
+                params![&self.orchestrator_id, key, state, now_ns],
+            )
+            .map_err(|e| format!("failed to upsert effect state='{state}' for '{key}': {e}"))?;
+        Ok(())
+    }
+
+    fn delete_state(&self, key: &str) -> Result<(), String> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "DELETE FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key],
+            )
+            .map_err(|e| format!("failed to delete effect state for '{key}': {e}"))?;
+        Ok(())
+    }
+}
+
+impl EffectJournal<String> for SqliteEffectJournal {
+    type Error = String;
+
+    async fn query_state(&self, key: &String) -> Result<EffectExecutionState, Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.query_state_sync(&key))
+            .await
+            .map_err(|e| format!("effect journal spawn_blocking join failed: {e}"))?
+    }
+
+    async fn record_started(&self, key: &String) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.record_started_sync(&key))
+            .await
+            .map_err(|e| format!("effect journal spawn_blocking join failed: {e}"))?
+    }
+
+    async fn record_completed(&self, key: &String) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.record_completed_sync(&key))
+            .await
+            .map_err(|e| format!("effect journal spawn_blocking join failed: {e}"))?
+    }
+
+    async fn record_retryable(&self, key: &String) -> Result<(), Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.record_retryable_sync(&key))
+            .await
+            .map_err(|e| format!("effect journal spawn_blocking join failed: {e}"))?
+    }
+
+    async fn resolve_in_doubt(&self, key: &String) -> Result<InDoubtResolution, Self::Error> {
+        let this = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || this.resolve_in_doubt_sync(&key))
+            .await
+            .map_err(|e| format!("effect journal spawn_blocking join failed: {e}"))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use apm2_core::orchestrator_kernel::CompositeCursor;
+
+    use super::*;
+
+    fn test_conn() -> Arc<Mutex<Connection>> {
+        let conn =
+            Connection::open_in_memory().expect("in-memory sqlite connection should succeed");
+        init_orchestrator_runtime_schema(&conn).expect("schema init should succeed");
+        Arc::new(Mutex::new(conn))
+    }
+
+    // -- IntentKeyed test type --
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+    struct TestIntent {
+        key: String,
+        data: String,
+    }
+
+    impl IntentKeyed for TestIntent {
+        fn intent_key(&self) -> String {
+            self.key.clone()
+        }
+    }
+
+    // -- Schema tests --
+
+    #[test]
+    fn test_migration_idempotent() {
+        let conn =
+            Connection::open_in_memory().expect("in-memory sqlite connection should succeed");
+        init_orchestrator_runtime_schema(&conn).expect("first schema init should succeed");
+        init_orchestrator_runtime_schema(&conn).expect("second schema init should succeed");
+    }
+
+    // -- Cursor store tests --
+
+    #[tokio::test]
+    async fn test_cursor_store_roundtrip() {
+        let conn = test_conn();
+        let store = SqliteCursorStore::<CompositeCursor>::new(conn, "test-cursor-orch");
+
+        // Load default cursor
+        let cursor = store.load().await.expect("load default cursor");
+        assert_eq!(cursor, CompositeCursor::default());
+
+        // Store a cursor
+        let cursor = CompositeCursor {
+            timestamp_ns: 42_000_000,
+            event_id: "evt-cursor-test-001".to_string(),
+        };
+        store.save(&cursor).await.expect("save cursor");
+
+        // Load it back
+        let loaded = store.load().await.expect("load saved cursor");
+        assert_eq!(loaded, cursor);
+
+        // Update cursor
+        let cursor2 = CompositeCursor {
+            timestamp_ns: 99_000_000,
+            event_id: "evt-cursor-test-002".to_string(),
+        };
+        store.save(&cursor2).await.expect("save updated cursor");
+        let loaded2 = store.load().await.expect("load updated cursor");
+        assert_eq!(loaded2, cursor2);
+    }
+
+    // -- Intent store tests --
+
+    #[tokio::test]
+    async fn test_intent_store_enqueue_idempotent() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-orch");
+
+        let intent = TestIntent {
+            key: "intent-A".to_string(),
+            data: "first".to_string(),
+        };
+        let inserted1 = store
+            .enqueue_many(std::slice::from_ref(&intent))
+            .await
+            .expect("first enqueue");
+        assert_eq!(inserted1, 1, "first enqueue should insert 1 row");
+
+        // Enqueue same key again: INSERT OR IGNORE should skip it
+        let intent_dup = TestIntent {
+            key: "intent-A".to_string(),
+            data: "duplicate".to_string(),
+        };
+        let inserted2 = store
+            .enqueue_many(&[intent_dup])
+            .await
+            .expect("second enqueue");
+        assert_eq!(inserted2, 0, "duplicate enqueue should insert 0 rows");
+
+        // Verify only one row in dequeue
+        let batch = store.dequeue_batch(10).await.expect("dequeue after dup");
+        assert_eq!(batch.len(), 1, "should have exactly 1 pending intent");
+        assert_eq!(batch[0].data, "first", "original data should be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_intent_store_dequeue_ordering() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-order");
+
+        let a = TestIntent {
+            key: "intent-A".to_string(),
+            data: "first".to_string(),
+        };
+        let b = TestIntent {
+            key: "intent-B".to_string(),
+            data: "second".to_string(),
+        };
+        // Enqueue A then B in same batch (same created_at_ns).
+        // ORDER BY created_at_ns ASC, intent_key ASC should yield A first.
+        store
+            .enqueue_many(&[a.clone(), b.clone()])
+            .await
+            .expect("enqueue A+B");
+
+        let batch = store.dequeue_batch(2).await.expect("dequeue 2");
+        assert_eq!(batch.len(), 2, "should dequeue 2 intents");
+        assert_eq!(
+            batch[0].key, "intent-A",
+            "A should come before B (lexicographic tiebreak)"
+        );
+        assert_eq!(batch[1].key, "intent-B");
+    }
+
+    #[tokio::test]
+    async fn test_intent_store_retryable_moves_to_back() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-retry");
+
+        let a = TestIntent {
+            key: "intent-A".to_string(),
+            data: "alpha".to_string(),
+        };
+        let b = TestIntent {
+            key: "intent-B".to_string(),
+            data: "beta".to_string(),
+        };
+        store
+            .enqueue_many(&[a.clone(), b.clone()])
+            .await
+            .expect("enqueue A+B");
+
+        // Small sleep to ensure time advances for `created_at_ns = now` in
+        // mark_retryable. Without this, the retryable intent may get the same
+        // timestamp as B and tie-break on key order.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Mark A retryable: sets created_at_ns = now, moving it to back of queue
+        store
+            .mark_retryable(&"intent-A".to_string(), "transient failure")
+            .await
+            .expect("mark A retryable");
+
+        let batch = store.dequeue_batch(1).await.expect("dequeue 1");
+        assert_eq!(batch.len(), 1, "should dequeue 1 intent");
+        assert_eq!(
+            batch[0].key, "intent-B",
+            "B should come first because A was moved to back"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_intent_store_mark_done_removes_from_pending() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-done");
+
+        let a = TestIntent {
+            key: "intent-A".to_string(),
+            data: "alpha".to_string(),
+        };
+        store
+            .enqueue_many(std::slice::from_ref(&a))
+            .await
+            .expect("enqueue A");
+        store
+            .mark_done(&"intent-A".to_string())
+            .await
+            .expect("mark A done");
+
+        let batch = store.dequeue_batch(10).await.expect("dequeue after done");
+        assert!(batch.is_empty(), "no pending intents after mark_done");
+    }
+
+    #[tokio::test]
+    async fn test_intent_store_mark_blocked() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-blocked");
+
+        let a = TestIntent {
+            key: "intent-A".to_string(),
+            data: "alpha".to_string(),
+        };
+        store
+            .enqueue_many(std::slice::from_ref(&a))
+            .await
+            .expect("enqueue A");
+        store
+            .mark_blocked(&"intent-A".to_string(), "fail-closed reason")
+            .await
+            .expect("mark A blocked");
+
+        let batch = store
+            .dequeue_batch(10)
+            .await
+            .expect("dequeue after blocked");
+        assert!(
+            batch.is_empty(),
+            "blocked intent should not appear in pending dequeue"
+        );
+    }
+
+    // -- Effect journal tests --
+
+    #[tokio::test]
+    async fn test_effect_journal_resolve_in_doubt_fail_closed() {
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn, "test-effect-orch");
+
+        let key = "effect-A".to_string();
+
+        // Record started
+        journal.record_started(&key).await.expect("record_started");
+
+        // Do NOT record_completed. Resolve in-doubt.
+        let resolution = journal
+            .resolve_in_doubt(&key)
+            .await
+            .expect("resolve_in_doubt");
+        match resolution {
+            InDoubtResolution::Deny { reason } => {
+                assert!(
+                    reason.contains("in-doubt"),
+                    "deny reason should mention in-doubt: {reason}"
+                );
+            },
+            InDoubtResolution::AllowReExecution => {
+                panic!("resolve_in_doubt should return Deny, not AllowReExecution");
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_effect_journal_full_lifecycle() {
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn, "test-effect-lifecycle");
+
+        let key = "effect-lifecycle".to_string();
+
+        // Initial state: not started
+        let state = journal.query_state(&key).await.expect("query initial");
+        assert_eq!(state, EffectExecutionState::NotStarted);
+
+        // Record started
+        journal.record_started(&key).await.expect("record started");
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query after started");
+        // started maps to Unknown in our fail-closed model
+        assert_eq!(state, EffectExecutionState::Unknown);
+
+        // Record completed
+        journal
+            .record_completed(&key)
+            .await
+            .expect("record completed");
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query after completed");
+        assert_eq!(state, EffectExecutionState::Completed);
+
+        // Record started on completed key: should be idempotent (no regress)
+        journal
+            .record_started(&key)
+            .await
+            .expect("record started on completed");
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query still completed");
+        assert_eq!(state, EffectExecutionState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_effect_journal_retryable_clears_fence() {
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn, "test-effect-retryable");
+
+        let key = "effect-retry".to_string();
+
+        // Record started then retryable
+        journal.record_started(&key).await.expect("record started");
+        journal
+            .record_retryable(&key)
+            .await
+            .expect("record retryable");
+
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query after retryable");
+        assert_eq!(
+            state,
+            EffectExecutionState::NotStarted,
+            "retryable should clear the fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effect_journal_retryable_rejects_completed() {
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn, "test-effect-retry-completed");
+
+        let key = "effect-completed".to_string();
+
+        journal.record_started(&key).await.expect("record started");
+        journal
+            .record_completed(&key)
+            .await
+            .expect("record completed");
+
+        let result = journal.record_retryable(&key).await;
+        assert!(
+            result.is_err(),
+            "retryable on completed key should fail: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effect_journal_retryable_rejects_unknown_key() {
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn, "test-effect-retry-unknown");
+
+        let key = "effect-never-started".to_string();
+        let result = journal.record_retryable(&key).await;
+        assert!(
+            result.is_err(),
+            "retryable on unknown key should fail: {result:?}",
+        );
+    }
+
+    // -- Multi-orchestrator isolation test --
+
+    #[tokio::test]
+    async fn test_multi_orchestrator_isolation() {
+        let conn = test_conn();
+
+        // Two cursor stores with different orchestrator IDs
+        let store_a = SqliteCursorStore::<CompositeCursor>::new(conn.clone(), "orch-A");
+        let store_b = SqliteCursorStore::<CompositeCursor>::new(conn, "orch-B");
+
+        let cursor_a = CompositeCursor {
+            timestamp_ns: 100,
+            event_id: "A-evt".to_string(),
+        };
+        let cursor_b = CompositeCursor {
+            timestamp_ns: 200,
+            event_id: "B-evt".to_string(),
+        };
+
+        store_a.save(&cursor_a).await.expect("save A");
+        store_b.save(&cursor_b).await.expect("save B");
+
+        let loaded_a = store_a.load().await.expect("load A");
+        let loaded_b = store_b.load().await.expect("load B");
+
+        assert_eq!(loaded_a, cursor_a, "orchestrator A cursor isolated");
+        assert_eq!(loaded_b, cursor_b, "orchestrator B cursor isolated");
+    }
+}
