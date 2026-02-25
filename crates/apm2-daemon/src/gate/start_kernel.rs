@@ -690,10 +690,8 @@ impl SqliteGateStartIntentStore {
 
     /// Static `enqueue` — callable from `spawn_blocking`.
     ///
-    /// Each intent is persisted with its `observed_seq` (ledger observation
-    /// order). Dequeue ordering uses `observed_seq ASC, rowid ASC` to
-    /// preserve deterministic publication order even when all intents in a
-    /// batch share the same `created_at_ns` (Quality BLOCKER fix).
+    /// Each intent is persisted with strictly-increasing `created_at_ns` within
+    /// the batch so dequeue preserves enqueue/observation order.
     fn enqueue_many_with_conn(
         conn: &Arc<Mutex<Connection>>,
         intents: &[GateStartIntent],
@@ -735,18 +733,15 @@ impl SqliteGateStartIntentStore {
 
     /// Static `dequeue` — callable from `spawn_blocking`.
     ///
-    /// Dequeues pending intents in deterministic ledger observation order
-    /// (`observed_seq ASC, rowid ASC`). The `rowid` tiebreaker handles
-    /// pre-migration rows that all have `observed_seq=0` and provides a
-    /// stable secondary ordering within the same sequence number.
+    /// Dequeues pending intents in deterministic enqueue order
+    /// (`created_at_ns ASC, rowid ASC`). `rowid` provides a stable
+    /// insertion-order tiebreaker for legacy rows sharing the same timestamp.
     ///
     /// # Quality BLOCKER fix
     ///
-    /// Previously ordered by `created_at_ns ASC, intent_key ASC`, which
-    /// shared one timestamp across the whole batch and fell back to
-    /// lexical key order. Two same-work publications could be reordered
-    /// when their digest lexical order differed from publish order,
-    /// causing `start_for_publication` to supersede with an older digest.
+    /// Previously ordered by `created_at_ns ASC, intent_key ASC`, which could
+    /// fall back to lexical key ordering and reorder same-work publications
+    /// when digest lexical order differed from observation order.
     fn dequeue_batch_with_conn(
         conn: &Arc<Mutex<Connection>>,
         limit: usize,
@@ -764,7 +759,7 @@ impl SqliteGateStartIntentStore {
                 "SELECT intent_json
                  FROM orchestrator_kernel_intents
                  WHERE orchestrator_id = ?1 AND state = 'pending'
-                 ORDER BY created_at_ns ASC, intent_key ASC
+                 ORDER BY created_at_ns ASC, rowid ASC
                  LIMIT ?2",
             )
             .map_err(|e| format!("failed to prepare gate-start dequeue query: {e}"))?;
@@ -2525,7 +2520,7 @@ mod tests {
             changeset_published_event_id: "evt-first".to_string(),
         };
         let pub_second = apm2_core::fac::ChangesetPublication {
-            work_id: "W-order-test-2".to_string(),
+            work_id: "W-order-test".to_string(),
             changeset_digest: [0x00; 32],
             bundle_cas_hash: [0xBB; 32],
             published_at_ms: 2_000,
@@ -2542,7 +2537,7 @@ mod tests {
             observed_seq: 1,
         };
 
-        // Enqueue both in a single batch (same created_at_ns).
+        // Enqueue both in a single batch.
         let inserted = SqliteGateStartIntentStore::enqueue_many_with_conn(
             &store.conn,
             &[intent_first, intent_second],
@@ -2567,6 +2562,123 @@ mod tests {
         // Verify observed_seq values are preserved through persistence.
         assert_eq!(dequeued[0].observed_seq, 0);
         assert_eq!(dequeued[1].observed_seq, 1);
+    }
+
+    /// MAJOR regression integration: production `run_tick` wiring with shared
+    /// sqlite adapters MUST preserve observation order for same-work
+    /// publications, so latest-wins leaves the newest digest active.
+    #[tokio::test]
+    async fn run_tick_sqlite_shared_adapter_preserves_latest_wins_for_same_work() {
+        use apm2_core::crypto::Signer;
+        use apm2_core::orchestrator_kernel::{TickConfig, run_tick};
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        ));
+        {
+            let guard = conn.lock().expect("lock sqlite");
+            super::init_orchestrator_runtime_schema(&guard)
+                .expect("init shared orchestrator schema");
+            guard
+                .execute(
+                    "CREATE TABLE ledger_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        actor_id TEXT NOT NULL DEFAULT '',
+                        work_id TEXT NOT NULL DEFAULT '',
+                        payload BLOB NOT NULL,
+                        signature BLOB NOT NULL DEFAULT X'',
+                        timestamp_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy ledger table");
+
+            let work_id = "W-same-work";
+            let actor_id = "actor:test";
+            let ts = 1_706_000_000_111_000_000_i64;
+
+            // First observed publication has lexically larger digest (ff..).
+            let payload_first = serde_json::to_vec(&json!({
+                "work_id": work_id,
+                "changeset_digest": hex::encode([0xFF; 32]),
+                "cas_hash": hex::encode([0x11; 32]),
+                "actor_id": actor_id,
+                "timestamp_ns": ts,
+            }))
+            .expect("serialize first payload");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns)
+                     VALUES (?1, 'changeset_published', ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["evt-first", actor_id, work_id, payload_first, ts],
+                )
+                .expect("insert first publication");
+
+            // Second observed publication has lexically smaller digest (00..).
+            let payload_second = serde_json::to_vec(&json!({
+                "work_id": work_id,
+                "changeset_digest": hex::encode([0x00; 32]),
+                "cas_hash": hex::encode([0x22; 32]),
+                "actor_id": actor_id,
+                "timestamp_ns": ts + 1,
+            }))
+            .expect("serialize second payload");
+            guard
+                .execute(
+                    "INSERT INTO ledger_events
+                     (event_id, event_type, actor_id, work_id, payload, timestamp_ns)
+                     VALUES (?1, 'changeset_published', ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["evt-second", actor_id, work_id, payload_second, ts + 1],
+                )
+                .expect("insert second publication");
+        }
+
+        let orchestrator = Arc::new(crate::gate::GateOrchestrator::new(
+            crate::gate::GateOrchestratorConfig::default(),
+            Arc::new(Signer::generate()),
+        ));
+        let mut domain = super::GateStartDomain::new(Arc::clone(&orchestrator));
+        let ledger_reader = super::GateStartLedgerReader::Sqlite(
+            super::SqliteGateStartLedgerReader::new(Arc::clone(&conn)),
+        );
+        let cursor_store = super::GateStartCursorStore::Sqlite(super::SqliteCursorStore::new(
+            Arc::clone(&conn),
+            super::GATE_START_ORCHESTRATOR_ID,
+        ));
+        let intent_store = super::GateStartIntentStore::Sqlite(super::SqliteIntentStore::new(
+            Arc::clone(&conn),
+            super::GATE_START_ORCHESTRATOR_ID,
+        ));
+        let effect_journal = super::GateStartEffectJournal::new_shared(&conn);
+        let receipt_writer = super::GateStartReceiptWriter::new(None);
+
+        let report = run_tick(
+            &mut domain,
+            &ledger_reader,
+            &cursor_store,
+            &intent_store,
+            &effect_journal,
+            &receipt_writer,
+            TickConfig {
+                observe_limit: 16,
+                execute_limit: 16,
+            },
+        )
+        .await
+        .expect("tick should succeed");
+        assert_eq!(report.observed_events, 2);
+        assert_eq!(report.executed_intents, 2);
+
+        let active_lease = orchestrator
+            .gate_lease("W-same-work", crate::gate::GateType::Aat)
+            .await
+            .expect("active lease must exist after run_tick");
+        assert_eq!(
+            active_lease.changeset_digest, [0x00; 32],
+            "latest observed publication (00..) must remain active; lexical key order must not win"
+        );
     }
 
     /// Security MAJOR regression: serialized `GateOrchestratorEvent` variants
