@@ -8691,8 +8691,8 @@ mod tests {
     #[test]
     fn extract_tck_from_text_accepts_valid_pattern() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0018/RFC-0032::REQ-0268"),
-            Some("RFC-0032::REQ-0268".to_string())
+            extract_tck_from_text("ticket/RFC-0018/TCK-02680"),
+            Some("TCK-02680".to_string())
         );
     }
 
@@ -8700,10 +8700,7 @@ mod tests {
     fn extract_tck_from_text_rejects_invalid_pattern() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-640"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00640"), None);
-        assert_eq!(
-            extract_tck_from_text("ticket/rfc/RFC-0032::REQ-02680"),
-            None
-        );
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-026801"), None);
     }
 
     #[test]

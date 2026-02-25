@@ -116,11 +116,11 @@ mod tests {
     #[test]
     fn extract_tck_from_text_matches_exact_five_digits() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0032/RFC-0032::REQ-0268-work"),
-            Some("RFC-0032::REQ-0268".to_string())
+            extract_tck_from_text("ticket/RFC-0032/TCK-02680-work"),
+            Some("TCK-02680".to_string())
         );
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0032::REQ-02681"),
+            extract_tck_from_text("ticket/TCK-026801"),
             None,
             "six-digit token must not partially match"
         );

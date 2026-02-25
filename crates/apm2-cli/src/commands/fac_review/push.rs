@@ -5316,8 +5316,8 @@ ticket_alias: ticket-640
     #[test]
     fn extract_tck_from_text_accepts_valid_pattern() {
         assert_eq!(
-            extract_tck_from_text("ticket/RFC-0018/RFC-0032::REQ-0158"),
-            Some("RFC-0032::REQ-0158".to_string())
+            extract_tck_from_text("ticket/RFC-0018/TCK-01580"),
+            Some("TCK-01580".to_string())
         );
     }
 
@@ -5325,25 +5325,22 @@ ticket_alias: ticket-640
     fn extract_tck_from_text_rejects_invalid_variants() {
         assert_eq!(extract_tck_from_text("ticket/rfc/TCK-412"), None);
         assert_eq!(extract_tck_from_text("ticket/rfc/tck-00412"), None);
-        assert_eq!(
-            extract_tck_from_text("ticket/rfc/RFC-0032::REQ-01583"),
-            None
-        );
+        assert_eq!(extract_tck_from_text("ticket/rfc/TCK-015803"), None);
     }
 
     #[test]
     fn resolve_tck_id_prefers_branch() {
         let worktree = Path::new("/tmp/apm2-TCK-99999");
-        let tck = resolve_tck_id("ticket/RFC-0018/RFC-0032::REQ-0158", worktree)
+        let tck = resolve_tck_id("ticket/RFC-0018/TCK-01580", worktree)
             .expect("branch should provide tck");
-        assert_eq!(tck, "RFC-0032::REQ-0158");
+        assert_eq!(tck, "TCK-01580");
     }
 
     #[test]
     fn resolve_tck_id_falls_back_to_worktree_name() {
-        let worktree = Path::new("/tmp/apm2-RFC-0032::REQ-0168");
+        let worktree = Path::new("/tmp/apm2-TCK-01680");
         let tck = resolve_tck_id("feat/no-ticket", worktree).expect("worktree should provide tck");
-        assert_eq!(tck, "RFC-0032::REQ-0168");
+        assert_eq!(tck, "TCK-01680");
     }
 
     #[test]
