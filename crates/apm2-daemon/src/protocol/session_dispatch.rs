@@ -12614,35 +12614,48 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // revokes session-registry state but the HMAC remains valid
         // until expiry. A retained token could read WorkSpec data
         // after termination without this check.
-        if let Some(ref registry) = self.session_registry {
-            let Some(session_state) = registry.get_session(&token.session_id) else {
-                warn!(
-                    session_id = %token.session_id,
-                    "WorkShow rejected: session not found in registry (may have been terminated)"
-                );
-                return Ok(SessionResponse::error(
-                    SessionErrorCode::SessionErrorPermissionDenied,
-                    "WorkShow: session not found or already terminated",
-                ));
-            };
+        //
+        // Fail-closed: if session_registry is not wired, deny the
+        // request outright. A miswired embedding must not silently
+        // bypass the active-session and work-scope binding checks.
+        let Some(ref registry) = self.session_registry else {
+            warn!(
+                session_id = %token.session_id,
+                "WorkShow denied: session_registry not configured (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "WorkShow: session registry not configured",
+            ));
+        };
 
-            // Security gate 2: Enforce work-scope binding.
-            // request.work_id must match the session's authorized work_id
-            // to prevent cross-work metadata leakage. Without this check,
-            // any valid session token could read WorkSpec for unrelated
-            // work items.
-            if request.work_id != session_state.work_id {
-                warn!(
-                    session_id = %token.session_id,
-                    requested_work_id = %request.work_id,
-                    authorized_work_id = %session_state.work_id,
-                    "WorkShow rejected: work_id does not match session scope"
-                );
-                return Ok(SessionResponse::error(
-                    SessionErrorCode::SessionErrorPermissionDenied,
-                    "WorkShow: work_id does not match session scope",
-                ));
-            }
+        let Some(session_state) = registry.get_session(&token.session_id) else {
+            warn!(
+                session_id = %token.session_id,
+                "WorkShow rejected: session not found in registry (may have been terminated)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorPermissionDenied,
+                "WorkShow: session not found or already terminated",
+            ));
+        };
+
+        // Security gate 2: Enforce work-scope binding.
+        // request.work_id must match the session's authorized work_id
+        // to prevent cross-work metadata leakage. Without this check,
+        // any valid session token could read WorkSpec for unrelated
+        // work items.
+        if request.work_id != session_state.work_id {
+            warn!(
+                session_id = %token.session_id,
+                requested_work_id = %request.work_id,
+                authorized_work_id = %session_state.work_id,
+                "WorkShow rejected: work_id does not match session scope"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorPermissionDenied,
+                "WorkShow: work_id does not match session scope",
+            ));
         }
 
         // Parse work_id into typed WorkId at the boundary (parse, don't
@@ -27932,6 +27945,48 @@ mod tests {
             },
             other => {
                 panic!("Expected Error (gate not configured) for valid session, got: {other:?}")
+            },
+        }
+    }
+
+    /// Security regression: WorkShow MUST fail closed when `session_registry`
+    /// is not wired. A miswired embedding or future call path that omits
+    /// the registry must not silently bypass the active-session and
+    /// work-scope binding security gates.
+    #[test]
+    fn work_show_denied_when_session_registry_not_wired() {
+        let minter = test_minter();
+        let token = test_token(&minter);
+        let ctx = make_session_ctx();
+
+        // Deliberately omit .with_session_registry() — registry stays None.
+        // Wire nothing else; the test proves denial happens before any
+        // downstream gate/CAS interaction.
+        let dispatcher = SessionDispatcher::<InMemoryManifestStore>::new(minter);
+
+        let request = WorkShowRequest {
+            work_id: "W-TCK-00683".to_string(),
+            session_token: serde_json::to_string(&token).unwrap(),
+        };
+        let frame = encode_work_show_session_request(&request);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            SessionResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    SessionErrorCode::SessionErrorInternal as i32,
+                    "Missing session_registry must receive INTERNAL error, got code: {}",
+                    err.code
+                );
+                assert!(
+                    err.message.contains("session registry not configured"),
+                    "Error message should indicate missing registry, got: {}",
+                    err.message
+                );
+            },
+            other => {
+                panic!("Expected Error response when session_registry is None, got: {other:?}")
             },
         }
     }
