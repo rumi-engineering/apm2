@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use apm2_core::events::Validate;
 use apm2_core::orchestrator_kernel::{
     CursorStore, EffectExecutionState, EffectJournal, InDoubtResolution, IntentStore, KernelCursor,
 };
@@ -234,7 +235,7 @@ pub trait IntentKeyed {
 #[derive(Debug, Clone)]
 pub struct SqliteIntentStore<I>
 where
-    I: Serialize + DeserializeOwned + IntentKeyed + Send + Sync + 'static,
+    I: Serialize + DeserializeOwned + IntentKeyed + Validate + Send + Sync + 'static,
 {
     conn: Arc<Mutex<Connection>>,
     orchestrator_id: String,
@@ -243,7 +244,7 @@ where
 
 impl<I> SqliteIntentStore<I>
 where
-    I: Serialize + DeserializeOwned + IntentKeyed + Send + Sync + 'static,
+    I: Serialize + DeserializeOwned + IntentKeyed + Validate + Send + Sync + 'static,
 {
     /// Creates a new intent store for the given orchestrator.
     #[must_use]
@@ -320,6 +321,11 @@ where
             validate_json_size(&json, "intent store dequeue")?;
             let intent: I = serde_json::from_str(&json)
                 .map_err(|e| format!("failed to decode intent json: {e}"))?;
+            // BEH-DAEMON-OKRT-011: post-deserialization validation to reject
+            // malformed intents before they reach the domain execution path.
+            intent
+                .validate()
+                .map_err(|e| format!("intent post-deserialization validation failed: {e}"))?;
             intents.push(intent);
         }
         Ok(intents)
@@ -381,7 +387,7 @@ where
 
 impl<I> IntentStore<I, String> for SqliteIntentStore<I>
 where
-    I: Serialize + DeserializeOwned + IntentKeyed + Clone + Send + Sync + 'static,
+    I: Serialize + DeserializeOwned + IntentKeyed + Validate + Clone + Send + Sync + 'static,
 {
     type Error = String;
 
@@ -653,6 +659,12 @@ mod tests {
     impl IntentKeyed for TestIntent {
         fn intent_key(&self) -> String {
             self.key.clone()
+        }
+    }
+
+    impl Validate for TestIntent {
+        fn validate(&self) -> Result<(), String> {
+            Ok(())
         }
     }
 

@@ -378,6 +378,16 @@ impl IntentKeyed for GateTimeoutIntent {
     }
 }
 
+impl apm2_core::events::Validate for GateTimeoutIntent {
+    fn validate(&self) -> Result<(), String> {
+        // BEH-DAEMON-OKRT-011: validate the inner GateLease after deserialization
+        // to reject malformed/oversized data before it reaches domain execution.
+        self.lease
+            .validate()
+            .map_err(|e| format!("GateTimeoutIntent lease invariant violation: {e}"))
+    }
+}
+
 /// Cached observation of a gate lease's timeout state.
 ///
 /// **Monotonic time is process-local.** The `observed_monotonic_ns` and
@@ -473,6 +483,9 @@ impl TimeoutObservedLeaseStore {
         }
     }
 
+    /// Synchronous upsert used by tests and by the async wrapper on memory
+    /// backends. Production async callers should prefer [`Self::upsert_async`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn upsert(&self, state: &ObservedLeaseState) -> Result<(), String> {
         match self {
             Self::Sqlite(store) => store.upsert(state),
@@ -480,9 +493,30 @@ impl TimeoutObservedLeaseStore {
         }
     }
 
+    /// Synchronous remove used by tests and by the async wrapper on memory
+    /// backends. Production async callers should prefer [`Self::remove_async`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn remove(&self, lease_id: &str) -> Result<(), String> {
         match self {
             Self::Sqlite(store) => store.remove(lease_id),
+            Self::Memory(store) => store.remove(lease_id),
+        }
+    }
+
+    /// Async variant that offloads blocking `SQLite` I/O to `spawn_blocking`
+    /// per `INV-CQ-OK-003`. Memory variants delegate synchronously (no I/O).
+    async fn upsert_async(&self, state: &ObservedLeaseState) -> Result<(), String> {
+        match self {
+            Self::Sqlite(store) => store.upsert_async(state).await,
+            Self::Memory(store) => store.upsert(state),
+        }
+    }
+
+    /// Async variant that offloads blocking `SQLite` I/O to `spawn_blocking`
+    /// per `INV-CQ-OK-003`. Memory variants delegate synchronously (no I/O).
+    async fn remove_async(&self, lease_id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(store) => store.remove_async(lease_id).await,
             Self::Memory(store) => store.remove(lease_id),
         }
     }
@@ -766,6 +800,26 @@ impl SqliteTimeoutObservedLeaseStore {
             .map_err(|e| format!("failed to delete observed lease '{lease_id}': {e}"))?;
         Ok(())
     }
+
+    /// Async variant of [`Self::upsert`] that offloads blocking `SQLite` I/O
+    /// to `tokio::task::spawn_blocking` per `INV-CQ-OK-003`.
+    async fn upsert_async(&self, state: &ObservedLeaseState) -> Result<(), String> {
+        let this = self.clone();
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || this.upsert(&state))
+            .await
+            .map_err(|e| format!("observed lease store spawn_blocking join failed: {e}"))?
+    }
+
+    /// Async variant of [`Self::remove`] that offloads blocking `SQLite` I/O
+    /// to `tokio::task::spawn_blocking` per `INV-CQ-OK-003`.
+    async fn remove_async(&self, lease_id: &str) -> Result<(), String> {
+        let this = self.clone();
+        let lease_id = lease_id.to_string();
+        tokio::task::spawn_blocking(move || this.remove(&lease_id))
+            .await
+            .map_err(|e| format!("observed lease store spawn_blocking join failed: {e}"))?
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -806,9 +860,22 @@ enum TimeoutTerminalChecker {
 }
 
 impl TimeoutTerminalChecker {
+    /// Synchronous terminal check. Used internally by the async wrapper.
+    /// Production async callers should prefer
+    /// [`Self::lease_is_terminal_async`].
+    #[allow(dead_code)]
     fn lease_is_terminal(&self, lease_id: &str) -> Result<bool, String> {
         match self {
             Self::Sqlite(checker) => checker.lease_is_terminal(lease_id),
+            Self::Memory(_checker) => Ok(MemoryTimeoutTerminalChecker::lease_is_terminal(lease_id)),
+        }
+    }
+
+    /// Async variant that offloads blocking `SQLite` I/O to `spawn_blocking`
+    /// per `INV-CQ-OK-003`. Memory variant delegates synchronously (no I/O).
+    async fn lease_is_terminal_async(&self, lease_id: &str) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(checker) => checker.lease_is_terminal_async(lease_id).await,
             Self::Memory(_checker) => Ok(MemoryTimeoutTerminalChecker::lease_is_terminal(lease_id)),
         }
     }
@@ -872,6 +939,16 @@ impl SqliteTimeoutTerminalChecker {
             }
         }
         Ok(false)
+    }
+
+    /// Async variant of [`Self::lease_is_terminal`] that offloads blocking
+    /// `SQLite` I/O to `tokio::task::spawn_blocking` per `INV-CQ-OK-003`.
+    async fn lease_is_terminal_async(&self, lease_id: &str) -> Result<bool, String> {
+        let this = self.clone();
+        let lease_id = lease_id.to_string();
+        tokio::task::spawn_blocking(move || this.lease_is_terminal(&lease_id))
+            .await
+            .map_err(|e| format!("terminal checker spawn_blocking join failed: {e}"))?
     }
 
     fn has_terminal_row_in_canonical(conn: &Connection, lease_id: &str) -> Result<bool, String> {
@@ -957,6 +1034,10 @@ impl GateTimeoutDomain {
         })
     }
 
+    /// Synchronous variant kept for potential non-async callers.
+    /// Production async callers should prefer
+    /// [`Self::remove_work_leases_async`].
+    #[allow(dead_code)]
     fn remove_work_leases(&mut self, work_id: &str) -> Result<(), String> {
         let lease_ids: Vec<String> = self
             .observed_leases
@@ -966,6 +1047,22 @@ impl GateTimeoutDomain {
             .collect();
         for lease_id in lease_ids {
             self.observed_lease_store.remove(&lease_id)?;
+            self.observed_leases.remove(&lease_id);
+        }
+        Ok(())
+    }
+
+    /// Async variant of [`Self::remove_work_leases`] that uses
+    /// `remove_async` to offload `SQLite` I/O per `INV-CQ-OK-003`.
+    async fn remove_work_leases_async(&mut self, work_id: &str) -> Result<(), String> {
+        let lease_ids: Vec<String> = self
+            .observed_leases
+            .iter()
+            .filter(|(_, state)| state.lease.work_id == work_id)
+            .map(|(lease_id, _)| lease_id.clone())
+            .collect();
+        for lease_id in lease_ids {
+            self.observed_lease_store.remove_async(&lease_id).await?;
             self.observed_leases.remove(&lease_id);
         }
         Ok(())
@@ -993,16 +1090,16 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
                         observed_wall_ms,
                         observed_monotonic_ns,
                     );
-                    self.observed_lease_store.upsert(&state)?;
+                    self.observed_lease_store.upsert_async(&state).await?;
                     self.observed_leases.insert(lease.lease_id.clone(), state);
                 },
                 TimeoutObservedKind::GateReceiptFinalized { lease_id }
                 | TimeoutObservedKind::TimedOut { lease_id } => {
-                    self.observed_lease_store.remove(lease_id)?;
+                    self.observed_lease_store.remove_async(lease_id).await?;
                     self.observed_leases.remove(lease_id);
                 },
                 TimeoutObservedKind::AllCompleted { work_id } => {
-                    self.remove_work_leases(work_id)?;
+                    self.remove_work_leases_async(work_id).await?;
                 },
                 TimeoutObservedKind::Skipped { .. } => {
                     // Intentionally ignored -- the event exists only to
@@ -1029,7 +1126,7 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
         for key in &stale_keys {
             if let Some(state) = self.observed_leases.get(key) {
                 let rebased = state.rebase(now_wall_ms, monotonic_now_ns);
-                self.observed_lease_store.upsert(&rebased)?;
+                self.observed_lease_store.upsert_async(&rebased).await?;
                 self.observed_leases.insert(key.clone(), rebased);
             }
         }
@@ -1073,7 +1170,8 @@ impl OrchestratorDomain<TimeoutObservedEvent, GateTimeoutIntent, String, GateOrc
                 }
                 if self
                     .terminal_checker
-                    .lease_is_terminal(&intent.lease.lease_id)?
+                    .lease_is_terminal_async(&intent.lease.lease_id)
+                    .await?
                 {
                     return Ok(ExecutionOutcome::Completed {
                         receipts: Vec::new(),
@@ -1356,52 +1454,24 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
         return Ok(());
     }
 
-    // Collect all legacy rows into a Vec first. This drops the statement
-    // borrow before we begin writing, preventing SQLITE_BUSY on the same
-    // connection (N+1 query fix).
-    //
-    // The legacy schema stores `gate_type` as a separate column, whereas
-    // the new `orchestrator_kernel_intents.intent_json` column expects a
-    // full `GateTimeoutIntent { lease, gate_type }` JSON envelope. We
-    // must read `gate_type` here so we can reconstruct the envelope below.
-    #[allow(clippy::type_complexity)]
-    let legacy_rows: Vec<(String, String, String, String, Option<String>, i64, i64)> = {
+    // Count legacy rows to determine migration scope. We use COUNT(*)
+    // instead of collecting all rows into memory to avoid OOM with large
+    // legacy tables (MAJOR-4 fix).
+    let legacy_count: i64 = {
         let mut stmt = guard
             .prepare(
-                "SELECT intent_key, gate_type, lease_json, state, blocked_reason,
-                        created_at_ns, updated_at_ns
-                 FROM gate_timeout_intents
+                "SELECT COUNT(*) FROM gate_timeout_intents
                  WHERE state IN ('pending', 'done', 'blocked')",
             )
-            .map_err(|e| format!("intent migration: failed to prepare legacy query: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                let key: String = row.get(0)?;
-                let gate_type_raw: String = row.get(1)?;
-                let lease_json: String = row.get(2)?;
-                let state: String = row.get(3)?;
-                let blocked_reason: Option<String> = row.get(4)?;
-                let created_at_ns: i64 = row.get(5)?;
-                let updated_at_ns: i64 = row.get(6)?;
-                Ok((
-                    key,
-                    gate_type_raw,
-                    lease_json,
-                    state,
-                    blocked_reason,
-                    created_at_ns,
-                    updated_at_ns,
-                ))
-            })
-            .map_err(|e| format!("intent migration: failed to query legacy intents: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("intent migration: failed to decode legacy rows: {e}"))?
+            .map_err(|e| format!("intent migration: failed to prepare legacy count: {e}"))?;
+        stmt.query_row([], |row| row.get(0))
+            .map_err(|e| format!("intent migration: failed to count legacy rows: {e}"))?
     };
 
     // Skip check: if the legacy source is empty AND the target already has
     // rows, a prior migration completed successfully. This avoids the
     // count > 0 check that would mask a half-completed crash recovery.
-    if legacy_rows.is_empty() {
+    if legacy_count == 0 {
         let target_count: i64 = guard
             .query_row(
                 "SELECT COUNT(*) FROM orchestrator_kernel_intents
@@ -1416,8 +1486,11 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
         return Ok(()); // No legacy data to migrate.
     }
 
-    // Check if target already has rows matching the legacy count
-    // (prior completed migration).
+    // Content-aware validation: before declaring migration complete, verify
+    // every existing pending row for this orchestrator can be deserialized as
+    // `GateTimeoutIntent`. Quarantine invalid rows as 'blocked'. This prevents
+    // a prior bad migration from leaving malformed `intent_json` rows that
+    // wedge dequeue (MAJOR-2 fix).
     let target_count: i64 = guard
         .query_row(
             "SELECT COUNT(*) FROM orchestrator_kernel_intents
@@ -1426,74 +1499,180 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
             |r| r.get(0),
         )
         .map_err(|e| format!("intent migration: failed to count target rows: {e}"))?;
-    if target_count >= i64::try_from(legacy_rows.len()).unwrap_or(i64::MAX) {
+    if target_count >= legacy_count {
+        // Target has enough rows, but validate existing pending rows are well-formed.
+        // Only scan pending rows for this orchestrator_id (bounded, not full-table).
+        let malformed_keys: Vec<(String, String)> = {
+            let mut stmt = guard
+                .prepare(
+                    "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
+                     WHERE orchestrator_id = ?1 AND state = 'pending'
+                     ORDER BY created_at_ns ASC, intent_key ASC",
+                )
+                .map_err(|e| {
+                    format!("intent migration: failed to prepare validation query: {e}")
+                })?;
+            let rows = stmt
+                .query_map(params![GATE_TIMEOUT_ORCHESTRATOR_ID], |row| {
+                    let key: String = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    Ok((key, json))
+                })
+                .map_err(|e| format!("intent migration: failed to query pending intents: {e}"))?;
+            let mut bad = Vec::new();
+            for row in rows {
+                let (key, json) =
+                    row.map_err(|e| format!("intent migration: failed to decode row: {e}"))?;
+                if serde_json::from_str::<GateTimeoutIntent>(&json).is_err() {
+                    bad.push((
+                        key,
+                        "malformed intent_json: failed to deserialize as GateTimeoutIntent"
+                            .to_string(),
+                    ));
+                }
+            }
+            bad
+        };
+        // Quarantine any malformed pending rows as 'blocked'.
+        if !malformed_keys.is_empty() {
+            let now_ns = epoch_now_ns_i64()?;
+            for (key, reason) in &malformed_keys {
+                guard
+                    .execute(
+                        "UPDATE orchestrator_kernel_intents
+                         SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
+                         WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                        params![GATE_TIMEOUT_ORCHESTRATOR_ID, key, reason, now_ns],
+                    )
+                    .map_err(|e| {
+                        format!("intent migration: failed to quarantine malformed intent: {e}")
+                    })?;
+                tracing::warn!(
+                    intent_key = %key,
+                    "intent migration: quarantined malformed pending row: {reason}"
+                );
+            }
+        }
         return Ok(()); // Target already has at least as many rows as legacy source.
     }
 
-    // Wrap all INSERTs in a single transaction for crash-atomicity.
-    let tx = guard
-        .transaction()
-        .map_err(|e| format!("intent migration: failed to begin transaction: {e}"))?;
-    for (key, gate_type_raw, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) in
-        &legacy_rows
-    {
-        let mapped_state = match state.as_str() {
-            "done" => "completed",
-            other => other,
-        };
-
-        // Reconstruct the full GateTimeoutIntent JSON envelope from the
-        // separate legacy columns. If the row is malformed (bad gate_type
-        // or corrupt lease_json), quarantine it as 'blocked' with reason
-        // instead of poisoning the pending dequeue queue.
-        let intent_json = match reconstruct_intent_json(gate_type_raw, lease_json) {
-            Ok(json) => json,
-            Err(reason) => {
-                tracing::warn!(
-                    intent_key = %key,
-                    "intent migration: quarantining malformed legacy row: {reason}"
-                );
-                // Insert as blocked so this row is not dequeued but is
-                // still tracked for audit. Use the original lease_json
-                // as a best-effort payload to preserve evidence.
-                tx.execute(
-                    "INSERT OR IGNORE INTO orchestrator_kernel_intents
-                     (orchestrator_id, intent_key, intent_json, state,
-                      created_at_ns, updated_at_ns, blocked_reason)
-                     VALUES (?1, ?2, ?3, 'blocked', ?4, ?5, ?6)",
-                    params![
-                        GATE_TIMEOUT_ORCHESTRATOR_ID,
+    // Process legacy rows in batches to prevent unbounded memory allocation
+    // (MAJOR-4 fix). Each batch reads up to 500 rows using LIMIT/OFFSET,
+    // collects into a Vec (bounded), then writes within a single transaction.
+    let migration_batch_size: i64 = 500;
+    let mut offset: i64 = 0;
+    loop {
+        #[allow(clippy::type_complexity)]
+        let batch: Vec<(String, String, String, String, Option<String>, i64, i64)> = {
+            let mut stmt = guard
+                .prepare(
+                    "SELECT intent_key, gate_type, lease_json, state, blocked_reason,
+                            created_at_ns, updated_at_ns
+                     FROM gate_timeout_intents
+                     WHERE state IN ('pending', 'done', 'blocked')
+                     ORDER BY rowid ASC
+                     LIMIT ?1 OFFSET ?2",
+                )
+                .map_err(|e| format!("intent migration: failed to prepare legacy query: {e}"))?;
+            let rows = stmt
+                .query_map(params![migration_batch_size, offset], |row| {
+                    let key: String = row.get(0)?;
+                    let gate_type_raw: String = row.get(1)?;
+                    let lease_json: String = row.get(2)?;
+                    let state: String = row.get(3)?;
+                    let blocked_reason: Option<String> = row.get(4)?;
+                    let created_at_ns: i64 = row.get(5)?;
+                    let updated_at_ns: i64 = row.get(6)?;
+                    Ok((
                         key,
+                        gate_type_raw,
                         lease_json,
+                        state,
+                        blocked_reason,
                         created_at_ns,
                         updated_at_ns,
-                        reason
-                    ],
-                )
-                .map_err(|e| format!("intent migration: failed to insert blocked intent: {e}"))?;
-                continue;
-            },
+                    ))
+                })
+                .map_err(|e| format!("intent migration: failed to query legacy intents: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("intent migration: failed to decode legacy rows: {e}"))?
         };
 
-        tx.execute(
-            "INSERT OR IGNORE INTO orchestrator_kernel_intents
-             (orchestrator_id, intent_key, intent_json, state,
-              created_at_ns, updated_at_ns, blocked_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                GATE_TIMEOUT_ORCHESTRATOR_ID,
-                key,
-                intent_json,
-                mapped_state,
-                created_at_ns,
-                updated_at_ns,
-                blocked_reason
-            ],
-        )
-        .map_err(|e| format!("intent migration: failed to insert intent: {e}"))?;
+        if batch.is_empty() {
+            break; // All batches processed.
+        }
+
+        let batch_len = i64::try_from(batch.len()).unwrap_or(i64::MAX);
+
+        // Wrap each batch of INSERTs in a transaction for crash-atomicity.
+        let tx = guard
+            .transaction()
+            .map_err(|e| format!("intent migration: failed to begin transaction: {e}"))?;
+        for (key, gate_type_raw, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) in
+            &batch
+        {
+            let mapped_state = match state.as_str() {
+                "done" => "completed",
+                other => other,
+            };
+
+            // Reconstruct the full GateTimeoutIntent JSON envelope from the
+            // separate legacy columns. If the row is malformed (bad gate_type
+            // or corrupt lease_json), quarantine it as 'blocked' with reason
+            // instead of poisoning the pending dequeue queue.
+            let intent_json = match reconstruct_intent_json(gate_type_raw, lease_json) {
+                Ok(json) => json,
+                Err(reason) => {
+                    tracing::warn!(
+                        intent_key = %key,
+                        "intent migration: quarantining malformed legacy row: {reason}"
+                    );
+                    // Insert as blocked so this row is not dequeued but is
+                    // still tracked for audit. Use the original lease_json
+                    // as a best-effort payload to preserve evidence.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                         (orchestrator_id, intent_key, intent_json, state,
+                          created_at_ns, updated_at_ns, blocked_reason)
+                         VALUES (?1, ?2, ?3, 'blocked', ?4, ?5, ?6)",
+                        params![
+                            GATE_TIMEOUT_ORCHESTRATOR_ID,
+                            key,
+                            lease_json,
+                            created_at_ns,
+                            updated_at_ns,
+                            reason
+                        ],
+                    )
+                    .map_err(|e| {
+                        format!("intent migration: failed to insert blocked intent: {e}")
+                    })?;
+                    continue;
+                },
+            };
+
+            tx.execute(
+                "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                 (orchestrator_id, intent_key, intent_json, state,
+                  created_at_ns, updated_at_ns, blocked_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                    key,
+                    intent_json,
+                    mapped_state,
+                    created_at_ns,
+                    updated_at_ns,
+                    blocked_reason
+                ],
+            )
+            .map_err(|e| format!("intent migration: failed to insert intent: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("intent migration: failed to commit transaction: {e}"))?;
+
+        offset = offset.saturating_add(batch_len);
     }
-    tx.commit()
-        .map_err(|e| format!("intent migration: failed to commit transaction: {e}"))?;
     Ok(())
 }
 
@@ -1504,6 +1683,15 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
 ///
 /// Returns `Err` with a human-readable reason if the row is malformed.
 fn reconstruct_intent_json(gate_type_raw: &str, lease_json: &str) -> Result<String, String> {
+    // Validate JSON size before deserialization to prevent DoS via oversized
+    // payloads (MINOR security fix). Uses the same 65536 byte limit as
+    // `SqliteIntentStore::MAX_JSON_BYTES`.
+    if lease_json.len() > 65_536 {
+        return Err(format!(
+            "legacy lease_json payload length {} exceeds maximum (65536)",
+            lease_json.len()
+        ));
+    }
     let gate_type = parse_gate_type(gate_type_raw)
         .ok_or_else(|| format!("unknown legacy gate_type '{gate_type_raw}'"))?;
     let lease: GateLease = serde_json::from_str(lease_json)
