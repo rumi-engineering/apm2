@@ -2254,7 +2254,6 @@ fn git_update_ref_if_missing(
     ))
 }
 
-#[cfg(test)]
 fn git_worktree_has_tracked_changes(current_dir: &Path) -> Result<bool, String> {
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
@@ -2319,7 +2318,6 @@ fn find_main_worktree(reference_dir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
-#[cfg(test)]
 fn git_merge_base_is_ancestor(
     current_dir: &Path,
     ancestor_ref: &str,
@@ -2349,7 +2347,6 @@ fn git_merge_base_is_ancestor(
     }
 }
 
-#[cfg(test)]
 fn sync_main_worktree_if_present(reference_dir: &Path) {
     let Ok(Some(main_worktree)) = find_main_worktree(reference_dir) else {
         return;
@@ -2432,7 +2429,6 @@ fn sync_local_main_with_origin(current_dir: &Path) -> Result<(), String> {
     Err("local main diverged from origin/main; manual rebase/repair required".to_string())
 }
 
-#[cfg(test)]
 fn try_fast_forward_main(
     current_dir: &Path,
     branch: &str,
@@ -2473,6 +2469,25 @@ fn try_fast_forward_main(
     )?;
     sync_main_worktree_if_present(current_dir);
     Ok(())
+}
+
+fn rollback_local_main_after_failed_projection(reference_dir: &Path, previous_main_sha: &str) {
+    if validate_expected_head_sha(previous_main_sha).is_err() {
+        eprintln!(
+            "WARNING: skip local main rollback because previous SHA is invalid: `{previous_main_sha}`"
+        );
+        return;
+    }
+    if let Err(err) = git_run_checked(
+        reference_dir,
+        &["update-ref", "refs/heads/main", previous_main_sha],
+    ) {
+        eprintln!(
+            "WARNING: failed to rollback local refs/heads/main to {previous_main_sha}: {err}"
+        );
+        return;
+    }
+    sync_main_worktree_if_present(reference_dir);
 }
 
 fn resolve_primary_main_worktree(reference_dir: &Path) -> Result<PathBuf, String> {
@@ -3624,6 +3639,124 @@ fn replay_pending_verdict_projection_for_pr_locked(
     if replay_failed { None } else { latest_success }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub(super) struct ProjectionGapRepairSummary {
+    pub replayed_pending_projection: bool,
+    pub reprojected_from_snapshot: bool,
+    pub required_status_projected: bool,
+    pub auto_merge_attempted: bool,
+    pub remote_comment_bound: bool,
+    pub lifecycle_merged: bool,
+}
+
+impl ProjectionGapRepairSummary {
+    pub(super) const fn converged(self) -> bool {
+        self.remote_comment_bound || self.lifecycle_merged
+    }
+}
+
+fn snapshot_has_remote_comment_binding(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<bool, String> {
+    Ok(
+        verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, head_sha)?
+            .is_some_and(|snapshot| {
+                verdict_projection::has_remote_comment_binding(
+                    snapshot.source_comment_id,
+                    snapshot.source_comment_url.as_deref(),
+                )
+            }),
+    )
+}
+
+fn normalize_terminal_projection_decision(value: &str) -> Option<&'static str> {
+    let normalized = value.trim();
+    if normalized.eq_ignore_ascii_case("approve") {
+        Some("approve")
+    } else if normalized.eq_ignore_ascii_case("deny") {
+        Some("deny")
+    } else {
+        None
+    }
+}
+
+fn reproject_terminal_verdict_dimensions_from_snapshot_locked(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+) -> Result<bool, String> {
+    let Some(snapshot) =
+        verdict_projection::load_verdict_projection_snapshot(owner_repo, pr_number, head_sha)?
+    else {
+        return Ok(false);
+    };
+
+    let mut dimensions = snapshot.dimensions;
+    dimensions.sort_by(|lhs, rhs| lhs.dimension.cmp(&rhs.dimension));
+
+    let mut projected_any = false;
+    for dimension in dimensions {
+        let Some(decision) = normalize_terminal_projection_decision(&dimension.decision) else {
+            continue;
+        };
+        let reason = (!dimension.reason.trim().is_empty()).then_some(dimension.reason.as_str());
+        verdict_projection::persist_verdict_projection_locked(
+            owner_repo,
+            Some(pr_number),
+            Some(head_sha),
+            &dimension.dimension,
+            decision,
+            reason,
+            dimension.model_id.as_deref(),
+            dimension.backend_id.as_deref(),
+            false,
+        )?;
+        projected_any = true;
+    }
+
+    Ok(projected_any)
+}
+
+pub(super) fn reconcile_projection_gap_for_head(
+    owner_repo: &str,
+    pr_number: u32,
+    head_sha: &str,
+    merge_source: &str,
+) -> Result<ProjectionGapRepairSummary, String> {
+    validate_expected_head_sha(head_sha)?;
+    replay_pending_merge_projection_for_repo(owner_repo);
+
+    let _projection_lock = verdict_projection::acquire_projection_lock(owner_repo, pr_number)?;
+    let replayed_pending_projection =
+        replay_pending_verdict_projection_for_pr_locked(owner_repo, pr_number, Some(head_sha))
+            .is_some();
+    let reprojected_from_snapshot = if replayed_pending_projection {
+        false
+    } else {
+        reproject_terminal_verdict_dimensions_from_snapshot_locked(owner_repo, pr_number, head_sha)?
+    };
+
+    project_fac_required_status_with_fallback(owner_repo, pr_number, head_sha)?;
+    let mut auto_merge_attempted = false;
+    if let Some(record) = load_pr_state_for_readonly(owner_repo, pr_number)? {
+        auto_merge_attempted = record.pr_state == PrLifecycleState::MergeReady;
+        maybe_auto_merge_if_ready(&record, merge_source)?;
+    }
+
+    Ok(ProjectionGapRepairSummary {
+        replayed_pending_projection,
+        reprojected_from_snapshot,
+        required_status_projected: true,
+        auto_merge_attempted,
+        remote_comment_bound: snapshot_has_remote_comment_binding(owner_repo, pr_number, head_sha)?,
+        lifecycle_merged: load_pr_state_for_readonly(owner_repo, pr_number)?
+            .is_some_and(|record| record.pr_state == PrLifecycleState::Merged),
+    })
+}
+
 /// Run auto-merge synchronously when the PR reaches `MergeReady`. Earlier
 /// versions spawned a background thread, but short-lived CLI processes
 /// (reviewer agents) exit immediately after verdict set, killing the thread
@@ -3706,21 +3839,43 @@ fn maybe_auto_merge_if_ready_inner(record: &PrLifecycleRecord, source: &str) -> 
     };
 
     let merge_result = (|| -> Result<MergeProjectionContext, String> {
-        let projected = project_merge_on_any_sink_with_retry(
+        // Local merge first: advance local main as a fast-forward before any
+        // external projection/merge call.
+        let previous_main_sha = git_stdout_checked(
+            &merge_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/main^{commit}",
+            ],
+        )?;
+        try_fast_forward_main(&merge_dir, branch, &record.current_sha)?;
+
+        let projected = match project_merge_on_any_sink_with_retry(
             &record.owner_repo,
             record.pr_number,
             &record.current_sha,
             3,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                rollback_local_main_after_failed_projection(&merge_dir, &previous_main_sha);
+                return Err(err);
+            },
+        };
         eprintln!(
             "INFO: auto-merge fanout succeeded via sink={} merged_sha={}",
             projected.sink.as_str(),
             projected.merge_sha
         );
 
-        // RFC-0032::REQ-0255 S7: projection-first merge flow. Local main is reset only
-        // after an external projection has produced an authoritative merged SHA.
-        reset_local_main_after_projection(&merge_dir, &projected.merge_sha)?;
+        if !projected
+            .merge_sha
+            .eq_ignore_ascii_case(&record.current_sha)
+        {
+            reset_local_main_after_projection(&merge_dir, &projected.merge_sha)?;
+        }
 
         let persisted_receipt = persist_signed_merge_receipt(
             &record.owner_repo,
