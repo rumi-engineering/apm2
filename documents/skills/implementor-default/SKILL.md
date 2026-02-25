@@ -89,24 +89,19 @@ decision_tree:
           action: "Read any orchestrator-provided warm handoff files before edits."
         - id: LOAD_REQUIREMENT_BINDINGS
           action: |
-            If operating from a YAML-backed ticket:
-              For each entry in binds.requirements: read the file at requirement_ref
-              (strip the #anchor suffix). Extract statement, acceptance_criteria, and
-              priority. Merge these acceptance_criteria with definition_of_done.criteria
-              to form your complete implementation checklist.
-              For each entry in binds.evidence_artifacts: read the file at artifact_ref
-              (strip the #anchor suffix). Note expected_contents — this tells you exactly
-              what proof your PR must include (e.g., denial proofs, lifecycle receipts).
+            All work is now daemon-only (no YAML ticket files). Requirements live
+            in RFC nodes.
 
-            If operating from a daemon-only work object (no YAML):
-              Use WorkSpecV1.requirement_ids as the checklist source. Read each
-              referenced requirement file directly. If a requirement file does not exist
-              on disk, STOP with BLOCKED and report the missing path — do not fabricate
-              acceptance criteria.
+            Use WorkSpecV1.requirement_ids as the checklist source. Read each
+            requirement from the RFC JSON directly:
+              jq -r --arg id "<REQ_ID>" '.. | objects | select(.type?=="requirement" and .id==$id) | .data.statement' documents/rfcs/<RFC_ID>.cac.rfc_doc.v1.json
 
-            In all cases: read the parent RFC at documents/rfcs/<rfc_id>/ for design
-            context when requirement statements reference concepts you do not yet
-            understand.
+            If a requirement_id does not resolve, STOP with BLOCKED and report
+            the missing path — do not fabricate acceptance criteria.
+
+            Read the parent RFC at documents/rfcs/<rfc_id>.cac.rfc_doc.v1.json for
+            design context when requirement statements reference concepts you do not
+            yet understand.
         - id: LIST_MODULE_AGENTS_DOCS
           action: "List module-level AGENTS docs with `rg --files -g 'AGENTS.json' crates` and record candidates for touched areas."
         - id: READ_RELEVANT_MODULE_AGENTS
@@ -117,7 +112,36 @@ decision_tree:
       purpose: "Prepare and prove a healthy worktree before code edits."
       steps[5]:
         - id: SELECT_OR_CREATE_WORKTREE
-          action: "Implementor agent chooses/creates the correct worktree path and branch naming convention for the assigned scope."
+          action: |
+            Choose an existing worktree or create a new branch in the current worktree.
+            Branch naming: `ticket/<RFC_ID>/<TCK_ID>` (e.g. `ticket/RFC-0020/TCK-00681`).
+
+            If a work object does not yet exist for this task, create one first:
+
+              # 1. Find a recent valid claim lease from the ledger (any L-... from a previous work item):
+              apm2 fac work list | jq -r '.items[-1].latest_receipt_hash'
+              # => e.g. L-031f8282-2573-4441-8356-92614fd39fe9
+
+              # 2. Create a minimal work-scope JSON:
+              cat > /tmp/work-scope.TCK-NNNNN.json << 'JSON'
+              {
+                "ticket_meta": {
+                  "ticket": { "id": "TCK-NNNNN", "title": "Your title here" },
+                  "binds": { "rfc_id": "RFC-XXXX", "requirements": [] }
+                }
+              }
+              JSON
+
+              # 3. Open and claim the work:
+              apm2 fac work open --from-ticket /tmp/work-scope.TCK-NNNNN.json --lease-id L-<recent-claim-lease>
+              apm2 fac work claim --work-id W-TCK-NNNNN --lease-id L-<same-lease> --role implementer
+              # The claim response includes `issued_lease_id` — this is the binding used by push.
+
+              # 4. Create the branch (in a worktree, not the main repo):
+              git checkout -b ticket/RFC-XXXX/TCK-NNNNN origin/main
+
+            IMPORTANT: Main repo (/home/ubuntu/Projects/apm2) MUST stay on `main`.
+            All ticket branches live in worktrees under /home/ubuntu/Projects/apm2-worktrees/.
         - id: MAINLINE_SYNC
           action: |
             Synchronize worktree with the local main branch. Local main is
@@ -292,10 +316,10 @@ decision_tree:
             It will not stage or commit for you.
             First run `apm2 fac work current` to verify work binding.
             Then run `apm2 fac push`:
-              - Add `--ticket <TICKET_YAML>` only when a YAML file exists for this
-                work item (provides PR title/body from YAML metadata).
-              - Omit `--ticket` when operating from a daemon-only work object; push
-                will use WorkSpecV1.title and .summary from CAS projection instead.
+              - Do NOT pass `--ticket`; YAML ticket files are no longer used. Push
+                will use WorkSpecV1.title and .summary from the daemon CAS projection.
+              - Push auto-resolves work binding from the branch name (TCK-NNNNN) and
+                the daemon projection; no manual --work-id or --lease-id flags needed.
               - Add `--handoff-note <NOTE>` only when needed.
             Expect about 5-10 minutes on a fresh worktree.
         - id: CAPTURE_PR_CONTEXT
