@@ -1359,10 +1359,17 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
     // Collect all legacy rows into a Vec first. This drops the statement
     // borrow before we begin writing, preventing SQLITE_BUSY on the same
     // connection (N+1 query fix).
-    let legacy_rows: Vec<(String, String, String, Option<String>, i64, i64)> = {
+    //
+    // The legacy schema stores `gate_type` as a separate column, whereas
+    // the new `orchestrator_kernel_intents.intent_json` column expects a
+    // full `GateTimeoutIntent { lease, gate_type }` JSON envelope. We
+    // must read `gate_type` here so we can reconstruct the envelope below.
+    #[allow(clippy::type_complexity)]
+    let legacy_rows: Vec<(String, String, String, String, Option<String>, i64, i64)> = {
         let mut stmt = guard
             .prepare(
-                "SELECT intent_key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns
+                "SELECT intent_key, gate_type, lease_json, state, blocked_reason,
+                        created_at_ns, updated_at_ns
                  FROM gate_timeout_intents
                  WHERE state IN ('pending', 'done', 'blocked')",
             )
@@ -1370,13 +1377,15 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
         let rows = stmt
             .query_map([], |row| {
                 let key: String = row.get(0)?;
-                let lease_json: String = row.get(1)?;
-                let state: String = row.get(2)?;
-                let blocked_reason: Option<String> = row.get(3)?;
-                let created_at_ns: i64 = row.get(4)?;
-                let updated_at_ns: i64 = row.get(5)?;
+                let gate_type_raw: String = row.get(1)?;
+                let lease_json: String = row.get(2)?;
+                let state: String = row.get(3)?;
+                let blocked_reason: Option<String> = row.get(4)?;
+                let created_at_ns: i64 = row.get(5)?;
+                let updated_at_ns: i64 = row.get(6)?;
                 Ok((
                     key,
+                    gate_type_raw,
                     lease_json,
                     state,
                     blocked_reason,
@@ -1425,11 +1434,47 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
     let tx = guard
         .transaction()
         .map_err(|e| format!("intent migration: failed to begin transaction: {e}"))?;
-    for (key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) in &legacy_rows {
+    for (key, gate_type_raw, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) in
+        &legacy_rows
+    {
         let mapped_state = match state.as_str() {
             "done" => "completed",
             other => other,
         };
+
+        // Reconstruct the full GateTimeoutIntent JSON envelope from the
+        // separate legacy columns. If the row is malformed (bad gate_type
+        // or corrupt lease_json), quarantine it as 'blocked' with reason
+        // instead of poisoning the pending dequeue queue.
+        let intent_json = match reconstruct_intent_json(gate_type_raw, lease_json) {
+            Ok(json) => json,
+            Err(reason) => {
+                tracing::warn!(
+                    intent_key = %key,
+                    "intent migration: quarantining malformed legacy row: {reason}"
+                );
+                // Insert as blocked so this row is not dequeued but is
+                // still tracked for audit. Use the original lease_json
+                // as a best-effort payload to preserve evidence.
+                tx.execute(
+                    "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                     (orchestrator_id, intent_key, intent_json, state,
+                      created_at_ns, updated_at_ns, blocked_reason)
+                     VALUES (?1, ?2, ?3, 'blocked', ?4, ?5, ?6)",
+                    params![
+                        GATE_TIMEOUT_ORCHESTRATOR_ID,
+                        key,
+                        lease_json,
+                        created_at_ns,
+                        updated_at_ns,
+                        reason
+                    ],
+                )
+                .map_err(|e| format!("intent migration: failed to insert blocked intent: {e}"))?;
+                continue;
+            },
+        };
+
         tx.execute(
             "INSERT OR IGNORE INTO orchestrator_kernel_intents
              (orchestrator_id, intent_key, intent_json, state,
@@ -1438,7 +1483,7 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
             params![
                 GATE_TIMEOUT_ORCHESTRATOR_ID,
                 key,
-                lease_json,
+                intent_json,
                 mapped_state,
                 created_at_ns,
                 updated_at_ns,
@@ -1450,6 +1495,25 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
     tx.commit()
         .map_err(|e| format!("intent migration: failed to commit transaction: {e}"))?;
     Ok(())
+}
+
+/// Reconstructs a full `GateTimeoutIntent` JSON string from legacy schema
+/// columns (`gate_type` text and `lease_json` blob). Validates the
+/// deserialized `GateLease` to reject corrupt legacy data before it enters
+/// the shared intent store.
+///
+/// Returns `Err` with a human-readable reason if the row is malformed.
+fn reconstruct_intent_json(gate_type_raw: &str, lease_json: &str) -> Result<String, String> {
+    let gate_type = parse_gate_type(gate_type_raw)
+        .ok_or_else(|| format!("unknown legacy gate_type '{gate_type_raw}'"))?;
+    let lease: GateLease = serde_json::from_str(lease_json)
+        .map_err(|e| format!("failed to deserialize legacy lease_json: {e}"))?;
+    lease
+        .validate()
+        .map_err(|e| format!("legacy lease invariant violation: {e}"))?;
+    let intent = GateTimeoutIntent { lease, gate_type };
+    serde_json::to_string(&intent)
+        .map_err(|e| format!("failed to serialize reconstructed GateTimeoutIntent: {e}"))
 }
 
 /// Migrate legacy `gate_timeout_effect_journal.sqlite` file to the shared
@@ -2684,6 +2748,242 @@ mod tests {
             matches!(events[0].kind, TimeoutObservedKind::Skipped { .. }),
             "garbage row must be Skipped, got: {:?}",
             events[0].kind
+        );
+    }
+
+    /// Regression: `migrate_legacy_intents` must reconstruct a full
+    /// `GateTimeoutIntent { lease, gate_type }` JSON envelope from the
+    /// legacy schema that stores `gate_type` in a separate column. Without
+    /// this reconstruction, `SqliteIntentStore::dequeue_batch` fails with
+    /// JSON decode errors, permanently wedging the timeout kernel.
+    #[tokio::test]
+    async fn migrate_legacy_intents_reconstructs_intent_json() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite should open"),
+        ));
+
+        // Create the shared orchestrator runtime schema (target tables).
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            init_orchestrator_runtime_schema(&guard)
+                .expect("init orchestrator runtime schema should succeed");
+        }
+
+        // Create the legacy `gate_timeout_intents` table with its original
+        // schema that stores `gate_type` as a separate column.
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "CREATE TABLE gate_timeout_intents (
+                        intent_key TEXT PRIMARY KEY,
+                        work_id TEXT NOT NULL,
+                        gate_type TEXT NOT NULL,
+                        lease_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('pending', 'done', 'blocked')),
+                        blocked_reason TEXT,
+                        created_at_ns INTEGER NOT NULL,
+                        updated_at_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy table should succeed");
+        }
+
+        // Insert legacy rows with `lease_json` as plain GateLease JSON
+        // and `gate_type` as a separate column value.
+        let lease_quality = sample_gate_lease("lease-migrate-quality", 5_000);
+        let lease_security = sample_gate_lease("lease-migrate-security", 6_000);
+        let quality_json = serde_json::to_string(&lease_quality).expect("serialize quality lease");
+        let security_json =
+            serde_json::to_string(&lease_security).expect("serialize security lease");
+
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "INSERT INTO gate_timeout_intents
+                     (intent_key, work_id, gate_type, lease_json, state,
+                      created_at_ns, updated_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        "lease-migrate-quality",
+                        "W-1",
+                        "quality",
+                        &quality_json,
+                        1000_i64,
+                        1000_i64
+                    ],
+                )
+                .expect("insert legacy quality row");
+            guard
+                .execute(
+                    "INSERT INTO gate_timeout_intents
+                     (intent_key, work_id, gate_type, lease_json, state,
+                      created_at_ns, updated_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        "lease-migrate-security",
+                        "W-1",
+                        "security",
+                        &security_json,
+                        2000_i64,
+                        2000_i64
+                    ],
+                )
+                .expect("insert legacy security row");
+        }
+
+        // Run migration.
+        migrate_legacy_intents(&conn).expect("migration should succeed");
+
+        // Verify: dequeue from the shared intent store must return fully
+        // formed `GateTimeoutIntent` values with correct `gate_type`.
+        let store: SqliteIntentStore<GateTimeoutIntent> =
+            SqliteIntentStore::new(Arc::clone(&conn), GATE_TIMEOUT_ORCHESTRATOR_ID);
+        let dequeued = store
+            .dequeue_batch(10)
+            .await
+            .expect("dequeue_batch must succeed after migration");
+
+        assert_eq!(
+            dequeued.len(),
+            2,
+            "both legacy pending rows must be dequeued"
+        );
+
+        // Sort by lease_id for deterministic assertions.
+        let mut sorted = dequeued;
+        sorted.sort_by(|a, b| a.lease.lease_id.cmp(&b.lease.lease_id));
+
+        assert_eq!(sorted[0].lease.lease_id, "lease-migrate-quality");
+        assert_eq!(sorted[0].gate_type, GateType::Quality);
+        assert_eq!(sorted[1].lease.lease_id, "lease-migrate-security");
+        assert_eq!(sorted[1].gate_type, GateType::Security);
+    }
+
+    /// Regression: malformed legacy rows (bad `gate_type` or corrupt lease
+    /// JSON) must be quarantined as 'blocked' rather than failing the
+    /// migration or poisoning the pending dequeue.
+    #[tokio::test]
+    async fn migrate_legacy_intents_quarantines_malformed_rows() {
+        let conn = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory sqlite should open"),
+        ));
+
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            init_orchestrator_runtime_schema(&guard)
+                .expect("init orchestrator runtime schema should succeed");
+        }
+
+        // Create legacy table.
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            guard
+                .execute(
+                    "CREATE TABLE gate_timeout_intents (
+                        intent_key TEXT PRIMARY KEY,
+                        work_id TEXT NOT NULL,
+                        gate_type TEXT NOT NULL,
+                        lease_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('pending', 'done', 'blocked')),
+                        blocked_reason TEXT,
+                        created_at_ns INTEGER NOT NULL,
+                        updated_at_ns INTEGER NOT NULL
+                    )",
+                    [],
+                )
+                .expect("create legacy table should succeed");
+        }
+
+        // Insert a valid row and a malformed row (bad gate_type).
+        let valid_lease = sample_gate_lease("lease-valid", 5_000);
+        let valid_json = serde_json::to_string(&valid_lease).expect("serialize valid lease");
+
+        {
+            let guard = conn.lock().expect("sqlite lock");
+            // Valid row.
+            guard
+                .execute(
+                    "INSERT INTO gate_timeout_intents
+                     (intent_key, work_id, gate_type, lease_json, state,
+                      created_at_ns, updated_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        "lease-valid",
+                        "W-1",
+                        "quality",
+                        &valid_json,
+                        1000_i64,
+                        1000_i64
+                    ],
+                )
+                .expect("insert valid legacy row");
+            // Malformed row: unknown gate_type.
+            guard
+                .execute(
+                    "INSERT INTO gate_timeout_intents
+                     (intent_key, work_id, gate_type, lease_json, state,
+                      created_at_ns, updated_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        "lease-bad-type",
+                        "W-1",
+                        "nonexistent_gate",
+                        &valid_json,
+                        2000_i64,
+                        2000_i64
+                    ],
+                )
+                .expect("insert malformed legacy row");
+            // Malformed row: corrupt lease JSON.
+            guard
+                .execute(
+                    "INSERT INTO gate_timeout_intents
+                     (intent_key, work_id, gate_type, lease_json, state,
+                      created_at_ns, updated_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+                    params![
+                        "lease-bad-json",
+                        "W-1",
+                        "security",
+                        "{ not valid json",
+                        3000_i64,
+                        3000_i64
+                    ],
+                )
+                .expect("insert corrupt json legacy row");
+        }
+
+        // Migration must succeed (not fail on malformed rows).
+        migrate_legacy_intents(&conn).expect("migration must succeed despite malformed rows");
+
+        // Only the valid row should be dequeue-able as pending.
+        let store: SqliteIntentStore<GateTimeoutIntent> =
+            SqliteIntentStore::new(Arc::clone(&conn), GATE_TIMEOUT_ORCHESTRATOR_ID);
+        let dequeued = store
+            .dequeue_batch(10)
+            .await
+            .expect("dequeue_batch must succeed after migration");
+
+        assert_eq!(dequeued.len(), 1, "only the valid row should be pending");
+        assert_eq!(dequeued[0].lease.lease_id, "lease-valid");
+        assert_eq!(dequeued[0].gate_type, GateType::Quality);
+
+        // The malformed rows should be in 'blocked' state.
+        let guard = conn.lock().expect("sqlite lock");
+        let blocked_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1 AND state = 'blocked'",
+                params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+                |r| r.get(0),
+            )
+            .expect("count blocked rows");
+        assert_eq!(
+            blocked_count, 2,
+            "both malformed rows must be quarantined as blocked"
         );
     }
 }
