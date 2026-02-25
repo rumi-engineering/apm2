@@ -24,6 +24,27 @@ const MAX_DEQUEUE_BATCH: usize = 4096;
 /// call. This bounds the transaction size and prevents unbounded write batches.
 const MAX_ENQUEUE_BATCH: usize = 4096;
 
+/// Maximum byte length for any JSON payload retrieved from `SQLite` before
+/// deserialization. Prevents denial-of-service via oversized JSON strings
+/// stored by a compromised or buggy writer.
+const MAX_JSON_BYTES: usize = 65_536;
+
+// ---------------------------------------------------------------------------
+// Post-deserialization validation
+// ---------------------------------------------------------------------------
+
+/// Validates that a raw JSON string does not exceed `MAX_JSON_BYTES` before
+/// deserialization. Returns `Err` with a descriptive message if oversized.
+fn validate_json_size(json_str: &str, context: &str) -> Result<(), String> {
+    if json_str.len() > MAX_JSON_BYTES {
+        return Err(format!(
+            "{context}: JSON payload length {} exceeds MAX_JSON_BYTES ({MAX_JSON_BYTES})",
+            json_str.len()
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Schema init
 // ---------------------------------------------------------------------------
@@ -130,12 +151,14 @@ impl<C: KernelCursor> SqliteCursorStore<C> {
         row.map_or_else(
             || Ok(C::default()),
             |json| {
-                serde_json::from_str(&json).map_err(|e| {
+                validate_json_size(&json, "cursor store load")?;
+                let cursor: C = serde_json::from_str(&json).map_err(|e| {
                     format!(
                         "failed to decode cursor json for '{}': {e}",
                         self.orchestrator_id
                     )
-                })
+                })?;
+                Ok(cursor)
             },
         )
     }
@@ -241,12 +264,12 @@ where
             ));
         }
         let now_ns = epoch_now_ns_i64()?;
-        let guard = self
+        let mut guard = self
             .conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
         let tx = guard
-            .unchecked_transaction()
+            .transaction()
             .map_err(|e| format!("failed to begin intent enqueue transaction: {e}"))?;
         let mut inserted = 0usize;
         for intent in intents {
@@ -296,6 +319,7 @@ where
         let mut intents = Vec::new();
         for row in rows {
             let json = row.map_err(|e| format!("failed to decode intent row: {e}"))?;
+            validate_json_size(&json, "intent store dequeue")?;
             let intent: I = serde_json::from_str(&json)
                 .map_err(|e| format!("failed to decode intent json: {e}"))?;
             intents.push(intent);
@@ -953,5 +977,72 @@ mod tests {
 
         assert_eq!(loaded_a, cursor_a, "orchestrator A cursor isolated");
         assert_eq!(loaded_b, cursor_b, "orchestrator B cursor isolated");
+    }
+
+    // -- Oversized JSON rejection tests --
+
+    #[tokio::test]
+    async fn test_cursor_store_rejects_oversized_json_on_load() {
+        let conn = test_conn();
+
+        // Manually insert an oversized cursor JSON directly into SQLite.
+        let oversized_event_id = "x".repeat(MAX_JSON_BYTES + 1);
+        let oversized_json = format!(r#"{{"timestamp_ns":0,"event_id":"{oversized_event_id}"}}"#);
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute(
+                    "INSERT INTO orchestrator_kernel_cursors
+                     (orchestrator_id, cursor_json, updated_at_ns)
+                     VALUES (?1, ?2, 0)",
+                    params!["orch-oversized", &oversized_json],
+                )
+                .expect("manual insert oversized cursor");
+        }
+
+        let store = SqliteCursorStore::<CompositeCursor>::new(conn, "orch-oversized");
+        let result = store.load().await;
+        assert!(
+            result.is_err(),
+            "loading an oversized cursor JSON must return Err, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("MAX_JSON_BYTES"),
+            "error should reference MAX_JSON_BYTES: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_intent_store_rejects_oversized_json_on_dequeue() {
+        let conn = test_conn();
+
+        // Manually insert an oversized intent JSON directly into SQLite.
+        let oversized_data = "x".repeat(MAX_JSON_BYTES + 1);
+        let oversized_json = format!(r#"{{"key":"oversized-intent","data":"{oversized_data}"}}"#);
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute(
+                    "INSERT INTO orchestrator_kernel_intents
+                     (orchestrator_id, intent_key, intent_json, state,
+                      created_at_ns, updated_at_ns, blocked_reason)
+                     VALUES (?1, ?2, ?3, 'pending', 0, 0, NULL)",
+                    params!["orch-oversized-intent", "oversized-intent", &oversized_json],
+                )
+                .expect("manual insert oversized intent");
+        }
+
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "orch-oversized-intent");
+        let result = store.dequeue_batch(10).await;
+        assert!(
+            result.is_err(),
+            "dequeuing an oversized intent JSON must return Err, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("MAX_JSON_BYTES"),
+            "error should reference MAX_JSON_BYTES: {err}"
+        );
     }
 }

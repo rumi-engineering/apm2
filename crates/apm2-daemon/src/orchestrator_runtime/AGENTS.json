@@ -55,6 +55,18 @@
       "kind": "safety",
       "title": "Legacy effect journal migration treats started/unknown as unknown (fail-closed)",
       "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-010",
+      "kind": "safety",
+      "title": "JSON payloads from SQLite validated against MAX_JSON_BYTES (65536) before deserialization to prevent DoS",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-OKRT-011",
+      "kind": "safety",
+      "title": "GateLease.validate() called after every deserialization from SQLite to enforce field-level string bounds",
+      "rfc": ["RFC-0020"]
     }
   ]
 }

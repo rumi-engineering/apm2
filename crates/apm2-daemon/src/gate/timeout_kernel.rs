@@ -21,6 +21,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, GateType};
 use crate::ledger::SqliteLedgerEventEmitter;
+use crate::ledger_poll;
 use crate::orchestrator_runtime::sqlite::{
     IntentKeyed, SqliteCursorStore, SqliteEffectJournal, SqliteIntentStore,
     init_orchestrator_runtime_schema,
@@ -353,6 +354,7 @@ impl CursorEvent<CompositeCursor> for TimeoutObservedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GateTimeoutIntent {
     lease: GateLease,
     gate_type: GateType,
@@ -612,8 +614,17 @@ impl SqliteTimeoutObservedLeaseStore {
             let gate_type = parse_gate_type(&gate_type_raw).ok_or_else(|| {
                 format!("unknown gate_type '{gate_type_raw}' in observed lease store")
             })?;
+            if lease_json.len() > 65_536 {
+                return Err(format!(
+                    "observed lease JSON payload length {} exceeds maximum (65536)",
+                    lease_json.len()
+                ));
+            }
             let lease: GateLease = serde_json::from_str(&lease_json)
                 .map_err(|e| format!("failed to decode observed lease json: {e}"))?;
+            lease
+                .validate()
+                .map_err(|e| format!("observed lease invariant violation: {e}"))?;
             let observed_wall_ms = u64::try_from(observed_wall_ms_i64).unwrap_or(now_wall_ms);
             let observed_monotonic_ns = u64::try_from(observed_monotonic_ns_i64).unwrap_or(0);
             let deadline_monotonic_ns = u64::try_from(deadline_monotonic_ns_i64).unwrap_or(0);
@@ -1137,7 +1148,7 @@ impl SqliteTimeoutLedgerReader {
             .lock()
             .map_err(|e| format!("ledger reader lock poisoned: {e}"))?;
 
-        let signed_events = crate::ledger_poll::poll_events_blocking(
+        let signed_events = ledger_poll::poll_events_blocking(
             &guard,
             TIMEOUT_EVENT_TYPES,
             cursor_ts_i64,
@@ -1550,6 +1561,12 @@ fn parse_gate_type_from_gate_id(gate_id: &str) -> Option<GateType> {
 }
 
 fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), String> {
+    if payload.len() > 65_536 {
+        return Err(format!(
+            "gate_lease_issued payload length {} exceeds maximum (65536)",
+            payload.len()
+        ));
+    }
     let payload_json: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| format!("failed to decode gate_lease_issued payload json: {e}"))?;
     let (lease_value, decode_context) = payload_json
@@ -1563,6 +1580,9 @@ fn parse_gate_lease_payload(payload: &[u8]) -> Result<(GateLease, GateType), Str
     let lease: GateLease = serde_json::from_value(lease_value).map_err(|e| {
         format!("failed to decode gate_lease_issued payload ({decode_context}): {e}")
     })?;
+    lease
+        .validate()
+        .map_err(|e| format!("gate_lease_issued lease invariant violation: {e}"))?;
     let gate_type = parse_gate_type_from_gate_id(&lease.gate_id).ok_or_else(|| {
         format!(
             "gate_lease_issued full_lease has unsupported gate_id '{}'",

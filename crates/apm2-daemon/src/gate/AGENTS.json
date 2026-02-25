@@ -103,6 +103,18 @@
       "kind": "invariant",
       "title": "SqliteTimeoutLedgerReader.poll delegates to shared ledger_poll module (TCK-00675)",
       "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-018",
+      "kind": "safety",
+      "title": "GateTimeoutIntent uses #[serde(deny_unknown_fields)] to reject unexpected fields",
+      "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-019",
+      "kind": "safety",
+      "title": "parse_gate_lease_payload validates payload size and calls GateLease::validate() after deserialization",
+      "rfc": ["RFC-0020"]
     }
   ]
 }
