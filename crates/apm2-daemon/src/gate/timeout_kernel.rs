@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use apm2_core::events::GateReceipt as LedgerGateReceipt;
+use apm2_core::events::{GateReceipt as LedgerGateReceipt, Validate};
 use apm2_core::fac::GateLease;
 use apm2_core::orchestrator_kernel::{
     CompositeCursor, CursorEvent, CursorStore, EffectExecutionState, EffectJournal,
@@ -945,9 +945,10 @@ impl SqliteTimeoutTerminalChecker {
     }
 
     fn has_terminal_row_in_legacy(conn: &Connection, lease_id: &str) -> Result<bool, String> {
-        // Check gate.timed_out events using json_extract for O(log N) lookup
-        // instead of the previous O(N) instr() full-table scan (FINDING-4 fix).
-        // Filter by event_type first (uses index), then json_extract on payload.
+        // Check gate.timed_out events: indexed by event_type, then filtered by
+        // json_extract (sequential scan within event_type partition). Not true
+        // O(log N) — the json_extract predicate is evaluated row-by-row within
+        // the event_type index partition (FINDING-4 fix).
         let timed_out: bool = conn
             .query_row(
                 "SELECT 1 FROM ledger_events
@@ -966,9 +967,10 @@ impl SqliteTimeoutTerminalChecker {
         }
 
         // Check gate receipt events. Receipts may be JSON (json_extract) or
-        // protobuf (binary). Try json_extract first for O(log N) lookup on
-        // JSON payloads. If no JSON match, fall back to event_type-scoped
-        // instr() for protobuf payloads (still bounded by event_type filter).
+        // protobuf (binary). Try json_extract first — indexed by event_type,
+        // then json_extract filters within that partition (sequential scan).
+        // If no JSON match, fall back to event_type-scoped instr() for
+        // protobuf payloads (still bounded by event_type filter).
         for event_type in &["gate.receipt", "GateReceipt", "gate_receipt"] {
             // JSON path first.
             let json_found: bool = conn
@@ -1860,13 +1862,25 @@ fn quarantine_malformed_pending_intents(
         let batch_len = i64::try_from(batch.len()).unwrap_or(i64::MAX);
 
         // Validate each row and collect malformed keys for quarantine.
+        // Both structural (deserialization) and semantic (validate()) checks
+        // are performed so that oversized/invariant-violating intents are
+        // quarantined rather than left in the pending queue.
         let mut malformed_keys: Vec<(String, String)> = Vec::new();
         for (key, json) in &batch {
-            if serde_json::from_str::<GateTimeoutIntent>(json).is_err() {
-                malformed_keys.push((
-                    key.clone(),
-                    "malformed intent_json: failed to deserialize as GateTimeoutIntent".to_string(),
-                ));
+            match serde_json::from_str::<GateTimeoutIntent>(json) {
+                Err(_) => {
+                    malformed_keys.push((
+                        key.clone(),
+                        "malformed intent_json: failed to deserialize as GateTimeoutIntent"
+                            .to_string(),
+                    ));
+                },
+                Ok(intent) => {
+                    if let Err(e) = intent.validate() {
+                        malformed_keys
+                            .push((key.clone(), format!("semantic_validation_failed: {e}")));
+                    }
+                },
             }
         }
 
@@ -2107,12 +2121,14 @@ fn migrate_legacy_effect_journal(
 
 #[derive(Debug)]
 struct GateTimeoutReceiptWriter {
-    ledger_emitter: Option<SqliteLedgerEventEmitter>,
+    ledger_emitter: Option<Arc<SqliteLedgerEventEmitter>>,
 }
 
 impl GateTimeoutReceiptWriter {
-    const fn new(ledger_emitter: Option<SqliteLedgerEventEmitter>) -> Self {
-        Self { ledger_emitter }
+    fn new(ledger_emitter: Option<SqliteLedgerEventEmitter>) -> Self {
+        Self {
+            ledger_emitter: ledger_emitter.map(Arc::new),
+        }
     }
 }
 
@@ -2124,21 +2140,39 @@ impl ReceiptWriter<GateOrchestratorEvent> for GateTimeoutReceiptWriter {
             return Ok(());
         };
 
-        for event in receipts {
-            let (event_type, timestamp_ns) = timeout_event_persistence_fields(event);
-            let payload = serde_json::to_vec(event)
-                .map_err(|e| format!("failed to serialize timeout event for persistence: {e}"))?;
-            emitter
-                .emit_session_event(
-                    TIMEOUT_PERSISTOR_SESSION_ID,
-                    event_type,
-                    &payload,
-                    TIMEOUT_PERSISTOR_ACTOR_ID,
-                    timestamp_ns,
-                )
-                .map_err(|e| format!("failed to persist timeout event to ledger: {e}"))?;
-        }
-        Ok(())
+        // Pre-serialize all events on the async path (cheap CPU work) so that
+        // the blocking closure only performs synchronous SQLite I/O.
+        let serialized: Vec<(&'static str, u64, Vec<u8>)> = receipts
+            .iter()
+            .map(|event| {
+                let (event_type, timestamp_ns) = timeout_event_persistence_fields(event);
+                let payload = serde_json::to_vec(event).map_err(|e| {
+                    format!("failed to serialize timeout event for persistence: {e}")
+                })?;
+                Ok((event_type, timestamp_ns, payload))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // INV-CQ-OK-003: SqliteLedgerEventEmitter performs synchronous SQLite
+        // I/O, so we must offload to spawn_blocking to avoid blocking the
+        // tokio executor.
+        let emitter = Arc::clone(emitter);
+        tokio::task::spawn_blocking(move || {
+            for (event_type, timestamp_ns, payload) in &serialized {
+                emitter
+                    .emit_session_event(
+                        TIMEOUT_PERSISTOR_SESSION_ID,
+                        event_type,
+                        payload,
+                        TIMEOUT_PERSISTOR_ACTOR_ID,
+                        *timestamp_ns,
+                    )
+                    .map_err(|e| format!("failed to persist timeout event to ledger: {e}"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("persist_many spawn_blocking join failed: {e}"))?
     }
 }
 

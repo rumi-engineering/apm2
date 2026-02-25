@@ -141,24 +141,34 @@ impl<C: KernelCursor> SqliteCursorStore<C> {
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
 
-        // SQL-side length predicate: filter out oversized payloads before
-        // they are materialized as Rust strings (SEC finding: payload load
-        // before size check). The post-load validate_json_size is kept as a
-        // defence-in-depth safety net.
+        // Two-step fail-closed check (SEC finding fix):
+        // 1. Check if a row exists and get its length.
+        // 2. If exists AND oversized → return Err (not silent default).
+        // 3. If exists AND within bounds → deserialize.
+        // 4. If no row → return default cursor.
+        //
+        // This prevents conflating "missing cursor" (legitimate genesis) with
+        // "corrupt oversized cursor" (which should halt, not silently reset).
         let max_json_i64 = i64::try_from(MAX_JSON_BYTES).unwrap_or(i64::MAX);
-        let row: Option<String> = guard
+        let row_info: Option<(i64, String)> = guard
             .query_row(
-                "SELECT cursor_json FROM orchestrator_kernel_cursors
-                 WHERE orchestrator_id = ?1
-                   AND length(cursor_json) <= ?2",
-                params![&self.orchestrator_id, max_json_i64],
-                |r| r.get(0),
+                "SELECT length(cursor_json), cursor_json FROM orchestrator_kernel_cursors
+                 WHERE orchestrator_id = ?1",
+                params![&self.orchestrator_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| format!("failed to load cursor for '{}': {e}", self.orchestrator_id))?;
-        row.map_or_else(
-            || Ok(C::default()),
-            |json| {
+
+        match row_info {
+            None => Ok(C::default()),
+            Some((len, _)) if len > max_json_i64 => Err(format!(
+                "cursor store load: corrupt oversized cursor for '{}' \
+                 (length {} exceeds MAX_JSON_BYTES {MAX_JSON_BYTES})",
+                self.orchestrator_id, len
+            )),
+            Some((_, json)) => {
+                // Defence-in-depth: recheck byte length on the Rust side.
                 validate_json_size(&json, "cursor store load")?;
                 let cursor: C = serde_json::from_str(&json).map_err(|e| {
                     format!(
@@ -168,7 +178,7 @@ impl<C: KernelCursor> SqliteCursorStore<C> {
                 })?;
                 Ok(cursor)
             },
-        )
+        }
     }
 
     fn save_sync(&self, cursor: &C) -> Result<(), String> {
@@ -1134,21 +1144,19 @@ mod tests {
                 .expect("manual insert oversized cursor");
         }
 
-        // With SQL-side length predicate, the oversized row is filtered out
-        // at the query level and never materialized. load() returns the
-        // default cursor instead of an error (SEC finding fix: SQL-side
-        // length predicates before payload load).
+        // Fail-closed: an oversized cursor row MUST return Err, not silently
+        // fall back to the default cursor. Silent reset would replay from
+        // genesis, which is a correctness / security hazard.
         let store = SqliteCursorStore::<CompositeCursor>::new(conn, "orch-oversized");
         let result = store.load().await;
         assert!(
-            result.is_ok(),
-            "load must succeed (oversized row filtered at SQL level), got: {result:?}"
+            result.is_err(),
+            "load must fail for oversized cursor (not silently reset to default), got: {result:?}"
         );
-        let cursor = result.unwrap();
-        assert_eq!(
-            cursor,
-            CompositeCursor::default(),
-            "oversized row filtered out; default cursor returned"
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("corrupt oversized cursor"),
+            "error should mention corrupt oversized cursor: {err}"
         );
     }
 

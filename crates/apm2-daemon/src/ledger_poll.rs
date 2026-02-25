@@ -170,24 +170,32 @@ pub fn poll_events_blocking(
     )?;
 
     // --- Canonical events query (if table exists) ---
+    // Bound the canonical query to `limit - legacy_count` so the combined
+    // vector never exceeds `limit` entries, avoiding a transient 2x memory
+    // spike when both tables return a full batch.
     if detect_canonical_table(conn) {
-        let canonical = poll_canonical(
-            conn,
-            event_types,
-            &placeholders,
-            cursor_ts_ns,
-            &cursor_event_id,
-            limit_i64,
-        )?;
-        if !canonical.is_empty() {
-            events.extend(canonical);
-            // Merge-sort by (timestamp_ns, event_id) and truncate.
-            events.sort_by(|a, b| {
-                a.timestamp_ns
-                    .cmp(&b.timestamp_ns)
-                    .then_with(|| a.event_id.cmp(&b.event_id))
-            });
-            events.truncate(limit);
+        let remaining = limit.saturating_sub(events.len());
+        let remaining_i64 =
+            i64::try_from(remaining).map_err(|_| "poll remaining exceeds i64 range".to_string())?;
+        if remaining_i64 > 0 {
+            let canonical = poll_canonical(
+                conn,
+                event_types,
+                &placeholders,
+                cursor_ts_ns,
+                &cursor_event_id,
+                remaining_i64,
+            )?;
+            if !canonical.is_empty() {
+                events.extend(canonical);
+                // Merge-sort by (timestamp_ns, event_id) and truncate.
+                events.sort_by(|a, b| {
+                    a.timestamp_ns
+                        .cmp(&b.timestamp_ns)
+                        .then_with(|| a.event_id.cmp(&b.event_id))
+                });
+                events.truncate(limit);
+            }
         }
     }
 
