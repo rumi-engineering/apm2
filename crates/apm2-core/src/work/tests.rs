@@ -2503,7 +2503,7 @@ fn test_pr_number_rebinds_from_legacy_to_canonical_ticket_work() {
     let ctx = ReducerContext::new(1);
 
     let legacy_work_id = "W-439f2df5-4650-4632-9889-a39af6dae839";
-    let canonical_work_id = "W-RFC-0032::REQ-0268";
+    let canonical_work_id = "W-TCK-02680";
 
     setup_in_progress_work(&mut reducer, &ctx, legacy_work_id);
     setup_in_progress_work(&mut reducer, &ctx, canonical_work_id);
