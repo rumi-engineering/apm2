@@ -1776,56 +1776,117 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
 /// quarantines (marks `blocked`) any row whose `intent_json` cannot be
 /// deserialized as `GateTimeoutIntent`. This is called after ALL migration
 /// branches to ensure no malformed rows survive.
+///
+/// Processing is bounded: oversized payloads are quarantined at the SQL level
+/// without loading them into memory, and valid-sized rows are validated in
+/// batches of 500 to prevent startup-path OOM (SEC finding: unbounded scan).
 fn quarantine_malformed_pending_intents(
     conn: &std::sync::MutexGuard<'_, Connection>,
 ) -> Result<(), String> {
-    let malformed_keys: Vec<(String, String)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
-                 WHERE orchestrator_id = ?1 AND state = 'pending'
-                 ORDER BY created_at_ns ASC, intent_key ASC",
-            )
-            .map_err(|e| {
-                format!("intent migration: failed to prepare post-migration validation query: {e}")
-            })?;
-        let rows = stmt
-            .query_map(params![GATE_TIMEOUT_ORCHESTRATOR_ID], |row| {
-                let key: String = row.get(0)?;
-                let json: String = row.get(1)?;
-                Ok((key, json))
-            })
-            .map_err(|e| {
-                format!("intent migration: failed to query pending intents for validation: {e}")
-            })?;
-        let mut bad = Vec::new();
-        for row in rows {
-            let (key, json) =
-                row.map_err(|e| format!("intent migration: failed to decode validation row: {e}"))?;
-            if serde_json::from_str::<GateTimeoutIntent>(&json).is_err() {
-                bad.push((
-                    key,
+    // Maximum JSON payload size (matches SqliteIntentStore::MAX_JSON_BYTES).
+    const MAX_JSON_BYTES: i64 = 65_536;
+    const QUARANTINE_BATCH_SIZE: i64 = 500;
+
+    // Step 1: Quarantine oversized rows at the SQL level without loading
+    // payloads into memory. This prevents OOM from extremely large rows.
+    let now_ns = epoch_now_ns_i64()?;
+    let oversized_count = conn
+        .execute(
+            "UPDATE orchestrator_kernel_intents
+             SET state = 'blocked',
+                 blocked_reason = 'payload_exceeds_max_json_bytes',
+                 updated_at_ns = ?3
+             WHERE orchestrator_id = ?1 AND state = 'pending'
+               AND length(intent_json) > ?2",
+            params![GATE_TIMEOUT_ORCHESTRATOR_ID, MAX_JSON_BYTES, now_ns],
+        )
+        .map_err(|e| format!("intent migration: failed to quarantine oversized intents: {e}"))?;
+    if oversized_count > 0 {
+        tracing::warn!(
+            count = oversized_count,
+            "post-migration validation: quarantined {oversized_count} oversized pending row(s)"
+        );
+    }
+
+    // Step 2: Validate and quarantine malformed rows in batches of 500.
+    // Only fetches rows within the MAX_JSON_BYTES length budget.
+    let mut offset: i64 = 0;
+    loop {
+        let batch: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
+                     WHERE orchestrator_id = ?1 AND state = 'pending'
+                       AND length(intent_json) <= ?2
+                     ORDER BY created_at_ns ASC, intent_key ASC
+                     LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|e| {
+                    format!(
+                        "intent migration: failed to prepare post-migration validation query: {e}"
+                    )
+                })?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        GATE_TIMEOUT_ORCHESTRATOR_ID,
+                        MAX_JSON_BYTES,
+                        QUARANTINE_BATCH_SIZE,
+                        offset
+                    ],
+                    |row| {
+                        let key: String = row.get(0)?;
+                        let json: String = row.get(1)?;
+                        Ok((key, json))
+                    },
+                )
+                .map_err(|e| {
+                    format!("intent migration: failed to query pending intents for validation: {e}")
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("intent migration: failed to decode validation row: {e}"))?
+        };
+
+        if batch.is_empty() {
+            break; // All batches processed.
+        }
+
+        let batch_len = i64::try_from(batch.len()).unwrap_or(i64::MAX);
+
+        // Validate each row and collect malformed keys for quarantine.
+        let mut malformed_keys: Vec<(String, String)> = Vec::new();
+        for (key, json) in &batch {
+            if serde_json::from_str::<GateTimeoutIntent>(json).is_err() {
+                malformed_keys.push((
+                    key.clone(),
                     "malformed intent_json: failed to deserialize as GateTimeoutIntent".to_string(),
                 ));
             }
         }
-        bad
-    };
-    if !malformed_keys.is_empty() {
-        let now_ns = epoch_now_ns_i64()?;
-        for (key, reason) in &malformed_keys {
-            conn.execute(
-                "UPDATE orchestrator_kernel_intents
-                 SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
-                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
-                params![GATE_TIMEOUT_ORCHESTRATOR_ID, key, reason, now_ns],
-            )
-            .map_err(|e| format!("intent migration: failed to quarantine malformed intent: {e}"))?;
-            tracing::warn!(
-                intent_key = %key,
-                "post-migration validation: quarantined malformed pending row: {reason}"
-            );
+
+        if !malformed_keys.is_empty() {
+            let quarantine_now_ns = epoch_now_ns_i64()?;
+            for (key, reason) in &malformed_keys {
+                conn.execute(
+                    "UPDATE orchestrator_kernel_intents
+                     SET state = 'blocked', blocked_reason = ?3, updated_at_ns = ?4
+                     WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                    params![GATE_TIMEOUT_ORCHESTRATOR_ID, key, reason, quarantine_now_ns],
+                )
+                .map_err(|e| {
+                    format!("intent migration: failed to quarantine malformed intent: {e}")
+                })?;
+                tracing::warn!(
+                    intent_key = %key,
+                    "post-migration validation: quarantined malformed pending row: {reason}"
+                );
+            }
         }
+
+        if batch_len < QUARANTINE_BATCH_SIZE {
+            break; // Last batch (fewer rows than limit).
+        }
+        offset = offset.saturating_add(batch_len);
     }
     Ok(())
 }
@@ -1871,12 +1932,13 @@ fn migrate_legacy_effect_journal(
     conn: &Arc<Mutex<Connection>>,
     legacy_path: &Path,
 ) -> Result<(), String> {
+    const MIGRATION_BATCH_SIZE: i64 = 500;
+
     if !legacy_path.exists() {
         return Ok(());
     }
 
-    // Open legacy DB and read rows into Vec first (drops borrow before
-    // writing to the target connection).
+    // Open legacy DB to count rows first, then close before writing.
     let legacy_conn = Connection::open(legacy_path)
         .map_err(|e| format!("effect journal migration: failed to open legacy db: {e}"))?;
 
@@ -1900,28 +1962,19 @@ fn migrate_legacy_effect_journal(
         return Ok(());
     }
 
-    // Collect all rows into Vec to release the read borrow.
-    let legacy_rows: Vec<(String, String, i64)> = {
+    // Count legacy rows to determine migration scope. We use COUNT(*)
+    // instead of collecting all rows into memory to avoid OOM with large
+    // legacy tables (SEC finding: unbounded in-memory load).
+    let legacy_count: i64 = {
         let mut stmt = legacy_conn
-            .prepare(
-                "SELECT intent_key, state, updated_at_ns
-                 FROM gate_timeout_effect_journal_state",
-            )
+            .prepare("SELECT COUNT(*) FROM gate_timeout_effect_journal_state")
             .map_err(|e| {
-                format!("effect journal migration: failed to prepare legacy query: {e}")
+                format!("effect journal migration: failed to prepare legacy count: {e}")
             })?;
-        let rows = stmt
-            .query_map([], |row| {
-                let key: String = row.get(0)?;
-                let state: String = row.get(1)?;
-                let updated_at_ns: i64 = row.get(2)?;
-                Ok((key, state, updated_at_ns))
-            })
-            .map_err(|e| format!("effect journal migration: failed to query legacy rows: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("effect journal migration: failed to decode legacy rows: {e}"))?
+        stmt.query_row([], |row| row.get(0))
+            .map_err(|e| format!("effect journal migration: failed to count legacy rows: {e}"))?
     };
-    // Close legacy DB before writing to target.
+    // Close legacy DB before writing to target (we reopen per batch below).
     drop(legacy_conn);
 
     let mut guard = conn
@@ -1930,7 +1983,7 @@ fn migrate_legacy_effect_journal(
 
     // Skip if target already has at least as many rows as legacy source
     // (prior completed migration that was not renamed yet, or re-run).
-    if !legacy_rows.is_empty() {
+    if legacy_count > 0 {
         let target_count: i64 = guard
             .query_row(
                 "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal
@@ -1939,7 +1992,7 @@ fn migrate_legacy_effect_journal(
                 |r| r.get(0),
             )
             .map_err(|e| format!("effect journal migration: failed to count target rows: {e}"))?;
-        if target_count >= i64::try_from(legacy_rows.len()).unwrap_or(i64::MAX) {
+        if target_count >= legacy_count {
             // Target already populated; skip to rename.
             drop(guard);
             let migrated_path = legacy_path.with_extension("sqlite.migrated");
@@ -1948,38 +2001,91 @@ fn migrate_legacy_effect_journal(
             })?;
             return Ok(());
         }
+    } else {
+        // No legacy data to migrate — rename and return.
+        drop(guard);
+        let migrated_path = legacy_path.with_extension("sqlite.migrated");
+        std::fs::rename(legacy_path, &migrated_path)
+            .map_err(|e| format!("effect journal migration: failed to rename legacy file: {e}"))?;
+        return Ok(());
     }
 
-    // Wrap all INSERTs in a single transaction for crash-atomicity.
-    let now_ns = epoch_now_ns_i64()?;
-    let tx = guard
-        .transaction()
-        .map_err(|e| format!("effect journal migration: failed to begin transaction: {e}"))?;
-    for (key, state, updated_at_ns) in &legacy_rows {
-        // Fail-closed: treat started/unknown as unknown.
-        let mapped_state = match state.as_str() {
-            "completed" => "completed",
-            _ => "unknown",
+    // Process legacy rows in batches to prevent unbounded memory allocation
+    // (SEC finding: migrate_legacy_effect_journal unbounded in-memory load).
+    // Each batch reads up to 500 rows using LIMIT/OFFSET from the legacy DB,
+    // collects into a bounded Vec, then writes within a single transaction.
+    let mut offset: i64 = 0;
+    loop {
+        // Re-open legacy DB per batch to avoid holding two connections while
+        // writing to target (legacy_conn borrow released before guard write).
+        let legacy_conn = Connection::open(legacy_path)
+            .map_err(|e| format!("effect journal migration: failed to reopen legacy db: {e}"))?;
+        let batch: Vec<(String, String, i64)> = {
+            let mut stmt = legacy_conn
+                .prepare(
+                    "SELECT intent_key, state, updated_at_ns
+                     FROM gate_timeout_effect_journal_state
+                     ORDER BY rowid ASC
+                     LIMIT ?1 OFFSET ?2",
+                )
+                .map_err(|e| {
+                    format!("effect journal migration: failed to prepare legacy query: {e}")
+                })?;
+            let rows = stmt
+                .query_map(params![MIGRATION_BATCH_SIZE, offset], |row| {
+                    let key: String = row.get(0)?;
+                    let state: String = row.get(1)?;
+                    let updated_at_ns: i64 = row.get(2)?;
+                    Ok((key, state, updated_at_ns))
+                })
+                .map_err(|e| {
+                    format!("effect journal migration: failed to query legacy rows: {e}")
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                format!("effect journal migration: failed to decode legacy rows: {e}")
+            })?
         };
-        tx.execute(
-            "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
-             (orchestrator_id, intent_key, state, updated_at_ns)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                GATE_TIMEOUT_ORCHESTRATOR_ID,
-                key,
-                mapped_state,
-                if mapped_state == "unknown" {
-                    now_ns
-                } else {
-                    *updated_at_ns
-                }
-            ],
-        )
-        .map_err(|e| format!("effect journal migration: failed to insert: {e}"))?;
+        drop(legacy_conn);
+
+        if batch.is_empty() {
+            break; // All batches processed.
+        }
+
+        let batch_len = i64::try_from(batch.len()).unwrap_or(i64::MAX);
+
+        // Wrap each batch of INSERTs in a transaction for crash-atomicity.
+        let now_ns = epoch_now_ns_i64()?;
+        let tx = guard
+            .transaction()
+            .map_err(|e| format!("effect journal migration: failed to begin transaction: {e}"))?;
+        for (key, state, updated_at_ns) in &batch {
+            // Fail-closed: treat started/unknown as unknown.
+            let mapped_state = match state.as_str() {
+                "completed" => "completed",
+                _ => "unknown",
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
+                 (orchestrator_id, intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    GATE_TIMEOUT_ORCHESTRATOR_ID,
+                    key,
+                    mapped_state,
+                    if mapped_state == "unknown" {
+                        now_ns
+                    } else {
+                        *updated_at_ns
+                    }
+                ],
+            )
+            .map_err(|e| format!("effect journal migration: failed to insert: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("effect journal migration: failed to commit transaction: {e}"))?;
+
+        offset = offset.saturating_add(batch_len);
     }
-    tx.commit()
-        .map_err(|e| format!("effect journal migration: failed to commit transaction: {e}"))?;
     drop(guard);
 
     // Rename legacy file as durable completion marker.
