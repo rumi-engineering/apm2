@@ -1274,10 +1274,13 @@ fn migrate_legacy_cursor(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
 /// Migrate legacy `gate_timeout_intents` table to shared
 /// `orchestrator_kernel_intents`.
 ///
-/// Only copies if target has no rows for `gate_timeout_kernel`.
+/// Skips if the legacy table does not exist OR if the legacy table is empty
+/// AND the target already has rows (indicating a completed prior migration).
+/// All INSERTs are wrapped in a single transaction for atomicity.
+///
 /// Idempotent: safe to call on every startup.
 fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
-    let guard = conn
+    let mut guard = conn
         .lock()
         .map_err(|e| format!("intent migration lock poisoned: {e}"))?;
 
@@ -1296,8 +1299,60 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
         return Ok(());
     }
 
-    // Check if target already has rows for this orchestrator.
-    let count: i64 = guard
+    // Collect all legacy rows into a Vec first. This drops the statement
+    // borrow before we begin writing, preventing SQLITE_BUSY on the same
+    // connection (N+1 query fix).
+    let legacy_rows: Vec<(String, String, String, Option<String>, i64, i64)> = {
+        let mut stmt = guard
+            .prepare(
+                "SELECT intent_key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns
+                 FROM gate_timeout_intents
+                 WHERE state IN ('pending', 'done', 'blocked')",
+            )
+            .map_err(|e| format!("intent migration: failed to prepare legacy query: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let lease_json: String = row.get(1)?;
+                let state: String = row.get(2)?;
+                let blocked_reason: Option<String> = row.get(3)?;
+                let created_at_ns: i64 = row.get(4)?;
+                let updated_at_ns: i64 = row.get(5)?;
+                Ok((
+                    key,
+                    lease_json,
+                    state,
+                    blocked_reason,
+                    created_at_ns,
+                    updated_at_ns,
+                ))
+            })
+            .map_err(|e| format!("intent migration: failed to query legacy intents: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("intent migration: failed to decode legacy rows: {e}"))?
+    };
+
+    // Skip check: if the legacy source is empty AND the target already has
+    // rows, a prior migration completed successfully. This avoids the
+    // count > 0 check that would mask a half-completed crash recovery.
+    if legacy_rows.is_empty() {
+        let target_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1",
+                params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("intent migration: failed to count target rows: {e}"))?;
+        if target_count > 0 {
+            return Ok(()); // Legacy exhausted, target populated: migration already done.
+        }
+        return Ok(()); // No legacy data to migrate.
+    }
+
+    // Check if target already has rows matching the legacy count
+    // (prior completed migration).
+    let target_count: i64 = guard
         .query_row(
             "SELECT COUNT(*) FROM orchestrator_kernel_intents
              WHERE orchestrator_id = ?1",
@@ -1305,75 +1360,50 @@ fn migrate_legacy_intents(conn: &Arc<Mutex<Connection>>) -> Result<(), String> {
             |r| r.get(0),
         )
         .map_err(|e| format!("intent migration: failed to count target rows: {e}"))?;
-    if count > 0 {
-        return Ok(());
+    if target_count >= i64::try_from(legacy_rows.len()).unwrap_or(i64::MAX) {
+        return Ok(()); // Target already has at least as many rows as legacy source.
     }
 
-    // Copy pending/blocked rows from legacy table. The legacy schema has
-    // state values 'pending', 'done', 'blocked'. The shared schema uses
-    // 'pending', 'completed', 'blocked'. Map 'done' -> 'completed'.
-    let mut stmt = guard
-        .prepare(
-            "SELECT intent_key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns
-             FROM gate_timeout_intents
-             WHERE state IN ('pending', 'done', 'blocked')",
-        )
-        .map_err(|e| format!("intent migration: failed to prepare legacy query: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            let key: String = row.get(0)?;
-            let lease_json: String = row.get(1)?;
-            let state: String = row.get(2)?;
-            let blocked_reason: Option<String> = row.get(3)?;
-            let created_at_ns: i64 = row.get(4)?;
-            let updated_at_ns: i64 = row.get(5)?;
-            Ok((
-                key,
-                lease_json,
-                state,
-                blocked_reason,
-                created_at_ns,
-                updated_at_ns,
-            ))
-        })
-        .map_err(|e| format!("intent migration: failed to query legacy intents: {e}"))?;
-
-    for row in rows {
-        let (key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) =
-            row.map_err(|e| format!("intent migration: failed to decode legacy row: {e}"))?;
+    // Wrap all INSERTs in a single transaction for crash-atomicity.
+    let tx = guard
+        .transaction()
+        .map_err(|e| format!("intent migration: failed to begin transaction: {e}"))?;
+    for (key, lease_json, state, blocked_reason, created_at_ns, updated_at_ns) in &legacy_rows {
         let mapped_state = match state.as_str() {
             "done" => "completed",
             other => other,
         };
-        guard
-            .execute(
-                "INSERT OR IGNORE INTO orchestrator_kernel_intents
-                 (orchestrator_id, intent_key, intent_json, state,
-                  created_at_ns, updated_at_ns, blocked_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    GATE_TIMEOUT_ORCHESTRATOR_ID,
-                    &key,
-                    &lease_json,
-                    mapped_state,
-                    created_at_ns,
-                    updated_at_ns,
-                    &blocked_reason
-                ],
-            )
-            .map_err(|e| format!("intent migration: failed to insert intent: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO orchestrator_kernel_intents
+             (orchestrator_id, intent_key, intent_json, state,
+              created_at_ns, updated_at_ns, blocked_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                GATE_TIMEOUT_ORCHESTRATOR_ID,
+                key,
+                lease_json,
+                mapped_state,
+                created_at_ns,
+                updated_at_ns,
+                blocked_reason
+            ],
+        )
+        .map_err(|e| format!("intent migration: failed to insert intent: {e}"))?;
     }
+    tx.commit()
+        .map_err(|e| format!("intent migration: failed to commit transaction: {e}"))?;
     Ok(())
 }
 
 /// Migrate legacy `gate_timeout_effect_journal.sqlite` file to the shared
 /// `orchestrator_kernel_effect_journal` table in the main connection.
 ///
-/// If the legacy file exists and the target has no rows, reads all rows from
-/// the legacy file, inserts them treating `started`/`unknown` as `unknown`
+/// If the legacy file exists, reads all rows from the legacy file, inserts
+/// them in a single transaction treating `started`/`unknown` as `unknown`
 /// (fail-closed), then renames the file to `.migrated`.
 ///
-/// Idempotent: safe to call on every startup.
+/// Idempotent: safe to call on every startup. The `.migrated` rename is the
+/// durable completion marker; the `count > 0` check is only an optimization.
 fn migrate_legacy_effect_journal(
     conn: &Arc<Mutex<Connection>>,
     legacy_path: &Path,
@@ -1382,24 +1412,8 @@ fn migrate_legacy_effect_journal(
         return Ok(());
     }
 
-    let guard = conn
-        .lock()
-        .map_err(|e| format!("effect journal migration lock poisoned: {e}"))?;
-
-    // Check if target already has rows for this orchestrator.
-    let count: i64 = guard
-        .query_row(
-            "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal
-             WHERE orchestrator_id = ?1",
-            params![GATE_TIMEOUT_ORCHESTRATOR_ID],
-            |r| r.get(0),
-        )
-        .map_err(|e| format!("effect journal migration: failed to count target rows: {e}"))?;
-    if count > 0 {
-        return Ok(());
-    }
-
-    // Open legacy DB and read rows.
+    // Open legacy DB and read rows into Vec first (drops borrow before
+    // writing to the target connection).
     let legacy_conn = Connection::open(legacy_path)
         .map_err(|e| format!("effect journal migration: failed to open legacy db: {e}"))?;
 
@@ -1423,52 +1437,89 @@ fn migrate_legacy_effect_journal(
         return Ok(());
     }
 
-    let mut stmt = legacy_conn
-        .prepare(
-            "SELECT intent_key, state, updated_at_ns
-             FROM gate_timeout_effect_journal_state",
-        )
-        .map_err(|e| format!("effect journal migration: failed to prepare legacy query: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            let key: String = row.get(0)?;
-            let state: String = row.get(1)?;
-            let updated_at_ns: i64 = row.get(2)?;
-            Ok((key, state, updated_at_ns))
-        })
-        .map_err(|e| format!("effect journal migration: failed to query legacy rows: {e}"))?;
+    // Collect all rows into Vec to release the read borrow.
+    let legacy_rows: Vec<(String, String, i64)> = {
+        let mut stmt = legacy_conn
+            .prepare(
+                "SELECT intent_key, state, updated_at_ns
+                 FROM gate_timeout_effect_journal_state",
+            )
+            .map_err(|e| {
+                format!("effect journal migration: failed to prepare legacy query: {e}")
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let state: String = row.get(1)?;
+                let updated_at_ns: i64 = row.get(2)?;
+                Ok((key, state, updated_at_ns))
+            })
+            .map_err(|e| format!("effect journal migration: failed to query legacy rows: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("effect journal migration: failed to decode legacy rows: {e}"))?
+    };
+    // Close legacy DB before writing to target.
+    drop(legacy_conn);
 
+    let mut guard = conn
+        .lock()
+        .map_err(|e| format!("effect journal migration lock poisoned: {e}"))?;
+
+    // Skip if target already has at least as many rows as legacy source
+    // (prior completed migration that was not renamed yet, or re-run).
+    if !legacy_rows.is_empty() {
+        let target_count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1",
+                params![GATE_TIMEOUT_ORCHESTRATOR_ID],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("effect journal migration: failed to count target rows: {e}"))?;
+        if target_count >= i64::try_from(legacy_rows.len()).unwrap_or(i64::MAX) {
+            // Target already populated; skip to rename.
+            drop(guard);
+            let migrated_path = legacy_path.with_extension("sqlite.migrated");
+            std::fs::rename(legacy_path, &migrated_path).map_err(|e| {
+                format!("effect journal migration: failed to rename legacy file: {e}")
+            })?;
+            return Ok(());
+        }
+    }
+
+    // Wrap all INSERTs in a single transaction for crash-atomicity.
     let now_ns = epoch_now_ns_i64()?;
-    for row in rows {
-        let (key, state, updated_at_ns) =
-            row.map_err(|e| format!("effect journal migration: failed to decode legacy row: {e}"))?;
+    let tx = guard
+        .transaction()
+        .map_err(|e| format!("effect journal migration: failed to begin transaction: {e}"))?;
+    for (key, state, updated_at_ns) in &legacy_rows {
         // Fail-closed: treat started/unknown as unknown.
         let mapped_state = match state.as_str() {
             "completed" => "completed",
             _ => "unknown",
         };
-        guard
-            .execute(
-                "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
-                 (orchestrator_id, intent_key, state, updated_at_ns)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    GATE_TIMEOUT_ORCHESTRATOR_ID,
-                    &key,
-                    mapped_state,
-                    if mapped_state == "unknown" {
-                        now_ns
-                    } else {
-                        updated_at_ns
-                    }
-                ],
-            )
-            .map_err(|e| format!("effect journal migration: failed to insert: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO orchestrator_kernel_effect_journal
+             (orchestrator_id, intent_key, state, updated_at_ns)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                GATE_TIMEOUT_ORCHESTRATOR_ID,
+                key,
+                mapped_state,
+                if mapped_state == "unknown" {
+                    now_ns
+                } else {
+                    *updated_at_ns
+                }
+            ],
+        )
+        .map_err(|e| format!("effect journal migration: failed to insert: {e}"))?;
     }
+    tx.commit()
+        .map_err(|e| format!("effect journal migration: failed to commit transaction: {e}"))?;
+    drop(guard);
 
-    // Close legacy DB and rename file.
-    drop(stmt);
-    drop(legacy_conn);
+    // Rename legacy file as durable completion marker.
     let migrated_path = legacy_path.with_extension("sqlite.migrated");
     std::fs::rename(legacy_path, &migrated_path)
         .map_err(|e| format!("effect journal migration: failed to rename legacy file: {e}"))?;

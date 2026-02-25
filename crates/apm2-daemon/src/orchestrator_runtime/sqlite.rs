@@ -256,40 +256,38 @@ where
     }
 
     fn enqueue_many_sync(&self, intents: &[I]) -> Result<usize, String> {
-        if intents.len() > MAX_ENQUEUE_BATCH {
-            return Err(format!(
-                "enqueue_many batch size {} exceeds MAX_ENQUEUE_BATCH {}",
-                intents.len(),
-                MAX_ENQUEUE_BATCH
-            ));
-        }
-        let now_ns = epoch_now_ns_i64()?;
+        // Auto-chunk: process at most MAX_ENQUEUE_BATCH intents per
+        // transaction to prevent kernel deadlock when catch-up produces
+        // more intents than a single batch limit.
         let mut guard = self
             .conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        let tx = guard
-            .transaction()
-            .map_err(|e| format!("failed to begin intent enqueue transaction: {e}"))?;
-        let mut inserted = 0usize;
-        for intent in intents {
-            let key = intent.intent_key();
-            let json = serde_json::to_string(intent)
-                .map_err(|e| format!("failed to encode intent json: {e}"))?;
-            let rows = tx
-                .execute(
-                    "INSERT OR IGNORE INTO orchestrator_kernel_intents
-                     (orchestrator_id, intent_key, intent_json, state,
-                      created_at_ns, updated_at_ns, blocked_reason)
-                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL)",
-                    params![&self.orchestrator_id, &key, &json, now_ns, now_ns],
-                )
-                .map_err(|e| format!("failed to enqueue intent: {e}"))?;
-            inserted = inserted.saturating_add(rows);
+        let mut total_inserted = 0usize;
+        for chunk in intents.chunks(MAX_ENQUEUE_BATCH) {
+            let now_ns = epoch_now_ns_i64()?;
+            let tx = guard
+                .transaction()
+                .map_err(|e| format!("failed to begin intent enqueue transaction: {e}"))?;
+            for intent in chunk {
+                let key = intent.intent_key();
+                let json = serde_json::to_string(intent)
+                    .map_err(|e| format!("failed to encode intent json: {e}"))?;
+                let rows = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO orchestrator_kernel_intents
+                         (orchestrator_id, intent_key, intent_json, state,
+                          created_at_ns, updated_at_ns, blocked_reason)
+                         VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL)",
+                        params![&self.orchestrator_id, &key, &json, now_ns, now_ns],
+                    )
+                    .map_err(|e| format!("failed to enqueue intent: {e}"))?;
+                total_inserted = total_inserted.saturating_add(rows);
+            }
+            tx.commit()
+                .map_err(|e| format!("failed to commit intent enqueue transaction: {e}"))?;
         }
-        tx.commit()
-            .map_err(|e| format!("failed to commit intent enqueue transaction: {e}"))?;
-        Ok(inserted)
+        Ok(total_inserted)
     }
 
     fn dequeue_batch_sync(&self, limit: usize) -> Result<Vec<I>, String> {
@@ -482,11 +480,27 @@ impl SqliteEffectJournal {
     }
 
     fn record_started_sync(&self, key: &str) -> Result<(), String> {
-        // Idempotent: if already completed, do not regress.
-        if matches!(self.query_state_sync(key)?, EffectExecutionState::Completed) {
-            return Ok(());
-        }
-        self.upsert_state(key, "started")
+        // Atomic UPSERT that guards against regressing from 'completed'.
+        // The WHERE clause on the UPDATE arm prevents overwriting a completed
+        // record, making this a single atomic SQL statement with no TOCTOU gap.
+        let now_ns = epoch_now_ns_i64()?;
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "INSERT INTO orchestrator_kernel_effect_journal
+                     (orchestrator_id, intent_key, state, updated_at_ns)
+                 VALUES (?1, ?2, 'started', ?3)
+                 ON CONFLICT(orchestrator_id, intent_key) DO UPDATE SET
+                     state = 'started',
+                     updated_at_ns = excluded.updated_at_ns
+                 WHERE state != 'completed'",
+                params![&self.orchestrator_id, key, now_ns],
+            )
+            .map_err(|e| format!("failed to record_started for '{key}': {e}"))?;
+        Ok(())
     }
 
     fn record_completed_sync(&self, key: &str) -> Result<(), String> {
@@ -494,16 +508,46 @@ impl SqliteEffectJournal {
     }
 
     fn record_retryable_sync(&self, key: &str) -> Result<(), String> {
-        let current = self.query_state_sync(key)?;
-        match current {
-            EffectExecutionState::NotStarted => Err(format!(
-                "cannot mark effect retryable for unknown key '{key}'"
-            )),
-            EffectExecutionState::Completed => Err(format!(
+        // Atomic conditional DELETE: only removes if state is NOT 'completed'.
+        // If no row exists or is completed, `changes() == 0` tells us which
+        // case applies without a separate read-then-write TOCTOU gap.
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
+        guard
+            .execute(
+                "DELETE FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2
+                   AND state != 'completed'",
+                params![&self.orchestrator_id, key],
+            )
+            .map_err(|e| format!("failed to record_retryable for '{key}': {e}"))?;
+        let deleted = guard.changes();
+        if deleted > 0 {
+            // Successfully cleared a started/unknown fence.
+            return Ok(());
+        }
+        // No row was deleted. Disambiguate: completed (reject) vs never existed
+        // (reject).
+        let exists: bool = guard
+            .query_row(
+                "SELECT 1 FROM orchestrator_kernel_effect_journal
+                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
+                params![&self.orchestrator_id, key],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| format!("failed to check effect state for '{key}': {e}"))?
+            .unwrap_or(false);
+        if exists {
+            Err(format!(
                 "cannot mark effect retryable for completed key '{key}'"
-            )),
-            // Started or Unknown: clear the fence so re-execution is possible.
-            EffectExecutionState::Started | EffectExecutionState::Unknown => self.delete_state(key),
+            ))
+        } else {
+            Err(format!(
+                "cannot mark effect retryable for unknown key '{key}'"
+            ))
         }
     }
 
@@ -533,21 +577,6 @@ impl SqliteEffectJournal {
                 params![&self.orchestrator_id, key, state, now_ns],
             )
             .map_err(|e| format!("failed to upsert effect state='{state}' for '{key}': {e}"))?;
-        Ok(())
-    }
-
-    fn delete_state(&self, key: &str) -> Result<(), String> {
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|e| format!("effect journal lock poisoned: {e}"))?;
-        guard
-            .execute(
-                "DELETE FROM orchestrator_kernel_effect_journal
-                 WHERE orchestrator_id = ?1 AND intent_key = ?2",
-                params![&self.orchestrator_id, key],
-            )
-            .map_err(|e| format!("failed to delete effect state for '{key}': {e}"))?;
         Ok(())
     }
 }
@@ -1043,6 +1072,123 @@ mod tests {
         assert!(
             err.contains("MAX_JSON_BYTES"),
             "error should reference MAX_JSON_BYTES: {err}"
+        );
+    }
+
+    // -- Auto-chunking tests (enqueue_many over MAX_ENQUEUE_BATCH) --
+
+    #[tokio::test]
+    async fn test_enqueue_many_auto_chunks_large_batch() {
+        let conn = test_conn();
+        let store = SqliteIntentStore::<TestIntent>::new(conn, "test-auto-chunk");
+
+        // Create a batch larger than MAX_ENQUEUE_BATCH.
+        let batch_size = MAX_ENQUEUE_BATCH + 100;
+        let intents: Vec<TestIntent> = (0..batch_size)
+            .map(|i| TestIntent {
+                key: format!("intent-{i:05}"),
+                data: format!("data-{i}"),
+            })
+            .collect();
+
+        // Must succeed (auto-chunked), not return an error.
+        let inserted = store
+            .enqueue_many(&intents)
+            .await
+            .expect("auto-chunked enqueue should succeed");
+        assert_eq!(
+            inserted, batch_size,
+            "all intents should be inserted across chunks"
+        );
+
+        // Verify dequeue returns correct data (capped at MAX_DEQUEUE_BATCH).
+        let batch = store
+            .dequeue_batch(batch_size)
+            .await
+            .expect("dequeue large batch");
+        assert_eq!(
+            batch.len(),
+            MAX_DEQUEUE_BATCH,
+            "dequeue should be capped at MAX_DEQUEUE_BATCH"
+        );
+    }
+
+    // -- Atomic effect journal regression tests --
+
+    #[tokio::test]
+    async fn test_effect_journal_record_started_atomic_no_regress() {
+        // Verify that record_started uses a single atomic UPSERT and does
+        // not regress a completed effect back to started.
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn.clone(), "test-atomic-started");
+        let key = "effect-atomic".to_string();
+
+        // Insert completed state directly to simulate prior completion.
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute(
+                    "INSERT INTO orchestrator_kernel_effect_journal
+                     (orchestrator_id, intent_key, state, updated_at_ns)
+                     VALUES (?1, ?2, 'completed', 0)",
+                    params!["test-atomic-started", "effect-atomic"],
+                )
+                .expect("insert completed state");
+        }
+
+        // record_started must NOT regress.
+        journal
+            .record_started(&key)
+            .await
+            .expect("record_started on completed key");
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query after started-on-completed");
+        assert_eq!(
+            state,
+            EffectExecutionState::Completed,
+            "completed state must not regress to started"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effect_journal_record_retryable_atomic_no_regress() {
+        // Verify that record_retryable uses a conditional DELETE and
+        // does not delete a completed effect.
+        let conn = test_conn();
+        let journal = SqliteEffectJournal::new(conn.clone(), "test-atomic-retry");
+        let key = "effect-atomic-retry".to_string();
+
+        // Insert completed state directly.
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute(
+                    "INSERT INTO orchestrator_kernel_effect_journal
+                     (orchestrator_id, intent_key, state, updated_at_ns)
+                     VALUES (?1, ?2, 'completed', 0)",
+                    params!["test-atomic-retry", "effect-atomic-retry"],
+                )
+                .expect("insert completed state");
+        }
+
+        // record_retryable must reject completed keys.
+        let result = journal.record_retryable(&key).await;
+        assert!(
+            result.is_err(),
+            "record_retryable on completed must fail: {result:?}"
+        );
+
+        // Verify state is still completed (not deleted).
+        let state = journal
+            .query_state(&key)
+            .await
+            .expect("query after retryable-on-completed");
+        assert_eq!(
+            state,
+            EffectExecutionState::Completed,
+            "completed state must not be deleted by retryable"
         );
     }
 }

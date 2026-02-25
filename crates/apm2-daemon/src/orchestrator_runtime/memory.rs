@@ -19,6 +19,14 @@ use super::sqlite::IntentKeyed;
 /// production `SQLite` adapter's bounded design.
 const MAX_MEMORY_INTENTS: usize = 8192;
 
+/// Maximum number of intents per `enqueue_many` call. Mirrors the production
+/// `SQLite` adapter's per-batch bound.
+const MAX_ENQUEUE_BATCH: usize = 4096;
+
+/// Maximum number of intents returned by a single `dequeue_batch` call.
+/// Mirrors the production `SQLite` adapter's per-query bound.
+const MAX_DEQUEUE_BATCH: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // MemoryCursorStore
 // ---------------------------------------------------------------------------
@@ -138,6 +146,12 @@ where
     type Error = String;
 
     async fn enqueue_many(&self, intents: &[I]) -> Result<usize, Self::Error> {
+        if intents.len() > MAX_ENQUEUE_BATCH {
+            return Err(format!(
+                "enqueue_many batch size {} exceeds MAX_ENQUEUE_BATCH {MAX_ENQUEUE_BATCH}",
+                intents.len()
+            ));
+        }
         let mut inner = self
             .inner
             .lock()
@@ -165,12 +179,13 @@ where
     }
 
     async fn dequeue_batch(&self, limit: usize) -> Result<Vec<I>, Self::Error> {
+        let capped_limit = limit.min(MAX_DEQUEUE_BATCH);
         let inner = self
             .inner
             .lock()
             .map_err(|e| format!("memory intent lock poisoned: {e}"))?;
         let mut out = Vec::new();
-        for key in inner.pending.iter().take(limit) {
+        for key in inner.pending.iter().take(capped_limit) {
             if let Some((intent, IntentState::Pending)) = inner.intents.get(key) {
                 out.push(intent.clone());
             }
