@@ -16,10 +16,14 @@ use crate::exit_codes::codes as exit_codes;
 
 const PREPARE_SCHEMA: &str = "apm2.fac.review.prepare.v1";
 const PREPARE_INLINE_LINE_LIMIT: usize = 2_000;
+/// Maximum accepted PR body size in bytes. Bodies larger than this are treated
+/// as unbounded/hostile and cause work scope enrichment to degrade to null.
+const PREPARE_PR_BODY_MAX_BYTES: usize = 1_048_576; // 1 MiB
 
 /// A single expanded requirement node extracted from an RFC document.
-/// Reserved for future use when work objects include requirement_ids.
+/// Reserved for future use when work objects include `requirement_ids`.
 #[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RequirementNode {
     id: String,
     statement: String,
@@ -29,12 +33,12 @@ struct RequirementNode {
 /// Work scope context embedded in the prepare summary.
 ///
 /// Present when the PR body contains a valid `apm2.fac_push_metadata.v1` block
-/// AND the branch field in that block matches the PR's actual head branch
-/// (trust gate to prevent fork-PR metadata injection).
+/// with trusted origin (same-repo PR, branch field matches actual head ref).
 ///
 /// `requirement_ids` and `requirements` are reserved for future population
-/// once RFC-0032 work objects carry explicit requirements (post-TCK-00683).
+/// once daemon work objects carry explicit requirements (post-TCK-00683).
 #[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WorkScopeContext {
     work_id: String,
     ticket_alias: Option<String>,
@@ -171,44 +175,94 @@ fn build_prepare_inline_content(
     }
 }
 
-/// Extract the content between the first fenced YAML block and its closing
-/// fence in a markdown string.
+/// Search all fenced YAML blocks in `body` and return the content of the first
+/// one whose `schema` field equals `target_schema`.
 ///
-/// Returns the inner text (excluding the fence markers themselves) when found.
-fn extract_first_fenced_yaml_block(body: &str) -> Option<&str> {
+/// This correctly handles PR bodies that contain multiple YAML blocks (e.g.
+/// gate-status fences) by iterating until the matching schema is found.
+fn find_yaml_block_with_schema<'a>(body: &'a str, target_schema: &str) -> Option<&'a str> {
     let open_marker = "```yaml";
-    let open_start = body.find(open_marker)?;
-    let content_start = open_start.checked_add(open_marker.len())?;
-    // Skip past the newline following the opening marker.
-    let after_open = body.get(content_start..)?;
-    let newline_offset = after_open.find('\n')?;
-    let inner_start = content_start.checked_add(newline_offset)?.checked_add(1)?;
-    // Find the closing fence.
-    let remaining = body.get(inner_start..)?;
-    let close_offset = remaining.find("```")?;
-    body.get(inner_start..inner_start.checked_add(close_offset)?)
+    let mut search_start = 0usize;
+
+    while let Some(rel_open) = body[search_start..].find(open_marker) {
+        let open_start = search_start.saturating_add(rel_open);
+        let content_start = open_start.saturating_add(open_marker.len());
+
+        // Skip past the (optional) rest of the opening-fence line.
+        let after_open = body.get(content_start..)?;
+        let newline_offset = after_open.find('\n').unwrap_or(after_open.len());
+        let inner_start = content_start
+            .saturating_add(newline_offset)
+            .saturating_add(1);
+        if inner_start > body.len() {
+            break;
+        }
+
+        // Find the closing fence (``` on its own line).
+        let remaining = body.get(inner_start..)?;
+        if let Some(close_offset) = remaining.find("```") {
+            let inner_end = inner_start.saturating_add(close_offset);
+            if let Some(block) = body.get(inner_start..inner_end) {
+                if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(block) {
+                    if yaml.get("schema").and_then(serde_yaml::Value::as_str) == Some(target_schema)
+                    {
+                        return Some(block);
+                    }
+                }
+            }
+            // Advance past this block's closing fence and continue.
+            search_start = inner_end.saturating_add(3); // skip past ```
+        } else {
+            break;
+        }
+    }
+    None
 }
 
-/// Fetch the actual head branch ref for a PR from the GitHub API.
+/// Trust context fetched from GitHub for a PR.
+struct PrTrustContext {
+    /// Actual head branch ref (e.g. `ticket/RFC-0019/TCK-00685`).
+    head_ref: String,
+    /// Full repository name of the head branch owner (e.g.
+    /// `guardian-intelligence/apm2`). For fork PRs this differs from the
+    /// base repo's full name.
+    head_repo_full_name: String,
+}
+
+/// Fetch trust-relevant PR fields from the GitHub API in a single call.
 /// Uses `gh_command()` for FAC-hardened non-interactive access.
-fn fetch_pr_head_ref(owner_repo: &str, pr_number: u32) -> Option<String> {
+fn fetch_pr_trust_context(owner_repo: &str, pr_number: u32) -> Option<PrTrustContext> {
     let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
+    // Fetch both head.ref and head.repo.full_name in one API call.
     let output = gh_command()
-        .args(["api", &endpoint, "--jq", ".head.ref"])
+        .args([
+            "api",
+            &endpoint,
+            "--jq",
+            "{ref: .head.ref, repo: .head.repo.full_name}",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let head_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if head_ref.is_empty() || head_ref == "null" {
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let head_ref = json.get("ref").and_then(|v| v.as_str())?.to_string();
+    let head_repo_full_name = json.get("repo").and_then(|v| v.as_str())?.to_string();
+    if head_ref.is_empty() || head_ref == "null" || head_repo_full_name.is_empty() {
         return None;
     }
-    Some(head_ref)
+    Some(PrTrustContext {
+        head_ref,
+        head_repo_full_name,
+    })
 }
 
 /// Fetch the PR body text from the GitHub API.
+///
 /// Uses `gh_command()` for FAC-hardened non-interactive access.
+/// Bodies exceeding `PREPARE_PR_BODY_MAX_BYTES` are rejected to prevent
+/// unbounded memory consumption from hostile or malformed PR bodies.
 fn fetch_pr_body_text(owner_repo: &str, pr_number: u32) -> Option<String> {
     let endpoint = format!("/repos/{owner_repo}/pulls/{pr_number}");
     let output = gh_command()
@@ -218,8 +272,14 @@ fn fetch_pr_body_text(owner_repo: &str, pr_number: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
+    if output.stdout.len() > PREPARE_PR_BODY_MAX_BYTES {
+        eprintln!(
+            "warn: PR body exceeds {PREPARE_PR_BODY_MAX_BYTES} bytes; skipping work scope enrichment"
+        );
+        return None;
+    }
     let body = String::from_utf8(output.stdout).ok()?;
-    if body.trim().is_empty() {
+    if body.trim().is_empty() || body.trim() == "null" {
         return None;
     }
     Some(body)
@@ -240,32 +300,32 @@ fn parse_rfc_id_from_branch(branch: &str) -> Option<String> {
     })
 }
 
+const PUSH_METADATA_SCHEMA: &str = "apm2.fac_push_metadata.v1";
+
 /// Attempt to enrich prepare output with the work scope for this PR.
 ///
 /// Resolution steps:
-/// 1. Fetch PR body from GitHub API via `gh_command()`
-/// 2. Parse the `apm2.fac_push_metadata.v1` YAML block -> extract `work_id`,
-///    `ticket_alias`, `branch`
-/// 3. Fetch actual PR head ref via `gh_command()`, validate it matches the
-///    `branch` field from the YAML (trust gate against fork-PR injection)
+/// 1. Fetch PR body from GitHub API via `gh_command()` (bounded to 1 MiB)
+/// 2. Locate the `apm2.fac_push_metadata.v1` YAML block among all fenced blocks
+///    → extract `work_id`, `ticket_alias`, `branch`
+/// 3. Fetch actual PR trust context (head ref + head repo full name) and
+///    validate:
+///    - `head.repo.full_name == owner_repo` (same-repo PR, not a fork)
+///    - `head.ref == yaml branch` (branch field binding integrity)
 /// 4. Parse `rfc_id` from branch name
-/// 5. Return `Some(WorkScopeContext{...})` with empty `requirement_ids` and
-///    `requirements` (reserved for future population post-TCK-00683)
+/// 5. Return `Some(WorkScopeContext{...})` with `work_id`, `ticket_alias`, and
+///    `rfc_id`; `requirement_ids` and `requirements` are empty (reserved for
+///    future population once daemon work objects carry explicit requirements,
+///    post-TCK-00683).
 ///
-/// Returns `None` on any failure -- graceful degradation for external PRs or
-/// offline mode.
+/// Returns `None` on any failure — graceful degradation for external/fork PRs
+/// or offline mode.
 fn fetch_work_scope(owner_repo: &str, pr_number: u32) -> Option<WorkScopeContext> {
     let pr_body = fetch_pr_body_text(owner_repo, pr_number)?;
-    let yaml_block = extract_first_fenced_yaml_block(&pr_body)?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(yaml_block).ok()?;
 
-    // Verify schema marker before trusting content.
-    let schema = yaml_value
-        .get("schema")
-        .and_then(serde_yaml::Value::as_str)?;
-    if schema != "apm2.fac_push_metadata.v1" {
-        return None;
-    }
+    // Find the fac_push_metadata.v1 block among all fenced YAML blocks.
+    let yaml_block = find_yaml_block_with_schema(&pr_body, PUSH_METADATA_SCHEMA)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(yaml_block).ok()?;
 
     let work_id = yaml_value
         .get("work_id")
@@ -283,13 +343,23 @@ fn fetch_work_scope(owner_repo: &str, pr_number: u32) -> Option<WorkScopeContext
         .and_then(serde_yaml::Value::as_str)?
         .to_string();
 
-    // Trust gate: validate that the branch field in the YAML matches the
-    // actual PR head ref from GitHub. This prevents a fork PR from injecting
-    // a fake fac_push_metadata block pointing to a different work object.
-    let actual_ref = fetch_pr_head_ref(owner_repo, pr_number)?;
-    if yaml_branch != actual_ref {
+    // Trust gate: verify both same-repo origin and branch binding integrity.
+    // - head.repo.full_name must equal owner_repo: rejects fork PRs where an
+    //   attacker controls the PR body.
+    // - head.ref must match the YAML branch field: verifies binding integrity
+    //   between the push metadata and the actual PR head branch.
+    let trust_ctx = fetch_pr_trust_context(owner_repo, pr_number)?;
+    if trust_ctx.head_repo_full_name != owner_repo {
         eprintln!(
-            "warn: work_scope trust gate: branch field '{yaml_branch}' in PR body does not match actual head ref '{actual_ref}'; skipping work scope enrichment"
+            "warn: work_scope trust gate: PR head repo '{}' differs from base repo '{owner_repo}'; skipping work scope enrichment for fork PR",
+            trust_ctx.head_repo_full_name
+        );
+        return None;
+    }
+    if trust_ctx.head_ref != yaml_branch {
+        eprintln!(
+            "warn: work_scope trust gate: branch field '{yaml_branch}' in PR body does not match actual head ref '{}'; skipping work scope enrichment",
+            trust_ctx.head_ref
         );
         return None;
     }
@@ -858,7 +928,7 @@ mod tests {
     use super::{
         OwnedResolvedHead, PREPARE_INLINE_LINE_LIMIT, build_prepare_inline_content,
         cleanup_prepared_review_inputs_at, count_text_lines, ensure_prepare_head_alignment,
-        extract_first_fenced_yaml_block, parse_rfc_id_from_branch, prepared_review_dir_from_root,
+        find_yaml_block_with_schema, parse_rfc_id_from_branch, prepared_review_dir_from_root,
         resolve_base_ref_for_pr_with, resolve_head_sha_with, sha_is_locally_reachable,
     };
 
@@ -1338,30 +1408,14 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_first_fenced_yaml_block_finds_schema() {
-        let body = r"Some PR description text.
-
-```yaml
-schema: apm2.fac_push_metadata.v1
-work_id: W-TCK-12345
-ticket_alias: TCK-12345
-branch: ticket/RFC-0019/TCK-12345
-```
-
-More text after the block.
-";
-        let yaml = extract_first_fenced_yaml_block(body).expect("should find yaml block");
+    fn test_find_yaml_block_skips_non_matching_schema() {
+        // The gate-status block comes first; the push-metadata block is second.
+        let body = "<!-- gate-status:start -->\n```yaml\nschema: apm2.gate_status.v2\nfoo: bar\n```\n<!-- gate-status:end -->\n```yaml\nschema: apm2.fac_push_metadata.v1\nwork_id: W-TCK-12345\nbranch: ticket/RFC-0019/TCK-12345\n```\n";
+        let yaml = find_yaml_block_with_schema(body, "apm2.fac_push_metadata.v1")
+            .expect("should find push metadata block");
         assert!(
             yaml.contains("work_id: W-TCK-12345"),
             "extracted block must contain work_id"
-        );
-        assert!(
-            yaml.contains("schema: apm2.fac_push_metadata.v1"),
-            "extracted block must contain schema"
-        );
-        assert!(
-            !yaml.contains("```"),
-            "extracted block must not contain fence markers"
         );
 
         let parsed: serde_yaml::Value =
@@ -1373,9 +1427,20 @@ More text after the block.
     }
 
     #[test]
-    fn test_extract_first_fenced_yaml_block_finds_push_metadata() {
+    fn test_find_yaml_block_returns_none_when_schema_absent() {
+        let body =
+            "some intro\n```yaml\nschema: apm2.other.v1\nwork_id: W-TCK-12345\n```\nsome footer";
+        assert!(
+            find_yaml_block_with_schema(body, "apm2.fac_push_metadata.v1").is_none(),
+            "should not find block with wrong schema"
+        );
+    }
+
+    #[test]
+    fn test_find_yaml_block_finds_push_metadata() {
         let body = "some intro\n```yaml\nschema: apm2.fac_push_metadata.v1\nwork_id: W-TCK-12345\n```\nsome footer";
-        let yaml = extract_first_fenced_yaml_block(body).expect("yaml block");
+        let yaml =
+            find_yaml_block_with_schema(body, "apm2.fac_push_metadata.v1").expect("yaml block");
         assert!(yaml.contains("work_id: W-TCK-12345"));
     }
 
