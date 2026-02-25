@@ -2083,3 +2083,29 @@ message ResolveTicketAliasResponse {
   // Echoed ticket alias for response correlation.
   string ticket_alias = 3;
 }
+
+// IPC-PRIV-081 / IPC-SESS-007: WorkShow (RFC-0032)
+// Returns the full WorkSpecV1 content for a given work_id by looking up
+// the spec_snapshot_hash in the work authority and retrieving from CAS.
+// This is a read-only query used by reviewer agents to access work scope,
+// requirements, and definition_of_done. Available on both operator socket
+// (IPC-PRIV-081) and session socket (IPC-SESS-007) per BEH-CLI-005.
+message WorkShowRequest {
+  // Canonical work identifier to query (W-...).
+  string work_id = 1;
+  // Session token for authentication on session.sock (INV-SESS-001).
+  // Required when the request is sent over the session socket; ignored
+  // on the operator (privileged) socket where caller identity is
+  // established by socket-level credential passing.
+  string session_token = 2;
+}
+
+message WorkShowResponse {
+  // Canonical work identifier.
+  string work_id = 1;
+  // Raw canonical WorkSpecV1 JSON bytes retrieved from CAS.
+  // Consumers can parse this as apm2.work_spec.v1 JSON.
+  bytes work_spec_json = 2;
+  // BLAKE3 hash of the WorkSpec in CAS (32 bytes).
+  bytes spec_snapshot_hash = 3;
+}

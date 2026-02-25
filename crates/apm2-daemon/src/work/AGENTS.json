@@ -55,6 +55,20 @@
       "kind": "requirement",
       "title": "Single projection handle shared for both work authority and alias gate",
       "rfc": ["RFC-0017"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-010",
+      "kind": "invariant",
+      "title": "get_spec_hash returns Err(CasNotConfigured) when CAS absent (not Ok(None))",
+      "description": "Distinguishes CAS infrastructure absence from work_id-not-found so handlers can produce clear error messages.",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-WORK-011",
+      "kind": "invariant",
+      "title": "WorkId typed wrapper enforces non-empty and length-bounded invariants at parse boundary",
+      "description": "Parse, don't validate: raw work_id strings are parsed into WorkId via TryFrom at the handler boundary.",
+      "rfc": ["RFC-0032"]
     }
   ]
 }

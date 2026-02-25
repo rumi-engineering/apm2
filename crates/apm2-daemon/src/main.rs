@@ -1,3 +1,6 @@
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 //! apm2-daemon - AI CLI Process Manager Daemon
 //!
 //! This is the main daemon binary that manages AI CLI processes.
@@ -3227,7 +3230,10 @@ async fn handle_dual_socket_connection(
         let frame_bytes = Bytes::from(frame.to_vec());
         match socket_type {
             protocol::socket_manager::SocketType::Operator => {
-                match privileged_dispatcher.dispatch(&frame_bytes, &ctx) {
+                match privileged_dispatcher
+                    .dispatch_async(&frame_bytes, &ctx)
+                    .await
+                {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Privileged request dispatched successfully");
                         // RFC-0032::REQ-0089 Item 4: Send response back to client
@@ -3245,7 +3251,7 @@ async fn handle_dual_socket_connection(
                 }
             },
             protocol::socket_manager::SocketType::Session => {
-                match session_dispatcher.dispatch(&frame_bytes, &ctx) {
+                match session_dispatcher.dispatch_async(&frame_bytes, &ctx).await {
                     Ok(response) => {
                         info!(socket_type = %socket_type, "Session request dispatched successfully");
                         // RFC-0032::REQ-0089 Item 4: Send response back to client

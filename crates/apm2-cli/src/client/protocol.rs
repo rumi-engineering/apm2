@@ -139,6 +139,9 @@ use apm2_daemon::protocol::{
     WorkListResponse,
     // Work types
     WorkRole,
+    // RFC-0032: WorkShow messages
+    WorkShowRequest,
+    WorkShowResponse,
     // RFC-0032::REQ-0134: Work status messages
     WorkStatusRequest,
     WorkStatusResponse,
@@ -182,6 +185,8 @@ use apm2_daemon::protocol::{
     encode_stream_logs_request,
     encode_switch_credential_request,
     encode_work_list_request,
+    // RFC-0032: WorkShow encoding
+    encode_work_show_request,
     encode_work_status_request,
     parse_handshake_message,
     serialize_handshake_message,
@@ -1240,6 +1245,52 @@ impl OperatorClient {
     }
 
     // =========================================================================
+    // RFC-0032: WorkShow (read-only WorkSpec retrieval)
+    // =========================================================================
+
+    /// Retrieves the full `WorkSpecV1` content for a given `work_id` from the
+    /// daemon CAS (RFC-0032).
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Canonical work identifier (W-...)
+    ///
+    /// # Returns
+    ///
+    /// [`WorkShowResponse`] containing the raw `WorkSpec` JSON bytes, the
+    /// work_id, and the CAS hash.
+    pub async fn work_show(
+        &mut self,
+        work_id: &str,
+    ) -> Result<WorkShowResponse, ProtocolClientError> {
+        let request = WorkShowRequest {
+            work_id: work_id.to_string(),
+            // session_token is not required on the operator (privileged) socket;
+            // caller identity is established by socket-level credential passing.
+            session_token: String::new(),
+        };
+        let request_bytes = encode_work_show_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_work_show_response(&response_frame)
+    }
+
+    // =========================================================================
     // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
     // =========================================================================
 
@@ -2155,6 +2206,37 @@ impl OperatorClient {
         }
 
         WorkListResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Decodes a `WorkShow` response (RFC-0032).
+    fn decode_work_show_response(frame: &Bytes) -> Result<WorkShowResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::WorkShow.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected WorkShow response (tag {}), got tag {tag}",
+                PrivilegedMessageType::WorkShow.tag()
+            )));
+        }
+
+        WorkShowResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 

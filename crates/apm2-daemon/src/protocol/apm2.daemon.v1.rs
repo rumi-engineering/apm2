@@ -2103,6 +2103,37 @@ pub struct ResolveTicketAliasResponse {
     #[prost(string, tag = "3")]
     pub ticket_alias: ::prost::alloc::string::String,
 }
+/// IPC-PRIV-081 / IPC-SESS-007: WorkShow (RFC-0032)
+/// Returns the full WorkSpecV1 content for a given work_id by looking up
+/// the spec_snapshot_hash in the work authority and retrieving from CAS.
+/// This is a read-only query used by reviewer agents to access work scope,
+/// requirements, and definition_of_done. Available on both operator socket
+/// (IPC-PRIV-081) and session socket (IPC-SESS-007) per BEH-CLI-005.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkShowRequest {
+    /// Canonical work identifier to query (W-...).
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Session token for authentication on session.sock (INV-SESS-001).
+    /// Required when the request is sent over the session socket; ignored
+    /// on the operator (privileged) socket where caller identity is
+    /// established by socket-level credential passing.
+    #[prost(string, tag = "2")]
+    pub session_token: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkShowResponse {
+    /// Canonical work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Raw canonical WorkSpecV1 JSON bytes retrieved from CAS.
+    /// Consumers can parse this as apm2.work_spec.v1 JSON.
+    #[prost(bytes = "vec", tag = "2")]
+    pub work_spec_json: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the WorkSpec in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "3")]
+    pub spec_snapshot_hash: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {

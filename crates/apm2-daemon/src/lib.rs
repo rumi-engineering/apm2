@@ -2,6 +2,13 @@
 // false positives that cannot be scoped to specific modules
 // (RFC-0032::REQ-0142).
 #![cfg_attr(test, allow(clippy::large_stack_arrays))]
+// Suppress pedantic doc-formatting lints crate-wide.  RFC-prefixed identifiers
+// (e.g. RFC-0032::REQ-0134) are used pervasively in doc comments and cannot
+// be individually backtick-wrapped without reducing readability.  This mirrors
+// the same suppression applied to apm2-core and apm2-holon.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::too_long_first_doc_paragraph)]
+#![allow(clippy::doc_lazy_continuation)]
 
 //! apm2-daemon - AI CLI Process Manager Daemon Library
 //!

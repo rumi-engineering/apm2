@@ -537,7 +537,10 @@ pub struct DispatcherState {
     /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter`
     /// that persist across connections. Now also contains shared
     /// `TokenMinter` and `ManifestStore` for RFC-0032::REQ-0089 fixes.
-    privileged_dispatcher: PrivilegedDispatcher,
+    ///
+    /// Wrapped in `Arc` so that [`PrivilegedDispatcher::dispatch_async`] can
+    /// clone the handle into `tokio::task::spawn_blocking` (INV-CQ-OK-003).
+    privileged_dispatcher: Arc<PrivilegedDispatcher>,
 
     /// Session endpoint dispatcher with stable token minter.
     ///
@@ -545,7 +548,10 @@ pub struct DispatcherState {
     /// ensuring tokens minted during spawn can be validated here.
     /// The `ManifestStore` is shared with `PrivilegedDispatcher` so manifests
     /// registered during spawn are accessible for tool validation.
-    session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
+    ///
+    /// Wrapped in `Arc` so that [`SessionDispatcher::dispatch_async`] can
+    /// clone the handle into `tokio::task::spawn_blocking` (INV-CQ-OK-003).
+    session_dispatcher: Arc<SessionDispatcher<InMemoryManifestStore>>,
 
     /// Gate execution orchestrator for autonomous gate lifecycle
     /// (RFC-0032::REQ-0142).
@@ -701,16 +707,19 @@ impl DispatcherState {
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
         // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
         // SessionStatus queries
-        let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         Self {
-            privileged_dispatcher,
-            session_dispatcher,
+            privileged_dispatcher: Arc::new(privileged_dispatcher),
+            session_dispatcher: Arc::new(session_dispatcher),
             gate_orchestrator: None,
             merge_executor: None,
             stop_authority: None,
@@ -800,16 +809,19 @@ impl DispatcherState {
         // RFC-0032::REQ-0134: Wire session registry for SessionStatus queries
         // RFC-0032::REQ-0138: Wire telemetry store for counter updates and
         // SessionStatus queries
-        let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry)
-                .with_telemetry_store(telemetry_store);
+                .with_telemetry_store(telemetry_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         Self {
-            privileged_dispatcher,
-            session_dispatcher,
+            privileged_dispatcher: Arc::new(privileged_dispatcher),
+            session_dispatcher: Arc::new(session_dispatcher),
             gate_orchestrator: None,
             merge_executor: None,
             stop_authority: None,
@@ -1094,8 +1106,7 @@ impl DispatcherState {
         // manifest store for scope enforcement RFC-0020::REQ-0045:
         // Authoritative persistence mode requires durable consume enforcement
         // and lifecycle gate wiring.
-        let mut session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let mut session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1103,7 +1114,11 @@ impl DispatcherState {
                 .with_preactuation_gate(preactuation_gate)
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
-                .with_v1_manifest_store(v1_manifest_store);
+                .with_v1_manifest_store(v1_manifest_store)
+                // RFC-0032: Wire alias reconciliation gate for session-scoped WorkShow.
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
         let mut anti_entropy_pcac_gate: Option<Arc<crate::pcac::LifecycleGate>> = None;
 
         let sovereignty_trusted_signer_key = sovereignty_trusted_signer_key.unwrap_or([0u8; 32]);
@@ -1291,8 +1306,8 @@ impl DispatcherState {
         }
 
         Ok(Self {
-            privileged_dispatcher,
-            session_dispatcher,
+            privileged_dispatcher: Arc::new(privileged_dispatcher),
+            session_dispatcher: Arc::new(session_dispatcher),
             gate_orchestrator: None,
             merge_executor: None,
             // RFC-0020::REQ-0005 MAJOR 2 FIX: Store shared stop authority for
@@ -1669,8 +1684,7 @@ impl DispatcherState {
         let anti_entropy_pcac_gate = Arc::clone(&pcac_gate);
         privileged_dispatcher =
             privileged_dispatcher.with_pcac_lifecycle_gate(Arc::clone(&pcac_gate));
-        let mut session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+        let mut session_dispatcher = SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_channel_context_signer(channel_context_signer)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
@@ -1684,7 +1698,13 @@ impl DispatcherState {
                 .with_stop_authority(Arc::clone(&stop_authority))
                 .with_stop_conditions_store(stop_conditions_store)
                 .with_v1_manifest_store(v1_manifest_store)
-                .with_pcac_lifecycle_gate(pcac_gate);
+                .with_pcac_lifecycle_gate(pcac_gate)
+                // RFC-0032: Wire alias reconciliation gate from privileged dispatcher
+                // so that WorkShow on the session socket can resolve work_id ->
+                // spec_snapshot_hash for reviewer agents (BEH-CLI-005).
+                .with_alias_reconciliation_gate(
+                    Arc::clone(privileged_dispatcher.alias_reconciliation_gate()),
+                );
 
         // RFC-0032::REQ-0172: Wire AdmissionKernel for plan/execute-gated admission.
         // This is the CAS-backed production path — authoritative mode with
@@ -1793,8 +1813,8 @@ impl DispatcherState {
         }
 
         Ok(Self {
-            privileged_dispatcher,
-            session_dispatcher,
+            privileged_dispatcher: Arc::new(privileged_dispatcher),
+            session_dispatcher: Arc::new(session_dispatcher),
             gate_orchestrator: None,
             merge_executor: None,
             // RFC-0020::REQ-0005 MAJOR 2 FIX: Store shared stop authority for
@@ -1905,7 +1925,11 @@ impl DispatcherState {
     /// live process information instead of returning stub responses.
     #[must_use]
     pub fn with_daemon_state(mut self, state: SharedState) -> Self {
-        self.privileged_dispatcher = self.privileged_dispatcher.with_daemon_state(state);
+        self.privileged_dispatcher = Arc::new(
+            Arc::try_unwrap(self.privileged_dispatcher)
+                .unwrap_or_else(|_| panic!("single owner during build"))
+                .with_daemon_state(state),
+        );
         self
     }
 
@@ -1953,19 +1977,20 @@ impl DispatcherState {
         boundary_id: String,
         policy_digest: [u8; 32],
     ) -> Self {
-        self.privileged_dispatcher
-            .set_token_binding_boundary_id(boundary_id);
-        self.privileged_dispatcher
-            .set_token_binding_policy_digest(policy_digest);
+        let pd = Arc::get_mut(&mut self.privileged_dispatcher).expect("single owner during build");
+        pd.set_token_binding_boundary_id(boundary_id);
+        pd.set_token_binding_policy_digest(policy_digest);
         self
     }
 
     /// Sets privileged PCAC rollout policy for authority-bearing handlers.
     #[must_use]
     pub fn with_privileged_pcac_policy(mut self, policy: PrivilegedPcacPolicy) -> Self {
-        self.privileged_dispatcher = self
-            .privileged_dispatcher
-            .with_privileged_pcac_policy(policy);
+        self.privileged_dispatcher = Arc::new(
+            Arc::try_unwrap(self.privileged_dispatcher)
+                .unwrap_or_else(|_| panic!("single owner during build"))
+                .with_privileged_pcac_policy(policy),
+        );
         self
     }
 
@@ -1973,7 +1998,11 @@ impl DispatcherState {
     #[cfg(test)]
     #[must_use]
     pub fn without_privileged_pcac_lifecycle_gate(mut self) -> Self {
-        self.privileged_dispatcher = self.privileged_dispatcher.without_pcac_lifecycle_gate();
+        self.privileged_dispatcher = Arc::new(
+            Arc::try_unwrap(self.privileged_dispatcher)
+                .unwrap_or_else(|_| panic!("single owner during build"))
+                .without_pcac_lifecycle_gate(),
+        );
         self
     }
 
@@ -1988,13 +2017,16 @@ impl DispatcherState {
         // Wire orchestrator into session dispatcher so termination triggers
         // gate lifecycle directly from the session dispatch path (Security
         // BLOCKER 1 fix).
-        self.session_dispatcher
+        Arc::get_mut(&mut self.session_dispatcher)
+            .expect("single owner during build")
             .set_gate_orchestrator(Arc::clone(&orchestrator));
         // Wire orchestrator into privileged dispatcher so DelegateSublease
         // can access the orchestrator for sublease issuance (Quality BLOCKER 4 fix).
-        self.privileged_dispatcher = self
-            .privileged_dispatcher
-            .with_gate_orchestrator(Arc::clone(&orchestrator));
+        self.privileged_dispatcher = Arc::new(
+            Arc::try_unwrap(self.privileged_dispatcher)
+                .unwrap_or_else(|_| panic!("single owner during build"))
+                .with_gate_orchestrator(Arc::clone(&orchestrator)),
+        );
         self.gate_orchestrator = Some(orchestrator);
         self
     }
@@ -2048,9 +2080,11 @@ impl DispatcherState {
         // RFC-0020::REQ-0051: Wire watchdog into privileged dispatcher so
         // RegisterRecoveryEvidence and RequestUnfreeze handlers can call
         // through to the watchdog methods.
-        self.privileged_dispatcher = self
-            .privileged_dispatcher
-            .with_divergence_watchdog(Arc::clone(&watchdog));
+        self.privileged_dispatcher = Arc::new(
+            Arc::try_unwrap(self.privileged_dispatcher)
+                .unwrap_or_else(|_| panic!("single owner during build"))
+                .with_divergence_watchdog(Arc::clone(&watchdog)),
+        );
         self.divergence_watchdog = Some(watchdog);
         self
     }
@@ -2078,15 +2112,21 @@ impl DispatcherState {
         Some(orch.poll_session_lifecycle().await)
     }
 
-    /// Returns a reference to the privileged dispatcher.
+    /// Returns a shared reference to the privileged dispatcher.
+    ///
+    /// The returned `Arc` can be cloned into `spawn_blocking` closures
+    /// for INV-CQ-OK-003 compliant async dispatch.
     #[must_use]
-    pub const fn privileged_dispatcher(&self) -> &PrivilegedDispatcher {
+    pub const fn privileged_dispatcher(&self) -> &Arc<PrivilegedDispatcher> {
         &self.privileged_dispatcher
     }
 
-    /// Returns a reference to the session dispatcher.
+    /// Returns a shared reference to the session dispatcher.
+    ///
+    /// The returned `Arc` can be cloned into `spawn_blocking` closures
+    /// for INV-CQ-OK-003 compliant async dispatch.
     #[must_use]
-    pub const fn session_dispatcher(&self) -> &SessionDispatcher<InMemoryManifestStore> {
+    pub const fn session_dispatcher(&self) -> &Arc<SessionDispatcher<InMemoryManifestStore>> {
         &self.session_dispatcher
     }
 
@@ -2099,7 +2139,7 @@ impl DispatcherState {
     /// `unregister_connection(connection_id)` on this registry to free
     /// resources and prevent `DoS` via connection slot exhaustion.
     #[must_use]
-    pub const fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
+    pub fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
         self.privileged_dispatcher.subscription_registry()
     }
 

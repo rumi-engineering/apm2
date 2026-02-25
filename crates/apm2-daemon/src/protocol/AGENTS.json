@@ -112,6 +112,34 @@
       "title": "PCAC lifecycle enforcement runs BEFORE idempotency queries",
       "description": "Prevents unauthorized callers from probing work_id existence (no existence oracle).",
       "rfc": ["RFC-0027"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-019",
+      "kind": "invariant",
+      "title": "WorkShow session handler validates session token (INV-SESS-001) before CAS lookup",
+      "description": "Prevents unauthenticated work-spec retrieval on session.sock; token validated via constant-time HMAC.",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-020",
+      "kind": "invariant",
+      "title": "WorkShow handlers use spawn_blocking for rusqlite offloading (INV-CQ-OK-003)",
+      "description": "get_spec_hash and CAS retrieve calls run rusqlite/filesystem I/O; offloaded via tokio::task::spawn_blocking in the async dispatch path. Non-WorkShow handlers are wrapped in block_in_place to prevent async executor starvation.",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-021",
+      "kind": "safety",
+      "title": "Session WorkShow enforces active-session registry gate",
+      "description": "HMAC token validation alone is insufficient; session must exist in active registry (not terminated). Mirrors PublishEvidence pattern (RFC-0032::REQ-0149).",
+      "rfc": ["RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-PROTO-022",
+      "kind": "safety",
+      "title": "Session WorkShow enforces work-scope binding",
+      "description": "request.work_id must match session's authorized work_id; prevents cross-work metadata leakage via horizontal access with a valid token.",
+      "rfc": ["RFC-0032"]
     }
   ]
 }

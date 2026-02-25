@@ -215,6 +215,8 @@ pub use dispatch::{
     encode_switch_credential_request,
     encode_verify_ledger_chain_request,
     encode_work_list_request,
+    // RFC-0032: WorkShow encoding
+    encode_work_show_request,
     encode_work_status_request,
     generate_lease_id,
     generate_work_id,
@@ -365,6 +367,9 @@ pub use messages::{
     WorkListRequest,
     WorkListResponse,
     WorkRole,
+    // RFC-0032: WorkShow messages
+    WorkShowRequest,
+    WorkShowResponse,
     // RFC-0032::REQ-0134: Status query messages
     WorkStatusRequest,
     WorkStatusResponse,

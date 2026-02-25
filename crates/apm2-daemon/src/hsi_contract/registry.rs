@@ -249,19 +249,19 @@ fn build_manifest_from_descriptors(
 /// This constant MUST be updated when routes are added to or removed from
 /// `PrivilegedMessageType::all_request_variants()`. The
 /// `test_privileged_route_count` test enforces this.
-pub const EXPECTED_PRIVILEGED_ROUTE_COUNT: usize = 40;
+pub const EXPECTED_PRIVILEGED_ROUTE_COUNT: usize = 41;
 
 /// Expected number of session routes.
 ///
 /// This constant MUST be updated when routes are added to or removed from
 /// `SessionMessageType::all_request_variants()`. The
 /// `test_session_route_count` test enforces this.
-pub const EXPECTED_SESSION_ROUTE_COUNT: usize = 8;
+pub const EXPECTED_SESSION_ROUTE_COUNT: usize = 9;
 
 /// Number of routes that appear in both privileged and session dispatch
 /// registries (e.g., `SubscribePulse`, `UnsubscribePulse`). These are
 /// deduplicated during manifest construction.
-pub const EXPECTED_SHARED_ROUTE_COUNT: usize = 2;
+pub const EXPECTED_SHARED_ROUTE_COUNT: usize = 3;
 
 /// Expected total route count for the manifest (after deduplication).
 pub const EXPECTED_TOTAL_ROUTE_COUNT: usize =

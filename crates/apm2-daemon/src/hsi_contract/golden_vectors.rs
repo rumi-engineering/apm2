@@ -71,7 +71,8 @@ pub const MANIFEST_FULL_VECTOR: GoldenVector = GoldenVector {
     // RFC-0032::REQ-0270: PublishWorkLoopProfile (hsi.work_loop_profile.publish) added as
     // authoritative+idempotent+receipt.
     // RFC-0032::REQ-0264: ResolveTicketAlias (hsi.work.resolve_ticket_alias) added as advisory.
-    expected_hash: "ebd43e06929e5398fb5f3177afe5cf090a079e8bdd844a9ba87002eb9f770f18",
+    // RFC-0032: WorkShow (hsi.work.show) added as advisory (read-only WorkSpec retrieval).
+    expected_hash: "308c88e1d572be6969b1b9bf95b59d06c74b493059cd069b085a98d356d5c4e7",
 };
 
 /// Golden vector: minimal manifest with a single route.

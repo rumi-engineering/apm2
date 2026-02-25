@@ -1199,7 +1199,7 @@ mod tests {
         }
 
         // Unknown tags must return None (fail-closed)
-        let unknown_tags: Vec<u8> = vec![0, 7, 8, 50, 63, 65, 67, 69, 100, 255];
+        let unknown_tags: Vec<u8> = vec![0, 8, 50, 63, 65, 67, 69, 100, 255];
         for tag in unknown_tags {
             assert!(
                 SessionMessageType::from_tag(tag).is_none(),
