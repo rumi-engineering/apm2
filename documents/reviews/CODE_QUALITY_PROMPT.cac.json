@@ -72,6 +72,31 @@
           "id": "INV-CQ-007",
           "description": "Any persisted monotonic timestamp (Instant-derived values stored in SQLite, files, or other durable storage) MUST have an explicit rebase-on-load path that recalculates deadlines from a wall-clock anchor (e.g. GateLease.expires_at). Persisted monotonic values MUST NOT trigger irreversible actions (timeouts, denials, state transitions) solely due to monotonic epoch rewind after process restart. Grep anchors: observed_monotonic_ns, deadline_monotonic_ns, MONO_EPOCH, Instant::now.",
           "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-001",
+          "description": "Any new orchestrator that tails the ledger and emits receipts MUST use apm2_core::orchestrator_kernel (the Observe->Plan->Execute->Receipt kernel). A bespoke observe/plan/execute/receipt loop implemented outside the kernel is a MAJOR finding. Grep anchors: LedgerReader, OrchestratorDomain, run_tick, ReceiptWriter.",
+          "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-002",
+          "description": "Kernel orchestrators MUST use orchestrator_runtime adapters (SqliteCursorStore, SqliteIntentStore, SqliteEffectJournal in crates/apm2-daemon/src/orchestrator_runtime/) for durable cursor, intent, and effect-journal storage. New per-orchestrator sqlite tables or files for these concerns are a MAJOR finding. Grep anchors: CREATE TABLE.*cursor, CREATE TABLE.*intent, effect_journal, Connection::open(.",
+          "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-003",
+          "description": "No rusqlite work is permitted directly on async execution paths; it MUST be offloaded via spawn_blocking or a provided async wrapper in adapters. Performing blocking sqlite I/O on a tokio thread pool executor is a MAJOR finding. Grep anchors: rusqlite::Connection, query_map, execute, prepare — check that every call site is inside spawn_blocking.",
+          "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-004",
+          "description": "Canonical event IDs synthesized from a sequence number MUST be zero-padded to 20 digits using the form canonical-{seq_id:020}. Unpaded forms (e.g. canonical-{seq_id} without width) break lexicographic cursor ordering for seq_id >= 10 and are a MAJOR finding. Grep anchors: canonical-, format!(\"canonical-, canonical_event_id.",
+          "criticality": "CORRECTNESS"
+        },
+        {
+          "id": "INV-CQ-OK-005",
+          "description": "Any code that merges canonical `events` and legacy `ledger_events` tables MUST use the shared poller module (crates/apm2-daemon/src/ledger_poll.rs). Hand-rolled SQL that unions or interleaves both tables is a MAJOR finding. Grep anchors: ledger_events, canonical.*events, poll_events.",
+          "criticality": "CORRECTNESS"
         }
       ]
     },
