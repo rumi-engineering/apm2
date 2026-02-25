@@ -4171,29 +4171,23 @@ mod tests {
 
     #[test]
     fn validate_explicit_ticket_alias_binding_accepts_matching_resolution() {
-        let alias = validate_explicit_ticket_alias_binding(
-            "W-12345678",
-            "RFC-0032::REQ-0268",
-            Some("W-12345678"),
-        )
-        .expect("matching alias resolution should be accepted");
-        assert_eq!(alias, "RFC-0032::REQ-0268");
+        let alias =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", Some("W-12345678"))
+                .expect("matching alias resolution should be accepted");
+        assert_eq!(alias, "TCK-02680");
     }
 
     #[test]
     fn validate_explicit_ticket_alias_binding_rejects_mismatched_resolution() {
-        let err = validate_explicit_ticket_alias_binding(
-            "W-12345678",
-            "RFC-0032::REQ-0268",
-            Some("W-87654321"),
-        )
-        .expect_err("mismatched alias resolution must fail closed");
+        let err =
+            validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", Some("W-87654321"))
+                .expect_err("mismatched alias resolution must fail closed");
         assert!(err.contains("`--work-id` mismatch"));
     }
 
     #[test]
     fn validate_explicit_ticket_alias_binding_rejects_unresolved_alias() {
-        let err = validate_explicit_ticket_alias_binding("W-12345678", "RFC-0032::REQ-0268", None)
+        let err = validate_explicit_ticket_alias_binding("W-12345678", "TCK-02680", None)
             .expect_err("unresolved explicit alias must fail closed");
         assert!(err.contains("fail-closed"));
     }
@@ -4207,8 +4201,8 @@ mod tests {
 
     #[test]
     fn unresolved_push_alias_message_includes_fail_closed_guidance() {
-        let msg = unresolved_push_alias_message("RFC-0032::REQ-0268");
-        assert!(msg.contains("RFC-0032::REQ-0268"));
+        let msg = unresolved_push_alias_message("TCK-02680");
+        assert!(msg.contains("TCK-02680"));
         assert!(msg.contains("Refusing projection fallback"));
         assert!(msg.contains("apm2 fac work open --from-ticket"));
     }
@@ -4220,8 +4214,8 @@ Some PR text
 
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-RFC-0032::REQ-0268-R2
-ticket_alias: RFC-0032::REQ-0268
+work_id: W-TCK-02680-R2
+ticket_alias: TCK-02680
 fac_push_metadata:
   commit_history: []
 ```
@@ -4229,8 +4223,8 @@ fac_push_metadata:
         let parsed = parse_pr_body_work_binding(body)
             .expect("valid pr metadata must parse")
             .expect("binding should be present");
-        assert_eq!(parsed.work_id, "W-RFC-0032::REQ-0268-R2");
-        assert_eq!(parsed.ticket_alias.as_deref(), Some("RFC-0032::REQ-0268"));
+        assert_eq!(parsed.work_id, "W-TCK-02680-R2");
+        assert_eq!(parsed.ticket_alias.as_deref(), Some("TCK-02680"));
     }
 
     #[test]
@@ -4238,11 +4232,11 @@ fac_push_metadata:
         let body = r"
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-RFC-0032::REQ-0268
+work_id: W-TCK-02680
 ```
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-RFC-0032::REQ-0268-R2
+work_id: W-TCK-02680-R2
 ```
 ";
         let err = parse_pr_body_work_binding(body)
@@ -4255,7 +4249,7 @@ work_id: W-RFC-0032::REQ-0268-R2
         let body = r"
 ```yaml
 schema: apm2.fac_push_metadata.v1
-work_id: W-RFC-0032::REQ-0268
+work_id: W-TCK-02680
 ticket_alias: ticket-640
 ```
 ";
@@ -4267,24 +4261,21 @@ ticket_alias: ticket-640
     #[test]
     fn enforce_authoritative_pr_work_binding_rejects_mismatched_candidate() {
         let authoritative = PrBodyWorkBinding {
-            work_id: "W-RFC-0032::REQ-0268-R2".to_string(),
-            ticket_alias: Some("RFC-0032::REQ-0268".to_string()),
+            work_id: "W-TCK-02680-R2".to_string(),
+            ticket_alias: Some("TCK-02680".to_string()),
         };
-        let err = enforce_authoritative_pr_work_binding(
-            Some(805),
-            Some(&authoritative),
-            "W-RFC-0032::REQ-0268",
-        )
-        .expect_err("mismatched candidate must fail closed");
+        let err =
+            enforce_authoritative_pr_work_binding(Some(805), Some(&authoritative), "W-TCK-02680")
+                .expect_err("mismatched candidate must fail closed");
         assert!(err.contains("existing PR #805"));
-        assert!(err.contains("W-RFC-0032::REQ-0268-R2"));
+        assert!(err.contains("W-TCK-02680-R2"));
     }
 
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_skips_binding_when_no_pr_exists() {
         let mut resolve_called = false;
         let refreshed = refresh_existing_pr_number_for_preflight_with(
-            "W-RFC-0032::REQ-0268-R2",
+            "W-TCK-02680-R2",
             || 0,
             |_| {
                 resolve_called = true;
@@ -4302,12 +4293,12 @@ ticket_alias: ticket-640
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_revalidates_authoritative_binding() {
         let refreshed = refresh_existing_pr_number_for_preflight_with(
-            "W-RFC-0032::REQ-0268-R2",
+            "W-TCK-02680-R2",
             || 805,
             |_| {
                 Ok(Some(PrBodyWorkBinding {
-                    work_id: "W-RFC-0032::REQ-0268-R2".to_string(),
-                    ticket_alias: Some("RFC-0032::REQ-0268".to_string()),
+                    work_id: "W-TCK-02680-R2".to_string(),
+                    ticket_alias: Some("TCK-02680".to_string()),
                 }))
             },
         )
@@ -4318,7 +4309,7 @@ ticket_alias: ticket-640
     #[test]
     fn refresh_existing_pr_number_for_preflight_with_rejects_mismatched_binding() {
         let err = refresh_existing_pr_number_for_preflight_with(
-            "W-RFC-0032::REQ-0268-R2",
+            "W-TCK-02680-R2",
             || 805,
             |_| {
                 Ok(Some(PrBodyWorkBinding {
@@ -4359,16 +4350,16 @@ ticket_alias: ticket-640
     #[test]
     fn build_git_push_refspec_uses_captured_head_sha() {
         assert_eq!(
-            build_git_push_refspec("0123abcd", "ticket/RFC-0032/RFC-0032::REQ-0268"),
-            "0123abcd:refs/heads/ticket/RFC-0032/RFC-0032::REQ-0268"
+            build_git_push_refspec("0123abcd", "ticket/RFC-0032/TCK-02680"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-02680"
         );
     }
 
     #[test]
     fn build_git_push_refspec_normalizes_heads_prefix() {
         assert_eq!(
-            build_git_push_refspec("0123abcd", "refs/heads/ticket/RFC-0032/RFC-0032::REQ-0268"),
-            "0123abcd:refs/heads/ticket/RFC-0032/RFC-0032::REQ-0268"
+            build_git_push_refspec("0123abcd", "refs/heads/ticket/RFC-0032/TCK-02680"),
+            "0123abcd:refs/heads/ticket/RFC-0032/TCK-02680"
         );
     }
 
@@ -4556,7 +4547,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_prefers_requested_session_when_daemon_session_missing() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             Some("S-requested-123".to_string()),
             Some("L-lease-123".to_string()),
@@ -4571,7 +4562,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_uses_daemon_session_when_not_requested() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             None,
             None,
             Some("L-lease-123".to_string()),
@@ -4586,7 +4577,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_derives_adhoc_session_when_missing() {
         let binding = resolve_runtime_binding_from_inputs(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             None,
             Some("L-lease-123".to_string()),
@@ -4601,7 +4592,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_rejects_lease_mismatch() {
         let err = resolve_runtime_binding_from_inputs(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             Some("L-requested".to_string()),
             None,
             Some("L-daemon".to_string()),
@@ -4614,7 +4605,7 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_runtime_binding_from_inputs_rejects_session_mismatch() {
         let err = resolve_runtime_binding_from_inputs(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             Some("L-lease-123".to_string()),
             Some("S-requested".to_string()),
             Some("L-lease-123".to_string()),
@@ -4657,17 +4648,17 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_accepts_valid_payload() {
-        let changeset = sample_changeset_response("W-RFC-0032::REQ-0268");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let handoff = sample_context_response("W-RFC-0032::REQ-0268", "CTX-123");
-        let terminal = sample_context_response("W-RFC-0032::REQ-0268", "CTX-456");
+        let handoff = sample_context_response("W-TCK-02680", "CTX-123");
+        let terminal = sample_context_response("W-TCK-02680", "CTX-456");
 
         validate_work_publication_chain_responses(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4680,16 +4671,16 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_rejects_pr_number_mismatch() {
-        let changeset = sample_changeset_response("W-RFC-0032::REQ-0268");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             999,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let terminal = sample_context_response("W-RFC-0032::REQ-0268", "CTX-456");
+        let terminal = sample_context_response("W-TCK-02680", "CTX-456");
 
         let err = validate_work_publication_chain_responses(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4703,16 +4694,16 @@ ticket_alias: ticket-640
 
     #[test]
     fn validate_work_publication_chain_responses_rejects_non_context_entry_id() {
-        let changeset = sample_changeset_response("W-RFC-0032::REQ-0268");
+        let changeset = sample_changeset_response("W-TCK-02680");
         let association = sample_pr_association_response(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
         );
-        let terminal = sample_context_response("W-RFC-0032::REQ-0268", "bad-entry");
+        let terminal = sample_context_response("W-TCK-02680", "bad-entry");
 
         let err = validate_work_publication_chain_responses(
-            "W-RFC-0032::REQ-0268",
+            "W-TCK-02680",
             640,
             "0123456789abcdef0123456789abcdef01234567",
             &changeset,
@@ -4726,9 +4717,9 @@ ticket_alias: ticket-640
 
     #[test]
     fn derive_adhoc_session_id_is_deterministic_and_prefixed() {
-        let first = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-lease-123");
-        let second = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-lease-123");
-        let different = derive_adhoc_session_id("W-RFC-0032::REQ-0268", "L-lease-456");
+        let first = derive_adhoc_session_id("W-TCK-02680", "L-lease-123");
+        let second = derive_adhoc_session_id("W-TCK-02680", "L-lease-123");
+        let different = derive_adhoc_session_id("W-TCK-02680", "L-lease-456");
 
         assert_eq!(
             first, second,
@@ -5366,9 +5357,9 @@ ticket_alias: ticket-640
     #[test]
     fn render_push_body_markdown_includes_work_identity_and_commit_history() {
         let rendered = render_push_body_markdown(
-            "W-RFC-0032::REQ-0158",
-            Some("RFC-0032::REQ-0158"),
-            "ticket/RFC-0018/RFC-0032::REQ-0158",
+            "W-TCK-01580",
+            Some("TCK-01580"),
+            "ticket/RFC-0018/TCK-01580",
             &sample_commit_history(),
         )
         .expect("render push body");
@@ -5378,12 +5369,12 @@ ticket_alias: ticket-640
             .get("work_id")
             .and_then(serde_yaml::Value::as_str)
             .expect("work id");
-        assert_eq!(work_id, "W-RFC-0032::REQ-0158");
+        assert_eq!(work_id, "W-TCK-01580");
         let ticket_alias = yaml
             .get("ticket_alias")
             .and_then(serde_yaml::Value::as_str)
             .expect("ticket alias");
-        assert_eq!(ticket_alias, "RFC-0032::REQ-0158");
+        assert_eq!(ticket_alias, "TCK-01580");
 
         let history = yaml
             .get("fac_push_metadata")
@@ -5408,14 +5399,14 @@ ticket_alias: ticket-640
     #[test]
     fn resolve_pr_metadata_prefers_resolved_ticket_alias_prefix() {
         let metadata = resolve_pr_metadata(
-            "ticket/RFC-0018/RFC-0032::REQ-0158",
+            "ticket/RFC-0018/TCK-01580",
             Path::new("/tmp/apm2-no-ticket"),
             &sample_commit_history(),
-            "W-RFC-0032::REQ-0158",
-            Some("RFC-0032::REQ-0158"),
+            "W-TCK-01580",
+            Some("TCK-01580"),
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "RFC-0032::REQ-0158: second change");
+        assert_eq!(metadata.title, "TCK-01580: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         let history = yaml
             .get("fac_push_metadata")
@@ -5429,19 +5420,19 @@ ticket_alias: ticket-640
     fn resolve_pr_metadata_uses_branch_derived_alias_when_not_explicitly_supplied() {
         let metadata = resolve_pr_metadata(
             "feat/no-ticket",
-            Path::new("/tmp/apm2-RFC-0032::REQ-0168"),
+            Path::new("/tmp/apm2-TCK-01680"),
             &sample_commit_history(),
-            "W-RFC-0032::REQ-0168",
+            "W-TCK-01680",
             None,
         )
         .expect("resolve metadata");
-        assert_eq!(metadata.title, "RFC-0032::REQ-0168: second change");
+        assert_eq!(metadata.title, "TCK-01680: second change");
         let yaml = parse_yaml_from_markdown_fence(&metadata.body);
         assert_eq!(
             yaml.get("ticket_alias")
                 .and_then(serde_yaml::Value::as_str)
                 .expect("ticket alias"),
-            "RFC-0032::REQ-0168"
+            "TCK-01680"
         );
     }
 
