@@ -180,7 +180,7 @@
       "id": "BEH-CLI-FAC-REV-026",
       "kind": "capability",
       "title": "Prepare output enriched with work scope from PR metadata",
-      "description": "When the PR body contains a valid `apm2.fac_push_metadata.v1` YAML block, prepare extracts the work_id, calls the daemon to fetch the work object, expands requirement nodes from RFC JSON, and embeds the full work scope context in the JSON output. Graceful degradation: work_scope is null for external PRs or when any resolution step fails.",
+      "description": "When the PR body contains a valid `apm2.fac_push_metadata.v1` YAML block from a trusted same-repo PR (trust gate: head.repo.full_name == owner_repo AND head.ref == yaml.branch), prepare extracts `work_id`, `ticket_alias`, and `rfc_id` (parsed from branch name) and embeds them as `work_scope` in the JSON output. `requirement_ids` and `requirements` are reserved empty fields for future population once daemon work objects carry explicit requirements (post-TCK-00683). Graceful degradation: work_scope is null for fork PRs, external PRs, PRs without push metadata, or when any resolution step fails.",
       "rfc": ["RFC-0019"]
     }
   ]
