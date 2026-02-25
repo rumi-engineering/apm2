@@ -1719,6 +1719,8 @@ fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
         "--".to_string(),
         "-D".to_string(),
         "warnings".to_string(),
+        "-A".to_string(),
+        "clippy::doc_markdown".to_string(),
     ]);
     command
 }
@@ -4153,6 +4155,7 @@ mod tests {
         assert!(clippy.contains("cargo clippy"));
         assert!(clippy.contains("-p apm2-cli"));
         assert!(clippy.contains("--offline"));
+        assert!(clippy.contains("-A clippy::doc_markdown"));
         assert!(!clippy.contains("--workspace"));
     }
 
