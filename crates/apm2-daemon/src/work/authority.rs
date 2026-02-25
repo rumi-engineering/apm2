@@ -62,6 +62,63 @@ pub struct WorkAuthorityStatus {
     pub identity_chain_defect_count: u32,
 }
 
+/// Maximum length for a `work_id` string (bytes).
+///
+/// Shared invariant enforced by [`WorkId::try_from`] and handler-level
+/// validation to prevent DoS via oversized identifiers.
+pub const MAX_WORK_ID_LENGTH: usize = 256;
+
+/// Typed wrapper for canonical work identifiers (`W-...`).
+///
+/// Parse, don't validate: the fallible constructor enforces non-empty and
+/// length-bounded invariants at the boundary so downstream code can operate
+/// on a known-good identifier without re-checking.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkId(String);
+
+impl WorkId {
+    /// Returns the inner string as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Error produced when parsing a raw string into a [`WorkId`].
+#[derive(Debug, Error)]
+pub enum WorkIdParseError {
+    /// The supplied `work_id` string was empty.
+    #[error("work_id cannot be empty")]
+    Empty,
+
+    /// The supplied `work_id` exceeds [`MAX_WORK_ID_LENGTH`] bytes.
+    #[error("work_id exceeds maximum length of {MAX_WORK_ID_LENGTH} bytes (got {actual})")]
+    TooLong {
+        /// Actual byte-length of the oversized input.
+        actual: usize,
+    },
+}
+
+impl TryFrom<String> for WorkId {
+    type Error = WorkIdParseError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.is_empty() {
+            return Err(WorkIdParseError::Empty);
+        }
+        if s.len() > MAX_WORK_ID_LENGTH {
+            return Err(WorkIdParseError::TooLong { actual: s.len() });
+        }
+        Ok(Self(s))
+    }
+}
+
 /// Authority-layer errors.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -82,6 +139,22 @@ pub enum WorkAuthorityError {
     WorkNotFound {
         /// Missing work ID.
         work_id: String,
+    },
+}
+
+/// Error produced by [`AliasReconciliationGate::get_spec_hash`] to
+/// distinguish infrastructure failures from "work_id not found".
+#[derive(Debug, Error)]
+pub enum SpecHashError {
+    /// CAS is not configured on this gate instance.
+    #[error("CAS not configured")]
+    CasNotConfigured,
+
+    /// Projection lock or refresh failure.
+    #[error("projection error: {message}")]
+    ProjectionError {
+        /// Detail of the lock/refresh failure.
+        message: String,
     },
 }
 
@@ -684,6 +757,18 @@ pub trait AliasReconciliationGate: Send + Sync {
         &self,
         _ticket_alias: &str,
     ) -> Result<Option<String>, WorkAuthorityError> {
+        Ok(None)
+    }
+
+    /// Returns the `spec_snapshot_hash` for a given `work_id` if known.
+    ///
+    /// Returns `Ok(Some(hash))` when the work_id is found and has a stored
+    /// spec hash, `Ok(None)` when the work_id is unknown or has no spec hash,
+    /// and `Err(SpecHashError)` for infrastructure failures such as CAS not
+    /// being configured or projection lock failures.
+    ///
+    /// The default implementation returns `Ok(None)`.
+    fn get_spec_hash(&self, _work_id: &str) -> Result<Option<[u8; 32]>, SpecHashError> {
         Ok(None)
     }
 }
@@ -1435,6 +1520,32 @@ impl AliasReconciliationGate for ProjectionAliasReconciliationGate {
                 })
             },
         }
+    }
+
+    /// Returns the `spec_snapshot_hash` for a given `work_id` from the
+    /// bounded ticket alias index (RFC-0032).
+    ///
+    /// Refreshes the projection before lookup to ensure freshness.
+    /// Returns `Ok(None)` if the `work_id` is unknown or has no stored spec
+    /// hash. Returns `Err(SpecHashError::CasNotConfigured)` when CAS is not
+    /// wired, so the caller can produce a clear error message rather than
+    /// misinterpreting the absence as "work_id not found".
+    fn get_spec_hash(&self, work_id: &str) -> Result<Option<[u8; 32]>, SpecHashError> {
+        if self.cas.is_none() {
+            return Err(SpecHashError::CasNotConfigured);
+        }
+
+        // Best-effort refresh: if projection refresh fails we still
+        // attempt the lookup against stale data.
+        let _ = self.refresh_projection();
+
+        let alias_index =
+            self.ticket_alias_index
+                .read()
+                .map_err(|e| SpecHashError::ProjectionError {
+                    message: format!("ticket alias index lock poisoned: {e}"),
+                })?;
+        Ok(alias_index.spec_hash_by_work_id.get(work_id).copied())
     }
 }
 

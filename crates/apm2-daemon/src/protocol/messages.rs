@@ -436,6 +436,9 @@ impl_bounded_decode_simple!(
     // RFC-0032::REQ-0264: ResolveTicketAlias (RFC-0032 Phase 1)
     ResolveTicketAliasRequest,
     ResolveTicketAliasResponse,
+    // RFC-0032: WorkShow
+    WorkShowRequest,
+    WorkShowResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields

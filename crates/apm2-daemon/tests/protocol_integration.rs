@@ -5,17 +5,17 @@
 //! - Frame encoding/decoding over the wire
 //! - Handshake protocol completion
 //! - Connection lifecycle management
-//! - UID-based authentication at accept time (RFC-0032::REQ-0064)
-//! - Dual-socket privilege separation (RFC-0032::REQ-0065)
+//! - UID-based authentication at accept time (`RFC-0032::REQ-0064`)
+//! - Dual-socket privilege separation (`RFC-0032::REQ-0065`)
 //!
-//! # Security Note (RFC-0032::REQ-0064)
+//! # Security Note (`RFC-0032::REQ-0064`)
 //!
 //! UID validation is performed at `accept()` time, before the handshake.
 //! Since both client and server run as the same user in tests, integration
 //! tests verify the authorization succeeds. Unit tests in `server.rs` verify
 //! that the constant-time comparison and error handling work correctly.
 //!
-//! # Dual-Socket Topology (RFC-0032::REQ-0065)
+//! # Dual-Socket Topology (`RFC-0032::REQ-0065`)
 //!
 //! The socket manager creates two sockets with different permissions:
 //! - `operator.sock` (mode 0600): Privileged operations only
@@ -346,13 +346,13 @@ async fn test_connection_limit_enforcement() {
     assert!(inner.unwrap().is_ok(), "Third accept should succeed");
 }
 
-/// Test that same-UID connections are accepted (RFC-0032::REQ-0064).
+/// Test that same-UID connections are accepted (`RFC-0032::REQ-0064`).
 ///
 /// This integration test verifies that when client and server run as the same
 /// user (which is always the case in tests), the connection is accepted and
 /// handshake succeeds.
 ///
-/// # Security Note (RFC-0032::REQ-0064)
+/// # Security Note (`RFC-0032::REQ-0064`)
 ///
 /// UID validation now happens at `accept()` time (before handshake), using
 /// constant-time comparison via `subtle::ConstantTimeEq`. Since we can't
@@ -403,7 +403,7 @@ async fn test_accept_validates_uid_at_connection_time() {
 }
 
 /// Test full handshake succeeds after UID validation at accept
-/// (RFC-0032::REQ-0064).
+/// (`RFC-0032::REQ-0064`).
 ///
 /// This verifies that the handshake works correctly after UID authorization
 /// has already been performed at the `accept()` stage.
@@ -758,7 +758,7 @@ async fn test_session_socket_handshake() {
 
 /// INT-00279-01: `ProtocolServer`-only startup.
 ///
-/// This test verifies the acceptance criteria for RFC-0032::REQ-0085:
+/// This test verifies the acceptance criteria for `RFC-0032::REQ-0085`:
 ///
 /// 1. **`ProtocolServer` is the only daemon control-plane listener**
 ///    - Verification: `SocketManager` binds operator.sock + session.sock
@@ -958,7 +958,7 @@ async fn test_legacy_protocol_server_path_not_used_by_daemon() {
 /// library at `apm2_daemon::protocol::connection_handler`) properly implements
 /// the mandatory Hello/HelloAck handshake as specified in DD-001/DD-008.
 ///
-/// # RFC-0032::REQ-0086: Legacy JSON IPC Removed
+/// # `RFC-0032::REQ-0086`: Legacy JSON IPC Removed
 ///
 /// Per DD-009, legacy JSON IPC dispatch has been removed. This test now
 /// only verifies the handshake functionality, not JSON request/response
@@ -1050,7 +1050,7 @@ async fn test_perform_handshake_integration() {
 /// Per LAW-05 (testability principle), core security logic should be in
 /// testable library modules, not in the binary.
 ///
-/// # RFC-0032::REQ-0086: Legacy JSON IPC Removed
+/// # `RFC-0032::REQ-0086`: Legacy JSON IPC Removed
 ///
 /// Per DD-009, the `requires_privilege` function and JSON dispatch have been
 /// removed. Only handshake-related types remain in the library.
@@ -1086,7 +1086,7 @@ fn test_handshake_types_are_in_library() {
 
 /// IT-00287-01: JSON downgrade attempts are rejected.
 ///
-/// This test verifies the acceptance criteria for RFC-0032::REQ-0089:
+/// This test verifies the acceptance criteria for `RFC-0032::REQ-0089`:
 ///
 /// 1. **JSON `IpcRequest` frames are rejected before `handlers::dispatch`**
 ///    - Sending a JSON frame (starting with `{`) should trigger a dispatch
@@ -1185,7 +1185,7 @@ async fn protocol_dispatch_cutover_json_downgrade_rejection() {
 /// session.sock.
 ///
 /// This test verifies that valid tag-based frames are routed correctly.
-/// Per RFC-0032::REQ-0089 acceptance criteria:
+/// Per `RFC-0032::REQ-0089` acceptance criteria:
 /// - Tag-based protocol frames succeed on operator.sock and session.sock
 ///
 /// # Implementation Note
@@ -1239,7 +1239,7 @@ async fn protocol_dispatch_cutover_tag_routing() {
 /// This test documents the security invariant that JSON start bytes
 /// are outside the valid message type tag range, ensuring fail-closed
 /// behavior without explicit JSON detection code in the dispatchers.
-/// Updated for RFC-0032::REQ-0134: tag 5 is now valid (`WorkStatus` /
+/// Updated for `RFC-0032::REQ-0134`: tag 5 is now valid (`WorkStatus` /
 /// `SessionStatus`).
 #[test]
 fn protocol_dispatch_cutover_json_tag_validation() {
@@ -1294,7 +1294,7 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
     assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
 
-    // Valid session message types are 1-6, plus HEF range 64-68
+    // Valid session message types are 1-7, plus HEF range 64-68
     // Tags 1-4: Original session endpoints
     assert!(SessionMessageType::from_tag(1).is_some()); // RequestTool
     assert!(SessionMessageType::from_tag(2).is_some()); // EmitEvent
@@ -1304,7 +1304,9 @@ fn protocol_dispatch_cutover_json_tag_validation() {
     assert!(SessionMessageType::from_tag(5).is_some()); // StreamLogs
     // Tag 6: RFC-0032::REQ-0134 SessionStatus
     assert!(SessionMessageType::from_tag(6).is_some()); // SessionStatus
-    assert!(SessionMessageType::from_tag(7).is_none()); // Invalid (gap before HEF)
+    // Tag 7: RFC-0032 WorkShow (shared route, also IPC-PRIV-081)
+    assert!(SessionMessageType::from_tag(7).is_some()); // WorkShow
+    assert!(SessionMessageType::from_tag(8).is_none()); // Invalid (gap before HEF)
     // Tags 64-68: HEF Pulse Plane
     assert!(SessionMessageType::from_tag(64).is_some()); // SubscribePulse
     assert!(SessionMessageType::from_tag(66).is_some()); // UnsubscribePulse

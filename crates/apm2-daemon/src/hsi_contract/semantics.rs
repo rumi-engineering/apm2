@@ -165,6 +165,7 @@ pub fn annotate_route(route: &str) -> Option<HsiRouteSemantics> {
         | "hsi.work.status"
         | "hsi.work.list"
         | "hsi.work.resolve_ticket_alias"
+        | "hsi.work.show"
         | "hsi.ledger.verify_chain"
         | "hsi.launch.auditor_projection"
         | "hsi.launch.orchestrator_projection"
@@ -209,6 +210,7 @@ mod tests {
             "hsi.work.record_pr_association",
             "hsi.work_loop_profile.publish",
             "hsi.work.resolve_ticket_alias",
+            "hsi.work.show",
         ];
         for route in &known_routes {
             assert!(
@@ -265,6 +267,7 @@ mod tests {
             "hsi.consensus.metrics",
             "hsi.work.status",
             "hsi.work.list",
+            "hsi.work.show",
             "hsi.ledger.verify_chain",
             "hsi.launch.auditor_projection",
             "hsi.launch.orchestrator_projection",
@@ -294,6 +297,7 @@ mod tests {
             "hsi.consensus.status",
             "hsi.work.status",
             "hsi.work.list",
+            "hsi.work.show",
             "hsi.ledger.verify_chain",
             "hsi.launch.auditor_projection",
             "hsi.launch.orchestrator_projection",

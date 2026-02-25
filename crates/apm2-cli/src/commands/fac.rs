@@ -688,12 +688,27 @@ pub enum WorkSubcommand {
     /// `WorkSpec` lookup. Returns the canonical `work_id` when exactly one
     /// match is found, or reports not-found / ambiguity (fail-closed).
     ResolveAlias(ResolveAliasArgs),
+
+    /// Show full WorkSpecV1 content for a given work_id from CAS (RFC-0032).
+    ///
+    /// Retrieves the canonical `WorkSpec` JSON stored in CAS via the daemon's
+    /// alias reconciliation gate. Returns work_id, title, rfc_id, status,
+    /// and the full spec JSON.
+    Show(WorkShowArgs),
 }
 
 /// Arguments for `apm2 fac work status`.
 #[derive(Debug, Args)]
 pub struct WorkStatusArgs {
     /// Work identifier to query.
+    pub work_id: String,
+}
+
+/// Arguments for `apm2 fac work show`.
+#[derive(Debug, Args)]
+pub struct WorkShowArgs {
+    /// Work identifier to query (W-...).
+    #[arg(long = "work-id")]
     pub work_id: String,
 }
 
@@ -3594,6 +3609,9 @@ pub fn run_fac(
             WorkSubcommand::ResolveAlias(resolve_args) => {
                 run_resolve_alias(resolve_args, operator_socket, json_output)
             },
+            WorkSubcommand::Show(show_args) => {
+                run_work_show(show_args, operator_socket, json_output)
+            },
         },
         FacSubcommand::Install(args) => crate::commands::fac_install::run_install(
             json_output,
@@ -4537,6 +4555,96 @@ fn run_work_list(args: &WorkListArgs, operator_socket: &Path, json_output: bool)
                 total: rows.len(),
                 items: &rows,
             };
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+            );
+
+            exit_codes::SUCCESS
+        },
+        Err(error) => handle_protocol_error(json_output, &error),
+    }
+}
+
+/// Execute the work show command (RFC-0032).
+///
+/// Retrieves full `WorkSpecV1` JSON from daemon CAS for a given `work_id`.
+/// Output is valid JSON with at minimum: `work_id`, `title`, `rfc_id`,
+/// `spec_snapshot_hash`, `work_spec`.
+fn run_work_show(args: &WorkShowArgs, operator_socket: &Path, json_output: bool) -> u8 {
+    // Validate work_id is non-empty (fail-closed)
+    if args.work_id.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            "Work ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(operator_socket).await?;
+        client.work_show(&args.work_id).await
+    });
+
+    match result {
+        Ok(response) => {
+            // Parse the raw WorkSpec JSON bytes from CAS into a serde_json::Value
+            // so we can produce structured output containing the envelope fields.
+            let spec_json: serde_json::Value =
+                match serde_json::from_slice(&response.work_spec_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return output_error(
+                            json_output,
+                            "work_spec_parse_error",
+                            &format!(
+                                "Failed to parse WorkSpec JSON from CAS for '{}': {e}",
+                                response.work_id
+                            ),
+                            exit_codes::GENERIC_ERROR,
+                        );
+                    },
+                };
+
+            // Build a structured envelope with top-level fields for automation.
+            let spec_hash_hex = hex::encode(&response.spec_snapshot_hash);
+
+            // Extract title and rfc_id from the WorkSpec JSON for the
+            // envelope. WorkSpecV1 defines these as top-level fields.
+            let title = spec_json
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let rfc_id = spec_json
+                .get("rfc_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let output = serde_json::json!({
+                "work_id": response.work_id,
+                "title": title,
+                "rfc_id": rfc_id,
+                "spec_snapshot_hash": spec_hash_hex,
+                "work_spec": spec_json,
+            });
 
             println!(
                 "{}",
