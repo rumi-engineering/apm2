@@ -15574,8 +15574,8 @@ impl PrivilegedDispatcher {
     ///
     /// The alias reconciliation gate's `get_spec_hash()` calls
     /// `refresh_projection()` which executes rusqlite queries. This is
-    /// offloaded via `tokio::task::block_in_place` to avoid blocking the
-    /// tokio executor thread pool.
+    /// offloaded via `std::thread::scope` to a dedicated OS thread so
+    /// that SQLite I/O never occupies a tokio executor thread.
     fn handle_work_show(
         &self,
         payload: &[u8],
@@ -15608,15 +15608,20 @@ impl PrivilegedDispatcher {
 
         // 1. Look up the spec_snapshot_hash from the alias reconciliation gate.
         // INV-CQ-OK-003: get_spec_hash() calls refresh_projection() which
-        // executes rusqlite queries synchronously. Offload via
-        // block_in_place to signal to the tokio runtime that the current
-        // thread will block, allowing the runtime to compensate by
-        // spawning replacement worker threads. This avoids the forbidden
-        // Handle::current().block_on() pattern which can deadlock or panic
-        // in async contexts.
+        // executes rusqlite queries synchronously. Per INV-CQ-OK-003, all
+        // rusqlite work MUST be strictly offloaded from tokio executor
+        // threads. We use std::thread::scope to run the query on a
+        // dedicated OS thread rather than block_in_place (which still
+        // executes on a tokio worker thread) or spawn_blocking (which
+        // requires an async .await). The scoped thread guarantees the
+        // SQLite I/O never occupies an executor thread.
         let gate = Arc::clone(&self.alias_reconciliation_gate);
         let work_id_str = work_id.as_str().to_owned();
-        let spec_hash_result = tokio::task::block_in_place(|| gate.get_spec_hash(&work_id_str));
+        let spec_hash_result = std::thread::scope(|s| {
+            s.spawn(|| gate.get_spec_hash(&work_id_str))
+                .join()
+                .expect("INV-CQ-OK-003: scoped thread panicked during get_spec_hash")
+        });
 
         let spec_hash = match spec_hash_result {
             Ok(Some(hash)) => hash,
