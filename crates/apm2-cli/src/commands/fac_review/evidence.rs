@@ -1719,8 +1719,9 @@ fn build_clippy_gate_command(scope: &CargoGateExecutionScope) -> Vec<String> {
         "--".to_string(),
         "-D".to_string(),
         "warnings".to_string(),
-        "-A".to_string(),
-        "clippy::doc_markdown".to_string(),
+        "-Aclippy::doc-markdown".to_string(),
+        "-Aclippy::too-long-first-doc-paragraph".to_string(),
+        "-Aclippy::doc-lazy-continuation".to_string(),
     ]);
     command
 }
@@ -4155,7 +4156,9 @@ mod tests {
         assert!(clippy.contains("cargo clippy"));
         assert!(clippy.contains("-p apm2-cli"));
         assert!(clippy.contains("--offline"));
-        assert!(clippy.contains("-A clippy::doc_markdown"));
+        assert!(clippy.contains("-Aclippy::doc-markdown"));
+        assert!(clippy.contains("-Aclippy::too-long-first-doc-paragraph"));
+        assert!(clippy.contains("-Aclippy::doc-lazy-continuation"));
         assert!(!clippy.contains("--workspace"));
     }
 
