@@ -140,11 +140,18 @@ impl<C: KernelCursor> SqliteCursorStore<C> {
             .conn
             .lock()
             .map_err(|e| format!("cursor store lock poisoned: {e}"))?;
+
+        // SQL-side length predicate: filter out oversized payloads before
+        // they are materialized as Rust strings (SEC finding: payload load
+        // before size check). The post-load validate_json_size is kept as a
+        // defence-in-depth safety net.
+        let max_json_i64 = i64::try_from(MAX_JSON_BYTES).unwrap_or(i64::MAX);
         let row: Option<String> = guard
             .query_row(
                 "SELECT cursor_json FROM orchestrator_kernel_cursors
-                 WHERE orchestrator_id = ?1",
-                params![&self.orchestrator_id],
+                 WHERE orchestrator_id = ?1
+                   AND length(cursor_json) <= ?2",
+                params![&self.orchestrator_id, max_json_i64],
                 |r| r.get(0),
             )
             .optional()
@@ -308,20 +315,53 @@ where
             .conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
+        // SQL-side length predicate: filter out oversized payloads before
+        // they are materialized as Rust strings (SEC finding: payload load
+        // before size check). Oversized rows are quarantined below.
+        let max_json_i64 = i64::try_from(MAX_JSON_BYTES).unwrap_or(i64::MAX);
+
+        // Quarantine any oversized pending rows at the SQL level without
+        // loading their payloads into memory.
+        {
+            let now_ns = epoch_now_ns_i64()?;
+            let oversized_count = guard
+                .execute(
+                    "UPDATE orchestrator_kernel_intents
+                     SET state = 'blocked',
+                         blocked_reason = 'payload_exceeds_max_json_bytes',
+                         updated_at_ns = ?3
+                     WHERE orchestrator_id = ?1 AND state = 'pending'
+                       AND length(intent_json) > ?2",
+                    params![&self.orchestrator_id, max_json_i64, now_ns],
+                )
+                .map_err(|e| format!("failed to quarantine oversized intents in dequeue: {e}"))?;
+            if oversized_count > 0 {
+                tracing::warn!(
+                    orchestrator_id = %self.orchestrator_id,
+                    count = oversized_count,
+                    "dequeue_batch: quarantined {oversized_count} oversized pending row(s)"
+                );
+            }
+        }
+
         let mut stmt = guard
             .prepare(
                 "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
                  WHERE orchestrator_id = ?1 AND state = 'pending'
+                   AND length(intent_json) <= ?3
                  ORDER BY created_at_ns ASC, intent_key ASC
                  LIMIT ?2",
             )
             .map_err(|e| format!("failed to prepare intent dequeue query: {e}"))?;
         let rows = stmt
-            .query_map(params![&self.orchestrator_id, limit_i64], |row| {
-                let key: String = row.get(0)?;
-                let json: String = row.get(1)?;
-                Ok((key, json))
-            })
+            .query_map(
+                params![&self.orchestrator_id, limit_i64, max_json_i64],
+                |row| {
+                    let key: String = row.get(0)?;
+                    let json: String = row.get(1)?;
+                    Ok((key, json))
+                },
+            )
             .map_err(|e| format!("failed to query pending intents: {e}"))?;
 
         // Collect rows first so we can drop the statement borrow before
@@ -1094,16 +1134,21 @@ mod tests {
                 .expect("manual insert oversized cursor");
         }
 
+        // With SQL-side length predicate, the oversized row is filtered out
+        // at the query level and never materialized. load() returns the
+        // default cursor instead of an error (SEC finding fix: SQL-side
+        // length predicates before payload load).
         let store = SqliteCursorStore::<CompositeCursor>::new(conn, "orch-oversized");
         let result = store.load().await;
         assert!(
-            result.is_err(),
-            "loading an oversized cursor JSON must return Err, got: {result:?}"
+            result.is_ok(),
+            "load must succeed (oversized row filtered at SQL level), got: {result:?}"
         );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("MAX_JSON_BYTES"),
-            "error should reference MAX_JSON_BYTES: {err}"
+        let cursor = result.unwrap();
+        assert_eq!(
+            cursor,
+            CompositeCursor::default(),
+            "oversized row filtered out; default cursor returned"
         );
     }
 
@@ -1159,8 +1204,11 @@ mod tests {
             "oversized intent must be quarantined as blocked"
         );
         assert!(
-            reason.as_deref().unwrap_or("").contains("MAX_JSON_BYTES"),
-            "blocked_reason should reference MAX_JSON_BYTES: {reason:?}"
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("payload_exceeds_max_json_bytes"),
+            "blocked_reason should reference payload size exceeded: {reason:?}"
         );
     }
 
