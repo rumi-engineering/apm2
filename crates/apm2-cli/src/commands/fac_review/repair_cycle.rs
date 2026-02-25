@@ -288,6 +288,17 @@ fn execute_strategy(
     match strategy {
         RepairStrategy::Noop => Ok((None, None)),
         RepairStrategy::DispatchRepair => {
+            let projection_repair = lifecycle::reconcile_projection_gap_for_head(
+                &ctx.owner_repo,
+                ctx.pr_number,
+                &ctx.head_sha,
+                "doctor_fix_projection_gap",
+            )?;
+
+            if projection_repair.converged() {
+                return Ok((None, None));
+            }
+
             let reviews = dispatch_reviews(
                 &ctx.owner_repo,
                 ctx.pr_number,

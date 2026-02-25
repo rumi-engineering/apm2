@@ -276,6 +276,23 @@ where
         }
     }
 
+    fn next_created_at_base(
+        conn: &Connection,
+        orchestrator_id: &str,
+        now_ns: i64,
+    ) -> Result<i64, String> {
+        let max_created_ns: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(created_at_ns), 0)
+                 FROM orchestrator_kernel_intents
+                 WHERE orchestrator_id = ?1",
+                params![orchestrator_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to query max intent created_at_ns: {e}"))?;
+        Ok(now_ns.max(max_created_ns.saturating_add(1)))
+    }
+
     fn enqueue_many_sync(&self, intents: &[I]) -> Result<usize, String> {
         // Auto-chunk: process at most MAX_ENQUEUE_BATCH intents per
         // transaction to prevent kernel deadlock when catch-up produces
@@ -290,6 +307,7 @@ where
             let tx = guard
                 .transaction()
                 .map_err(|e| format!("failed to begin intent enqueue transaction: {e}"))?;
+            let mut created_at_ns = Self::next_created_at_base(&tx, &self.orchestrator_id, now_ns)?;
             for intent in chunk {
                 let key = intent.intent_key();
                 let json = serde_json::to_string(intent)
@@ -303,10 +321,17 @@ where
                          (orchestrator_id, intent_key, intent_json, state,
                           created_at_ns, updated_at_ns, blocked_reason)
                          VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL)",
-                        params![&self.orchestrator_id, &key, &json, now_ns, now_ns],
+                        params![
+                            &self.orchestrator_id,
+                            &key,
+                            &json,
+                            created_at_ns,
+                            created_at_ns
+                        ],
                     )
                     .map_err(|e| format!("failed to enqueue intent: {e}"))?;
                 total_inserted = total_inserted.saturating_add(rows);
+                created_at_ns = created_at_ns.saturating_add(1);
             }
             tx.commit()
                 .map_err(|e| format!("failed to commit intent enqueue transaction: {e}"))?;
@@ -359,7 +384,7 @@ where
                 "SELECT intent_key, intent_json FROM orchestrator_kernel_intents
                  WHERE orchestrator_id = ?1 AND state = 'pending'
                    AND length(intent_json) <= ?3
-                 ORDER BY created_at_ns ASC, intent_key ASC
+                 ORDER BY created_at_ns ASC, rowid ASC
                  LIMIT ?2",
             )
             .map_err(|e| format!("failed to prepare intent dequeue query: {e}"))?;
@@ -474,14 +499,16 @@ where
             .conn
             .lock()
             .map_err(|e| format!("intent store lock poisoned: {e}"))?;
-        // Retryable MUST set created_at_ns = now to move to back of queue.
+        // Retryable MUST move the intent to the back of the queue.
+        let retryable_created_at_ns =
+            Self::next_created_at_base(&guard, &self.orchestrator_id, now_ns)?;
         guard
             .execute(
                 "UPDATE orchestrator_kernel_intents
                  SET state = 'pending', blocked_reason = NULL,
                      created_at_ns = ?3, updated_at_ns = ?3
                  WHERE orchestrator_id = ?1 AND intent_key = ?2",
-                params![&self.orchestrator_id, key, now_ns],
+                params![&self.orchestrator_id, key, retryable_created_at_ns],
             )
             .map_err(|e| format!("failed to mark intent retryable: {e}"))?;
         Ok(())
@@ -852,28 +879,28 @@ mod tests {
         let conn = test_conn();
         let store = SqliteIntentStore::<TestIntent>::new(conn, "test-intent-order");
 
-        let a = TestIntent {
-            key: "intent-A".to_string(),
+        // Reverse lexical key order to assert dequeue follows enqueue order,
+        // not `intent_key` ordering.
+        let first = TestIntent {
+            key: "intent-z-first".to_string(),
             data: "first".to_string(),
         };
-        let b = TestIntent {
-            key: "intent-B".to_string(),
+        let second = TestIntent {
+            key: "intent-a-second".to_string(),
             data: "second".to_string(),
         };
-        // Enqueue A then B in same batch (same created_at_ns).
-        // ORDER BY created_at_ns ASC, intent_key ASC should yield A first.
         store
-            .enqueue_many(&[a.clone(), b.clone()])
+            .enqueue_many(&[first.clone(), second.clone()])
             .await
-            .expect("enqueue A+B");
+            .expect("enqueue first+second");
 
         let batch = store.dequeue_batch(2).await.expect("dequeue 2");
         assert_eq!(batch.len(), 2, "should dequeue 2 intents");
         assert_eq!(
-            batch[0].key, "intent-A",
-            "A should come before B (lexicographic tiebreak)"
+            batch[0].key, "intent-z-first",
+            "first enqueued intent must be dequeued first even when lexically greater"
         );
-        assert_eq!(batch[1].key, "intent-B");
+        assert_eq!(batch[1].key, "intent-a-second");
     }
 
     #[tokio::test]
@@ -894,12 +921,7 @@ mod tests {
             .await
             .expect("enqueue A+B");
 
-        // Small sleep to ensure time advances for `created_at_ns = now` in
-        // mark_retryable. Without this, the retryable intent may get the same
-        // timestamp as B and tie-break on key order.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        // Mark A retryable: sets created_at_ns = now, moving it to back of queue
+        // Mark A retryable: adapter must move it to queue tail deterministically.
         store
             .mark_retryable(&"intent-A".to_string(), "transient failure")
             .await

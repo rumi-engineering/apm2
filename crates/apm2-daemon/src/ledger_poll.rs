@@ -39,9 +39,10 @@ pub const CANONICAL_EVENT_ID_WIDTH: usize = 20;
 /// Hard limit on events returned per poll call to prevent unbounded memory
 /// growth from a single query (denial-of-service prevention).
 ///
-/// Each `SignedLedgerEvent` payload can be up to ~1 MiB, so this cap limits a
-/// single poll to ~1 GiB peak allocation -- tolerable on production hosts
-/// while preventing the ~10 GiB spike that a 10,000-event cap would allow.
+/// Each `SignedLedgerEvent` payload can be up to ~1 MiB. During dual-source
+/// merge, a poll may temporarily hold up to ~2*limit events in memory, so
+/// this cap bounds worst-case peak allocation to about ~2 GiB while still
+/// preventing the much larger spikes from unbounded batch sizes.
 const MAX_POLL_LIMIT: usize = 1_000;
 
 /// SQL zero-pad constant -- 20 zeros for `SUBSTR` padding in canonical queries.
@@ -170,33 +171,32 @@ pub fn poll_events_blocking(
     )?;
 
     // --- Canonical events query (if table exists) ---
-    // Bound the canonical query to `limit - legacy_count` so the combined
-    // vector never exceeds `limit` entries, avoiding a transient 2x memory
-    // spike when both tables return a full batch.
+    // Query canonical independently with the same cursor + limit, then merge
+    // and truncate. Do NOT reduce canonical limit by legacy_count: doing so
+    // can skip canonical rows that should sort before legacy rows already
+    // returned in this batch when timestamps tie.
     if detect_canonical_table(conn) {
-        let remaining = limit.saturating_sub(events.len());
-        let remaining_i64 =
-            i64::try_from(remaining).map_err(|_| "poll remaining exceeds i64 range".to_string())?;
-        if remaining_i64 > 0 {
-            let canonical = poll_canonical(
-                conn,
-                event_types,
-                &placeholders,
-                cursor_ts_ns,
-                &cursor_event_id,
-                remaining_i64,
-            )?;
-            if !canonical.is_empty() {
-                events.extend(canonical);
-                // Merge-sort by (timestamp_ns, event_id) and truncate.
-                events.sort_by(|a, b| {
-                    a.timestamp_ns
-                        .cmp(&b.timestamp_ns)
-                        .then_with(|| a.event_id.cmp(&b.event_id))
-                });
-                events.truncate(limit);
-            }
+        let canonical = poll_canonical(
+            conn,
+            event_types,
+            &placeholders,
+            cursor_ts_ns,
+            &cursor_event_id,
+            limit_i64,
+        )?;
+        if !canonical.is_empty() {
+            events.extend(canonical);
         }
+    }
+
+    if events.len() > 1 {
+        // Merge-sort by (timestamp_ns, event_id) and truncate.
+        events.sort_by(|a, b| {
+            a.timestamp_ns
+                .cmp(&b.timestamp_ns)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        events.truncate(limit);
     }
 
     Ok(events)
@@ -536,6 +536,50 @@ mod tests {
         assert!(
             remaining[0].event_id > *mid_id || remaining[0].timestamp_ns > mid_event.timestamp_ns,
             "first remaining event must be strictly after cursor"
+        );
+    }
+
+    #[test]
+    fn test_poll_events_limit_one_does_not_skip_cross_source_ties() {
+        let conn = setup_test_db();
+
+        // Legacy row with lexicographically larger event_id than canonical.
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, 'test_event', 'work-legacy', 'actor:legacy', X'7B7D', X'', 1000)",
+            params!["z-legacy"],
+        )
+        .expect("insert legacy row");
+
+        // Canonical row at the same timestamp.
+        conn.execute(
+            "INSERT INTO events
+                (event_type, session_id, actor_id, payload, signature, timestamp_ns)
+             VALUES ('test_event', 'work-canonical', 'actor:canonical', X'7B7D', X'', 1000)",
+            [],
+        )
+        .expect("insert canonical row");
+
+        // First batch with limit=1.
+        let first = poll_events_blocking(&conn, &["test_event"], 0, "", 1).expect("first poll");
+        assert_eq!(first.len(), 1, "first poll should return one row");
+
+        let first_event = &first[0];
+        let cursor_ts = i64::try_from(first_event.timestamp_ns).expect("cursor ts fits i64");
+        let cursor_id = first_event.event_id.clone();
+
+        // Resume from first cursor and ensure we still get the other row.
+        let second = poll_events_blocking(&conn, &["test_event"], cursor_ts, &cursor_id, 10)
+            .expect("second poll");
+        assert_eq!(second.len(), 1, "second poll should return remaining row");
+
+        let mut works = vec![first_event.work_id.clone(), second[0].work_id.clone()];
+        works.sort();
+        assert_eq!(
+            works,
+            vec!["work-canonical".to_string(), "work-legacy".to_string()],
+            "cursor progression must observe both cross-source rows"
         );
     }
 

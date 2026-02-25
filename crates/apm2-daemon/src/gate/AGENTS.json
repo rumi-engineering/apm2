@@ -115,6 +115,27 @@
       "kind": "safety",
       "title": "parse_gate_lease_payload validates payload size and calls GateLease::validate() after deserialization",
       "rfc": ["RFC-0020"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-020",
+      "kind": "invariant",
+      "title": "GateStart ledger tailing delegates to shared ledger_poll (no bespoke canonical+legacy merge)",
+      "description": "SqliteGateStartLedgerReader MUST call crates/apm2-daemon/src/ledger_poll.rs (`poll_events_async`/`poll_events_blocking`) for cursor-safe canonical+legacy reads. Hand-rolled merge SQL in gate-start is forbidden.",
+      "rfc": ["RFC-0020", "RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-021",
+      "kind": "invariant",
+      "title": "GateStart durable cursor/intent/effect state uses orchestrator_runtime shared tables",
+      "description": "GateStartKernel stores cursor, intent buffer, and effect journal via orchestrator_runtime adapters keyed by orchestrator_id `gate_start_kernel` (tables: orchestrator_kernel_cursors, orchestrator_kernel_intents, orchestrator_kernel_effect_journal).",
+      "rfc": ["RFC-0020", "RFC-0032"]
+    },
+    {
+      "id": "BEH-DAEMON-GATE-022",
+      "kind": "safety",
+      "title": "GateStart legacy storage migration is one-time, idempotent, and fail-closed",
+      "description": "Legacy gate-start artifacts (`gate_start_kernel_cursor`, `gate_start_intents`, `gate_start_effect_journal.sqlite`) are migrated into shared orchestrator_runtime tables only when the target namespace is empty. Legacy effect states `started/unknown` map to `unknown` to preserve fail-closed semantics.",
+      "rfc": ["RFC-0020", "RFC-0032"]
     }
   ]
 }

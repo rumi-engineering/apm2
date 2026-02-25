@@ -23,13 +23,13 @@
     {
       "id": "BEH-DAEMON-OKRT-004",
       "kind": "invariant",
-      "title": "Intent dequeue ordered by (created_at_ns ASC, intent_key ASC) for FIFO",
+      "title": "Intent enqueue assigns strictly increasing created_at_ns and dequeue orders by (created_at_ns ASC, rowid ASC) to preserve enqueue order",
       "rfc": ["RFC-0020"]
     },
     {
       "id": "BEH-DAEMON-OKRT-005",
       "kind": "invariant",
-      "title": "mark_retryable sets created_at_ns = now to move intent to back of queue",
+      "title": "mark_retryable assigns tail created_at_ns based on MAX(created_at_ns)+1 to move intent to queue back deterministically",
       "rfc": ["RFC-0020"]
     },
     {
